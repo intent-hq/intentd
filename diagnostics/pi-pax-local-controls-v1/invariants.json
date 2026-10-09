@@ -1,0 +1,43 @@
+{
+  "review": "fb2e894fcbccdc87bd9dfb6045bd0ed65b460e5945ffdf63e61688ac96fe3690",
+  "admissionPolicy": {
+    "status": "DESIGN PROPOSAL ONLY; no candidate source modification, parser execution, synthetic execution or next route selected",
+    "goal": "Support a strict intersection of pinned portable per-entry PAX output and regular-file content verification, not general PAX extraction. Actual package might remain unsupported.",
+    "metadataTypes": {
+      "x": "Single local extended header, followed immediately by exactly one regular type0/NUL file; validate all records and apply effective semantics.",
+      "g": "Explicit refusal. No global path/size/time state is silently discarded or approximated.",
+      "other": "Refuse X,L,K,sparse/vendor/unknown metadata and any intervening metadata while pending. Existing links/devices/FIFO/unknown refusals remain."
+    },
+    "targetTypes": "Pending x accepted only for raw regular type0/NUL with no trailing-slash path and empty raw linkname. Pending x on directory/root/link/unknown refuses. Existing unextended directory/root behavior remains exact; directory-PAX is outside this minimal release, not claimed supported.",
+    "keys": {
+      "path": "Optional nonempty strict UTF8, <=4096 encoded bytes, no BOM/NUL/CR/LF, no normalization; replaces whole decoded name for one target. Apply all original A04/A05 package/traversal/backslash/colon/Windows predicates to effective path and retain raw-header path checks independently.",
+      "size": "Optional canonical nonnegative ASCIIdecimal integer, safe integer <=33554432; overrides body hash length AND next block stride. Original raw-size cap/extent check remains plus effective-size/padded-extent checks. Reject fractional/exponent/signed/overflow/empty values.",
+      "mtime": "Optional canonical signed decimal seconds with optional fractional digits, <=64ASCIIbytes and finite numeric/Date range. Validate syntax/range but do not use for file content hashing/materialization; pinned install noMtime. Empty value refuses.",
+      "linkpath": "Optional exactly empty only, explicitly verifying no link target. Nonempty refuses regardless of type.",
+      "allOtherKeys": "Refuse including hdrcharset/charset, GNU.sparse*, SCHILY.*, uid/gid/uname/gname/atime/ctime/mode/comment/vendor extensions. This deliberately excludes nonportable metadata and cannot claim all publishers supported."
+    },
+    "recordPolicy": "Require at least1/max4 records and unique allowed keys; reject duplicates, deletion empty path/size/time, chained x and all g. Explicit refusal avoids last-wins/deletion/global merge ambiguity. Allow empty linkpath only; this is not key deletion.",
+    "framing": "Work on bounded Buffer octets. Parse canonical positive decimal length through first ASCIIspace, ensure safe addition/end within metadata body and length includes digits/space/key/equal/value/finalLF. Find first ASCIIequal within this record; nonempty ASCII exact allowlisted keyword. Require finalLF exactly at declared end, full body consumed with no ignored suffix. Reject any embedded newline/CR/NUL in value so accepted syntax lies in pinned line parser intersection. Strict UTF8 for path before constructing effective key; byte count not JS string length. Never decode arbitrary header/body beyond existing bounded input.",
+    "carrier": "Existing full512 header/checksum/octal/raw-size/extent checks first. Require explicitUSTAR00, emptyprefix, typex, emptylinkname, carrier path under PaxHeader/ with one nonempty safe basename (no slash/backslash/dotdot/colon/NUL/Windows invalid component); no materialization of carrier. Require positive body <=1MiB and complete512 padding allzero. No claim every valid POSIX carriername is supported.",
+    "limits": {
+      "metadataBytesPerHeader": 1048576,
+      "metadataBytesAggregatePerTar": 8388608,
+      "metadataHeadersPerTar": 1024,
+      "recordsPerHeader": 4,
+      "pathBytes": 4096,
+      "timeBytes": 64,
+      "source": "1MiB matches pinned maxMetaEntrySize, but this verifier rejects rather than ignores overlimit; remaining limits are proposed conservative admission policies, not standard requirements or existing runtime guarantees. No fit to unseen archive is assumed."
+    },
+    "state": "EMPTY -> validated x produces PENDING local map -> next validated raw regular target computes effectivepath/size, all checks -> consume exactlyonce/reset EMPTY. EOF/zero block/truncated header with PENDING fails. Unsupported type or second x/g while PENDING fails before applying overlays; no global state.",
+    "termination": "Retain existing no-PAX behavior; for PAX-bearing archive require full512 alignment and no orphan state at zero/end. Original firstzero termination remains inherited; general end-of-archive hardening is not claimed.",
+    "queryAndError": "No extra network/process/file queries, no dependency import. Only bounded in-memory header/PAX parse and state. Keep existing fixed-error helper/rethrow/sidefile/relay/caps. New parse validation may report coarse/stale existing tar-parse; no new diagnostic field/record proposed.",
+    "unresolvedForBroaderSupport": [
+      "Directory-target PAX requires separate effective-directory/root/zero-size analysis and controls.",
+      "Global path/size and deletion/merge semantics require explicit target-reader contract and native differential proof before accepting g.",
+      "Unknown metadata/charset/sparse/link semantics require separate review; never treat unknown as inert.",
+      "Actual archive fields/validity remain unknown, so even this strict subset may continue to refuse."
+    ]
+  },
+  "fullNativeReaderDifferential": false,
+  "missingClosure": "See packet native-reader-closure.json; no source model earns native-reader credit."
+}
