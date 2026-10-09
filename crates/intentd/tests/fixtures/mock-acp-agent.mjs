@@ -1222,6 +1222,14 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      // Codex's supported title control is not a model turn or transcript item.
+      if (process.env.CODEX_PATH && extractPromptText(msg.params).startsWith('/rename ')) {
+        note('session/update', {
+          sessionId: msg.params.sessionId,
+          update: { sessionUpdate: 'session_info_update', title: extractPromptText(msg.params).slice(8).trim() },
+        });
+        return result(msg.id, { stopReason: 'end_turn' });
+      }
       // Test-owned receipt barrier: turnInFlight can be true before this child
       // records the prompt. Hold only the selected current prompt, so replayed
       // history in a fresh child's follow-up cannot accidentally re-enter it.

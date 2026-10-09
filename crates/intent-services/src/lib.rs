@@ -70,6 +70,7 @@ mod browser_tabs;
 mod capability;
 mod clone_ops;
 pub mod codex_diagnostics;
+mod codex_session_title;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;

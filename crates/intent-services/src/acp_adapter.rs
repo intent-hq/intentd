@@ -200,6 +200,10 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    pub(crate) fn is_codex(&self) -> bool {
+        self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Codex)
+    }
+
     fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
         command

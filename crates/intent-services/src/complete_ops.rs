@@ -862,6 +862,11 @@ rl.on('line', (line) => {{
   if (msg.method === 'initialize') return send({{ jsonrpc: '2.0', id: msg.id, result: {{ protocolVersion: 1 }} }});
   if (msg.method === 'session/new') return send({{ jsonrpc: '2.0', id: msg.id, result: {{ sessionId: 's1' }} }});
   if (msg.method === 'session/prompt') {{
+    const titleControl = msg.params.prompt?.[0]?.text;
+    if (titleControl?.startsWith('/rename ')) {{
+      send({{ jsonrpc: '2.0', method: 'session/update', params: {{ sessionId: msg.params.sessionId, update: {{ sessionUpdate: 'session_info_update', title: titleControl.slice(8).trim() }} }} }});
+      return send({{ jsonrpc: '2.0', id: msg.id, result: {{ stopReason: 'end_turn' }} }});
+    }}
     send({{
       jsonrpc: '2.0',
       method: 'session/update',
@@ -934,6 +939,11 @@ rl.on('line', (line) => {
   if (msg.method === 'session/new') { sessionNew = msg.params; return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } }); }
   if (msg.method === 'session/set_config_option') { selectedModel = msg.params.value; return send({ jsonrpc: '2.0', id: msg.id, result: {} }); }
   if (msg.method === 'session/prompt') {
+    const titleControl = msg.params.prompt?.[0]?.text;
+    if (titleControl?.startsWith('/rename ')) {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'session_info_update', title: titleControl.slice(8).trim() } } });
+      return send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    }
     const text = JSON.stringify({ sessionNew, prompt: msg.params.prompt[0].text, selectedModel, argv: process.argv.slice(2), config: process.argv.includes('--workspaces=false') ? process.env.CODEX_CONFIG : null, hasCodexPath: 'CODEX_PATH' in process.env, codexPath: process.env.CODEX_PATH });
     send({
       jsonrpc: '2.0',
@@ -1149,6 +1159,11 @@ rl.on('line', (line) => {
   if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
   if (msg.method === 'session/new') return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } });
   if (msg.method === 'session/prompt') {
+    const titleControl = msg.params.prompt?.[0]?.text;
+    if (titleControl?.startsWith('/rename ')) {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'session_info_update', title: titleControl.slice(8).trim() } } });
+      return send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    }
     send({
       jsonrpc: '2.0',
       method: 'session/update',
@@ -1308,7 +1323,7 @@ rl.on('line', (line) => {
                     serde_json::from_str(observed["config"].as_str().unwrap()).unwrap();
                 assert_eq!(
                     config,
-                    json!({"features": {"multi_agent": false, "multi_agent_v2": false}})
+                    json!({"agents": {"enabled": false}, "features": {"multi_agent": false, "multi_agent_v2": false}})
                 );
                 assert_eq!(
                     observed["selectedModel"],
@@ -1359,7 +1374,9 @@ rl.on('line', (line) => {
             .map(|(_, value)| value.to_str().unwrap());
         assert_eq!(
             config.map(|value| serde_json::from_str::<Value>(value).unwrap()),
-            Some(json!({"features": {"multi_agent": false, "multi_agent_v2": false}}))
+            Some(
+                json!({"agents": {"enabled": false}, "features": {"multi_agent": false, "multi_agent_v2": false}})
+            )
         );
         assert!(!cmd.removed_env_vars().iter().any(|key| key == "CODEX_PATH"));
         assert!(!cmd

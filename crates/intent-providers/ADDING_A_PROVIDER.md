@@ -96,6 +96,17 @@ needs. Fields that matter most:
   That test doubles only the installed CLI protocol; it does not replace the ACP adapter.
   Keep live-account and real-platform evidence separate from this controlled proof.
 
+  codex-acp 2.1.1 starts its automatic-title thread without per-session
+  `CODEX_CONFIG`. Intent confirms an explicit title using the adapter's `/rename`
+  control before persistent and utility inference, preserving the existing title
+  on load. The command must succeed and produce a fresh matching title notification;
+  failure stops setup. The control adds no user conversation item or model request.
+  `codex_session_title` owns this adapter-specific requirement; reconsider it when
+  updating the pin. The strict runtime fixture checks every captured request,
+  including auxiliary requests, with v1/v2/absent model metadata. Set
+  `INTENT_CODEX_TEST_DAEMON` to a freshly built local daemon to additionally exercise
+  the production utility runner against the actual runtime and pinned adapter.
+
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
 + executable), (2) the provider's native-installer location where one exists
@@ -236,11 +247,12 @@ certainly needs new normalization arms:
     overrides are bypassed.
     After all environment merges, the shared `CODEX_SUBAGENT_POLICY_CONFIG`
     policy (`crates/intent-providers/src/config.rs`) replaces `CODEX_CONFIG` with
-    `{"features":{"multi_agent":false,"multi_agent_v2":false}}`.
-    Both values are JSON booleans, disabling both generations of native
-    delegation even if user configuration enables them. Do not use
-    `agents.enabled`: older installed Codex versions treat it as a role name
-    and reject a boolean with an `AgentRoleToml` error (intent-hq/intent#6982).
+    `{"agents":{"enabled":false},"features":{"multi_agent":false,"multi_agent_v2":false}}`.
+    All values are JSON booleans. The explicit `agents.enabled=false` takes
+    precedence over model metadata selecting v1/v2; feature flags alone can
+    expose native delegation even when both are false. The derived minimum
+    gate excludes older parsers that reject `agents.enabled` with an
+    `AgentRoleToml` error (intent-hq/intent#6982).
     The launch boundary keeps `CODEX_PATH` on the exact installed CLI and
     rejects a confirmed version below the minimum derived from the pinned
     adapter's CLI declaration. This prevents older runtimes that drop the
@@ -385,7 +397,8 @@ After authorized merges, monitor the carrying cloudlands-fe alpha release before
 
 ### Codex policy compatibility regression
 
-The ordinary provider test suite guards the feature-flag policy shape. To verify
+The ordinary provider test suite guards explicit agent denial and both feature
+flags. To verify
 the actual runtime parser, model catalog, session start/resume, and absence of
 native delegation tools, run the opt-in regression with explicit local binaries:
 
@@ -400,12 +413,13 @@ Run from the intentd checkout with Python 3 and Node on PATH. Use the adapter
 version pinned above and test the declared minimum and installed runtime.
 The regression uses a temporary home, dummy authentication, and a local
 HTTP fixture; it makes no paid model call and never reads user credentials.
-It covers new sessions, subsequent live prompts, same-process `session/resume`,
-and `session/load` after process recreation. Codex 0.159.1 and 0.160.0 pass.
-Codex 0.114.0 accepts the feature-flag shape but drops the adapter-only policy
-on a second live prompt and lacks the pinned adapter's history API. It is
-therefore rejected before adapter launch by the derived-minimum gate; parser
-compatibility alone does not establish supported runtime behavior.
+It supplies synthetic model catalogs with absent, v1, and v2 multi-agent
+metadata and user configuration enabling delegation, covering new sessions,
+subsequent live prompts, same-process `session/resume`, and `session/load`
+after process recreation. Each phase must emit a tool-bearing request for the
+selected model; every captured catalog must exclude native delegation tools.
+Codex 0.114.0 rejects explicit agent denial and loses feature-only denial on
+later turns. It is rejected before adapter launch by the derived-minimum gate.
 
 Startup discovery derives optional CLI minima from the exact pinned adapter's
 npm dependency declarations, stored in `data/adapter-cli-packages.json`. The

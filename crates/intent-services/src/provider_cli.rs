@@ -27,13 +27,32 @@ pub async fn add_installed_cli_versions(discovery: &mut Value) {
             let path = context.as_ref().map(|c| c.runtime.path().to_owned());
             let version = match context {
                 Some(context) => {
-                    let mut launch = tokio::process::Command::new(context.runtime.path());
-                    context.apply(&mut launch);
-                    context
-                        .observe(&launch)
-                        .await
-                        .ok()
-                        .map(|(_, version)| version)
+                    // Match npx-backed launch PATH and neutral working directory.
+                    // In particular, an env-node CLI must not become "unknown"
+                    // merely because the daemon inherited a restricted PATH.
+                    let cli = context.runtime.cli();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        let npx = if cli == InstalledCli::Codex {
+                            intent_providers::find_codex_npx()
+                        } else {
+                            intent_providers::find_npx()
+                        };
+                        let path = intent_providers::enhanced_path(npx.as_deref());
+                        intent_acp::NpxLaunchDir::create(None).map(|dir| (dir, path))
+                    })
+                    .await;
+                    if let Ok(Ok((dir, launch_path))) = prepared {
+                        let mut launch = tokio::process::Command::new(context.runtime.path());
+                        launch.current_dir(dir.path()).env("PATH", launch_path);
+                        context.apply(&mut launch);
+                        context
+                            .observe(&launch)
+                            .await
+                            .ok()
+                            .map(|(_, version)| version)
+                    } else {
+                        None
+                    }
                 }
                 None => None,
             };

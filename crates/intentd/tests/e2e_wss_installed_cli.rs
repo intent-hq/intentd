@@ -371,6 +371,15 @@ exit 97
         prompt(&mut ws, workspace, agent, &log, index * 2 + 2).await;
     }
     let rows = records(&log);
+    assert!(
+        !rows.iter().any(|row| row["kind"] == "auxiliary_prompt"),
+        "explicit titles must suppress the adapter's unconfigured inference"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["provider"] == "codex" && row["method"] == "thread/name/set"),
+        "production persistent setup must confirm an explicit Codex title"
+    );
     for provider in ["codex", "claude-code"] {
         let prompts: Vec<_> = rows
             .iter()
@@ -410,6 +419,7 @@ exit 97
                 .find(|r| r["pid"] == prompts[0]["pid"] && r["method"] == "thread/start")
                 .unwrap();
             assert_eq!(thread["params"]["config"]["features"]["multi_agent"], false);
+            assert_eq!(thread["params"]["config"]["agents"]["enabled"], false);
             assert_eq!(
                 thread["params"]["config"]["features"]["multi_agent_v2"],
                 false
@@ -440,6 +450,7 @@ exit 97
                 let policy: Value =
                     serde_json::from_str(launch["policy"].as_str().unwrap()).unwrap();
                 assert_eq!(policy["features"]["multi_agent"], false);
+                assert_eq!(policy["agents"]["enabled"], false);
                 assert_eq!(policy["features"]["multi_agent_v2"], false);
             }
         }

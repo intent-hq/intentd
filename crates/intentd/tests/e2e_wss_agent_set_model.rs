@@ -745,7 +745,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
 
 /// Startup warning data follows the installed CLI, never an adapter override.
 #[intent_test_macros::daemon_test]
-async fn wss_provider_cli_minimum_reports_old_supported_and_unknown() {
+async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restricted_path() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = temp_data_dir();
@@ -755,13 +755,20 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown() {
     let codex = bin.join("codex");
     std::fs::write(
         &codex,
-        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 92\n/bin/cat \"$0.version\"\n",
+        "#!/usr/bin/env node\nif(process.argv[2]!==\"--version\")process.exit(92);if(JSON.parse(require(\"node:fs\").readFileSync(\"package.json\")).name!==\"intentd-npx-launch\")process.exit(93);process.stdout.write(require(\"node:fs\").readFileSync(process.argv[1]+\".version\"));\n",
     )
     .unwrap();
     std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
     let version_file = bin.join("codex.version");
     std::fs::write(&version_file, "codex-cli 0.114.0\n").unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    // The CLI is selected from inherited PATH, but its Node interpreter must
+    // come from the same enhanced PATH used by the real adapter launch.
+    let node = intent_providers::find_node().expect("Node fixture prerequisite");
+    let tool_bin = data_dir.join("home/.local/bin");
+    std::fs::create_dir_all(&tool_bin).unwrap();
+    std::os::unix::fs::symlink(node, tool_bin.join("node")).unwrap();
+    let path = bin.to_string_lossy().into_owned();
+    let home = data_dir.join("home").to_string_lossy().into_owned();
     let _daemon = Daemon {
         child: spawn_serve(
             data_dir,
@@ -770,6 +777,9 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown() {
                 ("INTENTD_AUTH_TOKEN", TOKEN),
                 ("PATH", &path),
                 ("CODEX_PATH", "/must-not-probe-this-adapter"),
+                ("HOME", &home),
+                ("USERPROFILE", &home),
+                ("SHELL", "/bin/false"),
             ],
         ),
     };

@@ -247,6 +247,21 @@ async fn drive_one_shot(
     .await
     .unwrap_or(Err(OneShotError::SetupTimeout))?;
 
+    if cmd.is_codex() {
+        serve_requests_while(
+            &mut responder,
+            requests,
+            crate::codex_session_title::confirm(
+                conn,
+                &session_id,
+                "Intent utility",
+                cmd.session_new_timeout(),
+            ),
+        )
+        .await
+        .map_err(map_acp_error)?;
+    }
+
     if let Some(model) = config_option_model {
         if let Some(response) = apply_config_option_model(
             &mut responder,
