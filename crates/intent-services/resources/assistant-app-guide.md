@@ -197,6 +197,29 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Workspace numbers for Micro keys
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
+
+With a supported **Creator Micro 2** or **Codex Micro** connected to Intent,
+**Home → Workspaces** shows colored numbered squares on assigned workspaces in
+both list and board views. Matching smaller squares appear at the left of top
+workspace tabs, including pinned tabs. Numbers **1–6** identify the workspace's
+Micro key assignment. An unassigned workspace has no number.
+
+Right-click a workspace's list row, board card, or top tab and choose **Assign to
+Micro Key**, then a key number. This also works for workspaces without a number;
+the workspace does not need to be selected. Archived, deleted, and Assistant
+workspaces cannot receive Micro assignments.
+An occupied key's menu label names the workspace it will replace. Choose
+**Unassign** to remove the current assignment. Changes are shared across these
+views and saved.
+
+The numbers and assignment actions appear only while Intent's Micro integration
+is connected; a device merely being plugged in or detected is not enough.
+Disconnecting hides them without deleting saved assignments. If they are missing,
+check the device's connection to Intent before trying to change assignments.
+
 ## Inspect a failed response and recover
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
