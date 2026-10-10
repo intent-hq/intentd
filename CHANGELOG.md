@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.41] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain hardware workspace numbering and assignment ([#2369](https://github.com/intent-hq/intentd/pull/2369))
+
+
 ## [0.10.40] - 2026-10-10
 
 ### 🧪 Testing
