@@ -1113,8 +1113,8 @@ mod prompt_guidance_tests {
         let (mut replies, read) = tokio::io::duplex(4096);
         let conn = Connection::new(input, read, None, ConnectionHooks::default());
         let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
-            {"type":"text","text":"original user block"},
-            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"}
+            {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}}
         ]))
         .unwrap();
         let activity = ActivityTracker::new();
@@ -1198,8 +1198,8 @@ mod prompt_guidance_tests {
         assert_eq!(
             frame["params"]["prompt"],
             json!([
-                {"type":"text","text":"original user block"},
-                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"},
+                {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}},
                 {"type":"text","text":"optional inert text"}
             ])
         );

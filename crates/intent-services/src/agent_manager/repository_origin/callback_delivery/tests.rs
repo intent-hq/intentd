@@ -6714,9 +6714,13 @@ mod normal_launch {
             "wrong-session",
             "wrong-connection",
             "wrong-content",
+            "wrong-attachment",
+            "wrong-metadata",
             "stream",
             "stream-retired",
             "stream-wrong-content",
+            "stream-wrong-attachment",
+            "stream-wrong-metadata",
             "acknowledge",
             "acknowledge-retired",
             "acknowledge-stale",
@@ -6744,7 +6748,7 @@ mod normal_launch {
             assert_eq!(authorities.len(), 1, "{registered}");
             let authority = authorities[0].clone();
             let original = authority.original_services().unwrap();
-            if retire_at.starts_with("acknowledge") {
+            if retire_at.starts_with("acknowledge") || retire_at.contains("wrong-") {
                 sqlx::query("UPDATE pr_monitor SET pending_changes = '[\"new commits pushed\"]', baseline_snapshot = '{\"fixture\":\"older baseline\"}' WHERE agent_id = ?")
                     .bind(&h.f.row.id.0).execute(original.store.write_pool()).await.unwrap();
             }
@@ -6800,9 +6804,7 @@ mod normal_launch {
                         assert!(completion.acknowledge("2026-10-09T23:00:00Z").await.is_err(),
                             "persistence or preparation cannot acknowledge a transfer");
                     }
-                    if retire_at == "wrong-content" {
-                        assert!(prepared.commit_message(&row, "original-wake", &metadata, "2026-10-09T22:00:00Z").await.unwrap().is_some());
-                    }
+                    assert!(prepared.commit_message(&row, "original-wake", &metadata, "2026-10-09T22:00:00Z").await.unwrap().is_some());
                     if matches!(retire_at, "before-send" | "stream-retired") {
                         origin.retire();
                     }
@@ -6814,10 +6816,24 @@ mod normal_launch {
                     } else {
                         started.turn.connection.as_ref().unwrap()
                     };
-                    let prompt = serde_json::from_value(json!([{"type":"text","text": if matches!(retire_at, "wrong-content" | "stream-wrong-content") {"substituted private wake"} else {"private monitor wake"}}])).unwrap();
+                    let mut blocks = json!([{"type":"text","text": if matches!(retire_at, "wrong-content" | "stream-wrong-content") {"substituted private wake"} else {"private monitor wake"}}]);
+                    if retire_at.ends_with("wrong-attachment") {
+                        blocks.as_array_mut().unwrap().push(json!({
+                            "type":"resource", "resource":{
+                                "uri":"file:///private-monitor-attachment.txt",
+                                "mimeType":"text/plain", "text":"substituted attachment"
+                            }
+                        }));
+                    }
+                    if retire_at.ends_with("wrong-metadata") {
+                        blocks[0]["_meta"] = json!({"monitorPayload":"substituted metadata"});
+                    }
+                    let prompt = serde_json::from_value(blocks.clone()).unwrap();
+                    assert_eq!(serde_json::to_value(&prompt).unwrap(), blocks,
+                        "mutation must survive ACP serialization: {retire_at}");
                     if retire_at.starts_with("stream") {
                         let mut notifications = started.turn.notifications.lock().await;
-                        return services.run_prompt_turn_captured(
+                        let result = services.run_prompt_turn_captured(
                             started.turn.runtime.as_ref(),
                             &mut notifications,
                             &agent_id,
@@ -6831,6 +6847,14 @@ mod normal_launch {
                                 required: Some(Box::new(prepared)),
                             }),
                         ).await.is_ok();
+                        if retire_at.contains("wrong-") {
+                            assert!(!result);
+                            assert!(completion.acknowledge("2026-10-09T23:00:01Z").await.is_err());
+                            let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
+                            assert_eq!(saved.pending_changes, row.monitor().pending_changes);
+                            assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
+                        }
+                        return result;
                     }
                     let result = intent_acp::session::prompt_with_required_admission(
                         destination,
@@ -6845,6 +6869,13 @@ mod normal_launch {
                     )
                     .await
                     .is_ok();
+                    if retire_at.contains("wrong-") {
+                        assert!(!result);
+                        assert!(completion.acknowledge("2026-10-09T23:00:01Z").await.is_err());
+                        let saved = services.store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
+                        assert_eq!(saved.pending_changes, row.monitor().pending_changes);
+                        assert_eq!(saved.baseline_snapshot, row.monitor().baseline_snapshot);
+                    }
                     if retire_at.starts_with("acknowledge") {
                         assert!(result);
                         if retire_at == "acknowledge-retired" { origin.retire(); }
@@ -6889,7 +6920,24 @@ mod normal_launch {
                 matches!(retire_at, "never" | "stream") || retire_at.starts_with("acknowledge");
             assert_eq!(outcome, accepted, "{retire_at}");
             let frames = h.prompts().await;
-            assert_eq!(frames.len(), usize::from(accepted));
+            assert_eq!(
+                frames.len(),
+                usize::from(accepted),
+                "no substituted frame or base fallback: {retire_at}"
+            );
+            if retire_at.contains("wrong-") {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_message WHERE agent_id = ? AND role = 'user'",
+                )
+                .bind(&h.f.row.id.0)
+                .fetch_one(h.original.store.read_pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "rejection must not duplicate the persisted wake: {retire_at}"
+                );
+            }
             if accepted {
                 assert!(frames[0].to_string().contains("private monitor wake"));
             }
