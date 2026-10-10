@@ -137,6 +137,13 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
+
+When an agent monitors a GitHub pull request, its conversation shows the monitored
+PR and its latest status. Required checks that are still running or failing can
+block merging. If monitoring is paused or information is unavailable, wait for a
+fresh status before treating the PR as ready.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
 
 Images sent to agents may be resized or re-encoded for provider delivery; original
