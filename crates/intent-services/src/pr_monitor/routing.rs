@@ -13,6 +13,18 @@ use crate::repository_read_source::{
 use intent_core::ReviewTarget;
 use intent_store::{MonitorTargetProvenance, PersistedMonitorTarget};
 
+/// Proven producer classification only. Qualified output needs its own
+/// original recipient/authority route; stripping its fields is never legacy.
+pub(super) fn legacy_output(record: &intent_store::QualifiedPrMonitor) -> bool {
+    matches!(
+        record.target(),
+        PersistedMonitorTarget::Resolved {
+            provenance: MonitorTargetProvenance::LegacyGithubWriter,
+            ..
+        }
+    )
+}
+
 struct QualifiedBaseline {
     snapshot: Option<String>,
     polled_at: Option<String>,

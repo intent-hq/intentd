@@ -8296,17 +8296,16 @@ impl Services {
         // own poll loop will wake the agent when it changes or settles.
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
-        let active_pr_monitors: Vec<serde_json::Value> =
-            if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_pr_monitors_for_agent(child_id)
-                    .await
-                    .iter()
-                    .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let pr_monitor_waiting = !active_pr_monitors.is_empty();
+        let pr_monitor_waiting = if event.event_type == AGENT_IDLE && !completion_reported {
+            !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        } else {
+            false
+        };
+        let active_pr_monitors = if pr_monitor_waiting {
+            self.legacy_pr_monitor_wait_entries(child_id).await
+        } else {
+            Vec::new()
+        };
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it

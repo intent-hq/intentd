@@ -388,6 +388,41 @@ impl Store {
             .iter().map(qualified_from_row).collect()
     }
 
+    /// List an agent's rows with their original target evidence, including history.
+    /// This supplies provenance for projection, never provider read authority.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure or malformed stored row.
+    pub async fn list_qualified_pr_monitors_by_agent(
+        &self,
+        agent: &AgentId,
+    ) -> Result<Vec<QualifiedPrMonitor>> {
+        self.list_qualified_monitors("agent_id", &agent.0).await
+    }
+
+    /// List a workspace's rows with target evidence for destination-aware projection.
+    ///
+    /// # Errors
+    /// Returns `Internal` for a database failure or malformed stored row.
+    pub async fn list_qualified_pr_monitors_by_workspace(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<Vec<QualifiedPrMonitor>> {
+        self.list_qualified_monitors("workspace_id", &workspace.0)
+            .await
+    }
+
+    async fn list_qualified_monitors(
+        &self,
+        scope: &str,
+        id: &str,
+    ) -> Result<Vec<QualifiedPrMonitor>> {
+        sqlx::query(&format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE {scope} = ? ORDER BY created_at, monitor_id"))
+            .bind(id).fetch_all(self.read_pool()).await
+            .map_err(|e| intent_core::Error::Internal(format!("list qualified monitors: {e}")))?
+            .iter().map(qualified_from_row).collect()
+    }
+
     /// Find the active, qualified target owned by this agent. Never uses an
     /// unresolved legacy slot as a match for a caller's qualified target.
     ///

@@ -4078,9 +4078,17 @@ impl Services {
                 self.clear_pr_monitor_pause_annotations(None).await;
             }
         }
-        let monitors = self.store.load_active_pr_monitors().await?;
+        let monitors = self.store.load_active_qualified_pr_monitors().await?;
         let mut resumed = 0;
-        for mut monitor in monitors {
+        for record in monitors {
+            let legacy = matches!(
+                record.target(),
+                intent_store::PersistedMonitorTarget::Resolved {
+                    provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    ..
+                }
+            );
+            let mut monitor = record.monitor().clone();
             // Owner deleted, session row gone, or soft-retired — the
             // retire-time sweep ([`Services::cancel_agent_pr_monitors`])
             // could have been missed by a crash window.
@@ -4118,13 +4126,21 @@ impl Services {
             // Coalesced-era rows are a fixed point of the recompute and stay
             // on the normal catch-up poll, which folds downtime changes into
             // one consolidated wake.
-            if !monitor.pending_changes.is_empty() && !pending_survives_recompute(&monitor) {
+            // A legacy-shaped snapshot does not establish its writer. Imports
+            // and captured targets keep their exact pending bytes until their
+            // own recovery path has independently admitted the original target.
+            if legacy
+                && !monitor.pending_changes.is_empty()
+                && !pending_survives_recompute(&monitor)
+            {
                 self.emit_pending_changes(&monitor).await?;
             }
-            self.pr_monitor_catch_up
-                .lock()
-                .unwrap()
-                .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            if legacy {
+                self.pr_monitor_catch_up
+                    .lock()
+                    .unwrap()
+                    .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            }
             resumed += 1;
         }
         Ok(resumed)
@@ -4393,6 +4409,21 @@ impl Services {
         }
     }
 
+    /// Generic agent summaries can disclose only proven legacy producer rows.
+    /// Keep internal waiting/adoption checks on the unfiltered method above.
+    pub(crate) async fn legacy_pr_monitor_wait_entries(&self, agent_id: &AgentId) -> Vec<Value> {
+        self.store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .map(|row| row.monitor())
+            .filter(|m| m.state == PrMonitorState::Active)
+            .map(waiting_on_pr_monitors_entry)
+            .collect()
+    }
+
     /// Workspace-batched variant of
     /// [`active_pr_monitors_for_agent`](Self::active_pr_monitors_for_agent)
     /// for `agent.list`: one store query for the whole workspace, grouped by
@@ -4406,7 +4437,7 @@ impl Services {
     ) -> HashMap<String, Vec<Value>> {
         let monitors = match self
             .store
-            .list_active_pr_monitors_by_workspace(workspace_id)
+            .list_qualified_pr_monitors_by_workspace(workspace_id)
             .await
         {
             Ok(monitors) => monitors,
@@ -4420,12 +4451,17 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for m in monitors {
+        for record in monitors {
+            if !routing::legacy_output(&record) || record.monitor().state != PrMonitorState::Active
+            {
+                continue;
+            }
+            let m = record.monitor();
             let agent = m.agent_id.0.clone();
             by_agent
                 .entry(agent)
                 .or_default()
-                .push(waiting_on_pr_monitors_entry(&m));
+                .push(waiting_on_pr_monitors_entry(m));
         }
         by_agent
     }
@@ -4443,11 +4479,40 @@ impl Services {
     ) -> Vec<Value> {
         self.annotate_waiting_on_script_monitors(agent_id, data)
             .await;
-        if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
-            return existing.clone();
+        let records = self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default();
+        let legacy: Vec<_> = records
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .collect();
+        let entries: Vec<Value> =
+            if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
+                existing
+                    .iter()
+                    .filter(|entry| {
+                        legacy.iter().any(|row| {
+                            entry.get("monitorId").and_then(Value::as_str)
+                                == Some(row.monitor().monitor_id.0.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                legacy
+                    .iter()
+                    .map(|row| row.monitor())
+                    .filter(|m| m.state == PrMonitorState::Active)
+                    .map(waiting_on_pr_monitors_entry)
+                    .collect()
+            };
+        if entries.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.remove("waitingOnPrMonitors");
+            }
         }
-        let monitors = self.active_pr_monitors_for_agent(agent_id).await;
-        let entries: Vec<Value> = monitors.iter().map(waiting_on_pr_monitors_entry).collect();
         if !entries.is_empty() {
             if let Some(obj) = data.as_object_mut() {
                 obj.insert(
@@ -4466,7 +4531,11 @@ impl Services {
     /// no snapshot parsing. Best-effort: a store failure reads as empty so a
     /// snapshot build never fails on it.
     pub(crate) async fn active_pr_monitor_labels(&self, agent_id: &AgentId) -> Vec<String> {
-        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+        let monitors = match self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+        {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -4479,9 +4548,11 @@ impl Services {
         };
         monitors
             .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-            .map(|m| {
-                let label = monitor_label(&m);
+            .filter(routing::legacy_output)
+            .filter(|row| row.monitor().state == PrMonitorState::Active)
+            .map(|row| {
+                let m = row.monitor();
+                let label = monitor_label(m);
                 if m.pending_changes.is_empty() {
                     label
                 } else {
@@ -4500,6 +4571,18 @@ impl Services {
         monitor: &PrMonitor,
         extra: Option<Value>,
     ) {
+        // The global bus has consumers with no qualified recipient receipt.
+        // Qualified lifecycle output must use its scoped native route instead.
+        let Ok(record) = self
+            .store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+        else {
+            return;
+        };
+        if !routing::legacy_output(&record) {
+            return;
+        }
         let mut data = json!({
             "workspaceId": monitor.workspace_id,
             "agentId": monitor.agent_id,
@@ -4531,6 +4614,7 @@ mod tests {
     mod ancestry_messages;
     mod ancestry_regression;
     mod qualified_isolation;
+    mod qualified_recovery;
     mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;

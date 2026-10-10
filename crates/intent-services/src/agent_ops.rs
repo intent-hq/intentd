@@ -3670,12 +3670,7 @@ impl Services {
         let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
         // Idle-visibility (unified external-wait): same overlay for active
         // PR monitors (`waitingOnPrMonitors`, omitted when empty).
-        let waiting_on_pr_monitors = self
-            .active_pr_monitors_for_agent(&agent_id)
-            .await
-            .iter()
-            .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
-            .collect();
+        let waiting_on_pr_monitors = self.legacy_pr_monitor_wait_entries(&agent_id).await;
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
         lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
