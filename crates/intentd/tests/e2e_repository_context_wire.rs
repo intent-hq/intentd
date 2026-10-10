@@ -153,6 +153,9 @@ impl Harness {
         Self::boot_with_ids(None).await
     }
     async fn boot_with_ids(ids: Option<(WorkspaceId, WorkspaceGitRootId)>) -> Self {
+        Self::boot_with_monitor_support(ids, false).await
+    }
+    async fn boot_with_monitor_support(ids: Option<(WorkspaceId, WorkspaceGitRootId)>, support: bool) -> Self {
         let dir = common::test_tempdir_in("/tmp", "itd-repository-wire-");
         let root = dir.path().join("repo");
         repository(&root);
@@ -218,6 +221,10 @@ impl Harness {
         std::fs::create_dir(&workspaces).unwrap();
         let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
         let mut cmd = common::hermetic_serve_command(dir.path());
+        cmd.env_remove("INTENTD_REVIEW_MONITOR_TEST_SUPPORT");
+        if support {
+            cmd.env("INTENTD_REVIEW_MONITOR_TEST_SUPPORT", "1");
+        }
 
         cmd.env("INTENTD_DATA_DIR", dir.path())
             .env("INTENTD_WORKSPACES_DIR", workspaces)

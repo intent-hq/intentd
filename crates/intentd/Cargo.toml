@@ -45,7 +45,7 @@ default = []
 js-engine = ["dep:intent-js"]
 # Explicit cold loopback descriptors for the real GitLab auth socket tests.
 # Packaging and ordinary daemon builds must leave this feature disabled.
-repository-test-fixtures = ["intent-services/repository-test-fixtures", "dep:intent-sourcecontrol"]
+repository-test-fixtures = ["intent-services/repository-test-fixtures", "intent-transport/repository-test-fixtures", "dep:intent-sourcecontrol"]
 
 [[test]]
 name = "e2e_wss_gitlab_auth"

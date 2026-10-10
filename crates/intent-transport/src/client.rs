@@ -132,6 +132,30 @@ pub(crate) fn server_json(
     server
 }
 
+/// A deliberately compiled test host can exercise the real negotiation path.
+/// This signal supplies compatibility only, never source or recipient authority.
+fn connection_server_json(is_local: bool) -> Value {
+    let server = server_json(
+        detect_has_display(), std::env::consts::OS, std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"), crate::BUILD_COMMIT, is_local,
+    );
+    #[cfg(feature = "repository-test-fixtures")]
+    let server = {
+        let mut server = server;
+        apply_monitor_test_support(&mut server,
+            std::env::var("INTENTD_REVIEW_MONITOR_TEST_SUPPORT").as_deref() == Ok("1"));
+        server
+    };
+    server
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
+    if enabled {
+        server["capabilities"]["reviewMonitoring"] = json!(1);
+    }
+}
+
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
 /// task binds onto its reverse-registry entry (REV-2).
@@ -162,8 +186,7 @@ pub(crate) fn attachment_result(
             "clientId":client_id.as_str(),
             "connectionRole":"review-monitor",
             "protocolVersion":PROTOCOL_VERSION,
-            "server":server_json(detect_has_display(), std::env::consts::OS,
-                std::env::consts::ARCH, env!("CARGO_PKG_VERSION"), crate::BUILD_COMMIT, is_local)
+            "server":connection_server_json(is_local)
         }),
     )
 }
@@ -249,14 +272,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let server = server_json(
-        detect_has_display(),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        env!("CARGO_PKG_VERSION"),
-        crate::BUILD_COMMIT,
-        is_local,
-    );
+    let server = connection_server_json(is_local);
     HelloOutcome {
         frame: frame(
             req.id_present,

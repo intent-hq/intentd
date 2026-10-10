@@ -179,8 +179,8 @@ async fn unresolved_monitor(store: &Store, workspace: &WorkspaceId) -> intent_co
     row
 }
 
-async fn check_native_unresolved_delivery(wss: bool) {
-    let h = Harness::boot().await;
+async fn check_native_unresolved_delivery(wss: bool, support: bool) {
+    let h = Harness::boot_with_monitor_support(None, support).await;
     let store = Store::open(&h.dir.path().join("intentd.db")).await.unwrap();
     let row = unresolved_monitor(&store, &h.workspace).await;
     let mut ordinary = connect(&h, wss).await;
@@ -188,10 +188,9 @@ async fn check_native_unresolved_delivery(wss: bool) {
         .rpc("client.hello", json!({"clientId":"monitor-events-desktop"}))
         .await;
     let id = success(&hello)["clientId"].clone();
-    assert!(
-        success(&hello)["server"]["capabilities"]
-            .get("reviewMonitoring")
-            .is_none()
+    assert_eq!(
+        success(&hello)["server"]["capabilities"].get("reviewMonitoring"),
+        support.then_some(&json!(1)),
     );
     let legacy_list = ordinary.rpc("prMonitor.list", h.query()).await;
     assert_eq!(success(&legacy_list)["monitors"], json!([]));
@@ -200,6 +199,10 @@ async fn check_native_unresolved_delivery(wss: bool) {
     assert_eq!(
         success(&attachment_hello)["connectionRole"],
         "review-monitor"
+    );
+    assert_eq!(
+        success(&attachment_hello)["server"]["capabilities"].get("reviewMonitoring"),
+        support.then_some(&json!(1)),
     );
     let list = doc.rpc("prMonitor.list", h.query()).await;
     assert_eq!(success(&list)["monitors"][0]["monitorId"], row.monitor_id.0);
@@ -250,15 +253,16 @@ async fn check_native_unresolved_delivery(wss: bool) {
     assert_eq!(saved, expected);
     if let Ok(dir) = std::env::var("INTENT_MONITOR_FIXTURE_DIR") {
         std::fs::create_dir_all(&dir).unwrap();
-        let name = if wss {
-            "producer-unresolved-wss.json"
-        } else {
-            "producer-unresolved-uds.json"
+        let name = match (support, wss) {
+            (true, true) => "producer-supported-unresolved-wss.json",
+            (true, false) => "producer-supported-unresolved-uds.json",
+            (false, true) => "producer-unresolved-wss.json",
+            (false, false) => "producer-unresolved-uds.json",
         };
         std::fs::write(
             Path::new(&dir).join(name),
             serde_json::to_vec_pretty(&json!({
-                "scope":"actual unresolved recovery only; production support unadvertised",
+                "scope":"actual unresolved recovery only", "testHostSupport":support,
                 "ordinaryHello":hello,"attachmentHello":attachment_hello,"legacyList":legacy_list,
                 "list":list,"subscription":subscribe,"cancel":cancelled,"event":event,
             }))
@@ -270,9 +274,20 @@ async fn check_native_unresolved_delivery(wss: bool) {
 
 #[tokio::test]
 async fn monitor_unresolved_real_uds_list_cancel_and_original_event() {
-    check_native_unresolved_delivery(false).await;
+    check_native_unresolved_delivery(false, false).await;
 }
 #[tokio::test]
 async fn monitor_unresolved_real_wss_list_cancel_and_original_event() {
-    check_native_unresolved_delivery(true).await;
+    check_native_unresolved_delivery(true, false).await;
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+#[tokio::test]
+async fn monitor_supported_real_uds_negotiates_list_cancel_and_event() {
+    check_native_unresolved_delivery(false, true).await;
+}
+#[cfg(feature = "repository-test-fixtures")]
+#[tokio::test]
+async fn monitor_supported_real_wss_negotiates_list_cancel_and_event() {
+    check_native_unresolved_delivery(true, true).await;
 }

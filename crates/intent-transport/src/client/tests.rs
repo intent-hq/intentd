@@ -468,3 +468,18 @@ async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
         binding = None;
     }
 }
+
+#[cfg(feature = "repository-test-fixtures")]
+#[test]
+fn monitor_test_host_support_requires_explicit_opt_in() {
+    let ordinary = server_json(false, "linux", "x86_64", "test", None, true);
+    assert!(ordinary["capabilities"].get("reviewMonitoring").is_none());
+    let mut disabled = ordinary.clone();
+    apply_monitor_test_support(&mut disabled, false);
+    assert_eq!(disabled, ordinary);
+    let mut enabled = ordinary.clone();
+    apply_monitor_test_support(&mut enabled, true);
+    assert_eq!(enabled["capabilities"]["reviewMonitoring"], 1);
+    enabled["capabilities"].as_object_mut().unwrap().remove("reviewMonitoring");
+    assert_eq!(enabled, ordinary, "test support changes no other host claims");
+}
