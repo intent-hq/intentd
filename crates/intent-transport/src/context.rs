@@ -49,7 +49,7 @@ use futures::future::Either;
 use intent_core::repository_request::{
     RepositoryReadConnection, RepositoryReadRequestScope, RepositoryWireEntry,
 };
-pub use intent_core::{current_caller, with_caller, Caller};
+pub use intent_core::{Caller, current_caller, with_caller};
 
 tokio::task_local! {
     /// Connection origin for the current request task. Set by the transport layer
@@ -217,6 +217,14 @@ pub(crate) fn review_monitoring_hello(
 ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
     READ_CONNECTION
         .try_with(|connection| connection.as_ref()?.review_monitoring_hello(support))
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn capture_monitor_events()
+-> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_events())
         .ok()
         .flatten()
 }

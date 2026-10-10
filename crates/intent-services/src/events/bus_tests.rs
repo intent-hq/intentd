@@ -10,7 +10,7 @@ use intent_store::{EventQuery, NewEvent, Store};
 use serde_json::json;
 use tokio::time::timeout;
 
-use super::bus::{Delivery, EventBus, LagWarnThrottle, BROADCAST_CAPACITY, LAG_WARN_INTERVAL};
+use super::bus::{BROADCAST_CAPACITY, Delivery, EventBus, LAG_WARN_INTERVAL, LagWarnThrottle};
 use super::filter::SubscriptionFilter;
 
 /// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers the
@@ -1231,7 +1231,9 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             n, OVERFLOW as u64,
             "marker carries the ring's exact skipped count"
         ),
-        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+        Delivery::Batch(_) | Delivery::Monitor(_) => {
+            panic!("expected the lag marker before any surviving event")
+        }
     }
     let second = timeout(Duration::from_secs(5), sub.recv_delivery())
         .await

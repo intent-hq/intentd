@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use intent_core::caller::{
-    current_caller, current_wire_credential, with_caller, with_wire_credential, WireCredential,
+    WireCredential, current_caller, current_wire_credential, with_caller, with_wire_credential,
 };
 use intent_core::repository_request::{
     RepositoryContextBoundQuery, RepositoryContextCapture, RepositoryContextCoverage,
@@ -22,7 +22,7 @@ use intent_core::{
 use intent_store::{
     RepositoryAuthoritySnapshot, RepositoryLifecycleKey, RepositoryLifecycleObserver,
 };
-use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::repository_admission::lifecycle::{
     RepositorySourceLifetime, RepositorySubscription, RepositoryWireOrigin,
@@ -32,9 +32,9 @@ use crate::repository_admission::{
     RepositoryAuthorityProvenance, RepositoryEntry, RepositoryRetirement,
 };
 use crate::repository_admission_git_source::{RepositoryGitSource, RootRecord};
-use crate::repository_context_live::{resolver, target_context, SelectionFacts};
+use crate::repository_context_live::{SelectionFacts, resolver, target_context};
 use crate::repository_context_reader::{
-    read_context_root_with_resolver, GitConfigEnvironment, RepositoryObservedRoot,
+    GitConfigEnvironment, RepositoryObservedRoot, read_context_root_with_resolver,
 };
 use crate::settings_registry::SettingsSnapshot;
 use crate::source_control_auth_ops::repository_owner::{
@@ -298,10 +298,7 @@ impl Connection {
     }
 }
 impl Connection {
-    fn capture_native(
-        &self,
-        query: Option<&RepositoryContextQuery>,
-    ) -> Arc<dyn RepositoryReadRequestScope> {
+    fn capture_native(&self, query: Option<&RepositoryContextQuery>) -> Arc<Request> {
         let captured = (|| {
             self.entered()?;
             if NATIVE_REQUEST.try_with(|_| ()).is_ok() {
@@ -373,6 +370,11 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_monitor_events(
+        &self,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+        monitor::capture_events(self)
+    }
     fn review_monitoring_hello(
         &self,
         support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
@@ -507,6 +509,7 @@ impl RepositoryReadRetirements for Receiver {
                                 };
                                 for id in ids { c.retire_id(&id); }
                             }
+                            Some(crate::Delivery::Monitor(_)) => {},
                             Some(crate::Delivery::Lagged(_)) | None => c.close(),
                         }
                     },

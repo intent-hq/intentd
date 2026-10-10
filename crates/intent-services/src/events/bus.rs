@@ -22,12 +22,13 @@ use std::time::{Duration, Instant};
 
 use intent_core::{ActorType, Error, Event, EventActor, PrincipalId, Result};
 use intent_store::{NewEvent, Store};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::filter::{event_matches, SubscriptionFilter};
+use super::filter::{SubscriptionFilter, event_matches};
+use super::monitor_delivery::{BroadcastEvent, MonitorEvent, PrivateEventDelivery, Recipient};
 
 /// Capacity of the broadcast channel that fans published events out to every
 /// subscriber's delivery task. Slow subscribers that fall this far behind are
@@ -117,7 +118,7 @@ pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 #[derive(Clone)]
 pub struct EventBus {
     store: Store,
-    tx: broadcast::Sender<Arc<Event>>,
+    tx: broadcast::Sender<Arc<BroadcastEvent>>,
     writer_tx: Arc<Mutex<Option<mpsc::Sender<WriterRequest>>>>,
     writer: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Attribution names by principal, each with its load time; entries
@@ -320,7 +321,9 @@ impl EventBus {
         };
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
-        let _ = self.tx.send(Arc::new(event.clone()));
+        let _ = self
+            .tx
+            .send(Arc::new(BroadcastEvent::Public(event.clone())));
         event
     }
 
@@ -331,8 +334,57 @@ impl EventBus {
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let rx = self.tx.subscribe();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx));
-        Subscription { rx: out_rx, handle }
+        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx, None));
+        Subscription {
+            rx: out_rx,
+            handle,
+            monitor_recipient: None,
+        }
+    }
+    /// Subscribe on the existing queue with an original native monitor recipient.
+    /// Every private event still needs fresh original account/workspace admission.
+    #[must_use]
+    pub fn subscribe_monitor(
+        &self,
+        filter: SubscriptionFilter,
+        owner: Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>,
+        subscription_id: String,
+    ) -> Subscription {
+        let (out, rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let recipient = Recipient {
+            owner: owner.clone(),
+            subscription_id,
+        };
+        let handle = intent_core::spawn_daemon(delivery_task(
+            self.tx.subscribe(),
+            filter,
+            out,
+            Some(recipient),
+        ));
+        Subscription {
+            rx,
+            handle,
+            monitor_recipient: Some(owner),
+        }
+    }
+
+    pub(crate) fn publish_monitor(
+        &self,
+        event: Event,
+        binding: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+        source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+    ) -> Result<()> {
+        let mut envelope = Some(BroadcastEvent::Monitor(MonitorEvent {
+            event,
+            binding,
+            source: source.clone(),
+        }));
+        source.with_current(&mut || {
+            if let Some(envelope) = envelope.take() {
+                let _ = self.tx.send(Arc::new(envelope));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -359,6 +411,8 @@ pub enum Delivery {
     /// forwarder) recover with a bounded re-read; [`Subscription::recv`]
     /// consumers see no marker (skipped transparently).
     Lagged(u64),
+    /// Already-authorized private native frame; never flatten into public events.
+    Monitor(PrivateEventDelivery),
 }
 
 /// A live subscription. Yields filtered (and optionally batched) events via
@@ -366,6 +420,8 @@ pub enum Delivery {
 pub struct Subscription {
     rx: mpsc::Receiver<Delivery>,
     handle: JoinHandle<()>,
+    monitor_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>>,
 }
 
 impl Subscription {
@@ -377,7 +433,7 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) => {}
+                Delivery::Lagged(_) | Delivery::Monitor(_) => {}
             }
         }
     }
@@ -397,6 +453,9 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        if let Some(recipient) = &self.monitor_recipient {
+            recipient.retire();
+        }
         self.handle.abort();
     }
 }
@@ -422,7 +481,7 @@ impl Drop for Subscription {
 async fn writer_task(
     store: Store,
     rx: mpsc::Receiver<WriterRequest>,
-    broadcast_tx: broadcast::Sender<Arc<Event>>,
+    broadcast_tx: broadcast::Sender<Arc<BroadcastEvent>>,
 ) {
     writer_loop(
         move |events: Arc<[NewEvent]>| {
@@ -443,7 +502,7 @@ async fn writer_task(
 pub(crate) async fn writer_loop<F, Fut>(
     insert: F,
     mut rx: mpsc::Receiver<WriterRequest>,
-    broadcast_tx: broadcast::Sender<Arc<Event>>,
+    broadcast_tx: broadcast::Sender<Arc<BroadcastEvent>>,
 ) where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -478,7 +537,7 @@ pub(crate) async fn writer_loop<F, Fut>(
 async fn flush_batch<F, Fut>(
     insert: &F,
     pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &broadcast::Sender<Arc<Event>>,
+    broadcast_tx: &broadcast::Sender<Arc<BroadcastEvent>>,
 ) where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -524,7 +583,7 @@ async fn flush_batch<F, Fut>(
 pub(crate) async fn flush_prepared<F, Fut>(
     mut insert: F,
     pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &broadcast::Sender<Arc<Event>>,
+    broadcast_tx: &broadcast::Sender<Arc<BroadcastEvent>>,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -563,7 +622,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
                 evt.data = orig.data;
                 let _ = tx.send(Ok(evt.clone()));
                 // Broadcast in insertion order (append-then-broadcast semantics).
-                let _ = broadcast_tx.send(Arc::new(evt));
+                let _ = broadcast_tx.send(Arc::new(BroadcastEvent::Public(evt)));
             }
         }
         Err(e) => {
@@ -640,9 +699,10 @@ impl LagWarnThrottle {
 
 /// Per-subscriber delivery loop: filter, then coalesce within `batch_window`.
 async fn delivery_task(
-    mut rx: broadcast::Receiver<Arc<Event>>,
+    mut rx: broadcast::Receiver<Arc<BroadcastEvent>>,
     filter: SubscriptionFilter,
     out: mpsc::Sender<Delivery>,
+    recipient: Option<Recipient>,
 ) {
     let batch_window = filter.batch_window;
     let mut buffer: Vec<Event> = Vec::new();
@@ -653,7 +713,24 @@ async fn delivery_task(
         tokio::select! {
             recv = rx.recv() => match recv {
                 Ok(ev) => {
-                    if !event_matches(&filter, &ev) {
+                    let ev = match ev.as_ref() {
+                        BroadcastEvent::Public(ev) => ev,
+                        BroadcastEvent::Monitor(ev) => {
+                            let Some(recipient) = &recipient else { continue };
+                            if !event_matches(&filter, &ev.event) { continue; }
+                            // Preserve barriers across public batches without a
+                            // second queue or a plain-event private fallback.
+                            if !buffer.is_empty() {
+                                deadline = None;
+                                if out.send(Delivery::Batch(std::mem::take(&mut buffer))).await.is_err() { return; }
+                            }
+                            if let Ok(output) = recipient.project(ev).await {
+                                if out.send(Delivery::Monitor(output)).await.is_err() { return; }
+                            }
+                            continue;
+                        }
+                    };
+                    if !event_matches(&filter, ev) {
                         continue;
                     }
                     match batch_window {

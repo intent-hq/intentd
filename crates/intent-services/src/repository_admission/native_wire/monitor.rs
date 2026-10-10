@@ -330,6 +330,7 @@ pub(crate) async fn cancel(
     services
         .require_workspace_manager(workspace, "prMonitor.cancel")
         .await?;
+    let event_source = EventSource::capture(recipient.clone())?;
     let admitted = recipient.clone();
     let services = services.clone();
     let mut monitor = row.monitor().clone();
@@ -352,6 +353,19 @@ pub(crate) async fn cancel(
         monitor.state = intent_core::PrMonitorState::Cancelled;
         monitor.updated_at = now;
         services.settle_unresolved_monitor_cancel(&monitor).await;
+        if let Some(bus) = &services.event_bus {
+            let event = intent_core::Event {
+                id: uuid::Uuid::now_v7().to_string(), workspace_id: monitor.workspace_id.clone(),
+                timestamp: intent_core::now_iso(), event_type: intent_core::events::PR_MONITOR_CANCELLED.into(),
+                actor: crate::system_actor(), session_id: Some(monitor.agent_id.0.clone()),
+                correlation_id: None, parent_event_id: None, metadata: None,
+                data: serde_json::json!({
+                    "workspaceId":monitor.workspace_id,"agentId":monitor.agent_id,"monitorId":monitor.monitor_id,
+                    "repo":format!("{}/{}",monitor.repo_owner,monitor.repo_name),"prNumber":monitor.pr_number,"state":monitor.state,
+                }),
+            };
+            let _ = bus.publish_monitor(event, None, event_source);
+        }
         Ok::<_, intent_core::Error>(monitor)
     })
     .await
@@ -363,4 +377,165 @@ pub(crate) async fn cancel(
         "ok": true,
         "monitor": crate::pr_monitor::unresolved_pr_monitor_wire(&monitor, reason),
     })))
+}
+
+pub(super) fn capture_events(
+    connection: &Connection,
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+    // Subscription construction runs inside the already captured RPC. Generic
+    // capture_native deliberately refuses nested captures; fork only this
+    // subscription lifetime from the exact original request and hello receipt.
+    let original = super::NATIVE_REQUEST.try_with(Clone::clone).ok()?;
+    if !std::ptr::eq(original.connection.as_ref(), connection) {
+        return None;
+    }
+    original.check().ok()?;
+    let receipt = original.monitor_receipt.clone().filter(|r| r.capable())?;
+    let (lifetime, registration) = connection.new_lifetime().ok()?;
+    let request = Arc::new_cyclic(|weak| super::Request {
+        connection: original.connection.clone(),
+        weak: weak.clone(),
+        lifetime: Some(lifetime),
+        _registration: Some(registration),
+        state: Mutex::new(super::RequestState::Ordinary),
+        completed: AtomicBool::new(false),
+        consumed: AtomicBool::new(false),
+        read_lane: Mutex::new(None),
+        subscriptions: Mutex::new(Vec::new()),
+        queued_query: None,
+        monitor_receipt: Some(receipt),
+    });
+    request
+        .subscribe(&[
+            super::RepositoryLifecycleKey::Database,
+            super::RepositoryLifecycleKey::WireAuthority,
+        ])
+        .ok()?;
+    Some(Arc::new(EventRecipient { request }))
+}
+struct EventRecipient {
+    request: Arc<super::Request>,
+}
+impl Drop for EventRecipient {
+    fn drop(&mut self) {
+        self.request.finish();
+    }
+}
+impl intent_core::repository_request::RepositoryMonitorEventRecipient for EventRecipient {
+    fn retire(&self) {
+        self.request.finish();
+    }
+
+    fn project<'a>(
+        &'a self,
+        event: &'a intent_core::Event,
+        binding: Option<&'a intent_core::review_monitor::ReviewMonitorBinding>,
+        source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+        subscription_id: &'a str,
+    ) -> intent_core::BoxFuture<
+        'a,
+        intent_core::Result<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>,
+    > {
+        Box::pin(async move {
+            // Resolved private events require original provider/account admission,
+            // added independently of this workspace-only recovery projection.
+            if binding.is_some() {
+                return Err(super::unavailable());
+            }
+            let c = &self.request.connection;
+            let recipient = super::with_caller(
+                c.caller.caller().clone(),
+                super::with_wire_credential(
+                    c.caller.wire_credential().cloned(),
+                    Recipient::acquire(&self.request, &event.workspace_id),
+                ),
+            )
+            .await?;
+            let frame = serde_json::json!({
+                "jsonrpc":"2.0", "method":"events.event",
+                "params":{"subscriptionId":subscription_id,"event":{
+                    "type":event.event_type,"workspaceId":event.workspace_id,
+                    "id":event.id,"timestamp":event.timestamp,"actor":event.actor,"data":event.data,
+                }},
+            })
+            .to_string();
+            let output = Arc::new(EventOutput {
+                recipient,
+                subscription: self.request.clone(),
+                source,
+                frame,
+            });
+            use intent_core::repository_request::RepositoryPrivateOutput;
+            output.with_current(&mut || Ok(()))?;
+            Ok(output as Arc<dyn RepositoryPrivateOutput>)
+        })
+    }
+}
+struct EventOutput {
+    recipient: Arc<Recipient>,
+    subscription: Arc<super::Request>,
+    source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+    frame: String,
+}
+impl intent_core::repository_request::RepositoryPrivateOutput for EventOutput {
+    fn frame(&self) -> &str {
+        &self.frame
+    }
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        self.source.with_current(&mut || {
+            self.subscription
+                .lifetime
+                .as_ref()
+                .ok_or_else(super::unavailable)?
+                .retirement()
+                .native_dispatch(|| Ok(self.recipient.with_current(action)))
+                .map_err(|_| super::unavailable())?
+        })
+    }
+}
+struct EventSource {
+    _recipient: Arc<Recipient>,
+    leaf: RepositoryRetirement,
+    parents: Vec<RepositoryRetirement>,
+}
+impl EventSource {
+    fn capture(recipient: Arc<Recipient>) -> intent_core::Result<Arc<Self>> {
+        let leaf = RepositoryRetirement::default();
+        let parents = vec![
+            recipient.connection.parent.clone(),
+            recipient.receipt.lifetime.clone(),
+            recipient.lifetime.retirement(),
+        ];
+        for parent in &parents {
+            parent
+                .native_link(&leaf)
+                .map_err(|_| super::unavailable())?;
+        }
+        Ok(Arc::new(Self {
+            _recipient: recipient,
+            leaf,
+            parents,
+        }))
+    }
+}
+impl intent_core::repository_request::RepositoryMonitorEventSource for EventSource {
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        // Each original parent joins this independent leaf before its mutation.
+        // Do not reacquire parent fences: producer and subscriber may be the
+        // same socket, and two native recipients may receive each other's events.
+        self.leaf
+            .native_dispatch(|| {
+                if self.parents.iter().any(RepositoryRetirement::native_closed) {
+                    return Err(super::AdmissionError::Retired);
+                }
+                Ok(action())
+            })
+            .map_err(|_| super::unavailable())?
+    }
 }

@@ -14,11 +14,11 @@ use intent_core::events::{
 };
 use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -36,9 +36,9 @@ use crate::panic_guard;
 use crate::presence;
 use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
 use crate::router::{
-    check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
+    EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET, check_envelope, handle_message,
 };
-use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
+use crate::rpc_limit::{OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE, Overloaded, RpcLimiter};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection **priority** outbound lane (RPC responses,
@@ -242,6 +242,8 @@ struct ChatLifecycle {
 /// layer by [`ConnSubs::remove`] before the removal is acknowledged).
 struct ConnSub {
     handle: JoinHandle<()>,
+    monitor_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>>,
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
@@ -250,6 +252,11 @@ struct ConnSub {
 
 impl Drop for ConnSub {
     fn drop(&mut self) {
+        // Aborting the forwarder alone defers its Drop until a scheduler turn.
+        // Join the original queued-output fence before removal is acknowledged.
+        if let Some(recipient) = &self.monitor_recipient {
+            recipient.retire();
+        }
         if let Some(lifecycle) = &self.lifecycle {
             subscriptions::trace_chat_teardown(&lifecycle.scope, &lifecycle.subscription_id);
         }
@@ -295,6 +302,7 @@ impl ConnSubs {
             id,
             ConnSub {
                 handle,
+                monitor_recipient: None,
                 replace_group,
                 lifecycle,
                 note_lease: false,
@@ -315,6 +323,7 @@ impl ConnSubs {
             id,
             ConnSub {
                 handle,
+                monitor_recipient: None,
                 replace_group,
                 lifecycle: None,
                 note_lease: true,
@@ -1226,7 +1235,8 @@ pub(crate) async fn handle_fast_path(
                             pattern,
                         )
                     });
-                let subscription = bus.subscribe(SubscriptionFilter {
+                let subscription_id = events::next_subscription_id();
+                let filter = SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
@@ -1234,8 +1244,14 @@ pub(crate) async fn handle_fast_path(
                     member_execution_events: true,
                     exclude_channel_only: true,
                     ..Default::default()
-                });
-                let subscription_id = events::next_subscription_id();
+                };
+                let monitor_recipient = crate::context::capture_monitor_events();
+                let subscription = match &monitor_recipient {
+                    Some(recipient) => {
+                        bus.subscribe_monitor(filter, recipient.clone(), subscription_id.clone())
+                    }
+                    None => bus.subscribe(filter),
+                };
                 // Enqueue the response (priority lane) before spawning the
                 // forwarder (bulk lane); the writer drains priority first, so
                 // it can never be preceded by an `events.event` notification.
@@ -1259,10 +1275,9 @@ pub(crate) async fn handle_fast_path(
                     host_removal_control,
                 ));
                 subs.insert(subscription_id.clone(), handle, replace_group, None);
-                subs.subs
-                    .get_mut(&subscription_id)
-                    .expect("just inserted")
-                    .host_removal_control = host_removal_control;
+                let sub = subs.subs.get_mut(&subscription_id).expect("just inserted");
+                sub.host_removal_control = host_removal_control;
+                sub.monitor_recipient = monitor_recipient;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1357,13 +1372,22 @@ async fn forward_subscription(
                     _ => membership_events = None,
                 }
             },
-            maybe = subscription.recv() => {
-                let Some(batch) = maybe else {
+            maybe = subscription.recv_delivery() => {
+                let Some(delivery) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
                     let _ = buffer
                         .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
                         .await;
                     return;
+                };
+                let batch = match delivery {
+                    Delivery::Batch(batch) => batch,
+                    Delivery::Lagged(_) => continue,
+                    Delivery::Monitor(output) => {
+                        if !buffer.drain_all(&out_tx, |item| item.into_frame(&subscription_id).into()).await { return; }
+                        if out_tx.send(crate::OutboundFrame::private(output.into_output())).await.is_err() { return; }
+                        continue;
+                    }
                 };
                 for mut event in batch {
                     // The revocation branch sends this exact durable event once,
@@ -2321,6 +2345,7 @@ async fn chat_subscription_loop(
                         continue;
                     }
                     Delivery::Batch(batch) => batch,
+                    Delivery::Monitor(_) => continue,
                     // Upstream loss: the ring dropped events before delivery,
                     // possibly this agent's turn tail. Self-heal by re-emitting
                     // a fresh bounded snapshot at the next seq (see the doc
@@ -2753,6 +2778,9 @@ async fn forward_channel_subscription(
 
 #[cfg(test)]
 pub(crate) mod read_delivery_tests;
+
+#[cfg(test)]
+mod monitor_event_tests;
 
 #[cfg(test)]
 mod tests {

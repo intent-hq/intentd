@@ -108,12 +108,14 @@ async fn unresolved_row(fixture: &Fixture) -> intent_core::PrMonitor {
         created_at: "created".into(),
         updated_at: "updated".into(),
     };
-    assert!(fixture
-        .services
-        .store
-        .insert_pr_monitor(&row)
-        .await
-        .unwrap());
+    assert!(
+        fixture
+            .services
+            .store
+            .insert_pr_monitor(&row)
+            .await
+            .unwrap()
+    );
     sqlx::query("UPDATE pr_monitor SET target_provider=NULL,target_instance_base_url=NULL,target_project_path=NULL,target_kind=NULL,target_provenance='unresolved',target_unresolved_reason='unverified-import' WHERE monitor_id=?")
         .bind(&row.monitor_id.0).execute(fixture.services.store.write_pool()).await.unwrap();
     row
@@ -193,12 +195,14 @@ async fn native_monitor_unresolved_list_retains_original_workspace_and_output_re
                 .review_monitoring_hello(ReviewMonitorRecipientSupport::default())
                 .unwrap();
             withdrawn.acknowledge();
-            assert!(output
-                .with_current(&mut || {
-                    effects += 1;
-                    Ok(())
-                })
-                .is_err());
+            assert!(
+                output
+                    .with_current(&mut || {
+                        effects += 1;
+                        Ok(())
+                    })
+                    .is_err()
+            );
             assert_eq!(effects, 1);
         })
         .await;
@@ -458,13 +462,15 @@ async fn native_monitor_unresolved_cancel_requires_manager_not_recipient_support
     let guest = f.guest("monitor-collaborator", true).await;
     enable_monitor(&guest).await;
     assert!(list_output(&f, &guest).await.is_ok());
-    assert!(guest
-        .request(
-            f.services
-                .pr_monitor_cancel_by_id(row.workspace_id.clone(), row.monitor_id.clone(),)
-        )
-        .await
-        .is_err());
+    assert!(
+        guest
+            .request(
+                f.services
+                    .pr_monitor_cancel_by_id(row.workspace_id.clone(), row.monitor_id.clone(),)
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         f.services
             .store
@@ -497,4 +503,106 @@ async fn native_monitor_unresolved_cancel_requires_manager_not_recipient_support
             .unwrap()["ok"],
         true
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_monitor_unresolved_cancel_event_retains_source_and_original_subscriber() {
+    for retire_source in [false, true] {
+        let git = GitFixture::new().await;
+        let bus = crate::EventBus::new(git.store.clone());
+        let services = Arc::new(
+            Services::new_repository_fixture(
+                git.store.clone(),
+                intent_core::FileSecretStore::with_path(git.dir.path().join("event-secrets.json")),
+                None,
+            )
+            .with_event_bus(bus.clone()),
+        );
+        services.initialize_repository_wire().await.unwrap();
+        let principal = services.store.get_primary_principal().await.unwrap();
+        let f = Fixture {
+            git,
+            services,
+            caller: Caller::Wire {
+                principal_id: principal.id,
+                host_role: HostRole::Owner,
+            },
+        };
+        let row = unresolved_row(&f).await;
+        let source = f.socket().await;
+        enable_monitor(&source).await;
+        let observer = f.socket().await;
+        enable_monitor(&observer).await;
+        let filter = crate::SubscriptionFilter {
+            event_types: vec!["prMonitor:*".into()],
+            batch_window: None,
+            ..Default::default()
+        };
+        let mut legacy = bus.subscribe(filter.clone());
+        let original = observer
+            .request(async { Ok(observer.owner.capture_monitor_events().unwrap()) })
+            .await
+            .unwrap();
+        let mut native =
+            bus.subscribe_monitor(filter.clone(), original, "original-subscription".into());
+        let same = source
+            .request(async { Ok(source.owner.capture_monitor_events().unwrap()) })
+            .await
+            .unwrap();
+        let mut same_socket = bus.subscribe_monitor(filter, same, "same-socket".into());
+        source
+            .request(
+                f.services
+                    .pr_monitor_cancel_by_id(row.workspace_id.clone(), row.monitor_id.clone()),
+            )
+            .await
+            .unwrap();
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(10), native.recv_delivery())
+                .await
+                .unwrap()
+                .unwrap();
+        let crate::Delivery::Monitor(output) = output else {
+            panic!("qualified event must retain private output")
+        };
+        let output = output.into_output();
+        output.with_current(&mut || Ok(())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(output.frame()).unwrap();
+        assert_eq!(value["method"], "events.event");
+        assert_eq!(value["params"]["subscriptionId"], "original-subscription");
+        assert_eq!(value["params"]["event"]["type"], "prMonitor:cancelled");
+        assert_eq!(
+            value["params"]["event"]["data"]["monitorId"],
+            row.monitor_id.0
+        );
+        assert!(!output.frame().contains("private pending text"));
+        let same_output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            same_socket.recv_delivery(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let crate::Delivery::Monitor(same_output) = same_output else {
+            panic!()
+        };
+        same_output
+            .into_output()
+            .with_current(&mut || Ok(()))
+            .unwrap();
+        assert!(
+            legacy.try_recv_delivery().is_none(),
+            "ordinary subscriptions withhold entire qualified envelope"
+        );
+        if retire_source {
+            source.owner.retire();
+        } else {
+            observer.owner.retire();
+        }
+        assert!(output.with_current(&mut || Ok(())).is_err());
+        // A new supported socket never restores an already queued original frame.
+        let replacement = f.socket().await;
+        enable_monitor(&replacement).await;
+        assert!(output.with_current(&mut || Ok(())).is_err());
+    }
 }

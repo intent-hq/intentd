@@ -42,6 +42,13 @@ pub trait RepositoryReadConnection: Send + Sync {
     ) -> Option<Arc<dyn ReviewMonitorHello>> {
         None
     }
+    /// Capture this socket's current acknowledged monitor recipient before a
+    /// subscription is queued. The recipient must independently authorize each
+    /// original workspace/account; compatibility alone grants no private data.
+    fn capture_monitor_events(&self) -> Option<Arc<dyn RepositoryMonitorEventRecipient>> {
+        None
+    }
+
     /// Pre-workspace host authority, captured on this original native socket.
     fn capture_checkout(
         &self,
@@ -128,6 +135,30 @@ pub trait ReviewMonitorHello: Send + Sync {
 pub trait RepositoryPrivateOutput: Send + Sync {
     fn frame(&self) -> &str;
     fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
+/// Retained original publisher authority for a private lifecycle envelope.
+/// This is never constructed from event metadata or a serialized account id.
+pub trait RepositoryMonitorEventSource: Send + Sync {
+    fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
+/// An original native subscription. Implementations join fresh recipient
+/// authorization with the publisher's retained authority and return immutable
+/// final-write ownership. Unsupported or retired recipients refuse the whole
+/// envelope. The existing events.event wire shape remains unchanged.
+pub trait RepositoryMonitorEventRecipient: Send + Sync {
+    /// Join original subscription retirement before unsubscribe or replacement
+    /// completes. Queued outputs must fail their next final-write admission.
+    fn retire(&self);
+
+    fn project<'a>(
+        &'a self,
+        event: &'a crate::Event,
+        binding: Option<&'a crate::review_monitor::ReviewMonitorBinding>,
+        source: Arc<dyn RepositoryMonitorEventSource>,
+        subscription_id: &'a str,
+    ) -> BoxFuture<'a, Result<Arc<dyn RepositoryPrivateOutput>>>;
 }
 
 /// An original request's scope, kept until its final response handling finishes.
@@ -282,10 +313,12 @@ mod native_contract_tests {
             .unwrap(),
             json!({"kind":"workspaceInventory","workspaceId":workspace})
         );
-        assert!(serde_json::from_value::<RepositoryContextCoverage>(
-            json!({"kind":"workspaceInventory","workspaceId":workspace,"gitRootId":root})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<RepositoryContextCoverage>(
+                json!({"kind":"workspaceInventory","workspaceId":workspace,"gitRootId":root})
+            )
+            .is_err()
+        );
     }
     #[test]
     fn repository_native_counters_remain_decimal_without_private_retirement_payload() {
@@ -516,14 +549,18 @@ mod selection_contract_tests {
         ] {
             assert!(serde_json::from_value::<RepositorySelectionChoice>(choice).is_err());
         }
-        assert!(serde_json::from_value::<RepositorySelectionBoundQuery>(
-            json!({"workspaceId":"w","selectionId":"a","choice":{"mode":"automatic"}})
-        )
-        .is_err());
-        assert!(serde_json::from_value::<RepositorySelectionQuery>(
-            json!({"workspaceId":"w","selectionId":"a"})
-        )
-        .is_err());
+        assert!(
+            serde_json::from_value::<RepositorySelectionBoundQuery>(
+                json!({"workspaceId":"w","selectionId":"a","choice":{"mode":"automatic"}})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RepositorySelectionQuery>(
+                json!({"workspaceId":"w","selectionId":"a"})
+            )
+            .is_err()
+        );
     }
     #[test]
     fn native_selection_independent_persistence_and_history_have_stable_tags() {
