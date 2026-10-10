@@ -35343,6 +35343,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // See `hook_list`: gate the workspace, not the optional filter.
             self.require_member(&workspace_id).await?;
+            if let Some(value) =
+                repository_native_wire::monitor::list(self, &workspace_id, agent_id.as_ref())
+                    .await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
                 .await
         })
@@ -35357,6 +35363,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "prMonitor.cancel")
                 .await?;
+            if let Some(value) =
+                repository_native_wire::monitor::cancel(self, &workspace_id, &monitor_id).await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
                 .await
         })

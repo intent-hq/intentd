@@ -1713,6 +1713,27 @@ fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str, paused_until: Option<&s
     metadata
 }
 
+/// An unresolved imported row is inspectable under native workspace admission,
+/// without treating its stored observation or pending text as authorized output.
+pub(crate) fn unresolved_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_store::MonitorTargetUnresolvedReason,
+) -> Value {
+    let mut safe = m.clone();
+    safe.pending_changes.clear();
+    safe.last_snapshot = None;
+    safe.last_error = None;
+    let mut value = pr_monitor_wire(&safe, None);
+    value["hasPendingChanges"] = json!(!m.pending_changes.is_empty());
+    let reason = match reason {
+        intent_store::MonitorTargetUnresolvedReason::MissingProvenance => "missing-provenance",
+        intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => "unverified-import",
+        intent_store::MonitorTargetUnresolvedReason::InvalidTarget => "invalid-target",
+    };
+    value["monitorAvailability"] = json!({"state":"unresolved","reason":reason});
+    value
+}
+
 /// The list-surface projection of one monitor: identity + lifecycle plus the
 /// hover/click fields the FE needs — PR title/URL and a compact summary of
 /// the last-refresh snapshot, whether changes are accumulated awaiting the
@@ -4144,6 +4165,17 @@ impl Services {
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    pub(crate) async fn settle_unresolved_monitor_cancel(&self, monitor: &PrMonitor) {
+        self.pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .remove(&monitor.monitor_id);
+        self.resettle_owner_after_pr_monitor_terminal(monitor).await;
+        self.maybe_emit_display_status_changed(&monitor.workspace_id)
+            .await;
+        self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
     }
 
     /// Idle-visibility deferral backstop (mirrors

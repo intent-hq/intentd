@@ -54,7 +54,7 @@ pub(crate) mod resource;
 pub(crate) mod selection;
 
 #[path = "native_wire/monitor.rs"]
-mod monitor;
+pub(crate) mod monitor;
 
 const LEASE_LIMIT: usize = 64;
 const ROOT_LIMIT: usize = 128;
@@ -538,6 +538,7 @@ struct Request {
 #[derive(Clone)]
 enum RequestState {
     Ordinary,
+    Monitor(Arc<monitor::Recipient>),
     Pending,
     Public,
     Capture(Arc<Lease>),
@@ -623,6 +624,17 @@ impl Drop for Request {
     }
 }
 impl RepositoryReadRequestScope for Request {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> Result<Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>> {
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        Ok(match &*state {
+            RequestState::Monitor(recipient) => Some(recipient.output(frame)),
+            _ => None,
+        })
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         let owner = self.weak.upgrade().expect("owned request scope");
         Box::pin(NATIVE_REQUEST.scope(owner, body))
@@ -640,6 +652,10 @@ impl RepositoryReadRequestScope for Request {
             let state = self.state.lock().map_err(|_| unavailable())?.clone();
             match state {
                 RequestState::Ordinary | RequestState::Public => transfer(),
+                RequestState::Monitor(recipient) => {
+                    entered.map_err(|_| unavailable())?;
+                    recipient.with_current(transfer)
+                }
                 RequestState::Pending | RequestState::Reading(_) => Err(unavailable()),
                 RequestState::Capture(lease) => {
                     entered.map_err(|_| unavailable())?;

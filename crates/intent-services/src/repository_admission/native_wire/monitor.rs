@@ -107,3 +107,260 @@ impl ReviewMonitorHello for Hello {
         });
     }
 }
+
+/// Workspace disclosure belongs to this acknowledged physical recipient. It is
+/// independent of the short RPC, and supplies no provider/account authority.
+pub(super) struct Recipient {
+    connection: Arc<Connection>,
+    receipt: Arc<Receipt>,
+    lifetime: super::RepositorySourceLifetime,
+    _registration: super::RepositorySubscription,
+    _subscription: super::RepositorySubscription,
+}
+
+impl Receipt {
+    fn capable(&self) -> bool {
+        self.with_current(|| Ok(())).is_ok()
+    }
+
+    fn with_current<T>(
+        &self,
+        action: impl FnOnce() -> super::AdmissionResult<T>,
+    ) -> super::AdmissionResult<T> {
+        self.lifetime.native_dispatch(|| {
+            use intent_core::review_monitor::{ReviewMonitorOutput, ReviewMonitoringCapabilities};
+            if !self.acknowledged.load(Ordering::Acquire)
+                || ReviewMonitorOutput::Qualified(())
+                    .project(
+                        &ReviewMonitoringCapabilities {
+                            review_monitoring: Some(1),
+                        },
+                        self.support,
+                    )
+                    .is_none()
+            {
+                return Err(super::AdmissionError::Denied);
+            }
+            action()
+        })
+    }
+}
+
+impl Recipient {
+    async fn acquire(
+        request: &Arc<super::Request>,
+        workspace: &intent_core::WorkspaceId,
+    ) -> intent_core::Result<Arc<Self>> {
+        let receipt = request
+            .monitor_receipt
+            .clone()
+            .filter(|r| r.capable())
+            .ok_or_else(super::unavailable)?;
+        let c = &request.connection;
+        let (lifetime, registration) = c.new_lifetime().map_err(|_| super::unavailable())?;
+        let subscription = lifetime
+            .subscribe(
+                &c.services.store,
+                c.caller.caller(),
+                &[
+                    super::RepositoryLifecycleKey::Database,
+                    super::RepositoryLifecycleKey::WireAuthority,
+                    super::RepositoryLifecycleKey::Workspace(workspace.clone()),
+                ],
+            )
+            .map_err(|_| super::unavailable())?;
+        // The original native caller must freshly pass the same Store-backed
+        // workspace/member/credential checks as existing repository reads.
+        super::authority(request, workspace)
+            .await
+            .map_err(|_| super::unavailable())?;
+        let recipient = Arc::new(Self {
+            connection: c.clone(),
+            receipt,
+            lifetime,
+            _registration: registration,
+            _subscription: subscription,
+        });
+        recipient.with_current(&mut || Ok(()))?;
+        Ok(recipient)
+    }
+
+    pub(super) fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        self.connection
+            .parent
+            .native_dispatch(|| {
+                self.receipt
+                    .with_current(|| self.lifetime.retirement().native_dispatch(|| Ok(action())))
+            })
+            .map_err(|_| super::unavailable())?
+    }
+
+    pub(super) fn output(
+        self: &Arc<Self>,
+        frame: &str,
+    ) -> Arc<dyn intent_core::repository_request::RepositoryPrivateOutput> {
+        Arc::new(Output {
+            recipient: self.clone(),
+            frame: frame.into(),
+        })
+    }
+}
+struct Output {
+    recipient: Arc<Recipient>,
+    frame: String,
+}
+impl intent_core::repository_request::RepositoryPrivateOutput for Output {
+    fn frame(&self) -> &str {
+        &self.frame
+    }
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        self.recipient.with_current(action)
+    }
+}
+
+/// Only the original supported native request enters this route. Legacy and ACP
+/// callers keep their existing producer. Unknown provenance never triggers reads.
+pub(crate) async fn list(
+    services: &super::Services,
+    workspace: &intent_core::WorkspaceId,
+    agent: Option<&intent_core::AgentId>,
+) -> intent_core::Result<Option<serde_json::Value>> {
+    let Some(captured) = super::NATIVE_REQUEST.try_with(Clone::clone).ok() else {
+        return Ok(None);
+    };
+    if !captured
+        .monitor_receipt
+        .as_ref()
+        .is_some_and(|r| r.capable())
+    {
+        return Ok(None);
+    }
+    let request = super::Request::current(services).map_err(|_| super::unavailable())?;
+    let recipient = Recipient::acquire(&request, workspace).await?;
+    let rows = match agent {
+        Some(agent) => {
+            services
+                .store
+                .list_qualified_pr_monitors_by_agent(agent)
+                .await?
+        }
+        None => {
+            services
+                .store
+                .list_qualified_pr_monitors_by_workspace(workspace)
+                .await?
+        }
+    };
+    let mut monitors = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|row| &row.monitor().workspace_id == workspace)
+    {
+        match row.target() {
+            intent_store::PersistedMonitorTarget::Unresolved { reason } => monitors.push(
+                crate::pr_monitor::unresolved_pr_monitor_wire(row.monitor(), *reason),
+            ),
+            intent_store::PersistedMonitorTarget::Resolved {
+                provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                ..
+            } => {
+                if let Some(value) = services.review_monitor_list_entry(row.monitor()).await? {
+                    monitors.push(value);
+                }
+            }
+            // Resolved private observations need their original provider/account
+            // admission in addition to this workspace recipient. Never infer it.
+            _ => {}
+        }
+    }
+    recipient.with_current(&mut || Ok(()))?;
+    *request.state.lock().map_err(|_| super::unavailable())? =
+        super::RequestState::Monitor(recipient);
+    Ok(Some(serde_json::json!({"monitors":monitors})))
+}
+
+/// An unresolved row has no provider authority to recover. Its original
+/// workspace manager may cancel it without interpreting any saved private data.
+pub(crate) async fn cancel(
+    services: &super::Services,
+    workspace: &intent_core::WorkspaceId,
+    monitor_id: &intent_core::PrMonitorId,
+) -> intent_core::Result<Option<serde_json::Value>> {
+    let Some(captured) = super::NATIVE_REQUEST.try_with(Clone::clone).ok() else {
+        return Ok(None);
+    };
+    if !captured
+        .monitor_receipt
+        .as_ref()
+        .is_some_and(|r| r.capable())
+    {
+        return Ok(None);
+    }
+    let row = services.store.get_qualified_pr_monitor(monitor_id).await?;
+    let intent_store::PersistedMonitorTarget::Unresolved { reason } = row.target() else {
+        return Ok(None);
+    };
+    let reason = *reason;
+    if &row.monitor().workspace_id != workspace
+        || row.monitor().state != intent_core::PrMonitorState::Active
+    {
+        return Err(super::unavailable());
+    }
+    let request = super::Request::current(services).map_err(|_| super::unavailable())?;
+    let recipient = Recipient::acquire(&request, workspace).await?;
+    // Reserve the writer before entering source/recipient fences. Membership
+    // changes after acquisition retire this lifetime through the Store observer.
+    let now = intent_core::now_iso();
+    #[cfg(test)]
+    if let Some(ready) = services
+        .test_review_monitor_write_ready
+        .lock()
+        .unwrap()
+        .as_ref()
+    {
+        ready.notify_one();
+    }
+    let write = services.store.prepare_monitor_cancel(&row, &now).await?;
+    services
+        .require_workspace_manager(workspace, "prMonitor.cancel")
+        .await?;
+    let admitted = recipient.clone();
+    let services = services.clone();
+    let mut monitor = row.monitor().clone();
+    // Once admitted, the commit and terminal settlement survive a lost caller.
+    let monitor = tokio::spawn(async move {
+        let changed = tokio::task::spawn_blocking(move || {
+            let mut write = Some(write);
+            let mut changed = false;
+            admitted.with_current(&mut || {
+                changed = write.take().ok_or_else(super::unavailable)?.commit()?;
+                Ok(())
+            })?;
+            Ok::<_, intent_core::Error>(changed)
+        })
+        .await
+        .map_err(|_| super::unavailable())??;
+        if !changed {
+            return Err(super::unavailable());
+        }
+        monitor.state = intent_core::PrMonitorState::Cancelled;
+        monitor.updated_at = now;
+        services.settle_unresolved_monitor_cancel(&monitor).await;
+        Ok::<_, intent_core::Error>(monitor)
+    })
+    .await
+    .map_err(|_| super::unavailable())??;
+    recipient.with_current(&mut || Ok(()))?;
+    *request.state.lock().map_err(|_| super::unavailable())? =
+        super::RequestState::Monitor(recipient);
+    Ok(Some(serde_json::json!({
+        "ok": true,
+        "monitor": crate::pr_monitor::unresolved_pr_monitor_wire(&monitor, reason),
+    })))
+}
