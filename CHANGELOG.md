@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.39] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain browser recovery after reconnect ([#7004](https://github.com/intent-hq/intentd/pull/7004)) ([#2371](https://github.com/intent-hq/intentd/pull/2371))
+
+### 🧪 Testing
+
+- Wait for durable idle before model recreation ([#2377](https://github.com/intent-hq/intentd/pull/2377))
+
+
 ## [0.10.38] - 2026-10-09
 
 ### 🐛 Bug Fixes
