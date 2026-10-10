@@ -173,6 +173,16 @@ an agent is a particular conversation doing work.
 
 When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceControls,HomeWorkspaceDashboard,HomeWorkspaceDashboardCard,HomeWorkspaceSettings}.svelte; src/features/home/home-workspaces-selectors.ts; src/store/renderer/slices/hud/hud-selectors.ts (selectDashboardWorkspaceDetails); messages/en.json. -->
+
+In **Home → Workspaces**, choose **Dashboard view** beside **List view** and
+**Board view** for cards with live workspace summaries, status, and available task
+progress. Cards also show agent activity, reasons for attention, waiting and unread
+indicators, and workspace token totals when available. Open the workspace's
+conversation to read the full response or address a question or blocker. Cards adapt
+to the available width and follow **View options → Group by**: status, repository,
+or none. Search and filters continue to apply when you switch views.
+
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
 unless you scroll away; older-history loading becomes available when that initial
