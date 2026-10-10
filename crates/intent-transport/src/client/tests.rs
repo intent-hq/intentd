@@ -35,6 +35,59 @@ fn parsed(outcome: HelloOutcome) -> Value {
 }
 
 #[tokio::test]
+async fn monitor_attachment_cannot_fall_through_to_profile_upsert_without_source_admission() {
+    let api = RecordingApi::default();
+    let mut binding = Some(ClientId::from_string("original-desktop"));
+    let req = classify(&json!({
+        "jsonrpc":"2.0", "id":1, "method":"client.hello",
+        "params": {
+            "clientId":"original-desktop", "connectionRole":"review-monitor",
+            "name":"replacement", "hostname":"replacement-host",
+            "capabilities":{"reviewMonitoring":1,"browserExec":true}
+        }
+    }))
+    .unwrap();
+    let outcome = handle(req, &api, &mut binding, true).await;
+    assert!(
+        outcome.bound.is_none(),
+        "attachment requires admitted physical source"
+    );
+    assert!(parsed(outcome).get("error").is_some());
+    assert!(
+        api.last.lock().unwrap().is_none(),
+        "attachment cannot overwrite desktop profile"
+    );
+    assert_eq!(binding.unwrap().as_str(), "original-desktop");
+}
+
+#[tokio::test]
+async fn unknown_or_malformed_connection_role_cannot_mutate_client_profile() {
+    for role in [
+        json!("unknown"),
+        Value::Null,
+        json!(false),
+        json!(1),
+        json!({}),
+    ] {
+        let api = RecordingApi::default();
+        let mut binding = None;
+        let req = classify(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"client.hello",
+            "params":{"clientId":"desktop", "connectionRole":role}
+        }))
+        .unwrap();
+        let outcome = handle(req, &api, &mut binding, true).await;
+        assert!(
+            outcome.bound.is_none(),
+            "unknown role cannot become ordinary hello"
+        );
+        assert_eq!(parsed(outcome)["error"]["code"], -32602);
+        assert!(api.last.lock().unwrap().is_none());
+        assert!(binding.is_none());
+    }
+}
+
+#[tokio::test]
 async fn mints_client_id_when_omitted() {
     let api = RecordingApi::default();
     let mut binding: Option<ClientId> = None;

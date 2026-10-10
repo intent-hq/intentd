@@ -743,6 +743,67 @@ async fn process_captured_frame(
             return true;
         }
         if let Some(req) = client::classify(value) {
+            reverse_guard.retire_monitor_hello();
+            let monitor_hello = crate::context::review_monitoring_hello(
+                intent_core::review_monitor::ReviewMonitorRecipientSupport::from_capabilities(
+                    if req.connection_role == client::ConnectionRole::ReviewMonitor {
+                        req.capabilities.as_ref().unwrap_or(&Value::Null)
+                    } else {
+                        &Value::Null
+                    },
+                ),
+            );
+            if req.connection_role != client::ConnectionRole::Ordinary
+                || reverse_guard.is_monitor_attachment()
+            {
+                let admitted = (|| {
+                    if req.connection_role != client::ConnectionRole::ReviewMonitor
+                        || req.client_id_invalid
+                        || !req.id_present
+                        || !req
+                            .capabilities
+                            .as_ref()
+                            .and_then(|v| v.get("reviewMonitoring"))
+                            .and_then(Value::as_u64)
+                            .is_some_and(|v| v >= 1)
+                    {
+                        return None;
+                    }
+                    let canonical = ClientId::from_string(req.client_id.as_ref()?.clone());
+                    // Attachments must present the actual acknowledged id, not
+                    // a raw id that the handler silently namespaces for them.
+                    if client::scope_to_caller(canonical.clone()) != canonical {
+                        return None;
+                    }
+                    let principal = crate::context::current_caller()?.principal_id()?.clone();
+                    let attachment = reverse_guard.prepare_monitor_attachment(
+                        &canonical,
+                        &principal,
+                        monitor_hello.clone()?,
+                    )?;
+                    Some((canonical, attachment))
+                })();
+                if let Some((canonical, attachment)) = admitted {
+                    let sent = out_tx
+                        .send_priority(client::attachment_result(&req, &canonical, is_local))
+                        .await
+                        .is_ok();
+                    if sent {
+                        *client_id = Some(canonical);
+                        attachment.acknowledge();
+                    } else {
+                        reverse_guard.retire_monitor_hello();
+                    }
+                    return sent;
+                }
+                if let Some(receipt) = monitor_hello {
+                    receipt.retire();
+                }
+                return match client::reject_role(&req) {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
             let setup_requested = req.id_present
                 && req
                     .capabilities
@@ -762,6 +823,10 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
+            let ordinary_source = bound.as_ref().and_then(|identity| {
+                let principal = crate::context::current_caller()?.principal_id()?.clone();
+                reverse_guard.prepare_ordinary_monitor_source(identity.client_id.clone(), principal)
+            });
             if let Some(identity) = bound {
                 reverse
                     .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
@@ -789,7 +854,21 @@ async fn process_captured_frame(
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                     .is_some_and(|v| v.get("result").is_some());
             return match frame {
-                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                Some(frame) => {
+                    let acknowledged = hello_ok
+                        && serde_json::from_str::<Value>(&frame)
+                            .is_ok_and(|value| value.get("result").is_some());
+                    let sent = out_tx.send_priority(frame).await.is_ok();
+                    if sent && acknowledged {
+                        if let Some(source) = ordinary_source {
+                            source.acknowledge();
+                        }
+                        if let Some(receipt) = monitor_hello {
+                            receipt.acknowledge();
+                        }
+                    }
+                    sent
+                }
                 None => true,
             };
         }

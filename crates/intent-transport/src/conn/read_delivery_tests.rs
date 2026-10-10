@@ -16,6 +16,9 @@ use super::*;
 use crate::context::{with_credential_context, ReadConnectionGuard};
 use crate::reverse::{PrimaryReverseRegistry, ReverseTransport};
 
+#[path = "monitor_hello_tests.rs"]
+mod monitor_hello_tests;
+
 tokio::task_local! {
     static FIXTURE_SCOPE: Arc<FixtureScope>;
 }
@@ -133,6 +136,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    monitor_hellos: Mutex<Vec<Arc<monitor_hello_tests::Hello>>>,
     checkout_frames: Mutex<Vec<intent_core::repository_checkout::CheckoutFrame>>,
     resource_frames: Mutex<Vec<intent_core::repository_request::RepositoryResourceFrame>>,
     review_frames: Mutex<Vec<intent_core::repository_request::NativeReviewFrame>>,
@@ -158,6 +162,15 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn review_monitoring_hello(
+        &self,
+        support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+        let hello = Arc::new(monitor_hello_tests::Hello::new(support));
+        self.monitor_hellos.lock().unwrap().push(hello.clone());
+        Some(hello)
+    }
+
     fn capture_checkout(
         &self,
         frame: &intent_core::repository_checkout::CheckoutFrame,
@@ -255,6 +268,16 @@ impl FixtureApi {
 }
 
 impl WorkspaceApi for FixtureApi {
+    fn upsert_client(
+        &self,
+        _client_id: ClientId,
+        _name: Option<String>,
+        _capabilities: Option<Value>,
+        _host: intent_core::ClientHostInfo,
+    ) -> BoxFuture<'_, intent_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn repository_checkout_repo_config(
         &self,
         q: intent_core::repository_checkout::CheckoutRepoConfigQuery,
@@ -381,6 +404,7 @@ impl WorkspaceApi for FixtureApi {
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            monitor_hellos: Mutex::default(),
             checkout_frames: Mutex::new(Vec::new()),
             resource_frames: Mutex::new(Vec::new()),
             review_frames: Mutex::new(Vec::new()),

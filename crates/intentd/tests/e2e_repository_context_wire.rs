@@ -2,6 +2,8 @@
 //! All stores, Git roots, credentials and TLS endpoints belong to this fixture.
 #![cfg(unix)]
 mod common;
+#[path = "e2e_repository_context_wire/monitor_attachment.rs"]
+mod monitor_attachment;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, Principal, PrincipalId, WorkspaceGitRootId, WorkspaceId, WorkspaceRole,

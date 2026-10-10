@@ -31,6 +31,17 @@ pub enum RepositoryReadReplyKind {
 
 /// One original authenticated connection, independent of client and RPC ids.
 pub trait RepositoryReadConnection: Send + Sync {
+    /// Replace this physical connection's monitor consumer declaration before
+    /// processing a hello. The receipt remains inactive until the successful
+    /// hello response has been accepted by the original transport. Unsupported
+    /// service implementations provide no receipt. This never grants access to
+    /// repository data or upgrades another socket with the same client id.
+    fn review_monitoring_hello(
+        &self,
+        _support: crate::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn ReviewMonitorHello>> {
+        None
+    }
     /// Pre-workspace host authority, captured on this original native socket.
     fn capture_checkout(
         &self,
@@ -97,6 +108,17 @@ pub trait RepositoryReadConnection: Send + Sync {
     fn take_retirements(&self) -> Option<Box<dyn RepositoryReadRetirements>> {
         None
     }
+}
+
+/// Transport-owned completion of one original connection hello. A later hello
+/// or connection retirement must permanently invalidate an earlier receipt.
+pub trait ReviewMonitorHello: Send + Sync {
+    /// Called only after a successful response is queued on the original
+    /// connection. Failure and notification-only hellos never acknowledge.
+    fn acknowledge(&self);
+
+    /// Permanently withdraw this hello when its physical source retires.
+    fn retire(&self);
 }
 
 /// An original request's scope, kept until its final response handling finishes.

@@ -212,6 +212,15 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
 #[derive(Clone)]
 pub(crate) struct ReadConnectionGuard(Option<Arc<dyn RepositoryReadConnection>>);
 
+pub(crate) fn review_monitoring_hello(
+    support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.review_monitoring_hello(support))
+        .ok()
+        .flatten()
+}
+
 impl ReadConnectionGuard {
     pub(crate) fn bind(api: &dyn intent_core::WorkspaceApi, entry: RepositoryWireEntry) -> Self {
         Self(api.repository_read_connection(entry))

@@ -9,6 +9,9 @@ use intent_core::{
 use serde_json::json;
 use std::future::Future;
 
+#[path = "tests/monitor.rs"]
+mod monitor;
+
 struct Fixture {
     git: GitFixture,
     services: Arc<Services>,

@@ -53,6 +53,9 @@ pub(crate) mod resource;
 #[path = "native_selection.rs"]
 pub(crate) mod selection;
 
+#[path = "native_wire/monitor.rs"]
+mod monitor;
+
 const LEASE_LIMIT: usize = 64;
 const ROOT_LIMIT: usize = 128;
 const NOTICE_LIMIT: usize = 64;
@@ -127,6 +130,7 @@ pub(crate) fn connection(
         resource: resource::ConnectionState::default(),
         checkout: checkout::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
+        monitor: monitor::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
         permits: Arc::new(Semaphore::new(LEASE_LIMIT)),
@@ -148,6 +152,7 @@ struct Connection {
     resource: resource::ConnectionState,
     checkout: checkout::ConnectionState,
     selection: selection::ConnectionState,
+    monitor: monitor::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
     permits: Arc<Semaphore>,
@@ -243,6 +248,7 @@ impl Connection {
         self.resource.close();
         self.checkout.close();
         self.selection.close();
+        self.monitor.close();
         self.origin.retire();
         for lease in leases {
             lease.lifetime.retirement().end_scope();
@@ -343,6 +349,7 @@ impl Connection {
             read_lane: Mutex::new(None),
             subscriptions: Mutex::new(subscriptions),
             queued_query: query.cloned(),
+            monitor_receipt: self.monitor.capture(),
         });
         if query.is_some() {
             let weak = Arc::downgrade(&request);
@@ -366,6 +373,12 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn review_monitoring_hello(
+        &self,
+        support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+        monitor::hello(self, support)
+    }
     fn capture_checkout(
         &self,
         frame: &intent_core::repository_checkout::CheckoutFrame,
@@ -520,6 +533,7 @@ struct Request {
     read_lane: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     subscriptions: Mutex<Vec<RepositorySubscription>>,
     queued_query: Option<RepositoryContextQuery>,
+    monitor_receipt: Option<Arc<monitor::Receipt>>,
 }
 #[derive(Clone)]
 enum RequestState {
