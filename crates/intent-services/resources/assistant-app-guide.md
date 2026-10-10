@@ -240,6 +240,22 @@ details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
 
+## Follow an agent's browsing
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{ToolCall.svelte,tool-result-parser.ts}; src/features/browser/{BrowserActivityBadge.svelte,main/browser-action-executor.ts}; src/store/renderer/slices/app-layout/sagas/{browser-ipc-saga,app-layout-navigation-saga}.ts; src/store/renderer/slices/panel-layout/panel-layout-slice.ts; messages/en.json. -->
+<!-- Release coordination: background insertion and Browsing badges are pending the companion frontend release. Keep this availability qualification until that release is ready. -->
+
+Agent browser tabs normally stay hidden while the agent works. The companion
+frontend update adds **Browsing** badges in chat and keeps newly opened visible
+agent tabs behind the current tab in the same panel, immediately below it in the
+panel content menu. Your active content and keyboard focus stay in place.
+
+This update is not yet released. On builds that show **Browsing** followed by a
+hostname (and a local port when relevant), click the badge to reveal that existing
+browser tab, including one the agent opened hidden. It does not open another copy;
+the badge is unavailable if the tab no longer exists.
+Older builds may bring a visible agent tab to the front and have no browsing badge.
+
 ## Restore workspace browser use
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->

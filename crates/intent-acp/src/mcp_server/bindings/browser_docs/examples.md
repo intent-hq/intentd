@@ -124,27 +124,37 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
   ]
 }
 
-// Or open directly into the UI in the first place: the tab is activated in its
-// panel without stealing focus (on any position), and the result says whether it
-// ended up as its panel's active tab (`displayed`).
+// With the companion frontend update (pending release), a fresh visible agent
+// tab goes immediately behind the current panel's active tab. Content, keyboard
+// focus, and forward history stay intact. Use a different URL here to avoid
+// reusing the hidden tab above; visible: true does not reveal a dedupe hit.
 {
   "actions": [
-    { "action": "openTab", "url": "http://localhost:5173", "visible": true }
+    { "action": "openTab", "url": "http://localhost:5173/preview", "visible": true }
   ]
 }
-// → { tabId: "tab-ui1", url: "http://localhost:5173/", displayed: true, ... }
+// → { action: "openTab", success: true, result: { tabId: "tab-ui1", url: "http://localhost:5173/preview", displayed: false, ... } }
+// An empty panel can instead make the new tab active (`displayed: true`).
+// Address tab-ui1 explicitly for subsequent browser actions.
 // `displayed` is optional on openTab results: when the layout state could not be
 // confirmed (stale tab list, tab not listed) the field is omitted — absent means
 // unknown, not false. Re-check with listTabs, which carries the host's current
 // report when the daemon holds one (also absent = unknown, never false):
-// → { tabId: "tab-ui1", url: "http://localhost:5173/", ... }   (no displayed)
+// → { action: "openTab", success: true, result: { tabId: "tab-ui1", url: "http://localhost:5173/preview", ... } }   (no displayed)
 ```
+
+The accompanying chat UI shows successful opens with a tab ID and URL as a
+**Browsing localhost:5173** badge. Clicking it reveals that existing tab, including
+a hidden tab; it does not open a duplicate. The badge requires the companion
+frontend release. `result.url` is the resolved URL used for the open, before any
+page redirect; URL rewrites still carry their existing `requestedUrl` / `finalUrl`
+echoes. Older frontend results may omit `url` on fresh opens.
 
 ## Visible but Not Displayed
 
 `visibility: "visible"` means the tab is in the user's panel layout; it does not mean
-the tab can paint. Only a panel's active tab renders, so a visible tab that the user
-(or another open) pushed behind a sibling is `displayed: false`. A capture op mounts
+the tab can paint. Only a panel's active tab is shown onscreen; a fresh visible
+agent tab behind it is `displayed: false`. A capture op mounts
 such a tab on demand, but if its surface still does not paint (the capture times out
 at its own cap, or returns an empty image) the op fails with
 `errorCode: "not-painting"`. Check `displayed` and bring the tab to the front
