@@ -672,7 +672,7 @@ fn chat_event_conflatable_only_for_chunk_deltas() {
 
 #[tokio::test]
 async fn offer_passes_through_when_uncongested() {
-    let (tx, mut rx) = mpsc::channel::<String>(4);
+    let (tx, mut rx) = mpsc::channel::<crate::OutboundFrame>(4);
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::new();
     let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({ "n": 1 }));
     let key = event_key(&ev).unwrap();
@@ -685,8 +685,8 @@ async fn offer_passes_through_when_uncongested() {
 
 #[tokio::test]
 async fn offer_buffers_and_conflates_when_the_lane_is_full() {
-    let (tx, mut rx) = mpsc::channel::<String>(1);
-    tx.try_send("occupying".to_string()).unwrap();
+    let (tx, mut rx) = mpsc::channel::<crate::OutboundFrame>(1);
+    tx.try_send("occupying".into()).unwrap();
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::new();
     for n in 1..=3 {
         let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({ "n": n }));
@@ -709,7 +709,7 @@ async fn barrier_flushes_conflated_frames_before_the_terminal_event() {
     // The forwarder's barrier path: drain the buffer with blocking sends,
     // THEN send the barrier — a conflated terminal:data frame always lands
     // before its stream's terminal:exit.
-    let (tx, mut rx) = mpsc::channel::<String>(8);
+    let (tx, mut rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::new();
     for text in ["a", "b"] {
         let ev = event(
@@ -723,7 +723,7 @@ async fn barrier_flushes_conflated_frames_before_the_terminal_event() {
     let exit = event(TERMINAL_EXIT, None, json!({ "terminalId": "t-1" }));
     assert_eq!(event_key(&exit), None, "terminal:exit is a barrier");
     assert!(buf.drain_all(&tx, |i| i.into_frame("sub-1")).await);
-    tx.send(events::build_event_notification("sub-1", &exit))
+    tx.send(events::build_event_notification("sub-1", &exit).into())
         .await
         .unwrap();
     let first = rx.recv().await.unwrap();
@@ -792,8 +792,8 @@ fn push_rejects_beyond_the_byte_bound() {
 
 #[tokio::test]
 async fn offer_hands_back_overflow_at_capacity() {
-    let (tx, _rx) = mpsc::channel::<String>(1);
-    tx.try_send("occupying".to_string()).unwrap();
+    let (tx, _rx) = mpsc::channel::<crate::OutboundFrame>(1);
+    tx.try_send("occupying".into()).unwrap();
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::bounded(1, usize::MAX);
     let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({}));
     let key = event_key(&ev).unwrap();
@@ -815,7 +815,7 @@ async fn offer_hands_back_overflow_at_capacity() {
 
 #[tokio::test]
 async fn offer_reports_a_closed_lane() {
-    let (tx, rx) = mpsc::channel::<String>(1);
+    let (tx, rx) = mpsc::channel::<crate::OutboundFrame>(1);
     drop(rx);
     let mut buf: ConflationBuffer<EventItem> = ConflationBuffer::new();
     let ev = event(AGENT_STREAM_ACTIVITY, Some("ag-1"), json!({}));

@@ -47,6 +47,9 @@ struct ScopeState {
     public_service_error: bool,
     sent: bool,
     kinds: Vec<RepositoryReadReplyKind>,
+    private_output: Option<Arc<std::sync::atomic::AtomicBool>>,
+    private_binding_fault: Option<String>,
+    private_binding_attempts: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -68,7 +71,57 @@ pub(crate) struct FixtureScope {
     fault: DeliveryFault,
 }
 
+struct FixturePrivateOutput {
+    frame: String,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+impl intent_core::repository_request::RepositoryPrivateOutput for FixturePrivateOutput {
+    fn frame(&self) -> &str {
+        &self.frame
+    }
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        if !self.live.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Forbidden("original private output retired".into()));
+        }
+        action()
+    }
+}
 impl RepositoryReadRequestScope for FixtureScope {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> intent_core::Result<
+        Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>,
+    > {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.private_binding_attempts += 1;
+        match state.private_binding_fault.as_deref() {
+            Some("refuse") => return Err(Error::Forbidden("private output unavailable".into())),
+            Some("panic") => {
+                drop(state);
+                panic!("private output binding panic")
+            }
+            _ => {}
+        }
+        let frame = if state.private_binding_fault.as_deref() == Some("mismatch") {
+            "wrong frame"
+        } else {
+            frame
+        };
+        Ok(state.private_output.clone().map(|live| {
+            Arc::new(FixturePrivateOutput {
+                frame: frame.to_owned(),
+                live,
+            }) as Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>
+        }))
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         // Fixture context clones share exact state, never reconstruct by RPC id.
         let captured = Arc::new(Self {
@@ -495,6 +548,11 @@ impl WorkspaceApi for FixtureApi {
                 );
                 let mut state = scope.state.lock().unwrap();
                 state.qualified = path != "ordinary";
+                if path.starts_with("private-output") {
+                    state.private_output = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+                    state.private_binding_fault =
+                        path.strip_prefix("private-output-").map(str::to_owned);
+                }
                 state.public_service_error = path == "provider-error";
             }
             if let Some(gate) = &self.handler {
@@ -1736,5 +1794,68 @@ async fn checkout_config_private_reply_obeys_final_delivery_retirement() {
             assert!(!reply.to_string().contains("team/sub/project"));
         }
         assert!(h.rx.priority.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn native_private_output_router_retains_original_owner_after_queueing() {
+    use tokio::io::AsyncReadExt;
+    for revoked in [false, true] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        assert!(h.dispatch(&request("private-output")).await);
+        let frame = h.rx.recv_priority().await.unwrap();
+        assert!(
+            frame.is_private(),
+            "router must not flatten qualified output into a plain response"
+        );
+        let original = h.original();
+        let state = original.scopes.lock().unwrap()[0].state.clone();
+        assert!(
+            state.lock().unwrap().retired,
+            "short request is complete before final write"
+        );
+        let live = state.lock().unwrap().private_output.clone().unwrap();
+        if revoked {
+            live.store(false, std::sync::atomic::Ordering::Release);
+        }
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let result = frame.write_uds(&mut writer).await;
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        if revoked {
+            assert!(result.is_err());
+            assert!(bytes.is_empty());
+        } else {
+            result.unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply["result"]["private"], "original payload");
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_private_output_binding_failure_never_falls_back_to_plain_payload() {
+    for fault in ["refuse", "mismatch", "panic"] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        assert!(
+            h.dispatch(&request(&format!("private-output-{fault}")))
+                .await
+        );
+        let response = h.response().await;
+        assert!(response.get("error").is_some());
+        assert!(response.get("result").is_none());
+        assert!(!response.to_string().contains("original payload"));
+        assert_eq!(h.limiter.available_permits(), Some(1));
+        assert_eq!(
+            h.original().scopes.lock().unwrap()[0]
+                .state
+                .lock()
+                .unwrap()
+                .private_binding_attempts,
+            1,
+            "binding fault must reach original handler"
+        );
     }
 }

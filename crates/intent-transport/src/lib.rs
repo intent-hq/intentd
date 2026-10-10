@@ -73,6 +73,8 @@ pub mod listener;
 pub mod pairing;
 mod panic_guard;
 mod presence;
+mod private_output;
+pub use private_output::OutboundFrame;
 mod protocol;
 mod provider_setup;
 pub mod reverse;

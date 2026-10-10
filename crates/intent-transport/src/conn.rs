@@ -74,8 +74,8 @@ pub(crate) const BULK_CAPACITY: usize = 256;
 /// the forwarder is spawned.
 #[derive(Clone)]
 pub(crate) struct OutboundSender {
-    priority: mpsc::Sender<String>,
-    bulk: mpsc::Sender<String>,
+    priority: mpsc::Sender<crate::OutboundFrame>,
+    bulk: mpsc::Sender<crate::OutboundFrame>,
     shutdown: Option<RpcLimiter>,
 }
 
@@ -83,7 +83,7 @@ impl OutboundSender {
     /// Queue a latency-critical frame (RPC response / error / reverse
     /// request). `Err` means the connection's writer is gone.
     pub(crate) async fn send_priority(&self, frame: String) -> Result<(), ()> {
-        match self.priority.try_send(frame) {
+        match self.priority.try_send(frame.into()) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
             Err(mpsc::error::TrySendError::Full(frame)) => tokio::select! {
@@ -103,7 +103,7 @@ impl OutboundSender {
     /// Queue a bulk frame (event notification / subscription push). `Err`
     /// means the connection's writer is gone.
     pub(crate) async fn send_bulk(&self, frame: String) -> Result<(), ()> {
-        self.bulk.send(frame).await.map_err(|_| ())
+        self.bulk.send(frame.into()).await.map_err(|_| ())
     }
 
     /// Reserve one slot on the priority lane, waiting for space when the
@@ -113,7 +113,9 @@ impl OutboundSender {
     /// backpressure point, applied on the read loop BEFORE a limiter slot is
     /// claimed (see [`finish_slow_path_rpc`]). `Err` means the connection's
     /// writer is gone.
-    pub(crate) async fn reserve_priority(&self) -> Result<mpsc::OwnedPermit<String>, ()> {
+    pub(crate) async fn reserve_priority(
+        &self,
+    ) -> Result<mpsc::OwnedPermit<crate::OutboundFrame>, ()> {
         tokio::select! {
             () = self.shutdown_requested() => Err(()),
             result = self.priority.clone().reserve_owned() => result.map_err(|_| ()),
@@ -136,14 +138,14 @@ impl OutboundSender {
 
     /// The priority-lane sender for collaborators that only ever send
     /// latency-critical frames (the reverse-RPC channel).
-    pub(crate) fn priority_sender(&self) -> mpsc::Sender<String> {
+    pub(crate) fn priority_sender(&self) -> mpsc::Sender<crate::OutboundFrame> {
         self.priority.clone()
     }
 
     /// The bulk-lane sender for the subscription forwarders, which only ever
     /// send bulk frames and need `reserve` / `try_reserve` on the lane for
     /// backpressure conflation (see [`crate::conflate`]).
-    pub(crate) fn bulk_sender(&self) -> mpsc::Sender<String> {
+    pub(crate) fn bulk_sender(&self) -> mpsc::Sender<crate::OutboundFrame> {
         self.bulk.clone()
     }
 }
@@ -151,14 +153,14 @@ impl OutboundSender {
 /// Receiving half of the two-lane outbound queue; owned by the transport
 /// writer.
 pub(crate) struct OutboundReceiver {
-    pub(crate) priority: mpsc::Receiver<String>,
-    pub(crate) bulk: mpsc::Receiver<String>,
+    pub(crate) priority: mpsc::Receiver<crate::OutboundFrame>,
+    pub(crate) bulk: mpsc::Receiver<crate::OutboundFrame>,
     priority_open: bool,
     bulk_open: bool,
 }
 
 impl OutboundReceiver {
-    pub(crate) async fn recv_priority(&mut self) -> Option<String> {
+    pub(crate) async fn recv_priority(&mut self) -> Option<crate::OutboundFrame> {
         self.priority.recv().await
     }
     /// Next frame to write, priority lane first. Empties the priority lane
@@ -166,7 +168,7 @@ impl OutboundReceiver {
     /// (biased toward priority). Returns `None` once every sender is dropped
     /// and both lanes are drained. Cancel-safe: no frame is lost when the
     /// caller races this against other select arms.
-    pub(crate) async fn recv(&mut self) -> Option<String> {
+    pub(crate) async fn recv(&mut self) -> Option<crate::OutboundFrame> {
         loop {
             // Drain whatever is already queued on the priority lane first.
             if self.priority_open {
@@ -207,8 +209,8 @@ impl OutboundReceiver {
 /// Build one connection's two-lane outbound queue ([`PRIORITY_CAPACITY`] /
 /// [`BULK_CAPACITY`] frames).
 pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
-    let (priority_tx, priority_rx) = mpsc::channel::<String>(PRIORITY_CAPACITY);
-    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(BULK_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<crate::OutboundFrame>(PRIORITY_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<crate::OutboundFrame>(BULK_CAPACITY);
     (
         OutboundSender {
             priority: priority_tx,
@@ -1011,12 +1013,12 @@ async fn process_captured_frame(
 async fn finish_slow_path_rpc(
     permit: Option<OwnedSemaphorePermit>,
     handler: impl Future<Output = Option<String>>,
-    slot: mpsc::OwnedPermit<String>,
+    slot: mpsc::OwnedPermit<crate::OutboundFrame>,
 ) {
     let frame = handler.await;
     drop(permit);
     if let Some(frame) = frame {
-        slot.send(frame);
+        slot.send(frame.into());
     }
 }
 
@@ -1026,22 +1028,50 @@ async fn finish_prepared_rpc(
     context: &crate::context::CapturedFrame,
     permit: Option<OwnedSemaphorePermit>,
     handler: impl Future<Output = Option<crate::router::PreparedReply>>,
-    slot: mpsc::OwnedPermit<String>,
+    slot: mpsc::OwnedPermit<crate::OutboundFrame>,
 ) {
     use futures::FutureExt as _;
 
     let Some(reply) = handler.await else { return };
     let Some((kind, id)) = reply.service else {
         drop(permit);
-        slot.send(reply.frame);
+        slot.send(reply.frame.into());
         return;
     };
     let Some(scope) = context.read_scope() else {
         drop(permit);
-        slot.send(reply.frame);
+        slot.send(reply.frame.into());
         return;
     };
-    let mut packet = Some((slot, reply.frame));
+    // Attach the original service's final-egress owner before admission. A
+    // failed binding is a refusal, never a downgrade to an ordinary frame.
+    let bound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scope
+            .bind_private_output(&reply.frame)
+            .and_then(|owner| match owner {
+                Some(owner) if owner.frame() == reply.frame => {
+                    Ok(crate::OutboundFrame::private(owner))
+                }
+                Some(_) => Err(intent_core::Error::Internal(
+                    "private output binding mismatch".into(),
+                )),
+                None => Ok(reply.frame.into()),
+            })
+    }));
+    let frame = match bound {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            drop(permit);
+            slot.send(crate::router::delivery_error(&id, error).into());
+            return;
+        }
+        Err(_) => {
+            drop(permit);
+            slot.send(panic_guard::internal_error_frame(&id).into());
+            return;
+        }
+    };
+    let mut packet = Some((slot, frame));
     let mut permit = permit;
     let mut transfer = || {
         let (slot, frame) = packet.take().ok_or_else(|| {
@@ -1062,7 +1092,7 @@ async fn finish_prepared_rpc(
             Ok(Ok(())) | Err(_) => panic_guard::internal_error_frame(&id),
         };
         drop(permit);
-        slot.send(frame);
+        slot.send(frame.into());
     }
 }
 
@@ -1303,7 +1333,7 @@ async fn forward_subscription(
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
                     if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id));
+                        permit.send(item.into_frame(&subscription_id).into());
                     }
                 }
                 Err(_) => return,
@@ -1331,7 +1361,7 @@ async fn forward_subscription(
                 let Some(batch) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
                     let _ = buffer
-                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
                         .await;
                     return;
                 };
@@ -1366,12 +1396,12 @@ async fn forward_subscription(
                             // blocking backpressure — flush, then send.
                             Enqueue::Overflow(item) => {
                                 if !buffer
-                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
                                     .await
                                 {
                                     return;
                                 }
-                                if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                if out_tx.send(item.into_frame(&subscription_id).into()).await.is_err() {
                                     return;
                                 }
                             }
@@ -1379,14 +1409,14 @@ async fn forward_subscription(
                     } else {
                         // Barrier: flush conflated frames first, then block.
                         if !buffer
-                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
+                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
                             .await
                         {
                             return;
                         }
                         let frame =
                             events::build_event_notification(&subscription_id, &event);
-                        if out_tx.send(frame).await.is_err() {
+                        if out_tx.send(frame.into()).await.is_err() {
                             return;
                         }
                     }
@@ -1996,7 +2026,7 @@ async fn forward_chat_subscription(
 /// when the read or outbound reservation is ready on the same poll.
 async fn wait_for_chat_initial<T>(
     work: impl std::future::Future<Output = T>,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
     gate: &mut Option<events::MembershipGate>,
     membership_events: &mut Option<Subscription>,
     agent_workspace: Option<&str>,
@@ -2148,7 +2178,7 @@ async fn chat_subscription_loop(
     )
     .await
     {
-        Ok(Ok(permit)) => permit.send(frame),
+        Ok(Ok(permit)) => permit.send(frame.into()),
         Ok(Err(_)) => return "client_closed",
         Err(reason) => return reason,
     }
@@ -2208,7 +2238,7 @@ async fn chat_subscription_loop(
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
                     if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id, seq));
+                        permit.send(item.into_frame(&subscription_id, seq).into());
                         seq += 1;
                     }
                 }
@@ -2238,7 +2268,7 @@ async fn chat_subscription_loop(
                 let Ok(permit) = permit else { return "client_closed"; };
                 let history = history_frame.take().expect("guarded");
                 if let Some(message) = history.get("message") { state.seed_history_message(message); }
-                permit.send(subscriptions::build_history_push(&subscription_id, seq, &history));
+                permit.send(subscriptions::build_history_push(&subscription_id, seq, &history).into());
                 seq += 1;
                 if history["complete"] == true { initial_history = None; }
             }
@@ -2419,7 +2449,7 @@ async fn chat_subscription_loop(
                                     }
                                     let frame = item.into_frame(&subscription_id, seq);
                                     seq += 1;
-                                    if out_tx.send(frame).await.is_err() {
+                                    if out_tx.send(frame.into()).await.is_err() {
                                         return "client_closed";
                                     }
                                     continue;
@@ -2440,7 +2470,7 @@ async fn chat_subscription_loop(
                     }
                     let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                     seq += 1;
-                    if out_tx.send(frame).await.is_err() {
+                    if out_tx.send(frame.into()).await.is_err() {
                         return "client_closed";
                     }
                 }
@@ -2470,7 +2500,7 @@ async fn attempt_chat_recovery(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     seq: &mut u64,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
     limit: usize,
@@ -2495,7 +2525,7 @@ async fn attempt_chat_recovery(
     snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
-    if out_tx.send(frame).await.is_err() {
+    if out_tx.send(frame.into()).await.is_err() {
         return false;
     }
     *state = subscriptions::ChatDeltaState::new(agent_id, delta_encoding, projection);
@@ -2925,7 +2955,7 @@ mod tests {
             rx.recv().await.expect("first response"),
             rx.recv().await.expect("second response"),
         ];
-        got.sort();
+        got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(got, ["resp-0", "resp-1"]);
         for task in tasks {
             task.await.unwrap();
@@ -2949,7 +2979,7 @@ mod tests {
         // no permit while it waits.
         let parked = tokio::spawn(async move {
             let slot = tx.reserve_priority().await.expect("slot after drain");
-            slot.send("late-resp".to_string());
+            slot.send("late-resp".into());
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -3131,8 +3161,8 @@ mod tests {
         drop(tx);
         assert_eq!(rx.recv().await.as_deref(), Some("p1"));
         assert_eq!(rx.recv().await.as_deref(), Some("b1"));
-        assert_eq!(rx.recv().await, None);
-        assert_eq!(rx.recv().await, None, "recv stays terminal after None");
+        assert!(rx.recv().await.is_none());
+        assert!(rx.recv().await.is_none(), "recv stays terminal after None");
     }
 
     /// `recv` wakes for a frame that arrives while it is parked (both lanes
@@ -3152,7 +3182,7 @@ mod tests {
         // Both frames are delivered; the parked recv takes whichever lane
         // wakes it first, then the follow-up recv drains the other.
         let mut got = vec![first.unwrap(), second.unwrap()];
-        got.sort();
+        got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(got, ["b1", "p1"]);
     }
 
@@ -3167,7 +3197,7 @@ mod tests {
         assert!(tx.send_priority("p".to_string()).await.is_err());
         assert!(tx.send_bulk("b".to_string()).await.is_err());
         assert!(
-            tx.priority_sender().send("p".to_string()).await.is_err(),
+            tx.priority_sender().send("p".into()).await.is_err(),
             "the raw priority sender observes the close too"
         );
     }

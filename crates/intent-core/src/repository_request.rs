@@ -121,8 +121,28 @@ pub trait ReviewMonitorHello: Send + Sync {
     fn retire(&self);
 }
 
+/// One immutable native output and its retained original admission. This is an
+/// in-process owner, never reconstructed from JSON, client ids or message tags.
+/// Each transport write attempt runs synchronously inside its current fences;
+/// pending I/O must release those fences before awaiting readiness again.
+pub trait RepositoryPrivateOutput: Send + Sync {
+    fn frame(&self) -> &str;
+    fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
 /// An original request's scope, kept until its final response handling finishes.
 pub trait RepositoryReadRequestScope: Send + Sync {
+    /// Retain the original admission for an immutable encoded private response.
+    /// Ordinary owners return None. A qualified owner must return an owner or
+    /// refuse; errors must never downgrade its response to ordinary output.
+    /// This runs before queue admission and may not perform async work or I/O.
+    fn bind_private_output(
+        &self,
+        _frame: &str,
+    ) -> Result<Option<Arc<dyn RepositoryPrivateOutput>>> {
+        Ok(None)
+    }
+
     /// Restore the concrete owner's private context and run `body` exactly once.
     /// This must not turn an absent or retired capture into a later owner.
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()>;

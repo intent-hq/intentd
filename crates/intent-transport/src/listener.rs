@@ -39,7 +39,7 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::net::UnixListener;
 
 #[cfg(any(unix, windows))]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[cfg(any(unix, windows))]
 use crate::conn::{outbound_channel, process_frame, ConnSubs};
@@ -287,10 +287,7 @@ where
                 );
                 continue;
             }
-            if write_half.write_all(frame.as_bytes()).await.is_err()
-                || write_half.write_all(b"\n").await.is_err()
-                || write_half.flush().await.is_err()
-            {
+            if frame.write_uds(&mut write_half).await.is_err() {
                 break;
             }
         }

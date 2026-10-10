@@ -226,11 +226,11 @@ impl<T: Conflate> ConflationBuffer<T> {
     /// barrier path. Returns `false` when the outbound channel closed.
     pub(crate) async fn drain_all(
         &mut self,
-        out_tx: &mpsc::Sender<String>,
+        out_tx: &mpsc::Sender<crate::OutboundFrame>,
         mut build: impl FnMut(T) -> String,
     ) -> bool {
         while let Some(item) = self.pop() {
-            if out_tx.send(build(item)).await.is_err() {
+            if out_tx.send(build(item).into()).await.is_err() {
                 return false;
             }
         }
@@ -581,13 +581,13 @@ pub(crate) fn offer<T: Conflate>(
     buffer: &mut ConflationBuffer<T>,
     key: Key,
     item: T,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
     build: impl FnOnce(T) -> String,
 ) -> Enqueue<T> {
     if buffer.is_empty() {
         match out_tx.try_reserve() {
             Ok(permit) => {
-                permit.send(build(item));
+                permit.send(build(item).into());
                 return Enqueue::Sent;
             }
             Err(mpsc::error::TrySendError::Closed(())) => return Enqueue::Closed,

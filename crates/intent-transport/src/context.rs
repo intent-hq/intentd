@@ -229,7 +229,7 @@ impl ReadConnectionGuard {
     /// Consume the original owner's bounded control feed on this socket only.
     pub(crate) fn forward_retirements(
         &self,
-        output: tokio::sync::mpsc::Sender<String>,
+        output: tokio::sync::mpsc::Sender<crate::OutboundFrame>,
     ) -> RetirementForwarder {
         let resource_output = output.clone();
         let review_output = output.clone();
@@ -242,7 +242,7 @@ impl ReadConnectionGuard {
                         "jsonrpc": "2.0", "method": "workspace.repositoryContext.retired", "params": notice,
                     }).to_string();
                     // Receiver loss closes this original feed and all its leases.
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -251,7 +251,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"workspace.repositorySelection.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -260,7 +260,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"accept-changes.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -269,7 +269,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
