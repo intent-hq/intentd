@@ -143,7 +143,7 @@ impl MonitorPromptAdmission {
         }
         let write = services
             .store
-            .prepare_monitor_message(expected, id, &self.text, metadata, created_at)
+            .prepare_monitor_message(expected, &self.authority.binding, id, &self.text, metadata, created_at)
             .await?;
         // Recheck after reserving the writer, then move only the prebuilt SQL
         // effect and original leaves to the blocking commit worker.

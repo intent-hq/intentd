@@ -84,7 +84,7 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
+    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
     SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};

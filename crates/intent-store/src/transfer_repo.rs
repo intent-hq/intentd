@@ -101,6 +101,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("pr_monitor_message_provenance", "local original-message evidence; never transferable or imported authorization"),
     ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
     ("note_fts", "derived note full-text index; note import triggers rebuild it"),
     ("note_fts_config", "FTS5 shadow table of the derived note index"),
@@ -684,6 +685,14 @@ impl Store {
                 } else {
                     None
                 };
+                if *table == "agent_message" {
+                    // An imported ID never carries local original evidence.
+                    // Stay inside the original lifecycle mutation and SQL
+                    // transaction: a rejected import rolls this back too.
+                    sqlx::query("DELETE FROM pr_monitor_message_provenance WHERE message_id=?")
+                        .bind(object["id"].as_str()).execute(&mut *tx).await
+                        .map_err(|_| Error::Internal("import monitor provenance invalidation failed".into()))?;
+                }
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;

@@ -4,7 +4,7 @@ use super::{
     Result, Row, Store, UsageMessageOrigin, MESSAGE_INSERT_COLUMNS,
 };
 use crate::{MonitorTargetProvenance, PersistedMonitorTarget, QualifiedPrMonitor};
-use intent_core::review_monitor::ReviewMonitorWakeMetadata;
+use intent_core::review_monitor::{ReviewMonitorBinding, ReviewMonitorWakeMetadata};
 use serde_json::json;
 use sqlx::{QueryBuilder, Sqlite, Transaction};
 
@@ -18,6 +18,9 @@ pub struct PreparedMonitorMessage {
     content: PreparedContent,
     metadata_json: String,
     usage_model: String,
+    workspace_id: intent_core::WorkspaceId,
+    binding_json: String,
+    envelope_sha256: [u8; 32],
 }
 
 impl PreparedMonitorMessage {
@@ -70,6 +73,10 @@ impl PreparedMonitorMessage {
             &self.content.payload_rows,
         )
         .await?;
+        sqlx::query("INSERT INTO pr_monitor_message_provenance(message_id,agent_id,workspace_id,binding_json,envelope_sha256,version) VALUES (?,?,?,?,?,1)")
+            .bind(&m.id).bind(&m.agent_id.0).bind(&self.workspace_id.0)
+            .bind(&self.binding_json).bind(self.envelope_sha256.as_slice())
+            .execute(&mut *self.transaction).await.map_err(|error| database(&error))?;
         // Shared session previews have no original recipient admission. Keep
         // their previous ordinary-message projection; never cache private text.
         sqlx::query("UPDATE agent_session SET updated_at = ? WHERE id = ?")
@@ -101,6 +108,7 @@ impl Store {
     pub async fn prepare_monitor_message(
         &self,
         expected: &QualifiedPrMonitor,
+        binding: &ReviewMonitorBinding,
         id: &str,
         text: &str,
         metadata: &ReviewMonitorWakeMetadata,
@@ -122,11 +130,25 @@ impl Store {
             || metadata.pr_number != target.number
             || metadata.repo != target.repository.project_path
             || metadata.extension.resource.as_ref() != Some(target)
+            || &binding.resource != target
         {
             return Err(Error::InvalidParams(
                 "qualified monitor message identity mismatch".into(),
             ));
         }
+        let stored_binding: ReviewMonitorBinding = monitor
+            .last_snapshot
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| serde_json::from_value(value["monitorBinding"].clone()).ok())
+            .ok_or_else(|| Error::InvalidParams("original monitor binding unavailable".into()))?;
+        if &stored_binding != binding {
+            return Err(Error::InvalidParams(
+                "original monitor binding mismatch".into(),
+            ));
+        }
+        let binding_json = serde_json::to_string(binding)
+            .map_err(|_| Error::Internal("monitor binding encoding failed".into()))?;
         let metadata = serde_json::to_value(metadata)
             .map_err(|e| Error::Internal(format!("encode monitor message metadata: {e}")))?;
         let blocks = json!([{"type":"text", "text":text, "messageMetadata":metadata}]);
@@ -154,6 +176,11 @@ impl Store {
             author: None,
             created_at: created_at.into(),
         };
+        let envelope_sha256 = super::monitor_message_provenance::envelope_digest(
+            &message,
+            &monitor.workspace_id,
+            binding,
+        )?;
         Ok(PreparedMonitorMessage {
             transaction,
             expected: crate::pr_monitor_repo::captured_monitor_exists(expected),
@@ -161,6 +188,9 @@ impl Store {
             content,
             metadata_json,
             usage_model: row.get("model"),
+            workspace_id: monitor.workspace_id.clone(),
+            binding_json,
+            envelope_sha256,
         })
     }
 }

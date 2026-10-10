@@ -20,6 +20,8 @@ use crate::{enum_from_db, enum_to_db, Store};
 
 mod prepared_monitor_message;
 pub use prepared_monitor_message::PreparedMonitorMessage;
+mod monitor_message_provenance;
+pub use monitor_message_provenance::MonitorMessageProvenance;
 
 /// Last confirmed turn selection and the provider default to restore after a
 /// resume. A missing record is an unobserved baseline; `effort: None` is Auto.
