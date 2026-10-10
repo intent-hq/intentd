@@ -89,6 +89,14 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+<!-- Sources: packages/ios/Intent/Views/Conversation/Transcript/ConversationView.swift; packages/ios/Intent/Views/Conversation/Composer/ModelPickerView.swift. -->
+
+The iOS update allowing model changes in conversations with existing messages is
+not released yet. In builds with this update, open a workspace agent and choose
+**… → Change Model**. Select a model from the agent's current provider. A successful
+change applies to the next turn and preserves the conversation and draft. If saving
+fails, the picker stays open and shows an error so the user can try again.
+
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
