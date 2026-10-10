@@ -179,6 +179,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         browser_client_id: None,
         pull_requests_total: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,
@@ -31218,6 +31219,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -31369,6 +31371,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -31511,6 +31514,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -31648,6 +31652,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -31784,6 +31789,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -31925,6 +31931,7 @@ mod rules {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -32789,6 +32796,7 @@ mod known_repo {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -42719,9 +42727,8 @@ mod last_activity_events {
                 .expect("raise");
         }
 
-        // Consume the burst's immediate events (`workspace:attention-changed`,
-        // plus any `workspace:displayStatus-changed` a review_required raise
-        // moves) by type until the debounced `workspace:updated` arrives. An
+        // Consume immediate attention, displayStatus, and reminder events
+        // until the debounced workspace:updated { lastActivity } arrives. An
         // unconditional timed drain raced the debounce timer here: under
         // package load the window expired while the drain was still consuming,
         // which discarded the very event asserted below (intent#4886).
@@ -42734,13 +42741,15 @@ mod last_activity_events {
                 .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
-                if ev["type"] != "workspace:updated" {
+                if ev["type"] != "workspace:updated"
+                    || ev["data"]["changes"].get("lastActivity").is_none()
+                {
                     continue;
                 }
                 // A second one in the same batch is a coalescing failure.
                 assert!(
                     updated.is_none(),
-                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                    "burst coalesced into one lastActivity update, got a second: {ev:?}"
                 );
                 updated = Some(ev);
             }
@@ -42751,16 +42760,17 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
-        // No second workspace:updated (coalesced) within a quiet window after
+        // No second lastActivity update within a quiet window after
         // the first. One absolute deadline bounds the whole window, so a
         // stream of unrelated events cannot keep extending it.
         let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
         while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
-                assert_ne!(
-                    ev["type"], "workspace:updated",
-                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                assert!(
+                    ev["type"] != "workspace:updated"
+                        || ev["data"]["changes"].get("lastActivity").is_none(),
+                    "burst coalesced into one lastActivity update, got a second: {ev:?}"
                 );
             }
         }

@@ -623,6 +623,16 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Acknowledge only observed reminder versions for the authenticated person.
+    fn dismiss_attention_reasons(
+        &self,
+        id: WorkspaceId,
+        reasons: Vec<crate::AttentionReminderReason>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, reasons);
+        Box::pin(async { Err(Error::Internal("Reason acknowledgement unavailable".into())) })
+    }
+
     /// Mark the workspace seen, clearing an `unread` `attention` flag (§5.1).
     fn mark_seen(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let _ = id;

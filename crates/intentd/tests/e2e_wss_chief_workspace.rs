@@ -540,6 +540,8 @@ async fn chief_workspace_over_wss() {
     assert_eq!(chief["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(chief["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert!(chief.get("attentionReminder").is_none());
+    let initial_chief = chief.clone();
     assert!(chief.get("path").is_none_or(Value::is_null));
     assert!(chief.get("worktreePath").is_none_or(Value::is_null));
     assert!(chief.get("repositoryName").is_none_or(Value::is_null));
@@ -614,6 +616,8 @@ async fn chief_workspace_over_wss() {
     assert_eq!(updated["createdAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(updated["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
     assert_eq!(updated["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert!(updated.get("attentionReminder").is_none());
+    let updated_chief = updated.clone();
     // Not persisted: a follow-up `workspace.get` sees no `statusMessage`.
     let resp = wss_rpc_envelope(
         &mut ws,
@@ -690,6 +694,51 @@ async fn chief_workspace_over_wss() {
     assert_eq!(after["archived"], json!(false));
     assert_eq!(after["status"], json!("Active"));
     assert_eq!(after["updatedAt"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert_eq!(after["lastActivity"], json!(CHIEF_WORKSPACE_TIMESTAMP));
+    assert!(after.get("attentionReminder").is_none());
+    let after_chief = after.clone();
+    let mut restored = Vec::new();
+    for (request_id, method) in [(12, "workspace.unarchive"), (13, "workspace.restore")] {
+        let response = wss_rpc_envelope(
+            &mut ws,
+            request_id,
+            method,
+            json!({ "workspaceId": CHIEF_WORKSPACE_ID }),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], json!("2.0"));
+        assert_eq!(response["id"], json!(request_id));
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        let workspace = &response["result"]["workspace"];
+        assert_eq!(workspace["id"], json!(CHIEF_WORKSPACE_ID));
+        assert_eq!(workspace["status"], json!("Active"));
+        assert_eq!(workspace["archived"], json!(false));
+        for field in ["createdAt", "updatedAt", "lastActivity"] {
+            assert_eq!(
+                workspace[field],
+                json!(CHIEF_WORKSPACE_TIMESTAMP),
+                "{method} changed {field}"
+            );
+        }
+        assert!(workspace.get("attentionReminder").is_none());
+        restored.push(response);
+    }
+    let artifact = data_dir.join("chief-workspace-evidence.json");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&json!({
+            "initial": initial_chief,
+            "updated": updated_chief,
+            "after": after_chief,
+            "restored": restored,
+        }))
+        .expect("serialize Chief evidence"),
+    )
+    .expect("write Chief evidence");
+    eprintln!(
+        "Chief workspace WSS evidence: {} (retain with INTENTD_TEST_KEEP_TMP=1)",
+        artifact.display()
+    );
 }
 
 /// Chief provider children spawn in the dedicated, daemon-owned, EMPTY

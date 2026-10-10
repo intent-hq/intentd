@@ -315,6 +315,20 @@ impl Store {
         ws: &Workspace,
         branch: Option<&str>,
     ) -> Result<String> {
+        self.update_workspace_with_reminder_generation(ws, branch, false)
+            .await
+    }
+
+    /// Update workspace fields and atomically mint a generation for an explicit review raise.
+    ///
+    /// # Errors
+    /// Returns an error when the workspace is absent or persistence fails.
+    pub async fn update_workspace_with_reminder_generation(
+        &self,
+        ws: &Workspace,
+        branch: Option<&str>,
+        raise_review: bool,
+    ) -> Result<String> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let current = self.get_workspace(&ws.id).await?;
         if current.path != ws.path
@@ -327,6 +341,11 @@ impl Store {
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         }
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         let status = enum_to_db(&ws.status)?;
         let row = sqlx::query(
             "UPDATE workspace SET title=?, branch=COALESCE(?, branch), base_ref=?, base_commit_sha=?, \
@@ -376,9 +395,16 @@ impl Store {
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
         .bind(&ws.id.0)
-        .fetch_optional(self.write_pool())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
+        if row.is_some() && raise_review {
+            crate::attention_reminder_repo::write_reminder_generation(&mut tx, &ws.id, "review")
+                .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         lifecycle.settle();
         match row {
             Some(row) => col(&row, "branch"),
@@ -749,25 +775,44 @@ impl Store {
         if let Some(ts) = updated_at {
             query = query.bind(ts);
         }
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         let res = query
             .bind(&id.0)
             .bind(&guard)
-            .execute(self.write_pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("set attention failed: {e}")))?;
         if res.rows_affected() > 0 {
+            if attention == WorkspaceAttention::ReviewRequired {
+                crate::attention_reminder_repo::write_reminder_generation(&mut tx, id, "review")
+                    .await?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(e.to_string()))?;
             return Ok(true);
         }
         // Zero rows: either the guard declined (no change) or the workspace
         // is missing — distinguish so callers keep NotFound semantics.
         let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?) AS present")
             .bind(&id.0)
-            .fetch_one(self.read_pool())
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("set attention presence check failed: {e}")))?;
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
+        if attention == WorkspaceAttention::ReviewRequired {
+            crate::attention_reminder_repo::write_reminder_generation(&mut tx, id, "review")
+                .await?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(false)
     }
 
@@ -1170,6 +1215,13 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
+            let reminder_prefix = crate::attention_reminder_repo::reminder_prefix(id);
+            sqlx::query("DELETE FROM settings WHERE substr(key,1,?)=?")
+                .bind(i64::try_from(reminder_prefix.len()).unwrap_or(i64::MAX))
+                .bind(reminder_prefix)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("delete reminder state: {e}")))?;
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
@@ -1609,6 +1661,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         token_usage,
         // cow_supported is computed on the emit path (intent-services), never persisted.

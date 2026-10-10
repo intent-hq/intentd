@@ -129,6 +129,23 @@ Read current state and respect the user's requested scope.
 
 ## Start or continue work
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage.svelte,HomeWorkspaceBoard.svelte,home-model.ts}; src/lib/components/workspace/WorkspaceCard.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
+
+In **Home → Workspaces**, **PR ready** groups workspaces whose pull requests are
+ready to merge, separately from **Needs you**. Use the **PR ready** status filter
+to find them. Questions, review requests, blockers, and failures take priority over
+a ready PR. In **Board view** with **Group by → Status**, the **PR ready** column
+appears only while matching workspaces remain visible under the current filters.
+
+Use **Dismiss for now** in a workspace’s Home or sidebar actions menu to hide its current
+**Needs you** reminder for yourself. It stays dismissed across refreshes and
+restarts, while a new question or request brings it back. Pending questions and
+paused work stay available; dismissal does not answer, resume, complete, or merge
+anything. A dismissed reminder shows **Running** if work is running, otherwise
+**Waiting**. Blocked and failed work keeps its status.
+
+<!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
