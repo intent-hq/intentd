@@ -261,6 +261,21 @@ impl Services {
         {
             return Ok(None);
         }
+        if updated.pending_changes != old.pending_changes
+            || updated.last_error != old.last_error
+            || envelope.get("retryAt")
+                != serde_json::from_str::<Value>(old.last_snapshot.as_deref().unwrap_or("{}"))
+                    .ok()
+                    .as_ref()
+                    .and_then(|old| old.get("retryAt"))
+        {
+            self.emit_qualified_monitor_event(
+                authority,
+                intent_core::events::PR_MONITOR_CHANGED,
+                &updated,
+                Some(serde_json::json!({"changes":updated.pending_changes})),
+            );
+        }
         Ok(delivery.map(|delivery| (updated, delivery)))
     }
 

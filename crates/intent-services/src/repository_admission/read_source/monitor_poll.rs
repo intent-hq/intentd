@@ -279,6 +279,7 @@ impl MonitorDeliveryCompletion {
         let destination = self.destination.clone();
         let child = self.child.clone();
         let delivery = self.delivery.clone();
+        let acknowledged_monitor = acknowledged;
         let acknowledged = self.acknowledged.clone();
         tokio::task::spawn_blocking(move || {
             let _destination = destination;
@@ -307,6 +308,18 @@ impl MonitorDeliveryCompletion {
                 // Record completion on the admitted worker, even if its async
                 // waiter was cancelled during SQL COMMIT.
                 acknowledged.store(true, std::sync::atomic::Ordering::Release);
+                let event_type =
+                    if acknowledged_monitor.state == intent_core::PrMonitorState::Completed {
+                        intent_core::events::PR_MONITOR_COMPLETED
+                    } else {
+                        intent_core::events::PR_MONITOR_EMITTED
+                    };
+                services.emit_qualified_monitor_event(
+                    &authority,
+                    event_type,
+                    &acknowledged_monitor,
+                    None,
+                );
             }
             result
         })
@@ -540,5 +553,36 @@ impl MonitorAuthority {
         .await;
         self.validate(services).await?;
         Ok(outcome)
+    }
+}
+
+/// A native event keeps the actual original agent admission alive, not a row or
+/// account identifier. Native recipient admission independently requires this
+/// producer's exact current account generation through final transport egress.
+struct NativeMonitorEventSource(Arc<MonitorAuthority>);
+impl intent_core::repository_request::RepositoryMonitorEventSource for NativeMonitorEventSource {
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        self.0
+            .lifetime
+            .retirement()
+            .native_dispatch(|| Ok(action()))
+            .map_err(|_| refused())?
+    }
+}
+impl MonitorAuthority {
+    pub(crate) fn native_event_source(
+        self: &Arc<Self>,
+        monitor: &intent_core::PrMonitor,
+    ) -> intent_core::Result<Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>>
+    {
+        if monitor.agent_id != *self.owner()
+            || monitor.workspace_id != self.member.agent.workspace_id
+        {
+            return Err(refused());
+        }
+        Ok(Arc::new(NativeMonitorEventSource(self.clone())))
     }
 }

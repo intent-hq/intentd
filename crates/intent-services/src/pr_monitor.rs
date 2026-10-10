@@ -98,6 +98,7 @@ use crate::{publish_event, system_actor, Services};
 )]
 pub(crate) mod qualified_cache;
 mod qualified_poll;
+mod qualified_events;
 mod routing;
 pub(crate) use routing::wire as qualified_pr_monitor_wire;
 use qualified_cache::{CacheKey, CacheSlot};

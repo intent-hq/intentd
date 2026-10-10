@@ -340,7 +340,15 @@ impl Services {
         self.review_monitor_authorities
             .lock()
             .map_err(|_| source::refused())?
-            .insert(monitor.monitor_id.clone(), authority);
+            .insert(monitor.monitor_id.clone(), authority.clone());
+        self.emit_qualified_monitor_event(
+            &authority,
+            intent_core::events::PR_MONITOR_REGISTERED,
+            &monitor,
+            adopted_from
+                .as_ref()
+                .map(|from| json!({"adoptedFrom":from})),
+        );
         let mut out = json!({"ok":true,"monitor":wire(&monitor,&target)?,"requirements":snapshot.as_ref().map(|value| &value["requirements"])});
         if let Some(until) = out["monitor"].get("pausedUntil").cloned() {
             out["pausedUntil"] = until;
@@ -444,6 +452,13 @@ impl Services {
         }
         monitor.state = PrMonitorState::Cancelled;
         monitor.updated_at = now;
+        self.emit_qualified_monitor_event(
+            &authority,
+            intent_core::events::PR_MONITOR_CANCELLED,
+            &monitor,
+            None,
+        );
+        self.settle_unresolved_monitor_cancel(&monitor).await;
         let out = wire(&monitor, &target)?;
         self.review_monitor_authorities
             .lock()

@@ -5656,8 +5656,24 @@ mod normal_launch {
                 .unwrap();
             h.http.set_monitor_review("head-a", "opened", 0);
             h.start().await.unwrap();
+            use crate::repository_read_source::tests::native_monitor::{
+                NativeRecipient, next_monitor_event,
+            };
+            let native = NativeRecipient::new(h.original.clone()).await;
+            let bus = h.original.event_bus.as_ref().unwrap();
+            let filter = crate::SubscriptionFilter {
+                event_types: vec!["prMonitor:*".into()],
+                batch_window: None,
+                ..Default::default()
+            };
+            let mut legacy_events = bus.subscribe(filter.clone());
+            let mut native_events = bus.subscribe_monitor(
+                filter, native.events().await, "acknowledged-monitor-events".into(),
+            );
+            let mut actual_events = Vec::new();
             h.call(0, &h.confirmed(0).await, "return await ws.mr.monitor(4);")
                 .await;
+            actual_events.push(next_monitor_event(&mut native_events, "prMonitor:registered").await);
             let id = h
                 .original
                 .store
@@ -5686,6 +5702,7 @@ mod normal_launch {
                 })
                 .await;
                 assert!(h.prompts().await.is_empty(), "burst must remain debounced");
+                actual_events.push(next_monitor_event(&mut native_events, "prMonitor:changed").await);
             }
             let pending_reply = h
                 .call(0, &h.confirmed(0).await, "return await ws.mr.monitors();")
@@ -5720,6 +5737,7 @@ mod normal_launch {
                 1,
                 "one consolidated scheduler wake is required"
             );
+            actual_events.push(next_monitor_event(&mut native_events, "prMonitor:emitted").await);
             assert!(h
                 .original
                 .store
@@ -5769,6 +5787,8 @@ mod normal_launch {
                 2,
                 "one final {terminal} wake is required"
             );
+            actual_events.push(next_monitor_event(&mut native_events, "prMonitor:changed").await);
+            actual_events.push(next_monitor_event(&mut native_events, "prMonitor:completed").await);
             let completed = h.original.store.get_pr_monitor(&id).await.unwrap();
             assert_eq!(completed.state, intent_core::PrMonitorState::Completed);
             assert!(completed.pending_changes.is_empty());
@@ -5822,7 +5842,13 @@ mod normal_launch {
                 event_payloads.is_empty(),
                 "no unsupported shared lifecycle event route"
             );
-            let fixture = json!({"terminal":terminal,"pendingRows":pending_rows,
+            assert!(legacy_events.try_recv_delivery().is_none());
+            let actual_native_events = actual_events.iter().map(|output| {
+                output.with_current(&mut || Ok(())).unwrap();
+                serde_json::from_str::<Value>(output.frame()).unwrap()
+            }).collect::<Vec<_>>();
+            let fixture = json!({"actualNativeLifecycleEvents":actual_native_events,
+                "terminal":terminal,"pendingRows":pending_rows,
                 "completedRows":completed_rows,"wakes":wakes,"prompts":prompts,
                 "sharedLifecycleEvents":event_payloads});
             for forbidden in [
@@ -5837,6 +5863,12 @@ mod normal_launch {
                 );
             }
             println!("POLLING_PRODUCER_FIXTURE={fixture}");
+            drop(native);
+            for output in actual_events {
+                let mut wrote = false;
+                assert!(output.with_current(&mut || { wrote = true; Ok(()) }).is_err());
+                assert!(!wrote, "retired native recipient must withhold the whole queued event");
+            }
             h.finish().await;
         }
     }

@@ -25,7 +25,7 @@ const PROJECT: &str = "/api/v4/projects/group%2Fproject";
 #[path = "tests/polling.rs"]
 mod polling;
 #[path = "tests/native_monitor.rs"]
-mod native_monitor;
+pub(crate) mod native_monitor;
 
 pub(crate) struct ActualRead {
     pub(crate) auth: Fixture,

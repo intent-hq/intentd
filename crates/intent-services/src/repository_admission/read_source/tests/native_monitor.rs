@@ -7,14 +7,14 @@ use intent_core::repository_request::{
 use intent_core::review_monitor::ReviewMonitorRecipientSupport;
 use intent_core::{Caller, HostRole, with_caller};
 
-struct NativeRecipient {
+pub(crate) struct NativeRecipient {
     services: Arc<Services>,
     caller: Caller,
     connection: Arc<dyn RepositoryReadConnection>,
     _retirements: Box<dyn RepositoryReadRetirements>,
 }
 impl NativeRecipient {
-    async fn new(services: Arc<Services>) -> Self {
+    pub(crate) async fn new(services: Arc<Services>) -> Self {
         services.initialize_repository_wire().await.unwrap();
         let caller = Caller::Wire {
             principal_id: services.store.get_primary_principal().await.unwrap().id,
@@ -108,7 +108,7 @@ impl NativeRecipient {
         })
         .await
     }
-    async fn events(
+    pub(crate) async fn events(
         &self,
     ) -> Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient> {
         let connection = self.connection.clone();
@@ -409,6 +409,71 @@ async fn native_monitor_admitted_cancel_emits_original_qualified_event() {
         .await
         .unwrap();
     for output in queued.into_iter().chain([reply]) {
+        let mut wrote = false;
+        assert!(
+            output
+                .with_current(&mut || {
+                    wrote = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!wrote);
+    }
+}
+
+pub(crate) async fn next_monitor_event(
+    subscription: &mut crate::events::Subscription,
+    kind: &str,
+) -> Arc<dyn RepositoryPrivateOutput> {
+    let delivery = timeout(BUDGET, subscription.recv_delivery())
+        .await
+        .expect("actual monitor lifecycle event")
+        .unwrap();
+    let crate::Delivery::Monitor(delivery) = delivery else {
+        panic!("private lifecycle envelope")
+    };
+    let output = delivery.into_output();
+    output.with_current(&mut || Ok(())).unwrap();
+    let frame: Value = serde_json::from_str(output.frame()).unwrap();
+    assert_eq!(frame["params"]["event"]["type"], kind);
+    output
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_monitor_agent_registration_change_and_cancel_use_original_source() {
+    let provider = ReadServer::new().await;
+    let mut f = ActualRead::new(&provider).await;
+    let bus = crate::EventBus::new(f.auth.service.store.clone());
+    f.auth.service = Arc::new(f.auth.service.as_ref().clone().with_event_bus(bus.clone()));
+    routing_options(&f);
+    let native = NativeRecipient::new(f.auth.service.clone()).await;
+    let filter = crate::SubscriptionFilter {
+        event_types: vec!["prMonitor:*".into()],
+        batch_window: None,
+        ..Default::default()
+    };
+    let mut legacy = bus.subscribe(filter.clone());
+    let mut events = bus.subscribe_monitor(filter, native.events().await, "agent-events".into());
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    assert_eq!(registered["ok"], true);
+    let registration = next_monitor_event(&mut events, "prMonitor:registered").await;
+    let value: Value = serde_json::from_str(registration.frame()).unwrap();
+    assert_eq!(
+        value["params"]["event"]["data"]["resource"],
+        registered["monitor"]["resource"]
+    );
+    provider.set_monitor_review("new-head", "opened", 1);
+    f.auth.service.poll_pr_monitors().await;
+    let changed = next_monitor_event(&mut events, "prMonitor:changed").await;
+    let cancelled = routing_json(&run(&f.server(), "return await ws.mr.unmonitor(4);").await);
+    assert_eq!(cancelled["ok"], true);
+    let cancelled = next_monitor_event(&mut events, "prMonitor:cancelled").await;
+    assert!(legacy.try_recv_delivery().is_none());
+    // Neither a removed runtime map entry nor the subscriber's capability is
+    // authority. Every queued envelope keeps its actual original agent source.
+    f.owner.retirement().retire();
+    for output in [registration, changed, cancelled] {
         let mut wrote = false;
         assert!(
             output
