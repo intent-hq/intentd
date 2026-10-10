@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.40] - 2026-10-10
+
+### 🧪 Testing
+
+- Retain bounded Pi startup diagnostics in CI ([#2370](https://github.com/intent-hq/intentd/pull/2370))
+
+
 ## [0.10.39] - 2026-10-10
 
 ### 📚 Documentation
