@@ -3403,6 +3403,19 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
         assert_eq!(row["pendingChanges"], json!([]));
         assert_eq!(row["lastSnapshot"]["checks"]["total"], 36);
         assert_eq!(row["lastSnapshot"]["checks"]["failingRequired"], json!(2));
+        // The compact count must not discard the retained full check names,
+        // including across the alternating REST and folded reads.
+        let stored = fx
+            .services
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let full: Value = serde_json::from_str(stored.last_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            full["requirements"]["checks"]["failingRequired"],
+            json!(["route", "legacy-only"])
+        );
         assert_eq!(row["lastSnapshot"]["checks"]["requiredKnown"], true);
         assert!(!owner_messages(&fx).await.contains("pr_monitor_wake"));
         for private in [
