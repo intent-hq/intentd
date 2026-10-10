@@ -1442,6 +1442,8 @@ pub struct Services {
     test_review_monitoring_recipient: bool,
     #[cfg(test)]
     test_review_monitor_write_ready: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(test)]
+    test_export_monitor_preflight: Arc<Mutex<Option<transfer_export::MonitorExportBarrier>>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1812,6 +1814,8 @@ impl Services {
             test_review_monitoring_recipient: false,
             #[cfg(test)]
             test_review_monitor_write_ready: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_export_monitor_preflight: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),

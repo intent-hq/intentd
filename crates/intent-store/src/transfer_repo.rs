@@ -474,6 +474,30 @@ impl Store {
         Ok(out)
     }
 
+    /// Read retained monitor envelopes for transfer preflight, without changing
+    /// agents or creating an export. This is not the authoritative archive
+    /// snapshot; the caller must also check its final `transfer_export_rows`.
+    ///
+    /// # Errors
+    /// Returns an error if the read snapshot or row decoding fails.
+    pub async fn transfer_monitor_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let mut tx = self.read_pool().begin().await
+            .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+        let mut out = Vec::new();
+        for (table, predicate) in TRANSFER_TABLES.iter().filter(|(table, _)| matches!(*table, "pr_monitor" | "agent_message")) {
+            let rows = sqlx::query(&format!("SELECT * FROM \"{table}\" WHERE {predicate}"))
+                .bind(&workspace_id.0).fetch_all(&mut *tx).await
+                .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+            let objects = rows.iter().map(|row| row_to_json(table, row)).collect::<Result<Vec<_>>>()?;
+            out.push(((*table).to_string(), objects));
+        }
+        tx.commit().await.map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+        Ok(out)
+    }
+
     /// Insert transformed transfer rows into their tables inside ONE
     /// transaction — the atomic heart of `workspace.import.commit`. `rows`
     /// entries must name [`TRANSFER_TABLES`] members (anything else —

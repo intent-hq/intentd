@@ -3216,8 +3216,12 @@ fn is_qualified_monitor_metadata(metadata: Option<&Value>) -> bool {
 }
 
 pub(crate) fn is_qualified_monitor_message(message: &AgentMessage) -> bool {
-    is_qualified_monitor_metadata(message.metadata.as_ref())
-        || message.content.as_array().is_some_and(|blocks| {
+    is_qualified_monitor_envelope(&message.content, message.metadata.as_ref())
+}
+
+pub(crate) fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
+    is_qualified_monitor_metadata(metadata)
+        || content.as_array().is_some_and(|blocks| {
             blocks
                 .iter()
                 .any(|block| is_qualified_monitor_metadata(block.get("messageMetadata")))
