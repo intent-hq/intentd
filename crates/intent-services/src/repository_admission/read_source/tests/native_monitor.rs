@@ -71,6 +71,15 @@ impl NativeRecipient {
         workspace: WorkspaceId,
         id: intent_core::PrMonitorId,
     ) -> intent_core::Result<Value> {
+        self.cancel_output(workspace, id)
+            .await
+            .map(|(value, _)| value)
+    }
+    async fn cancel_output(
+        &self,
+        workspace: WorkspaceId,
+        id: intent_core::PrMonitorId,
+    ) -> intent_core::Result<(Value, Arc<dyn RepositoryPrivateOutput>)> {
         let services = self.services.clone();
         let connection = self.connection.clone();
         with_caller(self.caller.clone(), async {
@@ -78,11 +87,41 @@ impl NativeRecipient {
             let mut result = None;
             scope
                 .scope(Box::pin(async {
-                    result = Some(services.pr_monitor_cancel_by_id(workspace, id).await);
+                    result = Some(
+                        async {
+                            let value = services.pr_monitor_cancel_by_id(workspace, id).await?;
+                            let frame = json!({"jsonrpc":"2.0","id":2,"result":value}).to_string();
+                            let output = scope
+                                .bind_private_output(&frame)?
+                                .expect("private cancel reply");
+                            scope
+                                .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                                .await?;
+                            Ok((value, output))
+                        }
+                        .await,
+                    );
                 }))
                 .await;
             scope.retire();
             result.unwrap()
+        })
+        .await
+    }
+    async fn events(
+        &self,
+    ) -> Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient> {
+        let connection = self.connection.clone();
+        with_caller(self.caller.clone(), async {
+            let scope = connection.capture();
+            let mut result = None;
+            scope
+                .scope(Box::pin(async {
+                    result = connection.capture_monitor_events();
+                }))
+                .await;
+            scope.retire();
+            result.expect("original event recipient")
         })
         .await
     }
@@ -294,4 +333,91 @@ async fn native_monitor_missing_account_cancel_retains_raw_original_evidence() {
     assert_eq!(saved.target(), original.target());
     assert_eq!(provider.count(), calls);
     assert!(native.cancel(f.git.workspace.id.clone(), id).await.is_err());
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_monitor_admitted_cancel_emits_original_qualified_event() {
+    let provider = ReadServer::new().await;
+    let mut f = ActualRead::new(&provider).await;
+    let bus = crate::EventBus::new(f.auth.service.store.clone());
+    f.auth.service = Arc::new(f.auth.service.as_ref().clone().with_event_bus(bus.clone()));
+    routing_options(&f);
+    let registered = routing_json(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+    let id = intent_core::PrMonitorId(registered["monitor"]["monitorId"].as_str().unwrap().into());
+    let services = &f.auth.service;
+    let owner = services.store.get_primary_principal().await.unwrap();
+    services
+        .store
+        .add_workspace_member(
+            &f.git.workspace.id,
+            &owner.id,
+            intent_core::WorkspaceRole::Owner,
+        )
+        .await
+        .unwrap();
+    let before = services.store.get_qualified_pr_monitor(&id).await.unwrap();
+    let source = NativeRecipient::new(services.clone()).await;
+    let observer = NativeRecipient::new(services.clone()).await;
+    let filter = crate::SubscriptionFilter {
+        event_types: vec!["prMonitor:*".into()],
+        batch_window: None,
+        ..Default::default()
+    };
+    let mut legacy = bus.subscribe(filter.clone());
+    let mut same = bus.subscribe_monitor(filter.clone(), source.events().await, "source".into());
+    let mut sibling = bus.subscribe_monitor(filter, observer.events().await, "observer".into());
+    let calls = provider.count();
+    let (cancelled, reply) = source
+        .cancel_output(f.git.workspace.id.clone(), id.clone())
+        .await
+        .expect("fresh original account cancellation");
+    assert_eq!(
+        cancelled["monitor"]["resource"],
+        registered["monitor"]["resource"]
+    );
+    assert_eq!(cancelled["monitor"]["state"], "cancelled");
+    reply.with_current(&mut || Ok(())).unwrap();
+    let mut queued = Vec::new();
+    for subscription in [&mut same, &mut sibling] {
+        let delivery = timeout(BUDGET, subscription.recv_delivery())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::Delivery::Monitor(delivery) = delivery else {
+            panic!("qualified event")
+        };
+        let output = delivery.into_output();
+        output.with_current(&mut || Ok(())).unwrap();
+        let frame: Value = serde_json::from_str(output.frame()).unwrap();
+        assert_eq!(frame["params"]["event"]["type"], "prMonitor:cancelled");
+        assert_eq!(
+            frame["params"]["event"]["data"]["resource"],
+            registered["monitor"]["resource"]
+        );
+        assert!(!output.frame().contains("monitorBinding"));
+        queued.push(output);
+    }
+    assert!(legacy.try_recv_delivery().is_none());
+    assert_eq!(provider.count(), calls);
+    let saved = services.store.get_qualified_pr_monitor(&id).await.unwrap();
+    let mut expected = before.monitor().clone();
+    expected.state = intent_core::PrMonitorState::Cancelled;
+    expected.updated_at = saved.monitor().updated_at.clone();
+    assert_eq!(saved.monitor(), &expected);
+    services
+        .gitlab_connect_pat(provider.fixture.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    for output in queued.into_iter().chain([reply]) {
+        let mut wrote = false;
+        assert!(
+            output
+                .with_current(&mut || {
+                    wrote = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!wrote);
+    }
 }

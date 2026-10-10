@@ -266,7 +266,7 @@ pub(crate) async fn list(
                         row.monitor(),
                         target,
                     )?);
-                    admissions.push(admitted);
+                    admissions.push(admitted.eligibility);
                 } else {
                     monitors.push(crate::pr_monitor::recovery_pr_monitor_wire(
                         row.monitor(),
@@ -317,6 +317,7 @@ pub(crate) async fn cancel(
     }
     let request = super::Request::current(services).map_err(|_| super::unavailable())?;
     let recipient = Recipient::acquire(&request, workspace).await?;
+    let mut account = None;
     let reason = match row.target() {
         intent_store::PersistedMonitorTarget::Unresolved { reason } => {
             use intent_core::review_monitor::ReviewMonitorUnresolvedReason as Reason;
@@ -331,9 +332,7 @@ pub(crate) async fn cancel(
             }
         }
         intent_store::PersistedMonitorTarget::Resolved { .. } => {
-            if admission::acquire(&request, &recipient, &row).await.is_ok() {
-                return Ok(None);
-            }
+            account = admission::acquire(&request, &recipient, &row).await.ok();
             intent_core::review_monitor::ReviewMonitorUnresolvedReason::MissingAuthority
         }
     };
@@ -354,7 +353,16 @@ pub(crate) async fn cancel(
         .require_workspace_manager(workspace, "prMonitor.cancel")
         .await?;
     let event_source = EventSource::capture(recipient.clone())?;
-    let admitted = recipient.clone();
+    let binding = account.as_ref().map(|account| account.binding.clone());
+    let projection = Projection::new(
+        recipient.clone(),
+        account
+            .into_iter()
+            .map(|account| account.eligibility)
+            .collect(),
+    );
+    let admitted = projection.clone();
+    let event_binding = binding.clone();
     let services = services.clone();
     let mut monitor = row.monitor().clone();
     // Once admitted, the commit and terminal settlement survive a lost caller.
@@ -377,7 +385,7 @@ pub(crate) async fn cancel(
         monitor.updated_at = now;
         services.settle_unresolved_monitor_cancel(&monitor).await;
         if let Some(bus) = &services.event_bus {
-            let event = intent_core::Event {
+            let mut event = intent_core::Event {
                 id: uuid::Uuid::now_v7().to_string(), workspace_id: monitor.workspace_id.clone(),
                 timestamp: intent_core::now_iso(), event_type: intent_core::events::PR_MONITOR_CANCELLED.into(),
                 actor: crate::system_actor(), session_id: Some(monitor.agent_id.0.clone()),
@@ -387,19 +395,24 @@ pub(crate) async fn cancel(
                     "repo":format!("{}/{}",monitor.repo_owner,monitor.repo_name),"prNumber":monitor.pr_number,"state":monitor.state,
                 }),
             };
-            let _ = bus.publish_monitor(event, None, event_source);
+            if let Some(binding) = &event_binding {
+                event.data["resource"] = serde_json::json!(binding.resource);
+                event.data["monitorAvailability"] = serde_json::json!({"state":"available"});
+            }
+            let _ = bus.publish_monitor(event, event_binding, event_source);
         }
         Ok::<_, intent_core::Error>(monitor)
     })
     .await
     .map_err(|_| super::unavailable())??;
-    recipient.with_current(&mut || Ok(()))?;
+    projection.with_current(&mut || Ok(()))?;
+    let wire = match binding {
+        Some(binding) => crate::pr_monitor::qualified_pr_monitor_wire(&monitor, &binding.resource)?,
+        None => crate::pr_monitor::recovery_pr_monitor_wire(&monitor, reason),
+    };
     *request.state.lock().map_err(|_| super::unavailable())? =
-        super::RequestState::Monitor(Projection::new(recipient, Vec::new()));
-    Ok(Some(serde_json::json!({
-        "ok": true,
-        "monitor": crate::pr_monitor::recovery_pr_monitor_wire(&monitor, reason),
-    })))
+        super::RequestState::Monitor(projection);
+    Ok(Some(serde_json::json!({"ok": true, "monitor": wire})))
 }
 
 pub(super) fn capture_events(
@@ -460,18 +473,26 @@ impl intent_core::repository_request::RepositoryMonitorEventRecipient for EventR
         intent_core::Result<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>,
     > {
         Box::pin(async move {
-            // Resolved private events require original provider/account admission,
-            // added independently of this workspace-only recovery projection.
-            if binding.is_some() {
-                return Err(super::unavailable());
-            }
             let c = &self.request.connection;
             let recipient = super::with_caller(
                 c.caller.caller().clone(),
-                super::with_wire_credential(
-                    c.caller.wire_credential().cloned(),
-                    Recipient::acquire(&self.request, &event.workspace_id),
-                ),
+                super::with_wire_credential(c.caller.wire_credential().cloned(), async {
+                    let recipient = Recipient::acquire(&self.request, &event.workspace_id).await?;
+                    let accounts = if let Some(binding) = binding {
+                        if event.data.get("resource") != Some(&serde_json::json!(binding.resource))
+                        {
+                            return Err(super::unavailable());
+                        }
+                        vec![
+                            admission::acquire_event(&self.request, &recipient, binding)
+                                .await?
+                                .eligibility,
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, intent_core::Error>(Projection::new(recipient, accounts))
+                }),
             )
             .await?;
             let frame = serde_json::json!({
@@ -495,7 +516,7 @@ impl intent_core::repository_request::RepositoryMonitorEventRecipient for EventR
     }
 }
 struct EventOutput {
-    recipient: Arc<Recipient>,
+    recipient: Arc<Projection>,
     subscription: Arc<super::Request>,
     source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
     frame: String,

@@ -122,11 +122,16 @@ impl RepositoryAuthority for Arc<ReadAuthority> {
     }
 }
 
+pub(super) struct Admitted {
+    pub(super) eligibility: Arc<RepositoryReadEligibility>,
+    pub(super) binding: ReviewMonitorBinding,
+}
+
 pub(super) async fn acquire(
     request: &Arc<Request>,
     recipient: &Arc<Recipient>,
     row: &intent_store::QualifiedPrMonitor,
-) -> Result<Arc<RepositoryReadEligibility>> {
+) -> Result<Admitted> {
     let intent_store::PersistedMonitorTarget::Resolved {
         target,
         provenance: intent_store::MonitorTargetProvenance::CapturedRequest,
@@ -151,14 +156,42 @@ pub(super) async fn acquire(
     if original.resource != *target {
         return Err(unavailable());
     }
+    acquire_binding(request, recipient, &original, false).await
+}
+
+/// Events cannot revive a saved connection generation as a new delivery.
+/// Their original producer and the current recipient must admit the same live
+/// account generation. The caller supplies only a typed private-bus binding.
+pub(super) async fn acquire_event(
+    request: &Arc<Request>,
+    recipient: &Arc<Recipient>,
+    original: &ReviewMonitorBinding,
+) -> Result<Admitted> {
+    acquire_binding(request, recipient, original, true).await
+}
+
+async fn acquire_binding(
+    request: &Arc<Request>,
+    recipient: &Arc<Recipient>,
+    original: &ReviewMonitorBinding,
+    exact: bool,
+) -> Result<Admitted> {
     let services = &request.connection.services;
+    let target = &original.resource;
+    if target.repository.provider != RepositoryProvider::Gitlab {
+        return Err(unavailable());
+    }
     let settled = services
         .gitlab_repository_settled_connection()
         .map_err(|_| unavailable())?;
     let selected = settled.selected();
     // Verified account identity must match the original writer. Connection and
     // daemon generations are freshly captured, never reconstructed from disk.
-    if selected.binding.scope.account_id != original.connection.account_id {
+    if selected.binding.scope.account_id != original.connection.account_id
+        || (exact
+            && (selected.binding.scope != original.connection
+                || original.scope.daemon_id != services.daemon_boot_id))
+    {
         return Err(unavailable());
     }
     let expected = RepositoryAuthorityRequest {
@@ -199,5 +232,12 @@ pub(super) async fn acquire(
         .map_err(|_| unavailable())?
         .dispatch(&mut || eligibility.check())
         .map_err(|_| unavailable())?;
-    Ok(eligibility)
+    Ok(Admitted {
+        eligibility,
+        binding: ReviewMonitorBinding {
+            scope: expected.execution,
+            connection: expected.connection,
+            resource: target.clone(),
+        },
+    })
 }
