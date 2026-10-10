@@ -113,6 +113,108 @@ fn gl() -> ReviewTarget {
     )
 }
 
+#[tokio::test]
+async fn qualified_scope_lists_preserve_history_targets_and_unresolved_bytes_after_restart() {
+    let (dir, store) = store().await;
+    let mut completed = monitor("completed-github");
+    completed.state = PrMonitorState::Completed;
+    assert!(store
+        .insert_qualified_pr_monitor(&completed, &gh(), LegacyGithubWriter)
+        .await
+        .unwrap());
+    let gitlab = monitor("gitlab");
+    assert!(store
+        .insert_qualified_pr_monitor(&gitlab, &gl(), CapturedRequest)
+        .await
+        .unwrap());
+    let mut other = monitor("other-instance");
+    other.agent_id = AgentId("b".into());
+    let second = target(
+        Gitlab,
+        "https://other.example/forge",
+        "o/r",
+        MergeRequest,
+        42,
+    );
+    assert!(store
+        .insert_qualified_pr_monitor(&other, &second, CapturedRequest)
+        .await
+        .unwrap());
+    let mut unknown = monitor("unresolved");
+    unknown.agent_id = other.agent_id.clone();
+    assert!(store.insert_pr_monitor(&unknown).await.unwrap());
+    sqlx::query(
+        "UPDATE pr_monitor SET target_provider=NULL,target_instance_base_url=NULL,
+        target_project_path=NULL,target_kind=NULL,target_provenance='unresolved',
+        target_unresolved_reason='missing-provenance',pending_changes='[ \"keep\" ]'
+        WHERE monitor_id='unresolved'",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO workspace(id,title,branch,created_at,updated_at)
+        VALUES ('foreign','Foreign','main','created','updated');
+        INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at)
+        VALUES ('foreign-agent','foreign','Foreign','idle','created','updated');",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    let mut foreign = monitor("foreign");
+    foreign.agent_id = AgentId("foreign-agent".into());
+    foreign.workspace_id = WorkspaceId("foreign".into());
+    assert!(store.insert_pr_monitor(&foreign).await.unwrap());
+    let before = original_bytes(store.read_pool(), "unresolved").await;
+    drop(store);
+
+    let reopened = Store::open(&dir.path().join("monitors.db")).await.unwrap();
+    let rows = reopened
+        .list_qualified_pr_monitors_by_workspace(&WorkspaceId("w".into()))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].monitor(), &completed);
+    assert!(
+        matches!(rows[0].target(), PersistedMonitorTarget::Resolved {target,provenance:LegacyGithubWriter} if target == &gh())
+    );
+    assert!(
+        matches!(rows[1].target(), PersistedMonitorTarget::Resolved {target,provenance:CapturedRequest} if target == &gl())
+    );
+    assert!(
+        matches!(rows[2].target(), PersistedMonitorTarget::Resolved {target,provenance:CapturedRequest} if target == &second)
+    );
+    assert!(matches!(
+        rows[3].target(),
+        PersistedMonitorTarget::Unresolved { .. }
+    ));
+    assert_eq!(
+        reopened
+            .list_qualified_pr_monitors_by_agent(&AgentId("a".into()))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        reopened
+            .list_qualified_pr_monitors_by_agent(&AgentId("b".into()))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(reopened
+        .list_qualified_pr_monitors_by_agent(&AgentId("missing".into()))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        original_bytes(reopened.read_pool(), "unresolved").await,
+        before
+    );
+}
+
 async fn original_bytes(pool: &crate::StorePool, id: &str) -> Vec<serde_json::Value> {
     let row = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id=?"
