@@ -188,6 +188,7 @@ mod repository_read_source;
 mod agent_list_cache;
 mod automatic_pr_refresh;
 pub mod checkpoint;
+mod codex_home;
 mod direct_secret_ops;
 mod fast_mode;
 mod harness;
