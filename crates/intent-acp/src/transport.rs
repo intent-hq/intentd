@@ -49,6 +49,21 @@ struct PendingRequest {
 
 type PendingMap = Arc<Mutex<HashMap<i64, PendingRequest>>>;
 type SessionConfigOptions = Arc<Mutex<HashMap<String, Value>>>;
+type SessionTitles = HashMap<String, (u64, Option<String>)>;
+type TitleControls = Arc<Mutex<HashMap<String, String>>>;
+
+/// Scoped setup control: its matching title echo is metadata, not turn output.
+#[must_use]
+pub struct SessionTitleControl {
+    controls: TitleControls,
+    session_id: String,
+}
+
+impl Drop for SessionTitleControl {
+    fn drop(&mut self) {
+        self.controls.lock().unwrap().remove(&self.session_id);
+    }
+}
 
 fn retain_config_options(configs: &SessionConfigOptions, session_id: Option<&str>, value: &Value) {
     if let (Some(session_id), Some(options)) = (
@@ -548,6 +563,8 @@ fn dispatch(
     value: &Value,
     pending: &PendingMap,
     config_options: &SessionConfigOptions,
+    titles: &watch::Sender<SessionTitles>,
+    title_controls: &TitleControls,
     requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
     notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
     response_seq: &AtomicU64,
@@ -580,6 +597,34 @@ fn dispatch(
                     params["sessionId"].as_str(),
                     &params["update"],
                 );
+            }
+            if method == "session/update"
+                && params["update"]["sessionUpdate"] == "session_info_update"
+            {
+                if let (Some(id), Some(title)) =
+                    (params["sessionId"].as_str(), params["update"].get("title"))
+                {
+                    if title.is_null() || title.is_string() {
+                        // Decide before waking the waiter, which may drop its guard.
+                        let is_control = title_controls
+                            .lock()
+                            .unwrap()
+                            .get(id)
+                            .is_some_and(|expected| title.as_str() == Some(expected.as_str()));
+                        titles.send_modify(|titles| {
+                            let revision = titles
+                                .get(id)
+                                .map_or(1, |(revision, _)| revision.saturating_add(1));
+                            titles.insert(
+                                id.to_owned(),
+                                (revision, title.as_str().map(str::to_owned)),
+                            );
+                        });
+                        if is_control {
+                            return;
+                        }
+                    }
+                }
             }
             if let Some(tx) = notifications {
                 let _ = tx.send(IncomingNotification { method, params });
@@ -635,10 +680,13 @@ fn dispatch(
 /// so the detached drain (and its capture file) may outlive the connection
 /// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
+    pub(crate) codex_sandboxes: Mutex<HashMap<String, crate::codex_sandbox::CodexSandbox>>,
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
     pending: PendingMap,
     config_options: SessionConfigOptions,
+    session_titles: watch::Receiver<SessionTitles>,
+    title_controls: TitleControls,
     prompt_pending: Arc<Mutex<PromptPending>>,
     next_id: AtomicI64,
     response_seq: Arc<AtomicU64>,
@@ -670,6 +718,8 @@ impl Connection {
     {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let config_options = SessionConfigOptions::default();
+        let (titles_tx, session_titles) = watch::channel(SessionTitles::new());
+        let title_controls = TitleControls::default();
         let prompt_pending = Arc::new(Mutex::new(PromptPending::default()));
         let response_seq = Arc::new(AtomicU64::new(0));
         let response_notify = Arc::new(Notify::new());
@@ -696,6 +746,7 @@ impl Connection {
         // Reader task: frame on `\n`, parse, dispatch.
         let pending_reader = Arc::clone(&pending);
         let configs_reader = Arc::clone(&config_options);
+        let title_controls_reader = Arc::clone(&title_controls);
         let prompt_pending_reader = Arc::clone(&prompt_pending);
         let seq_reader = Arc::clone(&response_seq);
         let notify_reader = Arc::clone(&response_notify);
@@ -737,6 +788,8 @@ impl Connection {
                             &value,
                             &pending_reader,
                             &configs_reader,
+                            &titles_tx,
+                            &title_controls_reader,
                             requests.as_ref(),
                             notifications.as_ref(),
                             &seq_reader,
@@ -836,9 +889,12 @@ impl Connection {
 
         Self {
             callback_routes: Arc::new(CallbackToolRoutes::default()),
+            codex_sandboxes: Mutex::new(HashMap::new()),
             writer_tx,
             pending,
             config_options,
+            session_titles,
+            title_controls,
             prompt_pending,
             next_id: AtomicI64::new(1),
             response_seq,
@@ -1069,6 +1125,65 @@ impl Connection {
     /// Panics if the internal metadata mutex is poisoned.
     pub fn session_config_options(&self, session_id: &str) -> Option<Value> {
         self.config_options.lock().unwrap().get(session_id).cloned()
+    }
+
+    /// Latest title observed in stdout order, with a per-session revision.
+    /// An explicit null clears the title; omitted title fields leave it intact.
+    pub fn session_title(&self, session_id: &str) -> Option<(u64, Option<String>)> {
+        self.session_titles.borrow().get(session_id).cloned()
+    }
+
+    /// Consume only the matching setup-title echo while this guard is alive.
+    /// Other notifications retain their normal routing and retry safeguards.
+    ///
+    /// # Errors
+    /// Returns an error if another title control is active for this session.
+    ///
+    /// # Panics
+    /// Panics if the title-control mutex is poisoned.
+    pub fn session_title_control(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> AcpResult<SessionTitleControl> {
+        let mut controls = self.title_controls.lock().unwrap();
+        if controls.contains_key(session_id) {
+            return Err(AcpError::Protocol(
+                "session title control already active".into(),
+            ));
+        }
+        controls.insert(session_id.to_owned(), title.to_owned());
+        Ok(SessionTitleControl {
+            controls: Arc::clone(&self.title_controls),
+            session_id: session_id.to_owned(),
+        })
+    }
+
+    /// Wait for a fresh title echo. The caller must bound the whole operation.
+    ///
+    /// # Errors
+    /// Returns a transport error if the adapter closes before confirming it.
+    pub async fn wait_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        after: u64,
+    ) -> AcpResult<()> {
+        let mut titles = self.session_titles.clone();
+        loop {
+            if titles
+                .borrow_and_update()
+                .get(session_id)
+                .is_some_and(|(revision, current)| {
+                    *revision > after && current.as_deref() == Some(title)
+                })
+            {
+                return Ok(());
+            }
+            titles.changed().await.map_err(|_| {
+                AcpError::Transport("adapter closed before session title confirmation".into())
+            })?;
+        }
     }
 
     /// Only `session::prompt_with_guidance` constructs these matched parameters.

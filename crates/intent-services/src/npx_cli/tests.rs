@@ -26,6 +26,11 @@ rl.on('line', (line) => {
   }});
   if (msg.method === 'session/set_config_option') return send({ jsonrpc: '2.0', id: msg.id, result: {} });
   if (msg.method === 'session/prompt') {
+    const titleControl = msg.params.prompt?.[0]?.text;
+    if (titleControl?.startsWith('/rename ')) {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'session_info_update', title: titleControl.slice(8).trim() } } });
+      return send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    }
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'npm-guard-fixture', update: {
       sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'fixture reply' }
     }}});

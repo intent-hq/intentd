@@ -2,6 +2,96 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.42] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Emit compact monitor required-check counts ([#2380](https://github.com/intent-hq/intentd/pull/2380))
+
+### 📚 Documentation
+
+- Explain unsupported binary artifact downloads ([#2373](https://github.com/intent-hq/intentd/pull/2373))
+
+
+## [0.10.41] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain hardware workspace numbering and assignment ([#2369](https://github.com/intent-hq/intentd/pull/2369))
+
+
+## [0.10.40] - 2026-10-10
+
+### 🧪 Testing
+
+- Retain bounded Pi startup diagnostics in CI ([#2370](https://github.com/intent-hq/intentd/pull/2370))
+
+
+## [0.10.39] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain browser recovery after reconnect ([#7004](https://github.com/intent-hq/intentd/pull/7004)) ([#2371](https://github.com/intent-hq/intentd/pull/2371))
+
+### 🧪 Testing
+
+- Wait for durable idle before model recreation ([#2377](https://github.com/intent-hq/intentd/pull/2377))
+
+
+## [0.10.38] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Enforce adapter-derived Codex CLI compatibility ([#2372](https://github.com/intent-hq/intentd/pull/2372))
+
+
+## [0.10.37] - 2026-10-09
+
+### 🚀 Features
+
+- Add cross-platform daemon lifecycle commands ([#2355](https://github.com/intent-hq/intentd/pull/2355))
+
+
+## [0.10.36] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Fall back to permitted Codex sandbox modes ([#2366](https://github.com/intent-hq/intentd/pull/2366))
+
+### 📚 Documentation
+
+- Explain confirmed script deletion controls ([#2364](https://github.com/intent-hq/intentd/pull/2364))
+
+
+## [0.10.35] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Downscale images before provider delivery ([#2361](https://github.com/intent-hq/intentd/pull/2361))
+
+### 📚 Documentation
+
+- Explain image paste in question answers ([#2362](https://github.com/intent-hq/intentd/pull/2362))
+
+
+## [0.10.34] - 2026-10-08
+
+### 🚀 Features
+
+- Deliver initial chat history progressively ([#2339](https://github.com/intent-hq/intentd/pull/2339))
+
+
+## [0.10.33] - 2026-10-08
+
+### 🐛 Bug Fixes
+
+- Clear recovered agent blockers explicitly ([#2350](https://github.com/intent-hq/intentd/pull/2350))
+
+### 🧪 Testing
+
+- Separate report wake text from event metadata ([#2353](https://github.com/intent-hq/intentd/pull/2353))
+
+
 ## [0.10.32] - 2026-10-08
 
 ### 🐛 Bug Fixes

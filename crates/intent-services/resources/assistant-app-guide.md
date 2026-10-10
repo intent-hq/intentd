@@ -137,6 +137,23 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
+
+When an agent monitors a GitHub pull request, its conversation shows the monitored
+PR and its latest status. Required checks that are still running or failing can
+block merging. If monitoring is paused or information is unavailable, wait for a
+fresh status before treating the PR as ready.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
+
+Images sent to agents may be resized or re-encoded for provider delivery; original
+attachments and their displayed previews are unchanged. If an image cannot be read
+or the images together exceed the delivery budget, the turn fails rather than
+silently omitting an image. Re-export an unreadable image as PNG/JPEG, or send fewer
+images cropped to the relevant detail. A provider request-size error can also come
+from images retained in earlier turns: start a new agent conversation with only
+the images needed if sending fewer images still fails.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/lib.rs (SETUP_TERMINAL_NAME); packages/intentd/crates/intent-pty/src/host.rs. -->
 
 Workspace setup runs in the **Setup Script** terminal and can finish without that
@@ -144,11 +161,31 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; messages/en.json. -->
+
+To delete a saved script, use **Delete script** beside its play/edit controls in
+the bottom bar, or open the script panel's **…** menu and choose **Delete script**
+immediately after **Show in bottom bar**. Both actions ask **Delete “[name]”?**;
+confirm with **Delete script**, or cancel to keep it. Stop an active script first
+and wait until it is idle or has exited. Deletion stays disabled while the script
+is starting, running, restarting, its state is unknown, or changes are pending.
+
 To continue work, open its existing card or sidebar entry, then the existing agent's
 conversation. Read its status and last response before sending a follow-up. Use
 **Create new agent** in that workspace only when a separate conversation is needed;
 choose a specialist and model where offered. A specialist defines reusable behavior;
 an agent is a particular conversation doing work.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/questions/QuestionWizard.svelte. -->
+
+When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
+
+On desktop, recent conversation messages appear progressively, newest first, while
+older messages in the initial window load. The conversation stays bottom-aligned
+unless you scroll away; older-history loading becomes available when that initial
+window finishes. Older clients may show the initial messages together.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; src/lib/components/chat/AssistantThreadTitle.svelte. -->
 
@@ -166,6 +203,29 @@ files with their directory paths. Search by filename or path, then click a file 
 expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
+
+## Workspace numbers for Micro keys
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
+
+With a supported **Creator Micro 2** or **Codex Micro** connected to Intent,
+**Home → Workspaces** shows colored numbered squares on assigned workspaces in
+both list and board views. Matching smaller squares appear at the left of top
+workspace tabs, including pinned tabs. Numbers **1–6** identify the workspace's
+Micro key assignment. An unassigned workspace has no number.
+
+Right-click a workspace's list row, board card, or top tab and choose **Assign to
+Micro Key**, then a key number. This also works for workspaces without a number;
+the workspace does not need to be selected. Archived, deleted, and Assistant
+workspaces cannot receive Micro assignments.
+An occupied key's menu label names the workspace it will replace. Choose
+**Unassign** to remove the current assignment. Changes are shared across these
+views and saved.
+
+The numbers and assignment actions appear only while Intent's Micro integration
+is connected; a device merely being plugged in or detected is not enough.
+Disconnecting hides them without deleting saved assignments. If they are missing,
+check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
@@ -212,7 +272,7 @@ workspace setup script does not resolve it.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar warns when its primary browser client is offline, even if
 the workspace has no browser tabs yet. Hover over the warning for recovery help:
@@ -223,8 +283,11 @@ To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. The action depends on the
-current client's browser capability and your access. Do not promise automatic
-failover or change the primary client without the user's instruction.
+current client's browser capability and your access. After reconnecting, wait
+for the current client and workspace browser state to refresh. A checked action
+means this client is already explicitly primary; an unavailable action can also
+mean the connection, browser capability, or access is not ready. Do not promise
+automatic failover or change the primary client without the user's instruction.
 
 ## Add context, run a task, and find results
 
@@ -251,3 +314,42 @@ or artifact links the agent supplied. A status label alone is not proof that wor
 succeeded. Use live workspace, note, and agent tools for actual IDs, progress, and
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
+
+Workspace file links open a file panel. Excel workbooks and other binary files
+without a preview show a binary-file notice; use **Download file** in that panel
+to save the original file on your computer, including from a remote workspace.
+Binary files are not editable in the file panel or Files view. Delete is unavailable
+when Undo cannot preserve the file's contents; the file stays unchanged.
+A missing-file or access error is different: check the path and access rather than
+assuming the file cannot be previewed.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+
+## Daemon lifecycle from the terminal
+
+For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
+`intentd start` to run in the background, `intentd status` to inspect live status,
+`intentd stop` to confirm shutdown (including a supervisor still starting or recovering;
+already stopped succeeds), and `intentd restart` to replace the supervised daemon
+or start it if stopped. These commands act on the
+host where they run; stopping the daemon disconnects its clients.
+
+`start` waits for readiness (60-second default budget); starting a healthy daemon
+again succeeds without restarting it. Startup errors return nonzero and point to
+`<data-dir>/sitter/start.log`. `restart` from stopped uses that same startup path.
+For a running supervisor, restart retains its launch options; Windows waits for
+replacement readiness, while macOS/Linux return after signaling, so check `status`.
+This also works with supervisors launched by services or Windows Scheduled Tasks.
+Background start/restart does not install or enable boot/login services or tasks;
+stop does not disable an existing one.
+
+Use the same `INTENTD_DATA_DIR` and configuration environment for each command.
+`start` accepts serve options (`--mode`, `--insecure` for development only,
+`--resume-all`, `--specialists-dir`); restart takes no launch options. Stop then
+start to change options. `intentd --help` and `intentd start --help` are safe even
+before daemon installation. `serve` stays in the foreground. Direct bare daemon
+builds and the desktop-bundled daemon are distinct from this installed launcher;
+start/restart are launcher commands. Check the installed launcher's help when its
+version differs from this guide; do not infer launcher support from daemon version.
+
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop). -->

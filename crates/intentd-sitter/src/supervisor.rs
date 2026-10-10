@@ -25,8 +25,8 @@
 //!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`]) and
 //!    persist it to `state.json`
 //! 4. update found mid-run: download/verify/install first, then stop the
-//!    child gracefully (SIGTERM + kill timeout on unix; terminate on
-//!    windows) and respawn the new version with the same args. A version
+//!    child gracefully (SIGTERM on Unix, local shutdown RPC on Windows,
+//!    followed by a bounded kill fallback) and respawn the new version with the same args. A version
 //!    that is already installed and named by `state.json` but is not the
 //!    one running — staged by a SIGUSR2 check (item 10) the daemon has not
 //!    yet restarted into, or by a concurrent updater — counts as an update
@@ -62,7 +62,7 @@
 //!    while the loop was crashing
 //! 7. SIGINT/SIGTERM (ctrl-c on windows) are forwarded to the child and the
 //!    sitter exits with the child's status
-//! 8. SIGHUP (unix only, sent by `intentd restart`) stops the child
+//! 8. `intentd restart` (SIGHUP on Unix, private control on Windows) stops the child
 //!    gracefully and respawns it on the current `state.json` version —
 //!    activating a prior `sitter channel --redownload` install — without
 //!    the sitter exiting. A SIGHUP that lands during a crash-backoff sleep
@@ -296,6 +296,33 @@ pub fn read_live_pid(path: &Path) -> Option<nix::unistd::Pid> {
     nix::sys::signal::kill(pid, None).is_ok().then_some(pid)
 }
 
+#[cfg(windows)]
+pub struct WindowsPid(u32);
+#[cfg(windows)]
+impl WindowsPid {
+    #[must_use]
+    pub fn as_raw(&self) -> i32 {
+        self.0.cast_signed()
+    }
+}
+#[cfg(windows)]
+#[must_use]
+pub fn read_live_pid(path: &Path) -> Option<WindowsPid> {
+    let pid = std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)?;
+    // This is a conservative duplicate-start guard, not proof of ownership.
+    // Windows control validates the saved identity on its retained handle before
+    // opening any events. Access denied is not proof of death.
+    let alive = crate::windows::Process::open(pid, false)
+        .and_then(|process| process.exited())
+        .map_or_else(|error| error.raw_os_error() != Some(87), |exited| !exited);
+    alive.then_some(WindowsPid(pid))
+}
+
 /// Exclusive serve ownership, held until after the PID record is removed.
 /// The separate lock file is never unlinked: removing a locked inode would
 /// let another process lock a replacement while the original is still held.
@@ -304,6 +331,8 @@ struct PidFile {
     path: std::path::PathBuf,
     #[cfg(unix)]
     _lock: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(unix)]
+    stop: std::os::unix::net::UnixListener,
     #[cfg(not(unix))]
     _lock: std::fs::File,
 }
@@ -345,10 +374,30 @@ impl PidFile {
                 }
             }
         }
+        #[cfg(unix)]
+        let stop = {
+            use std::os::unix::fs::PermissionsExt;
+            let socket = path.with_extension("stop");
+            // The lifetime lock excludes another owner while stale control
+            // state is replaced. Publish discovery only after control is ready.
+            match std::fs::remove_file(&socket) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            listener
+        };
+        #[cfg(windows)]
+        crate::windows::publish_identity(path)?;
         std::fs::write(path, format!("{}\n", std::process::id()))?;
         Ok(Self {
             path: path.to_path_buf(),
             _lock: lock,
+            #[cfg(unix)]
+            stop,
         })
     }
 }
@@ -361,6 +410,8 @@ impl Drop for PidFile {
         let ours = std::process::id().to_string();
         if std::fs::read_to_string(&self.path).is_ok_and(|s| s.trim() == ours) {
             let _ = std::fs::remove_file(&self.path);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(self.path.with_extension("stop"));
         }
     }
 }
@@ -437,8 +488,20 @@ impl Supervisor {
         // subcommands never touch the updater: they run the installed
         // version exactly once and their exit status passes through.
         let supervised = self.passthrough.first().is_some_and(|arg| arg == "serve");
+        let mut starting = supervised && std::env::var_os(crate::startup::STARTING_ENV).is_some();
+        let startup_deadline = Instant::now() + crate::readiness::timeout_from_env();
 
-        let mut signals = match Signals::new() {
+        #[cfg(windows)]
+        if supervised {
+            match crate::windows::ProcessTree::contain_current_process() {
+                Ok(tree) => tree.retain_until_exit(),
+                Err(error) => {
+                    eprintln!("intentd-sitter: cannot contain supervisor process tree: {error}");
+                    return 1;
+                }
+            }
+        }
+        let mut signals = match Signals::new(&self.paths.sitter_dir) {
             Ok(signals) => signals,
             Err(e) => {
                 eprintln!("intentd-sitter: failed to install signal handlers: {e}");
@@ -448,7 +511,7 @@ impl Supervisor {
         // Claim ownership before any startup update can mutate shared state.
         // Publish only after handlers exist, so discovery cannot expose a
         // sitter that would die to SIGHUP. Failure must not spawn a child.
-        let _pidfile = if supervised {
+        let pidfile = if supervised {
             match PidFile::create(&self.paths.pid_path) {
                 Ok(guard) => Some(guard),
                 Err(e) => {
@@ -460,6 +523,23 @@ impl Supervisor {
             None
         };
 
+        #[cfg(windows)]
+        let _pidfile = pidfile;
+        #[cfg(unix)]
+        if let Some(pidfile) = &pidfile {
+            let listener = pidfile
+                .stop
+                .try_clone()
+                .and_then(tokio::net::UnixListener::from_std);
+            match listener {
+                Ok(listener) => signals.stop = Some(listener),
+                Err(error) => {
+                    eprintln!("intentd-sitter: cannot receive stop requests: {error}");
+                    return 1;
+                }
+            }
+        }
+
         let (mut current_version, mut next_check_at) = if supervised {
             // Startup check: always runs, regardless of the persisted schedule.
             // Signal handlers are already installed for PID discovery. Keep
@@ -467,22 +547,25 @@ impl Supervisor {
             // never waits for a manifest/download timeout or spawns a child.
             let check = self.check();
             tokio::pin!(check);
-            #[cfg_attr(
-                not(unix),
-                expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
-            )]
             let startup = loop {
                 tokio::select! {
                     biased;
                     event = signals.recv() => match event {
-                        SignalEvent::Shutdown(signal) => return 128 + signal,
+                        SignalEvent::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
                         // No child exists yet; startup already checks for an
                         // update and will spawn the selected version once.
+                        SignalEvent::Restart => {
+                            eprintln!("intentd-sitter: restart requested during startup");
+                        }
                         #[cfg(unix)]
-                        SignalEvent::Restart | SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                        SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
                             eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
                         }
                     },
+                    () = tokio::time::sleep_until(startup_deadline), if starting => {
+                        eprintln!("intentd-sitter: startup update check timed out");
+                        return 1;
+                    }
                     outcome = &mut check => break outcome,
                 }
             };
@@ -570,7 +653,10 @@ impl Supervisor {
         loop {
             let binary = self.paths.daemon_binary(&current_version);
             let mut command = tokio::process::Command::new(&binary);
-            command.args(&self.passthrough).kill_on_drop(true);
+            command
+                .args(&self.passthrough)
+                .kill_on_drop(true)
+                .env_remove(crate::startup::STARTING_ENV);
             if last_ran_version
                 .as_ref()
                 .is_some_and(|last| *last != current_version)
@@ -598,7 +684,7 @@ impl Supervisor {
                     // "failed to spawn" is part of the install-script log
                     // contract (see the `what` match in the wait arm below).
                     let what = format!("failed to spawn {}: {e}", binary.display());
-                    if !supervised {
+                    if !supervised || starting {
                         eprintln!("intentd-sitter: {what}");
                         return 1;
                     }
@@ -624,8 +710,9 @@ impl Supervisor {
                             failures = 0;
                             continue;
                         }
-                        FailedStartCheck::Shutdown(code) => return code,
-                        #[cfg(unix)]
+                        FailedStartCheck::Shutdown(code) => {
+                            return signals.finish_stop(code);
+                        }
                         FailedStartCheck::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
@@ -639,8 +726,9 @@ impl Supervisor {
                         return 0;
                     }
                     match self.backoff_sleep(&mut backoff, &mut signals).await {
-                        BackoffOutcome::Shutdown(code) => return code,
-                        #[cfg(unix)]
+                        BackoffOutcome::Shutdown(code) => {
+                            return signals.finish_stop(code);
+                        }
                         BackoffOutcome::RestartRequested => {
                             self.refresh_version_from_state(&mut current_version);
                             backoff = self.config.backoff_initial;
@@ -658,7 +746,9 @@ impl Supervisor {
                                 )
                                 .await
                             {
-                                CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                CheckNowOutcome::Shutdown(signal) => {
+                                    return signals.finish_stop(128 + signal);
+                                }
                                 CheckNowOutcome::RestartRequested => {
                                     self.refresh_version_from_state(&mut current_version);
                                 }
@@ -675,6 +765,39 @@ impl Supervisor {
                     }
                 }
             };
+            #[cfg(windows)]
+            let restart_pending = signals.restart_pending.is_some();
+            #[cfg(unix)]
+            let restart_pending = false;
+            if starting || restart_pending {
+                #[cfg(windows)]
+                {
+                    signals.restart_during_readiness = false;
+                }
+                if !self
+                    .await_initial_readiness(&binary, &mut child, &mut signals)
+                    .await
+                {
+                    let exit = if self.graceful_stop(&mut child).await {
+                        signals.finish_stop(1)
+                    } else {
+                        1
+                    };
+                    #[cfg(windows)]
+                    if signals.restart_during_readiness {
+                        self.refresh_version_from_state(&mut current_version);
+                        continue;
+                    }
+                    return exit;
+                }
+                #[cfg(windows)]
+                if let Some(nonce) = signals.restart_pending.take() {
+                    if let Err(error) = signals.control.finish(&nonce) {
+                        eprintln!("intentd-sitter: restart acknowledgment failed: {error}");
+                    }
+                }
+                starting = false;
+            }
             last_ran_version = Some(current_version.clone());
             let spawned_at = Instant::now();
 
@@ -745,9 +868,8 @@ impl Supervisor {
                                 failures = 0;
                                 break; // respawn the fixed version immediately
                             }
-                            FailedStartCheck::Shutdown(code) => return code,
-                            #[cfg(unix)]
-                            FailedStartCheck::RestartRequested => {
+                            FailedStartCheck::Shutdown(code) => { return signals.finish_stop(code); },
+                                                        FailedStartCheck::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
                                 failures = 0;
@@ -760,9 +882,8 @@ impl Supervisor {
                             return 0;
                         }
                         match self.backoff_sleep(&mut backoff, &mut signals).await {
-                            BackoffOutcome::Shutdown(code) => return code,
-                            #[cfg(unix)]
-                            BackoffOutcome::RestartRequested => {
+                            BackoffOutcome::Shutdown(code) => { return signals.finish_stop(code); },
+                                                        BackoffOutcome::RestartRequested => {
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
                                 failures = 0;
@@ -773,7 +894,7 @@ impl Supervisor {
                                     .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
-                                    CheckNowOutcome::Shutdown(signal) => return 128 + signal,
+                                    CheckNowOutcome::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
                                     CheckNowOutcome::RestartRequested => {
                                         self.refresh_version_from_state(&mut current_version);
                                     }
@@ -828,7 +949,6 @@ impl Supervisor {
                         next_check_at = self.schedule_next_check();
                     }
                     event = signals.recv() => {
-                        #[cfg_attr(not(unix), expect(clippy::infallible_destructuring_match, reason = "only the shutdown arm exists off unix"))]
                         let signal = match event {
                             // `intentd restart` (SIGHUP): stop the child
                             // gracefully and respawn it on the current
@@ -838,13 +958,12 @@ impl Supervisor {
                             // SIGHUP; the channel pin is re-resolved by the
                             // next periodic check as usual. One-shots have
                             // no supervised child to restart.
-                            #[cfg(unix)]
                             SignalEvent::Restart => {
                                 if !supervised {
                                     eprintln!("intentd-sitter: ignoring SIGHUP (one-shot invocation)");
                                     continue;
                                 }
-                                eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                                eprintln!("intentd-sitter: restart requested; restarting intentd");
                                 self.graceful_stop(&mut child).await;
                                 self.refresh_version_from_state(&mut current_version);
                                 backoff = self.config.backoff_initial;
@@ -933,23 +1052,35 @@ impl Supervisor {
                             }
                             SignalEvent::Shutdown(signal) => signal,
                         };
-                        forward_signal(&child, signal);
-                        let status = match tokio::time::timeout(self.config.kill_timeout, child.wait()).await {
-                            Ok(Ok(status)) => status,
-                            Ok(Err(e)) => {
-                                eprintln!("intentd-sitter: failed waiting on intentd: {e}");
-                                return 1;
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "intentd-sitter: intentd did not exit within {:?} of forwarded signal; killing",
-                                    self.config.kill_timeout
-                                );
-                                let _ = child.kill().await;
-                                return 128 + signal;
-                            }
-                        };
-                        return exit_code(status);
+                        #[cfg(windows)]
+                        {
+                            let _ = signal;
+                            self.graceful_stop(&mut child).await;
+                            return 0;
+                        }
+                        #[cfg(unix)]
+                        {
+                            forward_signal(&child, signal);
+                            let status = match tokio::time::timeout(self.config.kill_timeout, child.wait()).await {
+                                Ok(Ok(status)) => status,
+                                Ok(Err(e)) => {
+                                    eprintln!("intentd-sitter: failed waiting on intentd: {e}");
+                                    return 1;
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "intentd-sitter: intentd did not exit within {:?} of forwarded signal; killing",
+                                        self.config.kill_timeout
+                                    );
+                                    return if child.kill().await.is_ok() {
+                                        signals.finish_stop(128 + signal)
+                                    } else {
+                                        128 + signal
+                                    };
+                                }
+                            };
+                            return signals.finish_stop(exit_code(status));
+                        }
                     }
                 }
             }
@@ -1028,8 +1159,11 @@ impl Supervisor {
         let check = self.check();
         tokio::pin!(check);
         #[cfg_attr(
-            not(unix),
-            expect(clippy::never_loop, reason = "only the shutdown arm exists off unix")
+            windows,
+            expect(
+                clippy::never_loop,
+                reason = "Windows restart and shutdown both leave the failed-start check"
+            )
         )]
         let outcome = loop {
             tokio::select! {
@@ -1038,9 +1172,8 @@ impl Supervisor {
                     SignalEvent::Shutdown(signal) => {
                         return FailedStartCheck::Shutdown(128 + signal);
                     }
-                    #[cfg(unix)]
                     SignalEvent::Restart => {
-                        eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                        eprintln!("intentd-sitter: restart requested; restarting intentd");
                         return FailedStartCheck::RestartRequested;
                     }
                     // A check is already in flight, which is exactly what
@@ -1119,7 +1252,7 @@ impl Supervisor {
                         return CheckNowOutcome::Shutdown(signal);
                     }
                     SignalEvent::Restart => {
-                        eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                        eprintln!("intentd-sitter: restart requested; restarting intentd");
                         return CheckNowOutcome::RestartRequested;
                     }
                     // A check is already in flight, which is exactly what
@@ -1228,9 +1361,8 @@ impl Supervisor {
             () = tokio::time::sleep(delay) => BackoffOutcome::Elapsed,
             event = signals.recv() => match event {
                 SignalEvent::Shutdown(signal) => BackoffOutcome::Shutdown(128 + signal),
-                #[cfg(unix)]
                 SignalEvent::Restart => {
-                    eprintln!("intentd-sitter: SIGHUP received; restarting intentd");
+                    eprintln!("intentd-sitter: restart requested; restarting intentd");
                     BackoffOutcome::RestartRequested
                 }
                 // No child is running during a backoff, so there is nothing
@@ -1248,9 +1380,68 @@ impl Supervisor {
         }
     }
 
-    /// Sitter-initiated stop: graceful signal, then force-kill after the
-    /// kill timeout. Never triggers a respawn by itself.
-    async fn graceful_stop(&self, child: &mut tokio::process::Child) {
+    /// A background launch must answer before entering normal crash recovery.
+    async fn await_initial_readiness(
+        &self,
+        binary: &Path,
+        child: &mut tokio::process::Child,
+        signals: &mut Signals,
+    ) -> bool {
+        let deadline = Instant::now() + crate::readiness::timeout_from_env();
+        loop {
+            let probe = crate::readiness::probe_daemon_version_async(binary);
+            tokio::select! {
+                biased;
+                status = child.wait() => {
+                    eprintln!("intentd-sitter: daemon exited before startup readiness: {status:?}");
+                    return false;
+                }
+                event = signals.recv() => {
+                    if matches!(event, SignalEvent::Shutdown(_)) {
+                        return false;
+                    }
+                    #[cfg(windows)]
+                    if matches!(event, SignalEvent::Restart) {
+                        signals.restart_during_readiness = true;
+                        return false;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    eprintln!("intentd-sitter: startup readiness timed out");
+                    return false;
+                }
+                result = probe => {
+                    if result.is_some() {
+                        if !matches!(child.try_wait(), Ok(None)) {
+                            return false;
+                        }
+                        #[cfg(windows)]
+                        if !child.id().is_some_and(|pid| {
+                            crate::windows::Process::open(pid, false).is_ok_and(|process| {
+                                process.matches_record(&self.paths.data_dir.join("intentd.pid"), pid)
+                            })
+                        }) {
+                            // A booting unsupervised daemon can answer while
+                            // our duplicate child is about to fail its lock.
+                            continue;
+                        }
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Sitter-initiated stop: graceful signal, then bounded force-kill.
+    async fn graceful_stop(&self, child: &mut tokio::process::Child) -> bool {
+        // Readiness can already have reaped a failed duplicate child. A shared
+        // endpoint then belongs to another launch, never to this child.
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
         #[cfg(unix)]
         if let Some(id) = child.id() {
             let _ = nix::sys::signal::kill(
@@ -1258,18 +1449,37 @@ impl Supervisor {
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
-        #[cfg(not(unix))]
-        let _ = child.start_kill();
-
-        if tokio::time::timeout(self.config.kill_timeout, child.wait())
-            .await
-            .is_err()
+        #[cfg(windows)]
         {
+            // Reuse the existing graceful local RPC, with a bounded probe child.
+            let owned_pid = child.id().filter(|pid| {
+                crate::windows::Process::open(*pid, false).is_ok_and(|process| {
+                    process.matches_record(&self.paths.data_dir.join("intentd.pid"), *pid)
+                        && matches!(process.exited(), Ok(false))
+                })
+            });
+            let version = crate::state::load(&self.paths.state_path).current_version;
+            if let (Some(version), Some(pid)) = (version, owned_pid) {
+                let mut command = tokio::process::Command::new(self.paths.daemon_binary(&version));
+                command
+                    .args(["call", "system.shutdown"])
+                    .env("INTENTD_SHUTDOWN_EXPECTED_PID", pid.to_string())
+                    .kill_on_drop(true)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let _ = tokio::time::timeout(self.config.kill_timeout, command.status()).await;
+            }
+        }
+
+        if let Ok(result) = tokio::time::timeout(self.config.kill_timeout, child.wait()).await {
+            result.is_ok()
+        } else {
             eprintln!(
                 "intentd-sitter: intentd did not stop within {:?}; killing",
                 self.config.kill_timeout
             );
-            let _ = child.kill().await;
+            child.kill().await.is_ok()
         }
     }
 }
@@ -1286,7 +1496,6 @@ enum FailedStartCheck {
     /// A restart request (SIGHUP) arrived during the check; the caller must
     /// re-resolve the version from `state.json` and reset the backoff
     /// before respawning.
-    #[cfg(unix)]
     RestartRequested,
     /// A shutdown signal arrived during the check; exit with this code.
     Shutdown(i32),
@@ -1346,7 +1555,6 @@ enum BackoffOutcome {
     /// A restart request (SIGHUP) cut the wait short; the caller must
     /// re-resolve the version from `state.json` and reset the backoff
     /// before respawning.
-    #[cfg(unix)]
     RestartRequested,
     /// An update-now request (SIGUSR1, or SIGUSR2 — with no child running
     /// the idle hand-off degenerates to this) cut the wait short; the caller
@@ -1366,7 +1574,6 @@ enum SignalEvent {
     Shutdown(i32),
     /// Restart the supervised child in place without exiting the sitter
     /// (SIGHUP, sent by `intentd restart`).
-    #[cfg(unix)]
     Restart,
     /// Run the update check immediately, restarting the child only when a
     /// different version installs (SIGUSR1).
@@ -1402,11 +1609,13 @@ struct Signals {
     hup: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
     usr2: tokio::signal::unix::Signal,
+    stop: Option<tokio::net::UnixListener>,
+    stop_connection: Option<tokio::net::UnixStream>,
 }
 
 #[cfg(unix)]
 impl Signals {
-    fn new() -> io::Result<Self> {
+    fn new(_dir: &Path) -> io::Result<Self> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Self {
             term: signal(SignalKind::terminate())?,
@@ -1414,11 +1623,51 @@ impl Signals {
             hup: signal(SignalKind::hangup())?,
             usr1: signal(SignalKind::user_defined1())?,
             usr2: signal(SignalKind::user_defined2())?,
+            stop: None,
+            stop_connection: None,
         })
     }
 
+    /// A receipt proves orderly child cleanup; retaining the non-inherited
+    /// connection after it is written makes EOF a separate process-exit barrier.
+    /// Crash/early-close sends no receipt, so it cannot falsely confirm stop.
+    fn finish_stop(&mut self, exit_code: i32) -> i32 {
+        use std::io::Write;
+        if let Some(connection) = self.stop_connection.take() {
+            if let Ok(mut connection) = connection.into_std() {
+                let configured = connection
+                    .set_nonblocking(false)
+                    .and_then(|()| connection.set_write_timeout(Some(Duration::from_secs(1))));
+                if configured.is_ok() {
+                    let _ = connection.write_all(b"stopped\n");
+                }
+                std::mem::forget(connection);
+            }
+            // Installed service managers restart on failure. A successful
+            // private stop must leave the service stopped, even if the child
+            // needed SIGKILL or no child existed yet. External signals retain
+            // their original exit semantics because they have no connection.
+            return 0;
+        }
+        exit_code
+    }
+
     async fn recv(&mut self) -> SignalEvent {
+        let stop = async {
+            match &self.stop {
+                Some(listener) => loop {
+                    if let Ok((connection, _)) = listener.accept().await {
+                        break connection;
+                    }
+                },
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
+            connection = stop => {
+                self.stop_connection = Some(connection);
+                SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32)
+            },
             _ = self.term.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGTERM as i32),
             _ = self.int.recv() => SignalEvent::Shutdown(nix::sys::signal::Signal::SIGINT as i32),
             _ = self.hup.recv() => SignalEvent::Restart,
@@ -1428,22 +1677,55 @@ impl Signals {
     }
 }
 
-#[cfg(not(unix))]
-struct Signals;
-
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct Signals {
+    control: crate::windows::RestartControl,
+    restart_pending: Option<String>,
+    restart_during_readiness: bool,
+    interrupt: Option<tokio::signal::windows::CtrlC>,
+}
+#[cfg(windows)]
 impl Signals {
+    fn new(dir: &Path) -> io::Result<Self> {
+        Ok(Self {
+            control: crate::windows::RestartControl::create(dir)?,
+            restart_pending: None,
+            restart_during_readiness: false,
+            // Detached/task-launched sitters need no console. Failure to install
+            // a console handler must not masquerade as a shutdown request.
+            interrupt: tokio::signal::windows::ctrl_c().ok(),
+        })
+    }
     #[expect(
-        clippy::unnecessary_wraps,
-        reason = "mirrors the fallible unix constructor signature"
+        clippy::unused_self,
+        reason = "Unix receipt hook; Windows stop waits on retained process handles"
     )]
-    fn new() -> io::Result<Self> {
-        Ok(Self)
+    fn finish_stop(&mut self, exit_code: i32) -> i32 {
+        exit_code
     }
 
     async fn recv(&mut self) -> SignalEvent {
-        let _ = tokio::signal::ctrl_c().await;
-        SignalEvent::Shutdown(2) // SIGINT's conventional number
+        loop {
+            if self.control.take_stop().unwrap_or(false) {
+                return SignalEvent::Shutdown(0);
+            }
+            if let Ok(Some(nonce)) = self.control.take_request() {
+                self.restart_pending = Some(nonce);
+                return SignalEvent::Restart;
+            }
+            let interrupt = async {
+                match &mut self.interrupt {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                () = interrupt => return SignalEvent::Shutdown(2),
+                () = tokio::time::sleep(Duration::from_millis(25)) => {},
+            }
+        }
     }
 }
 
@@ -1457,12 +1739,6 @@ fn forward_signal(child: &tokio::process::Child, signal: i32) {
     };
     let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(id.cast_signed()), signal);
 }
-
-/// On windows the child shares the sitter's console, so ctrl-c is already
-/// delivered to it directly; the kill-timeout fallback in the caller covers
-/// a child that ignores it.
-#[cfg(not(unix))]
-fn forward_signal(_child: &tokio::process::Child, _signal: i32) {}
 
 /// The sitter's exit code for a child exit status: the code when there is
 /// one, the shell convention `128 + signal` for signal deaths.

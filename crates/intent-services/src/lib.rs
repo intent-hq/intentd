@@ -70,6 +70,7 @@ mod browser_tabs;
 mod capability;
 mod clone_ops;
 pub mod codex_diagnostics;
+mod codex_session_title;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
@@ -225,6 +226,8 @@ mod primitive_ops;
 mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
+pub mod provider_cli;
+mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
 pub mod provider_test_prompt;
@@ -30407,6 +30410,19 @@ impl WorkspaceApi for Services {
                 include_in_progress,
             )
             .await
+        })
+    }
+
+    fn agent_history_batch(
+        &self,
+        agent_id: AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.agent_history_batch_op(agent_id, before_seq, limit)
+                .await
         })
     }
 

@@ -109,6 +109,27 @@ impl ClientRequestHandler {
     /// Returns an error only when sending the response (or error response) over `conn` fails; handler-level failures are answered as JSON-RPC errors.
     pub async fn serve(&self, conn: &Connection, req: IncomingRequest) -> AcpResult<()> {
         let IncomingRequest { id, method, params } = req;
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // Native client terminals have no Codex sandbox. Restrict them too,
+        // so a fallback cannot delegate an unsandboxed command to the daemon.
+        if (method == "terminal/create" && crate::codex_sandbox::restricted(conn, session_id))
+            || (method == "fs/write_text_file" && crate::codex_sandbox::read_only(conn, session_id))
+        {
+            return conn
+                .respond_error(
+                    id,
+                    JsonRpcError {
+                        code: -32603,
+                        message: "Codex sandbox does not permit this client-served operation"
+                            .into(),
+                        data: None,
+                    },
+                )
+                .await;
+        }
         match method.as_str() {
             "fs/read_text_file" => self.handle_read(conn, id, params).await,
             "fs/write_text_file" => self.handle_write(conn, id, params).await,
@@ -195,7 +216,14 @@ impl ClientRequestHandler {
             &parsed,
         );
 
-        let outcome = if let Some(allow) = self.policy.auto_allow(data.risk_level) {
+        let policy = if crate::codex_sandbox::restricted(conn, parsed.session_id.0.as_ref())
+            && !crate::codex_sandbox::is_plan_approval(&parsed)
+        {
+            PermissionPolicy::DenyAll
+        } else {
+            self.policy
+        };
+        let outcome = if let Some(allow) = policy.auto_allow(data.risk_level) {
             // Headless: emit the prompt for observability, then resolve it now.
             self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
                 .await;

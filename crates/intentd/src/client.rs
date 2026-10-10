@@ -68,6 +68,23 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
 
     const ERROR_PIPE_BUSY: i32 = 231;
 
+    // Sitter cleanup must never send shutdown to a different launch. Retain
+    // the expected process while checking the peer on the very connection used
+    // for the request; a separate probe/reconnect would reintroduce the race.
+    let expected = if method == "system.shutdown" {
+        std::env::var_os("INTENTD_SHUTDOWN_EXPECTED_PID")
+            .map(|value| -> anyhow::Result<_> {
+                let pid = value
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|pid| *pid != 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid expected shutdown process identity"))?;
+                Ok((pid, intentd_sitter::windows::Process::open(pid, false)?))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let pipe = intent_transport::pipe_name_for_socket_path(socket)
         .map_err(|e| anyhow::anyhow!("cannot derive pipe name for {}: {e}", socket.display()))?;
     let mut attempts = 0u32;
@@ -84,6 +101,20 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
             ),
         }
     };
+    if let Some((pid, process)) = &expected {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetNamedPipeServerProcessId(pipe: *mut std::ffi::c_void, pid: *mut u32) -> i32;
+        }
+        let mut peer = 0;
+        // SAFETY: the connected pipe handle is retained and peer is writable.
+        let found = unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &raw mut peer) };
+        anyhow::ensure!(
+            found != 0 && peer == *pid && !process.exited()?,
+            "refusing shutdown of an endpoint not owned by the expected child"
+        );
+    }
     exchange(stream, method, params).await
 }
 

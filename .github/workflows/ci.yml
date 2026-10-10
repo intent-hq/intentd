@@ -30,7 +30,8 @@ on:
   # event-aware about this (see the gate comment): it requires the coverage
   # jobs outright on merge_group and accepts their skip on pull_request /
   # push, and the reverse for coverage-changed. The native matrix is skipped
-  # at job level on PRs, so it allocates no macOS / Windows Rust runners.
+  # at job level on PRs; the focused daemon-lifecycle matrix still runs on
+  # PRs and merge groups with real Windows/macOS/Linux runtime proof.
   # CI Gate requires native check, Clippy and runtime proofs on merge_group,
   # and its release builds on push. CI Gate is the sole required status check.
   # Merge groups are created by the repo's own ruleset from already-filed
@@ -1915,7 +1916,9 @@ jobs:
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the Codex ACP rolling pin PR automation
-        run: python3 -S scripts/test-auto-pin-codex-acp.py
+        run: |
+          python3 -S scripts/test-auto-pin-codex-acp.py
+          python3 -S scripts/test-provider-cli-metadata.py
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2
@@ -1988,6 +1991,11 @@ jobs:
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    env:
+      PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+      PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+      PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+      PI_DIAGNOSTICS_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.node }}
     defaults:
       run:
         shell: bash
@@ -2003,31 +2011,81 @@ jobs:
           printf '%s\n' "$pin" > pi-path-evidence/package.txt
           npm install --prefix .pi-acp-test --no-save --ignore-scripts --no-audit --no-fund "$pin"
           cp .pi-acp-test/node_modules/.package-lock.json pi-path-evidence/package-lock.json
+          node crates/intentd/tests/fixtures/pi-artifact-audit.mjs --record-package
       - name: Test the pinned adapter (strict)
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs test.tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs
       - name: Test cleanup failure observability
         if: ${{ !cancelled() }}
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs cleanup-checks.tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs
+      - name: Test bounded diagnostics and independent audit failure paths
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs diagnostic-checks.tap crates/intentd/tests/fixtures/pi-diagnostics.test.mjs crates/intentd/tests/fixtures/pi-artifact-audit.test.mjs
+      - name: Prove original startup errors through the supported fixture launcher
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs startup.tap crates/intentd/tests/fixtures/pi-startup-diagnostics.test.mjs
       - name: Install the real minimum Pi CLI
+        if: ${{ !cancelled() }}
         run: |
           minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
           npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum" "@earendil-works/pi-agent-core@$minimum" "@earendil-works/pi-ai@$minimum" "@earendil-works/pi-tui@$minimum"
           cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
       - name: Test real Pi lifecycle and supported MCP extension delivery
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs runtime.tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs
+      - name: Independently audit diagnostics, replay, cleanup and unchanged package bytes
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-artifact-audit.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pi-session-pinned-${{ matrix.os }}-node${{ matrix.node }}
           path: pi-path-evidence
           if-no-files-found: error
+
+  daemon-lifecycle:
+    name: Daemon lifecycle (${{ matrix.platform }})
+    needs: route
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
+          - platform: macos
+            os: [self-hosted, macOS, ARM64]
+          - platform: windows
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: daemon-lifecycle-${{ matrix.platform }}
+      - name: Native lifecycle lint and runtime proof
+        shell: bash
+        run: |
+          cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
+          python3 -I -B scripts/test-daemon-lifecycle.py
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
@@ -2048,11 +2106,21 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [daemon-lifecycle, check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
-          # PRs deliberately allocate no native matrix runners. A skip on
+          if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
+            echo "daemon-lifecycle must execute successfully on PR and merge queue"
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ needs.daemon-lifecycle.result }}" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          fi
+          # PRs deliberately skip the general native build matrix. A skip on
           # merge_group or push must never pass as native validation.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             case "${{ needs.build.result }}" in
