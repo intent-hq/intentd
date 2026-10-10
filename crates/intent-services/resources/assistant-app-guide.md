@@ -199,6 +199,14 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 ## Inspect a failed response and recover
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts. -->
+
+**Switch To** notifications for agent failures, attention requests, and automatic
+workspace unarchiving are skipped when that workspace is already selected, even
+if another conversation, file, or note is open. Notifications for other workspaces
+can still appear. The workspace's agent status and conversation notices remain
+available.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
 
 In the existing conversation, **Couldn't complete this response** summarizes a
