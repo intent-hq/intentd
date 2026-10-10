@@ -323,13 +323,14 @@ const [fixtureRoot, raw, component, mode, output, compiledRevision, compiledGene
 // Follow symlinks before resolving parent segments. Use this same physical
 // directory for validator discovery and every fixture read/write below.
 const root = fs.realpathSync.native(fixtureRoot);
-const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson } = await import(
+const { assertContract, assertGenerated, assertFresh, normalizeCases, hashJson, resolveGoldenPath } = await import(
   pathToFileURL(path.resolve(root, '../../../../scripts/check-transfer-selection-contract.mjs')));
 const read = p => JSON.parse(fs.readFileSync(p, 'utf8'));
 const contract = read(path.join(root, 'contract.json'));
 assertContract(contract);
+const goldenPath = await resolveGoldenPath({fixtureRoot: root, intentdRoot: component});
+if (mode === 'golden-path') { console.log(goldenPath); process.exit(0); }
 const cases = normalizeCases(read(raw));
-const goldenPath = path.join(root, 'public-sessions.json');
 if (mode === 'check') {
   const golden = read(goldenPath);
   assertGenerated(contract, golden);
@@ -370,15 +371,24 @@ fn verify(root: &Path, rows: &Path, mode: &str, output: &Path) -> std::process::
         .expect("Node is required to validate the shared transfer-selection contract")
 }
 
+// Use the contract owner's selection for the committed component expectation.
+fn fixture_golden(root: &Path) -> PathBuf {
+    let result = verify(root, Path::new(""), "golden-path", Path::new(""));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    PathBuf::from(String::from_utf8(result.stdout).unwrap().trim())
+}
+
 #[test]
 fn validator_accepts_physical_fixture_aliases() {
     let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let golden = fixture_golden(&fixtures);
     let temporary = test_tempdir("transfer-selection-paths-");
     let rows = temporary.path().join("rows.json");
-    write_json(
-        &rows,
-        &read_json(&fixtures.join("public-sessions.json"))["cases"],
-    );
+    write_json(&rows, &read_json(&golden)["cases"]);
     let alias = temporary.path().join("external alias with spaces");
     std::os::unix::fs::symlink(&fixtures, &alias).unwrap();
     // A lexical sibling must not replace the physical target after alias/..
@@ -405,12 +415,11 @@ fn validator_accepts_physical_fixture_aliases() {
 #[test]
 fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
     let fixtures = std::fs::canonicalize(fixture_root()).unwrap();
+    let golden = fixture_golden(&fixtures);
+    let golden_name = golden.file_name().unwrap().to_str().unwrap();
     let temporary = test_tempdir("transfer-selection-corrupt-paths-");
     let rows = temporary.path().join("rows.json");
-    write_json(
-        &rows,
-        &read_json(&fixtures.join("public-sessions.json"))["cases"],
-    );
+    write_json(&rows, &read_json(&golden)["cases"]);
     let physical_checkout = temporary.path().join("physical checkout");
     let lexical_checkout = temporary.path().join("lexical checkout");
     let physical = physical_checkout.join("docs/protocol/fixtures/transfer-selection");
@@ -427,7 +436,7 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
             checkout.join("scripts/check-transfer-selection-contract.mjs"),
         )
         .unwrap();
-        for file in ["contract.json", "public-sessions.json"] {
+        for file in ["contract.json", golden_name] {
             std::fs::copy(fixtures.join(file), root.join(file)).unwrap();
         }
     }
@@ -444,7 +453,7 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
     }
     for (file, diagnostic) in [
         ("contract.json", "contract keys"),
-        ("public-sessions.json", "generated envelope keys"),
+        (golden_name, "generated envelope keys"),
     ] {
         let original = std::fs::read(physical.join(file)).unwrap();
         write_json(&lexical.join(file), &json!({}));
@@ -556,22 +565,50 @@ fn rejects_legacy_alias_regression_and_cleans_failure() {
 #[test]
 fn full_response_drift_is_rejected_without_rewriting_golden() {
     let fixtures = fixture_root();
-    let golden = std::fs::read(fixtures.join("public-sessions.json")).unwrap();
+    let selected = Command::new("node")
+        .env_remove("NODE_OPTIONS")
+        .args(["--input-type=module", "-e", r"
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [fixtureRoot, intentdRoot] = process.argv.slice(1);
+const { resolveGoldenPath } = await import(pathToFileURL(path.resolve(fixtureRoot, '../../../../scripts/check-transfer-selection-contract.mjs')));
+console.log(await resolveGoldenPath({fixtureRoot, intentdRoot}));
+"])
+        .arg(&fixtures)
+        .arg(component_root())
+        .output()
+        .unwrap();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let golden_path = PathBuf::from(String::from_utf8(selected.stdout).unwrap().trim());
+    let golden = std::fs::read(&golden_path).unwrap();
+    let legacy = std::fs::read(fixtures.join("public-sessions.json")).unwrap();
     let root;
     {
         let temporary = test_tempdir("transfer-selection-drift-");
         root = temporary.path().to_path_buf();
-        let mut cases = read_json(&fixtures.join("public-sessions.json"))["cases"].clone();
-        cases[0]["session"]["unexpectedPublicField"] = json!(true);
+        let mut cases = read_json(&golden_path)["cases"].clone();
         let path = root.join("drift.json");
+        write_json(&path, &cases);
+        let clean = verify(&fixtures, &path, "check", Path::new(""));
+        assert!(
+            clean.status.success(),
+            "clean selected payload must pass before mutation: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        cases[0]["session"]["unexpectedPublicField"] = json!(true);
         write_json(&path, &cases);
         let result = verify(&fixtures, &path, "check", Path::new(""));
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("stale public-sessions.json"));
     }
     assert!(!root.exists(), "comparison temporary root leaked");
+    assert_eq!(std::fs::read(&golden_path).unwrap(), golden);
     assert_eq!(
         std::fs::read(fixtures.join("public-sessions.json")).unwrap(),
-        golden
+        legacy
     );
 }

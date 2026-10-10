@@ -23,6 +23,7 @@ pub(crate) mod app;
 pub(crate) mod browser;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
+pub(crate) mod desktop;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod git;
@@ -90,6 +91,9 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         cross_workspace::PRELUDE,
         pr.as_str(),
     ];
+    if features.desktop_control {
+        fragments.push(desktop::PRELUDE);
+    }
     if features.browser_automation {
         fragments.push(browser::PRELUDE);
     }
@@ -231,6 +235,11 @@ pub(crate) async fn try_dispatch(
         .or_else(|| method.strip_prefix("mr."))
     {
         return pr::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("desktop.") {
+        return desktop::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
     }

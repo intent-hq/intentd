@@ -787,3 +787,163 @@ async fn workspace_delete_browser_batch_failure_evicts_only_committed_overlays()
     );
     assert_deleted(&store, &doomed, 0).await;
 }
+
+#[tokio::test]
+async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failure() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let workspace = seed_workspace(&store, "desktop-delete-race").await;
+    let agent = AgentId::from("desktop-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &workspace))
+        .await
+        .unwrap();
+    let principal = store.get_primary_principal().await.unwrap().id;
+    let keeper = seed_workspace(&store, "desktop-keeper").await;
+    let kept_agent = AgentId::from("desktop-kept-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&kept_agent, &keeper))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_desktop_final_delete BEFORE DELETE ON workspace BEGIN SELECT RAISE(ABORT,'late workspace failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+    let deleting = {
+        let store = store.clone();
+        let workspace = workspace.clone();
+        tokio::spawn(async move { store.delete_workspace(&workspace).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), barrier.entered.notified())
+        .await
+        .unwrap();
+    // A real producer enters after the successful scope sweep while the agent
+    // still exists. It must be refused, not queued behind the whole teardown.
+    let late_write = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.desktop_set_permission(&principal, &workspace, &agent, "physical", true),
+    )
+    .await
+    .unwrap();
+    let binding = serde_json::json!({
+        "workspaceId": workspace, "agentId": agent, "principalId": principal,
+        "clientId": "client", "computerId": "physical"
+    });
+    let late_request = store
+        .desktop_insert_request("late-request", &workspace, &agent, &binding)
+        .await;
+    let late_terminal = store
+        .desktop_insert_terminal("late-session", &workspace, &agent, &binding, "hash")
+        .await;
+    let late_outcome = store
+        .desktop_resolve_request("late-request", &workspace, &agent, "granted", &binding)
+        .await;
+    let late_claim = store
+        .desktop_claim_primary("late-request", &binding, "generation", true)
+        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.desktop_set_permission(&principal, &keeper, &kept_agent, "physical", true),
+    )
+    .await
+    .unwrap()
+    .expect("unrelated workspace remains writable");
+    barrier.release.notify_one();
+    assert!(deleting.await.unwrap().is_err());
+    assert!(store.get_agent_session_summary(&agent).await.is_err());
+    let orphan_count:i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*' AND json_extract(value,'$.agentId')=?")
+        .bind(agent.as_str()).fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(
+        orphan_count, 0,
+        "late desktop producer left private state for a deleted session"
+    );
+    assert!(
+        late_write.is_err(),
+        "desktop writes must be refused during teardown"
+    );
+    assert!(
+        late_request.is_err()
+            && late_terminal.is_err()
+            && late_outcome.is_err()
+            && late_claim.is_err()
+    );
+    assert!(store
+        .desktop_terminal("late-session")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        store
+            .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
+            .await
+            .is_err(),
+        "deleted agent cannot regain consent after the deletion guard is released"
+    );
+    assert!(store
+        .desktop_permission(&principal, &keeper, &kept_agent, "physical")
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let workspace = seed_workspace(&store, "desktop-concurrent-delete").await;
+    let agent = AgentId::from("desktop-deleted-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &workspace))
+        .await
+        .unwrap();
+    let keeper = seed_workspace(&store, "desktop-unrelated-workspace").await;
+    let kept_agent = AgentId::from("desktop-unrelated-agent");
+    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+
+    // The first deletion owns the desktop guard, has released lifecycle
+    // serialization, and will need it again for its nested agent deletion.
+    let mut first = Box::pin(store.delete_workspace(&workspace));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            () = barrier.entered.notified() => {},
+            result = &mut first => panic!("deletion finished before the barrier: {result:?}"),
+        }
+    })
+    .await
+    .expect("first deletion reaches the desktop sweep barrier");
+    *store.desktop_delete_barrier.lock().unwrap() = None;
+
+    // Poll the competing Store clone to its lock wait without a timing sleep.
+    let second_store = store.clone();
+    let mut second = Box::pin(second_store.delete_workspace(&workspace));
+    std::future::poll_fn(|cx| {
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        store.insert_agent_session(&sample_agent_session(&kept_agent, &keeper)),
+    )
+    .await
+    .expect("same-workspace delete waiter must not block unrelated lifecycle writers")
+    .unwrap();
+
+    barrier.release.notify_one();
+    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("both workspace deletions must settle");
+    first_result.unwrap();
+    assert!(matches!(second_result, Err(Error::NotFound(_))));
+    assert!(matches!(
+        store.get_workspace(&workspace).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(store.get_agent_session_summary(&agent).await.is_err());
+    store.get_agent_session_summary(&kept_agent).await.unwrap();
+}

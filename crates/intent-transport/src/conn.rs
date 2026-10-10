@@ -1257,6 +1257,7 @@ async fn forward_subscription(
                     return;
                 };
                 for mut event in batch {
+                    if !intent_core::desktop::event_visible(&event) { continue; }
                     // The revocation branch sends this exact durable event once,
                     // ahead of close, rather than racing its bulk forwarder.
                     if host_removal_control && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
@@ -1678,8 +1679,9 @@ where
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
+    let desktop = intent_core::desktop::current_connection();
     tokio::spawn(crate::context::with_credential_context(
-        is_tcp, caller, credential, forwarder,
+        is_tcp, caller, credential, desktop, forwarder,
     ))
 }
 

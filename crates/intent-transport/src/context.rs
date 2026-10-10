@@ -389,6 +389,7 @@ pub(crate) struct CapturedFrame {
     caller: Option<Caller>,
     credential: Option<intent_core::caller::WireCredential>,
     completion: Option<Arc<RequestCompletion>>,
+    desktop: Option<intent_core::desktop::DesktopConnection>,
 }
 
 impl CapturedFrame {
@@ -398,6 +399,7 @@ impl CapturedFrame {
             is_tcp: is_tcp_connection(),
             caller: current_caller(),
             credential: intent_core::caller::current_wire_credential(),
+            desktop: intent_core::desktop::current_connection(),
             completion: READ_CONNECTION
                 .try_with(|owner| {
                     owner.as_ref().and_then(|owner| {
@@ -442,6 +444,7 @@ impl CapturedFrame {
             self.is_tcp,
             self.caller.clone(),
             self.credential.clone(),
+            self.desktop.clone(),
             async {
                 if let Some(scope) = self.read_scope() {
                     let mut result = None;
@@ -535,10 +538,57 @@ pub(crate) fn with_credential_context<F: Future>(
     is_tcp: bool,
     caller: Option<Caller>,
     credential: Option<intent_core::caller::WireCredential>,
+    desktop: Option<intent_core::desktop::DesktopConnection>,
     future: F,
 ) -> impl Future<Output = F::Output> {
     intent_core::caller::with_wire_credential(
         credential,
-        with_request_context(is_tcp, caller, future),
+        intent_core::desktop::with_connection(
+            desktop,
+            with_request_context(is_tcp, caller, future),
+        ),
     )
+}
+
+#[cfg(test)]
+mod desktop_frame_tests {
+    use super::*;
+    use intent_core::desktop::{current_connection, with_connection, DesktopConnection};
+    use intent_core::{ClientId, PrincipalId};
+
+    fn connection(epoch: &str) -> DesktopConnection {
+        DesktopConnection {
+            client_id: ClientId("desktop-client".into()),
+            principal_id: PrincipalId("desktop-owner".into()),
+            connection_epoch: epoch.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_frame_preserves_original_desktop_connection() {
+        let original = connection("original-epoch");
+        let frame =
+            with_connection(Some(original.clone()), async { CapturedFrame::capture() }).await;
+        let observed = tokio::spawn(async move {
+            with_connection(
+                Some(connection("replacement-epoch")),
+                frame.run(async { current_connection() }),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(observed, Some(original));
+    }
+
+    #[tokio::test]
+    async fn unbound_frame_does_not_inherit_another_desktop_connection() {
+        let frame = with_connection(None, async { CapturedFrame::capture() }).await;
+        let observed = with_connection(
+            Some(connection("other-epoch")),
+            frame.run(async { current_connection() }),
+        )
+        .await;
+        assert_eq!(observed, None);
+    }
 }

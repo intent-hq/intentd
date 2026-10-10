@@ -1308,6 +1308,7 @@ impl WsInner {
             true,
             caller.clone(),
             credential_binding.clone(),
+            None,
             async {
                 if credential_binding.is_some() {
                     crate::context::ReadConnectionGuard::bind(
@@ -1501,30 +1502,33 @@ impl WsInner {
                         // Wrap in connection context (is_tcp=true for WSS) so server.*
                         // RPCs gate on real origin, not the locality flag (§5.2), and
                         // bind the caller resolved at upgrade (multiplayer w1).
-                        let frame_ok = intent_core::caller::with_wire_credential(
-                            credential_binding.clone(),
-                            crate::context::with_request_context(
-                                true,
-                                caller.clone(),
-                                read_connection.run(async {
-                                    crate::context::with_repository_frame(&text, || {
-                                        conn::process_frame(
-                                            &text,
-                                            &self.api,
-                                            &self.bus,
-                                            &app_tx,
-                                            &mut subs,
-                                            &reverse,
-                                            &reverse_guard,
-                                            self.control.as_ref(),
-                                            self.server_pairing_info.as_ref(),
-                                            &mut client_id,
-                                            self.locality_is_local,
-                                            &self.rpc_limiter,
-                                        )
-                                    })
-                                    .await
-                                }),
+                        let frame_ok = intent_core::desktop::with_connection(
+                            reverse_guard.desktop_connection(),
+                            intent_core::caller::with_wire_credential(
+                                credential_binding.clone(),
+                                crate::context::with_request_context(
+                                    true,
+                                    caller.clone(),
+                                    read_connection.run(async {
+                                        crate::context::with_repository_frame(&text, || {
+                                            conn::process_frame(
+                                                &text,
+                                                &self.api,
+                                                &self.bus,
+                                                &app_tx,
+                                                &mut subs,
+                                                &reverse,
+                                                &reverse_guard,
+                                                self.control.as_ref(),
+                                                self.server_pairing_info.as_ref(),
+                                                &mut client_id,
+                                                self.locality_is_local,
+                                                &self.rpc_limiter,
+                                            )
+                                        })
+                                        .await
+                                    }),
+                                ),
                             ),
                         )
                         .await;

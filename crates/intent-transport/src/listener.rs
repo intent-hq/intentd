@@ -248,7 +248,7 @@ where
         .into_caller(api.as_ref())
         .await;
     let read_connection =
-        crate::context::with_credential_context(false, caller.clone(), None, async {
+        crate::context::with_credential_context(false, caller.clone(), None, None, async {
             if caller.is_some() {
                 crate::context::ReadConnectionGuard::bind(
                     api.as_ref(),
@@ -349,6 +349,7 @@ where
             false,
             caller.clone(),
             None,
+            reverse_guard.desktop_connection(),
             read_connection.run(async {
                 crate::context::with_repository_frame(trimmed, || {
                     process_frame(
