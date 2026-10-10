@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.42] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Emit compact monitor required-check counts ([#2380](https://github.com/intent-hq/intentd/pull/2380))
+
+### 📚 Documentation
+
+- Explain unsupported binary artifact downloads ([#2373](https://github.com/intent-hq/intentd/pull/2373))
+
+
 ## [0.10.41] - 2026-10-10
 
 ### 📚 Documentation
