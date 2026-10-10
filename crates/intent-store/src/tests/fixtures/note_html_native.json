@@ -1,0 +1,448 @@
+[
+  {
+    "case": "cellRoles",
+    "source": "<table><tr><th>HEADER</th><td>DATA</td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "HEADER",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableHeader"
+                },
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "DATA",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "implicitBodiesAndEnds",
+    "source": "<table><tr><td>ONE<td>TWO<tr><td>THREE</table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "ONE",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                },
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "TWO",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            },
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "THREE",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "entitiesAndWhitespace",
+    "source": "<table><tr><td> A &amp; B&#x1f680;\r\n  C\t D&nbsp;E<br>F </td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "A & B🚀 C D E",
+                          "type": "text"
+                        },
+                        {
+                          "type": "hardBreak"
+                        },
+                        {
+                          "text": "F",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "nestedTable",
+    "source": "<table><tr><td>OUTER<table><tr><th>INNER</th></tr></table>AFTER</td><td>LAST</td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "OUTER",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    },
+                    {
+                      "content": [
+                        {
+                          "content": [
+                            {
+                              "attrs": {
+                                "align": null,
+                                "colspan": 1,
+                                "colwidth": null,
+                                "rowspan": 1
+                              },
+                              "content": [
+                                {
+                                  "content": [
+                                    {
+                                      "text": "INNER",
+                                      "type": "text"
+                                    }
+                                  ],
+                                  "type": "paragraph"
+                                }
+                              ],
+                              "type": "tableHeader"
+                            }
+                          ],
+                          "type": "tableRow"
+                        }
+                      ],
+                      "type": "table"
+                    },
+                    {
+                      "content": [
+                        {
+                          "text": "AFTER",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                },
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "LAST",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "malformedSpans",
+    "source": "<table><tr><td rowspan=\"0\" colspan=\"-2\">ZERO</td><td rowspan=\"wat\" colspan=\"999999999999999999999\">BAD</td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "ZERO",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                },
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "BAD",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "unsafeAttributes",
+    "source": "<table onclick=\"alert(1)\" style=\"color:red\"><tr><td data-unknown=\"raw\" title=\"cell\" onmouseover=\"alert(2)\"><a href=\"javascript:alert(3)\" title=\"link\">LINK</a><script>evil()</script><style>body{display:none}</style>TEXT</td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "text": "LINKTEXT",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  },
+  {
+    "case": "retainedAttributes",
+    "source": "<table><tr><td><a href=\"https://example.test/long\" title=\"tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt\">LINK</a><img src=\"https://example.test/image.png\" alt=\"ALT\" title=\"IMAGE\"></td></tr></table>",
+    "native": {
+      "content": [
+        {
+          "content": [
+            {
+              "content": [
+                {
+                  "attrs": {
+                    "align": null,
+                    "colspan": 1,
+                    "colwidth": null,
+                    "rowspan": 1
+                  },
+                  "content": [
+                    {
+                      "content": [
+                        {
+                          "marks": [
+                            {
+                              "attrs": {
+                                "class": "text-primary-ink underline cursor-pointer",
+                                "href": "https://example.test/long",
+                                "rel": "noopener noreferrer nofollow",
+                                "target": "_blank"
+                              },
+                              "type": "link"
+                            }
+                          ],
+                          "text": "LINK",
+                          "type": "text"
+                        }
+                      ],
+                      "type": "paragraph"
+                    },
+                    {
+                      "attrs": {
+                        "alt": "ALT",
+                        "height": null,
+                        "mediaUnsupported": null,
+                        "src": "https://example.test/image.png",
+                        "title": "IMAGE",
+                        "width": null
+                      },
+                      "type": "image"
+                    }
+                  ],
+                  "type": "tableCell"
+                }
+              ],
+              "type": "tableRow"
+            }
+          ],
+          "type": "table"
+        }
+      ],
+      "type": "doc"
+    }
+  }
+]

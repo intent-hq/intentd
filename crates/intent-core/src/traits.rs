@@ -1051,6 +1051,46 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
+    /// Persistent backend identity only when bounded note reads and annotations are available.
+    fn note_paging_backend_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Read bounded indexed source/context/metadata at one live revision.
+    fn get_note_page(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        request: crate::note_page::NotePageRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, request, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
+    }
+
+    /// Read an opt-in annotation page under current scope and authorization.
+    fn get_note_annotation_page(
+        &self,
+        method: crate::note_annotation::AnnotationMethod,
+        request: crate::note_annotation::AnnotationReadRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (method, request, rpc_id);
+        Box::pin(async { Err(crate::Error::Unsupported("annotation pages".into())) })
+    }
+
+    /// Read one bounded persisted subscription tuple under current authorization.
+    /// An incarnation pins a running subscription to its deletion tombstone.
+    fn get_note_page_state(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        incarnation: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, note_id, incarnation);
+        Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let _ = (workspace_id, note_id);
         Box::pin(async {
@@ -1244,6 +1284,38 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::update_note_metadata not implemented".to_string(),
             ))
         })
+    }
+
+    /// Whether this implementation provides the complete grace deletion contract.
+    fn supports_note_delete_grace(&self) -> bool {
+        false
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn schedule_note_delete(
+        &self,
+        request: crate::note_delete::NoteDeleteSchedule,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn cancel_note_delete(
+        &self,
+        request: crate::note_delete::NoteDeleteCancel,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
+    }
+
+    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
+    fn note_delete_status(
+        &self,
+        request: crate::note_delete::NoteDeleteStatus,
+    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteStatusResponse>> {
+        let _ = request;
+        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
     }
 
     /// `note.delete`: remove a note (PROTOCOL §5.2). `expected_version` gates the

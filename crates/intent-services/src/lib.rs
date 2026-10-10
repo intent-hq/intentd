@@ -97,6 +97,7 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
+mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -203,8 +204,10 @@ mod linear_ops;
 mod member_removal;
 mod model_catalog;
 mod nested_repos;
+mod note_annotation;
 mod note_merge;
 pub mod note_ops;
+mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -336,8 +339,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
-    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, InvalidationSubscription, SharedWatchHub, Subscription,
+    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -697,6 +700,7 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -1639,6 +1643,7 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
+            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -6739,6 +6744,8 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
+        self.note_deletions.close();
+        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -10978,9 +10985,8 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match persist_note_content(store, &note, Some(current_rev), author).await {
+        match plan.persist(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
-                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -11005,11 +11011,8 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers first persist the note-content change via an atomic
-/// versioned write (`persist_note_content` / the `*_with_version` store
-/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
-/// cannot leave comment rows flagged orphaned while the persisted markdown
-/// still contains the original anchors.
+/// writes. Callers commit source, its version, orphan flags and anchor readiness
+/// together through the versioned writer; a failure leaves every row unchanged.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -11032,7 +11035,7 @@ async fn reanchor_note_comments(
     // debris too.
     let mut live_ids = live_comment_ids(&comments);
     let mut current = content;
-    let mut orphaned: Vec<Comment> = Vec::new();
+    let mut orphaned: Vec<String> = Vec::new();
     for comment in &comments {
         // Only root-level anchored comments carry markers; replies inherit the
         // parent's anchor and never inject their own into the note body.
@@ -11047,18 +11050,12 @@ async fn reanchor_note_comments(
             note_ops::AnchorState::Healthy => {}
             note_ops::AnchorState::Missing => {
                 live_ids.remove(&comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::Degenerate => {
                 live_ids.remove(&comment.id);
                 current = note_ops::remove_anchor_markers(&current, &comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
                 let outcome = note_ops::recover_partial_anchor(
@@ -11079,10 +11076,7 @@ async fn reanchor_note_comments(
                         );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
-                        let mut updated = comment.clone();
-                        updated.is_orphaned = Some(true);
-                        updated.updated_at = now_iso();
-                        orphaned.push(updated);
+                        orphaned.push(comment.id.clone());
                     }
                 }
             }
@@ -11114,22 +11108,27 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 /// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
-    orphaned: Vec<Comment>,
+    orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    /// Persist the queued orphan flips. Callers **must** run this only after
-    /// the note-content write has succeeded so a note-write failure cannot
-    /// leave comment rows marked orphaned while the persisted markdown still
-    /// contains the original anchors. If a comment update fails after the
-    /// note has been written the anchors on disk are still a valid pointer
-    /// (either intact or scrubbed) and the next mutation's reanchor pass
-    /// will finish the job.
-    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
-        for c in self.orphaned {
-            store.update_comment(workspace_id, &c).await?;
-        }
-        Ok(())
+    async fn persist(
+        &self,
+        store: &Store,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
+        store
+            .update_note_with_version_and_orphans(
+                note,
+                expected_version,
+                author,
+                &note.updated_at,
+                &self.orphaned,
+            )
+            .await
+            .map(|(revision, _)| revision)
     }
 }
 
@@ -11254,14 +11253,25 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// The write is idempotent (upsert), so a race between two computes leaves
-    /// the store consistent with the *latest* one to complete.
+    /// A generation ticket binds the computation to its original source and
+    /// prevents an older or superseded job from publishing over newer state.
+    /// Indexed attribution and the compatible legacy snapshot commit together.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
+        let job = self
+            .store
+            .begin_note_attribution(workspace_id, note_id, note.rev)
+            .await?;
+        // Publish the committed pending invalidation without fabricating an
+        // empty legacy attribution result. Existing note listeners can re-read.
+        publish_event_transient(
+            self.event_bus.as_ref(),
+            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
+        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11300,7 +11310,9 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store.upsert_note_line_attribution(&data).await?;
+        self.store
+            .publish_note_attribution(&job, &note.content, &data)
+            .await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -16524,12 +16536,13 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children(
+                .update_note_with_version_and_children_and_orphans(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
+                    &plan.orphaned,
                 )
                 .await
             {
@@ -16543,7 +16556,6 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
-                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -25163,6 +25175,51 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn note_paging_backend_id(&self) -> Option<String> {
+        Some(self.store.note_paging_backend_id().to_owned())
+    }
+
+    fn get_note_page(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        request: intent_core::note_page::NotePageRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let principal = match intent_core::current_caller() {
+                Some(intent_core::Caller::Wire { principal_id, .. }) => {
+                    format!("principal:{}", principal_id.0)
+                }
+                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
+                Some(intent_core::Caller::Daemon) => "daemon".into(),
+                None => return Err(Error::Forbidden("Caller required".into())),
+            };
+            self.store
+                .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
+                .await
+        })
+    }
+
+    fn get_note_annotation_page(
+        &self,
+        method: intent_core::note_annotation::AnnotationMethod,
+        request: intent_core::note_annotation::AnnotationReadRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_annotation_page(method, request, rpc_id))
+    }
+
+    fn get_note_page_state(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        incarnation: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -25316,8 +25373,10 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                if let Some(plan) = &reanchor_plan {
+                    plan.persist(&store, &note, expected_version, &user_version_author())
+                        .await?;
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -25330,9 +25389,6 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
-            if let Some(plan) = reanchor_plan {
-                plan.apply_orphaned(&store, &workspace_id).await?;
-            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -25806,6 +25862,31 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
+    }
+
+    fn supports_note_delete_grace(&self) -> bool {
+        true
+    }
+
+    fn schedule_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteSchedule,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_schedule(request))
+    }
+
+    fn cancel_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteCancel,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_cancel(request))
+    }
+
+    fn note_delete_status(
+        &self,
+        request: intent_core::note_delete::NoteDeleteStatus,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
+        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(
@@ -26414,9 +26495,8 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                match plan.persist(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
-                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {

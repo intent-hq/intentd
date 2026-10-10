@@ -25,7 +25,9 @@ mod sharing;
 mod workspace_delete;
 
 mod metadata_key_json;
+mod note_annotations;
 mod note_line_attribution;
+mod note_pages;
 mod note_search;
 
 #[tokio::test]
@@ -7298,6 +7300,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
+        note_pages: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)

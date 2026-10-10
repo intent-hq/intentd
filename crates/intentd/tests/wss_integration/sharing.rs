@@ -468,3 +468,47 @@ async fn sharing_authorship_and_sender_spoofing_over_wss() {
     drop((a, b, guest));
     srv.ws.stop().await;
 }
+
+#[tokio::test]
+async fn bounded_note_pages_reauthorize_each_wss_request_and_scope_cursors() {
+    let srv = start(WsOptions::default()).await;
+    let mut alice = Guest::connect(&srv, &"1a".repeat(32)).await;
+    let mut bob = Guest::connect(&srv, &"bc".repeat(32)).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    srv.store
+        .insert_note(&fixture_note(&ws, "spec", &"private source".repeat(1000)))
+        .await
+        .unwrap();
+    for principal in [&alice.principal.id, &bob.principal.id] {
+        srv.store
+            .add_workspace_member(&ws, principal, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+    }
+    let first = alice
+        .call(
+            "note.get",
+            json!({"workspaceId":ws,"noteId":"spec","page":{"kind":"source","maxSourceBytes":16}}),
+        )
+        .await;
+    assert_eq!(first["result"]["kind"], "noteSourcePage", "{first}");
+    let continuation = json!({"workspaceId":ws,"noteId":"spec","page":{"kind":"source","cursor":first["result"]["nextCursor"],"maxSourceBytes":16}});
+    let crossed = bob.call("note.get", continuation.clone()).await;
+    assert_eq!(
+        crossed["error"]["data"]["code"], "note-page-cursor-invalid",
+        "{crossed}"
+    );
+    srv.store
+        .remove_workspace_member(&ws, &alice.principal.id)
+        .await
+        .unwrap();
+    let revoked = alice.call("note.get", continuation).await;
+    assert_eq!(revoked["error"]["data"]["code"], "not-found", "{revoked}");
+    assert!(!revoked.to_string().contains("private source"));
+    drop((alice, bob));
+    srv.ws.stop().await;
+}

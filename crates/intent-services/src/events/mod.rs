@@ -15,7 +15,7 @@ pub(crate) mod skills_watcher;
 pub(crate) mod specialists_watcher;
 pub mod watcher;
 
-pub use bus::{Delivery, EventBus, Subscription};
+pub use bus::{Delivery, EventBus, InvalidationSubscription, Subscription};
 pub use filter::{event_type_matches, SubscriptionFilter};
 pub(crate) use filter::{
     is_agent_restricted_event_type, resolve_event_types, resolve_event_types_for_agent,
