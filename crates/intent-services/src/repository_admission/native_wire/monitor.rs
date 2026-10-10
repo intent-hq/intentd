@@ -267,6 +267,11 @@ pub(crate) async fn list(
                         target,
                     )?);
                     admissions.push(admitted);
+                } else {
+                    monitors.push(crate::pr_monitor::recovery_pr_monitor_wire(
+                        row.monitor(),
+                        intent_core::review_monitor::ReviewMonitorUnresolvedReason::MissingAuthority,
+                    ));
                 }
             }
         }
@@ -296,10 +301,15 @@ pub(crate) async fn cancel(
         return Ok(None);
     }
     let row = services.store.get_qualified_pr_monitor(monitor_id).await?;
-    let intent_store::PersistedMonitorTarget::Unresolved { reason } = row.target() else {
+    if matches!(
+        row.target(),
+        intent_store::PersistedMonitorTarget::Resolved {
+            provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+            ..
+        }
+    ) {
         return Ok(None);
-    };
-    let reason = *reason;
+    }
     if &row.monitor().workspace_id != workspace
         || row.monitor().state != intent_core::PrMonitorState::Active
     {
@@ -307,6 +317,26 @@ pub(crate) async fn cancel(
     }
     let request = super::Request::current(services).map_err(|_| super::unavailable())?;
     let recipient = Recipient::acquire(&request, workspace).await?;
+    let reason = match row.target() {
+        intent_store::PersistedMonitorTarget::Unresolved { reason } => {
+            use intent_core::review_monitor::ReviewMonitorUnresolvedReason as Reason;
+            match reason {
+                intent_store::MonitorTargetUnresolvedReason::MissingProvenance => {
+                    Reason::MissingProvenance
+                }
+                intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => {
+                    Reason::UnverifiedImport
+                }
+                intent_store::MonitorTargetUnresolvedReason::InvalidTarget => Reason::InvalidTarget,
+            }
+        }
+        intent_store::PersistedMonitorTarget::Resolved { .. } => {
+            if admission::acquire(&request, &recipient, &row).await.is_ok() {
+                return Ok(None);
+            }
+            intent_core::review_monitor::ReviewMonitorUnresolvedReason::MissingAuthority
+        }
+    };
     // Reserve the writer before entering source/recipient fences. Membership
     // changes after acquisition retire this lifetime through the Store observer.
     let now = intent_core::now_iso();
@@ -368,7 +398,7 @@ pub(crate) async fn cancel(
         super::RequestState::Monitor(Projection::new(recipient, Vec::new()));
     Ok(Some(serde_json::json!({
         "ok": true,
-        "monitor": crate::pr_monitor::unresolved_pr_monitor_wire(&monitor, reason),
+        "monitor": crate::pr_monitor::recovery_pr_monitor_wire(&monitor, reason),
     })))
 }
 

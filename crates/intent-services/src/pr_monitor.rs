@@ -1720,18 +1720,29 @@ pub(crate) fn unresolved_pr_monitor_wire(
     m: &PrMonitor,
     reason: intent_store::MonitorTargetUnresolvedReason,
 ) -> Value {
+    use intent_core::review_monitor::ReviewMonitorUnresolvedReason as Reason;
+    let reason = match reason {
+        intent_store::MonitorTargetUnresolvedReason::MissingProvenance => Reason::MissingProvenance,
+        intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => Reason::UnverifiedImport,
+        intent_store::MonitorTargetUnresolvedReason::InvalidTarget => Reason::InvalidTarget,
+    };
+    recovery_pr_monitor_wire(m, reason)
+}
+
+/// Safe recovery controls for an original row whose private observation cannot
+/// presently be admitted. This does not change its persisted qualification.
+pub(crate) fn recovery_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_core::review_monitor::ReviewMonitorUnresolvedReason,
+) -> Value {
     let mut safe = m.clone();
     safe.pending_changes.clear();
     safe.last_snapshot = None;
     safe.last_error = None;
     let mut value = pr_monitor_wire(&safe, None);
     value["hasPendingChanges"] = json!(!m.pending_changes.is_empty());
-    let reason = match reason {
-        intent_store::MonitorTargetUnresolvedReason::MissingProvenance => "missing-provenance",
-        intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => "unverified-import",
-        intent_store::MonitorTargetUnresolvedReason::InvalidTarget => "invalid-target",
-    };
-    value["monitorAvailability"] = json!({"state":"unresolved","reason":reason});
+    value["monitorAvailability"] =
+        json!(intent_core::review_monitor::ReviewMonitorAvailability::Unresolved { reason });
     value
 }
 
