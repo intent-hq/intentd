@@ -395,6 +395,24 @@ impl PromptOrigin {
 }
 
 impl RepositoryPromptContext {
+    pub(crate) async fn recover_monitor(
+        self,
+        row: &intent_store::QualifiedPrMonitor,
+        connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<crate::repository_read_source::MonitorAuthority>> {
+        let services = self.owner.services.clone();
+        let destination = self.into_monitor_destination()?;
+        destination
+            .run(Box::pin(async {
+                let retained = destination.original().read().retain_monitor()?;
+                crate::repository_read_source::MonitorAuthority::recover(
+                    &services, retained, row, connection,
+                )
+                .await
+            }))
+            .await
+    }
+
     pub(crate) fn into_monitor_destination(
         self,
     ) -> AdmissionResult<RepositoryManagerPromptRequest> {

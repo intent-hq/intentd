@@ -134,6 +134,7 @@ impl EndpointBlueprint {
         physical: &crate::repository_admission::lifecycle::physical_owner::RepositoryPhysicalOwner,
         workspace: &intent_core::WorkspaceId,
         agent: &intent_core::AgentId,
+        recipient: Option<intent_acp::review_monitoring::PendingReviewMonitoring>,
     ) -> Option<Arc<LiveContext>> {
         let (services, session) = self.server.original.as_ref()?;
         if !intent_core::harness_supports_repository_guidance(&session.harness_version)
@@ -148,7 +149,13 @@ impl EndpointBlueprint {
             session_id: physical.confirmed_session_id().into(),
             owner: RepositoryContextOwner::bind(
                 services.clone(),
-                self.server.read_owner.clone(),
+                self.server.read_owner.clone().map(|owner| {
+                    owner.with_monitor_recipient(
+                        recipient,
+                        connection,
+                        physical.confirmed_session_id(),
+                    )
+                }),
                 physical,
             ),
             acknowledged: AtomicBool::new(false),
@@ -216,6 +223,23 @@ pub(crate) struct RepositoryPromptInput {
     captured: Option<AdmissionResult<RepositoryPromptContext>>,
 }
 impl RepositoryPromptInput {
+    pub(crate) async fn recover_monitor(
+        &mut self,
+        row: &intent_store::QualifiedPrMonitor,
+        connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<crate::repository_read_source::MonitorAuthority>> {
+        if !self.binding.acknowledged.load(Ordering::SeqCst)
+            || self.binding.retired.load(Ordering::SeqCst)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        self.captured
+            .take()
+            .ok_or(AdmissionError::Retired)??
+            .recover_monitor(row, connection)
+            .await
+    }
+
     pub(crate) async fn prepare_monitor(
         &mut self,
         authority: Arc<crate::repository_read_source::MonitorAuthority>,

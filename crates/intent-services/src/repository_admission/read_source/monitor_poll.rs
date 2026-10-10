@@ -21,7 +21,15 @@ pub(crate) struct MonitorPromptAdmission {
     session_id: String,
     text: String,
     params: serde_json::Value,
+    persisted: std::sync::OnceLock<intent_core::AgentMessage>,
+    committed: std::sync::OnceLock<CommittedMonitorPrompt>,
     transferred: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct CommittedMonitorPrompt {
+    params: serde_json::Value,
+    // Retain exactly the verified message, never reload output by public ID.
+    _proof: intent_store::MonitorMessageProvenance,
 }
 
 impl MonitorPromptAdmission {
@@ -73,13 +81,19 @@ impl MonitorPromptAdmission {
                                         .get()
                                         .ok_or(AdmissionError::Retired)?
                                         .with_current(&mut || {
-                                            result = Some(insert
-                                                .take()
-                                                .ok_or(RepositoryCredentialError::Retired)?(
-                                                owner
-                                                    .take()
-                                                    .ok_or(RepositoryCredentialError::Retired)?,
-                                            ));
+                                            authority
+                                                .request
+                                                .with_monitor_recipient(|| {
+                                                    result = Some(insert
+                                                        .take()
+                                                        .ok_or(AdmissionError::Retired)?(
+                                                        owner
+                                                            .take()
+                                                            .ok_or(AdmissionError::Retired)?,
+                                                    ));
+                                                    Ok(())
+                                                })
+                                                .map_err(credential)?;
                                             Ok(())
                                         })
                                         .map_err(|_| AdmissionError::Retired)
@@ -143,7 +157,14 @@ impl MonitorPromptAdmission {
         }
         let write = services
             .store
-            .prepare_monitor_message(expected, &self.authority.binding, id, &self.text, metadata, created_at)
+            .prepare_monitor_message(
+                expected,
+                &self.authority.binding,
+                id,
+                &self.text,
+                metadata,
+                created_at,
+            )
             .await?;
         // Recheck after reserving the writer, then move only the prebuilt SQL
         // effect and original leaves to the blocking commit worker.
@@ -159,7 +180,7 @@ impl MonitorPromptAdmission {
         let destination = self.destination.clone();
         let child = self.child.clone();
         let delivery = self.delivery.clone();
-        tokio::task::spawn_blocking(move || {
+        let message = tokio::task::spawn_blocking(move || {
             // Retain the request owner through COMMIT even if its waiter drops.
             let _destination = destination;
             let mut write = Some(write);
@@ -185,7 +206,71 @@ impl MonitorPromptAdmission {
             result.ok_or_else(refused)?
         })
         .await
-        .map_err(|_| refused())?
+        .map_err(|_| refused())??;
+        if let Some(message) = &message {
+            self.persisted.set(message.clone()).map_err(|_| refused())?;
+        }
+        Ok(message)
+    }
+
+    /// Persistence may succeed while retirement waits for COMMIT. Re-admit
+    /// delivery separately; a committed row alone must never permit transfer.
+    pub(crate) async fn bind_committed(
+        &self,
+        message: &intent_core::AgentMessage,
+    ) -> intent_core::Result<()> {
+        if self.persisted.get() != Some(message) {
+            return Err(refused());
+        }
+        let services = self.authority.original_services().map_err(|_| refused())?;
+        self.destination
+            .run(Box::pin(async {
+                self.authority.validate(&services).await?;
+                self.authority
+                    .check_destination(self.destination.original().read())?;
+                // Subscribe before reading proof: replacement/deletion after
+                // this read must retire the exact pending output owner.
+                self.child.subscribe(&[
+                    intent_store::RepositoryLifecycleKey::Database,
+                    intent_store::RepositoryLifecycleKey::MonitorHistory(message.agent_id.clone()),
+                ])?;
+                let proof = services
+                    .store
+                    .get_monitor_message_provenance(&message.agent_id, &message.id)
+                    .await
+                    .map_err(|_| AdmissionError::Unavailable)?
+                    .ok_or(AdmissionError::Denied)?;
+                if proof.binding != self.authority.binding
+                    || proof.workspace_id != self.authority.member.agent.workspace_id
+                    || proof.message != *message
+                {
+                    return Err(AdmissionError::Denied);
+                }
+                let digest = proof.envelope_sha256.iter().fold(
+                    String::with_capacity(64),
+                    |mut output, byte| {
+                        std::fmt::Write::write_fmt(&mut output, format_args!("{byte:02x}"))
+                            .expect("writing to a String cannot fail");
+                        output
+                    },
+                );
+                let params = intent_acp::review_monitoring::payload::classify_prompt(
+                    self.params.clone(),
+                    &message.id,
+                    &digest,
+                )
+                .map_err(|_| AdmissionError::Denied)?;
+                self.child.transfer(|| Ok(()))?;
+                self.committed
+                    .set(CommittedMonitorPrompt {
+                        params,
+                        _proof: proof,
+                    })
+                    .map_err(|_| AdmissionError::Denied)?;
+                Ok(())
+            }))
+            .await
+            .map_err(|_| refused())
     }
 }
 
@@ -308,6 +393,9 @@ impl MonitorDeliveryCompletion {
                 // Record completion on the admitted worker, even if its async
                 // waiter was cancelled during SQL COMMIT.
                 acknowledged.store(true, std::sync::atomic::Ordering::Release);
+                authority
+                    .explicit_recovery
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let event_type =
                     if acknowledged_monitor.state == intent_core::PrMonitorState::Completed {
                         intent_core::events::PR_MONITOR_COMPLETED
@@ -336,6 +424,23 @@ impl MonitorTransferObservation {
 }
 
 impl AcpPromptAdmission for MonitorPromptAdmission {
+    fn required_params(
+        &self,
+        params: serde_json::Value,
+    ) -> intent_acp::error::AcpResult<serde_json::Value> {
+        if params != self.params {
+            return Err(intent_acp::error::AcpError::Protocol(
+                "Monitor prompt unavailable".into(),
+            ));
+        }
+        self.committed
+            .get()
+            .map(|committed| committed.params.clone())
+            .ok_or_else(|| {
+                intent_acp::error::AcpError::Protocol("Monitor prompt unavailable".into())
+            })
+    }
+
     fn admit<'a>(
         &'a self,
         boundary: &'a AcpPromptBoundary,
@@ -345,7 +450,11 @@ impl AcpPromptAdmission for MonitorPromptAdmission {
             let Some(connection) = self.connection.upgrade() else {
                 return AcpPromptAdmissionOutcome::ConsumerClosed;
             };
-            if !boundary.is_for(&connection, &self.session_id) || !boundary.has_params(&self.params)
+            let Some(committed) = self.committed.get() else {
+                return AcpPromptAdmissionOutcome::OmitOptional;
+            };
+            if !boundary.is_for(&connection, &self.session_id)
+                || !boundary.has_params(&committed.params)
             {
                 return AcpPromptAdmissionOutcome::ForeignBoundary;
             }
@@ -360,6 +469,7 @@ impl AcpPromptAdmission for MonitorPromptAdmission {
                         .eligibility
                         .get()
                         .ok_or(AdmissionError::Unavailable)?;
+                    let native = self.authority.request.monitor_native_allocation()?;
                     let mut packet = Some(packet);
                     let mut result = None;
                     self.delivery
@@ -369,14 +479,20 @@ impl AcpPromptAdmission for MonitorPromptAdmission {
                                 .transfer(|| {
                                     self.child.transfer(|| {
                                         eligibility
-                                            .with_current(&mut || {
-                                                let outcome = packet
-                                                    .take()
-                                                    .ok_or(RepositoryCredentialError::Retired)?
-                                                    .transfer(
-                                                        boundary,
-                                                        PromptVariant::WithGuidance,
-                                                    );
+                                            .with_native_context(native.as_ref(), &mut || {
+                                                let outcome = self
+                                                    .authority
+                                                    .request
+                                                    .with_monitor_recipient(|| {
+                                                        Ok(packet
+                                                            .take()
+                                                            .ok_or(AdmissionError::Retired)?
+                                                            .transfer(
+                                                                boundary,
+                                                                PromptVariant::WithGuidance,
+                                                            ))
+                                                    })
+                                                    .map_err(credential)?;
                                                 if matches!(
                                                     outcome,
                                                     AcpPromptAdmissionOutcome::Transferred(_)
@@ -439,6 +555,8 @@ impl MonitorAuthority {
             params: serde_json::json!({"sessionId":session_id, "prompt":[{"type":"text", "text":text}]}),
             session_id,
             text,
+            persisted: std::sync::OnceLock::new(),
+            committed: std::sync::OnceLock::new(),
             transferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -493,9 +611,18 @@ impl MonitorAuthority {
         self.request.run_monitor(body)
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_poll(
         self: &Arc<Self>,
         services: &Services,
+    ) -> AdmissionResult<std::result::Result<CacheRead<ReviewObservation>, CacheFailure>> {
+        self.read_poll_controlled(services, None).await
+    }
+
+    pub(crate) async fn read_poll_controlled(
+        self: &Arc<Self>,
+        services: &Services,
+        control: Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>>,
     ) -> AdmissionResult<std::result::Result<CacheRead<ReviewObservation>, CacheFailure>> {
         self.validate(services).await?;
         let directory = services.repository_connection_directory();
@@ -529,9 +656,19 @@ impl MonitorAuthority {
         let eligibility = self.eligibility.get().ok_or(AdmissionError::Unavailable)?;
         let revalidate = || self.request.check_current().map_err(|_| refused());
         let guard: &CacheAdmissionGuard<'_> = &|action| {
-            self.lifetime
-                .transfer(|| Ok(action()))
-                .map_err(credential)?
+            let mut guarded = || {
+                self.lifetime
+                    .transfer(|| self.request.with_monitor_recipient(|| Ok(action())))
+                    .map_err(credential)?
+            };
+            if let Some(control) = &control {
+                crate::pr_monitor::qualified_cache::with_monitor_control(
+                    control.as_ref(),
+                    &mut guarded,
+                )
+            } else {
+                guarded()
+            }
         };
         let request = ManagedCacheRequest {
             request: CacheRequest {
@@ -552,7 +689,12 @@ impl MonitorAuthority {
         )
         .await;
         self.validate(services).await?;
-        Ok(outcome)
+        Ok(outcome.map(|mut read| {
+            if let Some(control) = control {
+                read.delivery = read.delivery.with_control(control);
+            }
+            read
+        }))
     }
 }
 

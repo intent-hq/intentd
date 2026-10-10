@@ -188,8 +188,8 @@ impl PendingDeleteClaim {
         &self.subject
     }
 
-    pub(crate) fn settle_confirmed(self) {
-        self.guard.settle_confirmed();
+    pub(crate) async fn settle_confirmed(self) -> Result<()> {
+        self.guard.settle_confirmed().await
     }
 }
 
@@ -519,7 +519,7 @@ impl OwnedPendingDeletes {
         let Some(claim) = self.take_for_cascade(subject).await? else {
             return Ok(false);
         };
-        claim.settle_confirmed();
+        claim.settle_confirmed().await?;
         Ok(true)
     }
 

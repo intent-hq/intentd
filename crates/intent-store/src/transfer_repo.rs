@@ -101,6 +101,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("review_context_private_family", "installation-private denial history; never imported or transferred"),
+    ("review_context_enrollment", "installation-private native family; never imported or transferred"),
     ("pr_monitor_message_provenance", "local original-message evidence; never transferable or imported authorization"),
     ("note_search_ctx", "derived note search identities/context; note import triggers rebuild them"),
     ("note_fts", "derived note full-text index; note import triggers rebuild it"),
@@ -485,17 +487,30 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
-        let mut tx = self.read_pool().begin().await
+        let mut tx = self
+            .read_pool()
+            .begin()
+            .await
             .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
         let mut out = Vec::new();
-        for (table, predicate) in TRANSFER_TABLES.iter().filter(|(table, _)| matches!(*table, "pr_monitor" | "agent_message")) {
+        for (table, predicate) in TRANSFER_TABLES
+            .iter()
+            .filter(|(table, _)| matches!(*table, "pr_monitor" | "agent_message"))
+        {
             let rows = sqlx::query(&format!("SELECT * FROM \"{table}\" WHERE {predicate}"))
-                .bind(&workspace_id.0).fetch_all(&mut *tx).await
+                .bind(&workspace_id.0)
+                .fetch_all(&mut *tx)
+                .await
                 .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
-            let objects = rows.iter().map(|row| row_to_json(table, row)).collect::<Result<Vec<_>>>()?;
+            let objects = rows
+                .iter()
+                .map(|row| row_to_json(table, row))
+                .collect::<Result<Vec<_>>>()?;
             out.push(((*table).to_string(), objects));
         }
-        tx.commit().await.map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
         Ok(out)
     }
 
@@ -685,13 +700,28 @@ impl Store {
                 } else {
                     None
                 };
+                if *table == "agent_session" {
+                    // Imported identical public bytes still replace local lineage.
+                    // Failed imports roll this back with their original batch.
+                    sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                        .bind(object["id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("import native enrollment invalidation failed".into())
+                        })?;
+                }
                 if *table == "agent_message" {
                     // An imported ID never carries local original evidence.
                     // Stay inside the original lifecycle mutation and SQL
                     // transaction: a rejected import rolls this back too.
                     sqlx::query("DELETE FROM pr_monitor_message_provenance WHERE message_id=?")
-                        .bind(object["id"].as_str()).execute(&mut *tx).await
-                        .map_err(|_| Error::Internal("import monitor provenance invalidation failed".into()))?;
+                        .bind(object["id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("import monitor provenance invalidation failed".into())
+                        })?;
                 }
                 query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
@@ -827,7 +857,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(inserted)
     }
 }

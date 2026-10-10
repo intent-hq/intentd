@@ -17,7 +17,7 @@
 //! - a `fn` under `crates/intent-services/src/` copies a `.data` field
 //!   wholesale (`e.data.clone()`, `"data": e.data,` … on an unborrowed
 //!   receiver) into a `json!` value and is neither a `WAKE_METADATA_BUILDERS`
-//!   row (registered, scrubbed) nor a `SAFE_DATA_COPIES` row (never reaches an
+//!   row (registered, scrubbed) nor a `SAFE_DATA_COPIES` row (function name or `file::function`, never reaches an
 //!   agent; reason required), or a listed builder has no registry entry;
 //! - an `EGRESS_REGISTRY` entry is claimed by no `SCRUBBED_BINDINGS` prefix
 //!   and no `WAKE_METADATA_BUILDERS` name, or an allowlist row is stale (its
@@ -110,10 +110,16 @@ const ALLOWLIST: Allowlist<'static> = Allowlist {
         "build_event_notification_metadata",
         "wake metadata (build_event_notification_metadata)",
     )],
-    safe_data_copies: &[(
-        "truncate_tool_call_for_persist",
-        "caps an oversized agent:tool:call payload before the store write; the copy is persisted, not delivered",
-    )],
+    safe_data_copies: &[
+        (
+            "truncate_tool_call_for_persist",
+            "caps an oversized agent:tool:call payload before the store write; the copy is persisted, not delivered",
+        ),
+        (
+            "crates/intent-services/src/repository_admission/native_wire/monitor.rs::project",
+            "private monitor EventOutput retains source/recipient fences through native transport write; generic bus recv, agent notification, and chat consumers discard Delivery::Monitor, so this frame is not agent transcript metadata",
+        ),
+    ],
 };
 
 // ---- lexing -----------------------------------------------------------------
@@ -773,7 +779,11 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
                 .wake_metadata_builders
                 .iter()
                 .find(|(f, _)| *f == name);
-            let safe = allow.safe_data_copies.iter().find(|(f, _)| *f == name);
+            let qualified_name = format!("{}::{name}", file.rel);
+            let safe = allow
+                .safe_data_copies
+                .iter()
+                .find(|(f, _)| *f == name || *f == qualified_name);
             match builder.or(safe) {
                 Some((f, _)) => {
                     found_fns.insert(f);
@@ -945,6 +955,29 @@ mod fixture {
         wake_metadata_builders: &[("build_meta", "wake metadata (build_meta)")],
         safe_data_copies: &[("persist", "store-side cap, never delivered")],
     };
+
+    #[test]
+    fn file_scoped_safe_copy_does_not_exempt_another_same_named_function() {
+        let dir = fixture();
+        let allow = Allowlist {
+            safe_data_copies: &[
+                ("persist", "store-side cap, never delivered"),
+                (
+                    "crates/intent-services/src/native.rs::project",
+                    "native output only",
+                ),
+            ],
+            ..FIXTURE_ALLOW
+        };
+        let body = r#"fn project(e: &Event) -> Value { json!({"data": e.data}) }"#;
+        write(dir.path(), "crates/intent-services/src/native.rs", body);
+        assert_eq!(check(dir.path(), &allow), Vec::<String>::new());
+        write(dir.path(), "crates/intent-services/src/agent.rs", body);
+        let failures = check(dir.path(), &allow);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("crates/intent-services/src/agent.rs"));
+        assert!(failures[0].contains("fn project"));
+    }
 
     #[test]
     fn baseline_fixture_passes() {

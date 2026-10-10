@@ -22,12 +22,12 @@ use std::time::{Duration, Instant};
 
 use intent_core::{ActorType, Error, Event, EventActor, PrincipalId, Result};
 use intent_store::{NewEvent, Store};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::filter::{SubscriptionFilter, event_matches};
+use super::filter::{event_matches, SubscriptionFilter};
 use super::monitor_delivery::{BroadcastEvent, MonitorEvent, PrivateEventDelivery, Recipient};
 
 /// Capacity of the broadcast channel that fans published events out to every
@@ -334,7 +334,7 @@ impl EventBus {
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let rx = self.tx.subscribe();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx, None));
+        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx, None, None));
         Subscription {
             rx: out_rx,
             handle,
@@ -360,6 +360,7 @@ impl EventBus {
             filter,
             out,
             Some(recipient),
+            None,
         ));
         Subscription {
             rx,
@@ -368,18 +369,52 @@ impl EventBus {
         }
     }
 
+    /// Opt an original qualified chat recipient into payload-free history
+    /// invalidations. The notification grants no read or output authority:
+    /// consumers must re-read under this same recipient and retain its fences.
+    #[must_use]
+    pub fn subscribe_history(
+        &self,
+        filter: SubscriptionFilter,
+        agent_id: String,
+        owner: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>,
+    ) -> Subscription {
+        let (out, rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let handle = intent_core::spawn_daemon(delivery_task(
+            self.tx.subscribe(),
+            filter,
+            out,
+            None,
+            Some((agent_id, owner)),
+        ));
+        Subscription {
+            rx,
+            handle,
+            monitor_recipient: None,
+        }
+    }
+
+    /// Called only after the original qualified message commit. Generic event
+    /// subscriptions never receive this notification, even as a public marker.
+    pub(crate) fn notify_monitor_history(&self, agent_id: &str) {
+        let _ = self.tx.send(Arc::new(BroadcastEvent::HistoryChanged(
+            agent_id.to_owned(),
+        )));
+    }
+
     pub(crate) fn publish_monitor(
         &self,
         event: Event,
         binding: Option<intent_core::review_monitor::ReviewMonitorBinding>,
         source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
     ) -> Result<()> {
+        let fence = source.clone();
         let mut envelope = Some(BroadcastEvent::Monitor(MonitorEvent {
             event,
             binding,
-            source: source.clone(),
+            source,
         }));
-        source.with_current(&mut || {
+        fence.with_current(&mut || {
             if let Some(envelope) = envelope.take() {
                 let _ = self.tx.send(Arc::new(envelope));
             }
@@ -413,6 +448,9 @@ pub enum Delivery {
     Lagged(u64),
     /// Already-authorized private native frame; never flatten into public events.
     Monitor(PrivateEventDelivery),
+    /// Private history changed; re-read with the original qualified recipient.
+    /// Contains no private row, metadata, or authority.
+    HistoryChanged,
 }
 
 /// A live subscription. Yields filtered (and optionally batched) events via
@@ -433,7 +471,7 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) | Delivery::Monitor(_) => {}
+                Delivery::Lagged(_) | Delivery::Monitor(_) | Delivery::HistoryChanged => {}
             }
         }
     }
@@ -703,6 +741,10 @@ async fn delivery_task(
     filter: SubscriptionFilter,
     out: mpsc::Sender<Delivery>,
     recipient: Option<Recipient>,
+    history: Option<(
+        String,
+        Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>,
+    )>,
 ) {
     let batch_window = filter.batch_window;
     let mut buffer: Vec<Event> = Vec::new();
@@ -715,6 +757,16 @@ async fn delivery_task(
                 Ok(ev) => {
                     let ev = match ev.as_ref() {
                         BroadcastEvent::Public(ev) => ev,
+                        BroadcastEvent::HistoryChanged(agent_id) => {
+                            let Some((original_agent, _owner)) = &history else { continue };
+                            if agent_id != original_agent { continue; }
+                            if !buffer.is_empty() {
+                                deadline = None;
+                                if out.send(Delivery::Batch(std::mem::take(&mut buffer))).await.is_err() { return; }
+                            }
+                            if out.send(Delivery::HistoryChanged).await.is_err() { return; }
+                            continue;
+                        }
                         BroadcastEvent::Monitor(ev) => {
                             let Some(recipient) = &recipient else { continue };
                             if !event_matches(&filter, &ev.event) { continue; }

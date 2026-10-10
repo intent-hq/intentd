@@ -472,11 +472,6 @@ impl PreparedReview {
         retained: Arc<RepositoryReadRequest>,
     ) -> AdmissionResult<Arc<MonitorAuthority>> {
         self.host.check_current()?;
-        if !retained.retains(self.host.services().as_ref()) {
-            return Err(AdmissionError::Denied);
-        }
-        retained.check_current()?;
-        let member = member(self.host.services(), &retained, &self.workspace).await?;
         let original = self
             .settled
             .as_ref()
@@ -489,66 +484,15 @@ impl PreparedReview {
         {
             return Err(AdmissionError::BindingChanged);
         }
-        let binding = intent_core::review_monitor::ReviewMonitorBinding {
-            scope: ExecutionScope {
-                daemon_id: self.host.services().daemon_boot_id.clone(),
-                authority_scope_id: retained.correlation().into(),
-                authority_generation: member
-                    .workspace
-                    .workspace
-                    .revision
-                    .ok_or(AdmissionError::Unavailable)?
-                    .get(),
-            },
-            connection: settled.selected().binding.scope.clone(),
-            resource: self.target.clone(),
-        };
-        let mut lifetime = retained.child()?;
-        lifetime.subscribe(&[
-            RepositoryLifecycleKey::Database,
-            RepositoryLifecycleKey::Workspace(self.workspace.clone()),
-            RepositoryLifecycleKey::Agent(member.agent.id.clone()),
-        ])?;
-        let authority = Arc::new(MonitorAuthority {
-            observations: crate::observation_adapter::ConnectionObservations::new(
-                binding.scope.clone(),
-                binding.connection.clone(),
-            ),
-            binding,
-            request: retained,
-            member,
+        MonitorAuthority::admit_original(
+            self.host.services(),
+            retained,
+            &self.workspace,
+            self.target.clone(),
             settled,
-            lifetime,
-            eligibility: OnceLock::new(),
-            source: OnceLock::new(),
-            services: Arc::downgrade(self.host.services()),
-        });
-        let source: Arc<dyn RepositoryAuthority> =
-            Arc::new(MonitorAuthoritySource(Arc::downgrade(&authority)));
-        authority
-            .source
-            .set(source.clone())
-            .map_err(|_| AdmissionError::Unavailable)?;
-        let admission = self
-            .host
-            .services()
-            .repository_connection_directory()
-            .admit(
-                &authority.settled.selected().binding,
-                authority.credential_request(),
-                source,
-            )
-            .map_err(|_| AdmissionError::Unavailable)?;
-        let eligibility = self
-            .host
-            .services()
-            .gitlab_repository_read_eligibility(&admission)
-            .map_err(|_| AdmissionError::Unavailable)?;
-        authority
-            .eligibility
-            .set(eligibility)
-            .map_err(|_| AdmissionError::Unavailable)?;
-        Ok(authority)
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn read(self) -> AdmissionResult<ReadOutcome> {
@@ -577,6 +521,8 @@ pub(crate) struct MonitorAuthority {
     source: OnceLock<Arc<dyn RepositoryAuthority>>,
     services: std::sync::Weak<Services>,
     observations: crate::observation_adapter::ConnectionObservations,
+    restored_from: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+    explicit_recovery: std::sync::atomic::AtomicBool,
 }
 
 #[path = "read_source/monitor_poll.rs"]
@@ -586,6 +532,145 @@ pub(crate) use monitor_poll::{
 };
 
 impl MonitorAuthority {
+    async fn admit_original(
+        services: &Arc<Services>,
+        retained: Arc<RepositoryReadRequest>,
+        workspace: &WorkspaceId,
+        target: ReviewTarget,
+        settled: RepositorySettledConnection,
+        restored_from: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+    ) -> AdmissionResult<Arc<Self>> {
+        if !retained.retains(services.as_ref()) || !retained.supports_review_monitoring() {
+            return Err(AdmissionError::Denied);
+        }
+        retained.check_current()?;
+        let member = member(services, &retained, workspace).await?;
+        let binding = intent_core::review_monitor::ReviewMonitorBinding {
+            scope: ExecutionScope {
+                daemon_id: services.daemon_boot_id.clone(),
+                authority_scope_id: retained.correlation().into(),
+                authority_generation: member
+                    .workspace
+                    .workspace
+                    .revision
+                    .ok_or(AdmissionError::Unavailable)?
+                    .get(),
+            },
+            connection: settled.selected().binding.scope.clone(),
+            resource: target,
+        };
+        let lifetime = retained.child()?;
+        lifetime.subscribe(&[
+            RepositoryLifecycleKey::Database,
+            RepositoryLifecycleKey::Workspace(workspace.clone()),
+            RepositoryLifecycleKey::Agent(member.agent.id.clone()),
+        ])?;
+        let authority = Arc::new(MonitorAuthority {
+            observations: crate::observation_adapter::ConnectionObservations::new(
+                binding.scope.clone(),
+                binding.connection.clone(),
+            ),
+            binding,
+            request: retained,
+            member,
+            settled,
+            lifetime,
+            eligibility: OnceLock::new(),
+            source: OnceLock::new(),
+            services: Arc::downgrade(services),
+            explicit_recovery: std::sync::atomic::AtomicBool::new(restored_from.is_some()),
+            restored_from,
+        });
+        let source: Arc<dyn RepositoryAuthority> =
+            Arc::new(MonitorAuthoritySource(Arc::downgrade(&authority)));
+        authority
+            .source
+            .set(source.clone())
+            .map_err(|_| AdmissionError::Unavailable)?;
+        let admission = services
+            .repository_connection_directory()
+            .admit(
+                &authority.settled.selected().binding,
+                authority.credential_request(),
+                source,
+            )
+            .map_err(|_| AdmissionError::Unavailable)?;
+        let eligibility = services
+            .gitlab_repository_read_eligibility(&admission)
+            .map_err(|_| AdmissionError::Unavailable)?;
+        authority
+            .eligibility
+            .set(eligibility)
+            .map_err(|_| AdmissionError::Unavailable)?;
+        Ok(authority)
+    }
+
+    /// A real manager prompt capture, not an ID lookup, supplies this request.
+    /// The saved row constrains fresh admission and never supplies a credential.
+    pub(crate) async fn recover(
+        services: &Arc<Services>,
+        retained: Arc<RepositoryReadRequest>,
+        row: &intent_store::QualifiedPrMonitor,
+        admitted_connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<Self>> {
+        let intent_store::PersistedMonitorTarget::Resolved {
+            target,
+            provenance: intent_store::MonitorTargetProvenance::CapturedRequest,
+        } = row.target()
+        else {
+            return Err(AdmissionError::Denied);
+        };
+        let envelope: serde_json::Value = serde_json::from_str(
+            row.monitor()
+                .last_snapshot
+                .as_deref()
+                .ok_or(AdmissionError::Unavailable)?,
+        )
+        .map_err(|_| AdmissionError::Unavailable)?;
+        let original: intent_core::review_monitor::ReviewMonitorBinding =
+            serde_json::from_value(envelope["monitorBinding"].clone())
+                .map_err(|_| AdmissionError::Unavailable)?;
+        if original.resource != *target
+            || original.connection.account_id != admitted_connection.account_id
+            || row.monitor().state != intent_core::PrMonitorState::Active
+        {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let settled = services
+            .gitlab_repository_settled_connection()
+            .map_err(|_| AdmissionError::Unavailable)?;
+        if &settled.selected().binding.scope != admitted_connection {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let authority = Self::admit_original(
+            services,
+            retained,
+            &row.monitor().workspace_id,
+            target.clone(),
+            settled,
+            Some(original),
+        )
+        .await?;
+        if authority.owner() != &row.monitor().agent_id {
+            return Err(AdmissionError::Denied);
+        }
+        authority.validate(services).await?;
+        Ok(authority)
+    }
+
+    pub(crate) fn requires_explicit_recovery(&self) -> bool {
+        self.explicit_recovery
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn matches_saved_binding(
+        &self,
+        saved: &intent_core::review_monitor::ReviewMonitorBinding,
+    ) -> bool {
+        (saved.resource == self.binding.resource
+            && saved.connection == self.binding.connection
+            && saved.scope.daemon_id == self.binding.scope.daemon_id)
+            || self.restored_from.as_ref() == Some(saved)
+    }
     fn credential_request(&self) -> RepositoryAuthorityRequest {
         RepositoryAuthorityRequest {
             execution: self.binding.scope.clone(),
@@ -899,7 +984,7 @@ async fn read_review(
     host: &ReadHost,
     workspace: WorkspaceId,
     number: u64,
-    mut child: RepositoryReadChild,
+    child: RepositoryReadChild,
     settled: credentials::Result<RepositorySettledConnection>,
     original: (
         RootRecord,
@@ -1587,3 +1672,11 @@ pub(crate) async fn with_context_only<T: Send>(
 #[cfg(test)]
 #[path = "read_source/tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "read_source/monitor_native_tests.rs"]
+mod monitor_native_tests;
+
+#[cfg(test)]
+#[path = "read_source/native_runtime_tests.rs"]
+mod native_runtime_tests;

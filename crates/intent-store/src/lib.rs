@@ -84,8 +84,10 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
-    SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
+    PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
+    ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -412,7 +414,7 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
             write_pool: StorePool::new(write_pool, owner.is_some()),

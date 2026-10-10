@@ -6,10 +6,10 @@ use intent_core::events::{
     PR_MONITOR_REGISTERED,
 };
 use intent_core::{Event, PrMonitor};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::Services;
 use crate::repository_read_source::MonitorAuthority;
+use crate::Services;
 
 impl Services {
     /// Called only after the original admitted transition commits. Event output

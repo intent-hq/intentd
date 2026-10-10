@@ -97,11 +97,11 @@ use crate::{publish_event, system_actor, Services};
     reason = "qualified reads await admitted caller-directory wiring"
 )]
 pub(crate) mod qualified_cache;
-mod qualified_poll;
 mod qualified_events;
+mod qualified_poll;
 mod routing;
-pub(crate) use routing::wire as qualified_pr_monitor_wire;
 use qualified_cache::{CacheKey, CacheSlot};
+pub(crate) use routing::wire as qualified_pr_monitor_wire;
 
 use intent_core::config::{
     MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -3167,16 +3167,37 @@ impl Services {
     /// docs). Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
+    /// # Panics
+    /// Panics if the monitor control mutex is poisoned.
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
+        let (sender, mut controls) = tokio::sync::mpsc::channel::<
+            crate::repository_native_wire::monitor::flush::Command,
+        >(32);
+        let installed = {
+            let mut current = self.review_monitor_controls.lock().unwrap();
+            if current.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                false
+            } else {
+                *current = Some(sender);
+                true
+            }
+        };
         intent_core::spawn_daemon(async move {
+            if !installed {
+                return;
+            }
+            let mut next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
             loop {
                 tokio::select! {
                     biased;
                     () = services.settings_tasks.closed() => break,
-                    () = tokio::time::sleep(services.pr_monitor_poll_interval()) => {}
+                    () = tokio::time::sleep_until(next) => {
+                        services.poll_due_pr_monitors().await;
+                        next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
+                    }
+                    Some(command) = controls.recv() => command.run().await,
                 }
-                services.poll_due_pr_monitors().await;
             }
         })
     }
@@ -4424,6 +4445,16 @@ impl Services {
         monitor_id: &PrMonitorId,
         check: bool,
     ) -> Result<Value> {
+        if let Some(result) = crate::repository_native_wire::monitor::flush::flush(
+            self,
+            workspace_id,
+            monitor_id,
+            check,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
         self.require_legacy_monitor_control(monitor_id).await?;
         let flushed = if check {
             self.pr_monitor_check_and_flush(workspace_id, monitor_id)
@@ -4463,7 +4494,7 @@ impl Services {
             .unwrap_or_default()
             .iter()
             .filter(|row| routing::legacy_output(row))
-            .map(|row| row.monitor())
+            .map(intent_store::QualifiedPrMonitor::monitor)
             .filter(|m| m.state == PrMonitorState::Active)
             .map(waiting_on_pr_monitors_entry)
             .collect()

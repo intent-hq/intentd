@@ -5,7 +5,7 @@ use intent_core::repository_request::{
     RepositoryReadRetirements, RepositoryWireEntry,
 };
 use intent_core::review_monitor::ReviewMonitorRecipientSupport;
-use intent_core::{Caller, HostRole, with_caller};
+use intent_core::{with_caller, Caller, HostRole};
 
 pub(crate) struct NativeRecipient {
     services: Arc<Services>,
@@ -66,7 +66,7 @@ impl NativeRecipient {
         })
         .await
     }
-    async fn cancel(
+    pub(crate) async fn cancel(
         &self,
         workspace: WorkspaceId,
         id: intent_core::PrMonitorId,
@@ -108,6 +108,123 @@ impl NativeRecipient {
         })
         .await
     }
+    pub(crate) async fn history_subscription(
+        &self,
+        agent: AgentId,
+        workspace: WorkspaceId,
+    ) -> (
+        Value,
+        Arc<dyn RepositoryPrivateOutput>,
+        Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>,
+    ) {
+        let services = self.services.clone();
+        let connection = self.connection.clone();
+        with_caller(self.caller.clone(), async {
+            let recipient = connection.capture_monitor_history().expect("supported original history subscription");
+            let mut result = None;
+            recipient.scope(Box::pin(async {
+                let first = services.agent_history_batch_op(agent.clone(),None,100).await.unwrap();
+                let second = services.agent_get_conversation_op(agent,None,Some(workspace),None,None,None,None,false).await.unwrap();
+                result = Some(json!({"first":first,"second":second}));
+            })).await;
+            let value = result.unwrap();
+            let output = recipient.bind_output(json!({"jsonrpc":"2.0","method":"subscription.push","params":{"subscriptionId":"native-history-test","kind":"snapshot","seq":0,"snapshot":value["second"]}}).to_string());
+            (value,output,recipient)
+        }).await
+    }
+
+    pub(crate) async fn history_api(
+        &self,
+        agent: AgentId,
+        workspace: WorkspaceId,
+        method: &str,
+        message_id: String,
+    ) -> (Value, Option<Arc<dyn RepositoryPrivateOutput>>) {
+        let services = self.services.clone();
+        let connection = self.connection.clone();
+        with_caller(self.caller.clone(), async {
+            let scope = connection.capture();
+            let mut result = None;
+            scope
+                .scope(Box::pin(async {
+                    let value = match method {
+                        "batch" => services.agent_history_batch_op(agent, None, 100).await,
+                        "index" => {
+                            services
+                                .agent_list_user_messages_op(agent, Some(workspace), Some(80))
+                                .await
+                        }
+                        "block" => {
+                            services
+                                .agent_get_message_block_op(
+                                    agent,
+                                    message_id.clone(),
+                                    format!("{message_id}:0"),
+                                    Some(workspace),
+                                )
+                                .await
+                        }
+                        _ => {
+                            services
+                                .agent_get_conversation_op(
+                                    agent,
+                                    None,
+                                    Some(workspace),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    false,
+                                )
+                                .await
+                        }
+                    }
+                    .unwrap();
+                    let frame = json!({"jsonrpc":"2.0","id":3,"result":value}).to_string();
+                    let output = scope.bind_private_output(&frame).unwrap();
+                    scope
+                        .deliver(RepositoryReadReplyKind::Result, &mut || Ok(()))
+                        .await
+                        .unwrap();
+                    result = Some((value, output));
+                }))
+                .await;
+            scope.retire();
+            result.unwrap()
+        })
+        .await
+    }
+
+    pub(crate) fn retire(&self) {
+        self.connection.retire();
+    }
+
+    pub(crate) async fn flush(
+        &self,
+        workspace: WorkspaceId,
+        id: intent_core::PrMonitorId,
+        check: bool,
+    ) -> intent_core::Result<Value> {
+        let services = self.services.clone();
+        let connection = self.connection.clone();
+        with_caller(self.caller.clone(), async {
+            let scope = connection.capture();
+            let mut result = None;
+            scope
+                .scope(Box::pin(async {
+                    result = Some(
+                        services
+                            .pr_monitor_flush_pending(workspace, id, check)
+                            .await,
+                    );
+                }))
+                .await;
+            scope.retire();
+            result.unwrap()
+        })
+        .await
+    }
+
     pub(crate) async fn events(
         &self,
     ) -> Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient> {
@@ -203,14 +320,12 @@ async fn native_monitor_qualified_list_account_replacement_retires_queued_output
         .await
         .unwrap();
     let mut wrote = false;
-    assert!(
-        pending
-            .with_current(&mut || {
-                wrote = true;
-                Ok(())
-            })
-            .is_err()
-    );
+    assert!(pending
+        .with_current(&mut || {
+            wrote = true;
+            Ok(())
+        })
+        .is_err());
     assert!(
         !wrote,
         "account replacement must fence the entire queued frame"
@@ -410,14 +525,12 @@ async fn native_monitor_admitted_cancel_emits_original_qualified_event() {
         .unwrap();
     for output in queued.into_iter().chain([reply]) {
         let mut wrote = false;
-        assert!(
-            output
-                .with_current(&mut || {
-                    wrote = true;
-                    Ok(())
-                })
-                .is_err()
-        );
+        assert!(output
+            .with_current(&mut || {
+                wrote = true;
+                Ok(())
+            })
+            .is_err());
         assert!(!wrote);
     }
 }
@@ -475,14 +588,12 @@ async fn native_monitor_agent_registration_change_and_cancel_use_original_source
     f.owner.retirement().retire();
     for output in [registration, changed, cancelled] {
         let mut wrote = false;
-        assert!(
-            output
-                .with_current(&mut || {
-                    wrote = true;
-                    Ok(())
-                })
-                .is_err()
-        );
+        assert!(output
+            .with_current(&mut || {
+                wrote = true;
+                Ok(())
+            })
+            .is_err());
         assert!(!wrote);
     }
 }

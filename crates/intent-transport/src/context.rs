@@ -49,13 +49,14 @@ use futures::future::Either;
 use intent_core::repository_request::{
     RepositoryReadConnection, RepositoryReadRequestScope, RepositoryWireEntry,
 };
-pub use intent_core::{Caller, current_caller, with_caller};
+pub use intent_core::{current_caller, with_caller, Caller};
 
 tokio::task_local! {
     /// Connection origin for the current request task. Set by the transport layer
     /// (UDS sets `false`, WSS sets `true`) before spawning the request handler.
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
+    static MONITOR_HISTORY: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
     static CHECKOUT_FRAME: Option<intent_core::repository_checkout::CheckoutFrame>;
     static RESOURCE_FRAME: Option<intent_core::repository_request::RepositoryResourceFrame>;
@@ -221,12 +222,52 @@ pub(crate) fn review_monitoring_hello(
         .flatten()
 }
 
-pub(crate) fn capture_monitor_events()
--> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+pub(crate) fn capture_monitor_events(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
     READ_CONNECTION
         .try_with(|connection| connection.as_ref()?.capture_monitor_events())
         .ok()
         .flatten()
+}
+
+/// Capture the acknowledged physical recipient before spawning the forwarder.
+pub(crate) fn capture_monitor_history(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_history())
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn with_monitor_history(
+    owner: Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>>,
+    body: impl Future<Output = ()> + Send,
+) {
+    struct Retire(Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>);
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            self.0.retire();
+        }
+    }
+    let Some(owner) = owner else {
+        return body.await;
+    };
+    // Natural forwarder exit and cancellation have the same retirement rule.
+    let _retire = Retire(owner.clone());
+    owner
+        .scope(Box::pin(MONITOR_HISTORY.scope(owner.clone(), body)))
+        .await;
+}
+
+pub(crate) fn chat_frame(frame: String) -> crate::OutboundFrame {
+    match MONITOR_HISTORY.try_with(Clone::clone) {
+        Ok(owner) => crate::OutboundFrame::private(owner.bind_output(frame)),
+        Err(_) => frame.into(),
+    }
+}
+
+pub(crate) fn begin_chat_history_generation() {
+    let _ = MONITOR_HISTORY.try_with(|owner| owner.begin_generation());
 }
 
 impl ReadConnectionGuard {

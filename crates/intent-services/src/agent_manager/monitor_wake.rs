@@ -49,6 +49,21 @@ impl Drop for MonitorDeliveryGuard {
 }
 
 impl AgentManager {
+    pub(crate) async fn recover_monitor_authority(
+        &self,
+        row: &QualifiedPrMonitor,
+        connection: &intent_core::RepositoryConnectionScope,
+    ) -> Result<Arc<MonitorAuthority>> {
+        let mut original = self.capture_turn(&row.monitor().agent_id)?;
+        original
+            .prompt
+            .as_mut()
+            .ok_or_else(refused)?
+            .recover_monitor(row, connection)
+            .await
+            .map_err(|_| refused())
+    }
+
     pub(crate) async fn prepare_monitor_turn(
         &self,
         row: QualifiedPrMonitor,
@@ -154,13 +169,19 @@ impl PreparedMonitorTurn {
         if !manager.owns_admission(&monitor.agent_id, slot) {
             return Err(refused());
         }
-        if admission
+        let Some(message) = admission
             .commit_message(&row, &id, &metadata, &now_iso())
             .await?
-            .is_none()
-        {
+        else {
             return Ok(false);
+        };
+        // The row is durable even if later native transfer fails. Notify only
+        // qualified chat readers; they must independently authorize the fresh
+        // read and keep its original fences through the socket write.
+        if let Some(bus) = &manager.services.event_bus {
+            bus.notify_monitor_history(monitor.agent_id.as_str());
         }
+        admission.bind_committed(&message).await?;
         if !manager.owns_admission(&monitor.agent_id, slot) {
             return Err(refused());
         }

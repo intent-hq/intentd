@@ -26,42 +26,32 @@ async fn unresolved_monitor_summaries_withhold_output_without_losing_internal_wa
     let reads = forge.fetches();
     assert_eq!(service.active_pr_monitors_for_agent(&owner).await.len(), 1);
     assert!(service.active_pr_monitor_labels(&owner).await.is_empty());
-    assert!(
-        service
-            .active_pr_monitors_by_agent(&workspace)
-            .await
-            .is_empty()
-    );
+    assert!(service
+        .active_pr_monitors_by_agent(&workspace)
+        .await
+        .is_empty());
     let mut idle = json!({"agentId":owner});
-    assert!(
-        service
-            .annotate_waiting_on_pr_monitors(&owner, &mut idle)
-            .await
-            .is_empty()
-    );
+    assert!(service
+        .annotate_waiting_on_pr_monitors(&owner, &mut idle)
+        .await
+        .is_empty());
     assert!(idle.get("waitingOnPrMonitors").is_none());
     let mut replay = json!({"waitingOnPrMonitors":[waiting_on_pr_monitors_entry(&before)]});
-    assert!(
-        service
-            .annotate_waiting_on_pr_monitors(&owner, &mut replay)
-            .await
-            .is_empty()
-    );
+    assert!(service
+        .annotate_waiting_on_pr_monitors(&owner, &mut replay)
+        .await
+        .is_empty());
     assert!(replay.get("waitingOnPrMonitors").is_none());
-    assert!(
-        service
-            .legacy_pr_monitor_wait_entries(&owner)
-            .await
-            .is_empty()
-    );
-    assert!(
-        service
-            .agent_get_op(owner.clone(), Some(workspace.clone()))
-            .await
-            .unwrap()
-            .waiting_on_pr_monitors
-            .is_empty()
-    );
+    assert!(service
+        .legacy_pr_monitor_wait_entries(&owner)
+        .await
+        .is_empty());
+    assert!(service
+        .agent_get_op(owner.clone(), Some(workspace.clone()))
+        .await
+        .unwrap()
+        .waiting_on_pr_monitors
+        .is_empty());
     assert_eq!(service.active_pr_monitors_for_agent(&owner).await.len(), 1);
     assert_eq!(
         service
@@ -193,12 +183,10 @@ async fn restart_preserves_unresolved_imported_pending_bytes_without_legacy_emis
             .await
             .unwrap();
     assert_eq!(raw, pending);
-    assert!(
-        store
-            .get_agent_session(&owner)
-            .await
-            .unwrap()
-            .messages
-            .is_empty()
-    );
+    assert!(store
+        .get_agent_session(&owner)
+        .await
+        .unwrap()
+        .messages
+        .is_empty());
 }

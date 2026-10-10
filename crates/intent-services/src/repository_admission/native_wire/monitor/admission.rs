@@ -6,7 +6,7 @@ use intent_core::repository_request::RepositoryPrivateOutput;
 use intent_core::review_monitor::ReviewMonitorBinding;
 use intent_core::{ExecutionScope, RepositoryProvider, Result};
 
-use super::super::{Request, authority, unavailable};
+use super::super::{authority, unavailable, Request};
 use super::Recipient;
 use crate::repository_credentials::authority::{
     CredentialFuture, RepositoryAuthority, RepositoryAuthorityFence, RepositoryAuthorityRequest,
@@ -52,6 +52,22 @@ impl Projection {
             }
         })
     }
+    pub(super) fn history_inputs(
+        &self,
+    ) -> (
+        Vec<super::RepositoryRetirement>,
+        Vec<Arc<RepositoryReadEligibility>>,
+    ) {
+        (
+            vec![
+                self.recipient.connection.parent.clone(),
+                self.recipient.receipt.lifetime.clone(),
+                self.recipient.lifetime.retirement().clone(),
+            ],
+            self.admissions.clone(),
+        )
+    }
+
     pub(in crate::repository_native_wire) fn output(
         self: &Arc<Self>,
         frame: &str,
@@ -168,6 +184,14 @@ pub(super) async fn acquire_event(
     original: &ReviewMonitorBinding,
 ) -> Result<Admitted> {
     acquire_binding(request, recipient, original, true).await
+}
+
+pub(super) async fn acquire_history(
+    request: &Arc<Request>,
+    recipient: &Arc<Recipient>,
+    original: &ReviewMonitorBinding,
+) -> Result<Admitted> {
+    acquire_binding(request, recipient, original, false).await
 }
 
 async fn acquire_binding(

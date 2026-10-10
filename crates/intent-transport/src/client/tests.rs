@@ -480,6 +480,12 @@ fn monitor_test_host_support_requires_explicit_opt_in() {
     let mut enabled = ordinary.clone();
     apply_monitor_test_support(&mut enabled, true);
     assert_eq!(enabled["capabilities"]["reviewMonitoring"], 1);
-    enabled["capabilities"].as_object_mut().unwrap().remove("reviewMonitoring");
-    assert_eq!(enabled, ordinary, "test support changes no other host claims");
+    enabled["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reviewMonitoring");
+    assert_eq!(
+        enabled, ordinary,
+        "test support changes no other host claims"
+    );
 }

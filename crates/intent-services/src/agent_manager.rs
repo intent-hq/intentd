@@ -3351,6 +3351,8 @@ impl AgentManager {
         // initialization confirms a distinct physical owner.
         let original_services = Arc::new(self.services.clone());
         let repository_origin = RepositoryOrigin::allocate(&original_services, &session).await;
+        #[cfg(feature = "repository-test-fixtures")]
+        repository_origin.capture_review_runtime_fixture(opts);
         let read_owner = crate::repository_admission::read_request::RepositoryReadOwner::capture(
             original_services.clone(),
         );
@@ -4095,13 +4097,23 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let negotiated = handshake_with_callbacks(
-            conn.clone(),
-            provider,
-            repository_origin.callback_offer(&session_record, provider),
-        )
-        .await
-        .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let callback_offer = repository_origin.callback_offer(&session_record, provider);
+        #[cfg(feature = "repository-test-fixtures")]
+        let negotiated = if repository_origin.review_runtime_fixture() {
+            intent_acp::handshake::handshake_with_review_monitoring(
+                conn.clone(),
+                provider,
+                callback_offer,
+                intent_acp::review_monitoring::ReviewMonitoringOffer::V1,
+            )
+            .await
+        } else {
+            handshake_with_callbacks(conn.clone(), provider, callback_offer).await
+        };
+        #[cfg(not(feature = "repository-test-fixtures"))]
+        let negotiated = handshake_with_callbacks(conn.clone(), provider, callback_offer).await;
+        let negotiated =
+            negotiated.map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
         let callbacks = negotiated.callbacks;
         let handshake = negotiated.ordinary;
 
@@ -4159,6 +4171,18 @@ impl AgentManager {
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
         let stored_id = session_record.acp_session_id.clone();
+        // A private family may resume only through its original admission.
+        // A failed or unavailable load must not replace it with a new session.
+        // The Store also refuses malformed or missing known-private enrollment.
+        let private_history = if let Some(session_id) = &stored_id {
+            self.services
+                .store
+                .get_review_context_enrollment(&session_record.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
 
         // Forced recreate (`agent.editAndRegenerate`): the transcript was
         // truncated, so resuming the provider session would retain the
@@ -4264,6 +4288,12 @@ impl AgentManager {
                     },
                 });
             }
+            Ok(None) if private_history => {
+                return Err(Error::Forbidden(
+                    "Private native history requires original admission".into(),
+                ));
+            }
+            Err(error) if private_history => return Err(error),
             Ok(None) => {}
             // Auth-required resume failure (intent-hq/intent#3941): the
             // provider said it is not logged in — propagate the actionable
@@ -10606,6 +10636,15 @@ impl AgentManager {
             .lock()
             .unwrap()
             .insert(agent_id.clone(), resolved.provider.id.to_string());
+        let private_history = if let Some(session_id) = &session.acp_session_id {
+            self.services
+                .store
+                .get_review_context_enrollment(workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -10635,13 +10674,21 @@ impl AgentManager {
             )
             .await?;
         }
+        let original_attempt = repository_origin::capture(&self.handles, agent_id);
         let session_result = self
             .start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
             .await;
         let acp_session_id = match session_result {
             Ok(id) => id,
             Err(error) => {
-                if resolved.provider.id == "antigravity" {
+                if private_history {
+                    // A refused private load has no usable session in this
+                    // child. Retire only this captured attempt so a later
+                    // original-account recovery must load on a fresh child.
+                    if let Some(original) = &original_attempt {
+                        self.kill_original_child(agent_id, original).await;
+                    }
+                } else if resolved.provider.id == "antigravity" {
                     // Never let the next turn reuse an unverified child
                     // through the fast path. Fresh candidates are not committed
                     // until confirmation; a failed load keeps its prior ID.
@@ -10705,6 +10752,9 @@ impl AgentManager {
         stopping.extend(self.workers.lock().unwrap().keys().cloned());
         drop(stopping);
         drop(closed);
+        self.services
+            .repository_lifecycle_registry
+            .begin_native_shutdown();
         // Join original authority before cancellation can drop its producer.
         // The separate shutdown mutex makes repeated callers join this same
         // boundary; admission/map locks are free while stages finish.
@@ -10840,12 +10890,34 @@ impl AgentManager {
     /// # Panics
     /// Panics if an internal mutex is poisoned.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_with_native_outcome().await {
+            tracing::error!(%error, "original native retirement unconfirmed during shutdown");
+        }
+    }
+
+    /// Preserve an uncertain original native join as a shutdown failure. Native
+    /// transports remain owned until their exact retirement outcomes settle.
+    /// # Errors
+    /// Returns an error when original native retirement is unconfirmed.
+    ///
+    /// # Panics
+    /// Panics if a manager bookkeeping mutex is poisoned.
+    pub async fn shutdown_with_native_outcome(&self) -> intent_core::Result<()> {
         self.begin_shutdown();
         let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
         ids.extend(self.list_busy().into_iter().map(|(id, _)| id));
         ids.extend(self.workers.lock().unwrap().keys().cloned());
         self.checkpoint_shutdown().await;
         self.services.shutdown_agent_deliveries().await;
+        self.services
+            .repository_lifecycle_registry
+            .join_native_shutdown()
+            .await
+            .map_err(|_| {
+                intent_core::Error::Internal(
+                    "original native retirement unconfirmed during shutdown".into(),
+                )
+            })?;
         // Now tear down every agent's bookkeeping (settles to RuntimeIdle) and
         // collect the detached children, then kill all process groups in
         // parallel under ONE shared grace window — total teardown stays ~one
@@ -10890,6 +10962,7 @@ impl AgentManager {
             })
         };
         finish.await;
+        Ok(())
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
@@ -12441,6 +12514,31 @@ fn resolve_spawn(
     // Filled by `ensure_started` (unsloth spawn gate) — pure resolution here
     // never starts the managed server.
     let unsloth_endpoint = None;
+    // Disposable process-integration fixtures select an already verified
+    // bundle launcher. This is absent from packaged builds and never enables
+    // a production provider or changes the ordinary catalog's path policy.
+    #[cfg(feature = "repository-test-fixtures")]
+    if provider.id == "claude-code" {
+        if let Some(path) = std::env::var_os("INTENTD_TEST_REVIEW_LAUNCHER") {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() || !path.is_file() {
+                return Err(Error::InvalidInput(
+                    "invalid private runtime fixture launcher".into(),
+                ));
+            }
+            return Ok(ResolvedSpawn {
+                provider,
+                model,
+                reasoning_effort,
+                cwd,
+                provider_binary: Some(path),
+                extra_env,
+                npx_fallback_binary: None,
+                npx_fallback_package: None,
+                unsloth_endpoint: None,
+            });
+        }
+    }
 
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is

@@ -66,7 +66,7 @@ async fn queued_write(operation: Operation, retirement: Option<bool>) {
     );
     let writer = services.store.write_pool().acquire().await.unwrap();
     let endpoint = f.server();
-    let task = tokio::spawn(async move {
+    let task = intent_core::caller::spawn_with_current_caller(async move {
         run(
             &endpoint,
             if operation == Operation::Cancel {
@@ -214,7 +214,9 @@ async fn commit_boundary(drop_caller: bool, abort_commit: bool) {
         });
     drop(writer);
     let endpoint = f.server();
-    let task = tokio::spawn(async move { run(&endpoint, "return await ws.mr.monitor(4);").await });
+    let task = intent_core::caller::spawn_with_current_caller(async move {
+        run(&endpoint, "return await ws.mr.monitor(4);").await
+    });
     timeout(BUDGET, entered.notified())
         .await
         .expect("SQL reached actual commit");
@@ -317,7 +319,9 @@ async fn review_monitor_sql_dropped_waiter_before_writer_acquisition_has_no_effe
     let pool = f.auth.service.store.write_pool();
     let writer = pool.acquire().await.unwrap();
     let endpoint = f.server();
-    let task = tokio::spawn(async move { run(&endpoint, "return await ws.mr.monitor(4);").await });
+    let task = intent_core::caller::spawn_with_current_caller(async move {
+        run(&endpoint, "return await ws.mr.monitor(4);").await
+    });
     timeout(BUDGET, ready.notified()).await.unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());

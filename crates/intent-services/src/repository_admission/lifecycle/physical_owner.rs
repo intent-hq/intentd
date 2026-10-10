@@ -63,6 +63,7 @@ pub(super) struct Pending {
     keys: HashSet<RepositoryLifecycleKey>,
     phase: Phase,
     binding: Option<RepositoryInitializationBinding>,
+    native: Option<Arc<super::native_allocation::NativeAllocation>>,
 }
 
 /// Nonclone original owner, allocated before exposing any pending endpoint.
@@ -75,6 +76,174 @@ pub(crate) struct RepositoryCreationOwner {
     agent: AgentId,
     intent: RepositoryCreationIntent,
     retirement: Arc<CreationAllocation>,
+}
+
+/// The private family candidate stays with its exact nonclone startup owner.
+/// It cannot be routed through the ordinary compatibility/CAS fallback path.
+pub(crate) struct RepositoryReviewCreationOwner {
+    original: RepositoryCreationOwner,
+    enrollment: intent_store::ReviewContextEnrollmentIntent,
+    context: intent_acp::review_monitoring::ReviewMonitoringContext,
+}
+
+/// A pre-confirmation capture of exactly one retained startup. It cannot mint
+/// a callback, agent caller, physical origin, or repository/account admission.
+/// It only fences the approved history bootstrap while that owner is pending.
+#[derive(Clone)]
+pub(crate) struct RepositoryReviewBootstrap {
+    store: Store,
+    session: Option<String>,
+    registry: Weak<RepositoryLifecycleRegistry>,
+    token: Weak<()>,
+    id: u64,
+    workspace: WorkspaceId,
+    agent: AgentId,
+}
+
+impl RepositoryReviewBootstrap {
+    pub(crate) fn loaded_session(&self) -> AdmissionResult<&str> {
+        self.session.as_deref().ok_or(AdmissionError::Denied)
+    }
+    pub(crate) fn workspace(&self) -> &WorkspaceId {
+        &self.workspace
+    }
+    pub(crate) fn agent(&self) -> &AgentId {
+        &self.agent
+    }
+
+    /// Register original history/source dependencies before reading them. A
+    /// mutation already pending refuses enrollment rather than borrowing its
+    /// later settled state as fresh authority.
+    pub(crate) fn subscribe(&self, keys: &[RepositoryLifecycleKey]) -> AdmissionResult<()> {
+        let registry = self.registry.upgrade().ok_or(AdmissionError::Retired)?;
+        let mut state = registry.state.lock().map_err(|_| AdmissionError::Retired)?;
+        let keys: HashSet<_> = keys.iter().cloned().collect();
+        if keys.is_empty() || state.blocked(&keys) {
+            return Err(AdmissionError::Retired);
+        }
+        let pending = state
+            .creations
+            .get_mut(&self.id)
+            .ok_or(AdmissionError::Retired)?;
+        if self.token.upgrade().is_none()
+            || !Weak::ptr_eq(&pending.token, &self.token)
+            || pending.phase != Phase::Allocated
+        {
+            return Err(AdmissionError::Retired);
+        }
+        pending.keys.extend(keys);
+        Ok(())
+    }
+
+    pub(crate) fn native_allocation(
+        &self,
+    ) -> AdmissionResult<Arc<super::native_allocation::NativeAllocation>> {
+        let registry = self.registry.upgrade().ok_or(AdmissionError::Retired)?;
+        let state = registry.state.lock().map_err(|_| AdmissionError::Retired)?;
+        let pending = state
+            .creations
+            .get(&self.id)
+            .ok_or(AdmissionError::Retired)?;
+        if self.token.upgrade().is_none()
+            || !Weak::ptr_eq(&pending.token, &self.token)
+            || pending.phase != Phase::Allocated
+            || state.blocked(&pending.keys)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        pending.native.clone().ok_or(AdmissionError::Denied)
+    }
+
+    /// Join the synchronous prebuilt transfer against pending-owner mutation.
+    /// The caller must separately hold every freshly admitted source fence.
+    /// This cannot remain usable after initialization claims or confirms it.
+    pub(crate) fn with_current<T>(
+        &self,
+        transfer: impl FnOnce() -> AdmissionResult<T>,
+    ) -> AdmissionResult<T> {
+        let registry = self.registry.upgrade().ok_or(AdmissionError::Retired)?;
+        let state = registry.state.lock().map_err(|_| AdmissionError::Retired)?;
+        let pending = state
+            .creations
+            .get(&self.id)
+            .ok_or(AdmissionError::Retired)?;
+        if self.token.upgrade().is_none()
+            || !Weak::ptr_eq(&pending.token, &self.token)
+            || pending.phase != Phase::Allocated
+            || state.blocked(&pending.keys)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        transfer()
+    }
+}
+
+impl RepositoryReviewCreationOwner {
+    pub(crate) fn attach_native(
+        &self,
+        native: Arc<super::native_allocation::NativeAllocation>,
+    ) -> AdmissionResult<()> {
+        let mut state = self
+            .original
+            .registry
+            .state
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        if state.shutdown {
+            return Err(AdmissionError::Retired);
+        }
+        let pending = state
+            .creations
+            .get_mut(&self.original.id)
+            .ok_or(AdmissionError::Retired)?;
+        if pending.phase != Phase::Allocated
+            || pending.native.is_some()
+            || !Weak::ptr_eq(&pending.token, &Arc::downgrade(&self.original.token))
+        {
+            return Err(AdmissionError::Retired);
+        }
+        pending.native = Some(native);
+        Ok(())
+    }
+    pub(crate) fn bootstrap(&self) -> AdmissionResult<RepositoryReviewBootstrap> {
+        self.original.check_pending()?;
+        let capture = RepositoryReviewBootstrap {
+            store: self.original.store.clone(),
+            session: match &self.original.intent {
+                RepositoryCreationIntent::Loaded { session_id } => Some(session_id.clone()),
+                _ => None,
+            },
+            registry: Arc::downgrade(&self.original.registry),
+            token: Arc::downgrade(&self.original.token),
+            id: self.original.id,
+            workspace: self.original.workspace.clone(),
+            agent: self.original.agent.clone(),
+        };
+        capture.subscribe(&[RepositoryLifecycleKey::MonitorHistory(
+            self.original.agent.clone(),
+        )])?;
+        Ok(capture)
+    }
+
+    pub(crate) fn context(&self) -> &intent_acp::review_monitoring::ReviewMonitoringContext {
+        &self.context
+    }
+
+    pub(crate) async fn initialize_with_outcome<T, E, F, Fut>(
+        self,
+        store: &Store,
+        operation: F,
+    ) -> AdmissionResult<RepositoryCreationOutcome<T, E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(String, T), E>>,
+    {
+        self.original.check_pending()?;
+        Ok(self
+            .original
+            .initialize_with_enrollment(store, Some(self.enrollment), operation)
+            .await)
+    }
 }
 
 #[derive(Default)]
@@ -120,6 +289,9 @@ impl RepositoryCreationRetirement {
             if let Some(pending) = state.creations.get_mut(&allocation.id) {
                 if Weak::ptr_eq(&pending.token, &allocation.token) {
                     pending.phase = Phase::Retired;
+                    if let Some(native) = &pending.native {
+                        native.retire();
+                    }
                 }
             }
             retirement.confirmed.clone()
@@ -142,6 +314,9 @@ fn retire_pending(state: &Mutex<State>, id: u64) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(pending) = state.creations.get_mut(&id) {
         pending.phase = Phase::Retired;
+        if let Some(native) = &pending.native {
+            native.retire();
+        }
     }
 }
 
@@ -175,6 +350,7 @@ impl RepositoryCreationOwner {
                 keys,
                 phase: Phase::Allocated,
                 binding: None,
+                native: None,
             },
         );
         drop(state);
@@ -194,6 +370,58 @@ impl RepositoryCreationOwner {
             intent,
             retirement,
         })
+    }
+
+    /// Pin a random new family, or read the exact installed family for a load.
+    /// This supplies no account authority and cannot confirm pending callbacks.
+    pub(crate) async fn prepare_review(self) -> AdmissionResult<RepositoryReviewCreationOwner> {
+        self.check_pending()?;
+        let enrollment = match &self.intent {
+            RepositoryCreationIntent::FirstSet | RepositoryCreationIntent::Replace { .. } => {
+                intent_store::ReviewContextEnrollmentIntent::Created(
+                    intent_store::ReviewContextOwnerKey::generate(),
+                )
+            }
+            RepositoryCreationIntent::Loaded { session_id } => {
+                let original = self
+                    .store
+                    .get_review_context_enrollment(&self.workspace, &self.agent, session_id)
+                    .await
+                    .map_err(|_| AdmissionError::Unavailable)?
+                    .ok_or(AdmissionError::Unavailable)?;
+                intent_store::ReviewContextEnrollmentIntent::Loaded(original)
+            }
+        };
+        self.check_pending()?;
+        let key = match &enrollment {
+            intent_store::ReviewContextEnrollmentIntent::Created(key) => key.as_str(),
+            intent_store::ReviewContextEnrollmentIntent::Loaded(original) => original.owner_key(),
+        };
+        let context = intent_acp::review_monitoring::ReviewMonitoringContext::new(key.to_owned())
+            .ok_or(AdmissionError::Unavailable)?;
+        Ok(RepositoryReviewCreationOwner {
+            original: self,
+            enrollment,
+            context,
+        })
+    }
+
+    fn check_pending(&self) -> AdmissionResult<()> {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?;
+        let pending = state
+            .creations
+            .get(&self.id)
+            .ok_or(AdmissionError::Retired)?;
+        if pending.phase != Phase::Allocated
+            || !Weak::ptr_eq(&pending.token, &Arc::downgrade(&self.token))
+        {
+            return Err(AdmissionError::Retired);
+        }
+        Ok(())
     }
 
     /// This projection remains unavailable forever, including after success.
@@ -243,6 +471,20 @@ impl RepositoryCreationOwner {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(String, T), E>>,
     {
+        self.initialize_with_enrollment(store, None, operation)
+            .await
+    }
+
+    async fn initialize_with_enrollment<T, E, F, Fut>(
+        self,
+        store: &Store,
+        enrollment: Option<intent_store::ReviewContextEnrollmentIntent>,
+        operation: F,
+    ) -> RepositoryCreationOutcome<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(String, T), E>>,
+    {
         let (session, payload) = match operation().await {
             Ok(produced) => produced,
             Err(error) => {
@@ -263,9 +505,18 @@ impl RepositoryCreationOwner {
                 };
             }
         };
-        let outcome = store
-            .initialize_repository_acp_session_outcome(claim, binding)
-            .await;
+        let outcome = match enrollment {
+            Some(enrollment) => {
+                store
+                    .initialize_repository_review_session_outcome(claim, binding, enrollment)
+                    .await
+            }
+            None => {
+                store
+                    .initialize_repository_acp_session_outcome(claim, binding)
+                    .await
+            }
+        };
         self.complete_outcome(store, payload, outcome)
     }
 
@@ -493,6 +744,7 @@ impl RepositoryCreationOwner {
             return Err(AdmissionError::Retired);
         }
         let keys = pending.keys.clone();
+        let native = pending.native.clone();
         let id = state.next()?;
         state.creations.remove(&self.id);
         state.origins.insert(
@@ -504,6 +756,7 @@ impl RepositoryCreationOwner {
                 },
                 keys,
                 retired: false,
+                native,
             },
         );
         proof.consumed = true;
@@ -535,7 +788,11 @@ impl Drop for RepositoryCreationOwner {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.creations.remove(&self.id);
+        if let Some(pending) = state.creations.remove(&self.id) {
+            if let Some(native) = pending.native {
+                state.retain_native_retirement(pending.keys, native);
+            }
+        }
     }
 }
 
@@ -585,6 +842,34 @@ struct Initialization {
 }
 
 impl RepositoryInitializationTicket for Initialization {
+    fn join_retirement(
+        &self,
+        confirm_original: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send + '_>>
+    {
+        let registry = self.registry.clone();
+        let barrier = self.barrier;
+        let creator = self.creator;
+        Box::pin(async move {
+            let obligations = {
+                let mut state = registry.state.lock().map_err(|_| unavailable())?;
+                let keys = state.pending.get(&barrier).ok_or_else(unavailable)?.clone();
+                if !confirm_original {
+                    if let Some(pending) = state.creations.get_mut(&creator) {
+                        pending.phase = Phase::Retired;
+                        if let Some(native) = &pending.native {
+                            native.retire();
+                        }
+                    }
+                }
+                super::native_obligations(&state, &keys)
+            };
+            for native in obligations {
+                native.join().await.map_err(|_| unavailable())?;
+            }
+            Ok(())
+        })
+    }
     fn finish_confirmed(mut self: Box<Self>) -> intent_core::Result<Box<dyn Any + Send>> {
         let mut state = self.registry.state.lock().map_err(|_| unavailable())?;
         // SQL already committed: settle ONLY this original known-completed
@@ -601,6 +886,9 @@ impl RepositoryInitializationTicket for Initialization {
             || pending.binding.as_ref() != Some(&self.binding)
         {
             pending.phase = Phase::Retired;
+            if let Some(native) = &pending.native {
+                native.retire();
+            }
             return Err(unavailable());
         }
         pending.phase = Phase::Confirmed;
@@ -622,6 +910,9 @@ impl RepositoryInitializationTicket for Initialization {
         state.pending.remove(&self.barrier);
         if let Some(pending) = state.creations.get_mut(&self.creator) {
             pending.phase = Phase::Retired;
+            if let Some(native) = &pending.native {
+                native.retire();
+            }
         }
         self.settled = true;
     }
@@ -636,6 +927,9 @@ impl RepositoryInitializationTicket for Initialization {
                 && pending.binding.as_ref() == Some(&self.binding)
             {
                 pending.phase = Phase::Retired;
+                if let Some(native) = &pending.native {
+                    native.retire();
+                }
             }
         }
         self.settled = true;
@@ -651,6 +945,54 @@ impl Drop for Initialization {
     }
 }
 
+pub(super) fn shutdown_pending_native(
+    state: &mut State,
+) -> Vec<(
+    HashSet<RepositoryLifecycleKey>,
+    Arc<super::native_allocation::NativeAllocation>,
+)> {
+    state
+        .creations
+        .values_mut()
+        .filter_map(|pending| {
+            pending.phase = Phase::Retired;
+            pending
+                .native
+                .clone()
+                .map(|native| (pending.keys.clone(), native))
+        })
+        .collect()
+}
+
+pub(super) fn retire_pending_native_contexts(
+    state: &mut State,
+    keys: &HashSet<RepositoryLifecycleKey>,
+) {
+    for pending in state
+        .creations
+        .values_mut()
+        .filter(|pending| overlaps(keys, &pending.keys))
+    {
+        if let Some(native) = &pending.native {
+            native.retire();
+        }
+    }
+}
+
+pub(super) fn pending_native_retirements(
+    state: &State,
+    keys: &HashSet<RepositoryLifecycleKey>,
+) -> Vec<Arc<super::native_allocation::NativeAllocation>> {
+    state
+        .creations
+        .values()
+        .filter(|pending| overlaps(keys, &pending.keys))
+        .filter_map(|pending| pending.native.as_ref())
+        .filter(|native| native.is_retired())
+        .cloned()
+        .collect()
+}
+
 pub(super) fn invalidate_pending(
     state: &mut State,
     keys: &HashSet<RepositoryLifecycleKey>,
@@ -659,6 +1001,9 @@ pub(super) fn invalidate_pending(
     for (id, pending) in &mut state.creations {
         if Some(*id) != except && overlaps(keys, &pending.keys) {
             pending.phase = Phase::Retired;
+            if let Some(native) = &pending.native {
+                native.retire();
+            }
         }
     }
 }
@@ -699,15 +1044,28 @@ pub(super) fn begin_initialization(
         .get_mut(&proof.id)
         .ok_or_else(unavailable)?
         .phase = Phase::Installing;
+    let mut native = Vec::new();
     let mut origins = HashSet::new();
     for (id, origin) in &mut state.origins {
         if overlaps(&keys, &origin.keys) {
             origin.retired = true;
+            if let Some(allocation) = origin.native.clone() {
+                native.push((origin.keys.clone(), allocation));
+            }
             origins.insert(*id);
         }
     }
-    let affected =
-        |entry: &Subscription| origins.contains(&entry.origin) || overlaps(&keys, &entry.keys);
+    for (keys, allocation) in native {
+        state.retain_native_retirement(keys, allocation);
+    }
+    // LOAD confirms a new physical owner of the same persisted session. It
+    // retires old physical producers, but does not replace the agent's stored
+    // history or revoke independently admitted wire readers of that history.
+    // Actual session replacement and Store mutations still retire those readers.
+    let replaces_session = !matches!(binding.action, RepositoryAcpInitialization::Loaded { .. });
+    let affected = |entry: &Subscription| {
+        origins.contains(&entry.origin) || (replaces_session && overlaps(&keys, &entry.keys))
+    };
     state.detach(affected);
     let leaves = state.pending_leaves(affected);
     proof.consumed = true;
@@ -766,7 +1124,11 @@ impl RepositoryPhysicalRetirement {
                 if !Weak::ptr_eq(&origin.token, &self.origin.token) {
                     return;
                 }
-                state.origins.remove(&self.origin.id);
+                if let Some(origin) = state.origins.remove(&self.origin.id) {
+                    if let Some(native) = origin.native {
+                        state.retain_native_retirement(origin.keys, native);
+                    }
+                }
                 state.detach(|entry| entry.origin == self.origin.id);
             }
             // Every original pre-abort caller must join an ongoing retirement,
@@ -778,6 +1140,22 @@ impl RepositoryPhysicalRetirement {
 }
 
 impl RepositoryPhysicalOwner {
+    #[cfg(test)]
+    pub(crate) fn native_allocation_for_test(
+        &self,
+    ) -> Arc<super::native_allocation::NativeAllocation> {
+        self.registry
+            .state
+            .lock()
+            .unwrap()
+            .origins
+            .get(&self.id)
+            .unwrap()
+            .native
+            .clone()
+            .unwrap()
+    }
+
     /// Captured from the one-use initialization confirmation, never a later
     /// session-row lookup or caller-supplied prompt parameter.
     pub(crate) fn confirmed_session_id(&self) -> &str {
@@ -826,3 +1204,6 @@ impl Drop for RepositoryPhysicalOwner {
 #[cfg(test)]
 #[path = "physical_owner/tests.rs"]
 mod tests;
+
+#[path = "physical_owner/history.rs"]
+mod history;

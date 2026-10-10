@@ -5,11 +5,13 @@ use std::sync::Arc;
 use intent_core::repository_request::{
     RepositoryMonitorEventRecipient, RepositoryMonitorEventSource, RepositoryPrivateOutput,
 };
-use intent_core::{Event, Result, review_monitor::ReviewMonitorBinding};
+use intent_core::{review_monitor::ReviewMonitorBinding, Event, Result};
 
 pub(crate) enum BroadcastEvent {
     Public(Event),
     Monitor(MonitorEvent),
+    // Routing identity only; no message, binding, or private content.
+    HistoryChanged(String),
 }
 
 // Public-event writer tests inspect fields on ordinary broadcasts. A private
@@ -19,7 +21,9 @@ impl std::ops::Deref for BroadcastEvent {
     fn deref(&self) -> &Event {
         match self {
             Self::Public(event) => event,
-            Self::Monitor(_) => panic!("private monitor event has no public projection"),
+            Self::Monitor(_) | Self::HistoryChanged(_) => {
+                panic!("private monitor event has no public projection")
+            }
         }
     }
 }
@@ -51,7 +55,7 @@ impl Recipient {
 }
 
 /// Only an already authorized immutable native frame may leave the private bus
-/// route. Generic recv() consumers discard it; native writers retain its guard.
+/// route. Generic `recv()` consumers discard it; native writers retain its guard.
 pub struct PrivateEventDelivery(Arc<dyn RepositoryPrivateOutput>);
 impl PrivateEventDelivery {
     #[must_use]

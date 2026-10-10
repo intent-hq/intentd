@@ -4,6 +4,9 @@
 mod common;
 #[path = "e2e_repository_context_wire/monitor_attachment.rs"]
 mod monitor_attachment;
+#[cfg(feature = "repository-test-fixtures")]
+#[path = "e2e_repository_context_wire/monitor_history.rs"]
+mod monitor_history;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, Principal, PrincipalId, WorkspaceGitRootId, WorkspaceId, WorkspaceRole,
@@ -155,8 +158,38 @@ impl Harness {
     async fn boot_with_ids(ids: Option<(WorkspaceId, WorkspaceGitRootId)>) -> Self {
         Self::boot_with_monitor_support(ids, false).await
     }
-    async fn boot_with_monitor_support(ids: Option<(WorkspaceId, WorkspaceGitRootId)>, support: bool) -> Self {
+    async fn boot_with_monitor_support(
+        ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
+        support: bool,
+    ) -> Self {
+        Self::boot_with_inputs(ids, support, None).await
+    }
+    async fn boot_with_inputs(
+        ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
+        support: bool,
+        history: Option<(&Path, &str)>,
+    ) -> Self {
+        Self::boot_with_writer_hold(ids, support, history, false).await
+    }
+    async fn boot_with_writer_hold(
+        ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
+        support: bool,
+        history: Option<(&Path, &str)>,
+        hold: bool,
+    ) -> Self {
+        Self::boot_case(ids, support, history, hold, false).await
+    }
+    async fn boot_case(
+        ids: Option<(WorkspaceId, WorkspaceGitRootId)>,
+        support: bool,
+        history: Option<(&Path, &str)>,
+        hold: bool,
+        native: bool,
+    ) -> Self {
         let dir = common::test_tempdir_in("/tmp", "itd-repository-wire-");
+        if let Some((database, _)) = history {
+            std::fs::copy(database, dir.path().join("intentd.db")).unwrap();
+        }
         let root = dir.path().join("repo");
         repository(&root);
         let registered_path = dir.path().join("secondary");
@@ -212,6 +245,11 @@ impl Harness {
             .unwrap();
         drop(store);
         std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        if let Some((_, endpoint)) = history {
+            let config = dir.path().join("config.toml");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(&config,format!("{text}\n[sourceControl.gitlab]\nhost = \"gitlab.test\"\ninstanceBaseUrl = \"https://gitlab.test/forge\"\napiBaseUrl = {endpoint:?}\n")).unwrap();
+        }
         common::enable_ws_api(dir.path());
         let bins = dir.path().join("bin");
         std::fs::create_dir(&bins).unwrap();
@@ -221,7 +259,26 @@ impl Harness {
         std::fs::create_dir(&workspaces).unwrap();
         let log = std::fs::File::create(dir.path().join("daemon.log")).unwrap();
         let mut cmd = common::hermetic_serve_command(dir.path());
+        #[cfg(not(feature = "repository-test-fixtures"))]
+        let _ = native;
+        cmd.env_remove("INTENTD_TEST_REVIEW_LAUNCHER");
+        #[cfg(feature = "repository-test-fixtures")]
+        if native {
+            monitor_history::configure_native_daemon(dir.path(), &mut cmd);
+        }
+        cmd.env_remove("INTENT_TEST_PRIVATE_WRITE_HOLD");
+        if hold {
+            let barrier = dir.path().join("private-write-hold");
+            std::fs::create_dir(&barrier).unwrap();
+            cmd.env("INTENT_TEST_PRIVATE_WRITE_HOLD", barrier);
+        }
         cmd.env_remove("INTENTD_REVIEW_MONITOR_TEST_SUPPORT");
+        if let Some((_, endpoint)) = history {
+            cmd.env(
+                "INTENTD_REPOSITORY_TEST_TRANSPORTS",
+                json!([["https://gitlab.test/forge", endpoint]]).to_string(),
+            );
+        }
         if support {
             cmd.env("INTENTD_REVIEW_MONITOR_TEST_SUPPORT", "1");
         }

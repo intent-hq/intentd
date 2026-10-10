@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use intent_core::repository_request::RepositoryPrivateOutput;
 use intent_core::repository_request::ReviewMonitorHello;
 use intent_core::review_monitor::ReviewMonitorRecipientSupport;
 
@@ -10,7 +11,12 @@ use super::{Connection, RepositoryRetirement};
 
 #[path = "monitor/admission.rs"]
 mod admission;
+#[path = "monitor/flush.rs"]
+pub(crate) mod flush;
+#[path = "monitor/history.rs"]
+mod history;
 pub(super) use admission::Projection;
+pub(super) use history::capture as capture_history;
 
 #[derive(Default)]
 pub(super) struct ConnectionState {
@@ -157,6 +163,14 @@ impl Recipient {
         request: &Arc<super::Request>,
         workspace: &intent_core::WorkspaceId,
     ) -> intent_core::Result<Arc<Self>> {
+        Self::acquire_for(request, workspace, &[]).await
+    }
+
+    async fn acquire_for(
+        request: &Arc<super::Request>,
+        workspace: &intent_core::WorkspaceId,
+        additional: &[super::RepositoryLifecycleKey],
+    ) -> intent_core::Result<Arc<Self>> {
         let receipt = request
             .monitor_receipt
             .clone()
@@ -164,16 +178,14 @@ impl Recipient {
             .ok_or_else(super::unavailable)?;
         let c = &request.connection;
         let (lifetime, registration) = c.new_lifetime().map_err(|_| super::unavailable())?;
+        let mut keys = vec![
+            super::RepositoryLifecycleKey::Database,
+            super::RepositoryLifecycleKey::WireAuthority,
+            super::RepositoryLifecycleKey::Workspace(workspace.clone()),
+        ];
+        keys.extend_from_slice(additional);
         let subscription = lifetime
-            .subscribe(
-                &c.services.store,
-                c.caller.caller(),
-                &[
-                    super::RepositoryLifecycleKey::Database,
-                    super::RepositoryLifecycleKey::WireAuthority,
-                    super::RepositoryLifecycleKey::Workspace(workspace.clone()),
-                ],
-            )
+            .subscribe(&c.services.store, c.caller.caller(), &keys)
             .map_err(|_| super::unavailable())?;
         // The original native caller must freshly pass the same Store-backed
         // workspace/member/credential checks as existing repository reads.
@@ -205,6 +217,140 @@ impl Recipient {
             })
             .map_err(|_| super::unavailable())?
     }
+}
+
+/// Whole-envelope history projection for the original acknowledged native
+/// recipient. Proof is loaded before fresh admission and that exact message is
+/// retained; current monitor state supplies neither content nor authorization.
+pub(crate) async fn history(
+    services: &super::Services,
+    workspace: &intent_core::WorkspaceId,
+    agent: &intent_core::AgentId,
+    messages: Vec<intent_core::AgentMessage>,
+) -> intent_core::Result<Vec<intent_core::AgentMessage>> {
+    let ids = messages
+        .iter()
+        .filter(|m| crate::agent_ops::is_qualified_monitor_message(m))
+        .map(|m| m.id.clone())
+        .collect::<Vec<_>>();
+    let mut admitted = admitted_history(services, workspace, agent, &ids).await?;
+    Ok(messages
+        .into_iter()
+        .filter_map(|message| {
+            if crate::agent_ops::is_qualified_monitor_message(&message) {
+                admitted.remove(&message.id)
+            } else {
+                Some(message)
+            }
+        })
+        .collect())
+}
+
+pub(crate) async fn history_index(
+    services: &super::Services,
+    workspace: &intent_core::WorkspaceId,
+    agent: &intent_core::AgentId,
+    items: Vec<intent_store::UserMessageIndexItem>,
+    preview_chars: usize,
+) -> intent_core::Result<Vec<intent_store::UserMessageIndexItem>> {
+    let ids = items
+        .iter()
+        .filter(|i| i.qualified_monitor)
+        .map(|i| i.id.clone())
+        .collect::<Vec<_>>();
+    let mut admitted = admitted_history(services, workspace, agent, &ids).await?;
+    Ok(items
+        .into_iter()
+        .filter_map(|item| {
+            if !item.qualified_monitor {
+                return Some(item);
+            }
+            let message = admitted.remove(&item.id)?;
+            // Derive every private byte from the exact verified message, never the
+            // earlier index read. Match Store's text extraction and character cap.
+            if message.role != "user" {
+                return None;
+            }
+            let text = match &message.content {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Array(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                other => other.to_string(),
+            };
+            Some(intent_store::UserMessageIndexItem {
+                qualified_monitor: true,
+                id: message.id,
+                preview: text.chars().take(preview_chars).collect(),
+                metadata: message.metadata,
+                created_at: message.created_at,
+            })
+        })
+        .collect())
+}
+
+async fn admitted_history(
+    services: &super::Services,
+    workspace: &intent_core::WorkspaceId,
+    agent: &intent_core::AgentId,
+    ids: &[String],
+) -> intent_core::Result<std::collections::HashMap<String, intent_core::AgentMessage>> {
+    let mut retained = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(retained);
+    }
+    let subscription = history::current();
+    let request = if let Some(subscription) = &subscription {
+        subscription.request(services)?
+    } else {
+        let captured = super::NATIVE_REQUEST.try_with(Clone::clone).ok();
+        if !captured.as_ref().is_some_and(|request| {
+            request
+                .monitor_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.capable())
+        }) {
+            return Ok(retained);
+        }
+        super::Request::current(services).map_err(|_| super::unavailable())?
+    };
+    let recipient = Recipient::acquire_for(
+        &request,
+        workspace,
+        &[
+            super::RepositoryLifecycleKey::Agent(agent.clone()),
+            super::RepositoryLifecycleKey::MonitorHistory(agent.clone()),
+        ],
+    )
+    .await?;
+    let mut admissions = Vec::new();
+    for id in ids {
+        let Some(proof) = services
+            .store
+            .get_monitor_message_provenance(agent, id)
+            .await?
+        else {
+            continue;
+        };
+        if &proof.workspace_id != workspace || proof.message.agent_id != *agent {
+            continue;
+        }
+        if let Ok(admitted) = admission::acquire_history(&request, &recipient, &proof.binding).await
+        {
+            admissions.push(admitted.eligibility);
+            retained.insert(proof.message.id.clone(), proof.message);
+        }
+    }
+    let projection = Projection::new(recipient, admissions);
+    projection.with_current(&mut || Ok(()))?;
+    if let Some(subscription) = subscription {
+        subscription.retain(agent, &retained, &projection)?;
+    }
+    *request.state.lock().map_err(|_| super::unavailable())? =
+        super::RequestState::Monitor(projection);
+    Ok(retained)
 }
 
 /// Only the original supported native request enters this route. Legacy and ACP
@@ -366,7 +512,7 @@ pub(crate) async fn cancel(
     let services = services.clone();
     let mut monitor = row.monitor().clone();
     // Once admitted, the commit and terminal settlement survive a lost caller.
-    let monitor = tokio::spawn(async move {
+    let monitor = intent_core::caller::spawn_with_current_caller(async move {
         let changed = tokio::task::spawn_blocking(move || {
             let mut write = Some(write);
             let mut changed = false;
@@ -509,7 +655,7 @@ impl intent_core::repository_request::RepositoryMonitorEventRecipient for EventR
                 source,
                 frame,
             });
-            use intent_core::repository_request::RepositoryPrivateOutput;
+
             output.with_current(&mut || Ok(()))?;
             Ok(output as Arc<dyn RepositoryPrivateOutput>)
         })

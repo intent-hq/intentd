@@ -4154,6 +4154,13 @@ impl Services {
                 .get_agent_messages_page(&agent_id, page_offset, page_limit)
                 .await?
         };
+        let raw_page = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            raw_page,
+        )
+        .await?;
         let mut page: Vec<AgentMessage> =
             raw_page.into_iter().map(project_served_message).collect();
         // Serve-time author projection (multiplayer w2): every user row gets
@@ -4216,9 +4223,8 @@ impl Services {
                 }
             }
         }
-        // Preserve physical page positions/cursors, but omit the whole private
-        // envelope. A stored binding cannot authorize this transcript reader.
-        page.retain(|message| !is_qualified_monitor_message(message));
+        // Physical cursors retain their original positions. Qualified entries
+        // came from the exact freshly admitted envelope before projection.
         let mut messages = serde_json::to_value(&page).expect("messages serialize");
         // In-progress tail (monorepo#3647): append the in-flight turn's
         // partial assistant message when the caller opted in and this page
@@ -4330,11 +4336,14 @@ impl Services {
             .store
             .get_agent_history_batch(&agent_id, before_seq, limit)
             .await?;
-        let mut page: Vec<_> = messages
-            .into_iter()
-            .filter(|message| !is_qualified_monitor_message(message))
-            .map(project_served_message)
-            .collect();
+        let messages = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            messages,
+        )
+        .await?;
+        let mut page: Vec<_> = messages.into_iter().map(project_served_message).collect();
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut page)
             .await;
@@ -4451,9 +4460,15 @@ impl Services {
                 }
             },
         };
-        if is_qualified_monitor_message(&message) {
-            return Err(Error::NotFound("message block unavailable".into()));
-        }
+        let message = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            vec![message],
+        )
+        .await?
+        .pop()
+        .ok_or_else(|| Error::NotFound("message block unavailable".into()))?;
         let message = project_served_message(message);
         let block = message
             .content
@@ -4504,10 +4519,14 @@ impl Services {
             .store
             .get_agent_user_message_index(&agent_id, preview_chars)
             .await?;
-        let items: Vec<_> = items
-            .into_iter()
-            .filter(|item| !is_qualified_monitor_metadata(item.metadata.as_ref()))
-            .collect();
+        let items = crate::repository_native_wire::monitor::history_index(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            items,
+            preview_chars,
+        )
+        .await?;
         let total = items.len();
         let items: Vec<Value> = items
             .into_iter()
@@ -5795,7 +5814,7 @@ impl Services {
         }
         if known_completion {
             if let Some(claim) = claim {
-                claim.settle_confirmed();
+                claim.settle_confirmed().await?;
             }
         }
         Ok(json!({ "success": true }))

@@ -5990,6 +5990,63 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
 }
 
+#[tokio::test]
+async fn start_session_private_family_never_uses_ordinary_recreate() {
+    for (load_cap, forced, missing) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("private-resume"));
+        seed_agent(&mgr, &ws, &id).await;
+        mgr.services
+            .store
+            .set_acp_session_id(&ws, &id, "original-private")
+            .await
+            .unwrap();
+        // Disposable fixture enrollment only; production startup owns this write.
+        sqlx::query("INSERT INTO review_context_enrollment(agent_id,workspace_id,acp_session_id,owner_key,version) VALUES(?,?,?,?,1)")
+            .bind(id.as_str()).bind(ws.as_str()).bind("original-private")
+            .bind("1aa11111-1111-4111-8111-111111111111")
+            .execute(mgr.services.store.write_pool()).await.unwrap();
+        if missing {
+            sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                .bind(id.as_str())
+                .execute(mgr.services.store.write_pool())
+                .await
+                .unwrap();
+        }
+        if forced {
+            mgr.force_recreate.lock().unwrap().insert(id.clone());
+        }
+        let (peer, calls) = track_mock_agent_with_log(&mgr, &id, load_cap);
+        assert!(mgr
+            .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .is_err());
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("original-private")
+        );
+        assert!(!mgr.take_recreated(&id));
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| method == "session/new" || method == "session/load"));
+        peer.abort();
+        let _ = peer.await;
+    }
+}
+
 /// The typed workspace-MCP bridge entry stashed on the handle (STAB-156):
 /// built from the same normalized-server shape `create_agent` uses for
 /// `supports_session_mcp_servers` providers (claude-code, codex, droid, grok).

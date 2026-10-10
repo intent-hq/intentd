@@ -108,14 +108,12 @@ async fn unresolved_row(fixture: &Fixture) -> intent_core::PrMonitor {
         created_at: "created".into(),
         updated_at: "updated".into(),
     };
-    assert!(
-        fixture
-            .services
-            .store
-            .insert_pr_monitor(&row)
-            .await
-            .unwrap()
-    );
+    assert!(fixture
+        .services
+        .store
+        .insert_pr_monitor(&row)
+        .await
+        .unwrap());
     sqlx::query("UPDATE pr_monitor SET target_provider=NULL,target_instance_base_url=NULL,target_project_path=NULL,target_kind=NULL,target_provenance='unresolved',target_unresolved_reason='unverified-import' WHERE monitor_id=?")
         .bind(&row.monitor_id.0).execute(fixture.services.store.write_pool()).await.unwrap();
     row
@@ -195,14 +193,12 @@ async fn native_monitor_unresolved_list_retains_original_workspace_and_output_re
                 .review_monitoring_hello(ReviewMonitorRecipientSupport::default())
                 .unwrap();
             withdrawn.acknowledge();
-            assert!(
-                output
-                    .with_current(&mut || {
-                        effects += 1;
-                        Ok(())
-                    })
-                    .is_err()
-            );
+            assert!(output
+                .with_current(&mut || {
+                    effects += 1;
+                    Ok(())
+                })
+                .is_err());
             assert_eq!(effects, 1);
         })
         .await;
@@ -462,15 +458,13 @@ async fn native_monitor_unresolved_cancel_requires_manager_not_recipient_support
     let guest = f.guest("monitor-collaborator", true).await;
     enable_monitor(&guest).await;
     assert!(list_output(&f, &guest).await.is_ok());
-    assert!(
-        guest
-            .request(
-                f.services
-                    .pr_monitor_cancel_by_id(row.workspace_id.clone(), row.monitor_id.clone(),)
-            )
-            .await
-            .is_err()
-    );
+    assert!(guest
+        .request(
+            f.services
+                .pr_monitor_cancel_by_id(row.workspace_id.clone(), row.monitor_id.clone(),)
+        )
+        .await
+        .is_err());
     assert_eq!(
         f.services
             .store

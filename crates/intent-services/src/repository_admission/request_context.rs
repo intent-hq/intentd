@@ -428,6 +428,16 @@ pub(crate) struct RepositoryCapturedRequest {
 }
 
 impl RepositoryCapturedRequest {
+    pub(super) fn native_allocation(
+        &self,
+    ) -> AdmissionResult<Arc<super::lifecycle::native_allocation::NativeAllocation>> {
+        self.check_read_caller()?;
+        let captured = self.captured.as_ref().map_err(|error| *error)?;
+        captured
+            .registry
+            .native_allocation(&captured.origin, &captured.caller)
+    }
+
     pub(super) fn same_physical_session(&self, other: &Self) -> AdmissionResult<()> {
         self.retirement.check_current()?;
         other.retirement.check_current()?;

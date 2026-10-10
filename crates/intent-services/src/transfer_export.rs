@@ -63,24 +63,32 @@ pub(crate) type MonitorExportBarrier = (
 
 fn reject_private_monitor_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
     fn parsed(row: &serde_json::Value, key: &str) -> serde_json::Value {
-        row[key].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
+        row[key]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default()
     }
-    let private = rows.iter().any(|(table, objects)| objects.iter().any(|row| {
-        match table.as_str() {
+    let private = rows.iter().any(|(table, objects)| {
+        objects.iter().any(|row| match table.as_str() {
             "agent_message" => crate::agent_ops::is_qualified_monitor_envelope(
-                &parsed(row, "content"), Some(&parsed(row, "metadata")),
+                &parsed(row, "content"),
+                Some(&parsed(row, "metadata")),
             ),
-            "pr_monitor" => row["target_provenance"] == "captured-request"
-                || ["last_snapshot", "baseline_snapshot"].iter().any(|key| {
-                    let value = parsed(row, key);
-                    value.get("monitorBinding").is_some() || value.get("qualifiedSnapshot").is_some()
-                }),
+            "pr_monitor" => {
+                row["target_provenance"] == "captured-request"
+                    || ["last_snapshot", "baseline_snapshot"].iter().any(|key| {
+                        let value = parsed(row, key);
+                        value.get("monitorBinding").is_some()
+                            || value.get("qualifiedSnapshot").is_some()
+                    })
+            }
             _ => false,
-        }
-    }));
+        })
+    });
     if private {
         return Err(Error::Unsupported(
-            "This workspace contains private review-monitor history that cannot be transferred".into(),
+            "This workspace contains private review-monitor history that cannot be transferred"
+                .into(),
         ));
     }
     Ok(())
@@ -1150,12 +1158,26 @@ mod tests {
                 };
                 let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
                 let mut rows = String::new();
-                zip.by_name("rows/agent_message.jsonl").unwrap().read_to_string(&mut rows).unwrap();
-                eprintln!("actual sealed archive contains private monitor body: {}", rows.contains("private-export-regression-sentinel"));
-                eprintln!("actual sealed archive exposes a readable chunk: {}", svc.workspace_export_read_op(export_id.to_owned(), 0).await.is_ok());
+                zip.by_name("rows/agent_message.jsonl")
+                    .unwrap()
+                    .read_to_string(&mut rows)
+                    .unwrap();
+                eprintln!(
+                    "actual sealed archive contains private monitor body: {}",
+                    rows.contains("private-export-regression-sentinel")
+                );
+                eprintln!(
+                    "actual sealed archive exposes a readable chunk: {}",
+                    svc.workspace_export_read_op(export_id.to_owned(), 0)
+                        .await
+                        .is_ok()
+                );
             }
         }
-        assert!(result.is_err(), "private monitor transfer must fail before export admission");
+        assert!(
+            result.is_err(),
+            "private monitor transfer must fail before export admission"
+        );
         assert!(svc.transfer_exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().exists());
         assert_eq!(svc.store.get_agent_session(&agent).await.unwrap(), before);
@@ -1171,7 +1193,9 @@ mod tests {
             for field in ["last_snapshot", "baseline_snapshot"] {
                 let mut row = json!({"state":state,"target_provenance":"unresolved"});
                 row[field] = json!(json!({"monitorBinding":{"original":"private"}}).to_string());
-                assert!(reject_private_monitor_export(&[("pr_monitor".into(),vec![row])]).is_err());
+                assert!(
+                    reject_private_monitor_export(&[("pr_monitor".into(), vec![row])]).is_err()
+                );
             }
         }
         for provider in ["github", "gitlab", "future"] {
@@ -1182,12 +1206,24 @@ mod tests {
                 } else {
                     json!({"content":json!([{"type":"text","messageMetadata":metadata}]).to_string(),"metadata":null})
                 };
-                assert!(reject_private_monitor_export(&[("agent_message".into(),vec![row])]).is_err());
+                assert!(
+                    reject_private_monitor_export(&[("agent_message".into(), vec![row])]).is_err()
+                );
             }
         }
         let legacy = vec![
-            ("pr_monitor".into(),vec![json!({"target_provenance":"legacy-github-writer","last_snapshot":"{\"state\":\"open\"}"})]),
-            ("agent_message".into(),vec![json!({"content":"[]","metadata":"{\"type\":\"pr_monitor_wake\",\"repo\":\"o/r\",\"prNumber\":42}"})]),
+            (
+                "pr_monitor".into(),
+                vec![
+                    json!({"target_provenance":"legacy-github-writer","last_snapshot":"{\"state\":\"open\"}"}),
+                ],
+            ),
+            (
+                "agent_message".into(),
+                vec![
+                    json!({"content":"[]","metadata":"{\"type\":\"pr_monitor_wake\",\"repo\":\"o/r\",\"prNumber\":42}"}),
+                ],
+            ),
         ];
         assert!(reject_private_monitor_export(&legacy).is_ok());
     }
@@ -1202,7 +1238,8 @@ mod tests {
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        *svc.test_export_monitor_preflight.lock().unwrap() = Some((entered.clone(),release.clone()));
+        *svc.test_export_monitor_preflight.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
         let exporting = svc.clone();
         let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
         entered.notified().await;
@@ -1212,11 +1249,24 @@ mod tests {
         release.notify_one();
         let started = start.await.unwrap().unwrap();
         let export_id = started["exportId"].as_str().unwrap();
-        assert!(!wait_ready(&svc, export_id).await, "racing private history cannot be sealed");
-        assert!(svc.workspace_export_read_op(export_id.to_owned(),0).await.is_err());
+        assert!(
+            !wait_ready(&svc, export_id).await,
+            "racing private history cannot be sealed"
+        );
+        assert!(svc
+            .workspace_export_read_op(export_id.to_owned(), 0)
+            .await
+            .is_err());
         assert!(svc.transfer_exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(export_id).exists());
-        assert_eq!(svc.store.get_agent_messages(&AgentId("agent-exp".into()),None).await.unwrap().len(),1);
+        assert_eq!(
+            svc.store
+                .get_agent_messages(&AgentId("agent-exp".into()), None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[intent_test_macros::daemon_test]

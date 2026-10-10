@@ -94,7 +94,10 @@ impl PrimaryReverseGuard {
             let previous = std::mem::take(&mut entry.monitor_hello);
             entry.monitor_hello.attachment = previous.attachment;
             entry.monitor_hello.ordinary_established = previous.ordinary_established;
-            entry.monitor_hello.attachment_source = previous.attachment_source.clone();
+            entry
+                .monitor_hello
+                .attachment_source
+                .clone_from(&previous.attachment_source);
             previous
         };
         previous.retire();

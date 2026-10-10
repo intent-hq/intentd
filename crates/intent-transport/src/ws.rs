@@ -1556,6 +1556,8 @@ impl WsInner {
                     }
                     if frame.write_wss(&mut sink).await.is_err() {
                         discard_private_output = frame.is_private();
+                        #[cfg(feature = "repository-test-fixtures")]
+                        crate::private_output::fixture_discarded_queue(&mut app_rx);
                         break;
                     }
                 }

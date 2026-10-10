@@ -49,6 +49,13 @@ pub trait RepositoryReadConnection: Send + Sync {
         None
     }
 
+    /// Freeze one acknowledged physical recipient for the existing chat
+    /// subscription. It supplies context and final-output fences, not access.
+    /// Unsupported owners keep ordinary history withholding.
+    fn capture_monitor_history(&self) -> Option<Arc<dyn RepositoryMonitorHistoryRecipient>> {
+        None
+    }
+
     /// Pre-workspace host authority, captured on this original native socket.
     fn capture_checkout(
         &self,
@@ -135,6 +142,25 @@ pub trait ReviewMonitorHello: Send + Sync {
 pub trait RepositoryPrivateOutput: Send + Sync {
     fn frame(&self) -> &str;
     fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
+/// Original physical recipient for one native chat history subscription.
+/// Every private read independently reauthorizes its saved original account;
+/// these in-process receipts are never reconstructed from public metadata.
+pub trait RepositoryMonitorHistoryRecipient: Send + Sync {
+    fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()>;
+
+    /// Bind the immutable frame to this subscription and all original private
+    /// reads retained in its current snapshot generation. Final socket writes
+    /// must use this owner, including frames already queued at retirement.
+    fn bind_output(&self, frame: String) -> Arc<dyn RepositoryPrivateOutput>;
+
+    /// A replacement snapshot discards earlier accumulated chat state. Existing
+    /// outputs keep their original fences; reset never revives them.
+    fn begin_generation(&self);
+
+    /// Join subscription retirement before unsubscribe/replacement completes.
+    fn retire(&self);
 }
 
 /// Retained original publisher authority for a private lifecycle envelope.
@@ -313,12 +339,10 @@ mod native_contract_tests {
             .unwrap(),
             json!({"kind":"workspaceInventory","workspaceId":workspace})
         );
-        assert!(
-            serde_json::from_value::<RepositoryContextCoverage>(
-                json!({"kind":"workspaceInventory","workspaceId":workspace,"gitRootId":root})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<RepositoryContextCoverage>(
+            json!({"kind":"workspaceInventory","workspaceId":workspace,"gitRootId":root})
+        )
+        .is_err());
     }
     #[test]
     fn repository_native_counters_remain_decimal_without_private_retirement_payload() {
@@ -549,18 +573,14 @@ mod selection_contract_tests {
         ] {
             assert!(serde_json::from_value::<RepositorySelectionChoice>(choice).is_err());
         }
-        assert!(
-            serde_json::from_value::<RepositorySelectionBoundQuery>(
-                json!({"workspaceId":"w","selectionId":"a","choice":{"mode":"automatic"}})
-            )
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<RepositorySelectionQuery>(
-                json!({"workspaceId":"w","selectionId":"a"})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<RepositorySelectionBoundQuery>(
+            json!({"workspaceId":"w","selectionId":"a","choice":{"mode":"automatic"}})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<RepositorySelectionQuery>(
+            json!({"workspaceId":"w","selectionId":"a"})
+        )
+        .is_err());
     }
     #[test]
     fn native_selection_independent_persistence_and_history_have_stable_tags() {

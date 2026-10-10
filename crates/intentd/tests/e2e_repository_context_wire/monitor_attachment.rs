@@ -249,7 +249,7 @@ async fn check_native_unresolved_delivery(wss: bool, support: bool) {
     let saved = store.get_pr_monitor(&row.monitor_id).await.unwrap();
     let mut expected = row.clone();
     expected.state = intent_core::PrMonitorState::Cancelled;
-    expected.updated_at = saved.updated_at.clone();
+    expected.updated_at.clone_from(&saved.updated_at);
     assert_eq!(saved, expected);
     if let Ok(dir) = std::env::var("INTENT_MONITOR_FIXTURE_DIR") {
         std::fs::create_dir_all(&dir).unwrap();

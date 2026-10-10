@@ -288,6 +288,8 @@ where
                 continue;
             }
             if frame.write_uds(&mut write_half).await.is_err() {
+                #[cfg(feature = "repository-test-fixtures")]
+                crate::private_output::fixture_discarded_queue(&mut out_rx);
                 break;
             }
         }

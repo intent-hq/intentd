@@ -94,10 +94,7 @@ pub(super) fn same_connection(m: &PrMonitor, authority: &MonitorAuthority) -> Re
             .map_err(|_| source::refused())?;
     // This comparison constrains independently admitted authority. The stored
     // evidence never supplies authority or reconstructs a runtime handle.
-    if evidence.resource != authority.binding.resource
-        || evidence.connection != authority.binding.connection
-        || evidence.scope.daemon_id != authority.binding.scope.daemon_id
-    {
+    if !authority.matches_saved_binding(&evidence) {
         return Err(source::refused());
     }
     Ok(())

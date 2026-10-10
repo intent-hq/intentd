@@ -50,8 +50,10 @@ impl ReviewMonitorHello for Hello {
 fn hello(id: Option<Value>, client: Value, capability: Value) -> String {
     let mut value = json!({
         "jsonrpc":"2.0", "method":"client.hello",
-        "params":{"clientId":client,"capabilities":{"reviewMonitoring":capability}}
+        "params":{"capabilities":{}}
     });
+    value["params"]["clientId"] = client;
+    value["params"]["capabilities"]["reviewMonitoring"] = capability;
     if let Some(id) = id {
         value["id"] = id;
     }

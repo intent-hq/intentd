@@ -14,11 +14,11 @@ use intent_core::events::{
 };
 use intent_core::{AgentId, ClientId, Event, NoteId, WorkspaceApi, WorkspaceId};
 use intent_services::{Delivery, EventBus, Subscription, SubscriptionFilter};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
@@ -36,9 +36,9 @@ use crate::panic_guard;
 use crate::presence;
 use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
 use crate::router::{
-    EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET, check_envelope, handle_message,
+    check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
 };
-use crate::rpc_limit::{OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE, Overloaded, RpcLimiter};
+use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
 /// Capacity of the per-connection **priority** outbound lane (RPC responses,
@@ -244,6 +244,8 @@ struct ConnSub {
     handle: JoinHandle<()>,
     monitor_recipient:
         Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>>,
+    history_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>>,
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
@@ -255,6 +257,9 @@ impl Drop for ConnSub {
         // Aborting the forwarder alone defers its Drop until a scheduler turn.
         // Join the original queued-output fence before removal is acknowledged.
         if let Some(recipient) = &self.monitor_recipient {
+            recipient.retire();
+        }
+        if let Some(recipient) = &self.history_recipient {
             recipient.retire();
         }
         if let Some(lifecycle) = &self.lifecycle {
@@ -303,6 +308,7 @@ impl ConnSubs {
             ConnSub {
                 handle,
                 monitor_recipient: None,
+                history_recipient: None,
                 replace_group,
                 lifecycle,
                 note_lease: false,
@@ -324,6 +330,7 @@ impl ConnSubs {
             ConnSub {
                 handle,
                 monitor_recipient: None,
+                history_recipient: None,
                 replace_group,
                 lifecycle: None,
                 note_lease: true,
@@ -771,12 +778,12 @@ async fn process_captured_frame(
                     if req.connection_role != client::ConnectionRole::ReviewMonitor
                         || req.client_id_invalid
                         || !req.id_present
-                        || !req
+                        || req
                             .capabilities
                             .as_ref()
                             .and_then(|v| v.get("reviewMonitoring"))
                             .and_then(Value::as_u64)
-                            .is_some_and(|v| v >= 1)
+                            .is_none_or(|v| v < 1)
                     {
                         return None;
                     }
@@ -1376,15 +1383,15 @@ async fn forward_subscription(
                 let Some(delivery) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
                     let _ = buffer
-                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
+                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
                         .await;
                     return;
                 };
                 let batch = match delivery {
                     Delivery::Batch(batch) => batch,
-                    Delivery::Lagged(_) => continue,
+                    Delivery::Lagged(_) | Delivery::HistoryChanged => continue,
                     Delivery::Monitor(output) => {
-                        if !buffer.drain_all(&out_tx, |item| item.into_frame(&subscription_id).into()).await { return; }
+                        if !buffer.drain_all(&out_tx, |item| item.into_frame(&subscription_id)).await { return; }
                         if out_tx.send(crate::OutboundFrame::private(output.into_output())).await.is_err() { return; }
                         continue;
                     }
@@ -1420,7 +1427,7 @@ async fn forward_subscription(
                             // blocking backpressure — flush, then send.
                             Enqueue::Overflow(item) => {
                                 if !buffer
-                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
+                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
                                     .await
                                 {
                                     return;
@@ -1433,7 +1440,7 @@ async fn forward_subscription(
                     } else {
                         // Barrier: flush conflated frames first, then block.
                         if !buffer
-                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id).into())
+                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
                             .await
                         {
                             return;
@@ -1634,6 +1641,7 @@ pub(crate) async fn handle_sub_fast_path(
                     projection,
                     replace_group,
                 } = p;
+                let history_recipient = crate::context::capture_monitor_history();
                 // Time the request-to-snapshot interval (intent-hq/intent#3707),
                 // started before the replace-group cleanup so a costly removal
                 // scan is included in the measured interval.
@@ -1660,14 +1668,18 @@ pub(crate) async fn handle_sub_fast_path(
                         ..Default::default()
                     })
                 });
-                let subscription = bus.subscribe(SubscriptionFilter {
+                let filter = SubscriptionFilter {
                     event_types: subscriptions::channel_event_types(Channel::Chat),
                     workspace_id: None,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
                     member_execution_events: true,
                     ..Default::default()
-                });
+                };
+                let subscription = match history_recipient.clone() {
+                    Some(owner) => bus.subscribe_history(filter, agent_id.clone(), owner),
+                    None => bus.subscribe(filter),
+                };
                 let subscription_id = events::next_subscription_id();
                 // Logged before the response enqueue so a client that vanishes
                 // mid-reply still leaves the subscribe record behind. The
@@ -1693,21 +1705,33 @@ pub(crate) async fn handle_sub_fast_path(
                     scope: agent_id.clone(),
                     subscription_id: subscription_id.clone(),
                 };
-                let handle = spawn_forwarder(forward_chat_subscription(
-                    api.clone(),
-                    AgentId::from(agent_id),
-                    since_message_id,
-                    delta_encoding,
-                    projection,
-                    subscription,
-                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
-                    subscription_id.clone(),
-                    out_tx.clone(),
-                    timer,
-                    limit,
-                    progressive_history,
+                let handle = spawn_forwarder(crate::context::with_monitor_history(
+                    history_recipient.clone(),
+                    forward_chat_subscription(
+                        api.clone(),
+                        AgentId::from(agent_id),
+                        since_message_id,
+                        delta_encoding,
+                        projection,
+                        subscription,
+                        gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
+                        subscription_id.clone(),
+                        out_tx.clone(),
+                        timer,
+                        limit,
+                        progressive_history,
+                    ),
                 ));
-                subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
+                subs.insert(
+                    subscription_id.clone(),
+                    handle,
+                    replace_group,
+                    Some(lifecycle),
+                );
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("just inserted")
+                    .history_recipient = history_recipient;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -2202,7 +2226,7 @@ async fn chat_subscription_loop(
     )
     .await
     {
-        Ok(Ok(permit)) => permit.send(frame.into()),
+        Ok(Ok(permit)) => permit.send(crate::context::chat_frame(frame)),
         Ok(Err(_)) => return "client_closed",
         Err(reason) => return reason,
     }
@@ -2262,7 +2286,7 @@ async fn chat_subscription_loop(
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
                     if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id, seq).into());
+                        permit.send(crate::context::chat_frame(item.into_frame(&subscription_id, seq)));
                         seq += 1;
                     }
                 }
@@ -2292,7 +2316,7 @@ async fn chat_subscription_loop(
                 let Ok(permit) = permit else { return "client_closed"; };
                 let history = history_frame.take().expect("guarded");
                 if let Some(message) = history.get("message") { state.seed_history_message(message); }
-                permit.send(subscriptions::build_history_push(&subscription_id, seq, &history).into());
+                permit.send(crate::context::chat_frame(subscriptions::build_history_push(&subscription_id, seq, &history)));
                 seq += 1;
                 if history["complete"] == true { initial_history = None; }
             }
@@ -2326,7 +2350,7 @@ async fn chat_subscription_loop(
                         .drain_all(&out_tx, |item| {
                             let frame = item.into_frame(&subscription_id, seq);
                             seq += 1;
-                            frame
+                            crate::context::chat_frame(frame)
                         })
                         .await;
                     return "bus_closed";
@@ -2346,6 +2370,27 @@ async fn chat_subscription_loop(
                     }
                     Delivery::Batch(batch) => batch,
                     Delivery::Monitor(_) => continue,
+                    Delivery::HistoryChanged => {
+                        // No private row crosses the bus. Re-read using this
+                        // original chat recipient and bind the replacement
+                        // snapshot to its freshly retained source fences.
+                        // Earlier queued deltas/history are superseded by the
+                        // same bounded recovery used for transcript replacement.
+                        while subscription.try_recv_delivery().is_some() {}
+                        initial_history = None;
+                        history_frame = None;
+                        history_read = None;
+                        held_events.clear();
+                        buffer = ConflationBuffer::new();
+                        pending_recovery = Some(0);
+                        if !attempt_chat_recovery(
+                            api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
+                        ).await {
+                            return "client_closed";
+                        }
+                        continue;
+                    }
                     // Upstream loss: the ring dropped events before delivery,
                     // possibly this agent's turn tail. Self-heal by re-emitting
                     // a fresh bounded snapshot at the next seq (see the doc
@@ -2454,7 +2499,7 @@ async fn chat_subscription_loop(
                             match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
                                 let frame = item.into_frame(sid, *s);
                                 *s += 1;
-                                frame
+                                crate::context::chat_frame(frame)
                             }) {
                                 Enqueue::Closed => return "client_closed",
                                 Enqueue::Sent | Enqueue::Buffered => continue,
@@ -2466,7 +2511,7 @@ async fn chat_subscription_loop(
                                         .drain_all(&out_tx, |item| {
                                             let frame = item.into_frame(&subscription_id, seq);
                                             seq += 1;
-                                            frame
+                                            crate::context::chat_frame(frame)
                                         })
                                         .await;
                                     if !drained {
@@ -2474,7 +2519,7 @@ async fn chat_subscription_loop(
                                     }
                                     let frame = item.into_frame(&subscription_id, seq);
                                     seq += 1;
-                                    if out_tx.send(frame.into()).await.is_err() {
+                                    if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
                                         return "client_closed";
                                     }
                                     continue;
@@ -2487,7 +2532,7 @@ async fn chat_subscription_loop(
                         .drain_all(&out_tx, |item| {
                             let frame = item.into_frame(&subscription_id, seq);
                             seq += 1;
-                            frame
+                            crate::context::chat_frame(frame)
                         })
                         .await;
                     if !drained {
@@ -2495,7 +2540,7 @@ async fn chat_subscription_loop(
                     }
                     let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                     seq += 1;
-                    if out_tx.send(frame.into()).await.is_err() {
+                    if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
                         return "client_closed";
                     }
                 }
@@ -2531,6 +2576,7 @@ async fn attempt_chat_recovery(
     limit: usize,
     progressive_history: bool,
 ) -> bool {
+    crate::context::begin_chat_history_generation();
     let Some(mut snapshot) =
         subscriptions::chat_recovery_snapshot(api, agent_id, projection, limit).await
     else {
@@ -2550,7 +2596,11 @@ async fn attempt_chat_recovery(
     snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
-    if out_tx.send(frame.into()).await.is_err() {
+    if out_tx
+        .send(crate::context::chat_frame(frame))
+        .await
+        .is_err()
+    {
         return false;
     }
     *state = subscriptions::ChatDeltaState::new(agent_id, delta_encoding, projection);

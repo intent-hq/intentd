@@ -22,10 +22,22 @@ const BUDGET: Duration = Duration::from_secs(10);
 const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
 const PROJECT: &str = "/api/v4/projects/group%2Fproject";
 
-#[path = "tests/polling.rs"]
-mod polling;
 #[path = "tests/native_monitor.rs"]
 pub(crate) mod native_monitor;
+#[path = "tests/polling.rs"]
+mod polling;
+
+pub(crate) async fn admit_original_monitor(
+    services: &Arc<Services>,
+    retained: Arc<RepositoryReadRequest>,
+    workspace: &WorkspaceId,
+    target: ReviewTarget,
+) -> AdmissionResult<Arc<MonitorAuthority>> {
+    let settled = services
+        .gitlab_repository_settled_connection()
+        .map_err(|_| AdmissionError::Unavailable)?;
+    MonitorAuthority::admit_original(services, retained, workspace, target, settled, None).await
+}
 
 pub(crate) struct ActualRead {
     pub(crate) auth: Fixture,

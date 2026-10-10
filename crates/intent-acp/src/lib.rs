@@ -28,6 +28,7 @@ pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
 pub mod permission;
+pub mod review_monitoring;
 pub mod session;
 pub mod spawn;
 pub mod terminal;

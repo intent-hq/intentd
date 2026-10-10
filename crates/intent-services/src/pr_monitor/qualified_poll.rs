@@ -1,4 +1,5 @@
 //! Qualified polling keeps private binding evidence out of public snapshots.
+use super::qualified_cache::CacheError;
 use super::{Arc, PrMonitorState, Services, Value};
 use crate::repository_admission::{AdmissionError, AdmissionResult};
 use crate::repository_read_source::MonitorAuthority;
@@ -88,6 +89,11 @@ impl Services {
                 }
                 continue;
             }
+            // Recovery never retries an uncertain obligation in the background.
+            // Only the original successful transfer acknowledgement releases it.
+            if authority.requires_explicit_recovery() {
+                continue;
+            }
             if skip_fresh
                 && monitor
                     .last_polled_at
@@ -107,18 +113,17 @@ impl Services {
             }
             let polled = authority
                 .run_poll(Box::pin(
-                    original.poll_qualified_monitor(&row, &authority, now),
+                    original.poll_qualified_monitor(&row, &authority, now, None),
                 ))
                 .await;
             // Prompt capture is a daemon-manager entry. Leave the original
             // polling caller scope before preparing a destination; the retained
             // authority and cache delivery still gate every resulting effect.
             let polled = match polled {
-                Ok(Some((observed, delivery))) => {
-                    original
-                        .queue_qualified_monitor_wake(&observed, &authority, delivery, now)
-                        .await
-                }
+                Ok(Some((observed, delivery))) => original
+                    .queue_qualified_monitor_wake(&observed, &authority, delivery, now, false)
+                    .await
+                    .map(|_| ()),
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
             };
@@ -131,11 +136,123 @@ impl Services {
         }
     }
 
+    pub(crate) async fn flush_qualified_pr_monitor(
+        &self,
+        expected: QualifiedPrMonitor,
+        captured_authority: Option<Arc<MonitorAuthority>>,
+        admitted_connection: intent_core::RepositoryConnectionScope,
+        control: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+        check: bool,
+    ) -> AdmissionResult<bool> {
+        let _lane = self.review_monitor_poll_lane.clone().lock_owned().await;
+        control
+            .with_current(&mut || Ok(()))
+            .map_err(|_| AdmissionError::Retired)?;
+        let current = self
+            .store
+            .get_qualified_pr_monitor(&expected.monitor().monitor_id)
+            .await
+            .map_err(|_| AdmissionError::Unavailable)?;
+        if current.monitor() != expected.monitor() || current.target() != expected.target() {
+            return Ok(false);
+        }
+        let current_authority = self
+            .review_monitor_authorities
+            .lock()
+            .unwrap()
+            .get(&expected.monitor().monitor_id)
+            .cloned();
+        match (&captured_authority, &current_authority) {
+            (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => {}
+            (None, None) => {}
+            _ => return Ok(false),
+        }
+        let previous = self
+            .review_monitor_deliveries
+            .lock()
+            .unwrap()
+            .get(&expected.monitor().monitor_id)
+            .cloned();
+        if let Some(previous) = previous {
+            if !previous.active() && previous.transferred() {
+                let _ = previous.acknowledge(&intent_core::now_iso()).await;
+            }
+            if previous.acknowledged() || (!previous.active() && !previous.transferred()) {
+                let mut records = self.review_monitor_deliveries.lock().unwrap();
+                if records
+                    .get(&expected.monitor().monitor_id)
+                    .is_some_and(|r| Arc::ptr_eq(r, &previous))
+                {
+                    records.remove(&expected.monitor().monitor_id);
+                }
+            }
+            return Ok(false);
+        }
+        if !check && expected.monitor().pending_changes.is_empty() {
+            return Ok(false);
+        }
+        let authority = match captured_authority.as_ref() {
+            Some(authority) if authority.binding.connection == admitted_connection => {
+                authority.clone()
+            }
+            _ => {
+                let manager = self.agent_manager().ok_or(AdmissionError::Unavailable)?;
+                let recovered = manager
+                    .recover_monitor_authority(&expected, &admitted_connection)
+                    .await
+                    .map_err(|_| AdmissionError::Unavailable)?;
+                let original = recovered.original_services()?;
+                if !Arc::ptr_eq(
+                    &original.review_monitor_authorities,
+                    &self.review_monitor_authorities,
+                ) {
+                    return Err(AdmissionError::BindingChanged);
+                }
+                control
+                    .with_current(&mut || {
+                        let mut authorities = self.review_monitor_authorities.lock().unwrap();
+                        match (
+                            captured_authority.as_ref(),
+                            authorities.get(&expected.monitor().monitor_id),
+                        ) {
+                            (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => {}
+                            (None, None) => {}
+                            _ => return Err(crate::repository_read_source::refused()),
+                        }
+                        authorities
+                            .insert(expected.monitor().monitor_id.clone(), recovered.clone());
+                        Ok(())
+                    })
+                    .map_err(|_| AdmissionError::Retired)?;
+                recovered
+            }
+        };
+        let original = authority.original_services()?;
+        let now = time::OffsetDateTime::now_utc();
+        // Even plain Flush derives sendable content from a freshly admitted read.
+        // Stored private text never becomes a replacement prompt.
+        let polled = authority
+            .run_poll(Box::pin(original.poll_qualified_monitor(
+                &expected,
+                &authority,
+                now,
+                Some(control),
+            )))
+            .await?;
+        let Some((observed, delivery)) = polled else {
+            return Ok(false);
+        };
+        original
+            .queue_qualified_monitor_wake(&observed, &authority, delivery, now, true)
+            .await
+    }
+
     async fn poll_qualified_monitor(
         &self,
         expected: &QualifiedPrMonitor,
         authority: &Arc<MonitorAuthority>,
         now: time::OffsetDateTime,
+        control: Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>>,
     ) -> AdmissionResult<
         Option<(
             intent_core::PrMonitor,
@@ -162,8 +279,11 @@ impl Services {
         {
             return Ok(None);
         }
-        let response =
-            tokio::time::timeout(self.pr_monitor_fetch_timeout, authority.read_poll(self)).await;
+        let response = tokio::time::timeout(
+            self.pr_monitor_fetch_timeout,
+            authority.read_poll_controlled(self, control.clone()),
+        )
+        .await;
         let mut updated = old.clone();
         updated.updated_at = now
             .format(&time::format_description::well_known::Rfc3339)
@@ -193,7 +313,17 @@ impl Services {
                         .unwrap_or(&baseline["qualifiedSnapshot"]),
                     &observed,
                 );
+                // A fresh no-op is not evidence that an old uncertain wake was
+                // delivered. Keep the complete original row and raw fields.
+                let terminal = matches!(fresh["state"].as_str(), Some("merged" | "closed"));
+                if authority.requires_explicit_recovery() && pending.is_empty() && !terminal {
+                    return Ok(None);
+                }
                 let activity = !diff(before, &observed).is_empty();
+                if authority.requires_explicit_recovery() {
+                    envelope["monitorBinding"] = serde_json::to_value(&authority.binding)
+                        .map_err(|_| AdmissionError::Unavailable)?;
+                }
                 envelope["qualifiedDiffSnapshot"] = observed;
                 envelope["qualifiedSnapshot"] = fresh;
                 envelope["retryAt"] = Value::Null;
@@ -219,7 +349,11 @@ impl Services {
                 updated.last_error = None;
             }
             Ok(Ok(Err(failure))) => {
-                use super::qualified_cache::CacheError;
+                // A failed explicit attempt cannot consume or rewrite old evidence.
+                if control.is_some() {
+                    return Err(AdmissionError::Unavailable);
+                }
+
                 if !matches!(failure.cause, CacheError::Provider(_)) {
                     return Err(AdmissionError::Retired);
                 }
@@ -247,6 +381,7 @@ impl Services {
                 }
             }
             Ok(Err(error)) => return Err(error),
+            Err(_) if control.is_some() => return Err(AdmissionError::Unavailable),
             Err(_) => updated.last_error = Some("Merge request refresh timed out".into()),
         }
         let write = self
@@ -285,7 +420,8 @@ impl Services {
         authority: &Arc<MonitorAuthority>,
         delivery: super::qualified_cache::CacheDelivery,
         now: time::OffsetDateTime,
-    ) -> AdmissionResult<()> {
+        force: bool,
+    ) -> AdmissionResult<bool> {
         let envelope: Value = observed
             .last_snapshot
             .as_deref()
@@ -298,12 +434,12 @@ impl Services {
         let terminal = matches!(state, "merged" | "closed");
         if !terminal
             && (observed.pending_changes.is_empty()
-                || !self.pr_monitor_debounce_elapsed_at(observed, now))
+                || (!force && !self.pr_monitor_debounce_elapsed_at(observed, now)))
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(manager) = self.agent_manager() else {
-            return Ok(());
+            return Ok(false);
         };
         // Read a fully qualified row for the next prepared CAS. A racing edit
         // must not be turned into a wake backed by another observation.
@@ -313,7 +449,7 @@ impl Services {
             .await
             .map_err(|_| AdmissionError::Unavailable)?;
         if expected.monitor() != observed {
-            return Ok(());
+            return Ok(false);
         }
         let target = &authority.binding.resource;
         let label = format!("{}!{}", target.repository.project_path, target.number);
@@ -356,7 +492,7 @@ impl Services {
             .await
             .map_err(|_| AdmissionError::Unavailable)?;
         let Some(prepared) = prepared.track(self) else {
-            return Ok(());
+            return Ok(false);
         };
         prepared
             .enqueue(self)
@@ -365,7 +501,7 @@ impl Services {
         manager
             .try_drain_queue(observed.agent_id.clone(), observed.workspace_id.clone())
             .await;
-        Ok(())
+        Ok(true)
     }
 }
 

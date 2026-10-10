@@ -155,14 +155,11 @@ mod repository_context_live;
 )]
 mod repository_context_output;
 mod repository_context_reader;
-#[expect(
-    dead_code,
-    unused_imports,
-    reason = "Settings and child-policy writer integration remains inactive"
-)]
 #[cfg_attr(
     not(test),
     expect(
+        dead_code,
+        unused_imports,
         clippy::wildcard_imports,
         reason = "Preserve private writer imports while native and child-policy integration is pending"
     )
@@ -1434,6 +1431,10 @@ pub struct Services {
     >,
     /// GitLab's configured connection has an independent, non-overlapping poll lane.
     review_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded controls consumed by the existing monitor loop, never a wake queue.
+    review_monitor_controls: Arc<
+        Mutex<Option<tokio::sync::mpsc::Sender<repository_native_wire::monitor::flush::Command>>>,
+    >,
     /// Current original deliveries; never reconstructed from persisted wake metadata.
     review_monitor_deliveries: repository_read_source::MonitorDeliveries,
     /// Explicit fixture receipt for tests that exercise the real session launcher.
@@ -1809,6 +1810,7 @@ impl Services {
             pr_monitor_registration: Arc::default(),
             review_monitor_authorities: Arc::default(),
             review_monitor_poll_lane: Arc::default(),
+            review_monitor_controls: Arc::default(),
             review_monitor_deliveries: Arc::default(),
             #[cfg(test)]
             test_review_monitoring_recipient: false,
@@ -17250,6 +17252,13 @@ impl Services {
         expected: Arc<SettingsSnapshot>,
         mut admission: PreparedReloadAdmission,
     ) -> Result<SettingsChanged> {
+        type Completion = (
+            PreparedReloadAdmission,
+            Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+            Result<SettingsChanged>,
+            Option<source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        );
         let registry = self
             .settings_registry
             .as_deref()
@@ -17262,7 +17271,78 @@ impl Services {
         } else {
             None
         };
-        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let revision_guard = admission
+            .wait(self.settings_revision_gate.clone().write_owned())
+            .await?;
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Completion>();
+        let services = self.clone();
+        // Pre-publication waits remain on the original watcher. Register the
+        // finite completion owner before committing, then hand it the SAME
+        // admitted write and guards without an intervening await.
+        let task =
+            self.store_tasks
+                .spawn_draining_with_current_caller(async move {
+                    let (admission, write, result, credential_guard, revision_guard) = receiver
+                        .await
+                        .map_err(|_| Error::Internal("settings reload was not published".into()))?;
+                    admission
+                        .finish(async {
+                            if let Some(write) = write
+                                .as_ref()
+                                .filter(|write| write.native_retirement_pending())
+                            {
+                                let completed = write
+                                    .completed_source(services.gitlab_secret_store.clone())
+                                    .await;
+                                drop(revision_guard);
+                                write.release_native_wait_lease();
+                                drop(credential_guard);
+                                if let Err(error) = write.join_native_retirement().await {
+                                    // The adopted external file remains authoritative. Keep
+                                    // any original publication error; never invent rollback.
+                                    return result.and(Err(error));
+                                }
+                                let credential_guard = services.gitlab_credential_gate.lock().await;
+                                write.restore_native_wait_lease(&credential_guard);
+                                if let Err(error) = write
+                                    .check_completed_source(
+                                        completed,
+                                        services.gitlab_secret_store.clone(),
+                                    )
+                                    .await
+                                {
+                                    return result.and(Err(error));
+                                }
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        Some(write),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                if let Ok(notice) = &result {
+                                    let _revision = services.settings_revision_gate.write().await;
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                result
+                            } else {
+                                if let Ok(notice) = &result {
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                drop(revision_guard);
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        write.as_deref(),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                result
+                            }
+                        })
+                        .await
+                })
+                .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
         let (write, result) = admission.publish(|| {
             let write = if self.gitlab_credential_gate.has_settings_boundary() {
                 credential_guard
@@ -17281,17 +17361,18 @@ impl Services {
             let result = registry.publish_repository_reload(candidate, write.as_deref());
             Ok((write, result))
         })?;
-        admission
-            .finish(async {
-                if let Ok(notice) = &result {
-                    self.apply_external_settings_change(notice).await;
-                }
-                drop(revision_guard);
-                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
-                    .await;
-                result
-            })
-            .await
+        sender
+            .send((admission, write, result, credential_guard, revision_guard))
+            .map_err(|_| {
+                Error::Internal(
+                    "settings reload completion owner unavailable; state may be unknown".into(),
+                )
+            })?;
+        task.await.map_err(|error| {
+            Error::Internal(format!(
+                "settings reload completion failed: {error}; state may be unknown"
+            ))
+        })?
     }
 
     /// Apply an **externally driven** settings change (config.toml
@@ -18205,7 +18286,9 @@ impl Services {
                 // Cancellation or a late blocking worker drops the claims as unknown.
                 if known_completion {
                     for claim in deletion_claims {
-                        claim.settle_confirmed();
+                        if claim.settle_confirmed().await.is_err() {
+                            tracing::warn!("background cleanup: original retirement completion unavailable");
+                        }
                     }
                 }
                 #[cfg(all(test, unix))]
@@ -38319,12 +38402,22 @@ pub(crate) mod setup_runner {
     }
 }
 
+// Retained by the settings supervisor before any effect; caller cancellation
+// cannot abandon the original write or its deferred publication.
+#[derive(Default)]
+struct SettingsNativeCompletion {
+    write: Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+    settlement: Option<(bool, bool)>,
+    event: Option<(Vec<serde_json::Value>, u64)>,
+}
+
 impl Services {
     async fn settings_update_owned(
         &self,
         changes: serde_json::Value,
         is_tcp: bool,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         /// Which store a captured old value belongs to, so the rollback
         /// path restores it through the same seam that persisted it.
@@ -38385,6 +38478,7 @@ impl Services {
         self.settings_service().validate_update(&changes)?;
         let repository_write =
             self.prepare_gitlab_repository_settings(&changes, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let settings = self
             .settings_service()
             .with_repository_write(repository_write.clone());
@@ -38393,7 +38487,8 @@ impl Services {
             let secrets = match settings.update_secrets(&changes).await {
                 Ok(secrets) => secrets,
                 Err(error) => {
-                    self.settle_gitlab_repository_settings(
+                    self.settle_settings_before_native_completion(
+                        native,
                         repository_write.as_deref(),
                         false,
                         false,
@@ -38687,12 +38782,12 @@ impl Services {
                     }
                     self.include_ws_port_assignment(port_was_unassigned, &mut applied);
                     let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        settings_changed_event(&applied, revision),
-                    )
-                    .await;
-                    self.on_settings_applied(&applied);
+                    if repository_write.as_deref().is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+                        native.lock().unwrap().event = Some((applied.clone(), revision));
+                    } else {
+                        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                        self.on_settings_applied(&applied);
+                    }
                     return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
                 }
                 Ok(serde_json::json!({
@@ -38706,7 +38801,8 @@ impl Services {
         drop(revision_guard);
         if let Err(error) = result {
             let rollback_incomplete = !secrets_compensated && secrets.rollback(&self.secrets).await;
-            self.settle_gitlab_repository_settings(
+            self.settle_settings_before_native_completion(
+                native,
                 repository_write.as_deref(),
                 compensation_complete && !rollback_incomplete,
                 true,
@@ -38719,8 +38815,13 @@ impl Services {
             }
             return Err(error);
         }
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         result
     }
 
@@ -38728,6 +38829,7 @@ impl Services {
         &self,
         path: String,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         Self::require_administrator("settings.reset")?;
         // Same serialization and lock order as `settings.update`
@@ -38741,6 +38843,7 @@ impl Services {
             Some(self.settings_revision_gate.write().await)
         };
         let repository_write = self.prepare_gitlab_repository_reset(&path, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let reset = self
             .settings_service()
             .with_repository_write(repository_write.clone())
@@ -38750,8 +38853,13 @@ impl Services {
             Ok(result) => result,
             Err(error) => {
                 drop(revision_guard);
-                self.settle_gitlab_repository_settings(repository_write.as_deref(), false, false)
-                    .await;
+                self.settle_settings_before_native_completion(
+                    native,
+                    repository_write.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -38760,22 +38868,49 @@ impl Services {
         }
         let revision = if changed {
             let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-            publish_event(
-                self.event_bus.as_ref(),
-                settings_changed_event(std::slice::from_ref(&result), revision),
-            )
-            .await;
-            self.on_settings_applied(std::slice::from_ref(&result));
+            if repository_write
+                .as_deref()
+                .is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending)
+            {
+                native.lock().unwrap().event = Some((vec![result.clone()], revision));
+            } else {
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(std::slice::from_ref(&result), revision),
+                )
+                .await;
+                self.on_settings_applied(std::slice::from_ref(&result));
+            }
             revision
         } else {
             self.settings_revision.load(Ordering::SeqCst)
         };
         drop(revision_guard);
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         let mut result = result;
         result["revision"] = serde_json::json!(revision);
         Ok(result)
+    }
+
+    async fn settle_settings_before_native_completion(
+        &self,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
+        write: Option<&source_control_auth_ops::repository_owner::RepositorySettingsWrite>,
+        settled: bool,
+        compensated: bool,
+    ) {
+        if write.is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+            native.lock().unwrap().settlement = Some((settled, compensated));
+        } else {
+            self.settle_gitlab_repository_settings(write, settled, compensated)
+                .await;
+        }
     }
 
     async fn owned_settings_mutation(
@@ -38802,31 +38937,96 @@ impl Services {
             operation.primary_auth_admitted = true;
             let primary = reset.as_deref().is_some_and(|path| path.starts_with("sourceControl.gitlab."))
                 || Self::repository_settings_relevant(&changes);
-            let credential_guard = if primary {
+            let mut credential_guard = if primary {
                 Some(Arc::new(operation.gitlab_credential_gate.lock().await))
             } else { None };
-            let paths: Vec<&str> = match &reset {
-                Some(path) => vec![path.as_str()],
-                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str)).collect(),
+            let paths: Vec<String> = match &reset {
+                Some(path) => vec![path.clone()],
+                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str).map(str::to_owned)).collect(),
             };
-            let _account_guards = operation.settings_secret_gates.write(&paths).await;
+            let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+            let native = Arc::new(std::sync::Mutex::new(SettingsNativeCompletion::default()));
+            let worker_native = native.clone();
             // The supervisor, not the fallible algorithm, owns these guards.
             // A panic becomes an unknown failure, then actual writes still
             // settle before another same-account operation can proceed.
             let worker = operation.clone();
             let worker_credential = credential_guard.clone();
-            let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
-                intent_core::caller::with_wire_credential(credential, async move {
+            let mut result = intent_core::spawn_daemon(intent_core::with_caller(caller.clone(),
+                intent_core::caller::with_wire_credential(credential.clone(), async move {
                     match reset {
-                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref()).await,
-                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref()).await,
+                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref(), &worker_native).await,
+                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref(), &worker_native).await,
                     }
                 })
             )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));
+            intent_core::with_caller(caller, intent_core::caller::with_wire_credential(credential, async {
+            let (original, deferred) = {
+                let state = native.lock().unwrap();
+                (state.write.clone(), state.settlement.is_some() || state.event.is_some())
+            };
+            if let Some(write) = original.filter(|write| deferred || write.native_retirement_pending()) {
+                // Complete actual persistence first, then release every physical
+                // guard. The original logical mutation stays retained in native.
+                operation.secrets.finish_operation().await;
+                let completed = write.completed_source(operation.gitlab_secret_store.clone()).await;
+                write.release_native_wait_lease();
+                drop(account_guards.take());
+                drop(credential_guard.take());
+                if let Err(error) = write.join_native_retirement().await {
+                    if result.is_ok() { result = Err(error); }
+                } else {
+                        credential_guard = Some(Arc::new(operation.gitlab_credential_gate.lock().await));
+                        account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+                        write.restore_native_wait_lease(credential_guard.as_deref().unwrap());
+                        let current = write.check_completed_source(completed, operation.gitlab_secret_store.clone()).await;
+                        if current.is_ok() {
+                            let (settled, compensated) = native.lock().unwrap().settlement.unwrap_or((false, false));
+                            operation.settle_gitlab_repository_settings(Some(&write), settled, compensated).await;
+                        } else if result.is_ok() {
+                            result = current.map(|()| serde_json::Value::Null);
+                        }
+                        let event = native.lock().unwrap().event.take();
+                        if let (Ok(response), Some((applied, _persisted_revision))) = (&mut result, event) {
+                            let _revision = operation.settings_revision_gate.write().await;
+                            // A later update may have superseded overlapping keys
+                            // while native retirement was held. Project the current
+                            // wire values for this batch's paths under the revision
+                            // gate, without reapplying its persisted values.
+                            let current = async {
+                                let settings = operation.settings_service();
+                                let mut current = Vec::with_capacity(applied.len());
+                                for entry in &applied {
+                                    let path = entry["path"].as_str().ok_or_else(|| Error::Internal("settings completion path unavailable".into()))?;
+                                    current.push(settings.completion_value(path).await?);
+                                }
+                                Ok::<_, Error>(current)
+                            }.await;
+                            match current {
+                                Ok(applied) => {
+                                    let revision = operation.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if response.get("applied").is_some() {
+                                        response["applied"] = serde_json::json!(applied);
+                                    } else if let Some(reset) = applied.first() {
+                                        *response = reset.clone();
+                                    }
+                                    response["revision"] = serde_json::json!(revision);
+                                    publish_event(operation.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                                    operation.on_settings_applied(&applied);
+                                }
+                                Err(error) => result = Err(error),
+                            }
+                        }
+                }
+            }
+            })).await;
             let _ = response.send(result);
             // Caller caps and unknown-state response are preserved. This tail
             // never resumes skipped work or blindly restores after that error.
             operation.secrets.finish_operation().await;
+            drop(account_guards);
+            drop(credential_guard);
         }).is_none() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }

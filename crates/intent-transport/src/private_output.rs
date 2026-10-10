@@ -137,6 +137,8 @@ impl PrivateOutput {
         &self,
         writer: &mut W,
     ) -> Result<(), ()> {
+        #[cfg(feature = "repository-test-fixtures")]
+        fixture_hold(self.0.frame(), "uds-before-write").await?;
         for bytes in [self.0.frame().as_bytes(), b"\n"] {
             let mut offset = 0;
             while offset < bytes.len() {
@@ -170,8 +172,71 @@ impl PrivateOutput {
                     })
             })
             .map_err(|_| ())?;
+        #[cfg(feature = "repository-test-fixtures")]
+        fixture_hold(self.0.frame(), "wss-before-flush").await?;
         poll_fn(|cx| self.poll(cx, |cx| std::pin::Pin::new(&mut *sink).poll_flush(cx))).await
     }
+}
+
+/// Disposable daemon fixtures only. Never compiled into a packaged daemon.
+/// Holds one selected private frame outside admission locks; resumption still
+/// goes through the original production admission and writer error paths.
+#[cfg(feature = "repository-test-fixtures")]
+async fn fixture_hold(frame: &str, stage: &str) -> Result<(), ()> {
+    use std::io::Write as _;
+    let Some(root) = std::env::var_os("INTENT_TEST_PRIVATE_WRITE_HOLD") else {
+        return Ok(());
+    };
+    let root = std::path::PathBuf::from(root);
+    let Ok(needle) = std::fs::read_to_string(root.join("arm")) else {
+        return Ok(());
+    };
+    if needle.is_empty() || !frame.contains(&needle) || !frame.contains("subscription.push") {
+        return Ok(());
+    }
+    let marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join("entered"));
+    let mut marker = match marker {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(_) => return Err(()),
+    };
+    marker.write_all(stage.as_bytes()).map_err(|_| ())?;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !root.join("release").exists() {
+            // timing-guard: disposable cross-process writer barrier readiness
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| ())
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+pub(crate) fn fixture_discarded_queue(queue: &mut crate::conn::OutboundReceiver) {
+    let Some(root) = std::env::var_os("INTENT_TEST_PRIVATE_WRITE_HOLD") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    if !root.join("entered").exists() {
+        return;
+    }
+    let mut public = Vec::new();
+    for lane in [&mut queue.priority, &mut queue.bulk] {
+        while let Ok(frame) = lane.try_recv() {
+            if !frame.is_private() {
+                public.push(frame.to_string());
+            }
+        }
+    }
+    // These items would be dropped on the same error path; this records their
+    // presence without writing or flushing them through the failed socket.
+    let _ = std::fs::write(
+        root.join("discarded-public.json"),
+        serde_json::to_vec(&public).unwrap(),
+    );
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 pub(crate) type ReadPolicyFactory =
     dyn Fn(Arc<RepositoryReadRequest>) -> Arc<dyn McpPrivatePolicy> + Send + Sync;
 
+#[derive(Clone)]
 enum OriginalReadOwner {
     Request(Arc<dyn Any + Send + Sync>),
     Monitor(Weak<dyn Any + Send + Sync>),
@@ -34,6 +35,7 @@ pub(crate) struct RepositoryReadOwner {
     store: Store,
     registry: Arc<RepositoryLifecycleRegistry>,
     policy: Option<Arc<ReadPolicyFactory>>,
+    monitor_recipient: Option<intent_acp::review_monitoring::PendingReviewMonitoring>,
     #[cfg(test)]
     review_monitoring: bool,
 }
@@ -55,6 +57,7 @@ impl RepositoryReadOwner {
             store,
             registry,
             policy: None,
+            monitor_recipient: None,
             #[cfg(test)]
             review_monitoring: false,
         }))
@@ -79,6 +82,25 @@ impl RepositoryReadOwner {
         self
     }
 
+    /// Bind only at the original Services/physical session installation. Keep
+    /// this per-session: cloning the shared owner never upgrades other sessions.
+    pub(crate) fn with_monitor_recipient(
+        self: &Arc<Self>,
+        recipient: Option<intent_acp::review_monitoring::PendingReviewMonitoring>,
+        connection: &Arc<intent_acp::Connection>,
+        session: &str,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            original: self.original.clone(),
+            store: self.store.clone(),
+            registry: self.registry.clone(),
+            policy: self.policy.clone(),
+            monitor_recipient: recipient.filter(|r| r.is_for(connection, session)),
+            #[cfg(test)]
+            review_monitoring: self.review_monitoring,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn with_review_monitoring(mut self: Arc<Self>) -> Arc<Self> {
         Arc::get_mut(&mut self)
@@ -94,6 +116,7 @@ pub(crate) struct RepositoryReadRequest {
     owner: Arc<RepositoryReadOwner>,
     original: Arc<RepositoryCapturedRequest>,
     correlation: String,
+    monitor_recipient: Option<intent_acp::review_monitoring::ReviewMonitoringReceipt>,
 }
 
 impl RepositoryReadRequest {
@@ -126,23 +149,83 @@ impl RepositoryReadRequest {
             store: self.owner.store.clone(),
             registry: self.owner.registry.clone(),
             policy: None,
+            monitor_recipient: None,
             #[cfg(test)]
             review_monitoring: self.owner.review_monitoring,
         });
-        Self::capture(owner, self.original.retain_monitor()?)
+        let original = self.original.retain_monitor()?;
+        original.check_read_owner(&owner.store, &owner.registry)?;
+        Ok(Arc::new(Self {
+            owner,
+            original,
+            correlation: uuid::Uuid::new_v4().to_string(),
+            monitor_recipient: self.monitor_recipient.clone(),
+        }))
     }
 
-    /// No production harness is qualified for monitor delivery yet. The later
-    /// lifecycle activation must install a receipt at original session creation;
-    /// request arguments, persisted metadata and ambient caller IDs cannot opt in.
+    /// Each request snapshots ACK at capture. A request captured before ACK
+    /// never gains support later; source/account authority remains independent.
     pub(crate) fn supports_review_monitoring(&self) -> bool {
         if self.check_current().is_err() {
             return false;
+        }
+        if let Some(receipt) = &self.monitor_recipient {
+            return receipt.is_current();
         }
         #[cfg(test)]
         return self.owner.review_monitoring;
         #[cfg(not(test))]
         false
+    }
+
+    /// Monitor-only synchronous final boundary. Call only once after acquiring
+    /// the SQL writer/source/account fences, never recursively for two leaves.
+    pub(crate) fn with_monitor_recipient<T>(
+        &self,
+        action: impl FnOnce() -> AdmissionResult<T>,
+    ) -> AdmissionResult<T> {
+        if let Some(receipt) = &self.monitor_recipient {
+            return receipt
+                .with_current(action)
+                .ok_or(AdmissionError::Retired)?;
+        }
+        #[cfg(test)]
+        if self.owner.review_monitoring {
+            return action();
+        }
+        Err(AdmissionError::Denied)
+    }
+
+    /// NEW private deliveries need the actual acknowledged allocation, not just
+    /// a matching public session. Test-only support has no native qualification.
+    pub(crate) fn monitor_native_allocation(
+        &self,
+    ) -> AdmissionResult<Option<Arc<super::lifecycle::native_allocation::NativeAllocation>>> {
+        self.check_current()?;
+        if let Some(receipt) = &self.monitor_recipient {
+            if !receipt.is_current() {
+                return Err(AdmissionError::Retired);
+            }
+            let native = self.original.native_allocation()?;
+            if native.context() != receipt.context() {
+                return Err(AdmissionError::Denied);
+            }
+            return Ok(Some(native));
+        }
+        #[cfg(test)]
+        if self.owner.review_monitoring {
+            return Ok(None);
+        }
+        Err(AdmissionError::Denied)
+    }
+
+    fn same_monitor_recipient(&self, other: &Self) -> AdmissionResult<()> {
+        match (&self.monitor_recipient, &other.monitor_recipient) {
+            (Some(a), Some(b)) if a.same_recipient(b) => Ok(()),
+            #[cfg(test)]
+            (None, None) if self.owner.review_monitoring && other.owner.review_monitoring => Ok(()),
+            _ => Err(AdmissionError::Denied),
+        }
     }
 
     /// Prequeue capture uses the authentic physical caller already captured by
@@ -153,9 +236,14 @@ impl RepositoryReadRequest {
         original: Arc<RepositoryCapturedRequest>,
     ) -> AdmissionResult<Arc<Self>> {
         original.check_read_owner(&owner.store, &owner.registry)?;
+        let monitor_recipient = owner
+            .monitor_recipient
+            .as_ref()
+            .and_then(intent_acp::review_monitoring::PendingReviewMonitoring::acknowledged);
         Ok(Arc::new(Self {
             owner,
             original,
+            monitor_recipient,
             correlation: uuid::Uuid::new_v4().to_string(),
         }))
     }
@@ -216,7 +304,7 @@ impl RepositoryReadRequest {
         Ok(RepositoryReadChild {
             request: self.clone(),
             lifetime: self.original.source_lifetime()?,
-            subscriptions: Vec::new(),
+            subscriptions: Mutex::new(Vec::new()),
         })
     }
 }
@@ -239,7 +327,7 @@ pub(crate) trait MonitorCommitAuthority {
 pub(crate) struct RepositoryReadChild {
     request: Arc<RepositoryReadRequest>,
     lifetime: RepositorySourceLifetime,
-    subscriptions: Vec<RepositorySubscription>,
+    subscriptions: Mutex<Vec<RepositorySubscription>>,
 }
 
 impl RepositoryReadChild {
@@ -247,14 +335,16 @@ impl RepositoryReadChild {
         self.lifetime.retirement()
     }
 
-    pub(crate) fn subscribe(&mut self, keys: &[RepositoryLifecycleKey]) -> AdmissionResult<()> {
+    pub(crate) fn subscribe(&self, keys: &[RepositoryLifecycleKey]) -> AdmissionResult<()> {
         self.request.check_current()?;
         let caller = current_caller().ok_or(AdmissionError::Denied)?;
-        self.subscriptions.push(self.lifetime.subscribe(
-            &self.request.owner.store,
-            &caller,
-            keys,
-        )?);
+        let subscription = self
+            .lifetime
+            .subscribe(&self.request.owner.store, &caller, keys)?;
+        self.subscriptions
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?
+            .push(subscription);
         Ok(())
     }
 
@@ -266,9 +356,10 @@ impl RepositoryReadChild {
         eligibility: &impl MonitorCommitAuthority,
         write: intent_store::PreparedMonitorWrite,
     ) -> AdmissionResult<intent_core::Result<bool>> {
-        self.lifetime
-            .retirement()
-            .dispatch(|| eligibility.commit_prepared(write))
+        self.lifetime.retirement().dispatch(|| {
+            self.request
+                .with_monitor_recipient(|| eligibility.commit_prepared(write))
+        })
     }
 
     /// Join both original source and destination retirement through COMMIT.
@@ -279,11 +370,12 @@ impl RepositoryReadChild {
         eligibility: &impl MonitorCommitAuthority,
         write: intent_store::PreparedMonitorMessage,
     ) -> AdmissionResult<intent_core::Result<Option<intent_core::AgentMessage>>> {
+        self.request.same_monitor_recipient(&destination.request)?;
         self.lifetime.retirement().dispatch(|| {
-            destination
-                .lifetime
-                .retirement()
-                .dispatch(|| eligibility.commit_message(write))
+            destination.lifetime.retirement().dispatch(|| {
+                self.request
+                    .with_monitor_recipient(|| eligibility.commit_message(write))
+            })
         })
     }
 
@@ -294,11 +386,12 @@ impl RepositoryReadChild {
         eligibility: &impl MonitorCommitAuthority,
         write: intent_store::PreparedMonitorWrite,
     ) -> AdmissionResult<intent_core::Result<bool>> {
+        self.request.same_monitor_recipient(&destination.request)?;
         self.lifetime.retirement().dispatch(|| {
-            destination
-                .lifetime
-                .retirement()
-                .dispatch(|| eligibility.commit_prepared(write))
+            destination.lifetime.retirement().dispatch(|| {
+                self.request
+                    .with_monitor_recipient(|| eligibility.commit_prepared(write))
+            })
         })
     }
 

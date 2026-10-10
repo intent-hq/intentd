@@ -305,7 +305,7 @@ pub async fn prompt_with_required_admission(
     admission: Box<dyn crate::transport::AcpPromptAdmission>,
 ) -> AcpResult<PromptOutcome> {
     let request = PromptRequest::new(SessionId::new(session_id), prompt);
-    let params = serde_json::to_value(&request)?;
+    let params = admission.required_params(serde_json::to_value(&request)?)?;
     let idle_window = prompt_idle_timeout();
     let req_fut =
         conn.request_required_prompt(params, admission, Duration::from_secs(24 * 60 * 60));

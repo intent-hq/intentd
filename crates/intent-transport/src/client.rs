@@ -136,14 +136,20 @@ pub(crate) fn server_json(
 /// This signal supplies compatibility only, never source or recipient authority.
 fn connection_server_json(is_local: bool) -> Value {
     let server = server_json(
-        detect_has_display(), std::env::consts::OS, std::env::consts::ARCH,
-        env!("CARGO_PKG_VERSION"), crate::BUILD_COMMIT, is_local,
+        detect_has_display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env!("CARGO_PKG_VERSION"),
+        crate::BUILD_COMMIT,
+        is_local,
     );
     #[cfg(feature = "repository-test-fixtures")]
     let server = {
         let mut server = server;
-        apply_monitor_test_support(&mut server,
-            std::env::var("INTENTD_REVIEW_MONITOR_TEST_SUPPORT").as_deref() == Ok("1"));
+        apply_monitor_test_support(
+            &mut server,
+            std::env::var("INTENTD_REVIEW_MONITOR_TEST_SUPPORT").as_deref() == Ok("1"),
+        );
         server
     };
     server

@@ -75,14 +75,14 @@ impl tracing::Subscriber for LifecycleCapture {
 /// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
         let dir = crate::test_support::test_tempdir("intentd-agent-");
         let path = dir.path().join("agent.db");
-        Self { path, _dir: dir }
+        Self { path, dir }
     }
 }
 
@@ -10902,3 +10902,6 @@ async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
         json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
     );
 }
+
+#[path = "review_startup_tests.rs"]
+mod review_startup_tests;

@@ -26,6 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
+#[path = "transport_review_history.rs"]
+pub(crate) mod review_history;
+
 use crate::callback_registration::{CallbackFailure, CallbackToolRoutes};
 use crate::error::{AcpError, AcpResult, JsonRpcError};
 
@@ -125,6 +128,18 @@ pub enum AcpPromptAdmissionOutcome {
 /// A trusted owner of the original prompt capture. This neutral transport does
 /// not manufacture that capture or validate repository/provider authority.
 pub trait AcpPromptAdmission: Send + Sync {
+    /// Bind required prompt metadata to the exact caller-supplied payload.
+    /// This only prepares bytes; `admit` must still authorize their final write.
+    ///
+    /// # Errors
+    /// Returns an error if the required original payload cannot be bound.
+    fn required_params(
+        &self,
+        params: serde_json::Value,
+    ) -> crate::error::AcpResult<serde_json::Value> {
+        Ok(params)
+    }
+
     /// Validate the original capture, then consume the borrowed packet while
     /// retaining the required guards. Release guards before returning. Never
     /// detach, retry, rebind, or reconstruct authority from public identifiers.
@@ -668,6 +683,7 @@ fn dispatch(
 /// so the detached drain (and its capture file) may outlive the connection
 /// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
+    review_monitoring: Arc<Mutex<crate::review_monitoring::ConnectionState>>,
     pub(crate) codex_sandboxes: Mutex<HashMap<String, crate::codex_sandbox::CodexSandbox>>,
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
@@ -712,9 +728,13 @@ impl Connection {
         let auth_error = Arc::new(AtomicBool::new(false));
         let auth_required = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
+        let review_monitoring = Arc::new(Mutex::new(
+            crate::review_monitoring::ConnectionState::default(),
+        ));
 
         // Writer task: drain whole lines to stdin, one at a time.
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(WRITER_CHANNEL_CAPACITY);
+        let review_writer = review_monitoring.clone();
         tasks.push(tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = writer_rx.recv().await {
@@ -725,6 +745,7 @@ impl Connection {
                     break;
                 }
             }
+            review_writer.lock().unwrap().close();
         }));
 
         // Reader task: frame on `\n`, parse, dispatch.
@@ -740,6 +761,7 @@ impl Connection {
         let auth_required_reader = Arc::clone(&auth_required);
         let auth_error_reader = Arc::clone(&auth_error);
         let agent_id_reader = hooks.agent_id;
+        let review_reader = review_monitoring.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -747,6 +769,7 @@ impl Connection {
                     continue;
                 }
                 if auth_marker.is_some_and(|marker| line.trim() == marker) {
+                    review_reader.lock().unwrap().close();
                     auth_required_reader.store(true, Ordering::SeqCst);
                     auth_error_reader.store(true, Ordering::SeqCst);
                     prompt_pending_reader.lock().unwrap().close();
@@ -789,6 +812,7 @@ impl Connection {
                     ),
                 }
             }
+            review_reader.lock().unwrap().close();
             // stdout closed: fail every still-pending request.
             prompt_pending_reader.lock().unwrap().close();
             {
@@ -869,6 +893,7 @@ impl Connection {
         }
 
         Self {
+            review_monitoring,
             callback_routes: Arc::new(CallbackToolRoutes::default()),
             codex_sandboxes: Mutex::new(HashMap::new()),
             writer_tx,
@@ -985,8 +1010,24 @@ impl Connection {
         params: Value,
         timeout: Duration,
     ) -> AcpResult<Value> {
+        if method == "initialize" {
+            self.review_monitoring.lock().unwrap().retire();
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.request_with_id(id, method, params, timeout).await
+    }
+
+    pub(crate) async fn initialize_recipient(
+        &self,
+        params: Value,
+        timeout: Duration,
+    ) -> AcpResult<(Value, Arc<crate::review_monitoring::Generation>)> {
+        let generation = self.review_monitoring.lock().unwrap().begin();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .request_with_id(id, "initialize", params, timeout)
+            .await?;
+        Ok((response, generation))
     }
 
     /// [`Connection::request_timeout`] that also tells the peer about an
@@ -1016,6 +1057,9 @@ impl Connection {
         timeout: Duration,
         cancel: impl FnOnce(i64) -> (String, Value),
     ) -> AcpResult<Value> {
+        if method == "initialize" {
+            self.review_monitoring.lock().unwrap().retire();
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let result = self.request_with_id(id, method, params, timeout).await;
         if matches!(result, Err(AcpError::Timeout(_))) {
@@ -1423,6 +1467,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.review_monitoring.lock().unwrap().close();
         // Aborts the writer/reader tasks only; the stderr drain task is
         // deliberately not owned here — it runs to stderr EOF so the child's
         // dying words reach the capture file (monorepo#3570).

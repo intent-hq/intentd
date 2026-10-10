@@ -34,7 +34,8 @@ const COLUMNS: &str = "monitor_id, workspace_id, agent_id, repo_owner, repo_name
     state, last_snapshot, baseline_snapshot, pending_changes, pending_since, last_change_at, \
     last_polled_at, last_error, created_at, updated_at";
 
-const TARGET_COLUMNS: &str = "target_provider, target_instance_base_url, target_project_path, \
+pub(crate) const TARGET_COLUMNS: &str =
+    "target_provider, target_instance_base_url, target_project_path, \
     target_kind, target_provenance, target_unresolved_reason";
 
 // This is a compatibility boundary, not evidence that an unresolved row is
@@ -220,7 +221,16 @@ fn validate_monitor_target(
     target: &ReviewTarget,
     provenance: MonitorTargetProvenance,
 ) -> Result<()> {
-    if target_number(target)? != monitor.pr_number {
+    validate_target_identity(&monitor.repo(), monitor.pr_number, target, provenance)
+}
+
+fn validate_target_identity(
+    repo: &intent_core::RepoRef,
+    number: i64,
+    target: &ReviewTarget,
+    provenance: MonitorTargetProvenance,
+) -> Result<()> {
+    if target_number(target)? != number {
         return Err(intent_core::Error::InvalidParams(
             "monitor number does not match target".into(),
         ));
@@ -238,13 +248,34 @@ fn validate_monitor_target(
             .repository
             .project_path
             .split_once('/')
-            .is_some_and(|(owner, name)| monitor.repo() == intent_core::RepoRef::new(owner, name))
+            .is_some_and(|(owner, name)| *repo == intent_core::RepoRef::new(owner, name))
     {
         return Err(intent_core::Error::InvalidParams(
             "legacy GitHub projection does not match target".into(),
         ));
     }
     Ok(())
+}
+
+/// Classify a narrow summary row with the same target decoder as full reads.
+/// Private and unresolved monitors never enter generic agent summaries.
+pub(crate) fn legacy_monitor_summary(row: &SqliteRow) -> Result<bool> {
+    let repo = intent_core::RepoRef::new(
+        row.try_get::<String, _>("repo_owner")
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?,
+        row.try_get::<String, _>("repo_name")
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?,
+    );
+    let number = row
+        .try_get("pr_number")
+        .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+    Ok(matches!(
+        TargetColumns::from_row(row)?.resolution(&repo, number),
+        PersistedMonitorTarget::Resolved {
+            provenance: MonitorTargetProvenance::LegacyGithubWriter,
+            ..
+        }
+    ))
 }
 
 impl TargetColumns {
@@ -277,7 +308,7 @@ impl TargetColumns {
         })
     }
 
-    fn resolution(&self, monitor: &PrMonitor) -> PersistedMonitorTarget {
+    fn resolution(&self, repo: &intent_core::RepoRef, number: i64) -> PersistedMonitorTarget {
         let unresolved = |reason| PersistedMonitorTarget::Unresolved { reason };
         if self.provenance == "unresolved" {
             return unresolved(match self.reason.as_deref() {
@@ -311,10 +342,10 @@ impl TargetColumns {
                     project_path: self.project.clone()?,
                 },
                 kind,
-                number: u64::try_from(monitor.pr_number).ok()?,
+                number: u64::try_from(number).ok()?,
             };
             if self.reason.is_some()
-                || validate_monitor_target(monitor, &target, provenance).is_err()
+                || validate_target_identity(repo, number, &target, provenance).is_err()
             {
                 return None;
             }
@@ -352,7 +383,7 @@ fn qualified_from_row(row: &SqliteRow) -> Result<QualifiedPrMonitor> {
         })
         .collect::<Result<_>>()?;
     Ok(QualifiedPrMonitor {
-        target: columns.resolution(&monitor),
+        target: columns.resolution(&monitor.repo(), monitor.pr_number),
         monitor,
         original_text,
         columns,
@@ -1890,7 +1921,8 @@ mod tests {
     }
 
     fn test_binding(row: &QualifiedPrMonitor) -> intent_core::review_monitor::ReviewMonitorBinding {
-        let envelope: serde_json::Value = serde_json::from_str(row.monitor().last_snapshot.as_deref().unwrap()).unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(row.monitor().last_snapshot.as_deref().unwrap()).unwrap();
         serde_json::from_value(envelope["monitorBinding"].clone()).unwrap()
     }
 
@@ -1902,59 +1934,149 @@ mod tests {
             "connection":{"connectionId":"original-connection","accountId":"original-account","connectionGeneration":"7"},
             "resource":metadata.extension.resource,
         });
-        let envelope = serde_json::json!({"monitorBinding":binding,"qualifiedSnapshot":{"state":"open"}});
+        let envelope =
+            serde_json::json!({"monitorBinding":binding,"qualifiedSnapshot":{"state":"open"}});
         sqlx::query("UPDATE pr_monitor SET last_snapshot=? WHERE monitor_id=?")
-            .bind(envelope.to_string()).bind(&row.monitor().monitor_id.0)
-            .execute(store.write_pool()).await.unwrap();
-        let row = store.get_qualified_pr_monitor(&row.monitor().monitor_id).await.unwrap();
-        let prepared = store.prepare_monitor_message(
-            &row, &test_binding(&row), "original-history", "private original change", &metadata, &now_iso(),
-        ).await.unwrap();
+            .bind(envelope.to_string())
+            .bind(&row.monitor().monitor_id.0)
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let row = store
+            .get_qualified_pr_monitor(&row.monitor().monitor_id)
+            .await
+            .unwrap();
+        let prepared = store
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "original-history",
+                "private original change",
+                &metadata,
+                &now_iso(),
+            )
+            .await
+            .unwrap();
         let message = tokio::task::spawn_blocking(move || prepared.commit())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         store.close().await;
         let reopened = Store::open(&tmp.path).await.unwrap();
         let proof = sqlx::query("SELECT agent_id,workspace_id,binding_json,envelope_sha256,version FROM pr_monitor_message_provenance WHERE message_id=?")
             .bind(&message.id).fetch_one(reopened.read_pool()).await
             .expect("actual prepared message needs independent durable original provenance");
-        assert_eq!(proof.get::<String,_>("agent_id"), message.agent_id.0);
-        assert_eq!(proof.get::<String,_>("workspace_id"), row.monitor().workspace_id.0);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&proof.get::<String,_>("binding_json")).unwrap(), binding);
-        assert_eq!(proof.get::<Vec<u8>,_>("envelope_sha256").len(), 32);
-        assert_eq!(proof.get::<i64,_>("version"), 1);
-        let saved = reopened.get_pr_monitor(&row.monitor().monitor_id).await.unwrap();
-        assert_eq!(saved, *row.monitor(), "history provenance is not delivery acknowledgment");
-        let history = reopened.get_agent_messages(&message.agent_id, None).await.unwrap();
+        assert_eq!(proof.get::<String, _>("agent_id"), message.agent_id.0);
+        assert_eq!(
+            proof.get::<String, _>("workspace_id"),
+            row.monitor().workspace_id.0
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&proof.get::<String, _>("binding_json"))
+                .unwrap(),
+            binding
+        );
+        assert_eq!(proof.get::<Vec<u8>, _>("envelope_sha256").len(), 32);
+        assert_eq!(proof.get::<i64, _>("version"), 1);
+        let saved = reopened
+            .get_pr_monitor(&row.monitor().monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            *row.monitor(),
+            "history provenance is not delivery acknowledgment"
+        );
+        let history = reopened
+            .get_agent_messages(&message.agent_id, None)
+            .await
+            .unwrap();
         assert_eq!(history[0].content, message.content);
         assert_eq!(history[0].metadata, message.metadata);
-        let verified = reopened.get_monitor_message_provenance(&message.agent_id, &message.id).await.unwrap().unwrap();
+        let verified = reopened
+            .get_monitor_message_provenance(&message.agent_id, &message.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(verified.message.content, message.content);
         assert_eq!(serde_json::to_value(verified.binding).unwrap(), binding);
         assert_eq!(verified.workspace_id, row.monitor().workspace_id);
-        assert!(reopened.get_monitor_message_provenance(&message.agent_id, "absent").await.unwrap().is_none());
+        assert!(reopened
+            .get_monitor_message_provenance(&message.agent_id, "absent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn prepared_monitor_message_provenance_rejects_mutation_and_identity_aba() {
-        for mutation in ["content", "metadata", "session", "replace", "payload", "import"] {
+        for mutation in [
+            "content", "metadata", "session", "replace", "payload", "import",
+        ] {
             let (_tmp, store, row, metadata) = message_fixture().await;
-            let prepared = store.prepare_monitor_message(&row, &test_binding(&row), "wake", "original private text", &metadata, &now_iso()).await.unwrap();
-            let message = tokio::task::spawn_blocking(move || prepared.commit()).await.unwrap().unwrap().unwrap();
+            let prepared = store
+                .prepare_monitor_message(
+                    &row,
+                    &test_binding(&row),
+                    "wake",
+                    "original private text",
+                    &metadata,
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+            let message = tokio::task::spawn_blocking(move || prepared.commit())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             sqlx::query("UPDATE agent_session SET updated_at='ordinary usage update' WHERE id=?")
-                .bind(&message.agent_id.0).execute(store.write_pool()).await.unwrap();
-            assert!(store.get_monitor_message_provenance(&message.agent_id, "wake").await.unwrap().is_some());
+                .bind(&message.agent_id.0)
+                .execute(store.write_pool())
+                .await
+                .unwrap();
+            assert!(store
+                .get_monitor_message_provenance(&message.agent_id, "wake")
+                .await
+                .unwrap()
+                .is_some());
             match mutation {
                 "content" => {
-                    sqlx::query("UPDATE agent_message SET content='[]' WHERE id='wake'").execute(store.write_pool()).await.unwrap();
-                    sqlx::query("UPDATE agent_message SET content=? WHERE id='wake'").bind(message.content.to_string()).execute(store.write_pool()).await.unwrap();
+                    sqlx::query("UPDATE agent_message SET content='[]' WHERE id='wake'")
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE agent_message SET content=? WHERE id='wake'")
+                        .bind(message.content.to_string())
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
                 }
                 "metadata" => {
-                    sqlx::query("UPDATE agent_message SET metadata=NULL WHERE id='wake'").execute(store.write_pool()).await.unwrap();
-                    sqlx::query("UPDATE agent_message SET metadata=? WHERE id='wake'").bind(message.metadata.as_ref().unwrap().to_string()).execute(store.write_pool()).await.unwrap();
+                    sqlx::query("UPDATE agent_message SET metadata=NULL WHERE id='wake'")
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE agent_message SET metadata=? WHERE id='wake'")
+                        .bind(message.metadata.as_ref().unwrap().to_string())
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
                 }
                 "session" => {
-                    sqlx::query("UPDATE agent_session SET backend_session_id='replacement' WHERE id=?").bind(&message.agent_id.0).execute(store.write_pool()).await.unwrap();
-                    sqlx::query("UPDATE agent_session SET backend_session_id=NULL WHERE id=?").bind(&message.agent_id.0).execute(store.write_pool()).await.unwrap();
+                    sqlx::query(
+                        "UPDATE agent_session SET backend_session_id='replacement' WHERE id=?",
+                    )
+                    .bind(&message.agent_id.0)
+                    .execute(store.write_pool())
+                    .await
+                    .unwrap();
+                    sqlx::query("UPDATE agent_session SET backend_session_id=NULL WHERE id=?")
+                        .bind(&message.agent_id.0)
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
                 }
                 "replace" => {
                     sqlx::query("INSERT OR REPLACE INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('wake',?,?,'user',?,?,?)")
@@ -1964,19 +2086,53 @@ mod tests {
                 "payload" => {
                     sqlx::query("INSERT INTO agent_message_payload(message_id,agent_id,block_ordinal,kind,encoding,body) VALUES ('wake',?,-1,'thumbnails','none',?)")
                         .bind(&message.agent_id.0).bind(b"{}".as_slice()).execute(store.write_pool()).await.unwrap();
-                    sqlx::query("DELETE FROM agent_message_payload WHERE message_id='wake'").execute(store.write_pool()).await.unwrap();
+                    sqlx::query("DELETE FROM agent_message_payload WHERE message_id='wake'")
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
                 }
                 "import" => {
-                    let rows = vec![("agent_message".into(),vec![serde_json::json!({"id":message.id,"agent_id":message.agent_id,"seq":message.seq,"role":"user","content":message.content.to_string(),"metadata":message.metadata.as_ref().unwrap().to_string(),"created_at":message.created_at})])];
-                    assert!(store.transfer_import_rows(&rows).await.is_err(), "duplicate imports are rejected atomically");
-                    assert!(store.get_monitor_message_provenance(&message.agent_id, "wake").await.unwrap().is_some(), "failed import must roll back provenance invalidation");
-                    sqlx::query("DELETE FROM agent_message WHERE id='wake'").execute(store.write_pool()).await.unwrap();
+                    let rows = vec![(
+                        "agent_message".into(),
+                        vec![
+                            serde_json::json!({"id":message.id,"agent_id":message.agent_id,"seq":message.seq,"role":"user","content":message.content.to_string(),"metadata":message.metadata.as_ref().unwrap().to_string(),"created_at":message.created_at}),
+                        ],
+                    )];
+                    assert!(
+                        store.transfer_import_rows(&rows).await.is_err(),
+                        "duplicate imports are rejected atomically"
+                    );
+                    assert!(
+                        store
+                            .get_monitor_message_provenance(&message.agent_id, "wake")
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "failed import must roll back provenance invalidation"
+                    );
+                    sqlx::query("DELETE FROM agent_message WHERE id='wake'")
+                        .execute(store.write_pool())
+                        .await
+                        .unwrap();
                     store.transfer_import_rows(&rows).await.unwrap();
                 }
                 _ => unreachable!(),
             }
-            assert!(store.get_monitor_message_provenance(&message.agent_id, "wake").await.unwrap().is_none(), "invalidated evidence revived after {mutation}");
-            assert_eq!(store.get_pr_monitor(&row.monitor().monitor_id).await.unwrap(), *row.monitor());
+            assert!(
+                store
+                    .get_monitor_message_provenance(&message.agent_id, "wake")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "invalidated evidence revived after {mutation}"
+            );
+            assert_eq!(
+                store
+                    .get_pr_monitor(&row.monitor().monitor_id)
+                    .await
+                    .unwrap(),
+                *row.monitor()
+            );
         }
     }
 
@@ -1986,20 +2142,63 @@ mod tests {
         let binding = test_binding(&row);
         let mut other = binding.clone();
         other.scope.authority_generation += 1;
-        assert!(store.prepare_monitor_message(&row,&other,"bad","private",&metadata,&now_iso()).await.is_err());
-        let prepared = store.prepare_monitor_message(&row,&binding,"wake","private",&metadata,&now_iso()).await.unwrap();
-        tokio::task::spawn_blocking(move || prepared.commit()).await.unwrap().unwrap().unwrap();
-        assert!(sqlx::query("UPDATE pr_monitor_message_provenance SET binding_json='{}' WHERE message_id='wake'").execute(store.write_pool()).await.is_err());
+        assert!(store
+            .prepare_monitor_message(&row, &other, "bad", "private", &metadata, &now_iso())
+            .await
+            .is_err());
+        let prepared = store
+            .prepare_monitor_message(&row, &binding, "wake", "private", &metadata, &now_iso())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || prepared.commit())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(sqlx::query(
+            "UPDATE pr_monitor_message_provenance SET binding_json='{}' WHERE message_id='wake'"
+        )
+        .execute(store.write_pool())
+        .await
+        .is_err());
         assert!(sqlx::query("INSERT OR REPLACE INTO pr_monitor_message_provenance SELECT * FROM pr_monitor_message_provenance WHERE message_id='wake'").execute(store.write_pool()).await.is_err());
-        let exported = store.transfer_export_rows(&row.monitor().workspace_id).await.unwrap();
-        assert!(exported.iter().all(|(table,_)| table != "pr_monitor_message_provenance"));
-        assert!(store.transfer_import_rows(&[("pr_monitor_message_provenance".into(),vec![serde_json::json!({"message_id":"injected"})])]).await.is_err());
+        let exported = store
+            .transfer_export_rows(&row.monitor().workspace_id)
+            .await
+            .unwrap();
+        assert!(exported
+            .iter()
+            .all(|(table, _)| table != "pr_monitor_message_provenance"));
+        assert!(store
+            .transfer_import_rows(&[(
+                "pr_monitor_message_provenance".into(),
+                vec![serde_json::json!({"message_id":"injected"})]
+            )])
+            .await
+            .is_err());
         // Rearm or cancellation never changes the old message's association.
-        sqlx::query("UPDATE pr_monitor SET last_snapshot='{}',state='cancelled' WHERE monitor_id=?").bind(&row.monitor().monitor_id.0).execute(store.write_pool()).await.unwrap();
-        let proof = store.get_monitor_message_provenance(&row.monitor().agent_id,"wake").await.unwrap().unwrap();
-        assert_eq!(proof.binding,binding);
-        sqlx::query("DELETE FROM agent_message WHERE id='wake'").execute(store.write_pool()).await.unwrap();
-        assert!(store.get_monitor_message_provenance(&row.monitor().agent_id,"wake").await.unwrap().is_none());
+        sqlx::query(
+            "UPDATE pr_monitor SET last_snapshot='{}',state='cancelled' WHERE monitor_id=?",
+        )
+        .bind(&row.monitor().monitor_id.0)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        let proof = store
+            .get_monitor_message_provenance(&row.monitor().agent_id, "wake")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(proof.binding, binding);
+        sqlx::query("DELETE FROM agent_message WHERE id='wake'")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        assert!(store
+            .get_monitor_message_provenance(&row.monitor().agent_id, "wake")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2047,7 +2246,14 @@ mod tests {
             .bind(&row.monitor().agent_id.0).execute(store.write_pool()).await.unwrap();
         let text = "private update ".repeat(20_000);
         let prepared = store
-            .prepare_monitor_message(&row, &test_binding(&row), "wake", &text, &metadata, &now_iso())
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "wake",
+                &text,
+                &metadata,
+                &now_iso(),
+            )
             .await
             .unwrap();
         assert!(store
@@ -2056,9 +2262,20 @@ mod tests {
             .unwrap()
             .is_empty());
         drop(prepared);
-        assert!(store.get_monitor_message_provenance(&row.monitor().agent_id, "wake").await.unwrap().is_none());
+        assert!(store
+            .get_monitor_message_provenance(&row.monitor().agent_id, "wake")
+            .await
+            .unwrap()
+            .is_none());
         let prepared = store
-            .prepare_monitor_message(&row, &test_binding(&row), "wake", &text, &metadata, &now_iso())
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "wake",
+                &text,
+                &metadata,
+                &now_iso(),
+            )
             .await
             .unwrap();
         let message = tokio::task::spawn_blocking(move || prepared.commit())
@@ -2099,7 +2316,14 @@ mod tests {
         let (_tmp, store, row, mut metadata) = message_fixture().await;
         metadata.pr_number += 1;
         assert!(store
-            .prepare_monitor_message(&row, &test_binding(&row), "wake", "private update", &metadata, &now_iso())
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "wake",
+                "private update",
+                &metadata,
+                &now_iso()
+            )
             .await
             .is_err());
         metadata.pr_number -= 1;
@@ -2109,7 +2333,14 @@ mod tests {
             .await
             .unwrap();
         let prepared = store
-            .prepare_monitor_message(&row, &test_binding(&row), "wake", "private update", &metadata, &now_iso())
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "wake",
+                "private update",
+                &metadata,
+                &now_iso(),
+            )
             .await
             .unwrap();
         assert!(tokio::task::spawn_blocking(move || prepared.commit())
@@ -2130,7 +2361,14 @@ mod tests {
         sqlx::query("CREATE TRIGGER reject_monitor_message AFTER UPDATE OF updated_at ON agent_session BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
             .execute(store.write_pool()).await.unwrap();
         let prepared = store
-            .prepare_monitor_message(&row, &test_binding(&row), "wake", "private update", &metadata, &now_iso())
+            .prepare_monitor_message(
+                &row,
+                &test_binding(&row),
+                "wake",
+                "private update",
+                &metadata,
+                &now_iso(),
+            )
             .await
             .unwrap();
         assert!(tokio::task::spawn_blocking(move || prepared.commit())
@@ -2150,8 +2388,13 @@ mod tests {
                 .unwrap();
         assert!(preview.is_none());
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pr_monitor_message_provenance")
-            .fetch_one(store.read_pool()).await.unwrap();
-        assert_eq!(count, 0, "message and private provenance must roll back together");
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "message and private provenance must roll back together"
+        );
     }
 
     /// The displayStatus derivation read returns every ACTIVE row plus only

@@ -21297,6 +21297,96 @@ async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
     assert_eq!(row["waitingOnPrMonitors"][0]["prNumber"], 42);
 }
 
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_withholds_nonlegacy_monitor_provenance() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Private monitor owner").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+    for (provider, instance, project, kind, provenance, reason) in [
+        (
+            None,
+            None,
+            None,
+            None,
+            "unresolved",
+            Some("missing-provenance"),
+        ),
+        (
+            Some("gitlab"),
+            Some("https://gitlab.com"),
+            Some("acme/widgets"),
+            Some("merge-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "validated-transfer",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("different/project"),
+            Some("pull-request"),
+            "legacy-github-writer",
+            None,
+        ),
+    ] {
+        sqlx::query("UPDATE pr_monitor SET target_provider=?,target_instance_base_url=?,target_project_path=?,target_kind=?,target_provenance=?,target_unresolved_reason=? WHERE monitor_id=?")
+            .bind(provider).bind(instance).bind(project).bind(kind).bind(provenance).bind(reason)
+            .bind(&monitor.monitor_id.0).execute(svc.store().write_pool()).await.unwrap();
+        let before = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let subscriptions = svc
+            .agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+            .unwrap();
+        let row = subscriptions["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == child.0)
+            .unwrap();
+        assert!(
+            row.get("waitingOnPrMonitors").is_none(),
+            "{provenance}/{project:?}: {row}"
+        );
+        assert_eq!(svc.active_pr_monitors_for_agent(&child).await.len(), 1);
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
 /// SQL events are attributed to this read's span (the production profiler's
 /// signal). Transcript bodies are deliberately malformed so hydration fails;
 /// both small and large reads must still use the persisted previews only.
@@ -24339,7 +24429,7 @@ async fn seed_active_hook(
     hook
 }
 
-/// Seed one ACTIVE PR-monitor row owned by `agent` directly in the store —
+/// Seed one ACTIVE legacy GitHub producer row owned by `agent` —
 /// the idle-visibility lookups read persisted monitor rows, so no poll loop
 /// is needed. Mirrors [`seed_active_hook`] for the pr-monitor-waiting
 /// classification.
@@ -24369,7 +24459,19 @@ async fn seed_active_pr_monitor(
         updated_at: now,
     };
     svc.store()
-        .insert_pr_monitor(&monitor)
+        .insert_qualified_pr_monitor(
+            &monitor,
+            &intent_core::ReviewTarget {
+                repository: intent_core::RepositoryTarget {
+                    provider: intent_core::RepositoryProvider::Github,
+                    instance_base_url: "https://github.com".into(),
+                    project_path: format!("{}/{}", monitor.repo_owner, monitor.repo_name),
+                },
+                kind: intent_core::RepositoryResourceKind::PullRequest,
+                number: u64::try_from(pr_number).unwrap(),
+            },
+            intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+        )
         .await
         .expect("insert pr monitor");
     monitor
