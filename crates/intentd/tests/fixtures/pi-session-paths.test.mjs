@@ -17,6 +17,8 @@ import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
+import diagnostics from './pi-diagnostics.cjs';
+const { Capture, safeValue, failureReport, publishEvidence } = diagnostics;
 
 assert.ok(process.env.PI_ACP_TEST_ENTRY, 'PI_ACP_TEST_ENTRY must select the adapter under test');
 const adapterEntry = resolve(process.env.PI_ACP_TEST_ENTRY);
@@ -44,7 +46,8 @@ class AcpClient {
   pending = new Map();
   notifications = [];
   transcript = [];
-  stderr = '';
+  capture = new Capture();
+  get stderr() { return this.capture.snapshot(true); }
   nextId = 1;
 
   constructor(cwd, env) {
@@ -61,21 +64,21 @@ class AcpClient {
     };
     this.child.on('error', fail);
     this.child.stdin.on('error', fail);
-    this.child.on('exit', (code, signal) => fail(new Error(`Adapter exited: ${code}/${signal}; ${this.stderr}`)));
-    this.child.stderr.on('data', data => { this.stderr += data; });
+    this.child.on('exit', (code, signal) => fail(new Error(`Adapter exited: ${code}/${signal}; ${this.stderr.text}`)));
+    this.child.stderr.on('data', data => { this.capture.push(data); });
     createInterface({ input: this.child.stdout }).on('line', line => {
       let message;
-      try { message = JSON.parse(line); } catch { fail(new Error(`Non-JSON ACP output: ${line}`)); return; }
-      this.transcript.push({ direction: 'received', message });
+      try { message = JSON.parse(line); } catch { fail(new Error('Non-JSON ACP output')); return; }
+      if (this.transcript.length < 128) this.transcript.push({ direction: 'received', message: safeValue(message).value });
       if (message.method) {
-        if (message.id !== undefined) { fail(new Error(`Unexpected ACP client request: ${line}`)); return; }
+        if (message.id !== undefined) { fail(new Error('Unexpected ACP client request')); return; }
         this.notifications.push(message);
         return;
       }
       const pending = this.pending.get(message.id);
-      if (!pending) { fail(new Error(`Unexpected ACP response: ${line}`)); return; }
+      if (!pending) { fail(new Error('Unexpected ACP response')); return; }
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(JSON.stringify(message.error)));
+      if (message.error) pending.reject(new Error(failureReport('path fixture', message.error)));
       else pending.resolve(message.result);
     });
   }
@@ -156,7 +159,7 @@ for (const launcherKind of launchers) {
       }, record => {
         if (process.env.PI_ACP_EVIDENCE_DIR) {
           mkdirSync(process.env.PI_ACP_EVIDENCE_DIR, { recursive: true });
-          writeFileSync(join(process.env.PI_ACP_EVIDENCE_DIR, `${caseId}.json`), JSON.stringify(record, null, 2));
+          publishEvidence(join(process.env.PI_ACP_EVIDENCE_DIR, `${caseId}.json`), record);
         }
         completedEvidence.set(caseId, record);
         t.diagnostic(JSON.stringify({ caseId, runId, root, cleanup: record.cleanup }));
@@ -264,8 +267,8 @@ for (const launcherKind of launchers) {
         evidence.result = 'passed';
       } catch (error) {
         evidence.result = 'failed';
-        evidence.error = String(error.stack ?? error);
-        throw error;
+        evidence.error = failureReport('path fixture', error);
+        throw new Error(evidence.error);
       } finally {
         evidence.pi = readJsonLines(journal);
         evidence.acp = clients.map(client => ({ transcript: client.transcript, stderr: client.stderr }));
