@@ -1,6 +1,6 @@
 //! Actual legacy producer rows shared with the desktop service/row regressions.
-//! Regenerate: INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-services --lib
-//! pr_monitor::tests::compact_required_checks::compact_required_checks_golden
+//! Regenerate with `INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-services --lib`
+//! filtered to `pr_monitor::tests::compact_required_checks::compact_required_checks_golden`.
 use super::*;
 
 const GOLDEN: &str = "src/pr_monitor/tests/fixtures/compact-required-checks.json";
