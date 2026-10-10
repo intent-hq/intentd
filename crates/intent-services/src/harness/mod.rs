@@ -39,6 +39,7 @@
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
+pub(crate) mod review_wake;
 pub(crate) mod v1;
 pub(crate) mod v1_1;
 pub(crate) mod v2;

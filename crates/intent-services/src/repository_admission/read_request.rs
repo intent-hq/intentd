@@ -97,6 +97,22 @@ pub(crate) struct RepositoryReadRequest {
 }
 
 impl RepositoryReadRequest {
+    pub(crate) fn same_physical_session(&self, other: &Self) -> AdmissionResult<()> {
+        self.original.same_physical_session(&other.original)
+    }
+
+    pub(crate) fn run_monitor<'a, T: Send + 'a>(
+        &'a self,
+        body: intent_core::BoxFuture<'a, AdmissionResult<T>>,
+    ) -> intent_core::BoxFuture<'a, AdmissionResult<T>> {
+        Box::pin(async move {
+            if !matches!(self.owner.original, OriginalReadOwner::Monitor(_)) {
+                return Err(AdmissionError::Denied);
+            }
+            self.original.run_monitor(body).await
+        })
+    }
+
     pub(crate) fn retain_monitor(&self) -> AdmissionResult<Arc<Self>> {
         self.check_current()?;
         let original = match &self.owner.original {
@@ -212,6 +228,11 @@ pub(crate) trait MonitorCommitAuthority {
         &self,
         write: intent_store::PreparedMonitorWrite,
     ) -> AdmissionResult<intent_core::Result<bool>>;
+
+    fn commit_message(
+        &self,
+        write: intent_store::PreparedMonitorMessage,
+    ) -> AdmissionResult<intent_core::Result<Option<intent_core::AgentMessage>>>;
 }
 
 /// Owns cleanup independently of escaped metadata and authority handles.
@@ -248,6 +269,37 @@ impl RepositoryReadChild {
         self.lifetime
             .retirement()
             .dispatch(|| eligibility.commit_prepared(write))
+    }
+
+    /// Join both original source and destination retirement through COMMIT.
+    /// Neither child can be replaced by a stored agent/session identifier.
+    pub(crate) fn commit_monitor_message(
+        &self,
+        destination: &Self,
+        eligibility: &impl MonitorCommitAuthority,
+        write: intent_store::PreparedMonitorMessage,
+    ) -> AdmissionResult<intent_core::Result<Option<intent_core::AgentMessage>>> {
+        self.lifetime.retirement().dispatch(|| {
+            destination
+                .lifetime
+                .retirement()
+                .dispatch(|| eligibility.commit_message(write))
+        })
+    }
+
+    /// A delivered wake acknowledges only under both original lifetimes.
+    pub(crate) fn commit_monitor_delivery(
+        &self,
+        destination: &Self,
+        eligibility: &impl MonitorCommitAuthority,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> AdmissionResult<intent_core::Result<bool>> {
+        self.lifetime.retirement().dispatch(|| {
+            destination
+                .lifetime
+                .retirement()
+                .dispatch(|| eligibility.commit_prepared(write))
+        })
     }
 
     pub(crate) fn transfer<T>(

@@ -1919,6 +1919,7 @@ fn build_session_meta(
 pub(crate) struct LocalPromptInput<'a> {
     pub(crate) connection: &'a Connection,
     pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    pub(crate) required: Option<Box<crate::repository_read_source::MonitorPromptAdmission>>,
 }
 
 impl Services {
@@ -3334,6 +3335,7 @@ impl Services {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
         let prompt = prompt.into_blocks();
+        let required = local.as_ref().is_some_and(|input| input.required.is_some());
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3487,6 +3489,21 @@ impl Services {
             let attempt_result = {
                 let prompt_fut = async {
                     if let Some(input) = local.as_mut() {
+                        if required {
+                            let admission = input.required.take().ok_or_else(|| {
+                                AcpError::Transport(
+                                    "required monitor prompt already consumed".into(),
+                                )
+                            })?;
+                            return Box::pin(session::prompt_with_required_admission(
+                                input.connection,
+                                acp_session_id,
+                                prompt.clone(),
+                                &activity,
+                                admission,
+                            ))
+                            .await;
+                        }
                         let guidance = match input.captured.as_mut() {
                             Some(original) => original.prepare().await,
                             None => None,
@@ -3584,7 +3601,8 @@ impl Services {
             // Only a recognized pre-start policy rejection may change modes and
             // replay the untouched prompt. Reuse the output/client-work guards
             // above, and recheck after the asynchronous mode change.
-            if !closed
+            if !required
+                && !closed
                 && !any_update_received
                 && conn.client_request_seq() == client_request_watermark
             {
@@ -3640,7 +3658,8 @@ impl Services {
             }
             match &attempt_result {
                 Err(e)
-                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                    if !required
+                        && fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
                         && conn.client_request_seq() == client_request_watermark

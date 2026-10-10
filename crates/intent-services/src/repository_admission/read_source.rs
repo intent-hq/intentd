@@ -510,14 +510,25 @@ impl PreparedReview {
             RepositoryLifecycleKey::Agent(member.agent.id.clone()),
         ])?;
         let authority = Arc::new(MonitorAuthority {
+            observations: crate::observation_adapter::ConnectionObservations::new(
+                binding.scope.clone(),
+                binding.connection.clone(),
+            ),
             binding,
             request: retained,
             member,
             settled,
             lifetime,
             eligibility: OnceLock::new(),
+            source: OnceLock::new(),
             services: Arc::downgrade(self.host.services()),
         });
+        let source: Arc<dyn RepositoryAuthority> =
+            Arc::new(MonitorAuthoritySource(Arc::downgrade(&authority)));
+        authority
+            .source
+            .set(source.clone())
+            .map_err(|_| AdmissionError::Unavailable)?;
         let admission = self
             .host
             .services()
@@ -525,7 +536,7 @@ impl PreparedReview {
             .admit(
                 &authority.settled.selected().binding,
                 authority.credential_request(),
-                Arc::new(MonitorAuthoritySource(Arc::downgrade(&authority))),
+                source,
             )
             .map_err(|_| AdmissionError::Unavailable)?;
         let eligibility = self
@@ -563,8 +574,16 @@ pub(crate) struct MonitorAuthority {
     settled: RepositorySettledConnection,
     lifetime: RepositoryReadChild,
     eligibility: OnceLock<RepositoryReadEligibility>,
+    source: OnceLock<Arc<dyn RepositoryAuthority>>,
     services: std::sync::Weak<Services>,
+    observations: crate::observation_adapter::ConnectionObservations,
 }
+
+#[path = "read_source/monitor_poll.rs"]
+mod monitor_poll;
+pub(crate) use monitor_poll::{
+    MonitorDeliveries, MonitorDeliveryCompletion, MonitorPromptAdmission,
+};
 
 impl MonitorAuthority {
     fn credential_request(&self) -> RepositoryAuthorityRequest {

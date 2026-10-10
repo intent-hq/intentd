@@ -105,8 +105,10 @@ impl OriginalTurn {
     }
 }
 
+mod monitor_wake;
 mod repository_origin;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
+pub(crate) use monitor_wake::QueuedMonitorTurn;
 pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
 use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
 use repository_origin::RepositoryOrigin;
@@ -519,6 +521,8 @@ async fn cancel_and_settle_idle_prompt(
     reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
 )]
 pub struct TurnOptions {
+    /// Current original monitor owner, never rebuilt from prompt metadata.
+    pub(crate) monitor_turn: Option<Arc<QueuedMonitorTurn>>,
     pub(crate) delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     pub(crate) prepend_delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     /// Resume recovery must retain its pending interruption when shutdown
@@ -5687,6 +5691,8 @@ impl AgentManager {
         // precede unrelated conversation. Remove only matched source rows.
         let prior: Vec<_> = prior
             .iter()
+            // Ordinary history replay has no original monitor admission.
+            .filter(|message| !crate::agent_ops::is_qualified_monitor_message(message))
             .filter(|message| {
                 message.role != "user"
                     || (!excluded_group_sources.contains(&message.id)
@@ -5804,6 +5810,7 @@ impl AgentManager {
                     .map(|connection| crate::agent_session::LocalPromptInput {
                         connection,
                         captured,
+                        required: None,
                     }),
             )
             .await;
@@ -8377,7 +8384,7 @@ impl AgentManager {
         // (`persisted: false`) so `agent.retry` re-attempts the append,
         // instead of producing assistant output for a user row that never
         // reached the transcript.
-        let user_persisted = if next.persisted {
+        let user_persisted = if next.monitor_turn.is_some() || next.persisted {
             true
         } else {
             persist_user(
@@ -8400,6 +8407,7 @@ impl AgentManager {
         // The `prepend_*` fields restore a failed zero-output interrupt's
         // combined delivery on retry (monorepo#1014).
         let options = TurnOptions {
+            monitor_turn: next.monitor_turn.clone(),
             delivery_groups: next.delivery_groups.clone(),
             prepend_delivery_groups: next.prepend_delivery_groups.clone(),
             image_blocks: next.image_blocks.clone(),
@@ -9214,7 +9222,11 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
+        let armed = if options.monitor_turn.is_none() {
+            self.stop_redelivery.lock().unwrap().remove(&agent_id)
+        } else {
+            None
+        };
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
             if let Some(last) = options
@@ -11707,6 +11719,15 @@ fn redelivery_prepend(
     active_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     marker_row_id: Option<&String>,
 ) -> Option<crate::agent_ops::QueuedPrepend> {
+    // Do not turn an interrupted private envelope into an ordinary prepend,
+    // including the saved-group/marker path. Its original scoped owner retries.
+    if messages
+        .iter()
+        .rfind(|message| message.role == "user")
+        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+    {
+        return None;
+    }
     match (active_groups, marker_row_id) {
         (Some(groups), Some(marker_id)) => {
             let marker = messages.iter().find(|message| &message.id == marker_id)?;
@@ -12658,7 +12679,9 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
+    if next.monitor_turn.is_some()
+        || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
+    {
         return None;
     }
     services.dequeue_ready_batch_draining(agent_id, false, 1)
@@ -12707,6 +12730,17 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        if let Some(owner) = options.monitor_turn.take() {
+            if let Some(turn) = owner.take() {
+                // Keep the qualified turn future out of the ordinary worker frame.
+                if let Err(error) = Box::pin(turn.run(&mgr, admission)).await {
+                    tracing::debug!(agent = %agent_id, ?error, "original monitor delivery withheld");
+                }
+            }
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
         if mgr.services.defer_script_monitor_for_export(
             &agent_id,
             &content,
@@ -12765,7 +12799,9 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        match retry_spawn_owned(&mgr, &agent_id, &workspace_id).await {
+        // Startup nests session creation and database acquisition. Keep that
+        // future out of this worker's frame, which also carries scoped delivery.
+        match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
             Ok(StartedSession {
                 session_id: acp_session_id,
                 turn,
@@ -13453,7 +13489,7 @@ async fn run_message_worker(
             // A terminal-failure requeue whose user row already reached the
             // transcript before its failed turn began must not duplicate the
             // row on retry; otherwise persist now and remember the outcome.
-            user_persisted = if next.persisted {
+            user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
                 persist_user(
@@ -13472,6 +13508,7 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                monitor_turn: next.monitor_turn.clone(),
                 delivery_groups: next.delivery_groups.clone(),
                 prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
@@ -13659,7 +13696,7 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            user_persisted = if next.persisted {
+            user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
                 persist_user(
@@ -13678,6 +13715,7 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                monitor_turn: next.monitor_turn.clone(),
                 delivery_groups: next.delivery_groups.clone(),
                 prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
@@ -15064,6 +15102,7 @@ async fn publish_error_status_and_requeue(
         // add earlier groups without duplicating that aggregate on retry.
         let prepend_delivery_groups = delivery_groups.as_ref().map(|_| Vec::new());
         let mut queued = crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             delivery_groups,
             prepend_delivery_groups,
             turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
@@ -21779,6 +21818,7 @@ mod agent_retry_tests {
             intent_core::MessageOrigin::Automatic,
         );
         let requeued = crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             requeued_after_failure: true,
             ..mgr
                 .services
@@ -21856,6 +21896,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },
@@ -22044,6 +22085,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },
@@ -22109,6 +22151,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },

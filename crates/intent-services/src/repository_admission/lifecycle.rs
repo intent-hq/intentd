@@ -98,6 +98,14 @@ pub(crate) struct RepositoryPhysicalOrigin {
     token: Weak<()>,
 }
 
+impl RepositoryPhysicalOrigin {
+    pub(super) fn same_allocation(&self, other: &Self) -> bool {
+        self.id == other.id
+            && Weak::ptr_eq(&self.registry, &other.registry)
+            && Weak::ptr_eq(&self.token, &other.token)
+    }
+}
+
 /// Caller-owned session input, never a serialized or default permission grant.
 pub(crate) struct RepositorySourceLifetime {
     registry: Arc<RepositoryLifecycleRegistry>,

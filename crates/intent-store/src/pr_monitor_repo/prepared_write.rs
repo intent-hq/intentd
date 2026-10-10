@@ -118,7 +118,7 @@ impl Store {
         self.prepare_monitor_write(query, true).await
     }
 
-    /// Prepare a refresh or ownership transfer of the exact captured row.
+    /// Prepare a refresh, lifecycle change or ownership transfer of the exact captured row.
     /// # Errors
     /// Returns inconsistent identity or database acquisition errors.
     pub async fn prepare_monitor_replace(
@@ -141,6 +141,8 @@ impl Store {
         let mut query = QueryBuilder::new("UPDATE pr_monitor SET agent_id = ");
         query
             .push_bind(replacement.agent_id.0.clone())
+            .push(", state = ")
+            .push_bind(state_to_db(replacement.state))
             .push(", last_snapshot = ")
             .push_bind(replacement.last_snapshot.clone())
             .push(", baseline_snapshot = ")

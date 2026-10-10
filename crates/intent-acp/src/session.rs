@@ -290,6 +290,46 @@ pub async fn prompt_with_guidance(
     }
 }
 
+/// Send a whole prompt only through its retained original admission. Unlike
+/// optional guidance, refusal sends no base prompt. The caller must bind the
+/// admission to the actual destination connection and session before calling.
+///
+/// # Errors
+/// Preserves ordinary prompt response/idle errors and refuses an unadmitted
+/// whole prompt without sending any replacement content.
+pub async fn prompt_with_required_admission(
+    conn: &Connection,
+    session_id: &str,
+    prompt: Vec<ContentBlock>,
+    activity: &ActivityTracker,
+    admission: Box<dyn crate::transport::AcpPromptAdmission>,
+) -> AcpResult<PromptOutcome> {
+    let request = PromptRequest::new(SessionId::new(session_id), prompt);
+    let params = serde_json::to_value(&request)?;
+    let idle_window = prompt_idle_timeout();
+    let req_fut =
+        conn.request_required_prompt(params, admission, Duration::from_secs(24 * 60 * 60));
+    tokio::pin!(req_fut);
+    loop {
+        tokio::select! {
+            res = &mut req_fut => {
+                let response: PromptResponse = serde_json::from_value(res?)
+                    .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
+                return Ok(PromptOutcome {
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    meta: response.meta,
+                });
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if Duration::from_millis(activity.idle_ms()) >= idle_window {
+                    return Err(AcpError::PromptIdleTimeout(idle_window));
+                }
+            }
+        }
+    }
+}
+
 /// `session/prompt` with the user content blocks → drives a turn; the agent
 /// streams `session/update`s then returns a [`PromptOutcome`] carrying the
 /// [`StopReason`] and optional end-of-turn usage snapshot (§6.5).

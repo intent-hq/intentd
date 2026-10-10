@@ -512,6 +512,11 @@ impl RepositoryCreationOwner {
             store: self.store.clone(),
             token,
             id,
+            session_id: match binding.action {
+                RepositoryAcpInitialization::FirstSet { session_id }
+                | RepositoryAcpInitialization::Loaded { session_id }
+                | RepositoryAcpInitialization::Replace { session_id, .. } => session_id,
+            },
             _creation_retirement: self.retirement.clone(),
         };
         retirement.confirmed = Some(owner.retirement());
@@ -724,6 +729,7 @@ pub(crate) struct RepositoryPhysicalOwner {
     store: Store,
     token: Arc<()>,
     id: u64,
+    session_id: String,
     // The original pending retirement handle stays weak, but can follow the
     // confirmed allocation for as long as the actual physical owner exists.
     _creation_retirement: Arc<CreationAllocation>,
@@ -772,6 +778,12 @@ impl RepositoryPhysicalRetirement {
 }
 
 impl RepositoryPhysicalOwner {
+    /// Captured from the one-use initialization confirmation, never a later
+    /// session-row lookup or caller-supplied prompt parameter.
+    pub(crate) fn confirmed_session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn origin(&self) -> RepositoryPhysicalOrigin {
         RepositoryPhysicalOrigin {
             registry: Arc::downgrade(&self.registry),

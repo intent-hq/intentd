@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
+mod prepared_monitor_message;
+pub use prepared_monitor_message::PreparedMonitorMessage;
+
 /// Last confirmed turn selection and the provider default to restore after a
 /// resume. A missing record is an unobserved baseline; `effort: None` is Auto.
 /// Kept outside [`AgentSession`] projections so picker updates cannot overwrite it.

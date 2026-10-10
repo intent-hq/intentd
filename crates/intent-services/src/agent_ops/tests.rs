@@ -34349,6 +34349,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     // persisted=true (matching persist_error_and_requeue's behavior).
     let message_id = new_message_id();
     let queued = QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         turn_id: message_id.clone(),
@@ -34938,6 +34939,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     svc.requeue_front(
         &id,
         crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: requeue_id.clone(),
@@ -35399,6 +35401,7 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 /// resets and preservations are both observable.
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: id.to_string(),
@@ -46383,6 +46386,30 @@ mod resume_tail_recap {
             author: None,
             created_at: "2026-08-15T12:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn qualified_monitor_recap_withholds_whole_private_envelope() {
+        for embedded in [false, true] {
+            let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}});
+            let mut private = user("private monitor update");
+            if embedded {
+                private.content[0]["messageMetadata"] = metadata;
+            } else {
+                private.metadata = Some(metadata);
+            }
+            assert!(build_resume_tail_recap(&[private.clone()]).is_none());
+            let recap = build_resume_tail_recap(&[user("ordinary request"), private])
+                .expect("ordinary recap remains available");
+            assert!(recap.text.contains("ordinary request"));
+            assert!(!recap.text.contains("private monitor update"));
+        }
+        let mut github = user("GitHub monitor update");
+        github.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
+        assert!(build_resume_tail_recap(&[github])
+            .unwrap()
+            .text
+            .contains("GitHub monitor update"));
     }
 
     fn user(text: &str) -> AgentMessage {

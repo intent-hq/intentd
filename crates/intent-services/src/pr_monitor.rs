@@ -97,6 +97,7 @@ use crate::{publish_event, system_actor, Services};
     reason = "qualified reads await admitted caller-directory wiring"
 )]
 pub(crate) mod qualified_cache;
+mod qualified_poll;
 mod routing;
 use qualified_cache::{CacheKey, CacheSlot};
 
@@ -3251,6 +3252,23 @@ impl Services {
     }
 
     async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
+        // Each configured connection owns its own in-flight lane. The periodic
+        // loop never waits for GitLab before allowing another GitHub tick.
+        let services = self.clone();
+        let qualified = self.store_tasks.spawn_draining(async move {
+            services.sweep_qualified_pr_monitors(skip_fresh).await;
+        });
+        self.sweep_legacy_pr_monitors_accounted(skip_fresh).await;
+        // Explicit deterministic sweeps await both lanes; the recurring loop
+        // leaves its bounded qualified fetch with the finite-task supervisor.
+        if !skip_fresh {
+            if let Some(qualified) = qualified {
+                let _ = qualified.await;
+            }
+        }
+    }
+
+    async fn sweep_legacy_pr_monitors_accounted(&self, skip_fresh: bool) {
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3263,8 +3281,20 @@ impl Services {
             }
             probed = lifted;
         }
-        let monitors = match self.store.load_active_pr_monitors().await {
-            Ok(monitors) => monitors,
+        let monitors = match self.store.load_active_qualified_pr_monitors().await {
+            Ok(monitors) => monitors
+                .into_iter()
+                .filter(|row| {
+                    matches!(
+                        row.target(),
+                        intent_store::PersistedMonitorTarget::Resolved {
+                            provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                            ..
+                        }
+                    )
+                })
+                .map(|row| row.monitor().clone())
+                .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(error = %e, "pr monitor sweep: load failed; skipping tick");
                 return;
@@ -3756,8 +3786,15 @@ impl Services {
     /// An unparseable/absent anchor emits immediately rather than stranding
     /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
+        self.pr_monitor_debounce_elapsed_at(monitor, time::OffsetDateTime::now_utc())
+    }
+
+    pub(crate) fn pr_monitor_debounce_elapsed_at(
+        &self,
+        monitor: &PrMonitor,
+        now: time::OffsetDateTime,
+    ) -> bool {
         let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs().cast_signed());
-        let now = time::OffsetDateTime::now_utc();
         if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
             if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
                 return true;
@@ -4493,6 +4530,7 @@ impl Services {
 mod tests {
     mod ancestry_messages;
     mod ancestry_regression;
+    mod qualified_isolation;
     mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;

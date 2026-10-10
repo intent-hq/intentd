@@ -84,8 +84,8 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage, SessionMessageProjection,
-    UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, PreparedMonitorMessage, PrunedToolField, PrunedToolPayload, ReplaceMessage,
+    SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;

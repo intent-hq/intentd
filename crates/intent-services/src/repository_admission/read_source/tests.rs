@@ -22,6 +22,9 @@ const BUDGET: Duration = Duration::from_secs(10);
 const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
 const PROJECT: &str = "/api/v4/projects/group%2Fproject";
 
+#[path = "tests/polling.rs"]
+mod polling;
+
 pub(crate) struct ActualRead {
     pub(crate) auth: Fixture,
     pub(crate) git: GitFixture,
@@ -293,7 +296,7 @@ async fn review_monitor_routing_explicit_gitlab_snapshot_without_remote_uses_bot
     );
 }
 
-fn routing_json(reply: &Value) -> Value {
+pub(crate) fn routing_json(reply: &Value) -> Value {
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
@@ -421,7 +424,7 @@ async fn review_monitor_registration_legacy_recipient_has_no_effects_or_owner_di
         .is_empty());
 }
 
-fn routing_options(f: &ActualRead) {
+pub(crate) fn routing_options(f: &ActualRead) {
     f.auth
         .registry
         .apply(&[
@@ -918,9 +921,9 @@ async fn routing_pipeline_fixture(provider: &ReadServer, restricted: bool) -> Ac
             "only_allow_merge_if_all_discussions_are_resolved":false}),
         );
         bodies.insert(MR.into(), json!({"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/merge_requests/4",
-            "title":"pipeline review","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
+            "title":"pipeline review","sha":"review-head","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
             "source_project_id":42,"target_project_id":42,"created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z",
-            "head_pipeline":{"id":18,"project_id":42,"status":"failed"}}));
+            "head_pipeline":{"id":18,"project_id":42,"status":"failed","sha":"review-head"}}));
         bodies.insert(
             jobs.into(),
             json!([
@@ -1365,6 +1368,7 @@ async fn current_provider_denial_and_quota_never_become_successful_private_data(
 #[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
+    quota_headers: Mutex<HashMap<String, String>>,
     bodies: Mutex<HashMap<String, Value>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
@@ -1383,6 +1387,20 @@ impl Drop for ReadServer {
     }
 }
 impl ReadServer {
+    pub(crate) fn set_monitor_review(&self, head: &str, state: &str, revision: u8) {
+        self.replies.bodies.lock().unwrap().insert(
+            MR.into(),
+            json!({
+                "iid":4,"web_url":"https://gitlab.test/forge/group/project/-/merge_requests/4",
+                "title":"actual review","state":state,"draft":false,"sha":head,
+                "source_branch":"feature","target_branch":"main",
+                "source_project_id":42,"target_project_id":42,
+                "created_at":"2026-09-27T00:00:00Z",
+                "updated_at":format!("2026-09-27T00:00:{revision:02}Z"),
+            }),
+        );
+    }
+
     pub(crate) async fn new() -> Self {
         Self::at_instance("https://gitlab.test/forge").await
     }
@@ -1491,12 +1509,23 @@ impl ReadServer {
                         json!({"iid":4,"web_url":"https://gitlab.test/forge/group/project/-/issues/4",
                             "title":"actual issue","state":"opened","created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"})
                     }.to_string();
-                    let extra = if status == 429 {
-                        "Retry-After: 60\r\n"
-                    } else {
-                        ""
-                    };
-                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}Connection: close\r\n\r\n{body}",body.len());
+                    let quota = control
+                        .quota_headers
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "RateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{}",
+                                if status == 429 {
+                                    "Retry-After: 60\r\n"
+                                } else {
+                                    ""
+                                }
+                            )
+                        });
+                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{quota}Connection: close\r\n\r\n{body}",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }

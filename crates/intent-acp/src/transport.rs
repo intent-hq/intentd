@@ -73,7 +73,35 @@ const PROMPT_QUEUED: u8 = 1;
 const PROMPT_RETIRED: u8 = 2;
 
 /// Allocation identity for one original prompt transfer, never an RPC/session ID.
-pub struct AcpPromptBoundary(Arc<()>);
+pub struct AcpPromptBoundary(Arc<()>, Option<PromptDestination>);
+
+struct PromptDestination {
+    writer: mpsc::Sender<String>,
+    session_id: String,
+    params: Value,
+}
+
+impl AcpPromptBoundary {
+    /// Check the encoded destination against an original trusted transport
+    /// capture. This is a binding check, never authority by session ID alone.
+    #[must_use]
+    pub fn is_for(&self, connection: &Connection, session_id: &str) -> bool {
+        self.1.as_ref().is_some_and(|destination| {
+            destination.writer.same_channel(&connection.writer_tx)
+                && destination.session_id == session_id
+        })
+    }
+
+    /// Compare the complete already-encoded enriched prompt with the retained
+    /// original body. A matching session alone must not admit substituted text,
+    /// attachments or metadata. This check does not grant transfer authority.
+    #[must_use]
+    pub fn has_params(&self, expected: &Value) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|destination| &destination.params == expected)
+    }
+}
 
 /// Created only by consuming the original queue slot. It proves queue ownership
 /// transfer, not a socket write, model receipt, or reusable approval.
@@ -140,6 +168,11 @@ impl PreparedAcpPromptTransfer<'_> {
     ) -> AcpPromptAdmissionOutcome {
         if !Arc::ptr_eq(&self.original.0, &original.0) {
             return AcpPromptAdmissionOutcome::ForeignBoundary;
+        }
+        // A required whole-prompt admission has no ordinary variant. Even a
+        // trusted optional policy cannot downgrade it to an unguarded prompt.
+        if variant == PromptVariant::Base && self.slot.base.is_none() {
+            return AcpPromptAdmissionOutcome::OmitOptional;
         }
         if self.writer.is_closed()
             || self.slot.permit.is_none()
@@ -1082,13 +1115,37 @@ impl Connection {
         admission: Box<dyn AcpPromptAdmission>,
         timeout: Duration,
     ) -> AcpResult<Value> {
+        self.request_admitted_prompt(Some(base_params), enriched_params, admission, timeout)
+            .await
+    }
+
+    /// The entire prompt requires original admission. There is no ordinary
+    /// fallback payload to send after refusal, timeout or failed preparation.
+    pub(crate) async fn request_required_prompt(
+        &self,
+        params: Value,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
+        self.request_admitted_prompt(None, params, admission, timeout)
+            .await
+    }
+
+    async fn request_admitted_prompt(
+        &self,
+        base_params: Option<Value>,
+        enriched_params: Value,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
+        let required = base_params.is_none();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, mut rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
             id,
             PendingRequest {
                 sender: tx,
-                session_id: base_params
+                session_id: enriched_params
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
@@ -1109,7 +1166,10 @@ impl Connection {
         if state.load(Ordering::SeqCst) != PROMPT_OPEN {
             return Err(AcpError::Transport("agent stdout closed".into()));
         }
-        let base = encode_message(Some(id), "session/prompt", &base_params)?;
+        let base = base_params
+            .as_ref()
+            .map(|params| encode_message(Some(id), "session/prompt", params))
+            .transpose()?;
         let enriched = encode_message(Some(id), "session/prompt", &enriched_params)?;
         let permit = tokio::select! {
             biased;
@@ -1118,10 +1178,21 @@ impl Connection {
                 permit.map_err(|_| AcpError::Transport("writer task closed".into()))?
             }
         };
-        let boundary = AcpPromptBoundary(Arc::new(()));
+        let boundary = AcpPromptBoundary(
+            Arc::new(()),
+            enriched_params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .map(|session_id| PromptDestination {
+                    writer: self.writer_tx.clone(),
+                    session_id,
+                    params: enriched_params,
+                }),
+        );
         let mut slot = PromptSlot {
             permit: Some(permit),
-            base: Some(base),
+            base,
             enriched: Some(enriched),
             queued: false,
         };
@@ -1165,6 +1236,11 @@ impl Connection {
                     return Err(AcpError::Transport("response channel dropped".into()));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+            if required {
+                return Err(AcpError::Transport(
+                    "required prompt admission refused".into(),
+                ));
             }
             let packet = PreparedAcpPromptTransfer {
                 original: &boundary,
@@ -1453,7 +1529,7 @@ mod prompt_transfer_tests {
                     Mode::PollPanic => panic!("injected poll panic"),
                     Mode::Hang => std::future::pending().await,
                     Mode::ForeignBoundary => packet.transfer(
-                        &AcpPromptBoundary(Arc::new(())),
+                        &AcpPromptBoundary(Arc::new(()), None),
                         PromptVariant::WithGuidance,
                     ),
                     Mode::ForeignReceipt => {
@@ -1595,6 +1671,105 @@ mod prompt_transfer_tests {
         (0..WRITER_CHANNEL_CAPACITY)
             .map(|_| conn.writer_tx.clone().try_reserve_owned().unwrap())
             .collect()
+    }
+
+    fn required_request(
+        conn: &Connection,
+        admission: Box<dyn AcpPromptAdmission>,
+    ) -> impl Future<Output = AcpResult<Value>> + '_ {
+        conn.request_required_prompt(
+            json!({"sessionId":"same-public-session","prompt":[{"type":"text","text":"private monitor wake"}]}),
+            admission,
+            Duration::from_secs(2),
+        )
+    }
+
+    #[tokio::test]
+    async fn required_prompt_refusal_never_falls_back_or_accepts_foreign_receipts() {
+        for mode in [
+            Mode::Refuse,
+            Mode::ConstructorPanic,
+            Mode::PollPanic,
+            Mode::ForeignBoundary,
+            Mode::ForeignReceipt,
+            Mode::DropPanic,
+            Mode::Hang,
+        ] {
+            let (conn, mut reader, _writer) = fixture();
+            let (admission, seen) = policy(mode);
+            let result = required_request(&conn, admission).await;
+            assert!(result.is_err());
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(conn.pending_len(), 0);
+            assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_preserves_one_actual_transfer_despite_late_policy_failure() {
+        for mode in [
+            Mode::Accept,
+            Mode::AfterPanic,
+            Mode::AfterHang,
+            Mode::AfterBadReceipt,
+        ] {
+            let (conn, mut reader, mut writer) = fixture();
+            let (admission, seen) = policy(mode);
+            let mut future = Box::pin(required_request(&conn, admission));
+            let frame = read_frame(&mut reader, future.as_mut()).await;
+            assert_eq!(frame["params"]["prompt"][0]["text"], "private monitor wake");
+            assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 1);
+            reply(&mut writer, &frame["id"]).await;
+            assert_eq!(future.await.unwrap(), json!({"originalResult":true}));
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(conn.pending_len(), 0);
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_cannot_downgrade_after_backpressure_or_admission_wait() {
+        for held_policy in [false, true] {
+            let (conn, mut reader, _writer) = fixture();
+            let mut reserved = if held_policy {
+                Vec::new()
+            } else {
+                reserve_all(&conn)
+            };
+            let (admission, seen) = policy(if held_policy {
+                Mode::Hold
+            } else {
+                Mode::Accept
+            });
+            let mut future = Box::pin(required_request(&conn, admission));
+            poll_pending(future.as_mut()).await;
+            assert_eq!(seen.calls.load(Ordering::SeqCst), usize::from(held_policy));
+            seen.currency.store(false, Ordering::SeqCst);
+            if held_policy {
+                seen.release.notify_one();
+            } else {
+                drop(reserved.pop());
+            }
+            assert!(future.await.is_err());
+            assert_eq!(conn.pending_len(), 0);
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_cancellation_before_reserved_slot_has_no_effect() {
+        let (conn, mut reader, _writer) = fixture();
+        let reserved = reserve_all(&conn);
+        let (admission, seen) = policy(Mode::Accept);
+        let mut future = Box::pin(required_request(&conn, admission));
+        poll_pending(future.as_mut()).await;
+        drop(future);
+        drop(reserved);
+        assert_eq!(seen.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(conn.pending_len(), 0);
+        assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+        no_frame(&mut reader).await;
     }
 
     #[tokio::test]
@@ -1811,7 +1986,7 @@ mod prompt_transfer_tests {
         let (admission, seen) = policy(Mode::Hold);
         let mut first_request = Box::pin(request(&first, admission, Duration::from_secs(2)));
         poll_pending(first_request.as_mut()).await;
-        let foreign = AcpPromptBoundary(Arc::clone(&seen.boundaries.lock().unwrap()[0]));
+        let foreign = AcpPromptBoundary(Arc::clone(&seen.boundaries.lock().unwrap()[0]), None);
         let mut second_request = Box::pin(request(
             &second,
             Box::new(Foreign(foreign)),

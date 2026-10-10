@@ -19,6 +19,14 @@ use crate::Store;
 mod prepared_write;
 pub use prepared_write::PreparedMonitorWrite;
 
+pub(crate) fn captured_monitor_exists(
+    expected: &QualifiedPrMonitor,
+) -> QueryBuilder<'static, Sqlite> {
+    let mut query = QueryBuilder::new("SELECT monitor_id FROM pr_monitor");
+    prepared_write::captured_condition(&mut query, expected);
+    query
+}
+
 #[cfg(test)]
 mod qualification_tests;
 
@@ -778,7 +786,9 @@ static ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL: LazyLock<String> = LazyLock::new(|
                  THEN substr(last_error, 1, instr(last_error, ?2) - 1) || ?1 \
              ELSE last_error || '; ' || ?1 \
          END \
-         WHERE state = 'active' AND NOT COALESCE({row_deadline} > {new_deadline}, 0)"
+         WHERE state = 'active' AND target_provenance = 'legacy-github-writer' \
+           AND target_provider = 'github' \
+           AND NOT COALESCE({row_deadline} > {new_deadline}, 0)"
     )
 });
 
@@ -798,7 +808,8 @@ static CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
         "UPDATE pr_monitor \
          SET last_error = NULLIF(rtrim(substr(last_error, 1, instr(last_error, ?1) - 1), '; '), '') \
-         WHERE state = 'active' AND instr(COALESCE(last_error, ''), ?1) > 0 \
+         WHERE state = 'active' AND target_provenance = 'legacy-github-writer' \
+           AND target_provider = 'github' AND instr(COALESCE(last_error, ''), ?1) > 0 \
            AND NOT COALESCE({row_deadline} > {lifted_deadline}, 0)"
     )
 });
@@ -1797,6 +1808,192 @@ mod tests {
         }
     }
 
+    async fn message_fixture() -> (
+        TempDb,
+        Store,
+        QualifiedPrMonitor,
+        intent_core::review_monitor::ReviewMonitorWakeMetadata,
+    ) {
+        let (tmp, store, workspace, agent) = store_with_owner().await;
+        let mut monitor = test_monitor(&workspace, &agent, &now_iso());
+        monitor.pending_changes = vec!["new commits pushed".into()];
+        let target = ReviewTarget {
+            repository: RepositoryTarget {
+                provider: RepositoryProvider::Gitlab,
+                instance_base_url: "https://gitlab.example".into(),
+                project_path: "o/r".into(),
+            },
+            kind: RepositoryResourceKind::MergeRequest,
+            number: 42,
+        };
+        assert!(store
+            .insert_qualified_pr_monitor(
+                &monitor,
+                &target,
+                MonitorTargetProvenance::CapturedRequest
+            )
+            .await
+            .unwrap());
+        let row = store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "type":"pr_monitor_wake", "monitorId":monitor.monitor_id,
+            "repo":"o/r", "prNumber":42, "reason":"changes", "resource":target,
+        }))
+        .unwrap();
+        (tmp, store, row, metadata)
+    }
+
+    #[tokio::test]
+    async fn prepared_monitor_replace_completes_only_the_captured_row() {
+        for stale in [false, true] {
+            let (_tmp, store, row, _) = message_fixture().await;
+            let mut completed = row.monitor().clone();
+            completed.state = PrMonitorState::Completed;
+            completed.pending_changes.clear();
+            completed.baseline_snapshot = completed.last_snapshot.clone();
+            if stale {
+                sqlx::query("UPDATE pr_monitor SET last_error = 'changed after capture' WHERE monitor_id = ?")
+                    .bind(&completed.monitor_id.0)
+                    .execute(store.write_pool()).await.unwrap();
+            }
+            let prepared = store
+                .prepare_monitor_replace(&row, &completed)
+                .await
+                .unwrap();
+            let changed = tokio::task::spawn_blocking(move || prepared.commit())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(changed, !stale);
+            let saved = store.get_pr_monitor(&completed.monitor_id).await.unwrap();
+            if stale {
+                assert_eq!(saved.state, PrMonitorState::Active);
+                assert_eq!(saved.pending_changes, row.monitor().pending_changes);
+                assert_eq!(saved.last_error.as_deref(), Some("changed after capture"));
+            } else {
+                assert_eq!(saved, completed);
+                assert!(store
+                    .load_active_qualified_pr_monitors()
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_monitor_message_drop_and_commit_preserve_payload_and_pending() {
+        let (_tmp, store, row, metadata) = message_fixture().await;
+        sqlx::query(r#"UPDATE agent_session SET last_user_preview = '["ordinary message"]', last_message_role = 'user', last_message_id = 'ordinary' WHERE id = ?"#)
+            .bind(&row.monitor().agent_id.0).execute(store.write_pool()).await.unwrap();
+        let text = "private update ".repeat(20_000);
+        let prepared = store
+            .prepare_monitor_message(&row, "wake", &text, &metadata, &now_iso())
+            .await
+            .unwrap();
+        assert!(store
+            .get_agent_messages(&row.monitor().agent_id, None)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(prepared);
+        let prepared = store
+            .prepare_monitor_message(&row, "wake", &text, &metadata, &now_iso())
+            .await
+            .unwrap();
+        let message = tokio::task::spawn_blocking(move || prepared.commit())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let saved = store
+            .get_agent_messages(&row.monitor().agent_id, None)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].content, message.content);
+        assert_eq!(saved[0].content[0]["text"], text);
+        assert_eq!(saved[0].metadata, message.metadata);
+        let projection = store
+            .get_agent_session_message_projection(&row.monitor().agent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.last_user_text_blocks,
+            Some(vec!["ordinary message".to_owned()])
+        );
+        assert_eq!(projection.last_message_id.as_deref(), Some("ordinary"));
+        let pending = store
+            .get_pr_monitor(&row.monitor().monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.pending_changes,
+            row.monitor().pending_changes,
+            "persistence is not an acknowledgment of actual delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_monitor_message_rejects_stale_row_and_wrong_resource() {
+        let (_tmp, store, row, mut metadata) = message_fixture().await;
+        metadata.pr_number += 1;
+        assert!(store
+            .prepare_monitor_message(&row, "wake", "private update", &metadata, &now_iso())
+            .await
+            .is_err());
+        metadata.pr_number -= 1;
+        sqlx::query("UPDATE pr_monitor SET last_error = 'changed' WHERE monitor_id = ?")
+            .bind(&row.monitor().monitor_id.0)
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let prepared = store
+            .prepare_monitor_message(&row, "wake", "private update", &metadata, &now_iso())
+            .await
+            .unwrap();
+        assert!(tokio::task::spawn_blocking(move || prepared.commit())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_agent_messages(&row.monitor().agent_id, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_monitor_message_sql_failure_rolls_back_message_and_preview() {
+        let (_tmp, store, row, metadata) = message_fixture().await;
+        sqlx::query("CREATE TRIGGER reject_monitor_message AFTER UPDATE OF updated_at ON agent_session BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
+            .execute(store.write_pool()).await.unwrap();
+        let prepared = store
+            .prepare_monitor_message(&row, "wake", "private update", &metadata, &now_iso())
+            .await
+            .unwrap();
+        assert!(tokio::task::spawn_blocking(move || prepared.commit())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(store
+            .get_agent_messages(&row.monitor().agent_id, None)
+            .await
+            .unwrap()
+            .is_empty());
+        let preview: Option<String> =
+            sqlx::query_scalar("SELECT last_user_preview FROM agent_session WHERE id = ?")
+                .bind(&row.monitor().agent_id.0)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+        assert!(preview.is_none());
+    }
+
     /// The displayStatus derivation read returns every ACTIVE row plus only
     /// the most recently updated COMPLETED row (`LIMIT 1`) — never older
     /// completed rows (retained indefinitely) and never cancelled rows —
@@ -2473,7 +2670,45 @@ mod tests {
         intent_core::iso_from_unix_secs(now + secs)
     }
 
-    /// The pause annotation reaches every ACTIVE row (across workspaces) and
+    impl Store {
+        async fn insert_test_github_monitor(&self, monitor: &PrMonitor) -> Result<bool> {
+            self.insert_qualified_pr_monitor(
+                monitor,
+                &ReviewTarget {
+                    repository: RepositoryTarget {
+                        provider: RepositoryProvider::Github,
+                        instance_base_url: "https://github.com".into(),
+                        project_path: format!("{}/{}", monitor.repo_owner, monitor.repo_name)
+                            .to_ascii_lowercase(),
+                    },
+                    kind: RepositoryResourceKind::PullRequest,
+                    number: u64::try_from(monitor.pr_number).unwrap(),
+                },
+                MonitorTargetProvenance::LegacyGithubWriter,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_leaves_unresolved_monitor_evidence_untouched() {
+        let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
+        let monitor = test_monitor(&ws_id, &agent_id, &now_iso());
+        assert!(store.insert_pr_monitor(&monitor).await.unwrap());
+        let annotation = pr_monitor_pause_error(Some(&rfc3339_from_now(600)));
+        assert_eq!(
+            store
+                .annotate_active_pr_monitors_pause(&annotation)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.clear_active_pr_monitors_pause(None).await.unwrap(), 0);
+        let saved = store.get_pr_monitor(&monitor.monitor_id).await.unwrap();
+        assert_eq!(saved.last_error, monitor.last_error);
+    }
+
+    /// The pause annotation reaches every ACTIVE GitHub row (across workspaces) and
     /// skips terminal rows: an empty `last_error` becomes the pause, a
     /// genuine error keeps the error and gains the pause, and an earlier
     /// annotation (bare or appended) is replaced by the new deadline rather
@@ -2501,7 +2736,7 @@ mod tests {
         completed.state = PrMonitorState::Completed;
         completed.last_error = Some("old failure".to_string());
         for m in [&empty, &genuine, &bare, &appended, &completed] {
-            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+            assert!(store.insert_test_github_monitor(m).await.expect("insert"));
         }
 
         let stamped = store
@@ -2599,7 +2834,7 @@ mod tests {
         let expired = pr_monitor_pause_error(Some(&rfc3339_from_now(-60)));
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
         let m = test_monitor(&ws_id, &agent_id, &now_iso());
-        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        assert!(store.insert_test_github_monitor(&m).await.expect("insert"));
 
         // Pause OPENS between the gate read (open → `None`) and the write.
         let read = store.get_pr_monitor(&m.monitor_id).await.expect("get");
@@ -2716,7 +2951,7 @@ mod tests {
         let pause = pr_monitor_pause_error(Some(deadline));
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
         let m = test_monitor(&ws_id, &agent_id, "2030-01-01T05:00:00.000Z");
-        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        assert!(store.insert_test_github_monitor(&m).await.expect("insert"));
 
         let mut expected_updated_at = m.updated_at.clone();
         for (write_at, kept) in [
@@ -2810,7 +3045,7 @@ mod tests {
         appended.pr_number = 45;
         appended.last_error = Some(format!("HTTP 502; {t1}"));
         for m in [&empty, &genuine, &bare, &appended] {
-            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+            assert!(store.insert_test_github_monitor(m).await.expect("insert"));
         }
         let expect_all = |pause: &str| {
             [
@@ -2880,7 +3115,7 @@ mod tests {
         completed.state = PrMonitorState::Completed;
         completed.last_error = Some(t1.clone());
         for m in [&bare, &appended, &genuine, &empty, &completed] {
-            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+            assert!(store.insert_test_github_monitor(m).await.expect("insert"));
         }
 
         assert_eq!(
@@ -2989,7 +3224,7 @@ mod tests {
         let t1 = pr_monitor_pause_error(Some("2030-01-01T07:00:00Z"));
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
         let m = test_monitor(&ws_id, &agent_id, "2030-01-01T05:00:00.000Z");
-        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        assert!(store.insert_test_github_monitor(&m).await.expect("insert"));
         set_last_error(&store, &m.monitor_id, Some(&t1)).await;
         // The images the in-flight writers read: the row under T1.
         let pre_lift = store.get_pr_monitor(&m.monitor_id).await.expect("get");
@@ -3103,7 +3338,7 @@ mod tests {
         stale.state = PrMonitorState::Completed;
         stale.last_error = Some(t1.clone());
         for m in [&bare, &appended, &stale] {
-            assert!(store.insert_pr_monitor(m).await.expect("insert"));
+            assert!(store.insert_test_github_monitor(m).await.expect("insert"));
         }
         let errors = |store: &Store| {
             let store = store.clone();
@@ -3230,7 +3465,7 @@ mod tests {
         let n = pr_monitor_pause_error(Some("2030-01-01T07:00:00Z"));
         let (_tmp, store, ws_id, agent_id) = store_with_owner().await;
         let m = test_monitor(&ws_id, &agent_id, "2030-01-01T05:00:00.000Z");
-        assert!(store.insert_pr_monitor(&m).await.expect("insert"));
+        assert!(store.insert_test_github_monitor(&m).await.expect("insert"));
 
         // Pause O is stamped; the in-flight writers read the row under O.
         assert_eq!(

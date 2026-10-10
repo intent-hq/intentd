@@ -73,7 +73,7 @@ fn wire(m: &PrMonitor, target: &ReviewTarget) -> Result<Value> {
     Ok(value)
 }
 
-fn same_connection(m: &PrMonitor, authority: &MonitorAuthority) -> Result<()> {
+pub(super) fn same_connection(m: &PrMonitor, authority: &MonitorAuthority) -> Result<()> {
     let envelope: Value =
         serde_json::from_str(m.last_snapshot.as_deref().ok_or_else(source::refused)?)
             .map_err(|_| source::refused())?;

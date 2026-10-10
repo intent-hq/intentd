@@ -985,6 +985,22 @@ impl crate::repository_admission::read_request::MonitorCommitAuthority
         self.commit_monitor_write(write)
             .map_err(|_| crate::repository_admission::AdmissionError::Retired)
     }
+
+    fn commit_message(
+        &self,
+        write: intent_store::PreparedMonitorMessage,
+    ) -> crate::repository_admission::AdmissionResult<
+        intent_core::Result<Option<intent_core::AgentMessage>>,
+    > {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })
+        .map_err(|_| crate::repository_admission::AdmissionError::Retired)?;
+        outcome.ok_or(crate::repository_admission::AdmissionError::Retired)
+    }
 }
 
 #[cfg_attr(

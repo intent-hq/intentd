@@ -1432,6 +1432,10 @@ pub struct Services {
     review_monitor_authorities: Arc<
         Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
     >,
+    /// GitLab's configured connection has an independent, non-overlapping poll lane.
+    review_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
+    /// Current original deliveries; never reconstructed from persisted wake metadata.
+    review_monitor_deliveries: repository_read_source::MonitorDeliveries,
     /// Explicit fixture receipt for tests that exercise the real session launcher.
     /// Captured once by the original read owner; absent from production builds.
     #[cfg(test)]
@@ -1802,6 +1806,8 @@ impl Services {
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
             review_monitor_authorities: Arc::default(),
+            review_monitor_poll_lane: Arc::default(),
+            review_monitor_deliveries: Arc::default(),
             #[cfg(test)]
             test_review_monitoring_recipient: false,
             #[cfg(test)]

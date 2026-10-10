@@ -7348,6 +7348,7 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
 /// A system-origin queue entry for the combined-flush requeue tests.
 fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: format!("qm-413-{suffix}"),
@@ -15461,6 +15462,7 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
     // requeue), second entry needs the row append — which fails NotFound
     // against the deleted session.
     let entry = |suffix: &str, persisted: bool| crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: format!("qm-2762-{suffix}"),
@@ -19506,6 +19508,7 @@ mod stale_redrive_tests {
 
     fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-stale-test".to_string(),
@@ -19966,6 +19969,7 @@ mod dequeue_wait_tests {
 
     pub(super) fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-wait-test".to_string(),
@@ -24563,6 +24567,7 @@ mod flush_queued_messages_tests {
 
     fn queued_msg(content: &str) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-flush-test".to_string(),
@@ -27820,5 +27825,72 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
             1
         );
         assert_eq!(blocks.iter().filter(|b| b["data"] == data).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn qualified_monitor_recreated_replay_withholds_private_envelope() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-monitor-replay"),
+        AgentId::from("a-monitor-replay"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    for (text, metadata) in [
+        ("ordinary request", None),
+        (
+            "private monitor update",
+            Some(json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}})),
+        ),
+        (
+            "GitHub monitor update",
+            Some(json!({"type":"pr_monitor_wake","prNumber":4})),
+        ),
+        ("current request", None),
+    ] {
+        mgr.services
+            .store
+            .append_agent_message_with_metadata(
+                &id,
+                "user",
+                &json!([{"type":"text","text":text}]),
+                metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+    mgr.recreated.lock().unwrap().insert(id.clone());
+    let body = mgr.build_turn_body(&id, "current request", None).await;
+    assert!(!body.contains("private monitor update"), "{body}");
+    assert!(body.contains("ordinary request"));
+    assert!(body.contains("GitHub monitor update"));
+    assert_eq!(body.matches("current request").count(), 1);
+}
+
+#[test]
+fn qualified_monitor_redelivery_withholds_private_envelope() {
+    for embedded in [false, true] {
+        let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}});
+        let mut message = intent_core::AgentMessage {
+            id: "private-wake".into(),
+            agent_id: AgentId::from("monitor-agent"),
+            seq: 0,
+            role: "user".into(),
+            content: json!([{"type":"text","text":"private monitor update"}]),
+            metadata: None,
+            app_message_id: None,
+            author: None,
+            created_at: now_iso(),
+        };
+        if embedded {
+            message.content[0]["messageMetadata"] = metadata;
+        } else {
+            message.metadata = Some(metadata);
+        }
+        assert!(super::redelivery_prepend(&[message.clone()], None, None).is_none());
+        message.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
+        message.content = json!([{"type":"text","text":"GitHub monitor update"}]);
+        assert!(super::redelivery_prepend(&[message], None, None).is_some());
     }
 }

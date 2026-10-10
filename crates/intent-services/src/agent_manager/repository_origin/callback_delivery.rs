@@ -145,6 +145,7 @@ impl EndpointBlueprint {
         }
         Some(Arc::new(LiveContext {
             connection: Arc::downgrade(connection),
+            session_id: physical.confirmed_session_id().into(),
             owner: RepositoryContextOwner::bind(
                 services.clone(),
                 self.server.read_owner.clone(),
@@ -170,6 +171,7 @@ impl EndpointBlueprint {
 /// Retains the first binding result and its original transport, never a lookup key.
 pub(super) struct LiveContext {
     connection: Weak<Connection>,
+    session_id: String,
     owner: AdmissionResult<Arc<RepositoryContextOwner>>,
     acknowledged: AtomicBool,
     retired: AtomicBool,
@@ -214,6 +216,29 @@ pub(crate) struct RepositoryPromptInput {
     captured: Option<AdmissionResult<RepositoryPromptContext>>,
 }
 impl RepositoryPromptInput {
+    pub(crate) async fn prepare_monitor(
+        &mut self,
+        authority: Arc<crate::repository_read_source::MonitorAuthority>,
+        delivery: crate::pr_monitor::qualified_cache::CacheDelivery,
+        text: String,
+    ) -> AdmissionResult<crate::repository_read_source::MonitorPromptAdmission> {
+        if !self.binding.acknowledged.load(Ordering::SeqCst)
+            || self.binding.retired.load(Ordering::SeqCst)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        let original = self.captured.take().ok_or(AdmissionError::Retired)??;
+        authority
+            .prepare_prompt(
+                original.into_monitor_destination()?,
+                delivery,
+                self.binding.connection.clone(),
+                self.binding.session_id.clone(),
+                text,
+            )
+            .await
+    }
+
     pub(crate) async fn prepare(&mut self) -> Option<intent_acp::session::PromptGuidance> {
         let original = self.captured.take()?.ok()?;
         tokio::time::timeout(std::time::Duration::from_secs(1), original.prepare())
