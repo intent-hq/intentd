@@ -32,7 +32,7 @@ struct QualifiedBaseline {
     now: String,
 }
 
-fn wire(m: &PrMonitor, target: &ReviewTarget) -> Result<Value> {
+pub(crate) fn wire(m: &PrMonitor, target: &ReviewTarget) -> Result<Value> {
     let mut value = pr_monitor_wire(m, None);
     value["repo"] = json!(target.repository.project_path);
     value["resource"] = json!(target);

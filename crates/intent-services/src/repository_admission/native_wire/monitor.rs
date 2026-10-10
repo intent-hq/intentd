@@ -8,6 +8,10 @@ use intent_core::review_monitor::ReviewMonitorRecipientSupport;
 
 use super::{Connection, RepositoryRetirement};
 
+#[path = "monitor/admission.rs"]
+mod admission;
+pub(super) use admission::Projection;
+
 #[derive(Default)]
 pub(super) struct ConnectionState {
     generation: Mutex<Option<Arc<Receipt>>>,
@@ -111,6 +115,8 @@ impl ReviewMonitorHello for Hello {
 /// Workspace disclosure belongs to this acknowledged physical recipient. It is
 /// independent of the short RPC, and supplies no provider/account authority.
 pub(super) struct Recipient {
+    workspace: intent_core::WorkspaceId,
+    authority: intent_store::RepositoryAuthoritySnapshot,
     connection: Arc<Connection>,
     receipt: Arc<Receipt>,
     lifetime: super::RepositorySourceLifetime,
@@ -171,10 +177,12 @@ impl Recipient {
             .map_err(|_| super::unavailable())?;
         // The original native caller must freshly pass the same Store-backed
         // workspace/member/credential checks as existing repository reads.
-        super::authority(request, workspace)
+        let authority = super::authority(request, workspace)
             .await
             .map_err(|_| super::unavailable())?;
         let recipient = Arc::new(Self {
+            workspace: workspace.clone(),
+            authority,
             connection: c.clone(),
             receipt,
             lifetime,
@@ -196,31 +204,6 @@ impl Recipient {
                     .with_current(|| self.lifetime.retirement().native_dispatch(|| Ok(action())))
             })
             .map_err(|_| super::unavailable())?
-    }
-
-    pub(super) fn output(
-        self: &Arc<Self>,
-        frame: &str,
-    ) -> Arc<dyn intent_core::repository_request::RepositoryPrivateOutput> {
-        Arc::new(Output {
-            recipient: self.clone(),
-            frame: frame.into(),
-        })
-    }
-}
-struct Output {
-    recipient: Arc<Recipient>,
-    frame: String,
-}
-impl intent_core::repository_request::RepositoryPrivateOutput for Output {
-    fn frame(&self) -> &str {
-        &self.frame
-    }
-    fn with_current(
-        &self,
-        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
-    ) -> intent_core::Result<()> {
-        self.recipient.with_current(action)
     }
 }
 
@@ -258,6 +241,7 @@ pub(crate) async fn list(
         }
     };
     let mut monitors = Vec::new();
+    let mut admissions = Vec::new();
     for row in rows
         .into_iter()
         .filter(|row| &row.monitor().workspace_id == workspace)
@@ -274,14 +258,23 @@ pub(crate) async fn list(
                     monitors.push(value);
                 }
             }
-            // Resolved private observations need their original provider/account
-            // admission in addition to this workspace recipient. Never infer it.
-            _ => {}
+            intent_store::PersistedMonitorTarget::Resolved { target, .. } => {
+                // Stored identity constrains fresh admission; neither the old
+                // runtime map nor today's selected Git remote authorizes this.
+                if let Ok(admitted) = admission::acquire(&request, &recipient, &row).await {
+                    monitors.push(crate::pr_monitor::qualified_pr_monitor_wire(
+                        row.monitor(),
+                        target,
+                    )?);
+                    admissions.push(admitted);
+                }
+            }
         }
     }
-    recipient.with_current(&mut || Ok(()))?;
+    let projection = Projection::new(recipient, admissions);
+    projection.with_current(&mut || Ok(()))?;
     *request.state.lock().map_err(|_| super::unavailable())? =
-        super::RequestState::Monitor(recipient);
+        super::RequestState::Monitor(projection);
     Ok(Some(serde_json::json!({"monitors":monitors})))
 }
 
@@ -372,7 +365,7 @@ pub(crate) async fn cancel(
     .map_err(|_| super::unavailable())??;
     recipient.with_current(&mut || Ok(()))?;
     *request.state.lock().map_err(|_| super::unavailable())? =
-        super::RequestState::Monitor(recipient);
+        super::RequestState::Monitor(Projection::new(recipient, Vec::new()));
     Ok(Some(serde_json::json!({
         "ok": true,
         "monitor": crate::pr_monitor::unresolved_pr_monitor_wire(&monitor, reason),

@@ -541,7 +541,7 @@ struct Request {
 #[derive(Clone)]
 enum RequestState {
     Ordinary,
-    Monitor(Arc<monitor::Recipient>),
+    Monitor(Arc<monitor::Projection>),
     Pending,
     Public,
     Capture(Arc<Lease>),
