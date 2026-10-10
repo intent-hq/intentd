@@ -1,0 +1,759 @@
+{
+  "cases": [
+    {
+      "name": "empty",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "pending": 0,
+            "failingRequired": 0,
+            "pendingRequired": 0,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true,
+            "unresolved": 0
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 0,
+          "passed": 0,
+          "failed": 0,
+          "pending": 0,
+          "items": [],
+          "failingRequired": [],
+          "pendingRequired": [],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "unresolved": 0,
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "pending-build",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 1,
+            "passed": 0,
+            "failed": 0,
+            "pending": 1,
+            "failingRequired": 0,
+            "pendingRequired": 1,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true,
+            "unresolved": 0
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 1,
+          "passed": 0,
+          "failed": 0,
+          "pending": 1,
+          "items": [
+            {
+              "name": "build",
+              "status": "pending",
+              "required": true
+            }
+          ],
+          "failingRequired": [],
+          "pendingRequired": [
+            "build"
+          ],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "unresolved": 0,
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "multiple-pending",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 2,
+            "passed": 0,
+            "failed": 0,
+            "pending": 2,
+            "failingRequired": 0,
+            "pendingRequired": 2,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true,
+            "unresolved": 0
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 2,
+          "passed": 0,
+          "failed": 0,
+          "pending": 2,
+          "items": [
+            {
+              "name": "build",
+              "status": "pending",
+              "required": true
+            },
+            {
+              "name": "e2e",
+              "status": "pending",
+              "required": true
+            }
+          ],
+          "failingRequired": [],
+          "pendingRequired": [
+            "build",
+            "e2e"
+          ],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "unresolved": 0,
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "mixed-required-optional",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 6,
+            "passed": 0,
+            "failed": 3,
+            "pending": 3,
+            "failingRequired": 2,
+            "pendingRequired": 2,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true,
+            "unresolved": 0
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 6,
+          "passed": 0,
+          "failed": 3,
+          "pending": 3,
+          "items": [
+            {
+              "name": "test",
+              "status": "failed",
+              "required": true
+            },
+            {
+              "name": "lint",
+              "status": "failed",
+              "required": true
+            },
+            {
+              "name": "build",
+              "status": "pending",
+              "required": true
+            },
+            {
+              "name": "e2e",
+              "status": "pending",
+              "required": true
+            },
+            {
+              "name": "optional-fail",
+              "status": "failed",
+              "required": false
+            },
+            {
+              "name": "optional-pending",
+              "status": "pending",
+              "required": false
+            }
+          ],
+          "failingRequired": [
+            "test",
+            "lint"
+          ],
+          "pendingRequired": [
+            "build",
+            "e2e"
+          ],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "unresolved": 0,
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "optional-only",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 2,
+            "passed": 0,
+            "failed": 1,
+            "pending": 1,
+            "failingRequired": 0,
+            "pendingRequired": 0,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true,
+            "unresolved": 0
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 2,
+          "passed": 0,
+          "failed": 1,
+          "pending": 1,
+          "items": [
+            {
+              "name": "optional-fail",
+              "status": "failed",
+              "required": false
+            },
+            {
+              "name": "optional-pending",
+              "status": "pending",
+              "required": false
+            }
+          ],
+          "failingRequired": [],
+          "pendingRequired": [],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "unresolved": 0,
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "unknown-required",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 2,
+            "passed": 0,
+            "failed": 1,
+            "pending": 1,
+            "failingRequired": 0,
+            "pendingRequired": 0,
+            "requiredKnown": false
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": null,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": null
+          },
+          "rulesKnown": false,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 2,
+          "passed": 0,
+          "failed": 1,
+          "pending": 1,
+          "items": [
+            {
+              "name": "test",
+              "status": "failed",
+              "required": false
+            },
+            {
+              "name": "build",
+              "status": "pending",
+              "required": false
+            }
+          ],
+          "failingRequired": [],
+          "pendingRequired": [],
+          "requiredKnown": false
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "changesRequested": 0
+        },
+        "threads": {},
+        "rulesKnown": false
+      }
+    },
+    {
+      "name": "unknown-empty",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "pending": 0,
+            "failingRequired": 0,
+            "pendingRequired": 0,
+            "requiredKnown": false
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": null,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": null
+          },
+          "rulesKnown": false,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 0,
+          "passed": 0,
+          "failed": 0,
+          "pending": 0,
+          "items": [],
+          "failingRequired": [],
+          "pendingRequired": [],
+          "requiredKnown": false
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "changesRequested": 0
+        },
+        "threads": {},
+        "rulesKnown": false
+      }
+    },
+    {
+      "name": "unknown-threads",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "title": "Add thing",
+        "url": "https://github.com/o/r/pull/42",
+        "lastSnapshot": {
+          "state": "open",
+          "isDraft": false,
+          "hasConflicts": false,
+          "isBehind": false,
+          "ancestry": {
+            "status": "unknown"
+          },
+          "mergeable": true,
+          "mergeBlockedReason": null,
+          "checks": {
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "pending": 0,
+            "failingRequired": 0,
+            "pendingRequired": 0,
+            "requiredKnown": true
+          },
+          "approvals": {
+            "decision": "approved",
+            "have": 1,
+            "needed": 1,
+            "changesRequested": 0
+          },
+          "threads": {
+            "resolutionRequired": true
+          },
+          "rulesKnown": true,
+          "branchUpdateRequired": false
+        }
+      },
+      "requirements": {
+        "state": "open",
+        "isDraft": false,
+        "hasConflicts": false,
+        "isBehind": false,
+        "ancestry": {
+          "status": "unknown"
+        },
+        "branchUpdateRequired": false,
+        "mergeable": true,
+        "checks": {
+          "total": 0,
+          "passed": 0,
+          "failed": 0,
+          "pending": 0,
+          "items": [],
+          "failingRequired": [],
+          "pendingRequired": [],
+          "requiredKnown": true
+        },
+        "approvals": {
+          "decision": "approved",
+          "have": 1,
+          "needed": 1,
+          "changesRequested": 0
+        },
+        "threads": {
+          "resolutionRequired": true
+        },
+        "mergeStateStatus": "CLEAN",
+        "rulesKnown": true
+      }
+    },
+    {
+      "name": "missing-baseline",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z"
+      }
+    },
+    {
+      "name": "paused-missing-baseline",
+      "monitor": {
+        "monitorId": "prmon-1",
+        "workspaceId": "ws-1",
+        "agentId": "agent-pr",
+        "repo": "o/r",
+        "prNumber": 42,
+        "state": "active",
+        "pendingChanges": [],
+        "hasPendingChanges": false,
+        "createdAt": "2026-01-02T03:04:05Z",
+        "updatedAt": "2026-01-02T03:04:05Z",
+        "lastError": "rate limited; PR monitor polling paused until 2026-01-02T04:00:00Z",
+        "pausedUntil": "2026-01-02T04:00:00Z"
+      }
+    }
+  ]
+}
