@@ -169,6 +169,17 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
         "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock-mcp-server.mjs")],
         "env": { "API_KEY": ENV_SECRET },
     });
+    let missing_command = data_dir.path().join("missing-mcp-executable");
+    let rejecting_args = json!([
+        "-e",
+        r"require('node:readline').createInterface({input: process.stdin}).on('line', line => {
+            const request = JSON.parse(line);
+            if (request.id !== undefined) process.stdout.write(JSON.stringify({
+                jsonrpc: '2.0', id: request.id,
+                error: {code: -32603, message: 'fixture handshake rejected'}
+            }) + '\n');
+        });"
+    ]);
     let code = format!(
         r"
         const before = await ws.app.mcp.listServers();
@@ -189,6 +200,17 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
             transport: 'http', url: {url}, enabled: false,
         }});
         const stdioCreated = await ws.app.mcp.createServer({stdio_config});
+        const workingStdio = (await ws.app.mcp.listServers()).servers.find(s => s.id === stdioCreated.server.id);
+        const spawnFailed = await ws.app.mcp.updateServer(workingStdio.id, {{
+            ...workingStdio, command: {missing_command},
+        }});
+        const spawnStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
+        const handshakeFailed = await ws.app.mcp.updateServer(workingStdio.id, {{
+            ...workingStdio, args: {rejecting_args},
+        }});
+        const handshakeStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
+        const stdioRecovered = await ws.app.mcp.updateServer(workingStdio.id, workingStdio);
+        const recoveredStatus = await ws.app.mcp.getServerStatus(workingStdio.id);
         const stdioStopped = await ws.app.mcp.setServerEnabled(stdioCreated.server.id, false);
         const stdioConfig = (await ws.app.mcp.listServers()).servers.find(s => s.id === stdioCreated.server.id);
         stdioConfig.name = 'Updated while disabled';
@@ -196,10 +218,12 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
         const finalList = await ws.app.mcp.listServers();
         return {{ mcpConfiguration: true, before, created, listed, updated,
             running, disabled, disabledList, enabled, stopped, savedDisabled,
-            stdioCreated, stdioStopped, stdioUpdated, finalList }};
+            stdioCreated, spawnFailed, spawnStatus, handshakeFailed, handshakeStatus,
+            stdioRecovered, recoveredStatus, stdioStopped, stdioUpdated, finalList }};
         ",
         replacement = json!(REPLACEMENT),
         url = json!(url),
+        missing_command = json!(missing_command),
     );
     let (_daemon, mut ws) = start_bridge(data_dir.path(), &script, &code).await;
     let socket = data_dir.path().join("intentd.sock");
@@ -248,9 +272,40 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
         "Assistant fixture updated"
     );
     assert!(result["updated"]["server"]["env"].get("DROP_ME").is_none());
-    for key in ["updated", "running", "enabled", "stdioCreated"] {
+    for key in [
+        "updated",
+        "running",
+        "enabled",
+        "stdioCreated",
+        "stdioRecovered",
+        "recoveredStatus",
+    ] {
         assert_eq!(result[key]["status"]["state"], "running", "{result}");
         assert_eq!(result[key]["status"]["toolCount"], 2, "{result}");
+        assert!(result[key]["status"].get("lastError").is_none());
+    }
+    for (failure, observed, expected_error) in [
+        ("spawnFailed", "spawnStatus", "missing-mcp-executable"),
+        (
+            "handshakeFailed",
+            "handshakeStatus",
+            "fixture handshake rejected",
+        ),
+    ] {
+        let status = &result[failure]["status"];
+        assert_eq!(status["state"], "error", "{result}");
+        assert!(
+            status["lastError"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error),
+            "{status}"
+        );
+        assert!(status.get("pid").is_none());
+        assert!(status.get("toolCount").is_none());
+        assert_eq!(result[observed]["status"], *status);
+        assert_eq!(result[failure]["server"]["enabled"], true);
+        assert_eq!(result[failure]["server"]["env"]["API_KEY"], PLACEHOLDER);
     }
     for key in [
         "disabled",
@@ -294,6 +349,7 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
         )
         .await;
         assert_eq!(status["status"]["state"], "stopped");
+        assert!(status["status"].get("lastError").is_none());
         assert_redacted(&status);
     }
     let store = intent_core::FileSecretStore::with_path(data_dir.path().join("secrets.json"));
@@ -336,6 +392,32 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
             _ => {}
         }
     }
+    let mut failures = Vec::new();
+    let mut recovered = false;
+    loop {
+        let frame = wss_event(&mut events, 20).await;
+        assert_eq!(frame["jsonrpc"], "2.0");
+        let event = &frame["params"]["event"];
+        assert_eq!(event["type"], "mcp.servers:status-changed");
+        assert_redacted(event);
+        if event["data"]["serverId"] != "assistant-mcp-stdio" {
+            continue;
+        }
+        let status = &event["data"]["status"];
+        match status["state"].as_str() {
+            Some("error") => failures.push(status.clone()),
+            Some("running") if failures.len() == 2 => recovered = true,
+            Some("stopped") if recovered => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        failures,
+        vec![
+            result["spawnFailed"]["status"].clone(),
+            result["handshakeFailed"]["status"].clone()
+        ]
+    );
     rpc(&mut ws, 202, "agent.stop", json!({ "agentId": agent_id })).await;
 }
 
