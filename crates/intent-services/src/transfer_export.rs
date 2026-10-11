@@ -1234,12 +1234,19 @@ mod tests {
         let assets = root.path().join("assets");
         let workspaces = root.path().join("workspaces");
         let (_db, svc) = fresh_services(&workspaces, &assets).await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
         let id = WorkspaceId::new();
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
         *svc.test_export_monitor_preflight.lock().unwrap() =
             Some((entered.clone(), release.clone()));
+        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
+            workspace_id: Some(id.0.clone()),
+            ..Default::default()
+        });
         let exporting = svc.clone();
         let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
         entered.notified().await;
@@ -1257,6 +1264,17 @@ mod tests {
             .workspace_export_read_op(export_id.to_owned(), 0)
             .await
             .is_err());
+        // Registry removal precedes asynchronous staging cleanup. The existing
+        // terminal event is published only after that cleanup has completed.
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
+            .await
+            .expect("failed export cleanup completes")
+            .expect("failure subscription remains open");
+        let failed = batch
+            .iter()
+            .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
+            .expect("failed export event");
+        assert_eq!(failed.data["exportId"], export_id);
         assert!(svc.transfer_exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(export_id).exists());
         assert_eq!(
