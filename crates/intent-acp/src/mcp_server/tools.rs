@@ -371,7 +371,7 @@ Examples (the final one shows the N+1 pattern: list items first, then batch-read
 "###;
 
 /// Chief-workspace variant of [`WORKSPACE_API_DESCRIPTION`]: includes the
-/// full `ws.app.*` surface (agents, settings, specialists, ui, workspaces).
+/// full `ws.app.*` surface, including Assistant chat and MCP configuration.
 /// Reference wording from `workspace-js-api-tool.ts` lines 58–78.
 pub(crate) const WORKSPACE_API_DESCRIPTION_CHIEF: &str = r###"Execute JavaScript against the workspace API. Your code runs as an async function — use `return` to send results back.
 
@@ -390,7 +390,7 @@ Parameters:
 Namespaces (index — full signatures in API below):
   ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
   ws.workspace.* — workspace info, title, status message
-  ws.app.* — Assistant app surface: agents, proposal, settings, specialists, ui, workspaces
+  ws.app.* — agents, chats, mcp, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
   ws.comment.* — comment threads on notes
@@ -430,6 +430,17 @@ API:
   ws.app.agents.send(agentId, message, priority?) → { ok, agentId, agentName, workspaceId, sourceMessageId, sourceUrl, ...sendOutcome }  // Assistant workspace only. Message an agent in any non-Assistant workspace without knowing its workspace ID. Omitted priority interrupts by default; pass `priority="queue"` to queue instead. The daemon derives the exact Assistant source-message link and persists Assistant attribution; do not put a source id or URL in the message.
   ws.app.agents.ask(agentId, message, priority?) → { ok, send, watch }  // Assistant workspace only. Send an attributed message and receive one wake only when the target completes. `send` is the ordinary send result; `watch` is the immediate completion-watch result. Direct target messages are progress only and never consume the ask. Omitted priority interrupts by default; pass `priority="queue"` to queue instead.
   ws.app.agents.waitFor({ agentIds, waitMode? }) → { ok, waitMode, results }  // Assistant workspace only. Register to be woken when existing agents (in any workspace) complete — the subscription side of `agent.delegate` without creating agents. `waitMode`: `"immediate"` (default) wakes you as each agent completes; `"after_all"` delivers one aggregated wake once all of them settle. Each result is { agentId, agentName, workspaceId, subscriptionId, groupId }.
+  ws.app.chats.list({ limit?, cursor? }?) → { chats, total, returned, nextCursor? }  // Assistant workspace only. List Assistant chats, newest activity first, without transcripts; defaults to 50, max 200. Rows include agentId, agentName, status, messageCount, timestamps, pendingDeleteAt, and isCurrent. List first to identify the requested chat; ask if the target is ambiguous.
+  ws.app.chats.readConversation(agentId, { lastN?, startTurn?, endTurn?, includeToolCalls? }?) → { agentId, agentName, totalMessages, returnedMessages, startTurn, endTurn, messages, ... }  // Assistant workspace only. Read another Assistant chat with the same bounded slim projection as app.agents.readConversation: last 20 messages by default, max 100; excludes tool-call blocks by default. Read only relevant slices.
+  ws.app.chats.getMessageBlock(agentId, messageId, blockId) → { block }  // Assistant workspace only. Fetch one full block from an Assistant chat when its slim conversation has truncation markers.
+  ws.app.chats.rename(agentId, name) → { success, name }  // Assistant workspace only. Rename an Assistant chat when the user asks; trims the name and rejects blank names. Workspace agent targets are rejected.
+  ws.app.chats.delete(agentId) → { success, scheduled, deleteAt }  // Assistant workspace only. Delete another Assistant chat only when the user requests it. Uses the app's 15-second undo window; cancelDelete can undo before deleteAt. The current chat cannot delete itself. Report deletion as scheduled until the deadline.
+  ws.app.chats.cancelDelete(agentId) → { cancelled }  // Assistant workspace only. Undo a pending Assistant chat deletion before its deadline; false means no deletion was pending. Cannot restore an already deleted chat.
+  ws.app.mcp.listServers() → { servers }  // Assistant workspace only. Read app-wide MCP configurations before setup or edits; env/header values are redacted. Match existing servers by id, name, or endpoint to avoid duplicates.
+  ws.app.mcp.createServer(config) → { server, status }  // Assistant workspace only. Save and connect an MCP server when the user asks to set it up. Config: { id?, name?, transport: "stdio"|"http"|"sse", enabled?, command?, args?: string[], env?: object, url?, headers?: object }; stdio requires command, http/sse require url. Enabled defaults to true; false saves without connecting. Changes affect all workspaces. Verify the provider's official setup instructions instead of guessing an endpoint or command. A saved server may need authentication or have a connection error; inspect status before reporting it connected.
+  ws.app.mcp.updateServer(serverId, config) → { server, status }  // Assistant workspace only. Replace a saved configuration and reconnect eligible enabled servers. Read listServers first, edit that full server object, and keep its redacted env/header placeholders to preserve credentials; omitted keys are removed. The id stays serverId. Use only for a user-requested change; disabled servers stay disabled when enabled is preserved.
+  ws.app.mcp.setServerEnabled(serverId, enabled) → { status }  // Assistant workspace only. Enable/connect or disable/stop a saved MCP server app-wide when requested. Respects the global MCP setting; does not change mcp.enableUserServers.
+  ws.app.mcp.getServerStatus(serverId) → { status }  // Assistant workspace only. Read the live MCP connection state. For auth_required, open Connections → MCP servers with ws.app.ui.navigate('/settings?tab=connections#mcp-servers') and ask the user to complete the existing sign-in flow. For an enabled server that stays stopped, check mcp.enableUserServers with ws.app.settings.get. Never request OAuth tokens in chat or report a saved definition as connected without checking status.
   ws.app.proposal.show(proposal) → ProposalCard  // Assistant workspace only. Render an app-level proposal card in chat.
   ws.app.question.ask({ header, question, options, explanation?, multiSelect? }) → { ok, attachmentId, message }  // Ask the user ONE structured clarifying question. REQUIRED: `header` (short topic label), `question` (the prompt text), and `options` — an array of at least 2 OBJECTS [{ label, description? }] (NOT bare strings); do NOT add an "Other" option, a free-form answer is always offered automatically. Example: ws.app.question.ask({ header: "Auth method", question: "Which auth should the endpoint use?", options: [{ label: "OAuth", description: "OAuth 2.0 flow" }, { label: "API key", description: "Static key in header" }] }). Call once per question (aim for at most ~4 questions per turn); `multiSelect: true` lets the user pick several. Questions are presented when your turn ends; the answers arrive as plain-text Q:/A: pairs in the next user message ("(skipped)" for skipped questions). Ask all your questions, then finish the turn.
   ws.app.settings.list({ includeValues?, category? }?) → settings[]  // List schema-backed persisted user settings, optionally with current values.
@@ -1338,6 +1349,8 @@ mod tests {
     const BINDINGS_APP_PROPOSAL: &str = include_str!("bindings/app/proposal.rs");
     const BINDINGS_APP_QUESTION: &str = include_str!("bindings/app/question.rs");
     const BINDINGS_APP_AGENTS: &str = include_str!("bindings/app/agents.rs");
+    const BINDINGS_APP_CHATS: &str = include_str!("bindings/app/chats.rs");
+    const BINDINGS_APP_MCP: &str = include_str!("bindings/app/mcp.rs");
     const BINDINGS_APP_SETTINGS: &str = include_str!("bindings/app/settings.rs");
     const BINDINGS_APP_SPECIALISTS: &str = include_str!("bindings/app/specialists.rs");
     const BINDINGS_APP_UI: &str = include_str!("bindings/app/ui.rs");
@@ -1377,6 +1390,8 @@ mod tests {
             "app.proposal" => Some(BINDINGS_APP_PROPOSAL),
             "app.question" => Some(BINDINGS_APP_QUESTION),
             "app.agents" => Some(BINDINGS_APP_AGENTS),
+            "app.chats" => Some(BINDINGS_APP_CHATS),
+            "app.mcp" => Some(BINDINGS_APP_MCP),
             "app.settings" => Some(BINDINGS_APP_SETTINGS),
             "app.specialists" => Some(BINDINGS_APP_SPECIALISTS),
             "app.ui" => Some(BINDINGS_APP_UI),
