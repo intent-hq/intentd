@@ -643,13 +643,105 @@ impl Drop for DetachedCleanup {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_detached_identity_ready(
+    root: &Path,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut home = b"HOME=".to_vec();
+    home.extend_from_slice(root.as_os_str().as_bytes());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let bytes = observe()?.ok_or("owned fixture child exited before identity readiness")?;
+        if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
+            return Ok(());
+        }
+        if !bytes.is_empty() {
+            return Err("owned fixture child has an unexpected HOME".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("owned fixture child identity readiness timed out".into());
+        }
+        // timing-guard: bounded fixture readiness polling, not capture retries.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
-    intentd_test_support::GuardedChild::spawn(
+    let mut child = intentd_test_support::GuardedChild::spawn(
         std::process::Command::new("/bin/sleep")
             .arg("120")
             .env("HOME", root),
     )
-    .unwrap()
+    .unwrap();
+    // A live, newly spawned fixture can transiently expose an empty environ.
+    // Establish fixture readiness before testing the strict capture operation.
+    let ready = wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(format!("/proc/{}/environ", child.id()))
+            .map_err(|e| format!("read owned fixture identity: {e}"))?;
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(bytes))
+        }
+    });
+    if let Err(error) = ready {
+        let kill = child.kill();
+        let wait = child.wait();
+        panic!("fixture identity not ready: {error}; cleanup kill={kill:?}, wait={wait:?}");
+    }
+    child
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
+    let root = Path::new("/owned-fixture");
+    let mut observations = [Some(Vec::new()), Some(b"HOME=/owned-fixture\0".to_vec())].into_iter();
+    wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        Ok(observations.next().unwrap())
+    })
+    .unwrap();
+    assert!(observations.next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_times_out_when_empty() {
+    let mut calls = 0;
+    let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+        calls += 1;
+        Ok(Some(Vec::new()))
+    })
+    .unwrap_err();
+    assert!(error.contains("timed out"));
+    assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors() {
+    for observation in [
+        Ok(None),
+        Ok(Some(b"HOME=/other-fixture\0".to_vec())),
+        Ok(Some(b"NOT_HOME=/owned-fixture\0".to_vec())),
+        Err("permission denied".to_owned()),
+    ] {
+        let mut calls = 0;
+        assert!(
+            wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+                calls += 1;
+                observation.clone()
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1125,4 +1217,63 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
         .await;
     });
     cancel_version_owner(operation, root.path()).await;
+}
+
+#[tokio::test]
+async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_other_cli() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    for (cli, version, rejected) in [
+        (InstalledCli::Codex, "codex-cli 0.114.0", true),
+        (InstalledCli::Codex, minimum.as_str(), false),
+        (InstalledCli::Codex, "codex-cli 99.0.0", false),
+        (InstalledCli::Codex, "unknown", false),
+        (InstalledCli::Claude, "0.0.1", false),
+    ] {
+        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let prepared = crate::acp_adapter::AcpAdapterCommand::binary(
+            "/must-not-launch-adapter".into(),
+            vec![],
+        )
+        .cwd(root.path().to_owned())
+        .prepare_with_context(context)
+        .await;
+        if rejected {
+            let Err(error) = prepared else {
+                panic!("old Codex was accepted");
+            };
+            assert!(error.contains("0.114.0"), "{error}");
+            assert!(error.contains(&minimum), "{error}");
+            assert!(error.contains("Upgrade"), "{error}");
+        } else {
+            assert!(
+                prepared.is_ok(),
+                "{version}: {}",
+                prepared.err().unwrap_or_default()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires INTENT_CODEX_OLD_TEST_BINARY pointing to a real below-minimum Codex CLI"]
+async fn codex_real_old_runtime_is_rejected_before_adapter_start() {
+    let binary = std::env::var_os("INTENT_CODEX_OLD_TEST_BINARY").expect("set old Codex path");
+    let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nexit 99\n");
+    std::fs::remove_file(root.path().join("codex")).unwrap();
+    std::os::unix::fs::symlink(binary, root.path().join("codex")).unwrap();
+    let result =
+        crate::acp_adapter::AcpAdapterCommand::binary("/must-not-launch-adapter".into(), vec![])
+            .cwd(root.path().to_owned())
+            .prepare_with_context(context)
+            .await;
+    let Err(error) = result else {
+        panic!("old runtime reached adapter preparation");
+    };
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    assert!(error.contains("0.114.0"), "{error}");
+    assert!(error.contains(&requirement.minimum.to_string()), "{error}");
+    println!("{error}");
 }

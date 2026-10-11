@@ -785,3 +785,251 @@ async fn chat_incremental_lag_recovery_snapshot_echoes_encoding() {
         "post-recovery deltas stay incremental: {next}"
     );
 }
+
+/// The negotiated initial transfer owns continuation, even when rows exceed
+/// a normal RPC page's byte budget. Legacy subscribers keep atomic snapshots.
+#[intent_test_macros::daemon_test]
+async fn chat_progressive_history_reaches_target_newest_first() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    let created = wss_rpc(&mut ws, 1, "workspace.create", json!({"title":"History"})).await;
+    let workspace_id = created["workspace"]["id"].as_str().unwrap();
+    for (count, target, body_bytes) in [
+        (0, 20, 0),
+        (1, 20, 0),
+        (19, 20, 0),
+        (20, 20, 0),
+        (21, 20, 0),
+        (53, 50, 0),
+        (7, 6, 600_000),
+        (12, 10, 200_000),
+    ] {
+        let created = wss_rpc(
+            &mut ws,
+            2,
+            "agent.create",
+            json!({"workspaceId":workspace_id,"name":"History"}),
+        )
+        .await;
+        let agent_id = created["agent"]["id"].as_str().unwrap();
+        let body = if body_bytes > 0 {
+            "x".repeat(body_bytes)
+        } else {
+            "history".into()
+        };
+        for i in 0..count {
+            fx.bus
+                .store()
+                .append_agent_message_with_id(
+                    &AgentId::from(agent_id),
+                    &format!("{agent_id}-history-{i}"),
+                    "user",
+                    &json!([{"type":"text","text":body}]),
+                    None,
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+        let sub = wss_rpc(
+            &mut ws,
+            3,
+            "chat.subscribe",
+            json!({"agentId":agent_id,"limit":target,"historyDelivery":"progressive"}),
+        )
+        .await;
+        let sid = sub["subscriptionId"].as_str().unwrap();
+        let first = next_push(&mut ws, sid).await;
+        let snap = &first["params"]["snapshot"];
+        assert_eq!(snap["historyDelivery"], "progressive", "{first}");
+        assert_eq!(snap["initialHistory"]["target"], target);
+        assert_eq!(snap["initialHistory"]["complete"], count == 0);
+        assert!(snap["nextToken"].is_null());
+        let mut ids: Vec<String> = snap["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().into())
+            .collect();
+        assert_eq!(ids.len(), usize::from(count > 0));
+        let mut seq = 1;
+        let terminal = if count == 0 {
+            snap.clone()
+        } else {
+            loop {
+                let frame = next_push(&mut ws, sid).await;
+                assert_eq!(frame["params"]["seq"], seq);
+                seq += 1;
+                assert_eq!(frame["params"]["kind"], "history", "{frame}");
+                let history = &frame["params"]["history"];
+                assert_eq!(history["target"], target);
+                if history["complete"] == true {
+                    assert!(history.get("message").is_none());
+                    assert_eq!(history["received"], ids.len());
+                    break history.clone();
+                }
+                ids.push(history["message"]["id"].as_str().unwrap().into());
+                assert_eq!(history["received"], ids.len());
+                assert!(history["nextToken"].is_null());
+            }
+        };
+        let expected: Vec<String> = (0..count)
+            .rev()
+            .take(target)
+            .map(|i| format!("{agent_id}-history-{i}"))
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(terminal["truncated"], count > target);
+        if count > target {
+            let older = wss_rpc(
+                &mut ws,
+                4,
+                "agent.getConversation",
+                json!({"agentId":agent_id,"limit":200,"nextToken":terminal["nextToken"]}),
+            )
+            .await;
+            assert_eq!(
+                older["messages"].as_array().unwrap().last().unwrap()["id"],
+                format!("{agent_id}-history-{}", count - target - 1)
+            );
+        } else {
+            assert!(terminal["nextToken"].is_null());
+        }
+        let _ = fx.bus.publish_transient(&stream_event(workspace_id, agent_id, CHAT_STREAM_DELTA,
+            json!({"messageId":"new-live","blockId":"new-live:0","blockType":"text","content":"after history","textOffset":0})));
+        let live = next_push(&mut ws, sid).await;
+        assert_eq!(live["params"]["kind"], "delta");
+        assert_eq!(live["params"]["seq"], seq);
+        assert_eq!(
+            live["params"]["delta"]["added"][0]["block"]["text"],
+            "after history"
+        );
+        wss_rpc(
+            &mut ws,
+            5,
+            "chat.unsubscribe",
+            json!({"subscriptionId":sid}),
+        )
+        .await;
+        let legacy = wss_rpc(
+            &mut ws,
+            6,
+            "chat.subscribe",
+            json!({"agentId":agent_id,"limit":target}),
+        )
+        .await;
+        let legacy_sid = legacy["subscriptionId"].as_str().unwrap();
+        let legacy_snap = next_push(&mut ws, legacy_sid).await;
+        assert!(legacy_snap["params"]["snapshot"]
+            .get("historyDelivery")
+            .is_none());
+        wss_rpc(
+            &mut ws,
+            7,
+            "chat.unsubscribe",
+            json!({"subscriptionId":legacy_sid}),
+        )
+        .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn chat_progressive_resume_and_invalid_mode_contract() {
+    let fx = boot().await;
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    for value in [json!("typo"), json!(true), json!(123)] {
+        let response = wss_rpc_raw(
+            &mut ws,
+            1,
+            "chat.subscribe",
+            json!({"agentId":"missing","historyDelivery":value}),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    let created = wss_rpc(&mut ws, 2, "workspace.create", json!({"title":"Resume"})).await;
+    let workspace_id = created["workspace"]["id"].as_str().unwrap();
+    let created = wss_rpc(
+        &mut ws,
+        3,
+        "agent.create",
+        json!({"workspaceId":workspace_id,"name":"Resume"}),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap();
+    for i in 0..3 {
+        fx.bus
+            .store()
+            .append_agent_message_with_id(
+                &AgentId::from(agent_id),
+                &format!("m{i}"),
+                "user",
+                &json!([{"type":"text","text":"history"}]),
+                None,
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+    let sub = wss_rpc(
+        &mut ws,
+        4,
+        "chat.subscribe",
+        json!({"agentId":agent_id,"historyDelivery":"progressive","sinceMessageId":"m1"}),
+    )
+    .await;
+    let sid = sub["subscriptionId"].as_str().unwrap();
+    let frame = next_push(&mut ws, sid).await;
+    let snapshot = &frame["params"]["snapshot"];
+    assert_eq!(snapshot["resumed"], true);
+    assert_eq!(snapshot["historyDelivery"], "progressive");
+    assert_eq!(
+        snapshot["initialHistory"],
+        json!({"target":20,"received":1,"complete":true})
+    );
+    assert_eq!(snapshot["messages"][0]["id"], "m2");
+    let _ = fx.bus.publish_transient(&stream_event(
+        workspace_id,
+        agent_id,
+        intent_core::events::AGENT_UPDATED,
+        json!({"replacedCount":0}),
+    ));
+    let recovery = next_push(&mut ws, sid).await;
+    assert_eq!(recovery["params"]["seq"], 1);
+    assert_eq!(
+        recovery["params"]["snapshot"]["initialHistory"],
+        json!({"target":20,"received":3,"complete":true})
+    );
+    assert_eq!(recovery["params"]["snapshot"]["resumed"], false);
+    wss_rpc(
+        &mut ws,
+        5,
+        "chat.unsubscribe",
+        json!({"subscriptionId":sid}),
+    )
+    .await;
+    let sub = wss_rpc(&mut ws,6,"chat.subscribe",json!({"agentId":agent_id,"historyDelivery":"progressive","sinceMessageId":"missing-anchor"})).await;
+    let sid = sub["subscriptionId"].as_str().unwrap();
+    let first = next_push(&mut ws, sid).await;
+    assert_eq!(first["params"]["snapshot"]["resumed"], false);
+    assert_eq!(
+        first["params"]["snapshot"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        first["params"]["snapshot"]["initialHistory"]["complete"],
+        false
+    );
+    assert!(first["params"]["snapshot"]["nextToken"].is_null());
+    for (seq, id) in [(1, "m1"), (2, "m0")] {
+        let frame = next_push(&mut ws, sid).await;
+        assert_eq!(frame["params"]["seq"], seq);
+        assert_eq!(frame["params"]["history"]["message"]["id"], id);
+    }
+    let done = next_push(&mut ws, sid).await;
+    assert_eq!(done["params"]["history"]["complete"], true);
+    assert_eq!(done["params"]["history"]["received"], 3);
+}

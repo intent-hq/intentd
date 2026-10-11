@@ -1,0 +1,127 @@
+[
+  {
+    "commit": "2797061ce20f3e02a66ae0041c0fe931ffde1d2f",
+    "sourceSha256": "a720f188c45718231f4e279767027f6e24d5fc80d15cfdd86583d18aba809a23",
+    "snapshotSha256": "915d4a740474f3a33c2d433938467ccf28d9406170735a1b4e75b6c9b86fb6a3",
+    "commentsEnabled": false,
+    "cases": [
+      {
+        "id": "adjacentHtmlBase64",
+        "source": "<div data-type=\"diff-block\" data-diff-code=\"LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg==\"></div>",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K"
+          },
+          {
+            "type": "mermaidBlock",
+            "code": "Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg=="
+          }
+        ]
+      },
+      {
+        "id": "adjacentHtmlPlainAttributes",
+        "source": "<div data-type=\"diff-block\" data-diff-code=\"-café &amp; old\n+世界 &lt;new&gt;\n\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"flowchart LR\n A[&quot;café &amp; 世界&quot;] --&gt; B\n\"></div>",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "-café & old\n+世界 <new>"
+          },
+          {
+            "type": "mermaidBlock",
+            "code": ""
+          }
+        ]
+      },
+      {
+        "id": "adjacentHtmlPlainWithoutArrow",
+        "source": "<div data-type=\"diff-block\" data-diff-code=\"-old\n+new\n\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"graph TD\n A[Alpha]\n\"></div>",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "-old\n+new"
+          },
+          {
+            "type": "mermaidBlock",
+            "code": "graph TD\n A[Alpha]"
+          }
+        ]
+      },
+      {
+        "id": "adjacentHtmlPreCodeBase64",
+        "source": "<pre><code class=\"language-diff\">LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K</code></pre><pre><code class=\"language-mermaid\">Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg==</code></pre>",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K"
+          },
+          {
+            "type": "mermaidBlock",
+            "code": "Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg=="
+          }
+        ]
+      },
+      {
+        "id": "adjacentHtmlPreCodePlain",
+        "source": "<pre><code class=\"language-diff\">-café &amp; old\n+世界 &lt;new&gt;\n</code></pre><pre><code class=\"language-mermaid\">flowchart LR\n A[\"café &amp; 世界\"] --&gt; B\n</code></pre>",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "-café & old\n+世界 <new>\n"
+          },
+          {
+            "type": "mermaidBlock",
+            "code": "flowchart LR\n A[\"café & 世界\"] --> B\n"
+          }
+        ]
+      },
+      {
+        "id": "markdownBeforeHtmlAtoms",
+        "source": "## Before\n\n<div data-type=\"diff-block\" data-diff-code=\"LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4K\"></div><div data-type=\"mermaid-block\" data-mermaid-code=\"Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBCCg==\"></div>\n\n**After**",
+        "atoms": []
+      },
+      {
+        "id": "mixedFences",
+        "source": "## Before\n\n```diff\n-café & old\n+世界 <new>\n```\n\n```mermaid\nflowchart LR\n A[\"café & 世界\"] --> B\n```\n\n**After**",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "LWNhZsOpICYgb2xkCivkuJbnlYwgPG5ldz4="
+          },
+          {
+            "type": "mermaidBlock",
+            "code": "Zmxvd2NoYXJ0IExSCiBBWyJjYWbDqSAmIOS4lueVjCJdIC0tPiBC"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "commit": "e6d6bb9990c7dfbd9c0a4ebd8a3accb59c0756db",
+    "sourceSha256": "cc7376ce520a2b23ab21f7d0645f1a3a9f5adc179a33a31dc3f3953679db57a0",
+    "snapshotSha256": "2eb82af1cc2d1164411206a22788216ac8258156bfb41c46a82ee1c0189b19c0",
+    "commentsEnabled": false,
+    "cases": [
+      {
+        "id": "titledDiffFence",
+        "source": "```diff title\n-café & old\n+世界 <new>\n```",
+        "atoms": [
+          {
+            "type": "diffBlock",
+            "code": "-café & old\n+世界 <new>"
+          }
+        ]
+      },
+      {
+        "id": "titledMermaidFence",
+        "source": "```mermaid title\nflowchart LR\n A[\"café & 世界\"] --> B\n```",
+        "atoms": [
+          {
+            "type": "mermaidBlock",
+            "code": "flowchart LR\n A[\"café & 世界\"] --> B"
+          }
+        ]
+      }
+    ]
+  }
+]

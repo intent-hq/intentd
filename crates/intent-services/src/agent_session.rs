@@ -1658,6 +1658,32 @@ fn is_acp_auth_required(e: &AcpError) -> bool {
     }
 }
 
+/// Providers own the complete HTTP body, including retained image history.
+/// New-image preparation cannot bound that history, so surface a recovery path
+/// for upstream size failures without changing the terminal/requeue semantics.
+fn prompt_size_error(e: &AcpError) -> Option<Error> {
+    let AcpError::Rpc(rpc) = e else {
+        return None;
+    };
+    let rendered = rpc.to_string();
+    let lower = rendered.to_ascii_lowercase();
+    let too_large = rpc.code == 413
+        || crate::is_context_size_error(&rendered)
+        || lower.contains("augmenttoolarge")
+        || lower.contains("413 payload too large")
+        || lower.contains("413 content too large");
+    too_large.then(|| {
+        Error::Internal(
+            "session/prompt failed: HTTP 413 Request Entity Too Large. The provider rejected \
+             the total request size, which can include images from earlier turns. \
+             Send fewer images or crop them to the relevant detail. If the conversation \
+             already contains large images, start a new agent conversation with only the \
+             images it needs. Original attachments are unchanged."
+                .to_string(),
+        )
+    })
+}
+
 /// Map an ACP session-setup/prompt failure to the surfaced [`Error`]. An
 /// auth-required failure becomes the same actionable
 /// [`Error::InvalidParams`] login message as the create/delegate gate
@@ -2828,6 +2854,16 @@ impl Services {
                 )
         }
         .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                opened.response.session_id.0.as_ref(),
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+        }
         Ok(PreparedAcpSession {
             response: opened.response,
             query: opened.query,
@@ -3161,6 +3197,16 @@ impl Services {
                 )
         }
         .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                &acp_session_id,
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+        }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
             query: opened.query,
@@ -3276,6 +3322,7 @@ impl Services {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
+        let prompt = crate::provider_images::PreparedPrompt::new(prompt).await?;
         self.run_prompt_turn_captured(
             conn,
             notifications,
@@ -3300,10 +3347,13 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
-        prompt: Vec<ContentBlock>,
+        prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
     ) -> Result<StopReason> {
+        // The worker prepares this outbound copy before committing its
+        // first-turn context. Persisted originals and local capture are untouched.
+        let prompt = prompt.into_blocks();
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3548,6 +3598,64 @@ impl Services {
                     updates_applied |= self
                         .route_notification(&note, agent_id, workspace_id, &mut transcript)
                         .await;
+                }
+            }
+            // Codex validates its sandbox override at turn/start, not set_mode.
+            // Only a recognized pre-start policy rejection may change modes and
+            // replay the untouched prompt. Reuse the output/client-work guards
+            // above, and recheck after the asynchronous mode change.
+            if !closed
+                && !any_update_received
+                && conn.client_request_seq() == client_request_watermark
+            {
+                if let (Err(error), Some(input)) = (&attempt_result, local.as_ref()) {
+                    match intent_acp::codex_sandbox::fallback(
+                        input.connection,
+                        acp_session_id,
+                        error,
+                    )
+                    .await
+                    {
+                        Ok(Some(mode)) => {
+                            while let Ok(note) = notifications.try_recv() {
+                                activity.touch();
+                                any_update_received = true;
+                                updates_applied |= self
+                                    .route_notification(
+                                        &note,
+                                        agent_id,
+                                        workspace_id,
+                                        &mut transcript,
+                                    )
+                                    .await;
+                            }
+                            if any_update_received
+                                || notifications.is_closed()
+                                || conn.client_request_seq() != client_request_watermark
+                            {
+                                break attempt_result;
+                            }
+                            tracing::warn!(agent = %agent_id, mode, "Codex sandbox rejected by policy; retrying with a stricter mode");
+                            self.publish_status_event(
+                                workspace_id,
+                                agent_id,
+                                "prompt",
+                                &format!(
+                                    "Codex policy requires {mode}; retrying before work started."
+                                ),
+                                "info",
+                            )
+                            .await;
+                            if let Some(original) =
+                                local.as_mut().and_then(|input| input.captured.as_mut())
+                            {
+                                original.recapture();
+                            }
+                            continue;
+                        }
+                        Err(error) => break Err(error),
+                        Ok(None) => {}
+                    }
                 }
             }
             match &attempt_result {
@@ -4224,6 +4332,8 @@ impl Services {
             }
             _ => None,
         };
+        let prompt_actionable_error =
+            prompt_auth_error.or_else(|| result.as_ref().err().and_then(prompt_size_error));
         // Quota-exhaustion observation: resolved in the SAME pre-persist seam
         // as the auth mapping above, for the same reason — this is the last
         // place the structured `AcpError` still exists, before the final
@@ -4255,7 +4365,7 @@ impl Services {
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
-                let wrapped = prompt_auth_error.as_ref().unwrap_or(&fallback);
+                let wrapped = prompt_actionable_error.as_ref().unwrap_or(&fallback);
                 if !crate::agent_manager::prompt_cancellation_error(wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
@@ -4496,7 +4606,7 @@ impl Services {
                 // Auth-required mapping (intent-hq/intent#3941): the event
                 // carries the same actionable message as the persisted
                 // stop_reason and returned error, not the raw adapter error.
-                let error_text = prompt_auth_error.as_ref().map_or_else(
+                let error_text = prompt_actionable_error.as_ref().map_or_else(
                     || e.to_string(),
                     |error| match error {
                         Error::InvalidParams(message) => message.clone(),
@@ -4504,7 +4614,7 @@ impl Services {
                     },
                 );
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
-                if let Some(auth) = prompt_auth_error
+                if let Some(auth) = prompt_actionable_error
                     .as_ref()
                     .and_then(Error::execution_authorization)
                 {
@@ -4539,9 +4649,8 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
-            } else if let Some(error) = prompt_auth_error {
-                // Auth-required failure: identical message to the persisted
-                // stop_reason above (intent-hq/intent#3941).
+            } else if let Some(error) = prompt_actionable_error {
+                // Identical actionable message to the persisted stop_reason.
                 error
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))

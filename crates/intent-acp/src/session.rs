@@ -1049,6 +1049,9 @@ mod prompt_guidance_tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    // Complete 1x1 RGB PNG, kept small enough to pass provider image preparation unchanged.
+    const PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNQTp8IAAHMARwXor27AAAAAElFTkSuQmCC";
+
     struct Accept(Arc<AtomicUsize>);
     impl AcpPromptAdmission for Accept {
         fn admit<'a>(
@@ -1071,7 +1074,7 @@ mod prompt_guidance_tests {
         let conn = Connection::new(input, read, None, ConnectionHooks::default());
         let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
             {"type":"text","text":"original user block"},
-            {"type":"image","data":"aGVsbG8=","mimeType":"image/png"}
+            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"}
         ]))
         .unwrap();
         let activity = ActivityTracker::new();
@@ -1156,7 +1159,7 @@ mod prompt_guidance_tests {
             frame["params"]["prompt"],
             json!([
                 {"type":"text","text":"original user block"},
-                {"type":"image","data":"aGVsbG8=","mimeType":"image/png"},
+                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"},
                 {"type":"text","text":"optional inert text"}
             ])
         );

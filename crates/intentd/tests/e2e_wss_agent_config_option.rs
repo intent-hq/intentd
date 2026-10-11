@@ -2089,13 +2089,17 @@ async fn assert_model_specific_thinking_options(load_session: bool) {
         )
         .await;
         await_stream_end(&mut sub, agent_id).await;
-        // stream:end precedes the worker's final state write. Wait until it
-        // is idle before changing settings or restarting the test daemon.
+        // Both stream:end and agent:idle precede the final status write. Wait for
+        // persisted idle so startup recovery cannot add a turn after restart.
         let mut idle = false;
         for _ in 0..120 {
             let frame = wss_event(&mut sub, 30).await;
             let event = &frame["params"]["event"];
-            if event["type"] == "agent:idle" && event["data"]["agentId"] == agent_id {
+            if event["type"] == "agent:status-changed"
+                && event["data"]["agentId"] == agent_id
+                && event["data"]["status"] == "idle"
+                && event["data"]["isActive"] == false
+            {
                 idle = true;
                 break;
             }

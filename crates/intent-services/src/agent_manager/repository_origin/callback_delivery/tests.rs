@@ -1419,10 +1419,12 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"local scripted output"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"local scripted output"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &h.node.connection,
@@ -1473,10 +1475,12 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"foreign connection"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"foreign connection"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &other.connection,
@@ -3888,10 +3892,12 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"local scripted output"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"local scripted output"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &h.node.connection,
@@ -3942,10 +3948,12 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"foreign connection"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"foreign connection"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &other.connection,
@@ -4597,6 +4605,7 @@ mod live_context {
         let text = text.to_owned();
         daemon(h, async move {
             let prompt = serde_json::from_value(json!([{"type":"text","text":text}])).unwrap();
+            let prompt = crate::provider_images::PreparedPrompt::new(prompt).await?;
             f.manager
                 .run_turn_owned(&f.row.id, &f.row.workspace_id, &id, prompt, None, turn)
                 .await
@@ -5301,7 +5310,7 @@ mod live_context {
                                 &f.row.id,
                                 &f.row.workspace_id,
                                 &session,
-                                blocks,
+                                crate::provider_images::PreparedPrompt::new(blocks).await?,
                                 None,
                                 original,
                             )
@@ -5931,7 +5940,10 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                         &f.row.id,
                         &f.row.workspace_id,
                         &id,
-                        serde_json::from_value(json!([{"type":"text","text":text}])).unwrap(),
+                        crate::provider_images::PreparedPrompt::new(
+                            serde_json::from_value(json!([{"type":"text","text":text}])).unwrap(),
+                        )
+                        .await?,
                         None,
                         turn,
                     )
@@ -6454,10 +6466,13 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                         &f.row.id,
                         &f.row.workspace_id,
                         &id,
-                        serde_json::from_value(
-                            json!([{"type":"text","text":"captured before retirement"}]),
+                        crate::provider_images::PreparedPrompt::new(
+                            serde_json::from_value(
+                                json!([{"type":"text","text":"captured before retirement"}]),
+                            )
+                            .unwrap(),
                         )
-                        .unwrap(),
+                        .await?,
                         None,
                         turn,
                     )

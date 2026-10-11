@@ -96,6 +96,17 @@ needs. Fields that matter most:
   That test doubles only the installed CLI protocol; it does not replace the ACP adapter.
   Keep live-account and real-platform evidence separate from this controlled proof.
 
+  codex-acp 2.1.1 starts its automatic-title thread without per-session
+  `CODEX_CONFIG`. Intent confirms an explicit title using the adapter's `/rename`
+  control before persistent and utility inference, preserving the existing title
+  on load. The command must succeed and produce a fresh matching title notification;
+  failure stops setup. The control adds no user conversation item or model request.
+  `codex_session_title` owns this adapter-specific requirement; reconsider it when
+  updating the pin. The strict runtime fixture checks every captured request,
+  including auxiliary requests, with v1/v2/absent model metadata. Set
+  `INTENT_CODEX_TEST_DAEMON` to a freshly built local daemon to additionally exercise
+  the production utility runner against the actual runtime and pinned adapter.
+
 **Binary discovery** — `find_provider_binary` (`crates/intent-providers/src/discover.rs`)
 resolves in precedence order: (1) explicit `providers.paths[id]` setting (must be absolute
 + executable), (2) the provider's native-installer location where one exists
@@ -235,12 +246,18 @@ certainly needs new normalization arms:
     Installed native or JS `codex-acp` binaries and `providers.paths.codex`
     overrides are bypassed.
     After all environment merges, the shared `CODEX_SUBAGENT_POLICY_CONFIG`
-    policy (`crates/intent-providers/src/config.rs`) sets `CODEX_PATH` to the
-    resolved installed CLI and replaces `CODEX_CONFIG` with
-    `{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}`.
-    Both values are JSON booleans: the V2 feature setting can otherwise
-    override the agents setting. Native `-c agents.enabled=false` is not a
-    compatible substitute. Node.js and npm/npx are required even on hosts
+    policy (`crates/intent-providers/src/config.rs`) replaces `CODEX_CONFIG` with
+    `{"agents":{"enabled":false},"features":{"multi_agent":false,"multi_agent_v2":false}}`.
+    All values are JSON booleans. The explicit `agents.enabled=false` takes
+    precedence over model metadata selecting v1/v2; feature flags alone can
+    expose native delegation even when both are false. The derived minimum
+    gate excludes older parsers that reject `agents.enabled` with an
+    `AgentRoleToml` error (intent-hq/intent#6982).
+    The launch boundary keeps `CODEX_PATH` on the exact installed CLI and
+    rejects a confirmed version below the minimum derived from the pinned
+    adapter's CLI declaration. This prevents older runtimes that drop the
+    feature policy on later turns from bypassing native-subagent denial.
+    No user configuration is changed. Node.js and npm/npx are required even on hosts
     with a native adapter; missing prerequisites produce an actionable error.
     The unchanged frontend may still offer Codex on a native-only host; the
     daemon launch error explains the missing toolchain. The adapter package
@@ -377,3 +394,55 @@ To roll back, disable Antigravity and select another provider. Do not delete glo
 Private conversation profiles remain under the daemon data directory. If their history is no longer needed, remove the profiles.
 Backend protocol support must land before frontend support. Do not create a manual submodule-pin bump.
 After authorized merges, monitor the carrying cloudlands-fe alpha release before calling the work shipped.
+
+### Codex policy compatibility regression
+
+The ordinary provider test suite guards explicit agent denial and both feature
+flags. To verify
+the actual runtime parser, model catalog, session start/resume, and absence of
+native delegation tools, run the opt-in regression with explicit local binaries:
+
+```bash
+INTENT_CODEX_TEST_BINARY=/absolute/path/to/codex \
+INTENT_CODEX_TEST_ADAPTER=/absolute/path/to/codex-acp/dist/index.js \
+CARGO_TERM_PROGRESS_WHEN=never cargo test -p intent-providers \
+  --test codex_policy_runtime -- --include-ignored --nocapture
+```
+
+Run from the intentd checkout with Python 3 and Node on PATH. Use the adapter
+version pinned above and test the declared minimum and installed runtime.
+The regression uses a temporary home, dummy authentication, and a local
+HTTP fixture; it makes no paid model call and never reads user credentials.
+It supplies synthetic model catalogs with absent, v1, and v2 multi-agent
+metadata and user configuration enabling delegation, covering new sessions,
+subsequent live prompts, same-process `session/resume`, and `session/load`
+after process recreation. Each phase must emit a tool-bearing request for the
+selected model; every captured catalog must exclude native delegation tools.
+Codex 0.114.0 rejects explicit agent denial and loses feature-only denial on
+later turns. It is rejected before adapter launch by the derived-minimum gate.
+
+Startup discovery derives optional CLI minima from the exact pinned adapter's
+npm dependency declarations, stored in `data/adapter-cli-packages.json`. The
+mapping explicitly identifies the underlying CLI package: Node engines, SDK
+dependencies, and the adapter's own version do not qualify. No declaration means
+no new check (currently Pi and Claude); Pi's existing launch gate stays separate.
+
+After changing a pin, run `python3 -S scripts/provider_cli_metadata.py` from the
+intentd checkout and commit the generated snapshot with the pin. The Codex
+rolling-pin automation updates both files together. Provider tests reject stale
+snapshot versions. The daemon uses the embedded snapshot, with no npm lookup or
+network dependency during startup. `node-semver` derives the lowest admissible
+version from npm ranges, including caret, tilde, comparisons and unions. Invalid,
+empty, wildcard, or unbounded-lower declarations omit the check.
+
+Discovery probes the same installed runtime and environment used for launches.
+`cliMinimumVersion` identifies this opt-in warning; `cliVersionRange` preserves
+the declaration and `cliRequirement` is the human label. `cliVersionOk` is false
+only below the derived minimum, true at or above it, and omitted for unknown,
+failed, or missing probes. A newer CLI outside a declaration's upper bound does
+not trigger the below-minimum warning. Discovery remains descriptive and does
+not change availability. Codex alone enforces the same derived minimum before
+persistent launches, one-shot completions, and model probes, with detected and
+required versions in its error. Unknown versions or absent declarations do not
+become an old-version verdict. Other providers retain their existing launch
+rules; clients must not infer warning eligibility from legacy Pi fields alone.
