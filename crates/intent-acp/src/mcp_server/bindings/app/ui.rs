@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{PublishEvent, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, PublishEvent, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::map_err;
@@ -28,6 +28,7 @@ const MAX_HIGHLIGHT_DURATION_MS: i64 = 30_000;
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
@@ -38,7 +39,7 @@ pub(crate) async fn dispatch(
     }
 
     match method {
-        "navigate" => navigate(api, workspace_id, args).await,
+        "navigate" => navigate(api, workspace_id, caller_agent_id, args).await,
         "highlight" => highlight(api, workspace_id, args).await,
         "targets" => Ok(targets()),
         other => Err(format!("host: unknown method `app.ui.{other}`")),
@@ -48,6 +49,7 @@ pub(crate) async fn dispatch(
 async fn navigate(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let route = normalize_required_string(args, "route")?;
@@ -75,6 +77,13 @@ async fn navigate(
             .as_object_mut()
             .unwrap()
             .insert("durationMs".to_string(), json!(duration));
+    }
+
+    if let Some(agent_id) = caller_agent_id {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("agentId".to_string(), json!(agent_id.as_str()));
     }
 
     // Emit app:ui-navigate event
@@ -132,62 +141,10 @@ async fn highlight(
 }
 
 fn targets() -> Value {
-    // Port of APP_UI_TARGETS from packages/cloudlands-fe/src/shared/app-ui-targets.ts
-    // DRIFT RISK: This is a static copy; changes to the FE targets table require
-    // manual sync. Keep this in sync with the FE reference.
-    json!([
-        {
-            "id": "home",
-            "tab": "",
-            "label": "Home",
-            "route": "/",
-            "category": "navigation",
-            "description": "Workspace home and global overview."
-        },
-        {
-            "id": "new-workspace",
-            "tab": "",
-            "label": "New workspace",
-            "route": "/workspace/new",
-            "category": "navigation",
-            "description": "Create-workspace flow."
-        },
-        // Settings targets
-        {
-            "id": "quickActions.defaultModel",
-            "tab": "agents",
-            "hashAliases": ["default-model", "quickActions.defaultModel"],
-            "scrollSelector": "#default-model",
-            "highlightSelector": "[data-highlight-id=\"quickActions.defaultModel\"]",
-            "label": "Settings: Default model",
-            "route": "/settings?tab=agents#default-model",
-            "category": "settings",
-            "description": "Default AI behavior model selection."
-        },
-        {
-            "id": "agents",
-            "tab": "agents",
-            "hashAliases": ["agents", "specialists", "all-agents"],
-            "scrollSelector": "#specialists",
-            "highlightSelector": "[data-highlight-id=\"specialists\"]",
-            "label": "Settings: Agents",
-            "route": "/settings?tab=agents#specialists",
-            "category": "settings",
-            "description": "Agent and specialist settings."
-        },
-        {
-            "id": "workspace-card",
-            "tab": "",
-            "hashAliases": ["workspace-card"],
-            "highlightSelector": "[data-highlight-id^=\"workspace-\"]",
-            "label": "Workspace card",
-            "route": "/",
-            "category": "workspace",
-            "description": "A workspace card on workspace list surfaces.",
-            "dynamic": true,
-            "idPattern": "workspace-{workspaceId}"
-        },
-    ])
+    // Supported destinations only. The monorepo check-app-ui-targets gate
+    // compares routes, aliases and selectors with the frontend registry.
+    serde_json::from_str(include_str!("../../../../resources/app-ui-targets.json"))
+        .expect("bundled app UI targets must be valid JSON")
 }
 
 /// Normalize a required string field (trim, non-empty check)
@@ -325,7 +282,14 @@ mod tests {
     async fn test_dispatch_rejects_non_chief_workspace() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let non_chief_id = WorkspaceId::from_string("amber-forest");
-        let result = dispatch(&api, &non_chief_id, "navigate", &json!({"route": "/"})).await;
+        let result = dispatch(
+            &api,
+            &non_chief_id,
+            None,
+            "navigate",
+            &json!({"route": "/"}),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err(),
@@ -337,7 +301,7 @@ mod tests {
     async fn test_navigate_requires_route() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "navigate", &json!({})).await;
+        let result = dispatch(&api, &chief_id, None, "navigate", &json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("route is required"));
     }
@@ -346,7 +310,7 @@ mod tests {
     async fn test_navigate_rejects_empty_route() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "  "})).await;
+        let result = dispatch(&api, &chief_id, None, "navigate", &json!({"route": "  "})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("route cannot be empty"));
     }
@@ -360,6 +324,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "navigate",
             &json!({"route": "/", "durationMs": 0}),
         )
@@ -371,6 +336,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "navigate",
             &json!({"route": "/", "durationMs": 40000}),
         )
@@ -384,9 +350,15 @@ mod tests {
         let fake = FakeApi::default();
         let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "navigate", &json!({"route": "/settings"}))
-            .await
-            .unwrap();
+        let result = dispatch(
+            &api,
+            &chief_id,
+            None,
+            "navigate",
+            &json!({"route": "/settings"}),
+        )
+        .await
+        .unwrap();
 
         assert!(result.get("ok").unwrap().as_bool().unwrap());
         assert_eq!(result.get("route").unwrap().as_str().unwrap(), "/settings");
@@ -414,6 +386,7 @@ mod tests {
         let result = dispatch(
             &api,
             &chief_id,
+            None,
             "navigate",
             &json!({
                 "route": "/settings",
@@ -441,7 +414,7 @@ mod tests {
     async fn test_highlight_requires_id() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "highlight", &json!({})).await;
+        let result = dispatch(&api, &chief_id, None, "highlight", &json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("id is required"));
     }
@@ -451,7 +424,7 @@ mod tests {
         let fake = FakeApi::default();
         let api: Arc<dyn WorkspaceApi> = Arc::new(fake.clone());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "highlight", &json!({"id": "agents"}))
+        let result = dispatch(&api, &chief_id, None, "highlight", &json!({"id": "agents"}))
             .await
             .unwrap();
 
@@ -476,7 +449,7 @@ mod tests {
     async fn test_targets_returns_array() {
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
         let chief_id = WorkspaceId::chief();
-        let result = dispatch(&api, &chief_id, "targets", &json!({}))
+        let result = dispatch(&api, &chief_id, None, "targets", &json!({}))
             .await
             .unwrap();
 

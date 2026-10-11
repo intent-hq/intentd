@@ -191,13 +191,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Desktop control adds four router methods; reverse methods are counted separately.
 // GitLab checkout repository configuration adds one router method.
-const EXPECTED_TOTAL_METHODS: usize = 433;
+// Cancellable note deletion (13.10): +3 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 436;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
-const EXPECTED_ROUTER_METHODS: usize = 377;
+/// Protocol 13.10 adds three cancellable note deletion controls.
+const EXPECTED_ROUTER_METHODS: usize = 380;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -744,6 +746,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.add",
     "note.create",
     "note.delete",
+    "note.deleteCancel",
+    "note.deleteSchedule",
+    "note.deleteStatus",
     "note.edit",
     "note.editLines",
     "note.get",

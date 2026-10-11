@@ -75,6 +75,7 @@ const SETUP_SCRIPT_GENERATOR_V1_1: &str = instr!("v1.1", "setup-script-generator
 /// live latest. Adding a version = a new directory + a new static + a
 /// registry entry (H2, intent-hq/monorepo#2459).
 pub(crate) struct InstructionSet {
+    pub assistant: Option<&'static str>,
     pub chat: &'static str,
     pub common: &'static str,
     pub debug: &'static str,
@@ -97,6 +98,7 @@ pub(crate) struct InstructionSet {
 /// byte-identical to the pre-versioned layout (pinned by
 /// `v1_goldens::golden_bundled_doctrine_hashes`).
 pub(crate) static V1: InstructionSet = InstructionSet {
+    assistant: None,
     chat: CHAT,
     common: COMMON,
     debug: DEBUG,
@@ -122,6 +124,7 @@ pub(crate) static V1: InstructionSet = InstructionSet {
 /// mechanics live in the ws.* docs). Every other body is a byte-identical
 /// copy of its v1 counterpart (pinned by `v1_1_goldens`).
 pub(crate) static V1_1: InstructionSet = InstructionSet {
+    assistant: None,
     chat: instr!("v1.1", "chat"),
     common: instr!("v1.1", "common"),
     debug: instr!("v1.1", "debug"),
@@ -173,6 +176,11 @@ pub(crate) static V2_8: InstructionSet = InstructionSet {
 pub(crate) static V2_10: InstructionSet = InstructionSet {
     common: instr!("v2.10", "common"),
     ..V2_8
+};
+
+pub(crate) static V3_1: InstructionSet = InstructionSet {
+    assistant: Some(instr!("v3.1", "assistant")),
+    ..V2_10
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of

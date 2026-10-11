@@ -252,7 +252,7 @@ fn safe_instance_facts(root: &RepositoryRootContext) -> bool {
 /// Eligibility never uses the registry's unknown-version fallback, the current
 /// harness constant, a parent's stamp or captured feature switches.
 fn eligible_harness_version(stamp: Option<&str>) -> bool {
-    stamp == Some("3.0")
+    stamp.is_some_and(intent_core::harness_supports_repository_guidance)
 }
 
 /// JSON escaping keeps repository facts inert, including role delimiters,

@@ -2874,8 +2874,8 @@ impl Store {
         // the same grounds: `set_agent_effort_levels` (called at session
         // open) is its only post-insert mutator, so a stale in-memory session
         // persisted here cannot wipe freshly discovered levels.
-        // Those two attention writers are
-        // the only post-insert mutators of the attention columns.
+        // The narrow attention writers (raise, turn-begin clear and conditional
+        // blocker recovery) are the only post-insert mutators of those columns.
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
@@ -3776,6 +3776,37 @@ impl Store {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Clear only the blocker observed by the resolver. A replacement request
+    /// (including a discussion) survives this conditional write.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_blocker_request_if_matches(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        reason: &str,
+        timestamp: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET attention_request_kind=NULL, \
+             attention_request_reason=NULL, attention_request_timestamp=NULL, updated_at=? \
+             WHERE id=? AND workspace_id=? AND attention_request_kind='blocker' \
+             AND attention_request_reason=? AND attention_request_timestamp IS ?",
+        )
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(reason)
+        .bind(timestamp)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("resolve blocker failed: {e}")))?
+        .rows_affected();
+        Ok(rows != 0)
     }
 
     /// Replace the session's `effort_levels` wholesale (PROTOCOL §5.5,
@@ -6077,6 +6108,54 @@ impl Store {
             .map_err(|e| Error::Internal(format!("acquire read connection failed: {e}")))?;
         let rows = Self::select_messages_page(&mut conn, agent_id, offset, limit).await?;
         rows.iter().map(map_message_row).collect::<Result<_>>()
+    }
+
+    /// Bounded keyset read for progressive history. Admission includes the row
+    /// crossing the stored-byte budget, so no fetched/enriched suffix is thrown
+    /// away and even an oversized single message makes progress. At most eight
+    /// rows are materialized; no payload side-table bodies are hydrated.
+    /// Returns the trigger-maintained count from the same read snapshot, so an
+    /// append cannot land between the count and newest-row boundary. Reading
+    /// the count never scans the transcript, including on continuation batches.
+    ///
+    /// # Errors
+    /// Returns an error if the database read or row decoding fails.
+    pub async fn get_agent_history_batch(
+        &self,
+        agent_id: &AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<(Vec<AgentMessage>, u64)> {
+        let mut tx = self.begin_read_snapshot().await?;
+        let total =
+            sqlx::query_scalar::<_, i64>("SELECT message_count FROM agent_session WHERE id = ?")
+                .bind(agent_id.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("read history count failed: {e}")))?
+                .unwrap_or(0)
+                .max(0)
+                .cast_unsigned();
+        let sql = format!(
+            "WITH candidates AS (SELECT {MESSAGE_COLUMNS} FROM agent_message \
+             WHERE agent_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?), \
+             bounded AS (SELECT *, SUM(length(CAST(content AS BLOB)) + \
+             COALESCE(length(CAST(metadata AS BLOB)), 0)) OVER \
+             (ORDER BY seq DESC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) \
+             AS preceding_bytes FROM candidates) \
+             SELECT {MESSAGE_COLUMNS} FROM bounded \
+             WHERE COALESCE(preceding_bytes, 0) < ? ORDER BY seq DESC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(agent_id.as_str())
+            .bind(before_seq.unwrap_or(i64::MAX))
+            .bind(i64::try_from(limit.clamp(1, 8)).unwrap_or(8))
+            .bind(i64::try_from(intent_core::SLIM_PAGE_BUDGET_BYTES).unwrap_or(i64::MAX))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read history batch failed: {e}")))?;
+        let messages = rows.iter().map(map_message_row).collect::<Result<_>>()?;
+        Ok((messages, total))
     }
 
     /// The shared page SELECT behind [`Store::get_agent_messages_page`]

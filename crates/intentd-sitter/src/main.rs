@@ -6,9 +6,8 @@
 //! verbatim, keep it updated on the randomized 12–24h cadence, and babysit
 //! crashes. One-shot subcommands run the installed daemon exactly once with
 //! no updater activity. The intercepted `intentd sitter channel`,
-//! `intentd restart`, and `intentd update` commands are handled entirely
-//! here — they never spawn a serving daemon (`update` only probes readiness
-//! with one-shot `call system.status` invocations after a restart).
+//! `intentd start`, `intentd restart`, and `intentd update` commands are handled
+//! here. Start and restart-from-stopped launch a detached supervisor.
 
 use intentd_sitter::cli::{self, SitterArgs, SitterCommand};
 use intentd_sitter::config;
@@ -40,6 +39,11 @@ fn run() -> i32 {
         return 0;
     }
 
+    if let Some(help) = args.help() {
+        println!("{help}");
+        return 0;
+    }
+
     let paths = match SitterPaths::resolve() {
         Ok(paths) => paths,
         Err(e) => {
@@ -60,6 +64,13 @@ fn run() -> i32 {
             .map(std::string::ToString::to_string)
             .collect(),
     };
+
+    // Let the daemon parser handle help and invalid options before any effect.
+    if args.passthrough.len() == 1 && args.passthrough[0] == "stop" {
+        if let Some(code) = intentd_sitter::startup::stop(&paths) {
+            return code;
+        }
+    }
 
     match args.sitter_command() {
         Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_urls),
@@ -86,7 +97,7 @@ const RESTART_HINT: &str = "apply it now with `intentd restart` (fallback: \
      `brew services restart intentd` / `systemctl --user restart intentd`)";
 
 /// Execute an intercepted sitter-owned command; returns the exit code.
-/// Never spawns the daemon.
+/// Start (and restart when stopped) launch the supervised daemon.
 fn run_sitter_command(
     command: SitterCommand,
     args: &SitterArgs,
@@ -97,7 +108,8 @@ fn run_sitter_command(
         SitterCommand::Channel { set, redownload } => {
             run_channel_command(set, redownload, args, paths, base_urls)
         }
-        SitterCommand::Restart => run_restart(paths),
+        SitterCommand::Restart => run_restart(args, paths),
+        SitterCommand::Start => intentd_sitter::startup::run(args, paths),
         SitterCommand::Update { check } => run_update_command(check, args, paths, base_urls),
     }
 }
@@ -340,11 +352,10 @@ fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
     }
 }
 
-/// No SIGHUP on windows: the new binary takes effect on the next (service)
-/// restart instead.
+/// Windows update installation does not automatically request a restart.
 #[cfg(not(unix))]
 fn apply_installed_update(_paths: &SitterPaths, _version: &str) -> i32 {
-    println!("restart the intentd service to start using the new version");
+    println!("run `intentd restart` to start using the new version");
     0
 }
 
@@ -352,25 +363,15 @@ fn apply_installed_update(_paths: &SitterPaths, _version: &str) -> i32 {
 /// SIGHUP to the serve-mode sitter found via its pidfile. Stale pidfiles
 /// (dead pid) are treated as no running service.
 #[cfg(unix)]
-fn run_restart(paths: &SitterPaths) -> i32 {
+fn run_restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     let Some(pid) = supervisor::read_live_pid(&paths.pid_path) else {
-        eprintln!(
-            "intentd-sitter: no running supervised intentd found (no live pid in {}); \
-             start the service first (`intentd serve`, `brew services start intentd`, \
-             or `systemctl --user start intentd`)",
-            paths.pid_path.display()
-        );
-        return 1;
+        println!("no running supervisor; starting intentd");
+        return intentd_sitter::startup::run(args, paths);
     };
     send_sighup_to_sitter(pid)
 }
 
-/// No SIGHUP on windows: point at the service manager instead.
-#[cfg(not(unix))]
-fn run_restart(_paths: &SitterPaths) -> i32 {
-    eprintln!(
-        "intentd-sitter: `intentd restart` is not supported on Windows; \
-         restart the service instead"
-    );
-    1
+#[cfg(windows)]
+fn run_restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
+    intentd_sitter::startup::restart(args, paths)
 }

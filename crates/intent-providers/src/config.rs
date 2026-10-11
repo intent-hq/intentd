@@ -51,12 +51,13 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.1";
 
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
-/// probes, and one-shot launches. V2 feature enabling takes precedence over
-/// `agents.enabled` in this runtime, so both settings must be false. Set this
-/// after all environment merges and set the resolved `CODEX_PATH` so the adapter uses
-/// the installed CLI. Do not merge user `CODEX_CONFIG`.
+/// probes, and one-shot launches. Explicit agent denial takes precedence over
+/// model-owned multi-agent metadata; feature flags alone do not. The derived
+/// CLI minimum gate excludes old parsers that reject `agents.enabled` (#6982).
+/// Set this after all environment merges and set the resolved `CODEX_PATH`
+/// so the adapter uses the installed CLI. Do not merge user `CODEX_CONFIG`.
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
-    r#"{"agents":{"enabled":false},"features":{"multi_agent_v2":false}}"#;
+    r#"{"agents":{"enabled":false},"features":{"multi_agent":false,"multi_agent_v2":false}}"#;
 
 /// Actionable prerequisite failure shared by all Codex launch entrypoints.
 pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
@@ -295,7 +296,64 @@ pub struct ProviderConfig {
     pub supports_test_prompt: bool,
 }
 
+/// Supported optional credentials for the reviewed ACP adapters. These are
+/// credential kinds, not token values; secrets remain in the shared secret store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAccessTokenKind {
+    ClaudeSetupToken,
+    CodexAccessToken,
+}
+
+impl ProviderAccessTokenKind {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ClaudeSetupToken => "claudeSetupToken",
+            Self::CodexAccessToken => "codexAccessToken",
+        }
+    }
+
+    /// Environment variable consumed by the provider CLI through its pinned adapter.
+    #[must_use]
+    pub const fn env_var(self) -> &'static str {
+        match self {
+            Self::ClaudeSetupToken => "CLAUDE_CODE_OAUTH_TOKEN",
+            Self::CodexAccessToken => "CODEX_ACCESS_TOKEN",
+        }
+    }
+}
+
+/// Static token-entry metadata shared by settings, catalog and launch consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderAccessToken {
+    pub kind: ProviderAccessTokenKind,
+    /// Also the `SecretStore` account. Never a config.toml setting.
+    pub setting_path: &'static str,
+    pub label: &'static str,
+    pub guidance: &'static str,
+}
+
 impl ProviderConfig {
+    /// Only advertise credential kinds verified through the pinned adapters.
+    #[must_use]
+    pub fn access_token(&self) -> Option<ProviderAccessToken> {
+        match self.id {
+            "claude-code" => Some(ProviderAccessToken {
+                kind: ProviderAccessTokenKind::ClaudeSetupToken,
+                setting_path: "providers.claude-code.accessToken",
+                label: "Claude setup token",
+                guidance: "Run claude setup-token on a machine with a browser and paste the generated token. Optional; without a saved token, authenticate on each target machine. Changes apply to subsequent launches.",
+            }),
+            "codex" => Some(ProviderAccessToken {
+                kind: ProviderAccessTokenKind::CodexAccessToken,
+                setting_path: "providers.codex.accessToken",
+                label: "Codex access token",
+                guidance: "Create a Codex access token in the ChatGPT admin console. Requires a ChatGPT Business or Enterprise workspace and a compatible Codex CLI on the target machine. Optional; without a saved token, authenticate on each target machine. Changes apply to subsequent launches.",
+            }),
+            _ => None,
+        }
+    }
+
     /// ACP session selector supported by the pinned adapter. This is a
     /// capability, not a guarantee of model or account eligibility.
     #[must_use]

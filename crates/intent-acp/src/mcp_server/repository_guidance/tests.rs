@@ -209,7 +209,7 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
         Some(" 3.0"),
         Some("3.0\n"),
         Some("unknown"),
-        Some("3.1"),
+        Some("3.2"),
     ] {
         assert!(
             GuidanceBinding::new(

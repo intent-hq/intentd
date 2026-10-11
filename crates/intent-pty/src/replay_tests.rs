@@ -14,7 +14,14 @@ fn fanout(cap: usize) -> Arc<Mutex<Fanout>> {
 }
 
 fn output(fanout: &Arc<Mutex<Fanout>>, bytes: &[u8]) {
-    read_loop(Box::new(Cursor::new(bytes.to_vec())), fanout);
+    #[cfg(windows)]
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(Box::new(std::io::sink())));
+    read_loop(
+        Box::new(Cursor::new(bytes.to_vec())),
+        fanout,
+        #[cfg(windows)]
+        &writer,
+    );
 }
 
 fn replay(rendered: &mut Vec<u8>, next: &mut u64, chunk: &OutputChunk) {

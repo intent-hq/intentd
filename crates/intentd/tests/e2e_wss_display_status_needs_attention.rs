@@ -368,10 +368,12 @@ async fn boot(script: &str, behavior: &str) -> (Daemon, String, u16, Arc<ClientC
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
-    let env: [(&str, &str); 3] = [
+    let prompt_log = data_dir.join("mock-prompts.jsonl");
+    let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script),
         ("MOCK_AGENT_BEHAVIOR", behavior),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
@@ -1449,4 +1451,619 @@ async fn mid_turn_blocker_defers_surfacing_until_idle_over_wss() {
         "blocked",
     )
     .await;
+}
+
+/// Recovery is exercised through real MCP JS in a hermetic daemon, observed
+/// through WSS. The response is derived from the tool result, so mock refusal
+/// or an assertion failure cannot masquerade as a passing scenario.
+async fn blocker_recovery_turn(
+    code: &str,
+    expected_kind: Option<&str>,
+    expected_reason: Option<&str>,
+) {
+    let script = gate("WSS explicit blocker recovery E2E").expect("mock ACP prerequisites");
+    let behavior = json!({"rules": [{
+        "ifPromptContains": "EXPLICIT_BLOCKER_RECOVERY",
+        "toolCall": {"name": "workspace_api", "arguments": {
+            "code": code, "summary": "exercise explicit blocker recovery"
+        }},
+        "responseFromToolResultField": "receipt"
+    }], "response": "automatic wake completed"})
+    .to_string();
+    let (daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({
+            "workspaceId": ws_id, "eventTypes": ["agent:*", "workspace:displayStatus-changed"]
+        }),
+    )
+    .await;
+    let agent = create_agent(&mut rpc, &ws_id, "recovery-agent").await;
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id, "agentId": agent, "content": "EXPLICIT_BLOCKER_RECOVERY"
+        }),
+    )
+    .await;
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let ev = wss_event_until(&mut sub, deadline)
+            .await
+            .expect("recovery turn idle");
+        let idle = ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(agent);
+        events.push(ev);
+        if idle {
+            break;
+        }
+    }
+    let fresh = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId": ws_id, "agentId": agent}),
+    )
+    .await;
+    assert_eq!(
+        fresh["session"]["attentionRequestKind"].as_str(),
+        expected_kind,
+        "{fresh}"
+    );
+    assert_eq!(
+        fresh["session"]["attentionRequestReason"].as_str(),
+        expected_reason,
+        "{fresh}"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({"workspaceId": ws_id, "agentId": agent}),
+    )
+    .await;
+    assert!(
+        conversation
+            .to_string()
+            .contains("BLOCKER_RECOVERY_RECEIPT_OK"),
+        "real tool assertions must pass: {conversation}"
+    );
+    let surfaced: Vec<_> = events
+        .iter()
+        .filter(|ev| {
+            ev["type"] == "agent:attention-requested" && ev["data"]["agentId"] == json!(agent)
+        })
+        .collect();
+    if expected_kind.is_none() {
+        assert!(
+            surfaced.is_empty(),
+            "same-turn recovered blocker must never surface: {surfaced:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event["type"] == "agent:updated"
+                && event["data"]["agentId"] == json!(agent)
+                && event["data"]["attentionRequestKind"].is_string()),
+            "cleared request must not publish ghost attention fields: {events:?}"
+        );
+        assert!(events.iter().any(
+            |ev| ev["type"] == "agent:updated" && ev["data"]["attentionRequestCleared"] == true
+        ));
+    } else {
+        assert_eq!(
+            surfaced.len(),
+            if expected_kind == Some("discussion") {
+                2
+            } else {
+                1
+            },
+            "only unresolved raises surface: {surfaced:?}"
+        );
+        assert_eq!(surfaced[0]["data"]["reason"].as_str(), expected_reason);
+    }
+    let mut reconnected = connect_ws(port, cfg).await;
+    let reconnect = wss_rpc(
+        &mut reconnected,
+        "agent.getSession",
+        json!({"workspaceId": ws_id, "agentId": agent}),
+    )
+    .await;
+    assert_eq!(
+        reconnect["session"]["attentionRequestKind"],
+        fresh["session"]["attentionRequestKind"]
+    );
+    if let Ok(dir) = std::env::var("BLOCKER_RECOVERY_RECEIPT_DIR") {
+        std::fs::create_dir_all(&dir).expect("receipt directory");
+        let filename = expected_reason
+            .unwrap_or(if code.contains("superseded discussion") {
+                "superseded-discussion"
+            } else {
+                "cleared"
+            })
+            .replace(' ', "-");
+        std::fs::write(
+            Path::new(&dir).join(format!("{filename}.json")),
+            serde_json::to_vec_pretty(&json!({
+                "scenario": filename, "result": "pass", "session": fresh, "reconnect": reconnect,
+                "events": events, "conversation": conversation
+            }))
+            .unwrap(),
+        )
+        .expect("write repeatable recovery receipt");
+        std::fs::copy(
+            daemon.data_dir.path().join("daemon.log"),
+            Path::new(&dir).join(format!("{filename}.log")),
+        )
+        .expect("save isolated daemon log");
+    }
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_same_turn_over_wss() {
+    blocker_recovery_turn(r"
+        const check = (ok, message) => { if (!ok) throw new Error(message); };
+        check(typeof ws.agent.resolveBlocker === 'function', 'binding missing');
+        check((await ws.help('agent')).includes('resolveBlocker'), 'runtime help missing');
+        await ws.agent.reportBlocker('recovered old blocker');
+        for (const reason of [undefined, null, '', '  \n ']) {
+            let rejected = false;
+            try { await ws.agent.resolveBlocker(reason); } catch { rejected = true; }
+            check(rejected, 'blank reason accepted');
+        }
+        const resolved = await ws.agent.resolveBlocker('  sandbox probe now succeeds  ');
+        check(resolved.ok === true && resolved.resolved === true && resolved.reason === 'sandbox probe now succeeds', 'bad recovery result');
+        check((await ws.agent.resolveBlocker('repeat evidence')).resolved === false, 'repeat must no-op');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ", None, None).await;
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_preserves_discussion_over_wss() {
+    blocker_recovery_turn(r"
+        await ws.agent.requestDiscussion('decision still needed');
+        await ws.agent.reportBlocker('temporary environment problem');
+        const cleared = await ws.agent.resolveBlocker('environment probe succeeds');
+        if (!cleared.resolved) throw new Error('blocker did not resolve');
+        await ws.agent.requestDiscussion('decision still needed');
+        if ((await ws.agent.resolveBlocker('environment still works')).resolved) throw new Error('discussion cleared');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ", Some("discussion"), Some("decision still needed")).await;
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_preserves_new_raise_over_wss() {
+    blocker_recovery_turn(r"
+        await ws.agent.reportBlocker('old blocker');
+        if (!(await ws.agent.resolveBlocker('old blocker recovered')).resolved) throw new Error('old blocker not resolved');
+        await ws.agent.reportBlocker('new blocker remains');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ", Some("blocker"), Some("new blocker remains")).await;
+}
+
+async fn blocker_recovery_automatic_wakes(state_snapshot: bool) {
+    let script = gate("WSS recovery automatic wakes E2E").expect("mock ACP prerequisites");
+    let raise = r#"
+        await ws.agent.reportBlocker('foreground blocker waiting for recovery');
+        await ws.hook.schedule({name:'ordinary automatic wake',delayMs:10000,ttlMs:60000,
+            code:"if (!hookState?.armed) return {dispatch:false,state:{armed:true}}; return {dispatch:true,message:'ORDINARY_BLOCKER_AUTO_WAKE'};"});
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RAISED'})}]};
+    "#;
+    let ordinary = r#"
+        await ws.hook.schedule({name:'confirmed recovery wake',delayMs:10000,ttlMs:60000,
+            code:"if (!hookState?.armed) return {dispatch:false,state:{armed:true}}; return {dispatch:true,message:'CONFIRMED_BLOCKER_AUTO_WAKE'};"});
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_PRESERVED'})}]};
+    "#;
+    let recover = r"
+        const result = await ws.agent.resolveBlocker('automatic probe confirmed recovery');
+        if (!result.resolved) throw new Error('automatic wake dismissed blocker before explicit recovery');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ";
+    let rule = |marker: &str, code: &str| {
+        json!({"ifPromptContains":marker,
+        "toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"blocker automatic-wake regression"}},
+        "responseFromToolResultField":"receipt"})
+    };
+    let behavior = json!({"rules":[rule("CONFIRMED_BLOCKER_AUTO_WAKE",recover),rule("ORDINARY_BLOCKER_AUTO_WAKE",ordinary),rule("START_BLOCKER_AUTO_WAKE",raise)]}).to_string();
+    let (daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:idle","agent:updated"]}),
+    )
+    .await;
+    let agent = create_agent(&mut rpc, &ws_id, "foreground-recovery").await;
+    let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let features = intent_core::settings_file::AgentFeaturesSettings {
+        state_snapshot,
+        attention_requests: true,
+        ..Default::default()
+    };
+    sqlx::query("UPDATE agent_session SET harness_version='2.10', harness_features=? WHERE id=?")
+        .bind(serde_json::to_string(&features).unwrap())
+        .bind(&agent)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent,"content":"START_BLOCKER_AUTO_WAKE"}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    let mut idles = 0;
+    let mut events = Vec::new();
+    while idles < 3 {
+        let ev = wss_event_until(&mut sub, deadline)
+            .await
+            .expect("three automatic recovery turns");
+        if ev["type"] == "agent:idle" && ev["data"]["agentId"] == json!(agent) {
+            idles += 1;
+            let got = wss_rpc(
+                &mut rpc,
+                "agent.getSession",
+                json!({"workspaceId":ws_id,"agentId":agent}),
+            )
+            .await;
+            if idles < 3 {
+                assert_eq!(
+                    got["session"]["attentionRequestKind"], "blocker",
+                    "ordinary wake preserves foreground blocker: {got}"
+                );
+            } else {
+                assert!(
+                    got["session"]["attentionRequestKind"].is_null(),
+                    "explicit recovery clears: {got}"
+                );
+            }
+        }
+        events.push(ev);
+    }
+    let conversation = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent}),
+    )
+    .await;
+    assert!(
+        conversation
+            .to_string()
+            .contains("BLOCKER_RECOVERY_RECEIPT_OK"),
+        "{conversation}"
+    );
+    let prompts =
+        std::fs::read_to_string(daemon.data_dir.path().join("mock-prompts.jsonl")).unwrap();
+    let prompts: Vec<Value> = prompts
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(prompts.len() >= 3, "{prompts:?}");
+    assert!(!prompts[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("After confirming recovery, call ws.agent.resolveBlocker(reason)"));
+    for prompt in &prompts[1..3] {
+        if !state_snapshot {
+            assert!(
+                !prompt["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("current ws.agent.snapshot() =>"),
+                "snapshot toggle respected: {prompt}"
+            );
+        }
+        assert!(
+            prompt["text"]
+                .as_str()
+                .unwrap()
+                .contains("After confirming recovery, call ws.agent.resolveBlocker(reason)"),
+            "pinned harness receives live reminder: {prompt}"
+        );
+    }
+    if let Ok(dir) = std::env::var("BLOCKER_RECOVERY_RECEIPT_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Path::new(&dir).join(format!("automatic-wakes-snapshot-{state_snapshot}.json")),serde_json::to_vec_pretty(&json!({"result":"pass","events":events,"conversation":conversation,"prompts":prompts})).unwrap()).unwrap();
+        std::fs::copy(
+            daemon.data_dir.path().join("daemon.log"),
+            Path::new(&dir).join(format!("automatic-wakes-snapshot-{state_snapshot}.log")),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_automatic_wakes_over_wss() {
+    blocker_recovery_automatic_wakes(true).await;
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_live_reminder_without_state_snapshot_over_wss() {
+    blocker_recovery_automatic_wakes(false).await;
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_superseded_discussion_stays_clear_over_wss() {
+    blocker_recovery_turn(r"
+        await ws.agent.requestDiscussion('superseded discussion');
+        await ws.agent.reportBlocker('temporary blocker');
+        if (!(await ws.agent.resolveBlocker('probe succeeded')).resolved) throw new Error('blocker did not resolve');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ", None, None).await;
+}
+
+/// Wait for a particular agent turn while retaining the WSS events for replay.
+async fn recovery_wait_idle(sub: &mut TlsWs, agent: &str, events: &mut Vec<Value>) {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let event = wss_event_until(sub, deadline)
+            .await
+            .expect("recovery scenario idle");
+        let idle = event["type"] == "agent:idle" && event["data"]["agentId"] == json!(agent);
+        events.push(event);
+        if idle {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_preserves_question_and_other_agent_over_wss() {
+    let script = gate("WSS recovery unrelated attention E2E").expect("mock ACP prerequisites");
+    let ask = r#"
+        await ws.hook.schedule({name:'recover environment while question waits',delayMs:10000,ttlMs:60000,
+            code:"if (!hookState?.armed) return {dispatch:false,state:{armed:true}}; return {dispatch:true,message:'RECOVER_WITH_PENDING_QUESTION'};"});
+        return await ws.app.question.ask({header:'Target',question:'Which target?',options:[{label:'First'},{label:'Second'}]});
+    "#;
+    let recover = r"
+        const before = await ws.agent.snapshot();
+        if (!before.numQuestionsAsked) throw new Error('question prerequisite missing');
+        if (!(await ws.agent.resolveBlocker('environment health probe passes')).resolved) throw new Error('blocker not resolved');
+        const after = await ws.agent.snapshot();
+        if (after.numQuestionsAsked !== before.numQuestionsAsked) throw new Error('question cleared');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ";
+    let behavior = json!({"rules":[
+        {"ifPromptContains":"RECOVER_WITH_PENDING_QUESTION","toolCall":{"name":"workspace_api","arguments":{"code":recover,"summary":"recover own environment"}},"responseFromToolResultField":"receipt"},
+        {"ifPromptContains":"ASK_WITH_RECOVERY_HOOK","toolCall":{"name":"workspace_api","arguments":{"code":ask,"summary":"ask while waiting for recovery"}},"response":"waiting for your target"},
+        {"ifPromptContains":"OTHER_FOREGROUND_BLOCKER","toolCall":{"name":"workspace_api","arguments":{"code":"return await ws.agent.reportBlocker('other agent environment still broken');","summary":"report other blocker"}},"response":"other blocker remains"}
+    ]}).to_string();
+    let (daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:*","workspace:displayStatus-changed"]}),
+    )
+    .await;
+    let other = create_agent(&mut rpc, &ws_id, "other-foreground").await;
+    let owner = create_agent(&mut rpc, &ws_id, "question-owner").await;
+    let mut events = Vec::new();
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":other,"content":"OTHER_FOREGROUND_BLOCKER"}),
+    )
+    .await;
+    recovery_wait_idle(&mut sub, &other, &mut events).await;
+    let other_before = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":other}),
+    )
+    .await;
+    assert_eq!(other_before["session"]["attentionRequestKind"], "blocker");
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":owner,"content":"ASK_WITH_RECOVERY_HOOK"}),
+    )
+    .await;
+    recovery_wait_idle(&mut sub, &owner, &mut events).await;
+    let before = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":owner}),
+    )
+    .await;
+    let pending = before["session"]["metadata"]["pendingQuestionsMessageId"]
+        .as_str()
+        .expect("pending question marker")
+        .to_string();
+    assert!(!pending.is_empty(), "{before}");
+    let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    store
+        .set_attention_request(
+            &intent_core::WorkspaceId(ws_id.clone()),
+            &intent_core::AgentId::from(owner.as_str()),
+            "blocker",
+            "own temporary blocker",
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    recovery_wait_idle(&mut sub, &owner, &mut events).await;
+    let owner_after = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":owner}),
+    )
+    .await;
+    assert!(
+        owner_after["session"]["attentionRequestKind"].is_null(),
+        "{owner_after}"
+    );
+    assert_eq!(
+        owner_after["session"]["metadata"]["pendingQuestionsMessageId"],
+        pending
+    );
+    let other_after = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":other}),
+    )
+    .await;
+    for field in [
+        "attentionRequestKind",
+        "attentionRequestReason",
+        "attentionRequestTimestamp",
+    ] {
+        assert_eq!(
+            other_before["session"][field], other_after["session"][field],
+            "another agent's request survives"
+        );
+    }
+    assert!(!events
+        .iter()
+        .any(|event| event["data"]["agentId"] == json!(other)
+            && event["data"]["attentionRequestCleared"] == true));
+    assert_eq!(
+        get_display_status(&mut rpc, &ws_id).await,
+        "blocked",
+        "other foreground blocker still governs workspace"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":owner}),
+    )
+    .await;
+    assert!(
+        conversation
+            .to_string()
+            .contains("BLOCKER_RECOVERY_RECEIPT_OK"),
+        "{conversation}"
+    );
+    let mut reconnect = connect_ws(port, cfg).await;
+    let fresh = wss_rpc(
+        &mut reconnect,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":owner}),
+    )
+    .await;
+    assert_eq!(
+        fresh["session"]["metadata"]["pendingQuestionsMessageId"],
+        pending
+    );
+    if let Ok(dir) = std::env::var("BLOCKER_RECOVERY_RECEIPT_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Path::new(&dir).join("question-and-other-agent.json"),serde_json::to_vec_pretty(&json!({"result":"pass","before":before,"ownerAfter":owner_after,"otherBefore":other_before,"otherAfter":other_after,"reconnect":fresh,"events":events,"conversation":conversation})).unwrap()).unwrap();
+        std::fs::copy(
+            daemon.data_dir.path().join("daemon.log"),
+            Path::new(&dir).join("question-and-other-agent.log"),
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn explicit_blocker_recovery_attention_requests_disabled_over_wss() {
+    let script = gate("WSS recovery feature gate E2E").expect("mock ACP prerequisites");
+    let setup = r#"
+        await ws.hook.schedule({name:'observe disabled recovery gate',delayMs:10000,ttlMs:60000,
+            code:"if (!hookState?.armed) return {dispatch:false,state:{armed:true}}; return {dispatch:true,message:'OBSERVE_DISABLED_RECOVERY'};"});
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'DISABLED_GATE_READY'})}]};
+    "#;
+    let observe = r"
+        if (typeof ws.agent.resolveBlocker !== 'undefined') throw new Error('disabled binding exposed');
+        if ((await ws.help('agent')).includes('ws.agent.resolveBlocker(')) throw new Error('disabled help exposed');
+        return {__mcpContentItems:[{type:'text',text:JSON.stringify({receipt:'BLOCKER_RECOVERY_RECEIPT_OK'})}]};
+    ";
+    let behavior = json!({"rules":[
+        {"ifPromptContains":"OBSERVE_DISABLED_RECOVERY","toolCall":{"name":"workspace_api","arguments":{"code":observe,"summary":"observe disabled recovery"}},"responseFromToolResultField":"receipt"},
+        {"ifPromptContains":"SCHEDULE_DISABLED_RECOVERY","toolCall":{"name":"workspace_api","arguments":{"code":setup,"summary":"schedule feature-gate observation"}},"responseFromToolResultField":"receipt"}
+    ]}).to_string();
+    let (daemon, ws_id, port, cfg) = boot(&script, &behavior).await;
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        "events.subscribe",
+        json!({"workspaceId":ws_id,"eventTypes":["agent:idle","agent:updated"]}),
+    )
+    .await;
+    let agent = create_agent(&mut rpc, &ws_id, "disabled-recovery").await;
+    let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let features = intent_core::settings_file::AgentFeaturesSettings {
+        attention_requests: false,
+        ..Default::default()
+    };
+    sqlx::query("UPDATE agent_session SET harness_features=? WHERE id=?")
+        .bind(serde_json::to_string(&features).unwrap())
+        .bind(&agent)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    wss_rpc(
+        &mut rpc,
+        "agent.sendMessage",
+        json!({"workspaceId":ws_id,"agentId":agent,"content":"SCHEDULE_DISABLED_RECOVERY"}),
+    )
+    .await;
+    recovery_wait_idle(&mut sub, &agent, &mut events).await;
+    store
+        .set_attention_request(
+            &intent_core::WorkspaceId(ws_id.clone()),
+            &intent_core::AgentId::from(agent.as_str()),
+            "blocker",
+            "gated pending blocker",
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    recovery_wait_idle(&mut sub, &agent, &mut events).await;
+    let after = wss_rpc(
+        &mut rpc,
+        "agent.getSession",
+        json!({"workspaceId":ws_id,"agentId":agent}),
+    )
+    .await;
+    assert_eq!(
+        after["session"]["attentionRequestKind"], "blocker",
+        "disabled feature never dismisses attention"
+    );
+    let conversation = wss_rpc(
+        &mut rpc,
+        "agent.getConversation",
+        json!({"workspaceId":ws_id,"agentId":agent}),
+    )
+    .await;
+    assert!(
+        conversation
+            .to_string()
+            .contains("BLOCKER_RECOVERY_RECEIPT_OK"),
+        "{conversation}"
+    );
+    let prompts =
+        std::fs::read_to_string(daemon.data_dir.path().join("mock-prompts.jsonl")).unwrap();
+    let prompts: Vec<Value> = prompts
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let reminder = "After confirming recovery, call ws.agent.resolveBlocker(reason)";
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| !prompt["text"].as_str().unwrap().contains(reminder)),
+        "disabled feature must hide live reminder: {prompts:?}"
+    );
+    if let Ok(dir) = std::env::var("BLOCKER_RECOVERY_RECEIPT_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(Path::new(&dir).join("attention-requests-disabled.json"),serde_json::to_vec_pretty(&json!({"result":"pass","session":after,"prompts":prompts,"events":events,"conversation":conversation})).unwrap()).unwrap();
+        std::fs::copy(
+            daemon.data_dir.path().join("daemon.log"),
+            Path::new(&dir).join("attention-requests-disabled.log"),
+        )
+        .unwrap();
+    }
 }

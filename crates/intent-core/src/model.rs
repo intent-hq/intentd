@@ -3656,7 +3656,13 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.0";
+pub const CURRENT_HARNESS_VERSION: &str = "3.1";
+
+/// Explicit admission preserves repository guidance without admitting unknown versions.
+#[must_use]
+pub fn harness_supports_repository_guidance(version: &str) -> bool {
+    matches!(version, "3.0" | "3.1")
+}
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
 /// exported before harness versioning existed deserialize as "1.0", matching

@@ -44,6 +44,17 @@ fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str)
 fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".into(), json!(p.id));
+    if let Some(token) = p.access_token() {
+        row.insert(
+            "accessToken".into(),
+            json!({
+                "kind": token.kind.wire_name(),
+                "settingPath": token.setting_path,
+                "label": token.label,
+                "guidance": token.guidance,
+            }),
+        );
+    }
     row.insert(
         "supportsFastMode".into(),
         json!(p.fast_mode_config_id().is_some()),
@@ -82,6 +93,48 @@ mod tests {
 
     fn catalog(env_has: &dyn Fn(&str) -> bool) -> Value {
         build_providers_catalog_with_env(env_has)
+    }
+
+    #[test]
+    fn provider_access_token_capabilities_match_sensitive_settings() {
+        let v = catalog(&|_| false);
+        for provider in intent_providers::ACP_PROVIDERS {
+            let advertised = &row(&v, provider.id)["accessToken"];
+            match provider.id {
+                "claude-code" | "codex" => {
+                    let token = provider.access_token().unwrap();
+                    assert_eq!(
+                        advertised["kind"],
+                        if provider.id == "codex" {
+                            "codexAccessToken"
+                        } else {
+                            "claudeSetupToken"
+                        }
+                    );
+                    assert_eq!(
+                        advertised["settingPath"],
+                        format!("providers.{}.accessToken", provider.id)
+                    );
+                    assert!(!advertised["label"].as_str().unwrap().is_empty());
+                    assert_eq!(advertised["guidance"], token.guidance);
+                    let definition = crate::settings::definitions()
+                        .into_iter()
+                        .find(|d| d.path == token.setting_path)
+                        .unwrap();
+                    assert!(definition.sensitive);
+                    assert!(!definition.read_only);
+                }
+                _ => assert!(row(&v, provider.id).get("accessToken").is_none()),
+            }
+        }
+        let codex = row(&v, "codex")["accessToken"]["guidance"]
+            .as_str()
+            .unwrap();
+        assert!(codex.contains("Business") && codex.contains("Enterprise"));
+        assert!(row(&v, "claude-code")["accessToken"]["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("claude setup-token"));
     }
 
     #[test]

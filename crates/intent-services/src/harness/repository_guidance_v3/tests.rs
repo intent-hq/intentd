@@ -90,8 +90,9 @@ fn select(root: &mut RepositoryRootContext, saved: &SavedReviewSelection) {
 }
 
 #[test]
-fn only_the_exact_known_stamp_is_eligible() {
+fn only_exact_known_stamps_are_eligible() {
     assert!(eligible_harness_version(Some("3.0")));
+    assert!(eligible_harness_version(Some("3.1")));
     for version in [
         None,
         Some(""),
@@ -113,7 +114,7 @@ fn only_the_exact_known_stamp_is_eligible() {
         Some("3.0\n"),
         Some(" 3.0"),
         Some("3.0\0"),
-        Some("3.1"),
+        Some("3.2"),
         Some("99.0"),
         Some("unknown"),
     ] {

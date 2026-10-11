@@ -70,15 +70,15 @@ runtime, source-control, git, PTY, and search engines into the service layer.
 ## Install
 
 Installing intentd installs the **sitter** — a small self-updating supervisor shim,
-packaged and named `intentd` (built from `crates/intentd-sitter`). On the first `serve`
-it downloads the real daemon from the per-channel release manifests (**stable** by
+packaged and named `intentd` (built from `crates/intentd-sitter`). On the first
+`serve` (including one launched by `start`) it downloads the real daemon from the per-channel release manifests (**stable** by
 default) — served from the public
 [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) mirror
 first, with a coded fallback to this repo (see
 [Channel manifests](#channel-manifests)) — checks for updates at startup and then every
-12–24 hours, forwards **all** CLI args to the daemon verbatim, and respawns the daemon
-if it crashes. Update checks happen only for `intentd serve`; one-shot subcommands
-(`doctor`, `status`, `stop`, `call`, …) run the already-installed daemon immediately
+12–24 hours, forwards daemon CLI args verbatim, and respawns the daemon
+if it crashes. Background `start` launches this same supervised `serve`; one-shot
+subcommands (`doctor`, `status`, `stop`, `call`, …) run the already-installed daemon immediately
 without checking for or installing updates. You never install the daemon binary
 directly.
 
@@ -146,7 +146,7 @@ intentd pair   # pairing info for remote clients (URL/token/fingerprint) — ski
 
 To connect the desktop or iOS app from another machine, run `intentd pair` once the
 daemon is running (the service starts it; if you declined service setup, start it
-with `intentd serve` first) — see
+with `intentd start` first) — see
 [Pairing a remote client](#pairing-a-remote-client-wss).
 
 ### One-line script (Windows)
@@ -172,7 +172,7 @@ intentd pair   # pairing info for remote clients (URL/token/fingerprint) — ski
 
 To connect the desktop or iOS app from another machine, run `intentd pair` once the
 daemon is running (the scheduled task starts it; if you declined task setup, start it
-with `intentd serve` first) — see
+with `intentd start` first) — see
 [Pairing a remote client](#pairing-a-remote-client-wss).
 
 ### Homebrew (macOS / Linux)
@@ -228,10 +228,63 @@ Once the daemon runs, `intentd pair` prints the pairing info remote clients need
 (URL/token/fingerprint) — skip it if only the local desktop app uses this daemon;
 see [Pairing a remote client](#pairing-a-remote-client-wss).
 
+### Start, status, stop, and restart
+
+The installed `intentd` launcher supports these commands on **Windows, macOS, and
+Linux**. `intentd --help` lists them and `intentd start --help` explains startup;
+both work before the daemon is installed and do not start or download anything.
+
+```sh
+intentd start                  # detach and wait for readiness
+intentd status                 # print live daemon status
+intentd restart                # replace the supervised daemon, or start if stopped
+intentd stop                   # wait for shutdown; already stopped succeeds
+intentd start --resume-all      # start again and resume interrupted agents
+```
+
+`start` returns successfully after the daemon answers `system.status`, with a
+60-second default readiness budget. The supervisor and daemon keep running after
+the invoking terminal closes. Repeating `start` against a healthy daemon succeeds
+without restarting it; new launch options apply only when starting a stopped daemon.
+Concurrent starts share startup ownership. A failed launch exits nonzero and prints
+where to inspect logs: **`<data-dir>/sitter/start.log`**, which appends supervisor and
+daemon stdout/stderr. A first launch may need to download the daemon; if it fails,
+inspect that log before retrying.
+
+`start` accepts the same options as `serve`: `--mode <local|remote>`, `--insecure`
+(development only, disables TLS and bearer authentication on the TCP listener),
+`--resume-all`, and `--specialists-dir <PATH>`. It inherits the same configuration
+and environment, including `INTENTD_DATA_DIR`, `INTENTD_CONFIG`, and
+`INTENTD_CHANNEL`; `--sitter-channel` remains a per-launch channel override.
+Use the same data directory/environment for all lifecycle commands. There is no
+`--data-dir` startup flag; set `INTENTD_DATA_DIR` instead. Run `intentd help serve`
+for the installed daemon's detailed options.
+
+`restart` takes no launch options. For a running supervised daemon it keeps the
+supervisor and its original launch options, gracefully stops the child, and respawns
+on the installed version/current channel pin. This works for manually launched
+supervisors and service-launched supervisors, including Windows Scheduled Tasks.
+On macOS/Linux it returns after sending SIGHUP; use `status` to check readiness.
+On Windows it waits for replacement readiness and returns nonzero on timeout.
+When stopped, `restart` uses the same detached, readiness-checked path as `start`,
+with the current invocation's environment/configuration and the same startup log.
+It does not replace a healthy unsupervised daemon. To change launch options, stop
+first, then use `start` with the desired options.
+
+**Background startup does not install or enable a service or Scheduled Task**, nor
+change boot/login persistence. Use the installer or service manager for that.
+`stop` confirms shutdown but does not disable an existing login service/task.
+`intentd serve` stays in the foreground under the installed launcher. A direct
+bare daemon build (`cargo run -p intentd -- serve`) also stays in the foreground,
+but has no sitter supervision; `start` and `restart` belong to the installed
+launcher, not that binary. Other commands pass through to the daemon; after
+installation, `intentd help` lists its full command set.
+
 ### Auto-resume on start
 
 Whether the daemon resumes interrupted agents when it starts (as a service or via
-`intentd serve`) is governed by the `agents.resumeInterruptedOnStart` setting:
+`intentd serve` / `intentd start`) is governed by the
+`agents.resumeInterruptedOnStart` setting:
 
 - **`auto`** (default) — resume only on headless hosts (no display detected).
   Servers keep resuming on start; desktop hosts (macOS/Windows/Linux with a
@@ -252,8 +305,8 @@ Change it with the settings CLI (applies at the next daemon start):
 intentd settings agents.resumeInterruptedOnStart on|off|auto
 ```
 
-`intentd serve --resume-all` force-enables the sweep for that single run,
-regardless of the setting.
+`intentd serve --resume-all` (or `intentd start --resume-all`) force-enables the
+sweep for that single run, regardless of the setting.
 
 **Update-triggered restarts always resume**, regardless of the setting: when the
 sitter installs an update and respawns the daemon (periodic mid-run check,
@@ -285,19 +338,17 @@ intentd sitter channel beta --redownload && intentd restart   # switch and activ
   this is the explicit downgrade path for beta → stable. It never touches the running
   daemon; the new binary becomes active only after a restart. If the install fails,
   the command exits non-zero but the channel pin is still written.
-- **`intentd restart`** restarts the supervised daemon in place — the sitter and the
-  service manager stay put. It signals (SIGHUP) the serve-mode sitter found via
-  `<data-dir>/sitter/sitter.pid`; the sitter gracefully stops the daemon and respawns
-  it on the currently installed version and channel pin. Unix only — on Windows,
-  restart the service instead. With no running supervised `serve`, it exits non-zero
-  with guidance to start the service first.
+- **`intentd restart`** replaces a running supervised daemon or starts a stopped
+  daemon in the background on all three platforms. See
+  [Start, status, stop, and restart](#start-status-stop-and-restart) for readiness
+  and launch-option behavior.
 - **`intentd update`** forces an update check on the effective channel right now,
   instead of waiting for the periodic serve-mode check. When a newer version is
   available it downloads and installs it (newer-only — never a downgrade), then
   restarts a running supervised daemon via the same SIGHUP path as `intentd restart`
   so the new version takes effect immediately (with no running service, the new
   binary simply takes effect on the next start; on Windows the install still
-  happens — restart the service to activate it). `intentd update --check` is the
+  happens — run `intentd restart` to activate it). `intentd update --check` is the
   dry-run form: it reports the installed and latest versions without downloading or
   installing anything. Exit 0 means the check succeeded, whether or not an update
   is available — parse stdout to tell the two apart.
@@ -313,9 +364,9 @@ Effective-channel precedence: `--sitter-channel` flag > `INTENTD_CHANNEL` env >
 `sitter/config.toml` > stable default. A flag/env selection stays pinned for that
 process's lifetime (its periodic checks do not re-read the config file).
 
-`--sitter-*` flags and the intercepted `sitter` / `restart` / `update` commands belong
-to the sitter and are never forwarded; everything else (e.g. `serve`, `--resume-all`,
-`--version`) goes to the daemon verbatim. A leading `--` forwards even those
+`--sitter-*` flags, launcher help, and the intercepted `sitter` / `start` /
+`restart` / `update` commands belong to the sitter and are never forwarded; other
+arguments (e.g. `serve`, `--resume-all`, `--version`) go to the daemon verbatim. A leading `--` forwards even those
 literally (`intentd -- restart` sends `restart` to the daemon).
 
 ### How updates work
@@ -346,12 +397,12 @@ literally (`intentd -- restart` sends `restart` to the daemon).
   installing (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
-  installed yet, they fail fast with guidance to start it first (`intentd serve` or
-  `brew services start intentd`) so it gets installed.
+  installed yet, they fail fast with guidance to start it first (`intentd start`,
+  `intentd serve`, or `brew services start intentd`) so it gets installed.
 - Sitter state lives under `<data-dir>/sitter/` (`versions/<version>/intentd`,
   `state.json`, `config.toml` — the channel pin, `sitter.pid` — the serve-mode
-  sitter's pid while it runs, `tmp/`). The current and previous daemon versions are
-  kept; older ones are pruned.
+  sitter's pid while it runs, `start.log` — background startup/output log, `tmp/`).
+  The current and previous daemon versions are kept; older ones are pruned.
 - If a `serve` update check fails (e.g. offline), the sitter falls back to the last
   installed daemon; only a first `serve` with nothing installed and no network exits
   with an error.

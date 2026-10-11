@@ -754,7 +754,11 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
         .await
         .expect("register");
-    assert_eq!(requirements.expect("baseline fetched").state, "open");
+    let requirements = serde_json::to_value(requirements.expect("baseline fetched")).unwrap();
+    assert_eq!(requirements["state"], "open");
+    // Registration retains named lists; only the compact list row uses counts.
+    assert_eq!(requirements["checks"]["pendingRequired"], json!(["build"]));
+    assert_eq!(requirements["checks"]["failingRequired"], json!([]));
 
     let evt = next_event(&mut sub, "prMonitor:registered").await;
     assert_eq!(evt["workspaceId"], fx.ws_id.as_str());
@@ -784,10 +788,9 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     assert_eq!(row["hasPendingChanges"], false);
     assert_eq!(row["lastSnapshot"]["state"], "open");
     assert_eq!(row["lastSnapshot"]["checks"]["pending"], 1);
-    assert_eq!(
-        row["lastSnapshot"]["checks"]["pendingRequired"],
-        json!(["build"])
-    );
+    assert_eq!(row["lastSnapshot"]["checks"]["pendingRequired"], json!(1));
+    assert_eq!(row["lastSnapshot"]["checks"]["failingRequired"], json!(0));
+    assert_eq!(row["lastSnapshot"]["checks"]["requiredKnown"], true);
     assert_eq!(row["lastSnapshot"]["approvals"]["needed"], 1);
     assert_eq!(row["lastSnapshot"]["threads"]["resolutionRequired"], true);
     // Readable thread resolution state: the known count is a number, and 0 is
@@ -3357,11 +3360,16 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
         }
     });
     let fx = boot_with_source_control(Some(mock.sc.clone())).await;
-    let (monitor, _) = fx
+    let (monitor, requirements) = fx
         .services
         .pr_monitor_register(&fx.ws_id, &fx.agent_id, "QwenLM", "qwen-code", 11506)
         .await
         .unwrap();
+    let requirements = serde_json::to_value(requirements.expect("baseline fetched")).unwrap();
+    assert_eq!(
+        requirements["checks"]["failingRequired"],
+        json!(["route", "legacy-only"])
+    );
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;
     let mut sub = connect(fx.port, fx.cfg.clone()).await;
     wss_rpc(
@@ -3394,8 +3402,18 @@ async fn qwen_legacy_fallback_and_post_push_recovery_over_wss() {
         let row = &listed["result"]["monitors"][0];
         assert_eq!(row["pendingChanges"], json!([]));
         assert_eq!(row["lastSnapshot"]["checks"]["total"], 36);
+        assert_eq!(row["lastSnapshot"]["checks"]["failingRequired"], json!(2));
+        // The compact count must not discard the retained full check names,
+        // including across the alternating REST and folded reads.
+        let stored = fx
+            .services
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let full: Value = serde_json::from_str(stored.last_snapshot.as_deref().unwrap()).unwrap();
         assert_eq!(
-            row["lastSnapshot"]["checks"]["failingRequired"],
+            full["requirements"]["checks"]["failingRequired"],
             json!(["route", "legacy-only"])
         );
         assert_eq!(row["lastSnapshot"]["checks"]["requiredKnown"], true);

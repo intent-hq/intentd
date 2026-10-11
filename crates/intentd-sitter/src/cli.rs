@@ -1,8 +1,8 @@
 //! Sitter CLI parsing.
 //!
-//! The sitter forwards ALL args verbatim to the daemon, so it owns only the
-//! `--sitter-*` flag namespace, stripped before forwarding, plus the
-//! intercepted `sitter` subcommand namespace ([`SitterCommand`]). Everything
+//! The sitter forwards daemon args verbatim and owns the
+//! `--sitter-*` flag namespace, stripped before forwarding, launcher help, and
+//! intercepted lifecycle/update commands ([`SitterCommand`]). Everything
 //! else — including `--version`, `serve`, `--resume-all` — is collected in
 //! order as passthrough args. A manual scan is used instead of clap so
 //! unknown daemon flags are never rejected here.
@@ -17,6 +17,72 @@ use crate::config::{ChannelOrigin, ResolvedChannel};
 /// Environment variable selecting the release channel
 /// (`stable` | `beta` | `alpha`).
 pub const CHANNEL_ENV: &str = "INTENTD_CHANNEL";
+
+const HELP: &str = "intentd — installed daemon launcher (Windows, macOS, Linux)
+
+Usage: intentd [--sitter-channel <stable|beta|alpha>] <COMMAND>
+
+Lifecycle commands:
+  start [OPTIONS]  Start in the background and wait for readiness
+  serve [OPTIONS]  Supervise the daemon in the foreground
+  status           Print live daemon status
+  stop             Stop the daemon and confirm exit; already stopped succeeds
+  restart          Restart a supervised daemon, or start if stopped
+
+Launcher commands:
+  sitter channel [stable|beta|alpha] [--redownload]  Show or set the channel pin
+  update [--check]  Check for updates now (--check does not install)
+
+Launcher options:
+  --sitter-channel <CHANNEL>  Override INTENTD_CHANNEL and the saved channel pin
+  --sitter-version            Print the launcher version
+  -h, --help                  Print this help without installing or starting anything
+
+Use intentd start --help or intentd restart --help for lifecycle details.
+Other daemon commands include call, doctor, settings, token, and pair.
+After installation, intentd help lists all daemon commands, and
+intentd help <COMMAND> describes their options. --version is the daemon version.
+A leading -- forwards all following arguments verbatim, bypassing launcher handling.
+Background start does not install or enable a service or Scheduled Task.
+Direct daemon builds support serve, but start/restart belong to this launcher.";
+
+const START_HELP: &str = "Start a supervised daemon in the background on Windows, macOS, and Linux.
+
+Usage: intentd start [OPTIONS]
+
+Returns after system.status responds (default readiness budget: 60 seconds).
+An already-running healthy daemon is a successful no-op; new launch options apply
+only when starting a stopped daemon. Failures exit nonzero and print the log path.
+Logs append to <data-dir>/sitter/start.log. No service or Scheduled Task is installed
+or enabled; use the installer/service manager for boot or login startup.
+
+Options (forwarded to the installed daemon's serve command):
+  --mode <MODE>             Force connection locality: local or remote
+  --insecure                Dev only: plain WebSocket without TLS or bearer auth
+  --resume-all              Resume interrupted agents on startup
+  --specialists-dir <PATH>  Replace the base specialist bundle with this directory
+  -h, --help                Print this help without installing or starting anything
+
+Uses the same environment/configuration as serve, including INTENTD_DATA_DIR,
+INTENTD_CONFIG and INTENTD_CHANNEL; --sitter-channel overrides the channel.
+Use the same data directory/environment for intentd status, stop, and restart.
+Run intentd help serve for the installed daemon's detailed serve options.";
+
+const RESTART_HELP: &str = "Restart intentd on Windows, macOS, and Linux.
+
+Usage: intentd restart
+
+For a running supervised daemon, keep its supervisor and launch options and replace
+the daemon. Works with manually launched supervisors and those launched by a service
+or Windows Scheduled Task. On Unix, returns after signaling; use intentd status to
+check readiness. On Windows, waits for replacement readiness and fails on timeout.
+If stopped, starts in the background using current environment/configuration and
+waits for readiness, like intentd start (logs: <data-dir>/sitter/start.log).
+Does not replace a healthy daemon running without a supervisor.
+No service or Scheduled Task is installed or enabled. Takes no launch options;
+use intentd stop followed by intentd start [OPTIONS] to change launch options.
+
+  -h, --help  Print this help without installing, starting, or restarting anything";
 
 /// Release channel the sitter tracks. Serialized lowercase to match the
 /// `stable.json` / `beta.json` / `alpha.json` channel-manifest naming.
@@ -84,7 +150,7 @@ pub enum CliError {
 }
 
 /// Intercepted sitter-owned subcommand, recognized when `sitter` (or bare
-/// `restart` / `update`) is the first passthrough token — like the
+/// `start` / `restart` / `update`) is the first passthrough token — like the
 /// `--sitter-*` flag namespace it is never forwarded to the daemon. A bare
 /// `--` before it still forwards everything verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,9 +165,11 @@ pub enum SitterCommand {
         /// force-install its version, bypassing the newer-only comparison.
         redownload: bool,
     },
-    /// `intentd restart` — restart the supervised daemon in place by
-    /// signaling the serve-mode sitter found via its pidfile (SIGHUP).
+    /// `intentd restart` — replace a supervised daemon in place using platform
+    /// control, or launch in the background if stopped.
     Restart,
+    /// Launch a detached supervised daemon, forwarding the remaining serve options.
+    Start,
     /// `intentd update [--check]` — force an update check on the effective
     /// channel now, instead of waiting for the periodic serve-mode check.
     Update {
@@ -158,6 +226,33 @@ pub struct SitterArgs {
 }
 
 impl SitterArgs {
+    /// Launcher-owned help, before any state access or lifecycle effects.
+    /// A bare `--` remains a forwarding boundary, including for help tokens.
+    #[must_use]
+    pub fn help(&self) -> Option<&'static str> {
+        let first = self.passthrough.first()?.to_str()?;
+        match first {
+            "--help" | "-h" if self.passthrough.len() == 1 => Some(HELP),
+            "start"
+                if self
+                    .passthrough
+                    .iter()
+                    .skip(1)
+                    .take_while(|arg| *arg != "--")
+                    .any(|arg| arg == "--help" || arg == "-h") =>
+            {
+                Some(START_HELP)
+            }
+            "restart"
+                if self.passthrough.len() == 2
+                    && matches!(self.passthrough[1].to_str(), Some("--help" | "-h")) =>
+            {
+                Some(RESTART_HELP)
+            }
+            _ => None,
+        }
+    }
+
     /// Parse from process args (without argv[0]) and the raw `INTENTD_CHANNEL`
     /// env value. Both are parameters so tests never mutate process state.
     ///
@@ -235,13 +330,14 @@ impl SitterArgs {
     }
 
     /// The intercepted sitter-owned subcommand, when the first passthrough
-    /// token is `sitter`, `restart`, or `update`. After a bare `--` the
+    /// token is `sitter`, `start`, `restart`, or `update`. After a bare `--` the
     /// first passthrough token is the `--` itself, so `intentd -- sitter …`,
     /// `intentd -- restart`, and `intentd -- update` still forward verbatim.
     #[must_use]
     pub fn sitter_command(&self) -> Option<Result<SitterCommand, CliError>> {
         let first = self.passthrough.first()?;
         match first.to_str() {
+            Some("start") => Some(Ok(SitterCommand::Start)),
             Some("sitter") => Some(SitterCommand::parse(&self.passthrough[1..])),
             Some("restart") => Some(match self.passthrough.get(1) {
                 Some(arg) => Err(CliError::UnexpectedRestartArg(
@@ -274,6 +370,30 @@ mod tests {
 
     fn parse(args: &[&str], env: Option<&str>) -> Result<SitterArgs, CliError> {
         SitterArgs::parse_from(args.iter().map(OsString::from), env.map(OsString::from))
+    }
+
+    #[test]
+    fn help_preserves_daemon_and_double_dash_passthrough() {
+        for args in [
+            vec!["--", "--help"],
+            vec!["--", "start", "--help"],
+            vec!["--", "restart", "-h"],
+            vec!["start", "--", "--help"],
+            vec!["serve", "--help"],
+            vec!["stop", "--help"],
+            vec!["help"],
+        ] {
+            let parsed = parse(&args, None).unwrap();
+            assert_eq!(parsed.help(), None, "{args:?}");
+            assert_eq!(
+                parsed.passthrough,
+                args.iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
+        assert!(parse(&["--sitter-channel=beta", "start", "--help"], None)
+            .unwrap()
+            .help()
+            .is_some());
     }
 
     #[expect(clippy::unnecessary_wraps)] // helper mirrors the Option field it is compared against
@@ -545,6 +665,29 @@ mod tests {
                 "restart".to_string()
             )))
         );
+    }
+
+    #[test]
+    fn start_preserves_serve_options_and_channel_selection() {
+        let args = parse(
+            &[
+                "start",
+                "--resume-all",
+                "--sitter-channel=beta",
+                "--specialists-dir",
+                "with spaces",
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(args.sitter_command(), Some(Ok(SitterCommand::Start)));
+        assert_eq!(args.channel, resolved(Channel::Beta, ChannelOrigin::Flag));
+        assert_eq!(
+            args.passthrough,
+            ["start", "--resume-all", "--specialists-dir", "with spaces"].map(OsString::from)
+        );
+        assert_eq!(sitter_cmd(&["--", "start"]), None);
+        assert_eq!(sitter_cmd(&["serve", "start"]), None);
     }
 
     #[test]

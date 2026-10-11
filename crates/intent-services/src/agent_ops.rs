@@ -118,6 +118,26 @@ impl AgentRetirementGates {
     }
 }
 
+/// Order attention persistence, deferred surfacing and matching clear events
+/// per agent. Weak entries retire when the last mutation finishes.
+#[derive(Clone, Default)]
+pub(crate) struct AttentionMutationGates {
+    gates: Arc<Mutex<HashMap<AgentId, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl AttentionMutationGates {
+    pub(crate) fn for_agent(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.gates.lock().expect("attention gate map poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(agent_id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(agent_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+}
+
 /// Per-agent ordering gate for pending-question marker writes and their
 /// matching `agent:updated` events. Different agents never contend.
 #[derive(Clone, Default)]
@@ -4271,6 +4291,38 @@ impl Services {
         Ok(result)
     }
 
+    /// Progressive history has its own bounded reader: page RPC byte trimming
+    /// must not repeatedly enrich/discard rows or reduce the requested target.
+    pub(crate) async fn agent_history_batch_op(
+        &self,
+        agent_id: AgentId,
+        before_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Value> {
+        let session = self.store.get_agent_session_summary(&agent_id).await?;
+        let (messages, total) = self
+            .store
+            .get_agent_history_batch(&agent_id, before_seq, limit)
+            .await?;
+        let mut page: Vec<_> = messages.into_iter().map(project_served_message).collect();
+        crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
+            .attach_typed(&mut page)
+            .await;
+        let ids: Vec<_> = page.iter().map(|m| m.id.clone()).collect();
+        let thumbnails = self
+            .store
+            .get_agent_message_thumbnails(&agent_id, &ids)
+            .await?;
+        let page: Vec<_> = page
+            .into_iter()
+            .map(|m| {
+                let thumbs = thumbnails.get(&m.id);
+                apply_slim_projection(m, thumbs)
+            })
+            .collect();
+        Ok(json!({"agentId":agent_id,"messages":page,"totalMessages":total}))
+    }
+
     /// `agent.getMessageBlock` (PROTOCOL §5.5): one FULL content block of one
     /// persisted message, by block id — the on-demand counterpart of the slim
     /// conversation projection. The row is served through the same
@@ -7817,28 +7869,28 @@ impl Services {
     /// within-root containment guard as `file.getAttachment`) and
     /// base64-encoded so the ACP receives the image exactly as an inline
     /// block. MIME resolves block `mimeType` > registry `mime_type` >
-    /// extension inference. Fail-soft by design — ingress already rejected
-    /// bad references, so a row/file that vanished since is skipped with a
-    /// warning rather than breaking the turn (same convention as note-image
-    /// resolution); the same skip re-enforces the [`IMAGE_REF_MAX_BYTES`]
-    /// aggregate cap over the bytes actually read, in case files grew after
-    /// ingress validated the recorded sizes. Inline entries pass through
-    /// untouched; inputs without references return unchanged.
+    /// extension inference. A row/file that vanished or became unsafe since
+    /// ingress fails the whole turn rather than silently omitting an image.
+    /// Bounded reads re-enforce the [`IMAGE_REF_MAX_BYTES`] aggregate cap
+    /// over actual bytes, in case files grew after ingress validated the
+    /// recorded sizes. Inline entries and original files remain untouched;
+    /// provider-specific image preparation happens at the ACP boundary.
     pub(crate) async fn resolve_image_block_refs(
         &self,
         image_blocks: Option<Value>,
-    ) -> Option<Value> {
+    ) -> Result<Option<Value>> {
         use base64::Engine as _;
+        use tokio::io::AsyncReadExt as _;
         if image_block_ref_ids(image_blocks.as_ref()).is_empty() {
-            return image_blocks;
+            return Ok(image_blocks);
         }
         let arr = match image_blocks {
             Some(Value::Array(arr)) => arr,
-            other => return other,
+            other => return Ok(other),
         };
         let mut out = Vec::with_capacity(arr.len());
         let mut total: u64 = 0;
-        for img in arr {
+        for (i, img) in arr.into_iter().enumerate() {
             let Some(obj) = img.as_object() else {
                 out.push(img);
                 continue;
@@ -7851,34 +7903,52 @@ impl Services {
                 out.push(img);
                 continue;
             };
-            let Ok(record) = self.store.get_attachment(id).await else {
-                tracing::warn!(attachment = %id, "image reference: attachment row vanished; skipping");
-                continue;
+            let invalid = |reason: String| {
+                Error::InvalidParams(format!(
+                    "imageBlocks[{i}] attachment {id}: {reason}. Reattach the image and retry."
+                ))
             };
+            let record = self
+                .store
+                .get_attachment(id)
+                .await
+                .map_err(|e| invalid(format!("cannot load attachment record: {e}")))?;
             let root = crate::file_ops::resolve_root(&self.store, &record.workspace_id, None).await;
-            if root.is_empty() {
-                tracing::warn!(attachment = %id, "image reference: attachment workspace has no resolved root; skipping");
-                continue;
+            if root.is_empty() || !std::path::Path::new(&root).is_absolute() {
+                return Err(invalid(
+                    "attachment workspace has no safe resolved root".into(),
+                ));
             }
-            let Ok(path) = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
-            else {
-                tracing::warn!(attachment = %id, "image reference: stored path escapes the workspace; skipping");
-                continue;
-            };
-            let bytes = match tokio::fs::read(&path).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(attachment = %id, error = %e, "image reference: read failed; skipping");
-                    continue;
-                }
-            };
+            let path = crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
+                .map_err(|e| invalid(format!("stored path is unsafe: {e}")))?;
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| invalid(format!("cannot access attachment file: {e}")))?;
+            if !metadata.is_file() {
+                return Err(invalid("attachment must be a regular file".into()));
+            }
+            if metadata.len() > IMAGE_REF_MAX_BYTES {
+                return Err(invalid(format!(
+                    "attachment exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references"
+                )));
+            }
+            let file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| invalid(format!("cannot open attachment file: {e}")))?;
+            let mut bytes = Vec::new();
+            file.take(IMAGE_REF_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| invalid(format!("cannot read attachment file: {e}")))?;
             if bytes.len() as u64 > IMAGE_REF_MAX_BYTES {
-                tracing::warn!(attachment = %id, size = bytes.len(), "image reference: over the byte cap; skipping");
-                continue;
+                return Err(invalid(format!(
+                    "attachment exceeds the {IMAGE_REF_MAX_BYTES} byte cap for image references"
+                )));
             }
             if total.saturating_add(bytes.len() as u64) > IMAGE_REF_MAX_BYTES {
-                tracing::warn!(attachment = %id, size = bytes.len(), total, "image reference: over the aggregate byte cap; skipping");
-                continue;
+                return Err(invalid(format!(
+                    "image references exceed the {IMAGE_REF_MAX_BYTES} byte aggregate cap"
+                )));
             }
             total += bytes.len() as u64;
             let mime = obj
@@ -7890,7 +7960,7 @@ impl Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             out.push(json!({ "type": "image", "data": data, "mimeType": mime }));
         }
-        Some(Value::Array(out))
+        Ok(Some(Value::Array(out)))
     }
 
     /// `agent.sendMessage`: persist the user message; on failure auto-queue
@@ -9859,6 +9929,82 @@ impl Services {
         }
     }
 
+    /// Explicit recovery affects only the blocker observed at admission.
+    pub(crate) async fn agent_resolve_blocker_op(
+        &self,
+        workspace_id: WorkspaceId,
+        reason: String,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Value> {
+        crate::workspace_mutations::boxed(async move {
+            let caller = caller_agent_id.ok_or_else(|| {
+                Error::Internal("resolveBlocker is only available to agents".to_string())
+            })?;
+            let reason = reason.trim().to_string();
+            if reason.is_empty() {
+                return Err(Error::InvalidParams("reason is required".to_string()));
+            }
+            let session = self.load_session_internal(&caller).await?;
+            if session.workspace_id != workspace_id {
+                return Err(Error::NotFound(format!("agent session {caller}")));
+            }
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
+            let result = |resolved| json!({ "ok": true, "resolved": resolved, "reason": reason });
+            if session.attention_request_kind.as_deref() != Some("blocker") {
+                return Ok(result(false));
+            }
+            let Some(blocker_reason) = session.attention_request_reason.as_deref() else {
+                return Ok(result(false));
+            };
+            let gate = self.attention_mutation_gates.for_agent(&caller);
+            let _guard = gate.lock().await;
+            let saved_at = session.attention_request_timestamp.as_deref();
+            if !self.store.clear_blocker_request_if_matches(
+                &workspace_id, &caller, blocker_reason, saved_at, &now_iso(),
+            ).await? {
+                return Ok(result(false));
+            }
+            // Retire this blocker and older blocker raises only. Discussions
+            // and replacement generations remain independently actionable.
+            if let Ok(mut map) = self.deferred_attention.lock() {
+                if let Some(entries) = map.get_mut(&caller) {
+                    // The generation CAS succeeded while holding the raise
+                    // gate: every parked blocker precedes or is this request.
+                    // A newer raise cannot park until this guard is released.
+                    entries.retain(|entry| entry.meta_kind != "blocker-report");
+                    if entries.is_empty() { map.remove(&caller); }
+                }
+            }
+            self.publish_agent_mutation_event(
+                &workspace_id, &caller, intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": caller.0, "attentionRequestCleared": true }),
+            ).await;
+            // Read the current task, then condition its write on both that
+            // revision and the session link in one SQLite statement. A note
+            // transition or a session-only relink wins before the write.
+            let current = self.store.get_agent_session_summary(&caller).await?;
+            if current.task_note_id == session.task_note_id {
+                if let Some(note_id) = &session.task_note_id {
+                    if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                        if note.metadata.task.as_ref().is_some_and(|task| {
+                            task.status == intent_core::TaskStatus::Blocked
+                                && task.assigned_agent_ids.contains(&caller)
+                        }) {
+                            if let Err(e) = self.set_task_note_status_guarded(
+                                &workspace_id, note_id, intent_core::TaskStatus::InProgress,
+                                Some(note.rev), Some(caller.clone()), Some(caller.clone()),
+                            ).await {
+                                tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
+                            }
+                        }
+                    }
+                }
+            }
+            self.maybe_emit_display_status_changed(&workspace_id).await;
+            Ok(result(true))
+        }).await
+    }
+
     /// Shared services op behind `ws.agent.requestDiscussion` /
     /// `ws.agent.reportBlocker` (`kind`: `"discussion" | "blocker"`). Modeled
     /// on [`Self::agent_report_to_parent_op`], but available to ALL agents —
@@ -9955,6 +10101,8 @@ impl Services {
         // post-insert mutator of the attention columns — the full-row
         // `update_agent_session` excludes them so a racing persist of a stale
         // session cannot clobber this write).
+        let attention_gate = self.attention_mutation_gates.for_agent(&caller);
+        let attention_guard = attention_gate.lock().await;
         let saved_at = now_iso();
         let workspace_id = session.workspace_id.clone();
         let task_note_id = session.task_note_id.clone();
@@ -10019,6 +10167,9 @@ impl Services {
             )
             .await;
         }
+        // Keep the raise ordered through its task transition: a resolver
+        // must not resume the task before this raise writes its blocked state.
+        drop(attention_guard);
         // 5. Kind-flavored parent wake for delegated callers — delivered
         // immediately even when the child is enrolled in an undelivered
         // `after_all` delegation group (mirroring the STAB-160 immediate
@@ -10256,6 +10407,8 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) {
+        let gate = self.attention_mutation_gates.for_agent(agent_id);
+        let _guard = gate.lock().await;
         let parked = self.take_deferred_attention(agent_id);
         if parked.is_empty() {
             return;
@@ -10272,8 +10425,8 @@ impl Services {
             }
         };
         if session.attention_request_kind.is_none() {
-            // Cleared before idle (user-origin delivery mid-turn) — nothing
-            // to surface.
+            // User-origin clear or explicit recovery retired the latest
+            // request. Superseded notices must not re-arm client attention.
             return;
         }
         for entry in parked {
@@ -12990,7 +13143,8 @@ impl Services {
     /// never blocks a turn).
     pub(crate) async fn agent_state_snapshot_line(&self, agent_id: &AgentId) -> Option<String> {
         let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
-        if !self.session_agent_features(&session).state_snapshot {
+        let features = self.session_agent_features(&session);
+        if !features.state_snapshot {
             return None;
         }
         let snapshot = self.build_agent_snapshot(&session).await.ok()?;
@@ -12999,6 +13153,18 @@ impl Services {
         }
         let json = serde_json::to_string(&snapshot).ok()?;
         Some(crate::harness::latest().snapshot_line(&json))
+    }
+
+    /// Live recovery guidance is independent of snapshot injection.
+    pub(crate) async fn agent_blocker_recovery_guidance(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<&'static str> {
+        let session = self.store.get_agent_session_summary(agent_id).await.ok()?;
+        let features = self.session_agent_features(&session);
+        (features.attention_requests
+            && session.attention_request_kind.as_deref() == Some("blocker"))
+            .then_some("After confirming recovery, call ws.agent.resolveBlocker(reason) with evidence to clear your own blocker. Ordinary automatic wakes do not clear it; keep genuine blockers pending.")
     }
 
     /// `agent.diagnostics`: a sanitized snapshot of agent statuses,

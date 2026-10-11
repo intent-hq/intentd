@@ -586,7 +586,7 @@ impl Updater {
             }
             let staged = dest.join(format!(".{name}-repair-{}", std::process::id()));
             fs::copy(source.join(name), &staged)?;
-            fs::File::open(&staged)?.sync_all()?;
+            sync_file(&staged)?;
             fs::rename(&staged, &target)?;
         }
         sync_dir(&dest)?;
@@ -613,7 +613,7 @@ impl Updater {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&staged_bin, fs::Permissions::from_mode(0o755))?;
         }
-        fs::File::open(&staged_bin)?.sync_all()?;
+        sync_file(&staged_bin)?;
 
         if let Some(src_dir) = src_bin.parent() {
             stage_sibling_payload(src_dir, &staging)?;
@@ -824,7 +824,7 @@ fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
             } else {
                 let dest = staging.join(&rel_child);
                 fs::copy(entry.path(), &dest)?;
-                fs::File::open(&dest)?.sync_all()?;
+                sync_file(&dest)?;
             }
         }
     }
@@ -834,6 +834,16 @@ fn stage_sibling_payload(src_dir: &Path, staging: &Path) -> io::Result<()> {
         sync_dir(dir)?;
     }
     Ok(())
+}
+
+/// Windows `FlushFileBuffers` requires a writable handle. Keep read-only
+/// access on Unix so archive payloads with read-only permissions still sync.
+fn sync_file(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(path)?
+        .sync_all()
 }
 
 /// Fsync a directory so its entries survive a power loss. On non-Unix
@@ -852,6 +862,53 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_version_preserves_binary_and_payload_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let source = dir.path().join("extracted");
+        fs::create_dir_all(source.join("libexec")).unwrap();
+        fs::write(source.join(DAEMON_BIN_NAME), b"daemon").unwrap();
+        fs::write(source.join("libexec").join(TAILCAT_BIN_NAME), b"sidecar").unwrap();
+        fs::write(source.join("libexec/tailcat.LICENSE"), b"license").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Unix archives can ship read-only payloads; syncing must not
+            // require write permission there or alter their permissions.
+            fs::set_permissions(
+                source.join("libexec/tailcat.LICENSE"),
+                fs::Permissions::from_mode(0o444),
+            )
+            .unwrap();
+        }
+
+        let installed = paths.versions_dir.join("0.9.92");
+        let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+        updater
+            .install_version("0.9.92", &source.join(DAEMON_BIN_NAME))
+            .unwrap();
+        for (relative, expected) in [
+            (PathBuf::from(DAEMON_BIN_NAME), b"daemon".as_slice()),
+            (Path::new("libexec").join(TAILCAT_BIN_NAME), b"sidecar"),
+            (PathBuf::from("libexec/tailcat.LICENSE"), b"license"),
+        ] {
+            assert_eq!(fs::read(installed.join(relative)).unwrap(), expected);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(installed.join("libexec/tailcat.LICENSE"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+        }
+    }
 
     #[test]
     fn repair_replaces_existing_empty_payload_files() {

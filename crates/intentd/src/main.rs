@@ -136,8 +136,9 @@ enum Command {
     /// Probe daemon liveness and print live status (transports, port, clients,
     /// agents, cert fingerprint, host OS/arch + hasDisplay + locality, §5.7).
     Status,
-    /// Ask a running daemon to shut down gracefully (control RPC → SIGTERM →
-    /// SIGKILL escalation, signalled via the pidfile, §5.7).
+    /// Shut down gracefully and confirm exit; already stopped succeeds.
+    /// Escalates within a bounded wait if needed (Unix signals or Windows
+    /// process control). Uses the current data directory (§5.7).
     Stop,
     /// Diagnostics: data-dir writable, SQLite/migrations current, providers,
     /// ports free, cert validity, GitHub token, context engine, host caps (§5.7).
@@ -5119,11 +5120,6 @@ fn pid_is_alive(pid: u32) -> bool {
     )
 }
 
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
-}
-
 /// Whether the process at `pid` is the supervising sitter: true exactly when
 /// BOTH signals hold — `pid` equals the daemon's parent pid AND the process
 /// at that pid carries a sitter binary name. SIGUSR1's default disposition
@@ -5757,14 +5753,13 @@ async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
     }
 
     if let Some(pid) = read_pid(&config.pid_path) {
-        // On Windows `pid_is_alive` cannot probe (no signal-0), and the pipe
-        // probe above is the authoritative liveness check — a pidfile that
-        // survives it is stale by definition and must not block startup.
-        let holder_is_alive = if cfg!(windows) {
-            false
-        } else {
-            pid_is_alive(pid)
-        };
+        #[cfg(windows)]
+        let holder_is_alive =
+            intentd_sitter::windows::Process::open(pid, false).is_ok_and(|process| {
+                process.matches_record(&config.pid_path, pid) && !process.exited().unwrap_or(false)
+            });
+        #[cfg(unix)]
+        let holder_is_alive = pid_is_alive(pid);
         if pid != std::process::id() && holder_is_alive {
             anyhow::bail!(
                 "intentd is already running (pid {pid}, pidfile {}) — refusing to start a second instance",
@@ -5775,6 +5770,8 @@ async fn acquire_single_instance(config: &Config) -> anyhow::Result<PidFile> {
         let _ = std::fs::remove_file(&config.pid_path);
     }
 
+    #[cfg(windows)]
+    intentd_sitter::windows::publish_identity(&config.pid_path)?;
     std::fs::write(&config.pid_path, std::process::id().to_string())
         .map_err(|e| anyhow::anyhow!("write pidfile {}: {e}", config.pid_path.display()))?;
     Ok(PidFile {
@@ -5793,8 +5790,10 @@ struct DataDirLock {
     _lock: nix::fcntl::Flock<std::fs::File>,
 }
 
-#[cfg(not(unix))]
-struct DataDirLock;
+#[cfg(windows)]
+struct DataDirLock {
+    _lock: std::fs::File,
+}
 
 /// Acquire the data-dir lock (§5.6): open/create `data_dir/intentd.lock` and take
 /// a non-blocking exclusive advisory `flock`. On contention another live instance
@@ -5850,12 +5849,17 @@ fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
     }
 }
 
-/// Non-unix has no `flock`; the lock is a no-op success (the socket/pidfile
-/// guards remain the single-instance enforcement on those platforms).
-#[cfg(not(unix))]
-#[expect(clippy::unnecessary_wraps)] // signature parity with the unix flock impl
-fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
-    Ok(DataDirLock)
+/// Exclusive Windows handle protects startup even before the pipe is bound.
+#[cfg(windows)]
+fn acquire_data_dir_lock(config: &Config) -> anyhow::Result<DataDirLock> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(config.data_dir.join("intentd.lock"))?;
+    Ok(DataDirLock { _lock: lock })
 }
 
 /// Spawn the periodic idle-reap sweep (§5.6/§6.7), or `None` when nothing to
@@ -6904,6 +6908,7 @@ fn print_status(config: &Config, r: &Value) {
 /// Ask a running daemon to stop (§5.7): issue the graceful `system.shutdown`
 /// control RPC, then escalate via the pidfile (SIGTERM → SIGKILL) with timeouts.
 /// Exits non-zero only if shutdown cannot be confirmed.
+#[cfg(unix)]
 async fn cmd_stop() -> ExitCode {
     let config = match resolve_config() {
         Ok(c) => c,
@@ -6949,13 +6954,76 @@ async fn cmd_stop() -> ExitCode {
         }
         ExitCode::SUCCESS
     }
-    // On non-unix there is no process signalling to escalate through, so
-    // shutdown cannot be confirmed.
-    #[cfg(not(unix))]
-    {
-        let _ = graceful;
+}
+
+/// Confirm Windows shutdown against a retained process handle. A stale/reused
+/// numeric PID never authorizes force-kill; the daemon's creation record must match.
+#[cfg(windows)]
+async fn cmd_stop() -> ExitCode {
+    use intentd_sitter::windows::Process;
+    let config = match resolve_config() {
+        Ok(config) => config,
+        Err(error) => return to_exit(Err(error)),
+    };
+    let Some(pid) = read_pid(&config.pid_path) else {
+        if uds_is_live(&config.socket_path).await {
+            eprintln!("error: daemon responds but its process ownership record is missing");
+            return ExitCode::FAILURE;
+        }
+        println!("intentd: not running");
+        return ExitCode::SUCCESS;
+    };
+    let process = match Process::open(pid, true) {
+        Ok(process) => process,
+        Err(error) if error.raw_os_error() == Some(87) => {
+            if uds_is_live(&config.socket_path).await {
+                return ExitCode::FAILURE;
+            }
+            println!("intentd: not running (stale pidfile)");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("error: cannot confirm daemon ownership: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let owned = process.matches_record(&config.pid_path, pid);
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(5),
+        rpc_call(&config.socket_path, "system.shutdown", json!({})),
+    )
+    .await;
+    let graceful = matches!(rpc, Ok(Ok(ref response)) if response.get("result").is_some());
+    if !owned {
+        eprintln!("error: shutdown unconfirmed; refusing to terminate an unverified process (pid {pid}, graceful request: {graceful})");
+        return ExitCode::FAILURE;
+    }
+    if wait_windows_exit(&process, Duration::from_secs(5)).await {
+        println!("intentd: stopped");
+        return ExitCode::SUCCESS;
+    }
+    if process.terminate().is_ok() && wait_windows_exit(&process, Duration::from_secs(3)).await {
+        println!("intentd: stopped (forced after graceful shutdown timeout)");
+        ExitCode::SUCCESS
+    } else {
         eprintln!("error: could not confirm intentd shutdown (pid {pid})");
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(windows)]
+async fn wait_windows_exit(process: &intentd_sitter::windows::Process, budget: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match process.exited() {
+            Ok(true) => return true,
+            Err(_) => return false,
+            Ok(false) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

@@ -136,7 +136,7 @@ impl EndpointBlueprint {
         agent: &intent_core::AgentId,
     ) -> Option<Arc<LiveContext>> {
         let (services, session) = self.server.original.as_ref()?;
-        if session.harness_version != "3.0"
+        if !intent_core::harness_supports_repository_guidance(&session.harness_version)
             || session.retired_at.is_some()
             || &session.workspace_id != workspace
             || &session.id != agent

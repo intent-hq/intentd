@@ -1419,10 +1419,12 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"local scripted output"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"local scripted output"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &h.node.connection,
@@ -1473,10 +1475,12 @@ async fn prompt_transcript_uses_only_original_connection_exact_routes_and_preser
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"foreign connection"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"foreign connection"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &other.connection,
@@ -2317,7 +2321,10 @@ impl NativeHarness {
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.0");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             let id = intent_core::AgentId::from(created["agent"]["id"].as_str().unwrap());
             let row = original.store.get_agent_session(&id).await.unwrap();
             assert_eq!(
@@ -3885,10 +3892,12 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"local scripted output"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"local scripted output"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &h.node.connection,
@@ -3939,10 +3948,12 @@ async fn confirmed_read_prompt_transcript_uses_only_original_connection_exact_ro
                 &h.f.row.id,
                 &h.f.row.workspace_id,
                 &id,
-                vec![
-                    serde_json::from_value(json!({"type":"text","text":"foreign connection"}))
-                        .unwrap(),
-                ],
+                crate::provider_images::PreparedPrompt::new(vec![serde_json::from_value(
+                    json!({"type":"text","text":"foreign connection"}),
+                )
+                .unwrap()])
+                .await
+                .unwrap(),
                 None,
                 Some(crate::agent_session::LocalPromptInput {
                     connection: &other.connection,
@@ -4594,6 +4605,7 @@ mod live_context {
         let text = text.to_owned();
         daemon(h, async move {
             let prompt = serde_json::from_value(json!([{"type":"text","text":text}])).unwrap();
+            let prompt = crate::provider_images::PreparedPrompt::new(prompt).await?;
             f.manager
                 .run_turn_owned(&f.row.id, &f.row.workspace_id, &id, prompt, None, turn)
                 .await
@@ -4804,10 +4816,10 @@ mod live_context {
     }
 
     #[intent_test_macros::daemon_test]
-    async fn confirmed_context_actual_created_3_0_reaches_original_guidance_boundary() {
+    async fn confirmed_context_actual_created_3_1_reaches_original_guidance_boundary() {
         let h = NativeHarness::observed("<created>", true, false, None, None).await;
         let created = h.f.stored().await;
-        assert_eq!(created.harness_version, "3.0");
+        assert_eq!(created.harness_version, "3.1");
         assert!(created.harness_features.is_some());
         select(&h, RepositorySelectionChange::Automatic).await;
         let id = h.start().await;
@@ -4837,7 +4849,7 @@ mod live_context {
             .agent_get_session_op(created.id.clone())
             .await
             .unwrap();
-        assert_eq!(full.harness_version, "3.0");
+        assert_eq!(full.harness_version, "3.1");
         assert_eq!(full.harness_features, created.harness_features);
         h.finish().await;
     }
@@ -5298,7 +5310,7 @@ mod live_context {
                                 &f.row.id,
                                 &f.row.workspace_id,
                                 &session,
-                                blocks,
+                                crate::provider_images::PreparedPrompt::new(blocks).await?,
                                 None,
                                 original,
                             )
@@ -5745,7 +5757,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     )
                     .await
                     .unwrap();
-                assert_eq!(result["agent"]["harnessVersion"], "3.0");
+                assert_eq!(result["agent"]["harnessVersion"], "3.1");
                 original
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -5928,7 +5940,10 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                         &f.row.id,
                         &f.row.workspace_id,
                         &id,
-                        serde_json::from_value(json!([{"type":"text","text":text}])).unwrap(),
+                        crate::provider_images::PreparedPrompt::new(
+                            serde_json::from_value(json!([{"type":"text","text":text}])).unwrap(),
+                        )
+                        .await?,
                         None,
                         turn,
                     )
@@ -6052,7 +6067,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .all(|p| p.to_string().contains(FACTS) && p["params"]["sessionId"] == s.session_id));
         assert_ne!(prompts[0]["id"], prompts[1]["id"]);
         assert_eq!(h.f.writes().await, 1);
-        assert_eq!(h.f.stored().await.harness_version, "3.0");
+        assert_eq!(h.f.stored().await.harness_version, "3.1");
         {
             let origin = h.origin();
             let state = origin.state.lock().unwrap();
@@ -6451,10 +6466,13 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                         &f.row.id,
                         &f.row.workspace_id,
                         &id,
-                        serde_json::from_value(
-                            json!([{"type":"text","text":"captured before retirement"}]),
+                        crate::provider_images::PreparedPrompt::new(
+                            serde_json::from_value(
+                                json!([{"type":"text","text":"captured before retirement"}]),
+                            )
+                            .unwrap(),
                         )
-                        .unwrap(),
+                        .await?,
                         None,
                         turn,
                     )
@@ -6863,7 +6881,7 @@ mod genuine_native_startup {
                     )
                     .await
                     .unwrap();
-                assert_eq!(created["agent"]["harnessVersion"], "3.0");
+                assert_eq!(created["agent"]["harnessVersion"], "3.1");
                 services
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -6924,7 +6942,7 @@ mod genuine_native_startup {
                 stored.acp_session_id.as_deref(),
                 Some(first.session_id.as_str())
             );
-            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.0" });
+            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.1" });
             let (origin, pending, pid) = {
                 let handles = self.manager.handles.lock().unwrap();
                 let handle = &handles[&self.row.id];
