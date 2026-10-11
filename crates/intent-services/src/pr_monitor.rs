@@ -1807,8 +1807,8 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
                 "passed": r.checks.passed,
                 "failed": r.checks.failed,
                 "pending": r.checks.pending,
-                "failingRequired": r.checks.failing_required,
-                "pendingRequired": r.checks.pending_required,
+                "failingRequired": r.checks.failing_required.len(),
+                "pendingRequired": r.checks.pending_required.len(),
                 "requiredKnown": r.checks.required_known,
             },
             "approvals": {
@@ -4689,6 +4689,7 @@ impl Services {
 mod tests {
     mod ancestry_messages;
     mod ancestry_regression;
+    mod compact_required_checks;
     mod qualified_isolation;
     mod qualified_recovery;
     mod quota_regression;
