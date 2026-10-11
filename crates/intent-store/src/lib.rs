@@ -11,7 +11,6 @@ use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, Sq
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
-
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
@@ -40,10 +39,16 @@ mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
+pub mod note_annotation_repo;
+pub mod note_delete_repo;
 mod note_line_attribution_repo;
+mod note_page_html;
+mod note_page_index;
+mod note_page_repo;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
+mod note_write_connection;
 mod pr_monitor_repo;
 mod presence_focus_repo;
 mod principal_repo;
@@ -63,6 +68,7 @@ mod transfer_authorship;
 mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
+mod workspace_annotation_cleanup;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_mcp_repo;
@@ -371,6 +377,7 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
+    note_pages: std::sync::Arc<note_page_repo::Runtime>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -412,11 +419,33 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
+        let write_pool = StorePool::new(write_pool, owner.is_some());
+        let read_pool = StorePool::new(read_pool, owner.is_some());
+        // Keep the derived-index startup future off enclosing callers' stacks,
+        // and leave the read pool cold until the first actual read.
+        let note_pages = std::sync::Arc::new(
+            Box::pin(async {
+                let mut index_conn =
+                    note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
+                let indexed = async {
+                    note_page_index::retire_changed_profiles(&mut index_conn).await?;
+                    note_page_index::rebuild_pending(&mut index_conn).await?;
+                    note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
+                }
+                .await;
+                index_conn
+                    .finish(indexed, "note index backfill commit")
+                    .await?;
+                note_page_repo::Runtime::open(&write_pool).await
+            })
+            .await?,
+        );
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
-            write_pool: StorePool::new(write_pool, owner.is_some()),
-            read_pool: StorePool::new(read_pool, owner.is_some()),
+            note_pages,
+            write_pool,
+            read_pool,
             _daemon_owner: owner,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
             #[cfg(test)]
