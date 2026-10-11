@@ -26,10 +26,16 @@ impl LiveFixture {
     pub(crate) async fn new(http: &ReadServer) -> Self {
         Self::from_base(ActualRead::new(http).await).await
     }
+    pub(crate) async fn with_version(http: &ReadServer, version: &str) -> Self {
+        Self::from_base_with_version(ActualRead::new(http).await, version).await
+    }
     async fn from_base(base: ActualRead) -> Self {
+        Self::from_base_with_version(base, "3.0").await
+    }
+    async fn from_base_with_version(base: ActualRead, version: &str) -> Self {
         let session: AgentSession = serde_json::from_value(json!({
             "id":AgentId::new(),"workspaceId":base.git.workspace.id,"name":"real-context",
-            "status":"active","harnessVersion":"3.0", "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
+            "status":"active","harnessVersion":version, "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
         })).unwrap();
         base.auth
             .service

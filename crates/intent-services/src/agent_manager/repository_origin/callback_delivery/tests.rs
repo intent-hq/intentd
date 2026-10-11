@@ -4822,10 +4822,10 @@ mod live_context {
     }
 
     #[intent_test_macros::daemon_test]
-    async fn confirmed_context_actual_created_3_1_reaches_original_guidance_boundary() {
+    async fn confirmed_context_actual_created_3_2_reaches_original_guidance_boundary() {
         let h = NativeHarness::observed("<created>", true, false, None, None).await;
         let created = h.f.stored().await;
-        assert_eq!(created.harness_version, "3.1");
+        assert_eq!(created.harness_version, "3.2");
         assert!(created.harness_features.is_some());
         select(&h, RepositorySelectionChange::Automatic).await;
         let id = h.start().await;
@@ -4842,6 +4842,9 @@ mod live_context {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["params"]["sessionId"], id);
         assert!(frames[0].to_string().contains(FACTS));
+        assert!(frames[0]
+            .to_string()
+            .contains("Qualified monitoring is prepared but production-disabled"));
         assert_eq!(
             h.http.count(),
             http,
@@ -4855,7 +4858,7 @@ mod live_context {
             .agent_get_session_op(created.id.clone())
             .await
             .unwrap();
-        assert_eq!(full.harness_version, "3.1");
+        assert_eq!(full.harness_version, "3.2");
         assert_eq!(full.harness_features, created.harness_features);
         h.finish().await;
     }
@@ -8292,7 +8295,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     )
                     .await
                     .unwrap();
-                assert_eq!(result["agent"]["harnessVersion"], "3.1");
+                assert_eq!(result["agent"]["harnessVersion"], "3.2");
                 original
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -8602,7 +8605,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .all(|p| p.to_string().contains(FACTS) && p["params"]["sessionId"] == s.session_id));
         assert_ne!(prompts[0]["id"], prompts[1]["id"]);
         assert_eq!(h.f.writes().await, 1);
-        assert_eq!(h.f.stored().await.harness_version, "3.1");
+        assert_eq!(h.f.stored().await.harness_version, "3.2");
         {
             let origin = h.origin();
             let state = origin.state.lock().unwrap();
@@ -9416,7 +9419,7 @@ mod genuine_native_startup {
                     )
                     .await
                     .unwrap();
-                assert_eq!(created["agent"]["harnessVersion"], "3.1");
+                assert_eq!(created["agent"]["harnessVersion"], "3.2");
                 services
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -9477,7 +9480,7 @@ mod genuine_native_startup {
                 stored.acp_session_id.as_deref(),
                 Some(first.session_id.as_str())
             );
-            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.1" });
+            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.2" });
             let (origin, pending, pid) = {
                 let handles = self.manager.handles.lock().unwrap();
                 let handle = &handles[&self.row.id];

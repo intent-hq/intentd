@@ -4,7 +4,7 @@
 //! PR state) plus the centralized PR-monitor surface — `pr.monitor` /
 //! `pr.unmonitor` / `pr.monitors`, gated by `agentFeatures.prMonitor`. Every
 //! other PR operation (create, view, comment, review threads, branch update,
-//! merge) is intentionally unbound — agents use the `gh` CLI instead. The
+//! merge) is intentionally unbound — agents use the forge-appropriate CLI. The
 //! bindings only peel arguments and forward the trait's `serde_json::Value`
 //! result unchanged.
 //!
@@ -13,8 +13,8 @@
 //! and both resolve the same selected project or explicit address.
 //!
 //! Addressed arguments use the dedicated service seam and original-caller
-//! admission. Qualified recipient activation remains disabled until the later
-//! polling and delivery paths are verified; runtime help keeps its shipped scope.
+//! admission. Qualified recipient activation remains disabled in ordinary product wiring; help describes the support requirement without
+//! enabling it.
 //!
 //! Monitors are agent-owned, so `pr.monitor` / `pr.unmonitor` / `pr.monitors`
 //! require an agent caller context (mirroring `ws.hook.schedule`): the FE

@@ -163,3 +163,59 @@ pub(crate) fn terminal(
     }
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_wakes_keep_shared_sentences_and_actual_forge_links() {
+        let changes = vec!["state: open → merged".to_string()];
+        let mr = terminal(
+            "MR",
+            "Team/Sub/App!7",
+            &changes,
+            "Review",
+            "https://git.example:8443/gitlab/Team/Sub/App/-/merge_requests/7",
+            true,
+        );
+        assert_eq!(
+            mr,
+            include_str!("review_wake_gitlab_completed.txt").trim_end()
+        );
+        let pr = terminal(
+            "PR",
+            "team/app#7",
+            &changes,
+            "Review",
+            "https://github.com/team/app/pull/7",
+            true,
+        );
+        assert_eq!(
+            pr,
+            mr.replace("MR", "PR")
+                .replace("Team/Sub/App!7", "team/app#7")
+                .replace(
+                    "https://git.example:8443/gitlab/Team/Sub/App/-/merge_requests/7",
+                    "https://github.com/team/app/pull/7"
+                )
+        );
+        assert!(!mr.contains("github.com"));
+        let checklist = checklist(
+            &serde_json::json!({"state":"open","approvals":{},"checks":{},"threads":{}}),
+            false,
+        );
+        let wake = changed(
+            "MR",
+            "Team/Sub/App!7",
+            &changes,
+            "Review",
+            "https://git.example/actual",
+            &checklist,
+        );
+        assert!(wake.contains("Where the MR stands now:"));
+        assert!(wake.contains("checks: unknown"));
+        assert!(wake.contains("unresolved threads: unknown"));
+        assert!(!wake.contains("0 passed"));
+    }
+}
