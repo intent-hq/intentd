@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.43] - 2026-10-11
+
+### 🚀 Features
+
+- Add bounded note viewing and cancellable deletion ([#2298](https://github.com/intent-hq/intentd/pull/2298))
+
+
 ## [0.10.42] - 2026-10-10
 
 ### 🐛 Bug Fixes
