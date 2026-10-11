@@ -59,7 +59,7 @@ test('TAP runner sanitizes unexpected failing assertions and caps output on disk
 
 test('harness reaps a known child after its launcher has already exited', async t => {
   const value = 'SYNTHETIC_ORPHAN_SETUP_CREDENTIAL_1234';
-  for (const scenario of ['ready', 'child failure', 'observer failure', 'readiness timeout']) await t.test(scenario, async () => {
+  for (const scenario of ['ready', 'child failure', 'observer failure', 'readiness timeout', 'observer close failure']) await t.test(scenario, async () => {
     const root = mkdtempSync(join(tmpdir(), 'pi-orphan-fixture-'));
     const directory = join(root, 'witness');
     mkdirSync(directory);
@@ -67,11 +67,27 @@ test('harness reaps a known child after its launcher has already exited', async 
     const childEntry = join(root, 'child.cjs');
     writeFileSync(childEntry, scenario === 'child failure'
       ? `process.stderr.write('token=${value}\\n'); process.exitCode = 17;`
-      : `setTimeout(() => process.stderr.write(${JSON.stringify(scenario === 'ready' ? 'child alive\n' : 'child not ready\n')}), 200); setInterval(() => {}, 1000);`);
+      : `setTimeout(() => process.stderr.write(${JSON.stringify(['ready', 'observer close failure'].includes(scenario) ? 'child alive\n' : 'child not ready\n')}), 200); setInterval(() => {}, 1000);`);
     let observerEntry = fixture('./pi-startup-witness.cjs');
     if (scenario === 'observer failure') {
       observerEntry = join(root, 'broken-observer.cjs');
       writeFileSync(observerEntry, `require('node:fs').writeSync(2, 'observer setup failed\\ntoken=${value}\\n' + 'é'.repeat(100000)); process.exitCode = 17;`);
+    }
+    if (scenario === 'observer close failure') {
+      observerEntry = join(root, 'close-failure-observer.cjs');
+      // Fail the real witness publication after a live child exits. This leaves
+      // missing close evidence even though cleanup must still reap every PID.
+      writeFileSync(observerEntry, `const fs = require('node:fs');
+        const rename = fs.renameSync;
+        fs.renameSync = (from, to) => {
+          const record = JSON.parse(fs.readFileSync(from, 'utf8'));
+          if (record.exit || record.close) {
+            fs.writeSync(2, 'observer close publication failed\\ntoken=${value}\\n');
+            throw new Error('injected observer close publication failure');
+          }
+          return rename(from, to);
+        };
+        require(${JSON.stringify(fixture('./pi-startup-witness.cjs'))});`);
     }
     const launcherEntry = join(root, 'launcher.cjs');
     // Keep the launcher alive until the test observes a live child. Detaching is
@@ -88,6 +104,7 @@ test('harness reaps a known child after its launcher has already exited', async 
       PI_TEST_WITNESS_DIR: directory, PI_TEST_RUN_ID: 'orphan-control' }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
     let observerPid, observerExit, launcherExit, launchError;
     let records = [];
+    let primaryError;
     launcher.stderr.on('data', chunk => capture.push(chunk));
     launcher.on('error', error => { launchError = error; });
     launcher.on('exit', (code, signal) => { launcherExit = { code, signal }; });
@@ -119,7 +136,7 @@ test('harness reaps a known child after its launcher has already exited', async 
       assert.ok(!setupReport.includes(value));
       assert.ok(Buffer.byteLength(setupReport) <= diagnostics.LIMITS.report);
       t.diagnostic(setupReport);
-      assert.equal(ready, scenario === 'ready', setupReport);
+      assert.equal(ready, ['ready', 'observer close failure'].includes(scenario), setupReport);
       if (ready) {
         // Exit the launcher only AFTER readiness, then prove the orphan is still
         // live before asking the harness to clean it up.
@@ -142,6 +159,8 @@ test('harness reaps a known child after its launcher has already exited', async 
           else assert.ok(!records[0].close && alive(records[0].pid), setupReport);
         }
       }
+    } catch (error) {
+      primaryError = error;
     } finally {
       // Retain PID ownership even if setup fails before any witness is written.
       // Refresh the records so a child created during a failed setup is reaped.
@@ -167,12 +186,33 @@ test('harness reaps a known child after its launcher has already exited', async 
       const cleanupDeadline = Date.now() + 3000;
       while (pids.some(alive) && Date.now() < cleanupDeadline) await delay(20);
       if (pids.some(alive)) failures.push(new Error('Fixture process survived cleanup'));
+      const observerStderr = capture.snapshot(true);
+      const survivingPids = pids.filter(alive);
       launcher.stderr.destroy();
       if (launcher.connected) launcher.disconnect();
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      assert.equal(failures.length, 0, diagnostics.failureReport('orphan fixture cleanup', {
-        message: failures.map(error => error.message).join('\n'),
-      }, records));
+      // Preserve the first failure even when cleanup also fails. The observer
+      // can emit its useful error only after the readiness snapshot above.
+      const describe = error => error && ({ name: error.name, message: error.message,
+        code: error.code, data: error.data });
+      const report = diagnostics.failureReport('orphan fixture cleanup', {
+        primaryError: describe(primaryError), observerStderr,
+        cleanupErrors: failures.map(describe), survivingPids,
+      }, records);
+      if (scenario === 'observer close failure') {
+        assert.ok(primaryError, 'The missing close must fail the original cleanup');
+        assert.ok(failures.length, 'Repeated cleanup must not waive missing close evidence');
+        assert.match(report, /primaryError/);
+        assert.match(report, /Missing child close|Fixture child force-stop failed/);
+        assert.match(report, /cleanupErrors/);
+        assert.match(report, /observer close publication failed/);
+        assert.ok(!report.includes(value));
+        auditText(report);
+        assert.ok(Buffer.byteLength(report) <= diagnostics.LIMITS.report);
+        assert.equal(pids.some(alive), false, report);
+      } else {
+        assert.ok(!primaryError && failures.length === 0, report);
+      }
       assert.equal(existsSync(root), false);
     }
   });

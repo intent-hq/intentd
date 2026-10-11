@@ -29,7 +29,12 @@ export async function stopWitnesses(directory) {
     if (!JSON.parse(readFileSync(file, 'utf8')).close) {
       if (process.platform === 'win32') {
         const run = spawnSync('taskkill.exe', ['/PID', String(record.pid), '/T', '/F'], { timeout: 3000 });
-        assert.equal(run.status, 0, 'Fixture child force-stop failed');
+        if (run.status !== 0) throw Object.assign(new Error('Fixture child force-stop failed'), {
+          data: { pid: record.pid, status: run.status, signal: run.signal,
+            error: run.error?.message,
+            stdout: diagnostics.safeText(run.stdout?.toString() ?? '', { limit: 512 }),
+            stderr: diagnostics.safeText(run.stderr?.toString() ?? '', { limit: 512 }) },
+        });
       } else {
         try { process.kill(record.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
