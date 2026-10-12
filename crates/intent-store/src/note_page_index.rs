@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 use std::collections::BTreeMap;
 
+mod prepared;
+pub(crate) use prepared::Projection;
+
 pub(crate) const PIECE_BYTES: usize = 4096;
 
 /// Retire derived projections whenever the pinned parser, index implementation,
@@ -19,6 +22,7 @@ pub(crate) fn profile_revision() -> &'static str {
         for input in [
             "canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions",
             include_str!("note_page_index.rs"),
+            include_str!("note_page_index/prepared.rs"),
             include_str!("note_page_html.rs"),
             include_str!("note_page_html/entry.rs"),
             include_str!("note_page_html/index.rs"),
@@ -559,19 +563,20 @@ pub(crate) fn rebuild<'a>(
     rev: i64,
     content_changed: bool,
 ) -> BoxFuture<'a, Result<()>> {
+    rebuild_with_projection(conn, note, rev, content_changed, None)
+}
+
+pub(crate) fn rebuild_with_projection<'a>(
+    conn: &'a mut SqliteConnection,
+    note: &'a Note,
+    rev: i64,
+    content_changed: bool,
+    projection: Option<Projection>,
+) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
+        let mut projection = projection.unwrap_or_else(|| Projection::build(note, content_changed));
         let ws = &note.workspace_id.0;
         let id = &note.id.0;
-        let mut entries = Entries {
-            rows: Vec::new(),
-            artifact_sources: Vec::new(),
-            serial: 0,
-        };
-        // Separate namespaces keep metadata-only rewrites from colliding with context.
-        entries.serial = 1_usize << 40;
-        let metadata = json!({"title":note.title,"tags":note.tags,"parentId":note.parent_id,"metadata":note.metadata,"contentType":note.content_type,"isPinned":note.is_pinned,"isArchived":note.is_archived,"isDefault":note.is_default,"visibility":note.visibility,"createdAt":note.created_at,"updatedAt":note.updated_at});
-        let root = entries.metadata(&metadata, "m", None, None, None);
-        entries.rows.push(("m:root".into(), 0, root));
         // Metadata fragments occupy the high serial namespace. The classification
         // column avoids inspecting or hydrating any old JSON during invalidation.
         sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'm:%' OR collection >= 'f:0000010000000000' AND collection < 'g:')")
@@ -588,8 +593,7 @@ pub(crate) fn rebuild<'a>(
                 .await
                 .map_err(db_error)?;
             sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'c:%' OR collection LIKE 'd:%' OR collection LIKE 't:%' OR collection LIKE 'h:%' OR collection < 'f:0000010000000000')").bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
-            let parts = pieces(&note.content);
-            for part in &parts {
+            for part in &projection.parts {
                 sqlx::query("INSERT INTO note_page_piece(workspace_id,note_id,start,end,text,byte_start,scalar_start,lf_start,content_generation) VALUES (?,?,?,?,?,?,?,?,?)")
                     .bind(ws)
                     .bind(id)
@@ -604,34 +608,17 @@ pub(crate) fn rebuild<'a>(
                     .await
                     .map_err(db_error)?;
             }
-            entries.serial = 0;
-            context_entries(&note.content, &parts, &mut entries);
-            let task_count = task_entries(&note.content, &mut entries);
             sqlx::query("UPDATE note_page_head SET task_count=?,source_length=?,source_bytes=?,scalar_count=?,lf_count=?,content_generation=? WHERE workspace_id=? AND note_id=?")
-            .bind(sql_offset(task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(&content_generation).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
+            .bind(sql_offset(projection.task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(&content_generation).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
         }
         // Avoid one SQLite-worker round trip per descriptor while holding the
         // sole writer. Seven binds per row keep each batch below even SQLite's
         // legacy 999-variable limit; all batches retain this transaction.
-        let mut rows = entries.rows.into_iter();
         loop {
-            let batch = rows
+            let batch = projection
+                .rows
                 .by_ref()
                 .take(128)
-                .map(|(collection, position, mut value)| {
-                    let admission = value
-                        .as_object_mut()
-                        .expect("index object")
-                        .remove("_admissionRange")
-                        .unwrap_or_else(|| value["sourceRange"].clone());
-                    Ok((
-                        collection,
-                        sql_offset(position)?,
-                        value.to_string(),
-                        admission["start"].as_i64(),
-                        admission["end"].as_i64(),
-                    ))
-                })
                 .collect::<Result<Vec<_>>>()?;
             if batch.is_empty() {
                 break;
@@ -653,7 +640,7 @@ pub(crate) fn rebuild<'a>(
             );
             query.build().execute(&mut *conn).await.map_err(db_error)?;
         }
-        for (native, source, primitive) in entries.artifact_sources {
+        for (native, source, primitive) in projection.artifact_sources {
             sqlx::query("INSERT INTO note_artifact_source(workspace_id,note_id,native_collection,source_collection,primitive) VALUES (?,?,?,?,?)")
                 .bind(ws).bind(id).bind(native).bind(source).bind(primitive)
                 .execute(&mut *conn).await.map_err(db_error)?;

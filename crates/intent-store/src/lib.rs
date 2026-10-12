@@ -45,6 +45,7 @@ mod note_line_attribution_repo;
 mod note_page_html;
 mod note_page_index;
 mod note_page_repo;
+mod note_prepared_write;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
@@ -378,6 +379,7 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    note_preparation: std::sync::Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -444,6 +446,7 @@ impl Store {
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            note_preparation: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             write_pool,
             read_pool,
             _daemon_owner: owner,

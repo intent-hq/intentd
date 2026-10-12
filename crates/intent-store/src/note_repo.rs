@@ -416,6 +416,7 @@ impl Store {
                 Some(expected_version),
                 NoteUpdateScope::Metadata,
                 Some(agent_id),
+                None,
             )
             .await?;
             if revision.is_some() {
@@ -1009,7 +1010,18 @@ pub(crate) async fn exec_update_note(
     expected_version: Option<i64>,
     scope: NoteUpdateScope,
 ) -> Result<Option<i64>> {
-    exec_update_note_with_link_guard(executor, note, expected_version, scope, None).await
+    exec_update_note_with_projection(executor, note, expected_version, scope, None).await
+}
+
+pub(crate) async fn exec_update_note_with_projection(
+    executor: &mut sqlx::SqliteConnection,
+    note: &Note,
+    expected_version: Option<i64>,
+    scope: NoteUpdateScope,
+    projection: Option<crate::note_page_index::Projection>,
+) -> Result<Option<i64>> {
+    exec_update_note_with_link_guard(executor, note, expected_version, scope, None, projection)
+        .await
 }
 
 async fn exec_update_note_with_link_guard(
@@ -1018,6 +1030,7 @@ async fn exec_update_note_with_link_guard(
     expected_version: Option<i64>,
     scope: NoteUpdateScope,
     required_link: Option<&AgentId>,
+    projection: Option<crate::note_page_index::Projection>,
 ) -> Result<Option<i64>> {
     let parent_id = note.parent_id.as_ref().map(|n| n.0.clone());
     let task_json = note
@@ -1075,8 +1088,14 @@ async fn exec_update_note_with_link_guard(
         .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
     let rev = row.as_ref().map(|r| col(r, "rev")).transpose()?;
     if let Some(rev) = rev {
-        crate::note_page_index::rebuild(executor, note, rev, scope == NoteUpdateScope::FullRow)
-            .await?;
+        crate::note_page_index::rebuild_with_projection(
+            executor,
+            note,
+            rev,
+            scope == NoteUpdateScope::FullRow,
+            projection,
+        )
+        .await?;
     }
     Ok(rev)
 }

@@ -459,6 +459,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     };
     legacy.run(&pool).await.unwrap();
     let store = Store {
+        note_preparation: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         note_pages: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: pool.into(),
