@@ -868,3 +868,80 @@ async fn omitted_purpose_upserts_preserve_unhydrated_store_definitions() {
         );
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn archived_script_remove_by_known_id_after_restart() {
+    for (scoped, purpose) in [
+        (false, intent_core::ScriptPurpose::Saved),
+        (true, intent_core::ScriptPurpose::Saved),
+        (false, intent_core::ScriptPurpose::OneOff),
+        (true, intent_core::ScriptPurpose::OneOff),
+    ] {
+        let h = harness().await;
+        let id = create(
+            &h,
+            ScriptCreateParams {
+                name: "archived".into(),
+                command: "true".into(),
+                mode: ScriptMode::Command,
+                purpose: Some(purpose),
+                ..Default::default()
+            },
+        )
+        .await;
+        h.services
+            .script_archive(h.ws.clone(), vec![id.clone()])
+            .await
+            .unwrap();
+        h.services.store.close().await;
+        let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+        restarted.hydrate_scripts().await.unwrap();
+        assert!(restarted
+            .script_manager()
+            .scripts
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(
+            restarted.script_list(h.ws.clone()).await.unwrap()["scripts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let other_ws = WorkspaceId::new();
+        restarted
+            .store
+            .insert_workspace(&workspace(&other_ws, None))
+            .await
+            .unwrap();
+        let manager = restarted.script_manager();
+        let foreign = if scoped {
+            manager.remove_in_workspace(&other_ws, &id).await
+        } else {
+            restarted.script_remove(other_ws, id.clone()).await
+        };
+        assert!(matches!(foreign, Err(Error::NotFound(_))));
+        assert!(manager.scripts.lock().unwrap().is_empty());
+        // First selected-ID operation in the owning workspace is removal: no
+        // status/output/start/restore call is allowed to prime the registry.
+        let removed = if scoped {
+            manager.remove_in_workspace(&h.ws, &id).await
+        } else {
+            restarted.script_remove(h.ws.clone(), id.clone()).await
+        };
+        assert_eq!(removed.unwrap(), json!({"ok":true,"scriptId":id}));
+        assert!(restarted
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(manager.scripts.lock().unwrap().is_empty());
+        assert!(
+            restarted.script_list(h.ws.clone()).await.unwrap()["scripts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

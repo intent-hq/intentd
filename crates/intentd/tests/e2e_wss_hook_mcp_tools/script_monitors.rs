@@ -345,6 +345,16 @@ async fn script_monitor_worker_user_stop_settles_delivery() {
 }
 
 #[tokio::test]
+async fn script_monitor_worker_acceptance_failure_recovers_without_restart() {
+    monitor_worker_receipt_lifecycle("acceptance-failure").await;
+}
+
+#[tokio::test]
+async fn script_monitor_worker_late_acceptance_failure_recovers_without_restart() {
+    monitor_worker_receipt_lifecycle("late-acceptance-failure").await;
+}
+
+#[tokio::test]
 async fn script_monitor_worker_crash_recovers_unfinished_delivery() {
     monitor_worker_receipt_lifecycle("crash").await;
 }
@@ -361,7 +371,7 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
     let data_dir = guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let prompt_log = data_dir.join("worker-prompts.jsonl");
-    let behavior = json!({"silentUntilCancelTurns": i32::from(!matches!(scenario, "cleanup-failure" | "marker-failure")), "response":"WORKER_RECEIPT_DONE"}).to_string();
+    let behavior = json!({"silentUntilCancelTurns": i32::from(!matches!(scenario, "cleanup-failure" | "marker-failure" | "acceptance-failure" | "late-acceptance-failure")), "rules":[{"ifPromptContains":"ARM_ACCEPTANCE_WATCH","toolCall":{"name":"workspace_api","arguments":{"code":"const agents=await ws.agent.list(); const owner=agents.find(a=>a.name==='Worker receipt owner'); return await ws.agent.watch(owner.id);","summary":"Watch acceptance recovery completion"}},"response":"ACCEPTANCE_WATCH_ARMED"},{"ifPromptContains":"[WORKSPACE EVENTS]","response":"ACCEPTANCE_COMPLETION_ACK"}],"response":"WORKER_RECEIPT_DONE"}).to_string();
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -399,12 +409,71 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
         sqlx::query("CREATE TRIGGER fail_completion_marker BEFORE UPDATE OF phase ON agent_queue_admission WHEN new.phase='completed' BEGIN SELECT RAISE(ABORT,'injected completion marker failure'); END")
             .execute(store.write_pool()).await.unwrap();
     }
+    if matches!(scenario, "acceptance-failure" | "late-acceptance-failure") {
+        sqlx::query("CREATE TABLE acceptance_attempts(turn_id TEXT)")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let old_phase = if scenario == "late-acceptance-failure" {
+            "accepted"
+        } else {
+            "pending"
+        };
+        sqlx::query(&format!("CREATE TRIGGER fail_acceptance BEFORE UPDATE OF phase ON agent_queue_admission WHEN old.phase='{old_phase}' AND new.phase='accepted' BEGIN INSERT INTO acceptance_attempts VALUES(old.turn_id); SELECT RAISE(FAIL,'injected acceptance failure'); END"))
+            .execute(store.write_pool()).await.unwrap();
+    }
     let mut row: ScriptMonitor = serde_json::from_value(json!({"monitorId":"worker-receipt","workspaceId":ws_id,"agentId":agent_id,"scriptId":"fixture","runId":"fixture-run","scriptName":"Fixture","mode":"command","state":"active","createdAt":now_iso(),"expiresAt":"2099-01-01T00:00:00Z"})).unwrap();
     store.insert_script_monitor(&row).await.unwrap();
     row.state = "expired".into();
     row.reason = Some("ttl".into());
     row.settled_at = Some(now_iso());
     store.settle_script_monitor(&row).await.unwrap();
+    let mut acceptance_watcher = None;
+    if matches!(scenario, "acceptance-failure" | "late-acceptance-failure") {
+        timeout(common::test_timeout(Duration::from_secs(10)), async {
+            loop {
+                let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM acceptance_attempts")
+                    .fetch_one(store.read_pool())
+                    .await
+                    .unwrap();
+                if attempts > 0 {
+                    break;
+                }
+                // timing-guard: observe the real worker's failed SQL acceptance before removing the fault
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("worker attempts durable acceptance");
+        assert!(
+            !std::fs::read_to_string(&prompt_log).is_ok_and(|text| !text.is_empty()),
+            "no provider prompt before acceptance"
+        );
+        let recovery = store.load_all_agent_queues().await.unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].turn_id, "script-monitor:worker-receipt");
+        let watcher = wss_rpc(&mut rpc, "agent.create", json!({"workspaceId":ws_id,"name":"Acceptance completion watcher","model":"default","provider":"mock"})).await;
+        let watcher_id = watcher["agent"]["id"].as_str().unwrap().to_owned();
+        wss_rpc(
+            &mut rpc,
+            "agent.sendMessage",
+            json!({"workspaceId":ws_id,"agentId":watcher_id,"content":"ARM_ACCEPTANCE_WATCH"}),
+        )
+        .await;
+        await_conversation_contains(
+            &mut rpc,
+            &ws_id,
+            &watcher_id,
+            "ACCEPTANCE_WATCH_ARMED",
+            tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(30)),
+        )
+        .await;
+        acceptance_watcher = Some(watcher_id);
+        sqlx::query("DROP TRIGGER fail_acceptance")
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+    }
     timeout(common::test_timeout(Duration::from_secs(30)), async {
         loop {
             if std::fs::read_to_string(&prompt_log).is_ok_and(|text| !text.is_empty()) {
@@ -470,6 +539,16 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
             store.load_all_agent_queues().await.unwrap().is_empty(),
             "settled notification must not recover as runnable work"
         );
+    }
+    if let Some(watcher) = &acceptance_watcher {
+        await_conversation_contains(
+            &mut rpc,
+            &ws_id,
+            watcher,
+            "ACCEPTANCE_COMPLETION_ACK",
+            tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(30)),
+        )
+        .await;
     }
     drop(rpc);
     drop(daemon);
@@ -556,6 +635,19 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
     }
     if scenario == "idle-warning" {
         assert_eq!(prompts_before, 2, "timeout continues on a warning turn");
+    }
+    if matches!(scenario, "acceptance-failure" | "late-acceptance-failure") {
+        assert_eq!(
+            prompts_before, 3,
+            "one owner turn plus watch registration and exactly one completion wake"
+        );
+        let attempts: Vec<String> = sqlx::query_scalar("SELECT turn_id FROM acceptance_attempts")
+            .fetch_all(store.read_pool())
+            .await
+            .unwrap();
+        assert!(attempts
+            .iter()
+            .all(|turn| turn == "script-monitor:worker-receipt"));
     }
     let messages: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM agent_message WHERE id='script-monitor:worker-receipt'",

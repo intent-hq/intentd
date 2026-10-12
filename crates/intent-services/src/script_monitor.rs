@@ -284,22 +284,20 @@ impl Services {
         &self,
         agent: &AgentId,
         metadata: Option<&Value>,
-    ) -> bool {
+    ) -> Result<bool> {
         if monitor_id(metadata).is_none() {
-            return true;
+            return Ok(true);
         }
         let _lane = self.script_locks.monitor_lane.lock().await;
         if !self
             .script_monitor_delivery_allowed(agent, metadata)
-            .await
-            .unwrap_or(false)
+            .await?
         {
-            return false;
+            return Ok(false);
         }
         self.store
             .accept_script_notification(agent, monitor_id(metadata).expect("monitor checked"))
             .await
-            .unwrap_or(false)
     }
 
     pub(crate) async fn script_monitor_delivery_allowed(
@@ -319,7 +317,11 @@ impl Services {
         {
             return Ok(false);
         }
-        let owner = self.store.get_agent_session_summary(agent).await?;
+        let owner = match self.store.get_agent_session_summary(agent).await {
+            Ok(owner) => owner,
+            Err(intent_core::Error::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         if metadata.and_then(|md| md["workspaceId"].as_str()) != Some(owner.workspace_id.as_str())
             || metadata
                 .and_then(|md| md["agentId"].as_str())
@@ -330,11 +332,11 @@ impl Services {
                 .await?
                 .is_some()
             || (!owner.workspace_id.is_chief()
-                && self
-                    .store
-                    .get_workspace(&owner.workspace_id)
-                    .await?
-                    .archived)
+                && match self.store.get_workspace(&owner.workspace_id).await {
+                    Ok(workspace) => workspace.archived,
+                    Err(intent_core::Error::NotFound(_)) => true,
+                    Err(error) => return Err(error),
+                })
         {
             return Ok(false);
         }

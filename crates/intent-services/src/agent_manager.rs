@@ -7060,6 +7060,32 @@ impl AgentManager {
             .await;
     }
 
+    /// Keep this worker's exact turn while the storage admission gate is
+    /// unavailable. Cancellation aborts the worker; shutdown leaves its durable
+    /// receipt recoverable. Only an explicit lifecycle refusal discards it.
+    async fn retry_script_monitor_admission(
+        &self,
+        agent_id: &AgentId,
+        metadata: Option<&Value>,
+    ) -> bool {
+        loop {
+            if self.is_shutting_down() {
+                return false;
+            }
+            match self
+                .services
+                .admit_script_monitor_turn(agent_id, metadata)
+                .await
+            {
+                Ok(allowed) => return allowed,
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, %error, "retrying monitor turn admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    }
+
     async fn fail_admitted_persist(
         &self,
         agent_id: &AgentId,
@@ -12728,15 +12754,22 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        if !mgr
+        match mgr
             .services
             .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
             .await
-            .unwrap_or(false)
         {
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
-            return;
+            Ok(true) => {}
+            Ok(false) => {
+                mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                    .await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "retrying monitor delivery check");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue 'outer;
+            }
         }
 
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
@@ -12769,8 +12802,7 @@ async fn run_message_worker(
             return;
         }
         if !mgr
-            .services
-            .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+            .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
             .await
         {
             mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
@@ -12881,8 +12913,7 @@ async fn run_message_worker(
                     return;
                 }
                 if !mgr
-                    .services
-                    .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+                    .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
                     .await
                 {
                     restore_undelivered_context();
@@ -14137,14 +14168,17 @@ async fn persist_user(
     if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.
-        if !mgr
+        match mgr
             .services
             .script_monitor_delivery_allowed(agent_id, message_metadata)
             .await
-            .unwrap_or(false)
         {
-            mgr.services.commit_queue_history(agent_id, &id);
-            return true;
+            Ok(true) => {}
+            Ok(false) => {
+                mgr.services.commit_queue_history(agent_id, &id);
+                return true;
+            }
+            Err(_) => return false,
         }
         match mgr
             .services
@@ -14216,12 +14250,12 @@ async fn persist_user(
             }
             Err(e) => {
                 if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
-                    if !mgr
-                        .services
-                        .script_monitor_delivery_allowed(agent_id, message_metadata)
-                        .await
-                        .unwrap_or(false)
-                    {
+                    if matches!(
+                        mgr.services
+                            .script_monitor_delivery_allowed(agent_id, message_metadata)
+                            .await,
+                        Ok(false)
+                    ) {
                         mgr.services.commit_queue_history(agent_id, &id);
                         return true;
                     }
@@ -21551,11 +21585,11 @@ mod agent_retry_tests {
                     .unwrap();
             }
             if boundary == "after-accept" {
-                assert!(
-                    mgr.services
-                        .admit_script_monitor_turn(&agent, Some(&job.metadata))
-                        .await
-                );
+                assert!(mgr
+                    .services
+                    .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                    .await
+                    .unwrap());
             }
             // Lose all process-local queue state, then use the production restoration path.
             mgr.services.store.close().await;
@@ -21596,11 +21630,11 @@ mod agent_retry_tests {
                 )
                 .await
             );
-            assert!(
-                mgr.services
-                    .admit_script_monitor_turn(&agent, restored.message_metadata.as_ref())
-                    .await
-            );
+            assert!(mgr
+                .services
+                .admit_script_monitor_turn(&agent, restored.message_metadata.as_ref())
+                .await
+                .unwrap());
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
                 .bind(&job.wake_id)
                 .fetch_one(store.read_pool())
@@ -21612,11 +21646,11 @@ mod agent_retry_tests {
                 .complete_script_notification(&agent, "recover")
                 .await
                 .unwrap();
-            assert!(
-                !mgr.services
-                    .admit_script_monitor_turn(&agent, Some(&job.metadata))
-                    .await
-            );
+            assert!(!mgr
+                .services
+                .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                .await
+                .unwrap());
             assert!(store.load_all_agent_queues().await.unwrap().is_empty());
             store.close().await;
         }

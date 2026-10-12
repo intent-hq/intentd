@@ -1151,6 +1151,8 @@ impl ScriptManager {
             return Err(Error::NotFound(format!("script {script_id}")));
         }
 
+        self.ensure_known_locked(workspace_id, script_id).await?;
+
         if self
             .scripts
             .lock()
