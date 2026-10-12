@@ -28,6 +28,29 @@ class DiagnosticTests(unittest.TestCase):
         for system,machine in [('Linux','arm64'),('Darwin','x86_64')]:
             with self.assertRaises(RuntimeError): d.check_guard(env,sha,system,machine)
 
+    def test_rejects_cross_target_without_rewriting_environment(self):
+        sha='a'*40
+        env=dict(GITHUB_RUN_ATTEMPT='1',EXPECTED_SOURCE_SHA=sha,GITHUB_SHA=sha,CARGO_BUILD_TARGET='x86_64-apple-darwin')
+        with self.assertRaisesRegex(RuntimeError,'CARGO_BUILD_TARGET'):
+            d.check_guard(env,sha,'Darwin','arm64')
+        self.assertEqual(env['CARGO_BUILD_TARGET'],'x86_64-apple-darwin')
+        d.check_guard(dict(env,CARGO_BUILD_TARGET='aarch64-apple-darwin'),sha,'Darwin','arm64')
+
+    def test_macho_requires_actual_arm64_executable(self):
+        import struct
+        with tempfile.TemporaryDirectory() as tmp:
+            binary=Path(tmp)/'test-binary'
+            binary.write_bytes(struct.pack('<8I',0xfeedfacf,0x0100000c,0,2,0,0,0,0))
+            self.assertEqual(d.macho_identity(binary)['architecture'],'arm64')
+            for data in [b'',b'not a macho',struct.pack('<8I',0xfeedfacf,0x01000007,3,2,0,0,0,0),struct.pack('<8I',0xfeedfacf,0x0100000c,0,6,0,0,0,0),struct.pack('>8I',0xcafebabe,2,0,0,0,0,0,0)]:
+                binary.write_bytes(data)
+                with self.assertRaisesRegex(RuntimeError,'Mach-O'):d.macho_identity(binary)
+
+    def test_worker_compiled_platform_must_be_native_before_identity_io(self):
+        for arch,system in [('x86_64','macos'),('aarch64','linux')]:
+            with self.assertRaisesRegex(RuntimeError,'compiled platform'):
+                d.validate_trace([dict(event='worker_start',fields=dict(arch=arch,os=system))],Path('/missing'),'')
+
     def test_invalid_dispatch_preserves_zero_invocations_and_exclusive_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory=Path(tmp)/'fresh'
@@ -109,6 +132,61 @@ event('owner_cleanup',cleaned=True,scratch_exists=False)
             # already exited fake owner to avoid the unit test itself leaking.
             d.UNCONFIRMED.pop().wait(timeout=2)
             self.assertFalse(json.loads((root/'out.process.json').read_text())['cleaned'])
+
+    def test_malformed_owner_log_resumes_live_owned_group(self):
+        for payload in ['{"event":', 'invalid json\n']:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);owner=root/'owners';cancel=root/'cancel';resumed=root/'resumed'
+                code="""import pathlib,sys,time
+owner,cancel,resumed=map(pathlib.Path,sys.argv[1:4])
+owner.write_text(sys.argv[4])
+while True:
+ if cancel.exists():resumed.write_text('owner can still run')
+ time.sleep(.01)
+"""
+                process=None;record={};states=[]
+                try:
+                    with self.assertRaises((RuntimeError,json.JSONDecodeError)):
+                        d.supervised([sys.executable,'-I','-S','-c',code,str(owner),str(cancel),str(resumed),payload],dict(os.environ),root/'out',time.monotonic()+.3,owner,cancel,cleanup_seconds=1)
+                    process=d.UNCONFIRMED.pop()
+                    resume_deadline=time.monotonic()+.5
+                    states=d.group_members(process.pid)
+                    while any(r['state'].startswith('T') for r in states) and time.monotonic()<resume_deadline:
+                        time.sleep(.01);states=d.group_members(process.pid)
+                    self.assertTrue(states)
+                    self.assertTrue(all(not r['state'].startswith('T') for r in states),states)
+                    record=json.loads((root/'out.process.json').read_text())
+                    self.assertFalse(record['cleaned']);self.assertTrue(cancel.exists())
+                    self.assertTrue(record['resume_sent'])
+                    self.assertTrue(all(r['state'].startswith(('T','Z')) for r in record['frozen_group_members']))
+                    self.assertLess(record['cleanup_seconds'],1.1)
+                finally:
+                    if process is None and d.UNCONFIRMED:process=d.UNCONFIRMED.pop()
+                    if process is not None:
+                        d.signal_owned(process,d.signal.SIGCONT)
+                        d.signal_owned(process,d.signal.SIGKILL)
+                        process.wait(timeout=2)
+                        survivors=d.group_members(process.pid)
+                        self.assertEqual(survivors,[])
+                        print(json.dumps(dict(control='malformed_owner',payload_kind='partial' if not payload.endswith('\n') else 'invalid',
+                                              stopped_snapshot=record.get('frozen_group_members'),after_resume=states,
+                                              cleanup_seconds=record.get('cleanup_seconds'),resume_sent=record.get('resume_sent'),
+                                              unit_final_survivors=survivors)))
+
+    def test_registration_inspection_waits_for_stopped_state(self):
+        observations=iter([[dict(pid=1,state='R')],[dict(pid=1,state='T')],[dict(pid=1,state='T')]])
+        seen=[]
+        with patch.object(d,'group_members',side_effect=lambda *args:next(observations)),patch.object(d.time,'sleep',side_effect=lambda seconds:seen.append(seconds)):
+            members=d.wait_frozen(1,time.monotonic()+1)
+        self.assertEqual(members[0]['state'],'T');self.assertTrue(seen)
+
+    def test_heartbeat_origin_precedes_spawn_and_first_poll_is_recorded(self):
+        probe=(ROOT/'crates/intent-services/src/repository_context_output/tests/diagnostic_trace.rs').read_text()
+        self.assertLess(probe.index('let cadence_start ='),probe.index('tokio::spawn'))
+        self.assertLess(probe.index('let deadline ='),probe.index('tokio::spawn'))
+        self.assertIn('heartbeat_first_poll',probe)
+        self.assertIn('lag.max_us = lag.max_us.max(first_poll_us)',probe)
+        self.assertIn('std::env::consts::ARCH',probe);self.assertIn('std::env::consts::OS',probe)
 
     def test_identity_rejects_zero_workers_before_hashing(self):
         with self.assertRaisesRegex(RuntimeError,'exactly one'):d.validate_trace([],Path('/missing'),'')

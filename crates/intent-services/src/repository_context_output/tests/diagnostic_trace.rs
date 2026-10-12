@@ -177,7 +177,7 @@ pub(crate) fn start() -> Option<Probe> {
     let pgid = 0;
     emit(
         "worker_start",
-        json!({"current_exe":std::env::current_exe().unwrap(),"git_path":git,"pgid":pgid,
+        json!({"current_exe":std::env::current_exe().unwrap(),"git_path":git,"pgid":pgid,"arch":std::env::consts::ARCH,"os":std::env::consts::OS,
         "settings":settings,"git_config_metadata":config,"tmpdir":std::env::temp_dir(),
         "runtime":"current_thread","fixture_guard_ms":15000}),
     );
@@ -190,12 +190,21 @@ pub(crate) fn start() -> Option<Probe> {
         "heartbeat_initial",
         json!({"period_ms":25,"bound_seconds":120}),
     );
+    let cadence_start = tokio::time::Instant::now();
+    let deadline = cadence_start + Duration::from_secs(120);
     let task = tokio::spawn(async move {
-        let start = tokio::time::Instant::now();
-        let mut ticks =
-            tokio::time::interval_at(start + Duration::from_millis(25), Duration::from_millis(25));
+        let first_poll_us = cadence_start.elapsed().as_micros();
+        {
+            let mut lag = state.lock().unwrap();
+            lag.max_us = lag.max_us.max(first_poll_us);
+        }
+        emit("heartbeat_first_poll", json!({"delay_us":first_poll_us}));
+        let mut ticks = tokio::time::interval_at(
+            cadence_start + Duration::from_millis(25),
+            Duration::from_millis(25),
+        );
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        while start.elapsed() < Duration::from_secs(120) {
+        while tokio::time::Instant::now() < deadline {
             let scheduled = ticks.tick().await;
             let delay = scheduled.elapsed().as_micros();
             let mut lag = state.lock().unwrap();

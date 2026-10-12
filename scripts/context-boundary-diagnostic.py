@@ -9,6 +9,7 @@ import re
 import selectors
 import signal
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -76,6 +77,21 @@ def signal_owned(process, sig):
         pass
 
 
+def wait_frozen(pgid, deadline):
+    # A delivered stop signal is not an acknowledgment. Require two stable
+    # snapshots of stopped/zombie members before reading owner registrations.
+    previous = None
+    while time.monotonic() < deadline:
+        members = group_members(pgid, min(2, max(.001, deadline-time.monotonic())))
+        identities = {r['pid'] for r in members}
+        stopped = all(r['state'].startswith(('T', 'Z')) for r in members)
+        if stopped and identities == previous:
+            return members
+        previous = identities if stopped else None
+        time.sleep(min(.02, max(0, deadline-time.monotonic())))
+    raise RuntimeError('owned group stop unconfirmed within cleanup budget')
+
+
 def supervised(command, env, output, deadline, owner_log=None, cancel=None, cleanup_seconds=CLEANUP_SECONDS):
     if time.monotonic() >= deadline:
         raise RuntimeError('phase budget exhausted before launch')
@@ -89,6 +105,7 @@ def supervised(command, env, output, deadline, owner_log=None, cancel=None, clea
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     eof = False
+    frozen = False
     with output.open('wb') as log:
         def drain(until):
             nonlocal eof
@@ -122,11 +139,13 @@ def supervised(command, env, output, deadline, owner_log=None, cancel=None, clea
                     record['unexpected_live_leader_after_eof'] = True
             # Freeze our owned group before inspecting registration; a parent
             # cannot race that inspection by launching a new worker afterward.
+            frozen = True
             signal_owned(process, signal.SIGSTOP)
+            record['frozen_group_members'] = wait_frozen(process.pid, cleanup_deadline)
             if owner_log is not None and not owner_cleanup(owner_log):
-                signal_owned(process, signal.SIGCONT)
                 raise RuntimeError('native owner cleanup unconfirmed; refused unsafe external worker-group signal')
             signal_owned(process, signal.SIGKILL)
+            frozen = False  # Owner cleanup is proven; never resume after reap.
             while time.monotonic() < cleanup_deadline:
                 members = group_members(process.pid, min(2, max(.001, cleanup_deadline-time.monotonic())))
                 record['last_group_members'] = members
@@ -147,6 +166,14 @@ def supervised(command, env, output, deadline, owner_log=None, cancel=None, clea
                 UNCONFIRMED.append(process)
             raise
         finally:
+            if frozen and not record['cleaned']:
+                # Parsing, reads, stop-observation and signaling can all fail.
+                # Always release a frozen owner so its native cleanup can run.
+                try:
+                    signal_owned(process, signal.SIGCONT)
+                    record['resume_sent'] = True
+                except OSError as error:
+                    record['resume_error'] = str(error)
             selector.close()
             process.stdout.close()
             record['total_seconds']=time.monotonic()-phase_started
@@ -157,6 +184,8 @@ def supervised(command, env, output, deadline, owner_log=None, cancel=None, clea
 def check_guard(env, actual_sha, system, machine):
     if system != 'Darwin' or machine != 'arm64':
         raise RuntimeError('diagnostic requires native macOS ARM64')
+    if env.get('CARGO_BUILD_TARGET') not in (None, 'aarch64-apple-darwin'):
+        raise RuntimeError('non-native CARGO_BUILD_TARGET prohibited; environment not rewritten')
     if env.get('GITHUB_RUN_ATTEMPT') != '1':
         raise RuntimeError('reruns prohibited')
     expected = env.get('EXPECTED_SOURCE_SHA', '')
@@ -164,6 +193,21 @@ def check_guard(env, actual_sha, system, machine):
         raise RuntimeError('reviewed source SHA mismatch')
     if env.get('GITHUB_SHA') != expected:
         raise RuntimeError('dispatch ref does not match reviewed source')
+
+
+def macho_identity(executable):
+    # Rust's native output is a thin Mach-O executable. Reject fat/universal or
+    # cross-target images instead of assuming the compiler host proves the target.
+    with Path(executable).open('rb') as binary:
+        header = binary.read(32)
+    if len(header) != 32:
+        raise RuntimeError('truncated Mach-O executable header')
+    magic, cpu, subtype, kind, commands, size, flags, reserved = struct.unpack('<8I', header)
+    if (magic, cpu, kind) != (0xfeedfacf, 0x0100000c, 2):
+        raise RuntimeError('requires thin ARM64 Mach-O executable')
+    return dict(format='Mach-O 64-bit little-endian', architecture='arm64',
+                cpu_type=cpu, cpu_subtype=subtype, file_type=kind,
+                load_commands=commands, load_commands_bytes=size, flags=flags)
 
 
 def compiler_artifact(text):
@@ -191,6 +235,8 @@ def validate_trace(events, executable, expected_hash):
     if len(workers) != 1:
         raise RuntimeError('expected exactly one isolated worker')
     fields = workers[0]['fields']
+    if (fields.get('arch'), fields.get('os')) != ('aarch64', 'macos'):
+        raise RuntimeError('worker compiled platform is not native macOS ARM64')
     worker_exe = Path(fields['current_exe']).resolve()
     if worker_exe != executable.resolve() or sha(worker_exe) != expected_hash:
         raise RuntimeError('worker/compiler executable identity mismatch')
@@ -258,6 +304,7 @@ def main():
         artifact=compiler_artifact((directory/'build.log').read_text())
         save(directory/'compiler-artifact.json',artifact)
         executable=Path(artifact['executable'])
+        receipt['executable_macho']=macho_identity(executable)
         before=sha(executable)
         receipt.update(executable=str(executable),binary_sha256_before=before)
         listing=supervised(CARGO+[TARGET,'--','--exact','--list','--format=terse'],env,directory/'listing.log',build_deadline)
