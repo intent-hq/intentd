@@ -286,7 +286,8 @@ impl Store {
     }
 
     /// Continue a notification on the worker's persisted warning turn. The
-    /// durable recovery payload follows that turn before it is submitted.
+    /// durable recovery payload and any surviving queue snapshot follow that
+    /// turn atomically before it is submitted.
     /// # Errors
     /// Returns database failures.
     pub async fn continue_script_notification(
@@ -296,10 +297,19 @@ impl Store {
         turn: &str,
         content: &str,
     ) -> Result<()> {
-        sqlx::query("UPDATE agent_queue_admission SET turn_id=?,payload=json_set(payload,'$.turnId',?,'$.content',?,'$.persisted',json('true')) WHERE id=? AND agent_id=? AND phase='accepted'")
-            .bind(turn).bind(turn).bind(content).bind(format!("script-monitor:{id}")).bind(agent.as_str())
-            .execute(self.write_pool()).await.map_err(db)?;
-        Ok(())
+        let wake_id = format!("script-monitor:{id}");
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let updated = sqlx::query("UPDATE agent_queue_admission SET turn_id=?,payload=json_set(payload,'$.turnId',?,'$.content',?,'$.persisted',json('true')) WHERE id=? AND agent_id=? AND phase='accepted'")
+            .bind(turn).bind(turn).bind(content).bind(&wake_id).bind(agent.as_str())
+            .execute(&mut *tx).await.map_err(db)?.rows_affected();
+        if updated != 0 {
+            // A failed best-effort dequeue may leave the ordinary copy behind.
+            // Preserve its other queue fields, but never recover its old turn.
+            sqlx::query("UPDATE agent_queue SET turn_id=?,payload=json_set(payload,'$.turnId',?,'$.content',?,'$.persisted',json('true')) WHERE id=? AND agent_id=?")
+                .bind(turn).bind(turn).bind(content).bind(&wake_id).bind(agent.as_str())
+                .execute(&mut *tx).await.map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
     }
 
     /// Retry physical cleanup independently of delivery settlement.

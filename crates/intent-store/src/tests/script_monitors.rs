@@ -855,3 +855,151 @@ async fn completed_cleanup_receipt_never_replays_or_exports_pending_work() {
         .unwrap();
     assert_eq!(remaining, 0);
 }
+
+#[tokio::test]
+async fn monitor_continuation_recovers_after_failed_dequeue_snapshot() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let (ws, agent) = seed(&store, "continuation-recovery").await;
+    let row = monitor(&ws, &agent, "continuation");
+    store.insert_script_monitor(&row).await.unwrap();
+    store.settle_script_monitor(&triggered(&row)).await.unwrap();
+    let mut queued = queue(&row);
+    queued.payload["content"] = json!("original notification");
+    store.admit_script_notification(&queued).await.unwrap();
+    // Pending queue edits and scheduling fields remain owned by the ordinary queue.
+    queued.payload["content"] = json!("edited notification");
+    queued.payload["editing"] = json!(true);
+    queued.payload["holdKind"] = json!("progress");
+    queued.payload["holdUntil"] = json!("2099-01-01T00:00:00Z");
+    store
+        .replace_agent_queue(&agent, &[queued.clone()])
+        .await
+        .unwrap();
+    store
+        .continue_script_notification(&agent, "continuation", "not-accepted", "ignored")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_all_agent_queues().await.unwrap()[0].payload,
+        queued.payload
+    );
+    queued.payload["editing"] = json!(false);
+    queued.payload["holdKind"] = serde_json::Value::Null;
+    queued.payload["holdUntil"] = serde_json::Value::Null;
+    store
+        .replace_agent_queue(&agent, &[queued.clone()])
+        .await
+        .unwrap();
+    // The actual snapshot API fails, leaving its original copy behind the worker.
+    sqlx::query("CREATE TRIGGER fail_dequeue BEFORE DELETE ON agent_queue BEGIN SELECT RAISE(ABORT,'dequeue failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    assert!(store.replace_agent_queue(&agent, &[]).await.is_err());
+    assert!(store
+        .accept_script_notification(&agent, "continuation")
+        .await
+        .unwrap());
+    store
+        .continue_script_notification(
+            &agent,
+            "continuation",
+            "warning-turn",
+            "continue after timeout",
+        )
+        .await
+        .unwrap();
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let recovered = reopened.load_all_agent_queues().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].turn_id, "warning-turn");
+    assert_eq!(recovered[0].payload["turnId"], "warning-turn");
+    assert_eq!(recovered[0].payload["content"], "continue after timeout");
+    assert_eq!(recovered[0].payload["persisted"], true);
+    assert_eq!(recovered[0].payload["editing"], false);
+    // A later snapshot may remove the stale copy, but cannot resurrect its old turn.
+    sqlx::query("DROP TRIGGER fail_dequeue")
+        .execute(reopened.write_pool())
+        .await
+        .unwrap();
+    reopened
+        .replace_agent_queue(&agent, &[queued])
+        .await
+        .unwrap();
+    let recovered = reopened.load_all_agent_queues().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].turn_id, "warning-turn");
+    assert_eq!(recovered[0].payload["content"], "continue after timeout");
+}
+
+#[tokio::test]
+async fn monitor_continuation_queue_copy_failure_rolls_back_receipt() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let (ws, agent) = seed(&store, "continuation-rollback").await;
+    let row = monitor(&ws, &agent, "continuation-rollback");
+    store.insert_script_monitor(&row).await.unwrap();
+    store.settle_script_monitor(&triggered(&row)).await.unwrap();
+    let mut queued = queue(&row);
+    queued.payload["content"] = json!("original notification");
+    store.admit_script_notification(&queued).await.unwrap();
+    assert!(store
+        .accept_script_notification(&agent, &row.monitor_id)
+        .await
+        .unwrap());
+    sqlx::query("CREATE TRIGGER fail_continuation_copy BEFORE UPDATE ON agent_queue BEGIN SELECT RAISE(ABORT,'continuation copy failure'); END")
+        .execute(store.write_pool()).await.unwrap();
+    assert!(store
+        .continue_script_notification(&agent, &row.monitor_id, "warning-turn", "warning")
+        .await
+        .is_err());
+    let receipt: (String, String) =
+        sqlx::query_as("SELECT turn_id,payload FROM agent_queue_admission WHERE id=?")
+            .bind(&queued.id)
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(receipt.0, queued.turn_id);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&receipt.1).unwrap(),
+        queued.payload
+    );
+    assert_eq!(
+        store.load_all_agent_queues().await.unwrap()[0].payload,
+        queued.payload
+    );
+    assert_eq!(
+        store.load_all_agent_queues().await.unwrap()[0].turn_id,
+        queued.turn_id
+    );
+    sqlx::query("DROP TRIGGER fail_continuation_copy")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    store
+        .continue_script_notification(&agent, &row.monitor_id, "warning-turn", "warning")
+        .await
+        .unwrap();
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let recovered = reopened.load_all_agent_queues().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].turn_id, "warning-turn");
+    assert_eq!(recovered[0].payload["content"], "warning");
+    reopened.replace_agent_queue(&agent, &[]).await.unwrap();
+    reopened
+        .continue_script_notification(
+            &agent,
+            &row.monitor_id,
+            "receipt-only-turn",
+            "receipt-only warning",
+        )
+        .await
+        .unwrap();
+    reopened.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let recovered = reopened.load_all_agent_queues().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].turn_id, "receipt-only-turn");
+    assert_eq!(recovered[0].payload["content"], "receipt-only warning");
+}
