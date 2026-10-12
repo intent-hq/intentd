@@ -68,11 +68,10 @@ fn cleanup_probe() {
         std::fs::write(ready, "ready").unwrap();
         if std::env::var(MODE).as_deref() == Ok("scratch-order") {
             wait_file(&record.with_extension("inspect"));
-            std::fs::write(
-                record.with_extension("ordering"),
-                std::env::temp_dir().exists().to_string(),
-            )
-            .unwrap();
+            let observation = record.with_extension("ordering-pending");
+            std::fs::write(&observation, std::env::temp_dir().exists().to_string()).unwrap();
+            // Publish only the complete observation before releasing the controller.
+            std::fs::rename(observation, record.with_extension("ordering")).unwrap();
         }
         // A bounded last-resort exit, not the expected cleanup mechanism.
         await_self_expiry();
