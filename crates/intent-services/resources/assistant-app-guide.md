@@ -36,6 +36,24 @@ requires Multiplayer and a refreshed identity; the remote-owner panel needs Remo
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
+## Inline visuals (unreleased)
+
+Inline HTML visuals are under development; do not recommend them in ordinary app
+help. Discuss or test them only when explicitly asked, and confirm the frontend
+supports them. A newer daemon or agent instruction version does not prove support
+in the installed client.
+
+In a supporting development frontend, an agent can put raw, self-contained
+HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
+in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
+Use this for exploring comparisons or changing inputs. Keep simple explanations
+in text and shareable charts in saved files. Visuals use app semantic CSS variables
+for both themes and cannot use external libraries, network access, app APIs,
+navigation, forms, popups, or embedded frames. **View source** shows the code;
+**Reload** starts the visual again and resets its local inputs.
+
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/InlineHtmlPreview.svelte; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
+
 ## Finding things
 
 Answer location questions with the destination and action first. Read settings only

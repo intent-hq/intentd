@@ -183,6 +183,12 @@ pub(crate) static V3_1: InstructionSet = InstructionSet {
     ..V2_10
 };
 
+/// Harness v3.2 adds development-only inline visual guidance.
+pub(crate) static V3_2: InstructionSet = InstructionSet {
+    common: instr!("v3.2", "common"),
+    ..V3_1
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {

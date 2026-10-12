@@ -114,7 +114,7 @@ fn only_exact_known_stamps_are_eligible() {
         Some("3.0\n"),
         Some(" 3.0"),
         Some("3.0\0"),
-        Some("3.2"),
+        Some("3.3"),
         Some("99.0"),
         Some("unknown"),
     ] {
