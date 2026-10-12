@@ -217,10 +217,20 @@ async fn archive_write_failure_cannot_hide_or_start_a_process() {
         "idle"
     );
     assert!(
-        h.services.script_list(h.ws.clone()).await.unwrap()["scripts"][0]
-            .get("archivedAt")
-            .is_some()
+        h.services.script_list(h.ws.clone()).await.unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
+    assert!(h
+        .services
+        .store
+        .get_script_in_workspace(&h.ws, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
 }
 
 #[intent_test_macros::daemon_test]

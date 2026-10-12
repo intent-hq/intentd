@@ -52,7 +52,10 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // from live delivery so already-delivered wakes never fire again.
     ("script_monitor", "workspace_id = ?1"),
     ("script_notification_job", "workspace_id = ?1"),
-    ("agent_queue_admission", "workspace_id = ?1"),
+    (
+        "agent_queue_admission",
+        "workspace_id = ?1 AND phase != 'completed'",
+    ),
     (
         "agent_message",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
@@ -67,7 +70,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ),
     (
         "agent_queue",
-        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed')",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
     ("agent_flipped_completion", "workspace_id = ?1"),
@@ -1468,6 +1471,8 @@ mod tests {
             format!("INSERT INTO pr_monitor (monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, created_at, updated_at) VALUES ('pm-{ws}', '{ws}', '{agent}', 'o', 'r', 1, 'active', '{t}', '{t}')"),
             format!("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('s-{ws}', '{ws}', 'S', 'true', 'command', 'user', '{t}')"),
             format!("INSERT INTO script_monitor (id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at) VALUES ('sm-{ws}', '{ws}', '{agent}', 's-{ws}', 'run-{ws}', 'active', '{{}}', '{t}')"),
+            format!("INSERT INTO script_notification_job (wake_id,workspace_id,agent_id,script_id,run_id,metadata,body,phase,created_at) VALUES ('script-monitor:job-{ws}','{ws}','{agent}','s-{ws}','run-{ws}','{{}}','wake','pending','{t}')"),
+            format!("INSERT INTO agent_queue_admission (id,agent_id,workspace_id,turn_id,payload,created_at,phase) VALUES ('script-monitor:admitted-{ws}','{agent}','{ws}','turn-{ws}','{{}}','{t}','pending')"),
             format!("INSERT INTO task_agent_link (workspace_id, note_id, task_key, task_text, agent_id, created_at) VALUES ('{ws}', 'n1', 'k', 'do', '{agent}', 1)"),
             format!("INSERT INTO sandbox (id, workspace_id, agent_id, path, branch, base_commit_sha, created_at, updated_at) VALUES ('sb-{ws}', '{ws}', '{agent}', '/tmp/sb', 'sb/a', 'abc', '{t}', '{t}')"),
             format!("INSERT INTO tracked_changes (id, workspace_id, path, stage, status, created_at, updated_at) VALUES ('tc-{ws}', '{ws}', 'a.txt', 'unstaged', 'modified', '{t}', '{t}')"),

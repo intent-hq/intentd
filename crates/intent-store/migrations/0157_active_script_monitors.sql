@@ -17,11 +17,12 @@ CREATE TABLE script_notification_job (
 );
 CREATE INDEX script_notification_owner ON script_notification_job(agent_id);
 -- Ordinary durable delivery ownership survives queue snapshot replacement/dequeue.
--- This is transient pending/accepted turn work, never a delivered receipt ledger.
+-- Completed rows are payload-free cleanup work, removed by the retry sweep;
+-- they never authorize delivery or form terminal monitor history.
 CREATE TABLE agent_queue_admission (
  id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE,
  workspace_id TEXT NOT NULL, turn_id TEXT NOT NULL, payload TEXT NOT NULL,
- created_at TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('pending','accepted'))
+ created_at TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('pending','accepted','completed'))
 );
 INSERT INTO script_notification_job
  SELECT 'script-monitor:'||m.id,m.workspace_id,m.agent_id,m.script_id,m.run_id,
@@ -86,7 +87,7 @@ BEGIN SELECT RAISE(ABORT,'script monitor lifecycle fence'); END;
 CREATE TRIGGER script_monitor_message_fence BEFORE INSERT ON agent_message
 WHEN (CASE WHEN json_valid(new.metadata) THEN json_extract(new.metadata,'$.type') END)='script_monitor_wake'
  AND NOT EXISTS (
- SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission) d
+ SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission WHERE phase != 'completed') d
  JOIN agent_session a ON a.id=d.agent_id JOIN workspace w ON w.id=d.workspace_id
  WHERE d.id='script-monitor:'||json_extract(new.metadata,'$.monitorId') AND d.agent_id=new.agent_id AND a.retired_at IS NULL AND w.archived=0)
 BEGIN SELECT RAISE(ABORT,'script monitor wake suppressed'); END;

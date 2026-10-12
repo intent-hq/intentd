@@ -385,8 +385,12 @@ impl ScriptManager {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<AgentId>> {
         let _lane = self.locks.monitor_lane.lock().await;
+        let owners = self.store.script_notification_owners(ws, agent).await?;
+        if owners.is_empty() {
+            return Ok(owners);
+        }
         for mut row in self.store.script_monitors(ws, agent).await? {
             if row.state == "active" {
                 row.state = "cancelled".into();
@@ -404,7 +408,7 @@ impl ScriptManager {
                 .remove(&row.monitor_id);
         }
         self.store.suppress_script_notifications(ws, agent).await?;
-        Ok(())
+        Ok(owners)
     }
 
     pub(crate) async fn recover_monitors(&self) -> Result<()> {

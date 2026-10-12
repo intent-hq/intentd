@@ -22,6 +22,69 @@ pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
 }
 
 impl Services {
+    pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
+        let mut workers = self
+            .script_locks
+            .monitor_workers
+            .lock()
+            .expect("monitor worker registry");
+        if let Some(id) = monitor_id(metadata) {
+            workers.insert(agent.clone(), id.to_owned());
+        } else {
+            workers.remove(agent);
+        }
+    }
+
+    pub(crate) async fn settle_script_monitor_worker(&self, agent: &AgentId) {
+        let id = self
+            .script_locks
+            .monitor_workers
+            .lock()
+            .expect("monitor worker registry")
+            .remove(agent);
+        if let Some(id) = id {
+            self.complete_script_monitor_delivery(agent, &id).await;
+        }
+    }
+
+    pub(crate) async fn complete_script_monitor_delivery(&self, agent: &AgentId, id: &str) {
+        {
+            let mut workers = self
+                .script_locks
+                .monitor_workers
+                .lock()
+                .expect("monitor worker registry");
+            if workers.get(agent).is_some_and(|current| current == id) {
+                workers.remove(agent);
+            }
+        }
+        // Record the exact finished delivery before awaiting SQL. A temporary
+        // marker-write failure must neither lose retry ownership nor re-prompt.
+        self.script_locks
+            .monitor_completions
+            .lock()
+            .expect("monitor completion retries")
+            .insert((agent.clone(), id.to_owned()));
+        self.retry_script_monitor_completion(agent, id).await;
+    }
+
+    pub(crate) async fn retry_script_monitor_completion(&self, agent: &AgentId, id: &str) {
+        match self.store.complete_script_notification(agent, id).await {
+            Ok(()) => {
+                self.script_locks
+                    .monitor_completions
+                    .lock()
+                    .expect("monitor completion retries")
+                    .remove(&(agent.clone(), id.to_owned()));
+                // The earlier idle event may have been deferred by this receipt.
+                self.redeliver_completion_after_queue_mutation(agent).await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, monitor=id, "notification completion remains owned for retry");
+            }
+        }
+    }
+
     pub(crate) fn script_monitor_export_blocked(&self, metadata: Option<&Value>) -> bool {
         let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
             return false;
@@ -68,6 +131,24 @@ impl Services {
             let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 sweep.tick().await;
+                let completions = services
+                    .script_locks
+                    .monitor_completions
+                    .lock()
+                    .expect("monitor completion retries")
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for (agent, id) in completions {
+                    services.retry_script_monitor_completion(&agent, &id).await;
+                }
+                if let Err(error) = services
+                    .store
+                    .cleanup_completed_script_notifications()
+                    .await
+                {
+                    tracing::warn!(%error, "completed notification cleanup will retry");
+                }
                 if let Ok(rows) = services.store.pending_script_monitors().await {
                     for (row, _) in rows {
                         if row.state == "active" {
@@ -229,6 +310,15 @@ impl Services {
         let Some(id) = monitor_id(metadata) else {
             return Ok(true);
         };
+        if self
+            .script_locks
+            .monitor_completions
+            .lock()
+            .expect("monitor completion retries")
+            .contains(&(agent.clone(), id.to_owned()))
+        {
+            return Ok(false);
+        }
         let owner = self.store.get_agent_session_summary(agent).await?;
         if metadata.and_then(|md| md["workspaceId"].as_str()) != Some(owner.workspace_id.as_str())
             || metadata
@@ -259,8 +349,8 @@ impl Services {
         agent: Option<&AgentId>,
         reason: &str,
     ) -> Result<()> {
-        let owners = self.store.script_notification_owners(ws, agent).await?;
-        self.script_manager()
+        let owners = self
+            .script_manager()
             .cleanup_monitors(ws, agent, reason)
             .await?;
         {

@@ -43,7 +43,7 @@ impl Store {
     /// Returns database failures so callers can defer settlement safely.
     pub async fn script_monitor_pending_for_agent(&self, agent: &AgentId) -> Result<bool> {
         sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE agent_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE agent_id=?)",
+            "SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE agent_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE agent_id=? AND phase != 'completed')",
         )
         .bind(agent.as_str())
         .bind(agent.as_str())
@@ -179,7 +179,7 @@ impl Store {
     /// Returns database errors.
     pub async fn script_monitor_wake_allowed(&self, id: &str) -> Result<bool> {
         let key = format!("script-monitor:{id}");
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE id=?)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE id=? AND phase != 'completed')")
             .bind(&key).bind(&key).fetch_one(self.read_pool()).await.map_err(db)
     }
 
@@ -193,7 +193,7 @@ impl Store {
         ws: &WorkspaceId,
     ) -> Result<bool> {
         let key = format!("script-monitor:{id}");
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission) WHERE id=? AND agent_id=? AND workspace_id=?)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission WHERE phase != 'completed') WHERE id=? AND agent_id=? AND workspace_id=?)")
             .bind(key).bind(agent.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(db)
     }
     /// Durable ordinary queue owners to kick after restart or temporary holds.
@@ -201,7 +201,7 @@ impl Store {
     /// Returns database errors.
     pub async fn script_notification_delivery_owners(&self) -> Result<Vec<(AgentId, WorkspaceId)>> {
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT DISTINCT agent_id,workspace_id FROM agent_queue_admission")
+            sqlx::query_as("SELECT DISTINCT agent_id,workspace_id FROM agent_queue_admission WHERE phase != 'completed'")
                 .fetch_all(self.read_pool())
                 .await
                 .map_err(db)?;
@@ -268,26 +268,48 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn accept_script_notification(&self, agent: &AgentId, id: &str) -> Result<bool> {
-        let result=sqlx::query("UPDATE agent_queue_admission SET phase='accepted' WHERE id=? AND agent_id=? AND EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=agent_queue_admission.agent_id AND a.retired_at IS NULL AND w.archived=0)")
+        let result=sqlx::query("UPDATE agent_queue_admission SET phase='accepted' WHERE id=? AND agent_id=? AND phase != 'completed' AND EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=agent_queue_admission.agent_id AND a.retired_at IS NULL AND w.archived=0)")
             .bind(format!("script-monitor:{id}")).bind(agent.as_str()).execute(self.write_pool()).await.map_err(db)?;
         Ok(result.rows_affected() == 1)
     }
 
-    /// Remove a completed ordinary delivery receipt and any stale queue copy.
+    /// Durably settle delivery before best-effort physical cleanup. A failed
+    /// DELETE cannot make a completed turn eligible for replay on restart.
     /// # Errors
-    /// Returns database errors.
+    /// Returns database errors; a committed completion is still authoritative
+    /// if the subsequent cleanup fails.
     pub async fn complete_script_notification(&self, agent: &AgentId, id: &str) -> Result<()> {
-        let key = format!("script-monitor:{id}");
+        sqlx::query("UPDATE agent_queue_admission SET phase='completed',payload='{}' WHERE id=? AND agent_id=?")
+            .bind(format!("script-monitor:{id}")).bind(agent.as_str())
+            .execute(self.write_pool()).await.map_err(db)?;
+        self.cleanup_completed_script_notifications().await
+    }
+
+    /// Continue a notification on the worker's persisted warning turn. The
+    /// durable recovery payload follows that turn before it is submitted.
+    /// # Errors
+    /// Returns database failures.
+    pub async fn continue_script_notification(
+        &self,
+        agent: &AgentId,
+        id: &str,
+        turn: &str,
+        content: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_queue_admission SET turn_id=?,payload=json_set(payload,'$.turnId',?,'$.content',?,'$.persisted',json('true')) WHERE id=? AND agent_id=? AND phase='accepted'")
+            .bind(turn).bind(turn).bind(content).bind(format!("script-monitor:{id}")).bind(agent.as_str())
+            .execute(self.write_pool()).await.map_err(db)?;
+        Ok(())
+    }
+
+    /// Retry physical cleanup independently of delivery settlement.
+    /// # Errors
+    /// Returns database failures; completed rows remain non-runnable.
+    pub async fn cleanup_completed_script_notifications(&self) -> Result<()> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
-        sqlx::query("DELETE FROM agent_queue_admission WHERE id=? AND agent_id=?")
-            .bind(&key)
-            .bind(agent.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(db)?;
-        sqlx::query("DELETE FROM agent_queue WHERE id=? AND agent_id=?")
-            .bind(&key)
-            .bind(agent.as_str())
+        sqlx::query("DELETE FROM agent_queue WHERE id IN (SELECT id FROM agent_queue_admission WHERE phase='completed')")
+            .execute(&mut *tx).await.map_err(db)?;
+        sqlx::query("DELETE FROM agent_queue_admission WHERE phase='completed'")
             .execute(&mut *tx)
             .await
             .map_err(db)?;

@@ -712,14 +712,11 @@ async fn script_monitor_wss_lifecycle_suppresses_recoverable_wakes_and_active_ro
                 .script_monitor_wake_allowed("pending-wake")
                 .await
                 .unwrap());
-            assert_eq!(
-                f.store
-                    .script_monitor(&f.ws_id, "active-watch")
-                    .await
-                    .unwrap()
-                    .state,
-                "cancelled"
-            );
+            assert!(f
+                .store
+                .script_monitor(&f.ws_id, "active-watch")
+                .await
+                .is_err());
         }
         assert!(f
             .store

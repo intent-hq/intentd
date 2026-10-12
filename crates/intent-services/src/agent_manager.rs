@@ -5957,6 +5957,9 @@ impl AgentManager {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
+        if sync_store && !self.is_shutting_down() {
+            self.services.settle_script_monitor_worker(agent_id).await;
+        }
         self.services
             .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
             .await;
@@ -6131,6 +6134,7 @@ impl AgentManager {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
+        self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
         // error stash and the handler's take (monorepo#2050); the orphaned
         // context describes the aborted turn, so it must not survive into a
@@ -7043,6 +7047,7 @@ impl AgentManager {
         if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
             return;
         }
+        self.services.track_script_monitor_worker(agent_id, None);
         self.clear_worker(agent_id);
         self.end_turn(agent_id).await;
         drop(starting);
@@ -9195,6 +9200,8 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.services
+            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
         // (intent-hq/monorepo#1757): the stopped turn's user message (text +
         // attachments) is merged into this turn's `prepend_*` options so the
@@ -12710,6 +12717,8 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        mgr.services
+            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         if mgr.services.defer_script_monitor_for_export(
             &agent_id,
             &content,
@@ -12896,14 +12905,9 @@ async fn run_message_worker(
                         if let Some(id) =
                             crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                         {
-                            if let Err(error) = mgr
-                                .services
-                                .store
-                                .complete_script_notification(&agent_id, id)
-                                .await
-                            {
-                                tracing::warn!(%error,"notification completion receipt cleanup failed");
-                            }
+                            mgr.services
+                                .complete_script_monitor_delivery(&agent_id, id)
+                                .await;
                         }
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
@@ -12972,6 +12976,13 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            if let Some(id) =
+                                crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                            {
+                                mgr.services
+                                    .complete_script_monitor_delivery(&agent_id, id)
+                                    .await;
+                            }
                             // Concurrent stop/cancel won the turn — not a failure.
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
@@ -13110,9 +13121,41 @@ async fn run_message_worker(
                                     false,
                                 )
                                 .await;
+                                if user_persisted {
+                                    if let Some(id) = crate::script_monitor::monitor_id(
+                                        options.message_metadata.as_ref(),
+                                    ) {
+                                        if let Err(error) = mgr
+                                            .services
+                                            .store
+                                            .continue_script_notification(
+                                                &agent_id,
+                                                id,
+                                                &warning_turn_id,
+                                                &warning,
+                                            )
+                                            .await
+                                        {
+                                            handle_terminal_turn_failure(
+                                                &mgr,
+                                                &agent_id,
+                                                &workspace_id,
+                                                &content,
+                                                &options,
+                                                true,
+                                                &error,
+                                            )
+                                            .await;
+                                            mgr.release_in_flight_slot(&agent_id);
+                                            break 'outer;
+                                        }
+                                    }
+                                }
                                 content = warning;
                                 options = TurnOptions {
                                     turn_id: Some(warning_turn_id),
+                                    // The same delivery remains owned until its continuation ends.
+                                    message_metadata: options.message_metadata.clone(),
                                     ..TurnOptions::default()
                                 };
                                 // New message → fresh silent-redrive budget

@@ -74,22 +74,18 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "listPage" | "monitorsPage" => {
-            if !args.is_object() {
-                return Err("script page options must be an object".into());
-            }
-            let mut options = args.clone();
-            options["view"] = Value::String("summary".into());
-            if method == "listPage" {
-                api.script_list_view(ws.clone(), options)
-                    .await
-                    .map_err(map_err)
-            } else {
-                api.script_monitor_list_view(ws.clone(), Some(monitor_owner(caller)?), options)
-                    .await
-                    .map_err(map_err)
-            }
-        }
+        "listPage" => api
+            .script_list_view(ws.clone(), page_options(args)?)
+            .await
+            .map_err(map_err),
+        "monitorsPage" => api
+            .script_monitor_list_view(
+                ws.clone(),
+                Some(monitor_owner(caller)?),
+                page_options(args)?,
+            )
+            .await
+            .map_err(map_err),
         "get" => api
             .script_get(ws.clone(), req_str(args, "scriptId")?)
             .await
@@ -138,6 +134,15 @@ pub(crate) async fn dispatch(
         "run" => run(api, ws, budget, args).await,
         other => Err(format!("host: unknown method `script.{other}`")),
     }
+}
+
+fn page_options(args: &Value) -> Result<Value, String> {
+    if !args.is_object() {
+        return Err("script page options must be an object".into());
+    }
+    let mut options = args.clone();
+    options["view"] = Value::String("summary".into());
+    Ok(options)
 }
 
 fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
@@ -339,7 +344,7 @@ async fn run(
                 "ws.script.run: timeoutSeconds {requested} exceeds what one workspace_api call \
                  can wait for (ceiling {ceiling}s, budget {}s). Start the script with \
                  ws.script.start(scriptId), carry its nonempty runId into ws.script.monitor with required ttlMs, \
-                 and inspect the result. Wait only on success. Handle run-finished immediately; attribute output \
+                 and inspect the result. Wait only on success. Handle run-finished immediately; attribute ws.script.output \
                  only when status-before/output/status-after preserve that runId, otherwise unavailable. \
                  Follow already-monitored owner instructions; never silently rearm.",
                 budget.as_secs()

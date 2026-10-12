@@ -2000,6 +2000,7 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "name": "n", "command": "true", "mode": "command" }),
             ),
             ("script.list", json!({ "workspaceId": ws })),
+            ("script.get", script.clone()),
             ("script.output", script.clone()),
             ("script.remove", script.clone()),
             ("script.restart", script.clone()),

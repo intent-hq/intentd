@@ -1245,13 +1245,31 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     let mut ws = connect_ws(port2, cfg).await;
 
     let scripts = wss_rpc(&mut ws, 17, "script.list", json!({"workspaceId":ws_id})).await;
-    let recovered = scripts["scripts"]
+    assert!(scripts["scripts"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|script| script["id"] == script_id)
-        .expect("interrupted script remains in history");
-    assert_eq!(recovered["lastRun"]["outcome"], "interrupted");
+        .all(|script| script["id"] != script_id));
+    let recovered = wss_rpc(
+        &mut ws,
+        18,
+        "script.status",
+        json!({"workspaceId":ws_id,"scriptId":script_id}),
+    )
+    .await;
+    assert_eq!(recovered["status"], "exited");
+    assert_eq!(recovered["exitCode"], -1);
+    let output = wss_rpc(
+        &mut ws,
+        19,
+        "script.output",
+        json!({"workspaceId":ws_id,"scriptId":script_id}),
+    )
+    .await;
+    assert!(
+        output.is_string(),
+        "known-ID output remains readable: {output}"
+    );
 
     // Phase 3: Call agent.listInterrupted over WSS.
     let result = wss_rpc(&mut ws, 4, "agent.listInterrupted", json!({})).await;

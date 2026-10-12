@@ -11036,7 +11036,7 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         "SELECT record_json FROM node_lease WHERE id='upgrade-lease'",
         "SELECT record_json FROM node_assignment WHERE agent_id='upgrade-agent'",
         "SELECT json_array(purpose,latest_run_id,latest_run_result,command) FROM script WHERE id='upgrade-script'",
-        "SELECT json_array(state,row_json,run_id,wake_state) FROM script_monitor WHERE id='upgrade-monitor'",
+        "SELECT json_array(state,row_json,run_id) FROM script_monitor WHERE id='upgrade-monitor'",
         "SELECT json_array(title,branch,repository_path,repository_owner,repository_name,created_at,updated_at) FROM workspace WHERE id='upgrade-workspace'",
         "SELECT json_array(repo_owner,repo_name,pr_number,state,created_at,updated_at) FROM pr_monitor WHERE monitor_id='upgrade-pr'",
         "SELECT json_array(principal_id,revoked_at,created_at) FROM principal_credential WHERE token_hash='upgrade-credential'",

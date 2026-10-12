@@ -7243,7 +7243,7 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Select active, archived or all retained definitions, preserving the list envelope.
+    /// Select only active definitions, preserving the legacy list envelope.
     fn script_list_filtered(
         &self,
         workspace_id: WorkspaceId,
@@ -7255,7 +7255,18 @@ pub trait WorkspaceApi: Send + Sync {
                     "only active script lists are supported".into(),
                 ));
             }
-            self.script_list(workspace_id).await
+            let mut result = self.script_list(workspace_id).await?;
+            let rows = if result.is_array() {
+                result.as_array_mut()
+            } else {
+                result
+                    .get_mut("scripts")
+                    .and_then(serde_json::Value::as_array_mut)
+            };
+            if let Some(rows) = rows {
+                rows.retain(|row| row.get("archivedAt").is_none_or(serde_json::Value::is_null));
+            }
+            Ok(result)
         })
     }
 

@@ -2136,16 +2136,17 @@ mod tests {
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
     // rendering (the common case for truncating providers) includes the
-    // retirement binding and three native script-monitor helpers. The latter
-    // add bounded signatures to the prior 22.4k budget; detail remains in help.
+    // retirement/monitor bindings and four compact-page/detail helpers.
+    // The four new signatures add ~0.5k to the prior 22.7k budget;
+    // detailed guidance remains in on-demand help.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         eprintln!("condensed all-on description: {} bytes", condensed.len());
         assert!(
-            condensed.len() < 22_700,
-            "condensed all-on description is {} bytes, over the 22.7k budget",
+            condensed.len() < 23_250,
+            "condensed all-on description is {} bytes, over the 23.25k budget",
             condensed.len()
         );
     }

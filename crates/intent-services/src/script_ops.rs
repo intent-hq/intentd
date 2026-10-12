@@ -147,6 +147,8 @@ pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), Manage
 pub(crate) struct ScriptLocks {
     pub(crate) monitor_maintenance: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) monitor_lane: Arc<AsyncMutex<()>>,
+    pub(crate) monitor_workers: Arc<Mutex<HashMap<intent_core::AgentId, String>>>,
+    pub(crate) monitor_completions: Arc<Mutex<HashSet<(intent_core::AgentId, String)>>>,
     monitor_windows: Arc<Mutex<HashMap<String, monitors::Window>>>,
     hydration: Arc<AsyncMutex<()>>,
     workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
@@ -600,7 +602,20 @@ impl ScriptManager {
         // recovering caller gets the chance to publish the committed snapshot.
         let _hydrating = self.locks.hydration.lock().await;
         let recovered = self.recover_commands().await?;
-        let defs = self.store.list_unarchived_scripts().await?;
+        let mut defs = self.store.list_unarchived_scripts().await?;
+        // Recovery knows these exact IDs from unfinished runs. Publish their
+        // terminal snapshots even when one-off settlement just archived them;
+        // do not enumerate unrelated archived definitions.
+        for (ws, id) in &recovered {
+            if !defs
+                .iter()
+                .any(|def| def.workspace_id == ws.as_str() && def.id == *id)
+            {
+                if let Some(def) = self.store.get_script_in_workspace(ws, id).await? {
+                    defs.push(def);
+                }
+            }
+        }
         let mut was_running: HashSet<(String, String)> = self
             .store
             .list_was_running_script_ids()
@@ -694,6 +709,15 @@ impl ScriptManager {
 
     /// Selected known-ID access may lazily load an archived definition; lists never do.
     pub(crate) async fn ensure_known(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        // Runtime reads must remain available while a mutation joins its supervisor.
+        if self
+            .scripts
+            .lock()
+            .unwrap()
+            .contains_key(&(ws.clone(), id.to_owned()))
+        {
+            return Ok(());
+        }
         let lock = self.locks.definition_lock(id);
         let _guard = lock.lock().await;
         self.ensure_known_locked(ws, id).await
@@ -715,8 +739,12 @@ impl ScriptManager {
             if let Some(result) = result {
                 state.status = ScriptStatus::Exited;
                 state.exit_code = result.exit_code;
-                state.started_at = result.started_at;
-                state.stopped_at = Some(result.stopped_at);
+                // Recovery times describe the durable outcome, not an observed
+                // runtime. Keep known-ID reads consistent across later boots.
+                if result.error.as_deref() != Some(LOST_AT_DAEMON_STOP_ERROR) {
+                    state.started_at = result.started_at;
+                    state.stopped_at = Some(result.stopped_at);
+                }
                 state.error = result.error;
             }
         }
@@ -1398,6 +1426,7 @@ impl ScriptManager {
         self.spawn_owned(async move {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
         .await
@@ -4498,16 +4527,19 @@ mod tests {
             "a failed relaunch durably clears the lost marker"
         );
 
-        // Fresh boot: plain idle, nothing resurrected as lost.
+        // Archived commands are loaded only on known-ID access after boot.
         let svc3 = Services::new(store.clone());
-        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 0);
+        assert!(svc3.script_list(h.ws.clone()).await.unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
-        assert_eq!(st["status"], "idle", "post-failure hydration: {st}");
+        assert_eq!(st["status"], "exited", "post-failure selected status: {st}");
+        assert_ne!(st["error"], LOST_AT_DAEMON_STOP_ERROR);
         assert!(
-            st.get("exitCode").is_none()
-                && st.get("error").is_none()
-                && st.get("previouslyRunning").is_none(),
-            "no marker-derived reading survives: {st}"
+            st.get("previouslyRunning").is_none(),
+            "no recovery marker survives: {st}"
         );
     }
 

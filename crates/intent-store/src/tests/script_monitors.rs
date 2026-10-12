@@ -751,3 +751,107 @@ async fn monitor_transfer_preserves_delivery_and_reimport_never_revives_settled_
         }
     }
 }
+
+#[tokio::test]
+async fn completed_cleanup_receipt_never_replays_or_exports_pending_work() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let (ws, agent) = seed(&store, "completed-cleanup").await;
+    let row = monitor(&ws, &agent, "cleanup");
+    store.insert_script_monitor(&row).await.unwrap();
+    store.settle_script_monitor(&triggered(&row)).await.unwrap();
+    let queued = queue(&row);
+    store.admit_script_notification(&queued).await.unwrap();
+    store
+        .accept_script_notification(&agent, "cleanup")
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_cleanup BEFORE DELETE ON agent_queue_admission BEGIN SELECT RAISE(ABORT,'cleanup failure'); END").execute(store.write_pool()).await.unwrap();
+    assert!(store
+        .complete_script_notification(&agent, "cleanup")
+        .await
+        .is_err());
+    let phase: (String, String) = sqlx::query_as("SELECT phase,payload FROM agent_queue_admission")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(phase, ("completed".into(), "{}".into()));
+    let stale: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_queue")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "failed cleanup retains the stale queue branch too"
+    );
+    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+    assert!(!store
+        .script_monitor_pending_for_agent(&agent)
+        .await
+        .unwrap());
+    assert!(store
+        .script_notification_delivery_owners()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!store.script_monitor_wake_allowed("cleanup").await.unwrap());
+    assert!(!store
+        .script_monitor_wake_allowed_for_agent("cleanup", &agent, &ws)
+        .await
+        .unwrap());
+    assert!(!store
+        .accept_script_notification(&agent, "cleanup")
+        .await
+        .unwrap());
+    assert!(store
+        .append_agent_message_with_provenance(
+            &agent,
+            &queued.id,
+            "user",
+            &json!([]),
+            Some(&metadata(&row)),
+            &now_iso(),
+            crate::UsageMessageOrigin::Excluded
+        )
+        .await
+        .is_err());
+    let exported = store.transfer_export_rows(&ws).await.unwrap();
+    for table in [
+        "script_monitor",
+        "script_notification_job",
+        "agent_queue_admission",
+        "agent_queue",
+    ] {
+        assert!(
+            exported
+                .iter()
+                .find(|(name, _)| name == table)
+                .unwrap()
+                .1
+                .is_empty(),
+            "completed cleanup is not transferable work: {table}"
+        );
+    }
+    let target = TempDb::new();
+    let imported = Store::open(&target.path).await.unwrap();
+    imported.transfer_import_rows(&exported).await.unwrap();
+    assert!(imported.load_all_agent_queues().await.unwrap().is_empty());
+    store.replace_agent_queue(&agent, &[queued]).await.unwrap();
+    assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+    store.close().await;
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert!(reopened.load_all_agent_queues().await.unwrap().is_empty());
+    sqlx::query("DROP TRIGGER fail_cleanup")
+        .execute(reopened.write_pool())
+        .await
+        .unwrap();
+    reopened
+        .cleanup_completed_script_notifications()
+        .await
+        .unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_queue_admission")
+        .fetch_one(reopened.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
