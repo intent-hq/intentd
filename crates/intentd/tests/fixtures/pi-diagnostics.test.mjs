@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import diagnostics from './pi-diagnostics.cjs';
@@ -154,4 +155,36 @@ test('nested JSON error labels are redacted before reports and artifacts are emi
       message = JSON.stringify({ details: message });
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('witness rename recovery is bounded and preserves permanent publication errors', () => {
+  const source = readFileSync(new URL('./pi-diagnostics.cjs', import.meta.url), 'utf8');
+  for (const [code, deniedAttempts, expectedAttempts] of [['EPERM', 2, 3], ['EPERM', Infinity, 5], ['EIO', Infinity, 1]]) {
+    const failure = Object.assign(new Error('publication denied'), { code });
+    const writes = [], waits = [];
+    let attempts = 0;
+    const module = { exports: {} };
+    runInNewContext(source, { module, Buffer, SharedArrayBuffer, Int32Array,
+      Atomics: { wait(_buffer, _index, _value, ms) { waits.push(ms); } },
+      require(name) {
+        assert.equal(name, 'node:fs');
+        return {
+          writeFileSync(...args) { writes.push(args); },
+          renameSync(from, to) {
+            assert.equal(from, 'witness.json.tmp');
+            assert.equal(to, 'witness.json');
+            if (++attempts <= deniedAttempts) throw failure;
+          },
+        };
+      },
+    });
+    const publish = () => module.exports.writeWitness('witness.json', { close: { code: 73 } });
+    if (deniedAttempts === Infinity) assert.throws(publish, error => error === failure);
+    else publish();
+    assert.equal(attempts, expectedAttempts);
+    assert.deepEqual(writes, [['witness.json.tmp', '{"close":{"code":73}}']], 'Retry only the same atomic rename');
+    assert.equal(waits.length, expectedAttempts - 1);
+    assert.ok(waits.every(ms => ms > 0) && waits.reduce((sum, ms) => sum + ms, 0) <= 100);
+  }
 });

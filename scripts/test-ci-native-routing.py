@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Exercise native CI event routing and the real CI Gate shell body offline.
+"""Exercise the real runner probe, native event routing and CI Gate offline.
 
 The small expression interpreter supports only the boolean/context subset used
 by these job and native-step conditions; unknown syntax fails closed. This is
-not an Actions runner: matrix scheduling and implicit success are modeled,
-while the gate's actual shell is executed with substituted result fixtures.
+not an Actions runner: matrix expressions and implicit success are modeled,
+while the actual probe JS and gate shell execute against API/result fixtures.
 """
 
 import ast
 import copy
+import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -51,6 +53,8 @@ def condition(value, context, *, success=True, cancelled=False):
     has_status = bool(re.search(r"\b(always|success|failure|cancelled)\(\)", expression))
     statuses = {"always": True, "success": success, "failure": not success, "cancelled": cancelled}
     expression = re.sub(r"\b(always|success|failure|cancelled)\(\)", lambda m: repr(statuses[m[1]]), expression)
+    expression = re.sub(r"contains\(matrix.os, 'self-hosted'\)",
+                        lambda _: repr("self-hosted" in context.get("matrix.os", [])), expression)
     expression = re.sub(r"\b(?:github|needs|runner)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression).strip()
@@ -205,6 +209,171 @@ def gitlab_errors(workflow):
     if step.get("env", {}).get("INTENTD_ASSERT_BOUND_CALLER") != "1":
         errors.append("GitLab caller policy must remain armed")
     return errors
+
+
+def run_route(workflow, **fixture):
+    """Execute the workflow's actual github-script body with offline API fixtures."""
+    step = next(s for s in workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
+    harness = r"""
+const { script, fixture } = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const outputs = {}, calls = [], logs = [];
+const github = {
+  rest: { actions: {
+    listSelfHostedRunnersForOrg: 'org', listSelfHostedRunnersForRepo: 'repo',
+    async listWorkflowRunsForRepo(args) {
+      if ((fixture.queueErrors || []).includes(args.repo)) throw new Error('queue unavailable');
+      return { data: { workflow_runs: args.repo === 'intentd' && args.status === 'queued' ? [{ id: 1 }] : [] } };
+    },
+    async listJobsForWorkflowRun() { return { data: { jobs: fixture.jobs || [] } }; },
+  } },
+  async paginate(endpoint, args) {
+    calls.push({ endpoint, args });
+    if (fixture[endpoint + 'Error']) throw new Error(fixture[endpoint + 'Error']);
+    return fixture[endpoint] ?? [];
+  },
+};
+const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
+process.env.THRESHOLD = '8';
+const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+new AsyncFunction('github', 'core', 'context', script)(github, core, context)
+  .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
+  .catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(["node", "-e", harness],
+                            input=json.dumps({"script": step["with"]["script"], "fixture": fixture}),
+                            env={k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"},
+                            capture_output=True, text=True, timeout=10, check=True)
+    return json.loads(result.stdout)
+
+
+def route_outputs(workflow, outputs):
+    result = {}
+    for key, expression in workflow["jobs"]["route"]["outputs"].items():
+        match = re.fullmatch(r"\$\{\{ steps\.decide\.outputs\.(\w+) \}\}", expression)
+        if not match:
+            raise ValueError(f"unsupported job output: {expression}")
+        result[key] = outputs.get(match[1], "")
+    return result
+
+
+def matrix_labels(value, outputs):
+    """Evaluate only the actual matrix's output-or-JSON-fallback expression."""
+    if isinstance(value, list):
+        return value
+    match = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.(\w+) \|\| '([^']+)'\) \}\}", value)
+    if not match:
+        raise ValueError(f"unsupported runner expression: {value}")
+    return json.loads(outputs.get(match[1], "") or match[2])
+
+
+def runner(platform="macOS", arch="ARM64", *, status="online", busy=False):
+    return {"status": status, "busy": busy,
+            "labels": [{"name": name} for name in ("self-hosted", platform, arch)]}
+
+
+class RunnerAvailabilityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+
+    def assert_mac_route(self, fixture, expected):
+        result = run_route(self.workflow, **fixture)
+        outputs = route_outputs(self.workflow, result["outputs"])
+        self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["macos-15"]).lower())
+        for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
+                                     ("daemon-lifecycle", "platform", "macos")):
+            job = self.workflow["jobs"][job_id]
+            self.assertIn("route", job["needs"])
+            self.assertEqual(job["runs-on"], "${{ matrix.os }}")
+            row = next(r for r in job["strategy"]["matrix"]["include"] if r[field] == value)
+            self.assertEqual(matrix_labels(row["os"], outputs), expected)
+        return result
+
+    def test_macos_requires_positive_idle_matching_availability(self):
+        missing_busy = runner()
+        missing_busy.pop("busy")
+        for fleet in ([], [runner(status="offline")], [runner(busy=True)], [missing_busy],
+                      [runner(busy=None)], [runner(busy="false")], [runner(busy=0)],
+                      [runner(arch="X64")], [runner(platform="Linux")],
+                      [{**runner(), "labels": []}], [{**runner(), "labels": None}],
+                      [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
+                      [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
+            with self.subTest(fleet=fleet):
+                self.assert_mac_route({"org": fleet}, ["macos-15"])
+        for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
+                      [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
+                      [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
+            with self.subTest(fleet=fleet):
+                self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
+
+    def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
+        cases = [({}, ["macos-15"], ["org"]),
+                 ({"orgError": "403 missing permission", "repo": [runner()]},
+                  ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["macos-15"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": []}, ["macos-15"], ["org", "repo"]),
+                 ({"orgError": "403", "repoError": "403 missing permission"}, ["macos-15"], ["org", "repo"]),
+                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["macos-15"], ["org", "repo"]),
+                 ({"org": {"unexpected": "response"}}, ["macos-15"], ["org"]),
+                 ({"org": [], "repo": [runner()]}, ["macos-15"], ["org"])]
+        for fixture, expected, endpoints in cases:
+            with self.subTest(fixture=fixture):
+                result = self.assert_mac_route(fixture, expected)
+                self.assertEqual([call["endpoint"] for call in result["calls"]], endpoints)
+                for call in result["calls"]:
+                    self.assertEqual(call["args"], {"org": "intent-hq", "per_page": 100} if call["endpoint"] == "org"
+                                     else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
+
+    def test_linux_and_windows_keep_existing_queue_and_online_semantics(self):
+        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64", busy=True), runner()]
+        for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
+                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "monorepo"], False)):
+            with self.subTest(depth=depth, queue_errors=queue_errors):
+                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux"]}
+                        for i in range(depth)]
+                jobs += [{"status": "in_progress", "labels": ["gh-linux-16x"]}] * 20
+                result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
+                                              ["self-hosted", "macOS", "ARM64"])
+                outputs = result["outputs"]
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"] if linux_burst else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"] if linux_burst else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+                self.assertEqual(outputs["windows_burst"], "false")
+        for fixture in ({}, {"orgError": "403", "repoError": "403"},
+                        {"org": [runner("Linux", "X64", status="offline"), runner("Windows", "X64", status="offline")]},
+                        {"org": [runner("linux", "x64"), runner("windows", "x64")]}):
+            with self.subTest(fixture=fixture):
+                outputs = run_route(self.workflow, **fixture)["outputs"]
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
+                self.assertEqual(outputs["linux_burst"], "true")
+                self.assertEqual(outputs["windows_burst"], "true")
+
+    def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
+        for job_id in ("build", "daemon-lifecycle"):
+            for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
+                expected = ["macos-15"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                    ["gh-linux-16x"] if row.get("platform") == "linux" else ["gh-windows-16x"])
+                for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
+                    with self.subTest(job=job_id, row=row, outputs=outputs):
+                        self.assertEqual(matrix_labels(row["os"], outputs), expected)
+        mac = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"][0]
+        self.assertEqual(mac["name"], "build (aarch64-apple-darwin, macos-14)")
+        self.assertEqual(self.workflow["jobs"]["daemon-lifecycle"]["name"], "Daemon lifecycle (${{ matrix.platform }})")
+
+    def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
+        steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
+        for labels in (["macos-15"], ["self-hosted", "macOS", "ARM64"]):
+            for fast_path in ("", "true"):
+                values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
+                for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):
+                    self.assertEqual(condition(steps[name]["if"], values), fast_path != "true" and "self-hosted" in labels)
+                self.assertEqual(condition(steps["Rust cache (GitHub-hosted runner only)"]["if"], values),
+                                 fast_path != "true" and "self-hosted" not in labels)
 
 
 class NativeRoutingTests(unittest.TestCase):
