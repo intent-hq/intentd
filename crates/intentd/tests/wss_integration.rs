@@ -15390,6 +15390,11 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     .await;
     let result = &resp["result"];
     assert_eq!(result["branch"], "feature/wss");
+    assert!(result["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(result["gitStatus"]["branch"], "feature/wss");
+    assert_eq!(result["gitStatus"]["files"], serde_json::json!([]));
     assert_eq!(result["trunkBranch"], "main");
     assert_eq!(result["hasRemote"], false);
     assert_eq!(result["aheadOfTrunk"], 1);
@@ -15406,6 +15411,63 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     // Metadata-only walk: no per-commit tree diffs in getStatus.
     assert!(c.get("files").is_none());
     assert!(c.get("filesChanged").is_none());
+
+    // A real WSS subscriber receives the same additive snapshot after a
+    // mutation. Adding a remote is network-free and does not change history.
+    let mut subscriber = connect_ws(srv.port, srv.cfg.clone()).await;
+    subscriber
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc":"2.0", "id":10, "method":"events.subscribe",
+                "params":{"workspaceId":ws_id,"eventTypes":["changes:git-status"]}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == 10 {
+                    assert!(response["result"]["subscriptionId"].is_string());
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let added = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":11, "method":"accept-changes.addRemote",
+            "params":{"workspaceId":ws_id,"remoteUrl":"https://github.com/example/history.git"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        added["result"]["historyIdentity"],
+        result["historyIdentity"]
+    );
+    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["method"] == "events.event"
+                    && event["params"]["event"]["type"] == "changes:git-status"
+                {
+                    break event["params"]["event"]["data"]["status"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pushed, added["result"]);
 
     srv.ws.stop().await;
 }
