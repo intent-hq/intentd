@@ -327,6 +327,39 @@ class NativeRoutingTests(unittest.TestCase):
             gate["run"] = gate["run"].replace("${{ needs.daemon-lifecycle.result }}", "success")
             self.assertIn(f"{event}: daemon-lifecycle=skipped", gate_errors(workflow))
 
+    def test_context_proof_uses_existing_trusted_native_route_and_retains_evidence(self):
+        job = self.workflow["jobs"]["daemon-lifecycle"]
+        for event, same_repo, expected in (("pull_request", True, True), ("merge_group", True, True),
+                                           ("pull_request", False, False), ("push", True, False)):
+            ctx = context(event)
+            ctx["github.repository"] = "intent-hq/intentd"
+            ctx["github.event.pull_request.head.repo.full_name"] = "intent-hq/intentd" if same_repo else "fork/intentd"
+            self.assertEqual(condition(job["if"], ctx), expected)
+        steps = job["steps"]
+        proof = next(s for s in steps if s.get("name") == "Native context consumer discovery and runtime proof")
+        self.assertNotIn("if", proof)
+        self.assertFalse(proof.get("continue-on-error", False))
+        self.assertEqual(proof["shell"], "bash")
+        self.assertEqual(proof["run"], "python -I -B scripts/test-context-consumer-native.py")
+        self.assertEqual(proof["env"], {
+            "INTENTD_ASSERT_BOUND_CALLER": "1", "INTENTD_TEST_TIMEOUT_MULTIPLIER": "1",
+            "CONTEXT_CONSUMER_EVIDENCE": "${{ runner.temp }}/context-consumer-proof",
+        })
+        python = next(s for s in steps if s.get("uses", "").startswith("actions/setup-python@"))
+        self.assertEqual(python["with"]["python-version"], "3.12")
+        self.assertLess(steps.index(python), steps.index(proof))
+        upload = next(s for s in steps if s.get("name") == "Upload native context consumer evidence")
+        self.assertEqual(upload["if"], "${{ always() }}")
+        self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["with"], {
+            "name": "context-consumer-${{ matrix.platform }}",
+            "path": "${{ runner.temp }}/context-consumer-proof/",
+            "if-no-files-found": "warn", "retention-days": 7,
+        })
+        regressions = self.workflow["jobs"]["release-scripts"]["steps"]
+        self.assertTrue(any("python3 -I -B scripts/test-context-consumer-native-proof.py" in s.get("run", "").splitlines()
+                            for s in regressions))
+
     def test_expression_status_and_unknown_syntax(self):
         self.assertFalse(condition("github.event_name != 'push'", context("pull_request"), success=False))
         self.assertTrue(condition("!cancelled()", {}, success=False))

@@ -1885,7 +1885,9 @@ jobs:
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
       - name: Test native CI routing and gate results
-        run: python3 -I -B scripts/test-ci-native-routing.py
+        run: |
+          python3 -I -B scripts/test-ci-native-routing.py
+          python3 -I -B scripts/test-context-consumer-native-proof.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -2081,11 +2083,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: daemon-lifecycle-${{ matrix.platform }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Native lifecycle lint and runtime proof
         shell: bash
         run: |
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
+      - name: Native context consumer discovery and runtime proof
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_TEST_TIMEOUT_MULTIPLIER: "1"
+          CONTEXT_CONSUMER_EVIDENCE: ${{ runner.temp }}/context-consumer-proof
+        run: python -I -B scripts/test-context-consumer-native.py
+      - name: Upload native context consumer evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: context-consumer-${{ matrix.platform }}
+          path: ${{ runner.temp }}/context-consumer-proof/
+          if-no-files-found: warn
+          retention-days: 7
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
