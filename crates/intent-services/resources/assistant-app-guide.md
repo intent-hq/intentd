@@ -302,9 +302,9 @@ the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the
 connected backend does not support cancellable deletion, the note is kept.
 
-In test builds that offer **Edit Raw Markdown** in a note's **…** menu, use it
-to edit Markdown directly; large notes otherwise stay read-only. **Back to
-rendered view** flushes pending edits and waits for the save acknowledgement before
+In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
+in a note's **…** menu to edit Markdown directly; large notes otherwise stay
+read-only. **Back to rendered view** flushes pending edits and waits for the save acknowledgement before
 leaving the editor. Returning does not undo saved changes. If saving fails or
 conflicts, the draft and editor stay open: use **Retry save** after addressing the
 error, then return. A rendered-note loading error is separate from a save failure;
