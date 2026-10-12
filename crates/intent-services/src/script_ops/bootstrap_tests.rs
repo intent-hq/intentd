@@ -98,11 +98,7 @@ async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
 
     // The same calls made by a reconnecting client must not recreate defaults.
     for _ in 0..2 {
-        for archive in [
-            ScriptArchiveFilter::All,
-            ScriptArchiveFilter::Active,
-            ScriptArchiveFilter::Archived,
-        ] {
+        for archive in [ScriptArchiveFilter::Active] {
             assert_eq!(
                 h.services
                     .script_list_filtered(h.ws.clone(), archive)
@@ -116,11 +112,7 @@ async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
 
     let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
     restarted.script_manager().hydrate().await.unwrap();
-    for archive in [
-        ScriptArchiveFilter::Archived,
-        ScriptArchiveFilter::Active,
-        ScriptArchiveFilter::All,
-    ] {
+    for archive in [ScriptArchiveFilter::Active] {
         assert_eq!(
             restarted
                 .script_list_filtered(h.ws.clone(), archive)

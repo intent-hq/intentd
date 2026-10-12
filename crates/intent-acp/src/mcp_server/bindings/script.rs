@@ -40,6 +40,10 @@ pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.script = {
         monitor: (scriptId, options) => host({ method: 'script.monitor', args: { scriptId, ...(options || {}) } }),
+        listPage: (options) => host({ method: 'script.listPage', args: options || {} }),
+        monitorsPage: (options) => host({ method: 'script.monitorsPage', args: options || {} }),
+        get: (scriptId) => host({ method: 'script.get', args: { scriptId } }),
+        monitorDetails: (monitorId) => host({ method: 'script.monitorDetails', args: { monitorId } }),
         monitors: () => host({ method: 'script.monitors', args: {} }),
         unmonitor: (monitorId) => host({ method: 'script.unmonitor', args: { monitorId } }),
         list: (options) => host({ method: 'script.list', args: options || {} }),
@@ -70,6 +74,30 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
+        "listPage" => api
+            .script_list_view(ws.clone(), page_options(args)?)
+            .await
+            .map_err(map_err),
+        "monitorsPage" => api
+            .script_monitor_list_view(
+                ws.clone(),
+                Some(monitor_owner(caller)?),
+                page_options(args)?,
+            )
+            .await
+            .map_err(map_err),
+        "get" => api
+            .script_get(ws.clone(), req_str(args, "scriptId")?)
+            .await
+            .map_err(map_err),
+        "monitorDetails" => api
+            .script_monitor_get(
+                ws.clone(),
+                req_str(args, "monitorId")?,
+                Some(monitor_owner(caller)?),
+            )
+            .await
+            .map_err(map_err),
         "monitor" => api
             .script_monitor(
                 ws.clone(),
@@ -108,6 +136,15 @@ pub(crate) async fn dispatch(
     }
 }
 
+fn page_options(args: &Value) -> Result<Value, String> {
+    if !args.is_object() {
+        return Err("script page options must be an object".into());
+    }
+    let mut options = args.clone();
+    options["view"] = Value::String("summary".into());
+    Ok(options)
+}
+
 fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
     caller
         .cloned()
@@ -142,6 +179,11 @@ async fn list(
     // JS callers get the documented shape; fall back to the raw value for
     // forward-compatibility with any daemon that already returns a bare
     // array.
+    let options =
+        intent_core::script_lists::ScriptListOptions::parse(args, false).map_err(map_err)?;
+    if options.summary {
+        return Err("use script.listPage for summary pages".into());
+    }
     let archive = args
         .get("archive")
         .map(|value| serde_json::from_value(value.clone()))
@@ -301,8 +343,10 @@ async fn run(
             return Err(format!(
                 "ws.script.run: timeoutSeconds {requested} exceeds what one workspace_api call \
                  can wait for (ceiling {ceiling}s, budget {}s). Start the script with \
-                 ws.script.start(scriptId) and register ws.script.monitor with a required ttlMs; \
-                 then read ws.script.output(scriptId) after its wake.",
+                 ws.script.start(scriptId), carry its nonempty runId into ws.script.monitor with required ttlMs, \
+                 and inspect the result. Wait only on success. Handle run-finished immediately; attribute ws.script.output \
+                 only when status-before/output/status-after preserve that runId, otherwise unavailable. \
+                 Follow already-monitored owner instructions; never silently rearm.",
                 budget.as_secs()
             ));
         }

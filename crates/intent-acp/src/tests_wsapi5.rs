@@ -1542,16 +1542,17 @@ async fn file_rename_forwards_pair() {
 #[tokio::test]
 async fn script_list_archive_filters_are_explicit_and_strict() {
     let (srv, _) = server();
-    for (options, expected) in [
-        ("{}", 1),
-        ("{archive:'all'}", 2),
-        ("{archive:'archived'}", 1),
-    ] {
+    for (options, expected) in [("{}", 1), ("{archive:'active'}", 1)] {
         let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
         assert_eq!(resp["result"]["isError"], false);
         assert_eq!(body(&resp).as_array().unwrap().len(), expected);
     }
-    for options in ["{archive:null}", "{archive:'unknown'}"] {
+    for options in [
+        "{archive:null}",
+        "{archive:'unknown'}",
+        "{archive:'all'}",
+        "{archive:'archived'}",
+    ] {
         let resp = call(&srv, &format!("return await ws.script.list({options});")).await;
         assert_eq!(resp["result"]["isError"], true);
     }

@@ -36,7 +36,15 @@ async fn script_snapshots_cover_committed_results_and_restore() {
         let event = await_script_change(&mut sub, "updated").await;
         let row = &event["data"]["script"];
         assert_eq!(row["lastRun"]["outcome"], expected);
-        assert_eq!(*row, mgr.list(&h.ws).await.unwrap()["scripts"][0]);
+        if purpose == intent_core::ScriptPurpose::Saved {
+            assert_eq!(*row, mgr.list(&h.ws).await.unwrap()["scripts"][0]);
+        } else {
+            assert!(mgr.list(&h.ws).await.unwrap()["scripts"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert_eq!(row["runtime"], mgr.status(&h.ws, &id).unwrap());
+        }
         assert_eq!(
             row["archivedAt"].is_string(),
             purpose == intent_core::ScriptPurpose::OneOff
@@ -87,9 +95,13 @@ async fn script_snapshot_recovery_installs_matching_runtime_before_publication()
     let row = &event["data"]["script"];
     assert_eq!(row["lastRun"]["outcome"], "interrupted");
     assert_eq!(row["runtime"]["status"], "exited");
+    assert!(fresh.script_manager().list(&h.ws).await.unwrap()["scripts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        *row,
-        fresh.script_manager().list(&h.ws).await.unwrap()["scripts"][0]
+        row["runtime"],
+        fresh.script_status(h.ws.clone(), id).await.unwrap()
     );
     assert_eq!(fresh.hydrate_scripts().await.unwrap(), 0);
 }
@@ -356,7 +368,13 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         .await;
         let mgr = h.services.script_manager();
         mgr.run(&h.ws, &id, None, Some(5)).await.unwrap();
-        let before = mgr.list(&h.ws).await.unwrap()["scripts"][0].clone();
+        let before = h
+            .services
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
         mgr.stop(&h.ws, &id).await.unwrap();
         let events = h
             .services
@@ -372,10 +390,16 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
             events.iter().any(|e| e.data["status"] == "idle"),
             "finished stop must publish its runtime change"
         );
-        let after = mgr.list(&h.ws).await.unwrap()["scripts"][0].clone();
-        assert_eq!(after["runtime"]["status"], "idle");
-        assert_eq!(after["archivedAt"], before["archivedAt"]);
-        assert_eq!(after["lastRun"], before["lastRun"]);
+        let after = h
+            .services
+            .store
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mgr.status(&h.ws, &id).unwrap()["status"], "idle");
+        assert_eq!(after.archived_at, before.archived_at);
+        assert_eq!(after.last_run, before.last_run);
         mgr.stop(&h.ws, &id).await.unwrap();
         let after_noop = h
             .services
@@ -392,6 +416,12 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
             events.len(),
             "an already-idle stop is a true no-op"
         );
-        assert_eq!(mgr.list(&h.ws).await.unwrap()["scripts"][0], after);
+        assert_eq!(
+            mgr.list(&h.ws).await.unwrap()["scripts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            usize::from(purpose == intent_core::ScriptPurpose::Saved)
+        );
     }
 }
