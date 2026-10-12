@@ -15537,6 +15537,23 @@ async fn wss_file_tracking_load_commits_bounded() {
         ),
     )
     .await;
+    assert!(resp["result"]["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":20, "method":"accept-changes.getStatus",
+            "params":{"workspaceId":ws_id}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["historyIdentity"],
+        status["result"]["historyIdentity"]
+    );
     assert!(
         resp["result"]["commits"].is_array(),
         "commits field: {resp}"
