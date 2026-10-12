@@ -843,7 +843,8 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           python3 -I -B -S - <<'PYTHON'
-          import os, signal, subprocess
+          import json, os, signal, subprocess
+          from pathlib import Path
 
           cargo = ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"],
                    "cargo", "test", "--locked", "--target", os.environ["INTENTD_TUNNEL_TARGET"]]
@@ -862,9 +863,11 @@ jobs:
               ]),
           ]
 
-          def bounded(command):
+          def bounded(command, package_dir, env):
+              print("+ " + repr(command), flush=True)
               child = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       cwd=package_dir, env=env)
               try:
                   output, _ = child.communicate(timeout=30)
                   print(output, end="", flush=True)
@@ -876,14 +879,46 @@ jobs:
                   print(output, end="", flush=True)
                   raise
 
+          rust_lib = subprocess.check_output(
+              ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"], "rustc",
+               "--print", "target-libdir", "--target", os.environ["INTENTD_TUNNEL_TARGET"]], text=True).strip()
           for package, tests in groups:
-              subprocess.run(cargo + package + ["--no-run"], check=True)
+              # Compilation has the step's budget. A later Cargo invocation
+              # can rebuild even after --no-run (e.g. missing watched Git
+              # metadata); never charge that work to the 30s runtime proof.
+              built = subprocess.run(cargo + package + ["--no-run", "--message-format=json-render-diagnostics"],
+                                     check=True, stdout=subprocess.PIPE, text=True)
+              messages = [json.loads(line) for line in built.stdout.splitlines() if line.startswith("{")]
+              package_dir = Path("crates", package[1]).resolve()
+              kind = "lib" if "--lib" in package else "test"
+              name = package[1].replace("-", "_") if kind == "lib" else package[package.index("--test") + 1]
+              artifacts = [m for m in messages if m.get("reason") == "compiler-artifact"
+                           and m.get("profile", {}).get("test") is True and m.get("executable")
+                           and m.get("target", {}).get("kind") == [kind] and m["target"].get("name") == name
+                           and m.get("manifest_path") == str(package_dir / "Cargo.toml")]
+              assert len(artifacts) == 1, ("expected one current native test executable", artifacts)
+              binary = Path(artifacts[0]["executable"])
+              assert binary.is_file() and os.access(binary, os.X_OK), binary
+              print("Using native test executable: " + str(binary), flush=True)
+              # Match Cargo's package cwd and native library search roots.
+              env = dict(os.environ)
+              libraries = []
+              # Explicit --target puts the binary at target/triple/profile/deps.
+              for message in messages:
+                  if message.get("reason") == "build-script-executed":
+                      for linked in message.get("linked_paths", []):
+                          path = Path(linked.split("=", 1)[-1] if not linked.startswith("/") else linked).resolve()
+                          if path.is_relative_to(binary.parents[3]):
+                              libraries.append(str(path))
+              libraries.extend([str(binary.parent), str(binary.parent.parent), rust_lib])
+              env["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(libraries + [env.get(
+                  "DYLD_FALLBACK_LIBRARY_PATH", str(Path.home() / "lib") + ":/usr/local/lib:/usr/lib")])
               for test in tests:
-                  command = cargo + package + [test, "--", "--exact"]
-                  listed = bounded(command + ["--list"])
+                  command = [str(binary), test, "--exact"]
+                  listed = bounded(command + ["--list"], package_dir, env)
                   assert test + ": test" in listed.splitlines(), listed
                   assert "1 test, 0 benchmarks" in listed.splitlines(), listed
-                  output = bounded(command + ["--nocapture", "--test-threads=1"])
+                  output = bounded(command + ["--nocapture", "--test-threads=1"], package_dir, env)
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
