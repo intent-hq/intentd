@@ -2150,8 +2150,15 @@ jobs:
         with:
           shared-key: daemon-lifecycle-${{ matrix.platform }}
       - uses: actions/setup-python@v6
+        # macOS jobs use the runner's Python, as the native build job does.
+        # Downloaded hosted-cache archives assume a different account layout.
+        if: runner.os != 'macOS'
         with:
           python-version: '3.12'
+      - name: Check installed Python (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: python3 -I -B -c 'import sys; print(sys.executable); print(sys.version); assert sys.version_info >= (3, 9), "Native proofs require Python 3.9+"'
       - name: Native lifecycle lint and runtime proof
         shell: bash
         run: |
@@ -2163,7 +2170,7 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TEST_TIMEOUT_MULTIPLIER: "1"
           CONTEXT_CONSUMER_EVIDENCE: ${{ runner.temp }}/context-consumer-proof
-        run: python -I -B scripts/test-context-consumer-native.py
+        run: python3 -I -B scripts/test-context-consumer-native.py
       - name: Upload native context consumer evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v7

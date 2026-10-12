@@ -509,7 +509,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertNotIn("if", proof)
         self.assertFalse(proof.get("continue-on-error", False))
         self.assertEqual(proof["shell"], "bash")
-        self.assertEqual(proof["run"], "python -I -B scripts/test-context-consumer-native.py")
+        self.assertEqual(proof["run"], "python3 -I -B scripts/test-context-consumer-native.py")
         self.assertEqual(proof["env"], {
             "INTENTD_ASSERT_BOUND_CALLER": "1", "INTENTD_TEST_TIMEOUT_MULTIPLIER": "1",
             "CONTEXT_CONSUMER_EVIDENCE": "${{ runner.temp }}/context-consumer-proof",
@@ -528,6 +528,30 @@ class NativeRoutingTests(unittest.TestCase):
         regressions = self.workflow["jobs"]["release-scripts"]["steps"]
         self.assertTrue(any("python3 -I -B scripts/test-context-consumer-native-proof.py" in s.get("run", "").splitlines()
                             for s in regressions))
+
+    def test_macos_lifecycle_uses_installed_python_without_hosted_cache_install(self):
+        steps = self.workflow["jobs"]["daemon-lifecycle"]["steps"]
+        installer = next(s for s in steps if s.get("uses", "").startswith("actions/setup-python@"))
+        for os_name in ("macOS", "Windows", "Linux"):
+            with self.subTest(os=os_name):
+                self.assertEqual(condition(installer.get("if", True), {"runner.os": os_name}), os_name != "macOS")
+        preflight = next(s for s in steps if s.get("name") == "Check installed Python (macOS)")
+        self.assertEqual(preflight["if"], "runner.os == 'macOS'")
+        self.assertEqual(preflight["shell"], "bash")
+        self.assertFalse(preflight.get("continue-on-error", False))
+        self.assertLess(steps.index(preflight), next(i for i, s in enumerate(steps)
+                                                   if s.get("name") == "Native lifecycle lint and runtime proof"))
+        args = shlex.split(preflight["run"])
+        self.assertEqual(args[:4], ["python3", "-I", "-B", "-c"])
+        self.assertEqual(len(args), 5)
+        for version, succeeds in (((3, 8, 0), False), ((3, 9, 0), True), ((3, 12, 0), True)):
+            with self.subTest(version=version):
+                result = subprocess.run(args[:4] + [f"import sys; sys.version_info = {version!r}; " + args[4]],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                self.assertTrue(result.stdout.strip(), "preflight must report the interpreter")
+                if not succeeds:
+                    self.assertIn("Python 3.9+", result.stderr)
 
     def test_expression_status_and_unknown_syntax(self):
         self.assertFalse(condition("github.event_name != 'push'", context("pull_request"), success=False))
