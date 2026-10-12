@@ -995,7 +995,7 @@ mod tests {
             resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
             None
         );
-        snapshot.fallback = Some(Oid::zero());
+        snapshot.fallback = Some(Oid::ZERO_SHA1);
         assert!(resolve_workspace_boundary_snapshot(&repo, &snapshot).is_err());
     }
 
