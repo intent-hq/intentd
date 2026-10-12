@@ -40,6 +40,10 @@ fn await_start() {
 }
 
 pub(super) fn enter(test: &str) -> Option<Completion> {
+    enter_with_timeout(test, Duration::from_secs(60))
+}
+
+fn enter_with_timeout(test: &str, timeout: Duration) -> Option<Completion> {
     await_start();
     if let Some(worker) = std::env::var_os(WORKER) {
         assert_eq!(worker, test, "wrong exact-test worker");
@@ -62,8 +66,13 @@ pub(super) fn enter(test: &str) -> Option<Completion> {
         .env("TMP", root.path())
         .env("TEMP", root.path());
     let nested = std::env::var_os(CONTROLLER).is_some();
-    run(command, root.path(), Duration::from_secs(60), nested);
-    assert_eq!(std::fs::read_to_string(proof).unwrap(), test);
+    run(
+        command,
+        root,
+        timeout,
+        nested,
+        Some((proof.as_path(), test)),
+    );
     None
 }
 
@@ -133,25 +142,51 @@ pub(super) fn ambient_controller(test: &str) {
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "remote.canary-count.url")
         .env("GIT_CONFIG_VALUE_0", "https://count.test/fixture/repo.git");
-    run(command, root.path(), Duration::from_secs(90), false);
+    // The outer owner must retain every nested directory if the controller
+    // exits without running destructors (including a watchdog group kill).
+    command
+        .env("TMPDIR", root.path())
+        .env("TMP", root.path())
+        .env("TEMP", root.path());
+    run(command, root, Duration::from_secs(90), false, None);
 }
 
-fn run(mut command: Command, root: &Path, timeout: Duration, nested: bool) {
-    let log_path = root.join("child.log");
+fn run(
+    mut command: Command,
+    root: tempfile::TempDir,
+    timeout: Duration,
+    nested: bool,
+    proof: Option<(&Path, &str)>,
+) {
+    let log_path = root.path().join("child.log");
     let log = File::create(&log_path).unwrap();
     command
         .stdin(Stdio::piped())
         .stdout(log.try_clone().unwrap())
         .stderr(log);
     let mut child = platform::Child::spawn(&mut command, nested);
-    child.start();
-    let status = child.wait(timeout);
-    #[cfg(windows)]
+    // Even a broken startup pipe or an injected controller panic must finish
+    // cleanup before the owning directory can be removed.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        child.start();
+        cleanup_tests::after_start(nested);
+        child.wait(timeout)
+    }));
     let cleaned = child.cleanup();
     drop(child);
-    #[cfg(windows)]
-    assert!(cleaned, "boundary child job did not finish cleanup");
+    if !cleaned {
+        let retained = root.keep();
+        panic!(
+            "boundary child cleanup unconfirmed; retained {}",
+            retained.display()
+        );
+    }
     let output = std::fs::read_to_string(log_path).unwrap();
+    let completed = proof
+        .as_ref()
+        .map(|(path, _)| std::fs::read_to_string(path));
+    drop(root);
+    let status = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     assert!(
         status.is_some_and(|s| s.success()),
         "boundary child failed: {status:?}\n{output}"
@@ -160,76 +195,17 @@ fn run(mut command: Command, root: &Path, timeout: Duration, nested: bool) {
         output.contains("1 passed"),
         "exact test did not execute: {output}"
     );
+    if let Some((_, expected)) = proof {
+        assert_eq!(completed.unwrap().unwrap(), expected);
+    }
 }
 
 #[cfg(unix)]
-mod platform {
-    use super::*;
-    use intentd_test_support::GuardedChild;
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::{getpgrp, getpid};
+#[path = "isolation_unix.rs"]
+mod platform;
 
-    pub(super) enum Child {
-        Group(GuardedChild),
-        // raw-child: allow — nested worker shares the controller's guarded group
-        Nested(std::process::Child),
-    }
-
-    impl Child {
-        pub(super) fn spawn(command: &mut Command, nested: bool) -> Self {
-            if nested {
-                // Only the ambient controller may launch a nested worker. Do
-                // not create a second group that escapes its parent's guard.
-                assert_eq!(getpgrp(), getpid(), "controller must own its group");
-                Self::Nested(command.spawn().unwrap())
-            } else {
-                Self::Group(GuardedChild::spawn(command).unwrap())
-            }
-        }
-
-        pub(super) fn start(&mut self) {
-            match self {
-                Self::Group(child) => child.stdin.take(),
-                Self::Nested(child) => child.stdin.take(),
-            }
-            .unwrap()
-            .write_all(&[1])
-            .unwrap();
-        }
-
-        pub(super) fn wait(&mut self, timeout: Duration) -> Option<ExitStatus> {
-            match self {
-                Self::Group(child) => child.wait_with_timeout(timeout).unwrap(),
-                Self::Nested(child) => {
-                    let deadline = std::time::Instant::now() + timeout;
-                    loop {
-                        if let Some(status) = child.try_wait().unwrap() {
-                            return Some(status);
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            return None;
-                        }
-                        // timing-guard: bounded process exit polling
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                }
-            }
-        }
-    }
-
-    impl Drop for Child {
-        fn drop(&mut self) {
-            if let Self::Nested(child) = self {
-                if !matches!(child.try_wait(), Ok(Some(_))) {
-                    // The outer GuardedChild owns/reaps the controller. On a
-                    // nested timeout or panic kill this entire group, including
-                    // ourselves, so neither worker nor Git can outlive it.
-                    let _ = killpg(getpgrp(), Signal::SIGKILL);
-                }
-            }
-        }
-    }
-}
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
 
 #[cfg(windows)]
 #[path = "isolation_windows.rs"]
