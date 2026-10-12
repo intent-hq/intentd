@@ -178,6 +178,35 @@ test('harness reaps a known child after its launcher has already exited', async 
   });
 });
 
+test('observer publishes actual exit and close after transient witness rename denial', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-observer-rename-'));
+  try {
+    writeFileSync(join(root, 'route'), 'publication-recovery');
+    const childEntry = join(root, 'child.cjs');
+    writeFileSync(childEntry, 'process.stdout.write("unchanged output\\n"); process.exitCode = 73;');
+    const preload = join(root, 'transient-publication.cjs');
+    writeFileSync(preload, `const fs = require('node:fs');
+      const original = fs.renameSync;
+      let calls = 0;
+      fs.renameSync = (...args) => {
+        if (++calls === 2) throw Object.assign(new Error('witness rename denied'), { code: 'EPERM', syscall: 'rename' });
+        return original(...args);
+      };`);
+    const run = spawnSync(process.execPath, ['--require', preload, fixture('./pi-startup-witness.cjs')], {
+      env: { ...env, PI_TEST_CHILD_ENTRY: childEntry, PI_TEST_WITNESS_DIR: root, PI_TEST_RUN_ID: 'publication-recovery' },
+      stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000,
+    });
+    assert.equal(run.status, 73, 'Observer must preserve the actual child exit');
+    assert.equal(run.stdout, 'unchanged output\n');
+    const records = readWitnesses(root);
+    assert.equal(records.length, 1, 'Publication recovery must not spawn another child');
+    assert.deepEqual(records[0].exit, { code: 73, signal: null, kind: 'natural' });
+    assert.deepEqual(records[0].close, records[0].exit);
+    assert.equal(records[0].observerError, undefined);
+    assert.equal(existsSync(join(root, records[0].invocationId + '.json.tmp')), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('observer publication failures remain visible when the adapter discards stderr', () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-observer-failure-'));
   try {
