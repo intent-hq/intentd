@@ -277,20 +277,18 @@ pub(crate) fn history_refresh_snapshot(
     worktree: &Path,
     ws: &Workspace,
 ) -> Option<HistoryRefreshSnapshot> {
-    history_refresh_snapshot_with(worktree, ws, || {
-        intent_git::history::resolve_workspace_boundary(
-            worktree,
-            ws.base_ref.as_deref(),
-            ws.base_commit_sha.as_deref(),
-        )
-        .ok()
+    history_refresh_snapshot_with(worktree, ws, |repo, inputs| {
+        intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).ok()
     })
 }
 
 fn history_refresh_snapshot_with(
     worktree: &Path,
     ws: &Workspace,
-    resolve_boundary: impl FnOnce() -> Option<Option<String>>,
+    resolve_boundary: impl FnOnce(
+        &git2::Repository,
+        &intent_git::history::WorkspaceBoundarySnapshot,
+    ) -> Option<Option<git2::Oid>>,
 ) -> Option<HistoryRefreshSnapshot> {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
@@ -302,7 +300,22 @@ fn history_refresh_snapshot_with(
         return None;
     }
     let before = history_ref_inputs(&repo, ws)?;
-    let boundary = resolve_boundary()?;
+    let inputs = intent_git::history::WorkspaceBoundarySnapshot {
+        head: git2::Oid::from_str(before["head"].as_str()?).ok()?,
+        base_candidates: before["boundaryRefs"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(git2::Oid::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .ok()?,
+        fallback: before["fallbackOid"]
+            .as_str()
+            .map(git2::Oid::from_str)
+            .transpose()
+            .ok()?,
+    };
+    let boundary = resolve_boundary(&repo, &inputs)?;
     if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary.is_none() {
         return None;
     }
@@ -311,12 +324,8 @@ fn history_refresh_snapshot_with(
         return None;
     }
     let history = intent_git::history::HistorySnapshot {
-        head: git2::Oid::from_str(before["head"].as_str()?).ok()?,
-        boundary: boundary
-            .as_deref()
-            .map(git2::Oid::from_str)
-            .transpose()
-            .ok()?,
+        head: inputs.head,
+        boundary,
         upstream: before["upstream"]
             .as_str()
             .map(git2::Oid::from_str)
@@ -326,7 +335,7 @@ fn history_refresh_snapshot_with(
     if let Some(upstream) = history.upstream {
         repo.find_commit(upstream).ok()?;
     }
-    let bytes = serde_json::to_vec(&json!([before, boundary])).ok()?;
+    let bytes = serde_json::to_vec(&json!([before, boundary.map(|oid| oid.to_string())])).ok()?;
     let identity = Sha256::digest(bytes)
         .iter()
         .fold("v1:".to_string(), |mut token, byte| {
@@ -359,13 +368,21 @@ fn history_ref_inputs(repo: &git2::Repository, ws: &Workspace) -> Option<Value> 
     if let Some(base) = &ws.base_ref {
         for name in [format!("origin/{base}"), base.clone()] {
             let oid = match repo.revparse_single(&name) {
-                Ok(object) => Some(object.id().to_string()),
+                Ok(object) => Some(object.peel_to_commit().ok()?.id().to_string()),
                 Err(e) if e.code() == git2::ErrorCode::NotFound => None,
                 Err(_) => return None,
             };
             boundary_refs.push(oid);
         }
     }
+    let fallback = match ws.base_commit_sha.as_deref() {
+        Some(name) => match repo.revparse_single(name) {
+            Ok(object) => Some(object.peel_to_commit().ok()?.id().to_string()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(_) => return None,
+        },
+        None => None,
+    };
     Some(json!({
         "head": head_oid,
         "branch": branch,
@@ -373,6 +390,7 @@ fn history_ref_inputs(repo: &git2::Repository, ws: &Workspace) -> Option<Value> 
         "baseRef": ws.base_ref,
         "baseCommitSha": ws.base_commit_sha,
         "boundaryRefs": boundary_refs,
+        "fallbackOid": fallback,
     }))
 }
 
@@ -1172,25 +1190,112 @@ mod tests {
     }
 
     #[test]
+    fn history_refresh_snapshot_freezes_boundary_during_aba() {
+        let dir = init_repo("refresh-boundary-aba");
+        let repo = Repository::open(dir.path()).unwrap();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir.path(), "trunk.txt", "trunk\n", "trunk");
+        let trunk = repo.head().unwrap().target().unwrap();
+        checkout_new_branch(dir.path(), "feature/aba");
+        commit_file(dir.path(), "feature.txt", "feature\n", "feature");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ws = mk_workspace();
+        ws.base_ref = Some("main".to_string());
+        let expected = history_refresh_snapshot(dir.path(), &ws).unwrap();
+        let snapshot = history_refresh_snapshot_with(dir.path(), &ws, |snapshot_repo, inputs| {
+            repo.reset(root.as_object(), git2::ResetType::Hard, None)
+                .unwrap();
+            let boundary =
+                intent_git::history::resolve_workspace_boundary_snapshot(snapshot_repo, inputs)
+                    .unwrap();
+            repo.reset(head.as_object(), git2::ResetType::Hard, None)
+                .unwrap();
+            Some(boundary)
+        })
+        .unwrap();
+        assert_eq!(snapshot.history.boundary, Some(trunk));
+        assert_eq!(snapshot.identity, expected.identity);
+        let page = intent_git::history::history_bounded_snapshot(
+            dir.path(),
+            &snapshot.history,
+            50,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].hash, head.id().to_string());
+    }
+
+    #[test]
+    fn history_refresh_snapshot_freezes_base_candidates_and_fallback() {
+        for base_name in [
+            "refs/remotes/origin/base",
+            "refs/heads/base",
+            "refs/heads/fallback",
+        ] {
+            let dir = init_repo("refresh-base-input-aba");
+            let repo = Repository::open(dir.path()).unwrap();
+            let root = repo.head().unwrap().target().unwrap();
+            commit_file(dir.path(), "trunk.txt", "trunk\n", "trunk");
+            let trunk = repo.head().unwrap().target().unwrap();
+            commit_file(dir.path(), "feature.txt", "feature\n", "feature");
+            let head = repo.head().unwrap().target().unwrap();
+            // A distinct fallback verifies origin/base precedence too.
+            let mut ws = mk_workspace();
+            ws.base_ref = Some("base".to_string());
+            ws.base_commit_sha = Some(root.to_string());
+            if base_name.ends_with("fallback") {
+                ws.base_ref = None;
+                ws.base_commit_sha = Some("fallback".to_string());
+            } else if base_name.contains("origin") {
+                repo.reference("refs/heads/base", root, true, "local base")
+                    .unwrap();
+            }
+            repo.reference(base_name, trunk, true, "captured base")
+                .unwrap();
+            let expected = history_refresh_snapshot(dir.path(), &ws).unwrap();
+            let snapshot = history_refresh_snapshot_with(dir.path(), &ws, |repo, inputs| {
+                repo.reference(base_name, root, true, "transient base")
+                    .unwrap();
+                let boundary =
+                    intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).unwrap();
+                repo.reference(base_name, trunk, true, "restore base")
+                    .unwrap();
+                Some(boundary)
+            })
+            .unwrap();
+            assert_eq!(snapshot.history.boundary, Some(trunk), "{base_name}");
+            assert_eq!(snapshot.identity, expected.identity, "{base_name}");
+            let page = intent_git::history::history_bounded_snapshot(
+                dir.path(),
+                &snapshot.history,
+                50,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(page.len(), 1, "{base_name}");
+            assert_eq!(page[0].hash, head.to_string());
+        }
+    }
+
+    #[test]
     fn history_refresh_identity_rejects_ref_movement_during_resolution() {
         let dir = init_repo("refresh-race");
         let mut ws = mk_workspace();
         ws.base_ref = Some("main".to_string());
-        assert!(history_refresh_snapshot_with(dir.path(), &ws, || None).is_none());
-        let raced = history_refresh_snapshot_with(dir.path(), &ws, || {
-            let boundary = intent_git::history::resolve_workspace_boundary(
-                dir.path(),
-                ws.base_ref.as_deref(),
-                None,
-            )
-            .unwrap();
+        assert!(history_refresh_snapshot_with(dir.path(), &ws, |_, _| None).is_none());
+        let raced = history_refresh_snapshot_with(dir.path(), &ws, |repo, inputs| {
+            let boundary =
+                intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).unwrap();
             commit_file(dir.path(), "next.txt", "next\n", "moved during resolve");
             Some(boundary)
         });
         assert!(raced.is_none());
         let repo = Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap().target().unwrap();
-        let raced = history_refresh_snapshot_with(dir.path(), &ws, || {
+        let raced = history_refresh_snapshot_with(dir.path(), &ws, |repo, _| {
             repo.reference(
                 "refs/remotes/origin/main",
                 head,
@@ -1198,7 +1303,7 @@ mod tests {
                 "push during resolve",
             )
             .unwrap();
-            Some(Some(head.to_string()))
+            Some(Some(head))
         });
         assert!(raced.is_none());
         assert!(history_refresh_identity(dir.path(), &ws).is_some());

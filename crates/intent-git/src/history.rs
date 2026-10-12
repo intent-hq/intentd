@@ -391,6 +391,44 @@ fn resolve_workspace_boundary_inner(
     Ok(None)
 }
 
+/// Captured inputs for workspace boundary resolution, with origin before local
+/// base candidates. No ref names may be resolved after these inputs are captured.
+pub struct WorkspaceBoundarySnapshot {
+    pub head: Oid,
+    pub base_candidates: Vec<Oid>,
+    pub fallback: Option<Oid>,
+}
+
+/// Resolve a boundary using only captured commit objects, never live refs.
+///
+/// # Errors
+///
+/// Returns an error if captured objects or their ancestry cannot be read.
+pub fn resolve_workspace_boundary_snapshot(
+    repo: &Repository,
+    snapshot: &WorkspaceBoundarySnapshot,
+) -> Result<Option<Oid>> {
+    repo.find_commit(snapshot.head).map_err(map_git_err)?;
+    for candidate in &snapshot.base_candidates {
+        repo.find_commit(*candidate).map_err(map_git_err)?;
+        match repo.merge_base(snapshot.head, *candidate) {
+            Ok(boundary) => return Ok(Some(boundary)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
+    }
+    if let Some(fallback) = snapshot.fallback {
+        repo.find_commit(fallback).map_err(map_git_err)?;
+        match repo.merge_base(snapshot.head, fallback) {
+            Ok(boundary) if boundary == fallback => return Ok(Some(fallback)),
+            Ok(_) => {}
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
+    }
+    Ok(None)
+}
+
 /// Read history bounded by a workspace boundary (for `file-tracking.loadCommits`).
 ///
 /// Returns commits in the range `boundary..HEAD` (workspace-owned only) when
@@ -917,6 +955,48 @@ mod tests {
         let err =
             commit_details(dir.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn workspace_boundary_snapshot_preserves_order_and_validates_fallback() {
+        let dir = init_repo("boundary-snapshot-order");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir.path(), "b.txt", "trunk\n");
+        let trunk = repo.head().unwrap().target().unwrap();
+        commit_file(dir.path(), "c.txt", "head\n");
+        let head = repo.head().unwrap().target().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let unrelated = repo
+            .commit(None, &sig, &sig, "unrelated", &root.tree().unwrap(), &[])
+            .unwrap();
+        let mut snapshot = WorkspaceBoundarySnapshot {
+            head,
+            base_candidates: vec![trunk, root.id()],
+            fallback: Some(root.id()),
+        };
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(trunk)
+        );
+        snapshot.base_candidates = vec![unrelated, root.id()];
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(root.id())
+        );
+        snapshot.base_candidates.clear();
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(root.id())
+        );
+        snapshot.fallback = Some(unrelated);
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            None
+        );
+        snapshot.fallback = Some(Oid::zero());
+        assert!(resolve_workspace_boundary_snapshot(&repo, &snapshot).is_err());
     }
 
     #[test]
