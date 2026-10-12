@@ -169,11 +169,16 @@ impl Store {
         .await;
 
         let settled = conn.finish(result, "commit note write tx failed").await;
+        let outcome = match settled {
+            Ok(Some(written)) => Ok(written),
+            Ok(None) => Err(self.note_update_miss(note).await),
+            Err(error) => Err(error),
+        };
+        // Conflict classification can await a reader. Keep admission until its
+        // owned input alias is gone, as well as through transaction settlement.
+        drop(prepared_note);
         drop(prepared);
-        match settled? {
-            Some(written) => Ok(written),
-            None => Err(self.note_update_miss(note).await),
-        }
+        outcome
     }
 
     /// Persist a parent-note content write together with the child-note

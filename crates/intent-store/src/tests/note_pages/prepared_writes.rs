@@ -417,3 +417,52 @@ async fn cancellation_drops_preparation_while_existing_sqlite_cleanup_settles() 
         1
     );
 }
+
+#[tokio::test]
+async fn conflict_classification_retains_admission_until_owned_input_drops() {
+    let (store, _tmp, mut note) = setup("original").await;
+    note.content = "prepared replacement".into();
+    let attempt = Attempt::try_prepare(&store, &note, note.rev)
+        .await
+        .unwrap()
+        .unwrap();
+    let input_lifetime = Arc::downgrade(&attempt.note());
+    sqlx::query(
+        "UPDATE note SET title='concurrent title' WHERE workspace_id='pages' AND id='spec'",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    let mut readers = Vec::new();
+    for _ in 0..store.read_pool().options().get_max_connections() {
+        readers.push(store.read_pool().acquire().await.unwrap());
+    }
+    let (started, ready) = tokio::sync::oneshot::channel();
+    {
+        let mut conn = store.write_pool().acquire().await.unwrap();
+        let mut started = Some(started);
+        conn.lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+                true
+            });
+    }
+    let work_store = store.clone();
+    let task = tokio::spawn(async move { finish(&work_store, &note, attempt).await });
+    ready.await.unwrap();
+    // The first writer has started. Reacquiring its sole connection proves its
+    // transaction settled while conflict classification is blocked on readers.
+    let settled = store.write_pool().acquire().await.unwrap();
+    assert!(!task.is_finished());
+    assert!(input_lifetime.upgrade().is_some());
+    assert_eq!(store.note_preparation.available_permits(), 0);
+    drop(settled);
+    drop(readers);
+    assert!(matches!(task.await.unwrap(), Err(Error::Conflict { .. })));
+    assert!(input_lifetime.upgrade().is_none());
+    assert_eq!(store.note_preparation.available_permits(), 1);
+}
