@@ -58,7 +58,16 @@ class PackagingTests(unittest.TestCase):
         if (STORE / "build.rs").exists():
             shutil.copyfile(STORE / "build.rs", self.crate / "build.rs")
 
+    def add_dependent(self):
+        dependent = self.repo / "crates/dependent"
+        (dependent / "src").mkdir(parents=True)
+        (dependent / "Cargo.toml").write_text(
+            '[package]\nname = "dependent"\nversion = "0.1.0"\nedition = "2021"\n'
+            '[dependencies]\nintent-store = { path = "../intent-store", version = "0.1.0" }\n')
+        (dependent / "src/lib.rs").write_text('pub const LOCK: &str = intent_store::LOCK;\n')
+
     def test_current_source_packages_and_verifies(self):
+        self.add_dependent()
         self.current_source()
         self.run_ok("cargo", "package", "--allow-dirty", "--workspace")
         packaged = self.repo / "target/package/intent-store-0.1.0"
@@ -74,12 +83,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(self.run_ok("cargo", "run", "--quiet"), lock.read_text())
 
     def test_historical_failure_and_planning_compatibility(self):
-        dependent = self.repo / "crates/dependent"
-        (dependent / "src").mkdir(parents=True)
-        (dependent / "Cargo.toml").write_text(
-            '[package]\nname = "dependent"\nversion = "0.1.0"\nedition = "2021"\n'
-            '[dependencies]\nintent-store = { path = "../intent-store", version = "0.1.0" }\n')
-        (dependent / "src/lib.rs").write_text('pub const LOCK: &str = intent_store::LOCK;\n')
+        self.add_dependent()
         self.source(BROKEN)
         failed = self.run_command("cargo", "package", "--allow-dirty", "--workspace")
         self.assertNotEqual(failed.returncode, 0)
@@ -92,6 +96,8 @@ class PackagingTests(unittest.TestCase):
             self.run_ok(sys.executable, str(WRAPPER), "package", "--allow-dirty", "--workspace")
             self.assertEqual(self.run_ok(str(self.repo / "target/debug/intent-store")), lock.read_text())
             self.assertEqual(source.read_bytes(), original)
+            packaged_source = self.repo / "target/package/intent-store-0.1.0/src/note_page_index.rs"
+            self.assertEqual(packaged_source.read_bytes(), original)
             self.assertFalse((self.repo / "target/Cargo.lock").exists())
 
     def test_fixed_source_needs_no_compatibility_file(self):
@@ -183,6 +189,10 @@ class PackagingTests(unittest.TestCase):
         self.run_ok(binary, "update", "--repo-url", "https://github.com/example/packaging-fixture")
         manifest = tomllib.loads((self.crate / "Cargo.toml").read_text())
         self.assertEqual(manifest["package"]["version"], "0.1.1")
+        changed = set(self.run_ok("git", "diff", "--name-only").splitlines())
+        self.assertEqual(changed, {"Cargo.lock", "crates/intent-store/Cargo.toml"})
+        self.assertNotIn("INTENT_STORE_BASELINE_LOCK",
+                         (self.crate / "src/note_page_index.rs").read_text())
         self.assertEqual(self.run_ok("git", "tag").strip(), "v0.1.0")
         # The next release's fixed baseline must work with ordinary Cargo again.
         self.run_ok("git", "add", ".")

@@ -14,6 +14,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tomllib
 
 BROKEN = b'include_str!("../../../Cargo.lock")'
 COMPATIBLE = b'include_str!(env!("INTENT_STORE_BASELINE_LOCK"))'
@@ -49,6 +50,10 @@ def main():
         if original.count(BROKEN) != 1:
             raise ValueError("unexpected historical lockfile includes; reassess compatibility")
         env["INTENT_STORE_BASELINE_LOCK"] = str(Path("Cargo.lock").resolve(strict=True))
+        manifest = tomllib.loads(Path("crates/intent-store/Cargo.toml").read_text())
+        version = manifest["package"]["version"]
+        target = Path(env.get("CARGO_TARGET_DIR", "target"))
+        packaged_source = target / "package" / f"intent-store-{version}" / "src/note_page_index.rs"
         try:
             handle.seek(0)
             handle.write(original.replace(BROKEN, COMPATIBLE))
@@ -59,6 +64,11 @@ def main():
             handle.seek(0)
             handle.write(original)
             handle.truncate()
+            # release-plz compares this extracted tree after verification. Give
+            # it the exact historical bytes, not our temporary compile adapter.
+            if (packaged_source.is_file()
+                    and packaged_source.read_bytes() == original.replace(BROKEN, COMPATIBLE)):
+                packaged_source.write_bytes(original)
 
 
 if __name__ == "__main__":
