@@ -73,7 +73,10 @@ impl Child {
             if let Some(status) = self.observe().unwrap() {
                 return Some(status);
             }
-            if Instant::now() >= deadline {
+            if std::env::var_os("CONTEXT_BOUNDARY_CANCEL")
+                .is_some_and(|path| Path::new(&path).exists())
+                || Instant::now() >= deadline
+            {
                 return None;
             }
             // timing-guard: bounded exit observation, without reaping the leader

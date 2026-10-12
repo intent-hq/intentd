@@ -2,11 +2,21 @@ name: m1mac smoke test
 
 on:
   workflow_dispatch:
+    inputs:
+      context_boundary_diagnostic:
+        description: Run the one-shot context boundary diagnostic instead of inventory
+        type: boolean
+        default: false
+      expected_source_sha:
+        description: Exact reviewed diagnostic commit (required for diagnostic)
+        type: string
+        default: ''
 
 permissions: {}
 
 jobs:
   smoke:
+    if: ${{ !inputs.context_boundary_diagnostic }}
     name: Machine inventory (m1mac)
     runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 10
@@ -79,3 +89,44 @@ jobs:
           else
             echo "simctl: absent"
           fi
+
+  context-boundary-diagnostic:
+    if: ${{ inputs.context_boundary_diagnostic }}
+    name: One-shot context boundary diagnostic (macOS ARM64)
+    runs-on: macos-15
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      INTENTD_ASSERT_BOUND_CALLER: '1'
+      INTENTD_TEST_TIMEOUT_MULTIPLIER: '1'
+      CONTEXT_BOUNDARY_EVIDENCE: ${{ runner.temp }}/context-boundary-diagnostic
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check diagnostic dispatch and installed Python
+        run: |
+          python3 -I -B -c 'import os, platform, sys; assert sys.version_info >= (3,9); assert platform.system() == "Darwin" and platform.machine() == "arm64"; assert os.environ["GITHUB_RUN_ATTEMPT"] == "1"'
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - name: One bounded diagnostic invocation
+        run: python3 -I -B scripts/context-boundary-diagnostic.py
+      - name: Preserve partial evidence even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: context-boundary-diagnostic-${{ github.run_id }}
+          path: ${{ env.CONTEXT_BOUNDARY_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 7

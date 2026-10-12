@@ -216,9 +216,13 @@ async fn context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_f
     let Some(completion) = isolation::enter(BOUNDARY_TEST) else {
         return;
     };
+    use crate::repository_context_output::tests::{diagnostic, diagnostic_trace};
+    let probe = diagnostic_trace::start();
     for count in [63, 64] {
+        diagnostic_trace::arm(count);
         let http = ReadServer::new().await;
         let f = LiveFixture::new(&http).await;
+        diagnostic("fixture_ready", format!("http_count={}", http.count()));
         let control = Arc::new(Control::default());
         let reply=tcp(controlled(&f,control.clone()),&format!("for(let i=0;i<{count};i++) {{ try {{await ws.pr.snapshot(4);}} catch(e) {{}} }} return 'all-calls-kept';")).await;
         if count == 63 {
@@ -235,9 +239,16 @@ async fn context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_f
             assert!(!reply.to_string().contains(FACTS));
         }
         assert!(http.count() > 0);
+        diagnostic("assertions_passed", format!("http_count={}", http.count()));
         f.owner.drain_jobs().await;
+        diagnostic("arm_drained", "");
     }
     completion.finish();
+    diagnostic(
+        "worker_completed",
+        "both original arms and completion proof",
+    );
+    drop(probe);
 }
 
 #[test]

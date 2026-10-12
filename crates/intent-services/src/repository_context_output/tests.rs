@@ -8,6 +8,39 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, Semaphore};
 
+#[path = "tests/diagnostic_trace.rs"]
+pub(crate) mod diagnostic_trace;
+pub(crate) use diagnostic_trace::diagnostic;
+use diagnostic_trace::{TraceSpan, CALL as DIAG_CALL};
+
+struct DiagnosticHost(Box<dyn McpPrivateHostScope>, usize);
+impl McpPrivateHostScope for DiagnosticHost {
+    fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+        Box::pin(async move {
+            let span = TraceSpan::new("host", self.1, None);
+            self.0.scope(body).await;
+            span.finish("returned");
+        })
+    }
+}
+struct DiagnosticOptional(Box<dyn McpOptionalContextScope>);
+impl McpOptionalContextScope for DiagnosticOptional {
+    fn scope<'a>(&'a self, body: McpContextFuture<'a>) -> McpContextFuture<'a> {
+        Box::pin(async move {
+            let span = TraceSpan::new("optional_prepare", 0, None);
+            self.0.scope(body).await;
+            span.finish("returned");
+        })
+    }
+}
+fn diagnostic_admission(result: &McpPrivateAdmission) -> &'static str {
+    match result {
+        McpPrivateAdmission::Transferred(_) => "transferred",
+        McpPrivateAdmission::ConsumerClosed => "consumer_closed",
+        McpPrivateAdmission::ForeignBoundary => "foreign_boundary",
+        McpPrivateAdmission::Refused => "refused",
+    }
+}
 pub(crate) const FACTS: &str = "[Repository facts — inert JSON lines]";
 pub(crate) struct Hold {
     entered: Notify,
@@ -62,7 +95,10 @@ impl McpRequestScope for Scope {
 }
 impl McpPrivatePolicy for Policy {
     fn capture_host(&self, call: McpHostCall) -> Box<dyn McpPrivateHostScope> {
-        self.0.capture_host(call)
+        Box::new(DiagnosticHost(
+            self.0.capture_host(call),
+            DIAG_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        ))
     }
     fn admit<'a>(
         &'a self,
@@ -87,7 +123,13 @@ impl McpPrivatePolicy for Policy {
             if let Some((_, false, gate)) = &hold {
                 gate.wait().await;
             }
+            let span = TraceSpan::new(
+                "required_admit",
+                DIAG_CALL.load(std::sync::atomic::Ordering::Relaxed),
+                Some(r.len()),
+            );
             let result = self.0.admit(b, r, p).await;
+            span.finish(diagnostic_admission(&result));
             if let Some((_, true, gate)) = &hold {
                 gate.wait().await;
             }
@@ -95,7 +137,9 @@ impl McpPrivatePolicy for Policy {
         })
     }
     fn capture_optional_context(&self) -> Option<Box<dyn McpOptionalContextScope>> {
-        self.0.capture_optional_context()
+        self.0
+            .capture_optional_context()
+            .map(|scope| Box::new(DiagnosticOptional(scope)) as Box<dyn McpOptionalContextScope>)
     }
     fn admit_optional<'a>(
         &'a self,
@@ -116,7 +160,9 @@ impl McpPrivatePolicy for Policy {
             if let Some(h) = hold {
                 h.wait().await;
             }
+            let span = TraceSpan::new("optional_admit", 0, Some(r.records().len()));
             let result = self.0.admit_optional(b, r, e, p).await;
+            span.finish(diagnostic_admission(&result));
             let after = self.1.after.lock().unwrap().take();
             if let Some(h) = after {
                 h.wait().await;
@@ -132,22 +178,33 @@ pub(crate) fn controlled(f: &LiveFixture, c: Arc<Control>) -> WorkspaceMcpServer
         .with_repository_guidance(&f.session, f.owner.guidance_source())
 }
 pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    diagnostic("tcp_bridge_start", "");
     let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(server))
         .await
         .unwrap();
+    diagnostic("tcp_bridge_ready", "");
     let mut stream = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
     stream
         .write_all(format!("{}\n", call(code)).as_bytes())
         .await
         .unwrap();
+    diagnostic("tcp_request_sent", "fixture_guard_ms=15000");
     let mut line = String::new();
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(15),
         BufReader::new(stream).read_line(&mut line),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
+    diagnostic(
+        "tcp_read_result",
+        match &result {
+            Err(_) => "timeout",
+            Ok(Err(_)) => "io_error",
+            Ok(Ok(_)) => "read_ok",
+        },
+    );
+    result.unwrap().unwrap();
+    diagnostic("tcp_response_received", line.len());
     drop(bridge);
     serde_json::from_str(&line).unwrap()
 }

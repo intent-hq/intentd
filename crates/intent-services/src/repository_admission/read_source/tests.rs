@@ -628,13 +628,22 @@ impl ReadServer {
                         }
                     }
                     let text = String::from_utf8_lossy(&request);
+                    crate::repository_context_output::tests::diagnostic("http_request_parsed", "");
                     let path = text.split_whitespace().nth(1).unwrap().to_owned();
                     if !path.starts_with("/api/v4/projects/") {
+                        crate::repository_context_output::tests::diagnostic(
+                            "http_upstream_start",
+                            "auth_fixture",
+                        );
                         let mut remote = tokio::net::TcpStream::connect(&upstream).await.unwrap();
                         remote.write_all(&request).await.unwrap();
                         let mut response = Vec::new();
                         remote.read_to_end(&mut response).await.unwrap();
                         let _ = socket.write_all(&response).await;
+                        crate::repository_context_output::tests::diagnostic(
+                            "http_upstream_reply",
+                            "auth_fixture",
+                        );
                         return;
                     }
                     assert!(
@@ -642,6 +651,10 @@ impl ReadServer {
                             || text.contains("rotated")
                             || text.contains("pat-second"),
                         "only real original-owner tokens reach this fixture"
+                    );
+                    crate::repository_context_output::tests::diagnostic(
+                        "http_project_arrival",
+                        &path,
                     );
                     control.calls.lock().unwrap().push(path.clone());
                     let status = *control.statuses.lock().unwrap().get(&path).unwrap_or(&200);
@@ -680,6 +693,10 @@ impl ReadServer {
                     };
                     let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}Connection: close\r\n\r\n{body}",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
+                    crate::repository_context_output::tests::diagnostic(
+                        "http_project_reply",
+                        format!("{path} status={status}"),
+                    );
                 });
             }
         });

@@ -11,6 +11,27 @@ const PROOF: &str = "INTENT_CONTEXT_BOUNDARY_PROOF";
 const CONTROLLER: &str = "INTENT_CONTEXT_BOUNDARY_CONTROLLER";
 const START: &str = "INTENT_CONTEXT_BOUNDARY_START";
 
+// Diagnostic-only owner telemetry is outside cleanup-owned scratch. The outer
+// supervisor never signals an unowned/reaped worker group by a numeric PID.
+fn diagnostic_owner(event: &str, root: &Path, cleaned: Option<bool>) {
+    let Some(path) = std::env::var_os("CONTEXT_BOUNDARY_OWNER_LOG") else {
+        return;
+    };
+    assert!(Path::new(&path).is_absolute());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"event":event,"pid":std::process::id(),
+        "root":root,"cleaned":cleaned,"scratch_exists":root.exists()})
+    )
+    .unwrap();
+}
+
 pub(super) struct Completion(PathBuf, String);
 
 impl Completion {
@@ -174,6 +195,7 @@ fn run(
         .stdin(Stdio::piped())
         .stdout(log.try_clone().unwrap())
         .stderr(log);
+    diagnostic_owner("owner_start", &root_path, None);
     let mut child = platform::Child::spawn(&mut command, nested);
     // Even a broken startup pipe or an injected controller panic must finish
     // cleanup before the owning directory can be removed.
@@ -185,6 +207,7 @@ fn run(
     let cleaned = child.cleanup();
     drop(child);
     if !cleaned {
+        diagnostic_owner("owner_cleanup", &root_path, Some(false));
         if let Some(root) = root {
             let _ = root.keep();
         }
@@ -198,6 +221,7 @@ fn run(
         .as_ref()
         .map(|(path, _)| std::fs::read_to_string(path));
     drop(root);
+    diagnostic_owner("owner_cleanup", &root_path, Some(true));
     #[cfg(unix)]
     cleanup_tests::after_scratch_release(nested);
     let status = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
