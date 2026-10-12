@@ -51,6 +51,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // Ownership must precede queue restoration; history is imported separately
     // from live delivery so already-delivered wakes never fire again.
     ("script_monitor", "workspace_id = ?1"),
+    ("script_notification_job", "workspace_id = ?1"),
+    ("agent_queue_admission", "workspace_id = ?1"),
     (
         "agent_message",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
@@ -574,6 +576,12 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        let existing_workspaces: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM workspace UNION SELECT id FROM deleted_workspace_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("read delivery import fence: {e}")))?;
         reclaim_imported_metadata(&mut tx, rows).await?;
         let mut anchor_notes = std::collections::BTreeSet::<(String, String)>::new();
         let mut inserted = 0usize;
@@ -583,22 +591,16 @@ impl Store {
             };
             let schema = &schemas[table];
             for object in objects {
-                // Deleting a workspace suppresses its retained monitor ledger.
-                // Reimport must preserve that terminal fence, never re-arm it.
-                if *table == "script_monitor" {
-                    let existing: Option<(String, String)> =
-                        sqlx::query_as("SELECT workspace_id,state FROM script_monitor WHERE id=?")
-                            .bind(object["id"].as_str())
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| {
-                                Error::Internal(format!("read imported monitor fence: {e}"))
-                            })?;
-                    if existing.is_some_and(|(ws, state)| {
-                        object["workspace_id"].as_str() == Some(ws.as_str()) && state != "active"
-                    }) {
-                        continue;
-                    }
+                // A repeated import may restore history, never superseded live delivery.
+                // Workspace lifecycle identity supplies this fence without monitor tombstones.
+                if matches!(
+                    *table,
+                    "script_monitor" | "script_notification_job" | "agent_queue_admission"
+                ) && object["workspace_id"]
+                    .as_str()
+                    .is_some_and(|ws| existing_workspaces.iter().any(|id| id == ws))
+                {
+                    continue;
                 }
                 // Imported conversation rows are history, not fresh wakes.
                 // Stage their metadata as NULL inside this transaction, then
@@ -2133,7 +2135,9 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
-script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, settled_at, cancel_intent, wake_state
+script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
+script_notification_job: wake_id, workspace_id, agent_id, script_id, run_id, metadata, body, phase, created_at
+agent_queue_admission: id, agent_id, workspace_id, turn_id, payload, created_at, phase
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
 agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages

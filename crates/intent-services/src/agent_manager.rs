@@ -12893,6 +12893,18 @@ async fn run_message_worker(
                     .await
                 {
                     Ok(_stop_reason) => {
+                        if let Some(id) =
+                            crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                        {
+                            if let Err(error) = mgr
+                                .services
+                                .store
+                                .complete_script_notification(&agent_id, id)
+                                .await
+                            {
+                                tracing::warn!(%error,"notification completion receipt cleanup failed");
+                            }
+                        }
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
@@ -21401,6 +21413,170 @@ mod agent_retry_tests {
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn monitor_delivery_recovers_each_persistence_boundary_without_duplicate_transcript() {
+        for boundary in [
+            "before-message",
+            "after-message",
+            "after-admission",
+            "after-accept",
+        ] {
+            let agent = AgentId::from("recover-monitor-owner");
+            let ws = WorkspaceId::from("recover-monitor-workspace");
+            let (mgr, db_dir) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+            let row: intent_core::ScriptMonitor = serde_json::from_value(json!({
+                "monitorId":"recover", "workspaceId":ws, "agentId":agent,
+                "scriptId":"script", "runId":"run", "scriptName":"Script", "mode":"command",
+                "state":"active", "createdAt":now_iso(), "expiresAt":"2099-01-01T00:00:00Z"
+            }))
+            .unwrap();
+            mgr.services
+                .store
+                .insert_script_monitor(&row)
+                .await
+                .unwrap();
+            let mut terminal = row;
+            terminal.state = "expired".into();
+            terminal.reason = Some("ttl".into());
+            terminal.settled_at = Some(now_iso());
+            mgr.services
+                .store
+                .settle_script_monitor(&terminal)
+                .await
+                .unwrap();
+            let job = mgr
+                .services
+                .store
+                .script_notification_jobs()
+                .await
+                .unwrap()
+                .remove(0);
+            let (queued, _) = mgr.services.enqueue_message_with_id(
+                &agent,
+                Some(job.wake_id.clone()),
+                job.body.clone(),
+                None,
+                None,
+                Some(job.metadata.clone()),
+                None,
+                false,
+                intent_core::MessageOrigin::Automatic,
+            );
+            if boundary != "before-message" {
+                assert!(
+                    persist_user(
+                        &mgr,
+                        &agent,
+                        &ws,
+                        &queued.content,
+                        None,
+                        None,
+                        queued.message_metadata.as_ref(),
+                        Some(&queued.turn_id),
+                        false
+                    )
+                    .await
+                );
+            }
+            assert!(mgr
+                .services
+                .store
+                .script_monitor_wake_pending("recover")
+                .await
+                .unwrap());
+            let durable = intent_store::AgentQueueRow {
+                id: queued.id.clone(),
+                agent_id: agent.clone(),
+                position: 0,
+                payload: serde_json::to_value(&queued).unwrap(),
+                created_at: queued.queued_at.clone(),
+                turn_id: queued.turn_id.clone(),
+            };
+            if matches!(boundary, "after-admission" | "after-accept") {
+                assert!(mgr
+                    .services
+                    .store
+                    .admit_script_notification(&durable)
+                    .await
+                    .unwrap());
+                mgr.services
+                    .store
+                    .replace_agent_queue(&agent, &[])
+                    .await
+                    .unwrap();
+            }
+            if boundary == "after-accept" {
+                assert!(
+                    mgr.services
+                        .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                        .await
+                );
+            }
+            // Lose all process-local queue state, then use the production restoration path.
+            mgr.services.store.close().await;
+            drop(mgr);
+            let store = Store::open(&db_dir.path().join("store.db")).await.unwrap();
+            if matches!(boundary, "before-message" | "after-message") {
+                assert!(store.script_monitor_wake_pending("recover").await.unwrap());
+                assert!(store.admit_script_notification(&durable).await.unwrap());
+            }
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            let mgr = Arc::new(AgentManager::new(
+                services,
+                Arc::new(BusEventSink::new(bus)),
+                8,
+            ));
+            assert_eq!(
+                mgr.services.rehydrate_agent_queues().await.unwrap(),
+                1,
+                "{boundary}"
+            );
+            let restored = mgr
+                .services
+                .find_queued_message(&agent, &job.wake_id)
+                .unwrap();
+            assert_eq!(restored.turn_id, queued.turn_id);
+            assert!(
+                persist_user(
+                    &mgr,
+                    &agent,
+                    &ws,
+                    &restored.content,
+                    None,
+                    None,
+                    restored.message_metadata.as_ref(),
+                    Some(&restored.turn_id),
+                    false
+                )
+                .await
+            );
+            assert!(
+                mgr.services
+                    .admit_script_monitor_turn(&agent, restored.message_metadata.as_ref())
+                    .await
+            );
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
+                .bind(&job.wake_id)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{boundary}");
+            assert!(store.script_monitors(&ws, None).await.unwrap().is_empty());
+            store
+                .complete_script_notification(&agent, "recover")
+                .await
+                .unwrap();
+            assert!(
+                !mgr.services
+                    .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                    .await
+            );
+            assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+            store.close().await;
+        }
     }
 
     #[intent_test_macros::daemon_test]

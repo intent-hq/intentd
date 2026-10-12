@@ -1,4 +1,4 @@
-//! Durable monitor rows are also their transactional wake outbox.
+//! Active watches, transient notification jobs and durable queue admission.
 use crate::Store;
 use intent_core::{AgentId, Error, Result, ScriptMonitor, WorkspaceId};
 
@@ -7,7 +7,7 @@ fn db(error: impl std::fmt::Display) -> Error {
 }
 
 impl Store {
-    /// Read bounded retained monitor rows, in canonical order.
+    /// Read active monitor rows, in canonical order.
     /// # Errors
     /// Fails closed on database/decoding errors.
     pub async fn script_monitors(
@@ -15,7 +15,7 @@ impl Store {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
     ) -> Result<Vec<ScriptMonitor>> {
-        let rows: Vec<String> = sqlx::query_scalar("SELECT row_json FROM script_monitor WHERE workspace_id = ? AND (? IS NULL OR agent_id = ?) ORDER BY created_at,id")
+        let rows: Vec<String> = sqlx::query_scalar("SELECT row_json FROM script_monitor WHERE state='active' AND workspace_id = ? AND (? IS NULL OR agent_id = ?) ORDER BY created_at,id")
             .bind(ws.as_str()).bind(agent.map(AgentId::as_str)).bind(agent.map(AgentId::as_str))
             .fetch_all(self.read_pool()).await.map_err(db)?;
         rows.into_iter()
@@ -43,8 +43,9 @@ impl Store {
     /// Returns database failures so callers can defer settlement safely.
     pub async fn script_monitor_pending_for_agent(&self, agent: &AgentId) -> Result<bool> {
         sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM script_monitor WHERE agent_id=? AND wake_state='pending')",
+            "SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE agent_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE agent_id=?)",
         )
+        .bind(agent.as_str())
         .bind(agent.as_str())
         .fetch_one(self.read_pool())
         .await
@@ -73,6 +74,11 @@ impl Store {
     /// # Errors
     /// Storage errors never acknowledge a memory-only watch.
     pub async fn insert_script_monitor(&self, row: &ScriptMonitor) -> Result<()> {
+        if row.state != "active" {
+            return Err(Error::InvalidParams(
+                "only active monitors can be stored".into(),
+            ));
+        }
         let json = serde_json::to_string(row).map_err(db)?;
         sqlx::query("INSERT INTO script_monitor(id,workspace_id,agent_id,script_id,run_id,state,row_json,created_at) VALUES(?,?,?,?,?,'active',?,?)")
             .bind(&row.monitor_id).bind(row.workspace_id.as_str()).bind(row.agent_id.as_str())
@@ -81,19 +87,32 @@ impl Store {
         Ok(())
     }
 
-    /// One CAS commits the terminal row and its stable wake identity together.
+    /// Atomically retire an active watch and reserve its notification, without history.
     /// # Errors
-    /// Returns a persistence error without changing the row on failure.
+    /// A failed write rolls back both changes.
     pub async fn settle_script_monitor(&self, row: &ScriptMonitor) -> Result<bool> {
-        let wake = if matches!(row.state.as_str(), "completed" | "expired" | "triggered") {
-            "pending"
-        } else {
-            "suppressed"
-        };
-        let result = sqlx::query("UPDATE script_monitor SET state=?,row_json=?,settled_at=?,wake_state=?,cancel_intent=0 WHERE id=? AND workspace_id=? AND state='active'")
-            .bind(&row.state).bind(serde_json::to_string(row).map_err(db)?).bind(&row.settled_at).bind(wake)
-            .bind(&row.monitor_id).bind(row.workspace_id.as_str()).execute(self.write_pool()).await.map_err(db)?;
-        Ok(result.rows_affected() == 1)
+        if !matches!(
+            row.state.as_str(),
+            "completed" | "expired" | "triggered" | "cancelled"
+        ) {
+            return Err(Error::InvalidParams(
+                "terminal monitor decision required".into(),
+            ));
+        }
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let deleted = sqlx::query("DELETE FROM script_monitor WHERE id=? AND workspace_id=? AND agent_id=? AND run_id=? AND state='active'")
+            .bind(&row.monitor_id).bind(row.workspace_id.as_str()).bind(row.agent_id.as_str()).bind(&row.run_id)
+            .execute(&mut *tx).await.map_err(db)?.rows_affected();
+        if deleted == 1 && matches!(row.state.as_str(), "completed" | "expired" | "triggered") {
+            sqlx::query("INSERT INTO script_notification_job(wake_id,workspace_id,agent_id,script_id,run_id,metadata,body,phase,created_at) VALUES(?,?,?,?,?,?,?,'pending',?)")
+                .bind(format!("script-monitor:{}",row.monitor_id)).bind(row.workspace_id.as_str()).bind(row.agent_id.as_str())
+                .bind(&row.script_id).bind(&row.run_id)
+                .bind(intent_core::script_monitor::script_monitor_wake_metadata(row).to_string())
+                .bind(intent_core::script_monitor::script_monitor_wake_text(row)).bind(&row.settled_at)
+                .execute(&mut *tx).await.map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(deleted == 1)
     }
 
     /// Reserve a guarded cancellation before touching the owned process.
@@ -114,81 +133,195 @@ impl Store {
     /// # Errors
     /// Returns storage/decoding failures.
     pub async fn pending_script_monitors(&self) -> Result<Vec<(ScriptMonitor, bool)>> {
-        let rows: Vec<(String,bool)> = sqlx::query_as("SELECT row_json,cancel_intent FROM script_monitor WHERE state='active' OR wake_state='pending'")
-            .fetch_all(self.read_pool()).await.map_err(db)?;
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT row_json,cancel_intent FROM script_monitor WHERE state='active'",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(db)?;
         rows.into_iter()
             .map(|(json, intent)| Ok((serde_json::from_str(&json).map_err(db)?, intent)))
             .collect()
     }
 
-    /// Read the stable outbox fence immediately before admission or delivery.
+    /// Read pending notification work, never monitor history.
     /// # Errors
-    /// Returns storage errors.
+    /// Returns storage/decoding failures.
+    pub async fn script_notification_jobs(&self) -> Result<Vec<ScriptNotificationJob>> {
+        let rows: Vec<(String,String,String,String,String)> = sqlx::query_as("SELECT wake_id,workspace_id,agent_id,metadata,body FROM script_notification_job ORDER BY created_at,wake_id")
+            .fetch_all(self.read_pool()).await.map_err(db)?;
+        rows.into_iter()
+            .map(|(wake_id, workspace_id, agent_id, metadata, body)| {
+                Ok(ScriptNotificationJob {
+                    wake_id,
+                    workspace_id: WorkspaceId::from(workspace_id),
+                    agent_id: AgentId::from(agent_id),
+                    metadata: serde_json::from_str(&metadata).map_err(db)?,
+                    body,
+                })
+            })
+            .collect()
+    }
+
+    /// Read the pending notification fence.
+    /// # Errors
+    /// Returns database errors.
     pub async fn script_monitor_wake_pending(&self, id: &str) -> Result<bool> {
-        let pending: Option<bool> =
-            sqlx::query_scalar("SELECT wake_state='pending' FROM script_monitor WHERE id=?")
-                .bind(id)
-                .fetch_optional(self.read_pool())
-                .await
-                .map_err(db)?;
-        Ok(pending.unwrap_or(false))
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=?)")
+            .bind(format!("script-monitor:{id}"))
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(db)
     }
 
-    /// A delivered wake may finish its admitted turn; suppression may never revive.
+    /// Delivery authority belongs to transient work, never a transcript alone.
     /// # Errors
-    /// Returns storage errors.
+    /// Returns database errors.
     pub async fn script_monitor_wake_allowed(&self, id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT wake_state IN ('pending','delivered') FROM script_monitor WHERE id=?",
-        )
-        .bind(id)
-        .fetch_optional(self.read_pool())
-        .await
-        .map_err(db)?
-        .unwrap_or(false))
+        let key = format!("script-monitor:{id}");
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM script_notification_job WHERE wake_id=? UNION ALL SELECT 1 FROM agent_queue_admission WHERE id=?)")
+            .bind(&key).bind(&key).fetch_one(self.read_pool()).await.map_err(db)
     }
 
-    /// Mark delivered only after the durable message exists; suppression is permanent.
+    /// Scope delivery authority to its original owner and workspace.
     /// # Errors
-    /// Returns storage errors.
-    pub async fn finish_script_monitor_wake(&self, id: &str, suppress: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE script_monitor SET wake_state=? WHERE id=? AND (wake_state='pending' OR ?=1)",
-        )
-        .bind(if suppress { "suppressed" } else { "delivered" })
-        .bind(id)
-        .bind(suppress)
-        .execute(self.write_pool())
-        .await
-        .map_err(db)?;
-        Ok(())
+    /// Returns database errors.
+    pub async fn script_monitor_wake_allowed_for_agent(
+        &self,
+        id: &str,
+        agent: &AgentId,
+        ws: &WorkspaceId,
+    ) -> Result<bool> {
+        let key = format!("script-monitor:{id}");
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM (SELECT wake_id AS id,agent_id,workspace_id FROM script_notification_job UNION ALL SELECT id,agent_id,workspace_id FROM agent_queue_admission) WHERE id=? AND agent_id=? AND workspace_id=?)")
+            .bind(key).bind(agent.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(db)
     }
-
-    /// Workspace keys for bounded-retention maintenance (never a UI read).
+    /// Durable ordinary queue owners to kick after restart or temporary holds.
     /// # Errors
-    /// Returns storage errors.
-    pub async fn script_monitor_workspaces(&self) -> Result<Vec<WorkspaceId>> {
-        let ids: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT workspace_id FROM script_monitor")
+    /// Returns database errors.
+    pub async fn script_notification_delivery_owners(&self) -> Result<Vec<(AgentId, WorkspaceId)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT DISTINCT agent_id,workspace_id FROM agent_queue_admission")
                 .fetch_all(self.read_pool())
                 .await
                 .map_err(db)?;
-        Ok(ids.into_iter().map(WorkspaceId::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(agent, ws)| (AgentId::from(agent), WorkspaceId::from(ws)))
+            .collect())
     }
 
-    /// Prune only terminal rows with no promised undelivered notification.
+    /// Suppress outstanding work. Message persistence alone cannot finish a job.
     /// # Errors
-    /// Returns storage errors.
-    pub async fn prune_script_monitors(
+    /// Returns database errors.
+    pub async fn finish_script_monitor_wake(&self, id: &str, suppress: bool) -> Result<()> {
+        if !suppress {
+            return Ok(());
+        }
+        let key = format!("script-monitor:{id}");
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        for query in [
+            "DELETE FROM script_notification_job WHERE wake_id=?",
+            "DELETE FROM agent_queue_admission WHERE id=?",
+            "DELETE FROM agent_queue WHERE id=?",
+        ] {
+            sqlx::query(query)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)
+    }
+
+    /// Outstanding reservations include active watches and untransferred jobs.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_monitor_reservations(&self, ws: &WorkspaceId) -> Result<i64> {
+        sqlx::query_scalar("SELECT (SELECT count(*) FROM script_monitor WHERE workspace_id=?)+(SELECT count(*) FROM script_notification_job WHERE workspace_id=?)")
+            .bind(ws.as_str()).bind(ws.as_str()).fetch_one(self.read_pool()).await.map_err(db)
+    }
+
+    /// Transfer one job to durable ordinary queue ownership in a single commit.
+    /// # Errors
+    /// Any failure preserves the job and leaves no partial admission.
+    pub async fn admit_script_notification(&self, row: &crate::AgentQueueRow) -> Result<bool> {
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        let inserted=sqlx::query("INSERT INTO agent_queue_admission(id,agent_id,workspace_id,turn_id,payload,created_at,phase) SELECT wake_id,j.agent_id,j.workspace_id,?,?,?,'pending' FROM script_notification_job j JOIN agent_session a ON a.id=j.agent_id JOIN workspace w ON w.id=j.workspace_id WHERE wake_id=? AND j.agent_id=? AND a.retired_at IS NULL AND w.archived=0 ON CONFLICT(id) DO NOTHING")
+            .bind(&row.turn_id).bind(row.payload.to_string()).bind(&row.created_at).bind(&row.id).bind(row.agent_id.as_str())
+            .execute(&mut *tx).await.map_err(db)?.rows_affected();
+        if inserted == 1 {
+            sqlx::query("INSERT OR IGNORE INTO agent_queue(id,agent_id,position,payload,created_at,turn_id) VALUES(?,?,?,?,?,?)")
+                .bind(&row.id).bind(row.agent_id.as_str()).bind(row.position).bind(row.payload.to_string()).bind(&row.created_at).bind(&row.turn_id)
+                .execute(&mut *tx).await.map_err(db)?;
+            sqlx::query("DELETE FROM script_notification_job WHERE wake_id=?")
+                .bind(&row.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(inserted == 1)
+    }
+
+    /// Repeated guards of the same durable turn are valid; completed receipts are gone.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn accept_script_notification(&self, agent: &AgentId, id: &str) -> Result<bool> {
+        let result=sqlx::query("UPDATE agent_queue_admission SET phase='accepted' WHERE id=? AND agent_id=? AND EXISTS(SELECT 1 FROM agent_session a JOIN workspace w ON w.id=a.workspace_id WHERE a.id=agent_queue_admission.agent_id AND a.retired_at IS NULL AND w.archived=0)")
+            .bind(format!("script-monitor:{id}")).bind(agent.as_str()).execute(self.write_pool()).await.map_err(db)?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Remove a completed ordinary delivery receipt and any stale queue copy.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn complete_script_notification(&self, agent: &AgentId, id: &str) -> Result<()> {
+        let key = format!("script-monitor:{id}");
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        sqlx::query("DELETE FROM agent_queue_admission WHERE id=? AND agent_id=?")
+            .bind(&key)
+            .bind(agent.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        sqlx::query("DELETE FROM agent_queue WHERE id=? AND agent_id=?")
+            .bind(&key)
+            .bind(agent.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    /// Owners affected by lifecycle cleanup, including already-retired watches.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn script_notification_owners(
         &self,
         ws: &WorkspaceId,
-        cutoff: &str,
-        for_admission: bool,
+        agent: Option<&AgentId>,
+    ) -> Result<Vec<AgentId>> {
+        let ids:Vec<String>=sqlx::query_scalar("SELECT agent_id FROM (SELECT workspace_id,agent_id FROM script_monitor UNION SELECT workspace_id,agent_id FROM script_notification_job UNION SELECT workspace_id,agent_id FROM agent_queue_admission) WHERE workspace_id=? AND (? IS NULL OR agent_id=?)")
+            .bind(ws.as_str()).bind(agent.map(AgentId::as_str)).bind(agent.map(AgentId::as_str)).fetch_all(self.read_pool()).await.map_err(db)?;
+        Ok(ids.into_iter().map(AgentId::from).collect())
+    }
+
+    /// Suppress work even when its active watch has already been deleted.
+    /// # Errors
+    /// Returns database errors.
+    pub async fn suppress_script_notifications(
+        &self,
+        ws: &WorkspaceId,
+        agent: Option<&AgentId>,
     ) -> Result<()> {
-        sqlx::query("DELETE FROM script_monitor WHERE workspace_id=? AND state!='active' AND wake_state IN ('delivered','suppressed') AND (settled_at < ? OR id IN (SELECT id FROM script_monitor WHERE workspace_id=? AND state!='active' AND wake_state IN ('delivered','suppressed') ORDER BY settled_at,id LIMIT max(0,(SELECT count(*) FROM script_monitor WHERE workspace_id=?)-?)))")
-            .bind(ws.as_str()).bind(cutoff).bind(ws.as_str()).bind(ws.as_str()).bind(if for_admission {999_i64} else {1000})
-            .execute(self.write_pool()).await.map_err(db)?;
-        Ok(())
+        let mut tx = self.write_pool().begin().await.map_err(db)?;
+        for query in [
+            "DELETE FROM script_notification_job WHERE workspace_id=? AND (? IS NULL OR agent_id=?)",
+            "DELETE FROM agent_queue_admission WHERE workspace_id=? AND (? IS NULL OR agent_id=?)",
+            "DELETE FROM agent_queue WHERE json_valid(payload) AND json_extract(payload,'$.messageMetadata.type')='script_monitor_wake' AND json_extract(payload,'$.messageMetadata.workspaceId')=? AND (? IS NULL OR agent_id=?)"
+        ] { sqlx::query(query).bind(ws.as_str()).bind(agent.map(AgentId::as_str)).bind(agent.map(AgentId::as_str)).execute(&mut *tx).await.map_err(db)?; }
+        tx.commit().await.map_err(db)
     }
 
     /// Latest accepted token remains available after settlement and marker dismissal.
@@ -216,4 +349,14 @@ impl Store {
         })
         .transpose()
     }
+}
+
+/// Private delivery work, containing no monitor configuration or process buffer.
+#[derive(Debug, Clone)]
+pub struct ScriptNotificationJob {
+    pub wake_id: String,
+    pub workspace_id: WorkspaceId,
+    pub agent_id: AgentId,
+    pub metadata: serde_json::Value,
+    pub body: String,
 }

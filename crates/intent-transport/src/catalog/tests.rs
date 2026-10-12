@@ -190,14 +190,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 432;
+const EXPECTED_TOTAL_METHODS: usize = 434;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 376;
+const EXPECTED_ROUTER_METHODS: usize = 378;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -793,6 +793,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
+    "script.get",
     "script.list",
     "script.output",
     "script.remove",
@@ -804,6 +805,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
+    "scriptMonitor.get",
     "scriptMonitor.list",
     "search.cancel",
     "search.codebase",
@@ -1347,6 +1349,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
+    "script.get",
     "script.list",
     "script.output",
     "script.remove",
@@ -1621,6 +1624,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
+        "script.get",
         "script.list",
         "debug.sampleStacks",
     ] {

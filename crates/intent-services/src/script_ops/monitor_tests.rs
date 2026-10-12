@@ -1,3 +1,30 @@
+// Terminal decisions are observed through their post-commit lifecycle event in tests,
+// never through a retained monitor row or a new production history API.
+async fn monitor_snapshot(
+    store: &Store,
+    ws: &WorkspaceId,
+    id: &str,
+) -> Result<intent_core::ScriptMonitor> {
+    if let Ok(row) = store.script_monitor(ws, id).await {
+        return Ok(row);
+    }
+    let events = store
+        .query_events(&EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_type_prefix: Some("scriptMonitor:".into()),
+            limit: Some(10000),
+            ..Default::default()
+        })
+        .await?;
+    events
+        .into_iter()
+        .filter_map(|e| {
+            serde_json::from_value::<intent_core::ScriptMonitor>(e.data["monitor"].clone()).ok()
+        })
+        .find(|row| row.monitor_id == id && row.state != "active")
+        .ok_or_else(|| Error::InvalidParams("no terminal event".into()))
+}
+
 async fn monitor_owner(h: &Harness, name: &str) -> intent_core::AgentId {
     let value = h
         .services
@@ -100,10 +127,7 @@ async fn monitor_retries_pending_result_after_write_and_pre_settlement_failure()
     for _ in 0..3 {
         mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
     }
-    let completed = h
-        .services
-        .store
-        .script_monitor(&h.ws, &row.monitor_id)
+    let completed = monitor_snapshot(&h.services.store, &h.ws, &row.monitor_id)
         .await
         .unwrap();
     assert_eq!(completed.state, "completed");
@@ -165,10 +189,22 @@ async fn monitor_pending_retry_preserves_ttl_and_cleanup() {
             _ => unreachable!(),
         }
         mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
-        let terminal = h
-            .services
-            .store
-            .script_monitor(&h.ws, &row.monitor_id)
+        if matches!(scenario, "retired" | "deleted" | "archived") {
+            assert!(h
+                .services
+                .store
+                .script_monitor(&h.ws, &row.monitor_id)
+                .await
+                .is_err());
+            assert!(!h
+                .services
+                .store
+                .script_monitor_wake_allowed(&row.monitor_id)
+                .await
+                .unwrap());
+            continue;
+        }
+        let terminal = monitor_snapshot(&h.services.store, &h.ws, &row.monitor_id)
             .await
             .unwrap();
         assert_eq!(
@@ -183,9 +219,7 @@ async fn monitor_pending_retry_preserves_ttl_and_cleanup() {
         assert!(terminal.result.is_none(), "{scenario}");
         mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
         assert_eq!(
-            h.services
-                .store
-                .script_monitor(&h.ws, &row.monitor_id)
+            monitor_snapshot(&h.services.store, &h.ws, &row.monitor_id)
                 .await
                 .unwrap(),
             terminal
@@ -243,9 +277,7 @@ async fn monitor_pending_retry_does_not_settle_replacement_or_wait_for_definitio
         "an old monitor must not finalize a different run"
     );
     assert_eq!(
-        h.services
-            .store
-            .script_monitor(&h.ws, &row.monitor_id)
+        monitor_snapshot(&h.services.store, &h.ws, &row.monitor_id)
             .await
             .unwrap()
             .state,
@@ -278,10 +310,7 @@ async fn monitor_reconciles_durable_result_without_notification_and_after_restar
             mgr.recover_monitors().await.unwrap();
         }
         mgr.reconcile_monitor(&h.ws, &row.monitor_id).await.unwrap();
-        let terminal = h
-            .services
-            .store
-            .script_monitor(&h.ws, &row.monitor_id)
+        let terminal = monitor_snapshot(&h.services.store, &h.ws, &row.monitor_id)
             .await
             .unwrap();
         assert_eq!(terminal.state, "completed");
@@ -293,9 +322,10 @@ async fn monitor_reconciles_durable_result_without_notification_and_after_restar
 async fn monitor_row(h: &Harness, id: &str, state: &str) -> intent_core::ScriptMonitor {
     tokio::time::timeout(LIVENESS, async {
         loop {
-            let row = h.services.store.script_monitor(&h.ws, id).await.unwrap();
-            if row.state == state {
-                return row;
+            if let Ok(row) = monitor_snapshot(&h.services.store, &h.ws, id).await {
+                if row.state == state {
+                    return row;
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -370,7 +400,15 @@ async fn monitor_registration_owner_retry_cancel_and_run_token_are_atomic() {
         .await
         .unwrap();
     assert_eq!(stopped["runStopped"], true);
-    assert_eq!(stopped["monitor"]["result"]["outcome"], "cancelled");
+    assert_eq!(stopped["monitorId"], mid);
+    assert_eq!(
+        monitor_row(&h, &mid, "completed")
+            .await
+            .result
+            .unwrap()
+            .outcome,
+        intent_core::ScriptRunOutcome::Cancelled
+    );
     assert!(h
         .services
         .active_script_monitors_for_agent(&owner)
@@ -382,13 +420,11 @@ async fn monitor_registration_owner_retry_cancel_and_run_token_are_atomic() {
         .await
         .unwrap();
     assert_ne!(next["runId"], start["runId"]);
-    assert_eq!(
-        h.services
-            .script_monitor_cancel(h.ws.clone(), mid, None, true)
-            .await
-            .unwrap()["runStopped"],
-        false
-    );
+    assert!(h
+        .services
+        .script_monitor_cancel(h.ws.clone(), mid, None, true)
+        .await
+        .is_err());
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
 }
 
@@ -415,15 +451,13 @@ async fn monitor_fast_completion_retries_have_one_durable_message() {
         )
         .await
         .unwrap();
-    assert_eq!(first["monitor"]["state"], "completed");
+    assert_eq!(first["ok"], false);
+    assert_eq!(first["reason"], "run-finished");
+    assert!(first.get("monitor").is_none());
     assert!(!first.to_string().contains("hidden-output"));
-    let mid = first["monitor"]["monitorId"].as_str().unwrap();
-    let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
-    h.services.dispatch_script_monitor(&row).await;
-    h.services.dispatch_script_monitor(&row).await;
     assert_eq!(
         h.services
-            .script_monitor(h.ws.clone(), owner.clone(), id, json!({"ttlMs":100}))
+            .script_monitor(h.ws.clone(), owner, id, json!({"ttlMs":100}))
             .await
             .unwrap(),
         first
@@ -431,16 +465,17 @@ async fn monitor_fast_completion_retries_have_one_durable_message() {
     assert!(h
         .services
         .store
-        .get_agent_message_by_id_with_pruned(&owner, &format!("script-monitor:{mid}"))
+        .script_monitors(&h.ws, None)
         .await
         .unwrap()
-        .is_some());
-    assert!(!h
+        .is_empty());
+    assert!(h
         .services
         .store
-        .script_monitor_wake_pending(mid)
+        .script_notification_jobs()
         .await
-        .unwrap());
+        .unwrap()
+        .is_empty());
 }
 
 #[intent_test_macros::daemon_test]
@@ -494,9 +529,7 @@ async fn monitor_output_fresh_window_regex_priority_rearm_and_eof() {
     .await
     .unwrap();
     assert_eq!(
-        h.services
-            .store
-            .script_monitor(&h.ws, mid)
+        monitor_snapshot(&h.services.store, &h.ws, mid)
             .await
             .unwrap()
             .state,
@@ -580,7 +613,9 @@ async fn monitor_cleanup_suppresses_pending_outbox_and_never_revives() {
         .cancel_script_monitors(&h.ws, Some(&owner), "owner-retired")
         .await
         .unwrap();
-    let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+    let row = monitor_snapshot(&h.services.store, &h.ws, mid)
+        .await
+        .unwrap();
     assert_eq!(row.state, "cancelled");
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
     h.services.dispatch_script_monitor(&row).await;
@@ -626,7 +661,12 @@ async fn monitor_exact_deadline_beats_new_cancel_without_stopping_run() {
         .cancel_monitor(&h.ws, row["monitorId"].as_str().unwrap(), None, true)
         .await
         .unwrap();
-    assert_eq!(result["monitor"]["state"], "expired");
+    assert_eq!(
+        monitor_row(&h, row["monitorId"].as_str().unwrap(), "expired")
+            .await
+            .state,
+        "expired"
+    );
     assert_eq!(result["runStopped"], false);
     assert!(mgr.is_live(&h.ws, &id).unwrap());
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
@@ -678,9 +718,7 @@ async fn monitor_cancel_before_spawn_reserves_outcome_against_deadline() {
     clock.store(now + 1000, Ordering::SeqCst);
     mgr.reconcile_monitor(&h.ws, &mid).await.unwrap();
     assert_eq!(
-        h.services
-            .store
-            .script_monitor(&h.ws, &mid)
+        monitor_snapshot(&h.services.store, &h.ws, &mid)
             .await
             .unwrap()
             .state,
@@ -693,9 +731,14 @@ async fn monitor_cancel_before_spawn_reserves_outcome_against_deadline() {
         .unwrap()
         .unwrap();
     assert_eq!(result["runStopped"], true);
-    assert_eq!(result["monitor"]["result"]["outcome"], "cancelled");
-    assert!(result["monitor"]["result"].get("startedAt").is_none());
-    assert!(result["monitor"]["result"].get("exitCode").is_none());
+    assert!(result.get("monitor").is_none());
+    let snapshot = serde_json::to_value(
+        monitor_row(&h, result["monitorId"].as_str().unwrap(), "completed").await,
+    )
+    .unwrap();
+    assert_eq!(snapshot["result"]["outcome"], "cancelled");
+    assert!(snapshot["result"].get("startedAt").is_none());
+    assert!(snapshot["result"].get("exitCode").is_none());
 }
 
 #[intent_test_macros::daemon_test]
@@ -758,9 +801,7 @@ async fn monitor_restart_cancel_before_spawn_does_not_reuse_predecessor_timing()
     clock.store(now + 1000, Ordering::SeqCst);
     mgr.reconcile_monitor(&h.ws, &mid).await.unwrap();
     assert_eq!(
-        h.services
-            .store
-            .script_monitor(&h.ws, &mid)
+        monitor_snapshot(&h.services.store, &h.ws, &mid)
             .await
             .unwrap()
             .state,
@@ -773,11 +814,16 @@ async fn monitor_restart_cancel_before_spawn_does_not_reuse_predecessor_timing()
         .unwrap()
         .unwrap();
     assert_eq!(result["runStopped"], true);
-    assert_eq!(result["monitor"]["runId"], successor["runId"]);
-    assert_ne!(result["monitor"]["runId"], prior["runId"]);
-    assert_eq!(result["monitor"]["result"]["outcome"], "cancelled");
-    assert!(result["monitor"]["result"].get("startedAt").is_none());
-    assert!(result["monitor"]["result"].get("exitCode").is_none());
+    assert!(result.get("monitor").is_none());
+    let snapshot = serde_json::to_value(
+        monitor_row(&h, result["monitorId"].as_str().unwrap(), "completed").await,
+    )
+    .unwrap();
+    assert_eq!(snapshot["runId"], successor["runId"]);
+    assert_ne!(snapshot["runId"], prior["runId"]);
+    assert_eq!(snapshot["result"]["outcome"], "cancelled");
+    assert!(snapshot["result"].get("startedAt").is_none());
+    assert!(snapshot["result"].get("exitCode").is_none());
 }
 
 #[intent_test_macros::daemon_test]
@@ -811,7 +857,9 @@ async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
     park.release.notify_one();
     let result = tokio::time::timeout(LIVENESS, async {
         loop {
-            let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+            let row = monitor_snapshot(&h.services.store, &h.ws, mid)
+                .await
+                .unwrap();
             if row.state != "active" {
                 break serde_json::to_value(row).unwrap();
             }
@@ -881,7 +929,9 @@ async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent()
         // the durable boundary. No process from the original boot is attached.
         mgr.locks = ScriptLocks::default();
         mgr.recover_monitors().await.unwrap();
-        let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+        let row = monitor_snapshot(&h.services.store, &h.ws, mid)
+            .await
+            .unwrap();
         if scenario == "deadline" {
             assert_eq!(row.state, "expired");
             assert!(row.result.is_none());
@@ -901,10 +951,10 @@ async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent()
         assert!(h
             .services
             .store
-            .get_agent_message_by_id_with_pruned(&owner, &format!("script-monitor:{mid}"))
+            .script_monitor_wake_pending(mid)
             .await
-            .unwrap()
-            .is_some());
+            .unwrap());
+        assert!(h.services.store.script_monitor(&h.ws, mid).await.is_err());
     }
 }
 
@@ -1020,22 +1070,25 @@ async fn monitor_service_backoff_keeps_token_and_manual_restart_settles_predeces
     .unwrap();
     assert_eq!(mgr.status(&h.ws, &id).unwrap()["runId"], started["runId"]);
     assert_eq!(
-        h.services
-            .store
-            .script_monitor(&h.ws, watch["monitor"]["monitorId"].as_str().unwrap())
-            .await
-            .unwrap()
-            .state,
+        monitor_snapshot(
+            &h.services.store,
+            &h.ws,
+            watch["monitor"]["monitorId"].as_str().unwrap()
+        )
+        .await
+        .unwrap()
+        .state,
         "active"
     );
     let restarted = mgr.restart(&h.ws, &id).await.unwrap();
     assert_ne!(restarted["runId"], started["runId"]);
-    let predecessor = h
-        .services
-        .store
-        .script_monitor(&h.ws, watch["monitor"]["monitorId"].as_str().unwrap())
-        .await
-        .unwrap();
+    let predecessor = monitor_snapshot(
+        &h.services.store,
+        &h.ws,
+        watch["monitor"]["monitorId"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(predecessor.state, "completed");
     assert_eq!(
         predecessor.result.unwrap().outcome,
@@ -1097,7 +1150,7 @@ async fn monitor_storage_failure_retries_reserved_trigger_without_duplicate_or_t
         .await
         .unwrap();
     let mid = watch["monitor"]["monitorId"].as_str().unwrap();
-    sqlx::query("CREATE TRIGGER refuse_monitor_result BEFORE UPDATE OF state ON script_monitor BEGIN SELECT RAISE(FAIL,'injected'); END").execute(h.services.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TRIGGER refuse_monitor_result BEFORE DELETE ON script_monitor BEGIN SELECT RAISE(FAIL,'injected'); END").execute(h.services.store.write_pool()).await.unwrap();
     assert!(mgr
         .monitor_output(
             &h.ws,
@@ -1118,7 +1171,9 @@ async fn monitor_storage_failure_retries_reserved_trigger_without_duplicate_or_t
         .await
         .unwrap();
     mgr.reconcile_monitor(&h.ws, mid).await.unwrap();
-    let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+    let row = monitor_snapshot(&h.services.store, &h.ws, mid)
+        .await
+        .unwrap();
     assert_eq!(row.state, "triggered");
     assert_eq!(row.trigger.unwrap().observed_line_count, 1);
     mgr.stop(&h.ws, &id).await.unwrap();
@@ -1157,13 +1212,34 @@ async fn monitor_restore_failure_keeps_legacy_marker_and_compact_failure() {
         .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
         .await
         .unwrap();
-    let row = monitor_row(
-        &h,
-        watch["monitor"]["monitorId"].as_str().unwrap(),
-        "completed",
-    )
-    .await;
-    let result = row.result.unwrap();
+    let result = if watch["ok"] == true {
+        monitor_row(
+            &h,
+            watch["monitor"]["monitorId"].as_str().unwrap(),
+            "completed",
+        )
+        .await
+        .result
+        .unwrap()
+    } else {
+        assert_eq!(watch["reason"], "run-finished");
+        let (run, result) = h
+            .services
+            .store
+            .latest_script_run(&h.ws, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(watch["runId"], run);
+        assert!(h
+            .services
+            .store
+            .script_monitors(&h.ws, None)
+            .await
+            .unwrap()
+            .is_empty());
+        result.unwrap()
+    };
     assert_eq!(result.outcome, intent_core::ScriptRunOutcome::Failed);
     assert_eq!(result.exit_code, Some(-1));
     assert!(result.error.is_some());
@@ -1197,193 +1273,83 @@ async fn monitor_cancel_terminal_write_failure_reconciles_reserved_result() {
         .await
         .unwrap();
     let mid = watch["monitor"]["monitorId"].as_str().unwrap();
-    sqlx::query("CREATE TRIGGER refuse_cancel_result BEFORE UPDATE OF state ON script_monitor BEGIN SELECT RAISE(FAIL,'injected'); END").execute(h.services.store.write_pool()).await.unwrap();
+    sqlx::query("CREATE TRIGGER refuse_cancel_result BEFORE DELETE ON script_monitor BEGIN SELECT RAISE(FAIL,'injected'); END").execute(h.services.store.write_pool()).await.unwrap();
     assert!(mgr.cancel_monitor(&h.ws, mid, None, true).await.is_err());
     sqlx::query("DROP TRIGGER refuse_cancel_result")
         .execute(h.services.store.write_pool())
         .await
         .unwrap();
     mgr.reconcile_monitor(&h.ws, mid).await.unwrap();
-    let row = h.services.store.script_monitor(&h.ws, mid).await.unwrap();
+    let row = monitor_snapshot(&h.services.store, &h.ws, mid)
+        .await
+        .unwrap();
     assert_eq!(row.state, "completed");
     assert_eq!(
         row.result.unwrap().outcome,
         intent_core::ScriptRunOutcome::Cancelled
     );
-    assert_eq!(
-        mgr.cancel_monitor(&h.ws, mid, None, true).await.unwrap()["runStopped"],
-        false
-    );
+    assert!(mgr.cancel_monitor(&h.ws, mid, None, true).await.is_err());
 }
 
 #[intent_test_macros::daemon_test]
 async fn monitor_transfer_round_trip_preserves_deadline_outbox_and_reimport_fences() {
-    for scenario in [
-        "active",
-        "deadline",
-        "result",
-        "pending",
-        "delivered",
-        "cancelled",
-    ] {
+    for pending in [false, true] {
         let h = harness().await;
-        let owner = monitor_owner(&h, "transferred owner").await;
-        let id = create_simple(&h, "source service", "read value", ScriptMode::Service).await;
+        let owner = monitor_owner(&h, "transfer owner").await;
+        let id = create_simple(&h, "transfer", "read value", ScriptMode::Command).await;
         h.services
             .store
             .admit_script_run(&h.ws, &id, "source-run")
             .await
             .unwrap();
-        let now = chrono::Utc::now().timestamp_millis() + 60_000;
-        let mut source = h.services.script_manager();
-        source.parks.monitor_clock = Some(Arc::new(std::sync::atomic::AtomicI64::new(now)));
-        let registered = source
-            .monitor(
-                &h.ws,
-                &owner,
-                &id,
-                json!({"ttlMs":1000,"outputPattern":"ready","lineCount":2}),
-            )
+        let registration = h
+            .services
+            .script_manager()
+            .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
             .await
             .unwrap();
-        let mut original: intent_core::ScriptMonitor =
-            serde_json::from_value(registered["monitor"].clone()).unwrap();
-        if scenario == "result" {
-            h.services
-                .store
-                .settle_script_run(
-                    &h.ws,
-                    &id,
-                    "source-run",
-                    &intent_core::ScriptLastRun {
-                        run_id: Some("source-run".into()),
-                        outcome: intent_core::ScriptRunOutcome::Succeeded,
-                        exit_code: Some(0),
-                        started_at: None,
-                        stopped_at: now_iso(),
-                        error: None,
-                    },
-                    false,
-                )
-                .await
-                .unwrap();
+        let mut row: intent_core::ScriptMonitor =
+            serde_json::from_value(registration["monitor"].clone()).unwrap();
+        if pending {
+            row.state = "expired".into();
+            row.reason = Some("ttl-expired".into());
+            row.settled_at = Some(now_iso());
+            h.services.store.settle_script_monitor(&row).await.unwrap();
         }
-        if matches!(scenario, "pending" | "delivered" | "cancelled") {
-            original.state = if scenario == "cancelled" {
-                "cancelled"
-            } else {
-                "expired"
-            }
-            .into();
-            original.reason = Some(
-                if scenario == "cancelled" {
-                    "cancelled"
-                } else {
-                    "ttl-expired"
-                }
-                .into(),
+        let exported = h.services.store.transfer_export_rows(&h.ws).await.unwrap();
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        store.transfer_import_rows(&exported).await.unwrap();
+        if !pending {
+            assert_eq!(
+                store.script_monitor(&h.ws, &row.monitor_id).await.unwrap(),
+                row
             );
-            original.settled_at = Some(now_iso());
-            h.services
-                .store
-                .settle_script_monitor(&original)
-                .await
-                .unwrap();
-            if scenario == "delivered" {
-                h.services.dispatch_script_monitor(&original).await;
-            }
         }
-        let rows = h.services.store.transfer_export_rows(&h.ws).await.unwrap();
-        let db = TempDb::new();
-        let store = Store::open(&db.path).await.unwrap();
-        store.transfer_import_rows(&rows).await.unwrap();
-        assert_eq!(
+        let services = Services::new(store.clone());
+        services.script_manager().recover_monitors().await.unwrap();
+        assert!(store.script_monitor(&h.ws, &row.monitor_id).await.is_err());
+        let jobs = store.script_notification_jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].metadata["runId"], "source-run");
+        assert_eq!(jobs[0].metadata["expiresAt"], row.expires_at);
+        services.dispatch_script_monitor(&row).await;
+        assert!(
             store
-                .script_monitor(&h.ws, &original.monitor_id)
+                .script_monitor_wake_pending(&row.monitor_id)
                 .await
                 .unwrap(),
-            original
+            "without a worker delivery remains pending"
         );
-        let target = Services::new(store.clone());
-        let mut manager = target.script_manager();
-        manager.parks.monitor_clock = Some(Arc::new(std::sync::atomic::AtomicI64::new(
-            now + if matches!(scenario, "deadline" | "result") {
-                1000
-            } else {
-                0
-            },
-        )));
-        manager.recover_monitors().await.unwrap();
-        manager.refresh_imported(&h.ws, &id).await.unwrap();
-        let settled = store
-            .script_monitor(&h.ws, &original.monitor_id)
-            .await
-            .unwrap();
-        assert_eq!(settled.expires_at, original.expires_at);
-        assert_eq!(settled.run_id, "source-run");
-        assert_eq!(settled.agent_id, owner);
-        match scenario {
-            "active" => assert_eq!(
-                settled.result.as_ref().unwrap().outcome,
-                intent_core::ScriptRunOutcome::Interrupted
-            ),
-            "result" => assert_eq!(
-                settled.result.as_ref().unwrap().outcome,
-                intent_core::ScriptRunOutcome::Succeeded
-            ),
-            "deadline" => assert_eq!(settled.state, "expired"),
-            _ => assert_eq!(settled, original),
-        }
-        assert_eq!(
-            target.pty().count(),
-            0,
-            "transfer never adopts or starts a source process"
-        );
-        assert_eq!(
-            target
-                .script_status(h.ws.clone(), id.clone())
-                .await
-                .unwrap()["runId"],
-            "source-run"
-        );
-        target.dispatch_script_monitor(&settled).await;
-        target.dispatch_script_monitor(&settled).await;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
-            .bind(format!("script-monitor:{}", original.monitor_id))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
-        assert_eq!(count, i64::from(scenario != "cancelled"), "{scenario}");
-        sqlx::query("DELETE FROM workspace WHERE id=?")
-            .bind(h.ws.as_str())
-            .execute(store.write_pool())
-            .await
-            .unwrap();
-        store.transfer_import_rows(&rows).await.unwrap();
-        manager.recover_monitors().await.unwrap();
-        let retained = store
-            .script_monitor(&h.ws, &original.monitor_id)
-            .await
-            .unwrap();
-        assert_ne!(
-            retained.state, "active",
-            "reimport cannot revive a deleted watch"
-        );
+        store.delete_workspace(&h.ws).await.unwrap();
+        store.transfer_import_rows(&exported).await.unwrap();
+        services.script_manager().recover_monitors().await.unwrap();
+        assert!(store.script_monitors(&h.ws, None).await.unwrap().is_empty());
+        assert!(store.script_notification_jobs().await.unwrap().is_empty());
         assert!(!store
-            .script_monitor_wake_allowed(&original.monitor_id)
+            .script_monitor_wake_allowed(&row.monitor_id)
             .await
             .unwrap());
-        target.dispatch_script_monitor(&retained).await;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
-            .bind(format!("script-monitor:{}", original.monitor_id))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
-        assert_eq!(
-            count,
-            i64::from(scenario == "delivered"),
-            "only exported history returns: {scenario}"
-        );
     }
 }
 
@@ -1443,7 +1409,7 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     let queued = h.services.dequeue_message(&owner).unwrap();
     assert_eq!(queued.id, format!("script-monitor:{}", row.monitor_id));
     h.services.dispatch_script_monitor(&row).await;
-    assert!(!h
+    assert!(h
         .services
         .store
         .script_monitor_wake_pending(&row.monitor_id)

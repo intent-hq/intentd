@@ -161,7 +161,13 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; packages/intentd/crates/intent-services/src/script_monitor.rs; messages/en.json. -->
+
+Script lists show unarchived scripts; use **Load more** when offered to see the
+next page. Open a script to inspect its full command and available output. Output
+is temporary and may no longer be available after a restart. Script watches show
+only active monitors and disappear when they finish, trigger, expire, or are
+cancelled; completion notices remain in the agent conversation.
 
 To delete a saved script, use **Delete script** beside its play/edit controls in
 the bottom bar, or open the script panel's **…** menu and choose **Delete script**

@@ -44,44 +44,51 @@ async fn archive_round_trip_preserves_output_scope_and_hydrates() {
             .unwrap(),
         output
     );
+    for archive in [ScriptArchiveFilter::All, ScriptArchiveFilter::Archived] {
+        assert!(matches!(
+            h.services.script_list_filtered(h.ws.clone(), archive).await,
+            Err(Error::InvalidParams(_))
+        ));
+    }
     let history = h
         .services
-        .script_list_filtered(h.ws.clone(), ScriptArchiveFilter::Archived)
+        .store
+        .get_script_in_workspace(&h.ws, &id)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(history["scripts"].as_array().unwrap().len(), 1);
-    assert_eq!(history["scripts"][0]["purpose"], "saved");
-    assert_eq!(history["scripts"][0]["lastRun"]["outcome"], "succeeded");
-    h.services
-        .script_archive(h.ws.clone(), vec![id.clone()])
+    assert!(history.archived_at.is_some());
+    assert!(h
+        .services
+        .script_get(h.ws.clone(), id.clone())
         .await
-        .unwrap();
-    assert_eq!(
-        h.services
-            .script_list_filtered(h.ws.clone(), ScriptArchiveFilter::Archived)
-            .await
-            .unwrap(),
-        history
-    );
+        .is_err());
     assert_eq!(
         h.services.script_list(h.ws.clone()).await.unwrap()["scripts"]
             .as_array()
             .unwrap()
             .len(),
-        2
+        1
     );
-    let store = Store::open(&h.tmp.path).await.unwrap();
-    let restarted = Services::new(store);
-    restarted.script_manager().hydrate().await.unwrap();
-    let hydrated = restarted
-        .script_list_filtered(h.ws.clone(), ScriptArchiveFilter::Archived)
-        .await
-        .unwrap();
+    let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+    assert_eq!(restarted.script_manager().hydrate().await.unwrap(), 1);
+    assert!(!restarted
+        .script_manager()
+        .scripts
+        .lock()
+        .unwrap()
+        .contains_key(&(h.ws.clone(), id.clone())));
     assert_eq!(
-        hydrated["scripts"][0]["archivedAt"],
-        history["scripts"][0]["archivedAt"]
+        restarted
+            .script_status(h.ws.clone(), id.clone())
+            .await
+            .unwrap()["runId"],
+        before["runId"]
     );
-    assert_eq!(hydrated["scripts"][0]["runtime"]["status"], "idle");
+    assert!(restarted
+        .script_output(h.ws.clone(), id.clone(), None, None, None)
+        .await
+        .is_ok());
     assert_eq!(
         restarted
             .script_restore(h.ws.clone(), vec![id.clone(), service.clone()])
@@ -89,13 +96,13 @@ async fn archive_round_trip_preserves_output_scope_and_hydrates() {
             .unwrap(),
         json!({"restored":[id,service],"skipped":[]})
     );
-    assert!(restarted
-        .script_list_filtered(h.ws.clone(), ScriptArchiveFilter::Archived)
-        .await
-        .unwrap()["scripts"]
-        .as_array()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        restarted.script_list(h.ws.clone()).await.unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[intent_test_macros::daemon_test]
@@ -299,13 +306,25 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
         .unwrap()
         .archived_at
         .is_none());
-    let changes = h.services.store.query_events(&EventQuery {
-        workspace_id: Some(h.ws.clone()),
-        event_types: vec![SCRIPT_CHANGED.to_string()],
-        ..Default::default()
-    }).await.unwrap();
-    let updates: Vec<_> = changes.iter().filter(|e| e.data["action"] == "updated").collect();
-    assert_eq!(updates.len(), 1, "only the committed part of a failed batch is published");
+    let changes = h
+        .services
+        .store
+        .query_events(&EventQuery {
+            workspace_id: Some(h.ws.clone()),
+            event_types: vec![SCRIPT_CHANGED.to_string()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let updates: Vec<_> = changes
+        .iter()
+        .filter(|e| e.data["action"] == "updated")
+        .collect();
+    assert_eq!(
+        updates.len(),
+        1,
+        "only the committed part of a failed batch is published"
+    );
     assert_eq!(updates[0].data["script"]["id"], a);
     assert!(updates[0].data["script"]["archivedAt"].is_string());
     sqlx::query("DROP TRIGGER refuse_second_archive")
@@ -498,9 +517,14 @@ async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() 
         .archived_at
         .is_none());
     let event = await_script_change(&mut sub, "updated").await;
-    assert_eq!(event["data"]["script"]["runtime"]["status"], "idle",
-        "a cancelled reservation was never published as running");
-    assert_eq!(event["data"]["script"], mgr.list(&h.ws).await.unwrap()["scripts"][0]);
+    assert_eq!(
+        event["data"]["script"]["runtime"]["status"], "idle",
+        "a cancelled reservation was never published as running"
+    );
+    assert_eq!(
+        event["data"]["script"],
+        mgr.list(&h.ws).await.unwrap()["scripts"][0]
+    );
     let scripts = mgr.scripts.lock().unwrap();
     let entry = scripts.get(&(h.ws.clone(), id)).unwrap();
     assert!(
@@ -556,13 +580,20 @@ async fn archive_empty_active_view_never_rebootstraps_repository_scripts() {
             json!({"scripts":[]})
         );
     }
-    let history = h
+    assert!(h
         .services
         .script_list_filtered(h.ws.clone(), ScriptArchiveFilter::Archived)
         .await
-        .unwrap();
-    assert_eq!(history["scripts"].as_array().unwrap().len(), 1);
-    assert_eq!(history["scripts"][0]["id"], id);
+        .is_err());
+    assert!(h
+        .services
+        .store
+        .get_script_in_workspace(&h.ws, &id)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
     assert_eq!(h.services.store.list_all_scripts().await.unwrap().len(), 1);
 }
 

@@ -15,7 +15,7 @@ async fn script_monitor_mcp_output_wakes_owner_once_over_wss() {
         .unwrap()
         .success());
     let command = format!("cat '{}'; read hold", fifo.display());
-    let code=format!("const s=await ws.script.create('Controlled output',{},'command',{{purpose:'saved'}}); const start=await ws.script.start(s.id); return await ws.script.monitor(s.id,{{ttlMs:60000,runId:start.runId,outputPattern:'^READY$',lineCount:1}});",json!(command));
+    let code=format!("const s=await ws.script.create('Controlled output',{},'command',{{purpose:'saved'}}); const start=await ws.script.start(s.id); const watch=await ws.script.monitor(s.id,{{ttlMs:60000,runId:start.runId,outputPattern:'^READY$',lineCount:1}}); const page=await ws.script.listPage({{limit:1}}); const monitors=await ws.script.monitorsPage({{limit:1}}); const detail=await ws.script.monitorDetails(watch.monitor.monitorId); const script=await ws.script.get(s.id); if(page.view!=='summary'||page.scripts[0].command!==undefined||monitors.view!=='summary'||monitors.monitors[0].outputPattern!==undefined||detail.outputPattern!=='^READY$'||script.command!==s.command) throw new Error('compact binding mismatch'); return {{...watch,compactBindingsVerified:true}};",json!(command));
     let behavior=json!({"rules":[{"ifPromptContains":"REGISTER_SCRIPT_MONITOR","toolCall":{"name":"workspace_api","arguments":{"code":code,"summary":"Register native script output monitor"}},"response":"MONITOR_REGISTERED"}],"response":"WAKE_ACKNOWLEDGED"}).to_string();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env = [
@@ -58,22 +58,12 @@ async fn script_monitor_mcp_output_wakes_owner_once_over_wss() {
     let text =
         await_conversation_contains(&mut rpc, &ws_id, &agent_id, "script_monitor_wake", deadline)
             .await;
+    assert!(text.contains("compactBindingsVerified"), "{text}");
     assert!(text.contains("output-match"), "{text}");
     assert!(text.contains("Untrusted script output"), "{text}");
     await_conversation_contains(&mut rpc, &ws_id, &agent_id, "WAKE_ACKNOWLEDGED", deadline).await;
     let terminal = wss_rpc(&mut rpc, "scriptMonitor.list", json!({"workspaceId":ws_id})).await;
-    assert_eq!(terminal["monitors"][0]["state"], "triggered");
-    assert_eq!(
-        terminal["monitors"][0]["trigger"],
-        json!({"observedLineCount":1,"matchedLine":"READY"})
-    );
-    let repeated = wss_rpc(
-        &mut rpc,
-        "scriptMonitor.cancelRun",
-        json!({"workspaceId":ws_id,"monitorId":row["monitorId"]}),
-    )
-    .await;
-    assert_eq!(repeated["runStopped"], false);
+    assert!(terminal["monitors"].as_array().unwrap().is_empty());
     wss_rpc(
         &mut rpc,
         "script.stop",
@@ -234,10 +224,7 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
     assert!(text.contains("finished"), "{text}");
     await_conversation_contains(&mut rpc, &ws_id, &agent_id, "WAKE_ACKNOWLEDGED", deadline).await;
     let terminal = wss_rpc(&mut rpc, "scriptMonitor.list", json!({"workspaceId":ws_id})).await;
-    assert_eq!(terminal["monitors"][0]["state"], "completed");
-    assert_eq!(terminal["monitors"][0]["runId"], row["runId"]);
-    assert_eq!(terminal["monitors"][0]["result"]["exitCode"], 1);
-    assert_eq!(terminal["monitors"][0]["result"]["outcome"], "failed");
+    assert!(terminal["monitors"].as_array().unwrap().is_empty());
     let id = intent_core::AgentId::from(agent_id);
     let mid = format!("script-monitor:{}", row["monitorId"].as_str().unwrap());
     assert!(store
@@ -249,31 +236,14 @@ async fn completion_wakes_idle_owner(reject_result: bool) {
         .script_monitor_wake_pending(row["monitorId"].as_str().unwrap())
         .await
         .unwrap());
-    // Replay the durable outbox twice after actual consumption, then wait for
-    // maintenance to acknowledge each replay. This drives duplicate delivery
-    // attempts without relying on an arbitrary sleep or transcript uniqueness.
-    for _ in 0..2 {
-        sqlx::query("UPDATE script_monitor SET wake_state='pending' WHERE id=?")
-            .bind(row["monitorId"].as_str().unwrap())
-            .execute(store.write_pool())
-            .await
-            .unwrap();
-        loop {
-            if !store
-                .script_monitor_wake_pending(row["monitorId"].as_str().unwrap())
-                .await
-                .unwrap()
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "outbox replay never acknowledged"
-            );
-            // timing-guard: wait for the maintenance delivery attempt to acknowledge the replay.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
+    // Repeated stale callbacks cannot retire a nonexistent monitor or manufacture a job.
+    let mut stale: intent_core::ScriptMonitor = serde_json::from_value(row.clone()).unwrap();
+    stale.state = "completed".into();
+    stale.reason = Some("finished".into());
+    stale.settled_at = Some(intent_core::now_iso());
+    assert!(!store.settle_script_monitor(&stale).await.unwrap());
+    assert!(!store.settle_script_monitor(&stale).await.unwrap());
+    assert!(store.script_notification_jobs().await.unwrap().is_empty());
     wss_rpc(
         &mut rpc,
         "agent.sendMessage",

@@ -353,7 +353,7 @@ async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
         json!({"clientId":"script-monitor-e2e","clientType":"web"}),
     )
     .await;
-    assert_eq!(hello["server"]["capabilities"]["scriptMonitors"], 1);
+    assert_eq!(hello["server"]["capabilities"]["scriptMonitors"], 2);
     wss_rpc(
         &mut events,
         1,
@@ -417,6 +417,27 @@ async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
     )
     .await;
     assert_eq!(list["monitors"], json!([monitor]));
+    assert_eq!(
+        wss_rpc(
+            &mut client,
+            401,
+            "scriptMonitor.get",
+            json!({"workspaceId":f.ws_id,"monitorId":monitor["monitorId"]})
+        )
+        .await,
+        monitor
+    );
+    let page = wss_rpc(
+        &mut client,
+        402,
+        "scriptMonitor.list",
+        json!({"workspaceId":f.ws_id,"view":"summary","limit":1}),
+    )
+    .await;
+    assert_eq!(page["monitors"][0]["monitorId"], monitor["monitorId"]);
+    assert_eq!(page["view"], "summary");
+    assert!(page.get("nextCursor").is_none());
+
     let foreign = WorkspaceId::new();
     f.store
         .insert_workspace(&workspace(&foreign))
@@ -472,11 +493,20 @@ async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
     )
     .await;
     assert_eq!(cancelled["runStopped"], true);
-    assert_eq!(cancelled["monitor"]["state"], "completed");
-    assert_eq!(cancelled["monitor"]["result"]["outcome"], "cancelled");
-    assert!(cancelled["monitor"]["result"].get("runId").is_none());
+    assert_eq!(
+        cancelled,
+        json!({"ok":true,"monitorId":monitor["monitorId"],"runStopped":true})
+    );
     let completed = next_event(&mut events, "scriptMonitor:completed").await;
-    assert_eq!(completed["data"]["monitor"], cancelled["monitor"]);
+    assert_eq!(
+        completed["data"]["monitor"]["result"]["outcome"],
+        "cancelled"
+    );
+    assert!(f
+        .store
+        .script_monitor(&f.ws_id, monitor["monitorId"].as_str().unwrap())
+        .await
+        .is_err());
     assert_eq!(
         wss_rpc(
             &mut client,
@@ -510,14 +540,14 @@ async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
         json!({"workspaceId":foreign,"scriptId":foreign_id}),
     )
     .await;
-    let repeat = wss_rpc(
+    let repeat = wss_call(
         &mut client,
         7,
         "scriptMonitor.cancelRun",
         json!({"workspaceId":f.ws_id,"monitorId":monitor["monitorId"]}),
     )
     .await;
-    assert_eq!(repeat["runStopped"], false);
+    assert_eq!(repeat["error"]["code"], -32602);
     let fresh = wss_rpc(
         &mut client,
         8,
@@ -543,12 +573,12 @@ async fn script_monitor_wss_ownership_cancel_run_events_and_isolation() {
         json!({"workspaceId":f.ws_id,"monitorId":rearmed["monitor"]["monitorId"]}),
     )
     .await;
-    assert_eq!(silent["monitor"]["state"], "cancelled");
-    assert_eq!(silent["monitor"]["reason"], "unmonitored");
     assert_eq!(
-        next_event(&mut events, "scriptMonitor:cancelled").await["data"]["monitor"],
-        silent["monitor"]
+        silent,
+        json!({"ok":true,"monitorId":rearmed["monitor"]["monitorId"]})
     );
+    let event = next_event(&mut events, "scriptMonitor:cancelled").await;
+    assert_eq!(event["data"]["monitor"]["reason"], "unmonitored");
     wss_rpc(
         &mut client,
         10,
@@ -653,15 +683,12 @@ async fn script_monitor_wss_lifecycle_suppresses_recoverable_wakes_and_active_ro
             json!({"workspaceId":f.ws_id}),
         )
         .await;
-        assert_eq!(rows["monitors"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            f.store
-                .script_monitor(&f.ws_id, "pending-wake")
-                .await
-                .unwrap()
-                .state,
-            "triggered"
-        );
+        assert!(rows["monitors"].as_array().unwrap().is_empty());
+        assert!(f
+            .store
+            .script_monitor(&f.ws_id, "pending-wake")
+            .await
+            .is_err());
         assert!(!f
             .store
             .script_monitor_wake_allowed("pending-wake")
@@ -708,4 +735,173 @@ async fn script_monitor_wss_lifecycle_suppresses_recoverable_wakes_and_active_ro
         )
         .await;
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn script_active_pages_and_selected_details_match_wss_contract() {
+    let f = boot().await;
+    let mut client = connect(f.port, f.cfg.clone()).await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let command = format!("printf 'selected-output\\n'; #{}", "é😀".repeat(10000));
+        let row=wss_rpc(&mut client,100+n,"script.create",json!({"workspaceId":f.ws_id,"name":format!("Script {n}"),"command":command,"mode":"command","purpose":"saved","env":{"LARGE":"value"}})).await;
+        ids.push(row["id"].as_str().unwrap().to_owned());
+    }
+    wss_rpc(
+        &mut client,
+        104,
+        "script.archive",
+        json!({"workspaceId":f.ws_id,"scriptIds":[ids[0]]}),
+    )
+    .await;
+    for archive in [json!("all"), json!("archived"), Value::Null] {
+        for view in ["full", "summary"] {
+            let error = wss_call(
+                &mut client,
+                105,
+                "script.list",
+                json!({"workspaceId":f.ws_id,"archive":archive,"view":view}),
+            )
+            .await;
+            assert_eq!(error["error"]["code"], -32602);
+        }
+    }
+    let first = wss_rpc(
+        &mut client,
+        106,
+        "script.list",
+        json!({"workspaceId":f.ws_id,"view":"summary","limit":1}),
+    )
+    .await;
+    assert_eq!(first["view"], "summary");
+    assert_eq!(first["scripts"].as_array().unwrap().len(), 1);
+    assert!(first["nextCursor"].is_string());
+    let summary = &first["scripts"][0];
+    assert!(summary.get("command").is_none());
+    assert!(summary.get("env").is_none());
+    assert_eq!(summary["commandTruncated"], true);
+    assert!(summary["commandPreview"].as_str().unwrap().len() <= 160);
+    let selected = summary["id"].clone();
+    let detail = wss_rpc(
+        &mut client,
+        107,
+        "script.get",
+        json!({"workspaceId":f.ws_id,"scriptId":selected}),
+    )
+    .await;
+    assert!(detail["command"].as_str().unwrap().len() > 50000);
+    assert_eq!(detail["env"]["LARGE"], "value");
+    let second = wss_rpc(
+        &mut client,
+        108,
+        "script.list",
+        json!({"workspaceId":f.ws_id,"view":"summary","cursor":first["nextCursor"],"limit":1}),
+    )
+    .await;
+    assert!(second.get("nextCursor").is_none());
+    assert_ne!(second["scripts"][0]["id"], selected);
+    let legacy = wss_rpc(
+        &mut client,
+        109,
+        "script.list",
+        json!({"workspaceId":f.ws_id}),
+    )
+    .await;
+    assert_eq!(legacy["scripts"].as_array().unwrap().len(), 2);
+    for id in [ids[0].clone(), "missing".into()] {
+        assert_eq!(
+            wss_call(
+                &mut client,
+                110,
+                "script.get",
+                json!({"workspaceId":f.ws_id,"scriptId":id})
+            )
+            .await["error"]["code"],
+            -32602
+        );
+    }
+    wss_rpc(
+        &mut client,
+        111,
+        "script.run",
+        json!({"workspaceId":f.ws_id,"scriptId":selected,"timeoutSeconds":5}),
+    )
+    .await;
+    wss_rpc(
+        &mut client,
+        112,
+        "script.archive",
+        json!({"workspaceId":f.ws_id,"scriptIds":[selected]}),
+    )
+    .await;
+    let output = wss_rpc(
+        &mut client,
+        113,
+        "script.output",
+        json!({"workspaceId":f.ws_id,"scriptId":selected,"maxLines":1}),
+    )
+    .await;
+    assert!(output.is_string());
+    let output = wss_rpc(
+        &mut client,
+        114,
+        "script.output",
+        json!({"workspaceId":f.ws_id,"scriptId":selected,"maxLines":100}),
+    )
+    .await;
+    assert!(output.as_str().unwrap().contains("selected-output"));
+    assert_eq!(
+        wss_rpc(
+            &mut client,
+            115,
+            "script.status",
+            json!({"workspaceId":f.ws_id,"scriptId":selected})
+        )
+        .await["status"],
+        "exited"
+    );
+    let active = wss_rpc(
+        &mut client,
+        116,
+        "script.list",
+        json!({"workspaceId":f.ws_id,"view":"summary"}),
+    )
+    .await;
+    assert_eq!(active["scripts"].as_array().unwrap().len(), 1);
+    assert!(active["scripts"][0].get("output").is_none());
+    for state in [json!("all"), json!("terminal"), Value::Null] {
+        assert_eq!(
+            wss_call(
+                &mut client,
+                117,
+                "scriptMonitor.list",
+                json!({"workspaceId":f.ws_id,"state":state})
+            )
+            .await["error"]["code"],
+            -32602
+        );
+    }
+    let monitors = wss_rpc(
+        &mut client,
+        118,
+        "scriptMonitor.list",
+        json!({"workspaceId":f.ws_id,"view":"summary"}),
+    )
+    .await;
+    assert_eq!(monitors, json!({"view":"summary","monitors":[]}));
+    assert_eq!(
+        wss_call(
+            &mut client,
+            119,
+            "scriptMonitor.get",
+            json!({"workspaceId":f.ws_id,"monitorId":"missing"})
+        )
+        .await["error"]["code"],
+        -32602
+    );
+    eprintln!(
+        "production WSS script payload: full={} bytes, first page={} bytes",
+        legacy.to_string().len(),
+        first.to_string().len()
+    );
 }
