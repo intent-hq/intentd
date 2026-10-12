@@ -6,6 +6,18 @@ use intent_core::WorkspaceApi;
 use intent_store::RepositorySelectionChange;
 use std::sync::Arc;
 
+#[path = "context_consumer/isolation.rs"]
+mod isolation;
+
+const BOUNDARY_TEST: &str = concat!(
+    "repository_read_policy::tests::context_consumer",
+    "::context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_five"
+);
+const MUTATION_TEST: &str = concat!(
+    "repository_read_policy::tests::context_consumer",
+    "::context_consumer_isolation_keeps_primary_git_mutation_refusals"
+);
+
 #[intent_test_macros::daemon_test]
 async fn context_consumer_saved_primary_choice_and_reset_control_actual_native_read() {
     let http = ReadServer::new().await;
@@ -201,6 +213,9 @@ async fn context_consumer_required_settings_and_secret_replacement_keep_all_reco
 
 #[intent_test_macros::daemon_test]
 async fn context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_five() {
+    let Some(completion) = isolation::enter(BOUNDARY_TEST) else {
+        return;
+    };
     for count in [63, 64] {
         let http = ReadServer::new().await;
         let f = LiveFixture::new(&http).await;
@@ -222,4 +237,81 @@ async fn context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_f
         assert!(http.count() > 0);
         f.owner.drain_jobs().await;
     }
+    completion.finish();
+}
+
+#[test]
+fn context_consumer_boundary_ignores_ambient_git_config() {
+    isolation::ambient_controller(BOUNDARY_TEST);
+}
+
+#[intent_test_macros::daemon_test]
+async fn context_consumer_isolation_keeps_primary_git_mutation_refusals() {
+    let Some(completion) = isolation::enter(MUTATION_TEST) else {
+        return;
+    };
+    for change in ["unchanged", "head", "remote"] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::new(&http).await;
+        let control = Arc::new(Control::default());
+        let hold = Hold::new();
+        *control.hold.lock().unwrap() = Some(hold.clone());
+        let server = controlled(&f, control.clone());
+        let task = tokio::spawn(async move {
+            tcp(
+                server,
+                "await ws.pr.snapshot(4); return 'unchanged-transfer';",
+            )
+            .await
+        });
+        hold.reached().await;
+        assert_eq!(*control.events.lock().unwrap(), vec![2]);
+        assert!(http.count() > 0);
+        match change {
+            "head" => {
+                f.base.git.git(
+                    &f.base.git.path,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "new head",
+                    ],
+                );
+            }
+            "remote" => {
+                f.base.git.git(
+                    &f.base.git.path,
+                    &[
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://gitlab.test/forge/other/changed.git",
+                    ],
+                );
+            }
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        hold.resume();
+        let reply = task.await.unwrap();
+        if change == "unchanged" {
+            assert!(reply.to_string().contains("unchanged-transfer"), "{reply}");
+            assert!(reply.to_string().contains(FACTS), "{reply}");
+        } else {
+            assert!(
+                reply
+                    .to_string()
+                    .contains("Private result delivery refused"),
+                "{change}: {reply}"
+            );
+            assert!(!reply.to_string().contains(FACTS), "{change}: {reply}");
+        }
+        f.owner.drain_jobs().await;
+    }
+    completion.finish();
 }
