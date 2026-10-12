@@ -158,7 +158,17 @@ fn run(
     nested: bool,
     proof: Option<(&Path, &str)>,
 ) {
-    let log_path = root.path().join("child.log");
+    let root_path = root.path().to_owned();
+    // On Unix, nested cleanup delegates descendants to the outer group owner.
+    // Its TempDir transitively owns this directory, so only that owner may
+    // remove it after the group stops (or retain it on uncertain cleanup).
+    let root = if cfg!(unix) && nested {
+        let _ = root.keep();
+        None
+    } else {
+        Some(root)
+    };
+    let log_path = root_path.join("child.log");
     let log = File::create(&log_path).unwrap();
     command
         .stdin(Stdio::piped())
@@ -175,10 +185,12 @@ fn run(
     let cleaned = child.cleanup();
     drop(child);
     if !cleaned {
-        let retained = root.keep();
+        if let Some(root) = root {
+            let _ = root.keep();
+        }
         panic!(
             "boundary child cleanup unconfirmed; retained {}",
-            retained.display()
+            root_path.display()
         );
     }
     let output = std::fs::read_to_string(log_path).unwrap();
@@ -186,6 +198,8 @@ fn run(
         .as_ref()
         .map(|(path, _)| std::fs::read_to_string(path));
     drop(root);
+    #[cfg(unix)]
+    cleanup_tests::after_scratch_release(nested);
     let status = outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     assert!(
         status.is_some_and(|s| s.success()),

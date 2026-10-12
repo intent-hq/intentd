@@ -89,6 +89,7 @@ impl Child {
             if matches!(self.process.try_wait(), Ok(Some(_))) {
                 // The outer owner will sweep the entire group before reaping
                 // this still-live controller, on both success and failure.
+                // The runner also defers nested scratch to that outer owner.
                 self.cleaned = true;
                 return true;
             }

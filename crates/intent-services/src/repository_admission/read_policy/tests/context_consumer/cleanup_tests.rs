@@ -31,6 +31,18 @@ fn await_self_expiry() {
     }
 }
 
+#[cfg(unix)]
+pub(super) fn after_scratch_release(nested: bool) {
+    if !nested || std::env::var(MODE).as_deref() != Ok("scratch-order") {
+        return;
+    }
+    let record = PathBuf::from(std::env::var_os(RECORD).unwrap());
+    // Hold the controller at the ownership handoff until its live descendant
+    // has observed scratch. No elapsed-time race with the outer group sweep.
+    std::fs::write(record.with_extension("inspect"), "inspect").unwrap();
+    wait_file(&record.with_extension("ordering"));
+}
+
 pub(super) fn after_start(nested: bool) {
     let Some(record) = std::env::var_os(RECORD) else {
         return;
@@ -54,6 +66,14 @@ fn cleanup_probe() {
     let ready = record.with_extension("descendant-ready");
     if std::env::var_os(DESCENDANT).is_some() {
         std::fs::write(ready, "ready").unwrap();
+        if std::env::var(MODE).as_deref() == Ok("scratch-order") {
+            wait_file(&record.with_extension("inspect"));
+            std::fs::write(
+                record.with_extension("ordering"),
+                std::env::temp_dir().exists().to_string(),
+            )
+            .unwrap();
+        }
         // A bounded last-resort exit, not the expected cleanup mechanism.
         await_self_expiry();
         std::process::exit(0);
@@ -91,7 +111,7 @@ fn cleanup_probe() {
     std::fs::write(&staging, value.to_string()).unwrap();
     std::fs::rename(staging, record).unwrap();
     match std::env::var(MODE).unwrap().as_str() {
-        "crash" => std::process::exit(23),
+        "crash" | "scratch-order" => std::process::exit(23),
         "panic" => panic!("intentional worker panic with live descendant"),
         "timeout" | "controller-crash" | "controller-panic" => {
             await_self_expiry();
@@ -130,6 +150,8 @@ fn failure_cleanup_stops_descendants_and_removes_owned_scratch() {
         (true, "timeout"),
         (true, "controller-crash"),
         (true, "controller-panic"),
+        #[cfg(unix)]
+        (true, "scratch-order"),
     ] {
         let observer = crate::test_support::test_tempdir("context-cleanup-observer-");
         let record = observer.path().join("worker.json");
@@ -184,6 +206,13 @@ fn failure_cleanup_stops_descendants_and_removes_owned_scratch() {
             "{nested}/{mode}: {status:?}\n{output}"
         );
         assert!(cleaned, "observer cleanup {nested}/{mode}");
+        if mode == "scratch-order" {
+            assert_eq!(
+                std::fs::read_to_string(record.with_extension("ordering")).unwrap(),
+                "true",
+                "scratch removed while descendant was alive"
+            );
+        }
         assert!(
             survivors.is_empty(),
             "live descendants {nested}/{mode}: {survivors:?}\n{output}"
