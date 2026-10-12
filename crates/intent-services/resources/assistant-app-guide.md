@@ -137,6 +137,15 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+
+Use **Next Workspace Tab** (default **Ctrl+Tab**) or **Previous Workspace Tab**
+(default **Ctrl+Shift+Tab**) to cycle through open workspace tabs in displayed
+order. From **Home**, next opens the first workspace tab and previous opens the
+last, regardless of which workspace was selected before Home. With no open
+workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
+and shortcuts → Keyboard shortcuts**.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
 When an agent monitors a GitHub pull request, its conversation shows the monitored
