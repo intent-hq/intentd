@@ -57,6 +57,90 @@ test('TAP runner sanitizes unexpected failing assertions and caps output on disk
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+function orphanCleanupReport(primaryError, failures, observerStderr, survivingPids, records) {
+  // Do not put all categories into failureReport's single prefix budget: a
+  // nested Windows taskkill report can otherwise hide cleanup and stderr.
+  const describe = error => {
+    if (!error) return undefined;
+    // AssertionError appends comparison details after the JSON report line.
+    // Keep its method even if a large single-line body must be omitted safely.
+    let method;
+    try { method = JSON.parse(error.message.split('\n')[0]).method; } catch {}
+    return {
+      name: diagnostics.safeText(error.name ?? '', { limit: 64 }),
+      code: diagnostics.safeText(error.code ?? '', { limit: 64 }),
+      method: method === undefined ? undefined : diagnostics.safeText(method, { limit: 128 }),
+      message: diagnostics.safeText(error.message ?? '', { limit: 2048 }),
+      data: diagnostics.safeText(JSON.stringify(diagnostics.safeValue(error.data).value) ?? '', { limit: 256 }),
+    };
+  };
+  const child = records.filter(row => row.argv?.includes('rpc')).at(-1) ?? records.at(-1);
+  return JSON.stringify({
+    method: 'orphan fixture cleanup',
+    primaryError: describe(primaryError),
+    cleanupErrors: failures.slice(0, 3).map(describe),
+    cleanupErrorCount: failures.length,
+    observerStderr,
+    survivingPids: survivingPids.slice(0, 2 * diagnostics.LIMITS.invocations + 1),
+    survivingPidCount: survivingPids.length,
+    independentChild: child ? {
+      invocationId: diagnostics.safeText(child.invocationId ?? '', { limit: 128 }),
+      pid: child.pid, observerPid: child.observerPid,
+      close: child.close ? { code: child.close.code,
+        signal: diagnostics.safeText(child.close.signal ?? '', { limit: 64 }),
+        kind: diagnostics.safeText(child.close.kind ?? '', { limit: 64 }) } : null,
+      stderr: diagnostics.safeText(child.stderr?.text ?? '', { limit: 512 }),
+      observerError: diagnostics.safeText(child.observerError?.text ?? '', { limit: 512 }),
+    } : null,
+  });
+}
+
+test('orphan cleanup keeps every diagnostic category when nested Windows errors are large', () => {
+  const nested = diagnostics.failureReport('Fixture child force-stop failed', {
+    status: 128, childState: 'exited', observerState: 'exited',
+    stderr: 'ERROR: process not found. ' + 'C:\\long\\fixture\\path '.repeat(300),
+  }, [{ invocationId: 'fixture', argv: [], pid: 123, close: null }]);
+  const windowsStack = ('\n    at C:\\fixture\\observer\\close-publication.cjs:158:11').repeat(30);
+  const primary = new Error(nested + windowsStack);
+  const cleanup = new Error(nested + windowsStack);
+  const observerStderr = diagnostics.safeText('observer close publication failed\n' +
+    'token=' + secret + '\n' + 'C:\\long\\observer\\path '.repeat(500), { limit: 2048 });
+  for (const count of [1, 20]) {
+    const pids = Array.from({ length: 40 }, (_, index) => 100 + index);
+    const report = orphanCleanupReport(primary, Array(count).fill(cleanup), observerStderr, pids,
+      [{ invocationId: 'fixture', argv: [], pid: 123, observerPid: 456, close: null,
+        stderr: diagnostics.safeText('child error\n' + 'C:\\path\\'.repeat(2000)), observerError: observerStderr }]);
+    const parsed = JSON.parse(report);
+    assert.match(parsed.primaryError.message.text, /Fixture child force-stop failed/);
+    assert.equal(parsed.cleanupErrors.length, Math.min(count, 3));
+    assert.equal(parsed.cleanupErrorCount, count);
+    assert.match(parsed.cleanupErrors[0].message.text, /Fixture child force-stop failed/);
+    assert.match(parsed.observerStderr.text, /observer close publication failed/);
+    assert.equal(parsed.survivingPidCount, pids.length);
+    assert.deepEqual(parsed.survivingPids, pids.slice(0, 2 * diagnostics.LIMITS.invocations + 1));
+    assert.equal(parsed.independentChild.invocationId.text, 'fixture');
+    assert.equal(parsed.independentChild.pid, 123);
+    assert.equal(parsed.independentChild.observerPid, 456);
+    assert.equal(parsed.independentChild.close, null);
+    assert.match(parsed.independentChild.stderr.text, /child error/);
+    auditText(report);
+    assert.ok(!report.includes(secret));
+    assert.ok(Buffer.byteLength(report) <= diagnostics.LIMITS.report);
+  }
+  const oversized = new Error(JSON.stringify({ method: 'Fixture child force-stop failed',
+    details: 'é'.repeat(10000) + 'token=' + secret }));
+  const report = orphanCleanupReport(oversized, [oversized], observerStderr, [], []);
+  const parsed = JSON.parse(report);
+  assert.equal(parsed.primaryError.method.text, 'Fixture child force-stop failed');
+  assert.equal(parsed.cleanupErrors[0].method.text, 'Fixture child force-stop failed');
+  assert.equal(parsed.primaryError.message.truncated, true);
+  assert.equal(parsed.cleanupErrors[0].message.truncated, true);
+  auditText(report);
+  assert.ok(!report.includes(secret));
+  assert.ok(Buffer.byteLength(report) <= diagnostics.LIMITS.report);
+
+});
+
 test('harness reaps a known child after its launcher has already exited', async t => {
   const value = 'SYNTHETIC_ORPHAN_SETUP_CREDENTIAL_1234';
   for (const scenario of ['ready', 'child failure', 'observer failure', 'readiness timeout', 'observer close failure']) await t.test(scenario, async () => {
@@ -193,12 +277,7 @@ test('harness reaps a known child after its launcher has already exited', async 
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       // Preserve the first failure even when cleanup also fails. The observer
       // can emit its useful error only after the readiness snapshot above.
-      const describe = error => error && ({ name: error.name, message: error.message,
-        code: error.code, data: error.data });
-      const report = diagnostics.failureReport('orphan fixture cleanup', {
-        primaryError: describe(primaryError), observerStderr,
-        cleanupErrors: failures.map(describe), survivingPids,
-      }, records);
+      const report = orphanCleanupReport(primaryError, failures, observerStderr, survivingPids, records);
       if (scenario === 'observer close failure') {
         assert.ok(primaryError, 'The missing close must fail the original cleanup');
         assert.ok(failures.length, 'Repeated cleanup must not waive missing close evidence');
