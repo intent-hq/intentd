@@ -17,6 +17,7 @@ mod delete_grace;
 mod guarded_metadata;
 mod immediate_delete;
 mod plain_markdown;
+mod prepared_writes;
 mod writer_anchors;
 
 fn request(value: Value) -> NotePageRequest {

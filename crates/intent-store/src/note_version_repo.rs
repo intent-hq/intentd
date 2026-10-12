@@ -108,14 +108,48 @@ impl Store {
         date: &str,
         orphaned: &[String],
     ) -> Result<(i64, i64)> {
+        let prepared = if let Some(expected) = expected_version {
+            crate::note_prepared_write::Attempt::try_prepare(self, note, expected).await?
+        } else {
+            None
+        };
+        self.finish_prepared_note_write(note, expected_version, author, date, orphaned, prepared)
+            .await
+    }
+
+    pub(crate) async fn finish_prepared_note_write(
+        &self,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+        date: &str,
+        orphaned: &[String],
+        mut prepared: Option<crate::note_prepared_write::Attempt>,
+    ) -> Result<(i64, i64)> {
+        let expected_version = prepared
+            .as_ref()
+            .map(crate::note_prepared_write::Attempt::expected_revision)
+            .or(expected_version);
+        let prepared_note = prepared
+            .as_ref()
+            .map(crate::note_prepared_write::Attempt::note);
+        let note = prepared_note.as_deref().unwrap_or(note);
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         let result = async {
-            let Some(rev) = crate::note_repo::exec_update_note(
+            if let Some(attempt) = &prepared {
+                if !attempt.matches(&mut conn).await? {
+                    return Ok(None);
+                }
+            }
+            let Some(rev) = crate::note_repo::exec_update_note_with_projection(
                 &mut conn,
                 note,
                 expected_version,
                 crate::note_repo::NoteUpdateScope::FullRow,
+                prepared
+                    .as_mut()
+                    .and_then(crate::note_prepared_write::Attempt::take_projection),
             )
             .await?
             else {
@@ -134,10 +168,17 @@ impl Store {
         }
         .await;
 
-        match conn.finish(result, "commit note write tx failed").await? {
-            Some(written) => Ok(written),
-            None => Err(self.note_update_miss(note).await),
-        }
+        let settled = conn.finish(result, "commit note write tx failed").await;
+        let outcome = match settled {
+            Ok(Some(written)) => Ok(written),
+            Ok(None) => Err(self.note_update_miss(note).await),
+            Err(error) => Err(error),
+        };
+        // Conflict classification can await a reader. Keep admission until its
+        // owned input alias is gone, as well as through transaction settlement.
+        drop(prepared_note);
+        drop(prepared);
+        outcome
     }
 
     /// Persist a parent-note content write together with the child-note

@@ -7300,6 +7300,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
+        note_preparation: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         note_pages: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
