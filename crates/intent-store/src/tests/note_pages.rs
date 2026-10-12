@@ -12,6 +12,7 @@ use std::sync::{
 };
 
 mod anchor_lifecycle;
+mod batched_writes;
 mod delete_grace;
 mod guarded_metadata;
 mod immediate_delete;
