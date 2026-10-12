@@ -335,6 +335,75 @@ async fn monitor_row(h: &Harness, id: &str, state: &str) -> intent_core::ScriptM
 }
 
 #[intent_test_macros::daemon_test]
+async fn monitor_terminal_wait_tolerates_settlement_publication_gap() {
+    let h = harness().await;
+    let owner = monitor_owner(&h, "owner").await;
+    let id = create_simple(&h, "publication gap", "true", ScriptMode::Command).await;
+    h.services
+        .store
+        .admit_script_run(&h.ws, &id, "publication-gap-run")
+        .await
+        .unwrap();
+    let mut mgr = h.services.script_manager();
+    // Drive the two production settlement/publication phases explicitly, with
+    // no maintenance task able to close the gap before it is observed.
+    mgr.owner_services = None;
+    let registered = mgr
+        .monitor(&h.ws, &owner, &id, json!({"ttlMs":60000}))
+        .await
+        .unwrap();
+    let mut terminal: intent_core::ScriptMonitor =
+        serde_json::from_value(registered["monitor"].clone()).unwrap();
+    terminal.state = "completed".into();
+    terminal.settled_at = Some(now_iso());
+    terminal.result = Some(intent_core::ScriptLastRun {
+        run_id: Some(terminal.run_id.clone()),
+        outcome: intent_core::ScriptRunOutcome::Failed,
+        exit_code: Some(-1),
+        started_at: None,
+        stopped_at: now_iso(),
+        error: Some("spawn failed before start".into()),
+    });
+    assert!(h
+        .services
+        .store
+        .settle_script_monitor(&terminal)
+        .await
+        .unwrap());
+    assert!(matches!(
+        h.services
+            .store
+            .script_monitor(&h.ws, &terminal.monitor_id)
+            .await,
+        Err(Error::InvalidParams(message)) if message == "unknown monitor ID"
+    ));
+    assert!(matches!(
+        monitor_snapshot(&h.services.store, &h.ws, &terminal.monitor_id).await,
+        Err(Error::InvalidParams(message)) if message == "no terminal event"
+    ));
+    let (observed, ()) = tokio::join!(monitor_row(&h, &terminal.monitor_id, "completed"), async {
+        // The waiter may be reading while neither row nor event exists.
+        // Publication, rather than a fixed delay, ends that valid gap.
+        h.bus
+            .publish(&script_event(
+                &h.ws,
+                "scriptMonitor:completed",
+                json!({"monitor": terminal}),
+            ))
+            .await
+            .unwrap();
+    });
+    assert_eq!(observed, terminal);
+    assert!(h
+        .services
+        .store
+        .script_monitors(&h.ws, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[intent_test_macros::daemon_test]
 async fn monitor_registration_owner_retry_cancel_and_run_token_are_atomic() {
     let h = harness().await;
     let owner = monitor_owner(&h, "owner").await;
@@ -855,19 +924,8 @@ async fn monitor_restart_spawn_failure_does_not_reuse_predecessor_timing() {
     // Closing the isolated PTY host forces spawn to fail before a process exists.
     h.services.pty().kill_all_sync();
     park.release.notify_one();
-    let result = tokio::time::timeout(LIVENESS, async {
-        loop {
-            let row = monitor_snapshot(&h.services.store, &h.ws, mid)
-                .await
-                .unwrap();
-            if row.state != "active" {
-                break serde_json::to_value(row).unwrap();
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    // Settlement deletes the active row before publishing the terminal event.
+    let result = serde_json::to_value(monitor_row(&h, mid, "completed").await).unwrap();
     assert_eq!(result["runId"], successor["runId"]);
     assert_eq!(result["result"]["outcome"], "failed");
     assert!(result["result"].get("startedAt").is_none());
