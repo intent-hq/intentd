@@ -34641,11 +34641,16 @@ impl WorkspaceApi for Services {
             let walked = tokio::task::spawn_blocking(move || -> Result<_> {
                 // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
                 let boundary_started = std::time::Instant::now();
-                let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                    &worktree,
-                    base_ref.as_deref(),
-                    base_commit_sha.as_deref(),
-                )?;
+                let snapshot = accept_changes::history_refresh_snapshot(&worktree, &ws);
+                let boundary_sha = if let Some(snapshot) = &snapshot {
+                    snapshot.history.boundary.map(|oid| oid.to_string())
+                } else {
+                    intent_git::history::resolve_workspace_boundary(
+                        &worktree,
+                        base_ref.as_deref(),
+                        base_commit_sha.as_deref(),
+                    )?
+                };
                 let boundary_ms =
                     u64::try_from(boundary_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -34660,21 +34665,41 @@ impl WorkspaceApi for Services {
                 // Metadata-only walk (`include_files = false`): the list
                 // payload skips the O(commits) per-commit tree diff; the FE
                 // fetches per-file data on demand via `git.commitDetails`.
-                let commits = intent_git::history::history_bounded(
-                    &worktree,
-                    boundary_sha.as_deref(),
-                    fetch,
-                    include_older,
-                    false,
-                )?;
+                // Never label a live-ref walk with a separately observed token:
+                // refs can move A -> B -> A between push and response.
+                let commits = if let Some(snapshot) = &snapshot {
+                    intent_git::history::history_bounded_snapshot(
+                        &worktree,
+                        &snapshot.history,
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                } else {
+                    intent_git::history::history_bounded(
+                        &worktree,
+                        boundary_sha.as_deref(),
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                };
+                let history_identity = snapshot.map(|snapshot| snapshot.identity);
                 let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+                Ok(Some((
+                    boundary_sha,
+                    boundary_ms,
+                    commits,
+                    walk_ms,
+                    history_identity,
+                )))
             })
             .await
             .map_err(|e| {
                 Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
             })??;
-            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
+            let Some((boundary_sha, boundary_ms, commits, walk_ms, history_identity)) = walked
+            else {
                 return Ok(empty);
             };
             let has_more = commits.len() > page_end;
@@ -34704,11 +34729,15 @@ impl WorkspaceApi for Services {
                 Some(sha) => serde_json::Value::String(sha),
                 None => serde_json::Value::Null,
             };
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "commits": values,
                 "nextToken": next_token,
                 "boundarySha": boundary_value
-            }))
+            });
+            if let Some(identity) = history_identity {
+                result["historyIdentity"] = serde_json::Value::String(identity);
+            }
+            Ok(result)
         })
     }
 

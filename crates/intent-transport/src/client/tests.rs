@@ -77,6 +77,7 @@ async fn mints_client_id_when_omitted() {
     let server = &resp["result"]["server"];
     // Advertising these APIs does not grant capabilities to the connecting client.
     assert_eq!(server["capabilities"]["desktopControl"], 1);
+    assert_eq!(server["capabilities"]["workspaceMembershipEvents"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
     assert_eq!(server["capabilities"]["scriptMonitors"], 2);
     assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
@@ -107,10 +108,16 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
     for local in [true, false] {
         let server = server_json(false, "linux", "x86_64", "test", None, local);
         assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(
+            server["capabilities"]["workspaceMembershipEvents"],
+            json!(1)
+        );
         assert_eq!(server["capabilities"]["invitationAccountSearch"], 1);
         assert_eq!(server["capabilities"]["personalPairing"], 1);
         assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
         assert_eq!(server["capabilities"]["agentRetire"], 1);
+        assert_eq!(server["capabilities"]["scriptMonitors"], 2);
+        assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
         assert_eq!(server["capabilities"]["submissionCorrelation"], json!(1));
         for capability in [
             "repositoryContext",
