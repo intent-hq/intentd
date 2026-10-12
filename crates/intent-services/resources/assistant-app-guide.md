@@ -195,6 +195,14 @@ an agent is a particular conversation doing work.
 
 When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
 
+In an empty composer, press **Up Arrow** to recall a previous prompt. Recalled
+prompts use the visible message text, without hidden sender or delivery metadata.
+At the start of the text, **Up Arrow** moves to an older prompt; at the end,
+**Down Arrow** moves forward and restores your draft. If an editable queued
+message is present, **Up Arrow** in an empty composer edits that message first.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/TipTapEditor.svelte; src/lib/utils/user-message-presentation.ts. -->
+
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
 unless you scroll away; older-history loading becomes available when that initial
