@@ -178,6 +178,37 @@ test('harness reaps a known child after its launcher has already exited', async 
   });
 });
 
+test('observer publication failures remain visible when the adapter discards stderr', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-observer-failure-'));
+  try {
+    writeFileSync(join(root, 'route'), 'publication-failure');
+    const childEntry = join(root, 'child.cjs');
+    writeFileSync(childEntry, 'process.stdout.write("unchanged child output\\n"); process.exitCode = 73;');
+    const preload = join(root, 'fail-publication.cjs');
+    writeFileSync(preload, `const fs = require('node:fs');
+      const original = fs.renameSync;
+      let calls = 0;
+      fs.renameSync = (...args) => {
+        if (++calls > 1) throw Object.assign(new Error('witness rename denied\\ntoken=${secret}\\n' + 'x'.repeat(100000)), { code: 'EPERM', syscall: 'rename' });
+        return original(...args);
+      };`);
+    const run = spawnSync(process.execPath, ['--require', preload, fixture('./pi-startup-witness.cjs')], {
+      env: { ...env, PI_TEST_CHILD_ENTRY: childEntry, PI_TEST_WITNESS_DIR: root, PI_TEST_RUN_ID: 'publication-failure' },
+      stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', timeout: 5000,
+    });
+    assert.equal(run.status, 1, 'Observer must still fail on publication error');
+    assert.equal(run.stdout, 'unchanged child output\n');
+    const [record] = readWitnesses(root);
+    assert.equal(record.close, null, 'Do not fabricate child close on observer failure');
+    assert.match(record.observerError?.text ?? '', /EPERM.*rename/s);
+    assert.ok(!JSON.stringify(record).includes(secret));
+    assert.equal(record.observerError.truncated, true);
+    assert.ok(Buffer.byteLength(record.observerError.text) <= 2048);
+    auditText(JSON.stringify(record));
+    assert.match(diagnostics.failureReport('fixture cleanup', new Error('missing close'), [record]), /EPERM/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('independent audit checks child proof and cleanup, not just the fixture result', () => {
   const child = { runId: 'case', invocationId: 'child', pid: 12345, route: 'session/new',
     close: { code: 73, signal: null, kind: 'natural' }, stderr: {
@@ -197,6 +228,7 @@ test('independent audit checks child proof and cleanup, not just the fixture res
     value => { value.diagnostics[0].runId = 'old'; },
     value => { value.diagnostics[0].close.kind = 'harness'; },
     value => { value.diagnostics[0].close = null; },
+    value => { value.diagnostics[0].observerError = { text: 'publication failed' }; },
     value => { value.diagnostics[0].stderr.text = 'generic failure'; },
     value => { value.diagnostics[0].stderr.bytesSeen = 999999; },
     value => { value.failureReport = 'generic failure'; },
