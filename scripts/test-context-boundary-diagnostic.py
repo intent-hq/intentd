@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import os
+import re
+import yaml
 from pathlib import Path
 import subprocess
 import sys
@@ -216,6 +218,26 @@ while True:
         probe=(ROOT/'crates/intent-services/src/repository_context_output/tests/diagnostic_trace.rs').read_text()
         for text in ['MissedTickBehavior::Skip','Duration::from_millis(25)','heartbeat_drop','logger_summary','create_new(true)']:
             self.assertIn(text,probe)
+
+    def test_job_environment_cannot_reference_runner_context(self):
+        workflow=yaml.safe_load((ROOT/'.github/workflows/m1mac-smoke.yml').read_text())
+        for job_name,job in workflow['jobs'].items():
+            for key,value in job.get('env',{}).items():
+                expressions=re.findall(r'\$\{\{(.*?)\}\}',str(value),re.S)
+                for expression in expressions:
+                    self.assertIsNone(re.search(r'\brunner\s*(?:\.|\[)',expression),
+                                      f'{job_name}.env.{key}: runner context unavailable at job scope')
+
+    def test_step_evidence_and_always_upload_use_same_external_path(self):
+        job=yaml.safe_load((ROOT/'.github/workflows/m1mac-smoke.yml').read_text())['jobs']['context-boundary-diagnostic']
+        step=next(s for s in job['steps'] if s.get('name')=='One bounded diagnostic invocation')
+        upload=next(s for s in job['steps'] if s.get('name')=='Preserve partial evidence even on failure')
+        expected='${{ runner.temp }}/context-boundary-diagnostic'
+        self.assertNotIn('CONTEXT_BOUNDARY_EVIDENCE',job['env'])
+        self.assertEqual(step.get('env',{}).get('CONTEXT_BOUNDARY_EVIDENCE'),expected)
+        self.assertEqual(upload['with']['path'],expected)
+        self.assertEqual(upload['if'],'${{ always() }}')
+        self.assertTrue(Path(expected.replace('${{ runner.temp }}','/hosted/runner temp')).is_absolute())
 
     def test_manual_route_has_no_automatic_trigger_or_normal_ci_edit(self):
         workflow=(ROOT/'.github/workflows/m1mac-smoke.yml').read_text()

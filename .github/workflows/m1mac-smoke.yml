@@ -103,7 +103,6 @@ jobs:
       CARGO_INCREMENTAL: 0
       INTENTD_ASSERT_BOUND_CALLER: '1'
       INTENTD_TEST_TIMEOUT_MULTIPLIER: '1'
-      CONTEXT_BOUNDARY_EVIDENCE: ${{ runner.temp }}/context-boundary-diagnostic
       EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
     steps:
       - uses: actions/checkout@v7
@@ -121,12 +120,14 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
       - name: One bounded diagnostic invocation
+        env:
+          CONTEXT_BOUNDARY_EVIDENCE: ${{ runner.temp }}/context-boundary-diagnostic
         run: python3 -I -B scripts/context-boundary-diagnostic.py
       - name: Preserve partial evidence even on failure
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: context-boundary-diagnostic-${{ github.run_id }}
-          path: ${{ env.CONTEXT_BOUNDARY_EVIDENCE }}
+          path: ${{ runner.temp }}/context-boundary-diagnostic
           if-no-files-found: error
           retention-days: 7
