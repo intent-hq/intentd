@@ -16,7 +16,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
 import diagnostics from './pi-diagnostics.cjs';
-import { readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
+import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 const { Capture, LIMITS, SECRET, safeValue, failureReport, publishEvidence } = diagnostics;
 
 assert.ok(process.env.PI_ACP_TEST_ENTRY, 'Select the actual published adapter');
@@ -102,6 +102,7 @@ function startAdapter(cwd, env, records) {
         lines.close();
         record.witnesses = readWitnesses(env.PI_TEST_WITNESS_DIR);
         if (witnessError) throw witnessError;
+        assertWitnessesClosed(record.witnesses);
       })();
     },
   };

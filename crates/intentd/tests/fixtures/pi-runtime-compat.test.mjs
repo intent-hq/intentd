@@ -19,7 +19,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertCleanupComplete, assertNoUnexpectedStreamErrors, finishCleanup } from './pi-session-cleanup.mjs';
 import diagnostics from './pi-diagnostics.cjs';
-import { readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
+import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 const { Capture, failureReport, publishEvidence, summarizeStreamErrors } = diagnostics;
 const observer = fileURLToPath(new URL('./pi-startup-witness.cjs', import.meta.url));
 
@@ -254,6 +254,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
             record.shutdown = { exitCode: child.exitCode, signalCode: child.signalCode };
             record.witnesses = readWitnesses(directory);
             if (witnessError) throw witnessError;
+            assertWitnessesClosed(record.witnesses);
           })();
         },
       };
