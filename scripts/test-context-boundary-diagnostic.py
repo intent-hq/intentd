@@ -245,7 +245,7 @@ while True:
             self.assertIn(text,workflow)
         self.assertNotIn('pull_request:',workflow);self.assertNotIn('push:',workflow)
         old_smoke=subprocess.check_output(['git','show','7f73b4d5:.github/workflows/m1mac-smoke.yml'],cwd=ROOT,text=True).split('  smoke:',1)[1]
-        new_smoke=workflow.split('  smoke:',1)[1].split('  context-boundary-diagnostic:',1)[0].replace('    if: ${{ !inputs.context_boundary_diagnostic }}\n','')
+        new_smoke=workflow.split('  smoke:',1)[1].split('  context-boundary-diagnostic:',1)[0].replace('    if: ${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control }}\n','')
         self.assertEqual(old_smoke.strip(),new_smoke.strip())
         old=subprocess.check_output(['git','show','7f73b4d5:.github/workflows/ci.yml'],cwd=ROOT)
         self.assertEqual((ROOT/'.github/workflows/ci.yml').read_bytes(),old)

@@ -7,6 +7,10 @@ on:
         description: Run the one-shot context boundary diagnostic instead of inventory
         type: boolean
         default: false
+      supervisor_control:
+        description: Run only the small native supervisor control
+        type: boolean
+        default: false
       expected_source_sha:
         description: Exact reviewed diagnostic commit (required for diagnostic)
         type: string
@@ -16,7 +20,7 @@ permissions: {}
 
 jobs:
   smoke:
-    if: ${{ !inputs.context_boundary_diagnostic }}
+    if: ${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control }}
     name: Machine inventory (m1mac)
     runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 10
@@ -91,7 +95,7 @@ jobs:
           fi
 
   context-boundary-diagnostic:
-    if: ${{ inputs.context_boundary_diagnostic }}
+    if: ${{ inputs.context_boundary_diagnostic && !inputs.supervisor_control }}
     name: One-shot context boundary diagnostic (macOS ARM64)
     runs-on: macos-15
     timeout-minutes: 50
@@ -129,5 +133,31 @@ jobs:
         with:
           name: context-boundary-diagnostic-${{ github.run_id }}
           path: ${{ runner.temp }}/context-boundary-diagnostic
+          if-no-files-found: error
+          retention-days: 7
+
+  supervisor-control:
+    if: ${{ inputs.supervisor_control && !inputs.context_boundary_diagnostic }}
+    name: Small native supervisor control (macOS ARM64)
+    runs-on: macos-15
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run only the bounded supervisor control
+        env:
+          SUPERVISOR_CONTROL_EVIDENCE: ${{ runner.temp }}/macos-supervisor-control
+        run: python3 -I -B scripts/macos-supervisor-control.py
+      - name: Preserve control evidence on every outcome
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-supervisor-control-${{ github.run_id }}
+          path: ${{ runner.temp }}/macos-supervisor-control
           if-no-files-found: error
           retention-days: 7
