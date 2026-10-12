@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -280,7 +281,6 @@ else:
 
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
-            ("Tunnel deadline and TLS controls (macOS runtime)", 8),
             ("Retained workspace CoW fixtures (macOS runtime)", 6),
         ):
             with self.subTest(step=step_name), tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +350,181 @@ else:
             steps = workflow["jobs"]["release-scripts"]["steps"]
             workflow["jobs"]["release-scripts"]["steps"] = [s for s in steps if script not in s.get("run", "")]
             self.assertTrue(any(script in error for error in violations(workflow, "1")))
+
+
+class TunnelArtifactTests(unittest.TestCase):
+    """Execute the real tunnel workflow with Cargo artifacts and native children."""
+
+    TESTS = {
+        "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
+        "tunnel::tests::connect_reset_preserves_error_before_deadline",
+        "tunnel::tests::connect_success_before_deadline_relays",
+        "tunnel_open_echo_eof_close_lifecycle",
+        "tunnel_open_err_for_closed_port_keeps_connection_alive",
+        "tunnel_close_tears_down_and_frees_stream_id",
+        "tunnel_connections_counted_in_health_and_stopped",
+        "tunnel_unauthenticated_upgrade_rejected",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.step = next(s for s in workflow["jobs"]["build"]["steps"]
+                        if s.get("name") == "Tunnel deadline and TLS controls (macOS runtime)")
+
+    def probe(self, mode="valid", *, inherited_libraries=False, timeout_probe=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "fixture binary"
+            binary.write_text(f"#!{sys.executable} -S\n" + r'''
+import json, os, signal, subprocess, sys
+args = sys.argv[1:]
+mode = os.environ["TUNNEL_MODE"]
+with open(os.environ["TUNNEL_LOG"], "a") as log:
+    log.write(json.dumps({"kind": "native", "args": args, "cwd": os.getcwd(),
+                         "policy": os.environ.get("INTENTD_ASSERT_BOUND_CALLER"),
+                         "libraries": os.environ.get("DYLD_FALLBACK_LIBRARY_PATH")}) + "\n")
+test = args[0]
+phase = "list" if "--list" in args else "run"
+if mode == "hang-" + phase:
+    child = subprocess.Popen([sys.executable, "-S", "-c", "import signal; signal.pause()"])
+    with open(os.environ["TUNNEL_PIDS"], "w") as f: json.dump([os.getpid(), child.pid], f)
+    signal.pause()
+if mode == "fail-" + phase: sys.exit(24)
+if phase == "list":
+    if mode != "missing-test": print(test + ": test")
+    print("2 tests, 0 benchmarks" if mode == "extra-test" else "1 test, 0 benchmarks")
+else:
+    print("running 0 tests" if mode == "zero-tests" else "running 1 test")
+    print("test result: ok. 0 passed; 0 failed; 1 ignored;" if mode == "ignored-test"
+          else "test result: ok. 1 passed; 0 failed; 0 ignored;")
+''')
+            binary.chmod(0o755)
+            stub = root / "rustup"
+            stub.write_text(f"#!{sys.executable} -S\n" + r'''
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["TUNNEL_ROOT"])
+mode = os.environ["TUNNEL_MODE"]
+with open(os.environ["TUNNEL_LOG"], "a") as log:
+    log.write(json.dumps({"kind": "rustup", "args": args,
+                         "policy": os.environ.get("INTENTD_ASSERT_BOUND_CALLER")}) + "\n")
+assert args[:2] == ["run", "pinned-channel"], args
+if args[2:] == ["rustc", "--print", "target-libdir", "--target", "aarch64-apple-darwin"]:
+    print(root / "toolchain lib"); sys.exit(0)
+assert args[2:5] == ["cargo", "test", "--locked"], args
+assert args[args.index("--target") + 1] == "aarch64-apple-darwin", args
+if "--no-run" not in args:
+    sys.exit("unexpected recompilation in bounded discovery/runtime")
+if mode == "build-failure": sys.exit(25)
+package = args[args.index("-p") + 1]
+kind = "lib" if "--lib" in args else "test"
+name = package.replace("-", "_") if kind == "lib" else args[args.index("--test") + 1]
+package_dir = root / "crates" / package
+package_dir.mkdir(parents=True, exist_ok=True)
+(package_dir / "Cargo.toml").touch()
+executable = root / "target with spaces" / "aarch64-apple-darwin" / "debug" / "deps" / name
+executable.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(root / "fixture binary", executable)
+artifact = {"reason": "compiler-artifact", "manifest_path": str(package_dir / "Cargo.toml"),
+            "target": {"kind": [kind], "name": name}, "profile": {"test": True},
+            "executable": str(executable)}
+print(json.dumps({"reason": "compiler-artifact", "profile": {"test": False}, "executable": "/wrong"}))
+print(json.dumps({"reason": "build-script-executed", "linked_paths": [
+    "native=" + str(executable.parent.parent / "build/native lib"), "/outside/target"]}))
+if mode == "wrong-target": artifact["target"]["name"] = "other_test"
+if mode == "wrong-package": artifact["manifest_path"] = str(root / "other/Cargo.toml")
+if mode == "non-test": artifact["profile"]["test"] = False
+if mode == "missing-file": executable.unlink()
+if mode == "missing-executable": artifact["executable"] = None
+if mode != "missing-artifact": print(json.dumps(artifact))
+if mode == "ambiguous-artifact": print(json.dumps(artifact))
+print(json.dumps({"reason": "build-finished", "success": True}))
+''')
+            stub.chmod(0o755)
+            env = {**os.environ, **self.step["env"], "INTENTD_TUNNEL_TOOLCHAIN": "pinned-channel",
+                   "INTENTD_TUNNEL_TARGET": "aarch64-apple-darwin", "TUNNEL_ROOT": tmp,
+                   "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
+                   "TUNNEL_PIDS": str(root / "pids.json"), "PATH": tmp + os.pathsep + os.environ["PATH"]}
+            env.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+            if inherited_libraries:
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = str(root / "existing lib")
+            body = self.step["run"]
+            if timeout_probe:
+                self.assertIn("communicate(timeout=30)", body)
+                body = body.replace("communicate(timeout=30)", "communicate(timeout=0.5)")
+            states = []
+            try:
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body],
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            finally:
+                # A broken timeout wrapper must not leak the regression's children.
+                if (root / "pids.json").exists():
+                    pids = json.loads((root / "pids.json").read_text())
+                    states = [subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip() for pid in pids]
+                    try:
+                        os.killpg(pids[0], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if mode.startswith("hang-"):
+                self.assertTrue((root / "pids.json").exists(), result.stdout + result.stderr)
+                for state in states:
+                    self.assertTrue(not state or state.startswith("Z"), f"timed out process still alive: {state}")
+            return result, calls, tmp
+
+    def test_built_artifacts_are_reused_without_cargo_inside_runtime_budget(self):
+        for inherited in (False, True):
+            with self.subTest(inherited_libraries=inherited):
+                result, calls, tmp = self.probe(inherited_libraries=inherited)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                builds = [c for c in calls if c["kind"] == "rustup" and "cargo" in c["args"]]
+                self.assertEqual(len(builds), 2)
+                for call in builds:
+                    self.assertIn("--no-run", call["args"])
+                    self.assertIn("--message-format=json-render-diagnostics", call["args"])
+                native = [c for c in calls if c["kind"] == "native"]
+                self.assertEqual(len(native), 16)
+                self.assertEqual({c["args"][0] for c in native if "--list" in c["args"]}, self.TESTS)
+                self.assertEqual({c["args"][0] for c in native if "--nocapture" in c["args"]}, self.TESTS)
+                for call in native:
+                    test = call["args"][0]
+                    package = "intent-transport" if test.startswith("tunnel::") else "intentd"
+                    self.assertEqual(call["cwd"], str(Path(tmp) / "crates" / package))
+                    self.assertEqual(call["policy"], "1")
+                    self.assertIn("--exact", call["args"])
+                    libraries = call["libraries"].split(os.pathsep)
+                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/deps"), libraries)
+                    self.assertIn(str(Path(tmp) / "toolchain lib"), libraries)
+                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/build/native lib"), libraries)
+                    self.assertNotIn("/outside/target", libraries)
+                    self.assertIn(str(Path(tmp) / "existing lib") if inherited else "/usr/lib", libraries)
+                    if "--list" not in call["args"]:
+                        self.assertIn("--nocapture", call["args"])
+                        self.assertIn("--test-threads=1", call["args"])
+
+    def test_artifact_or_test_failure_cannot_become_success(self):
+        for mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
+                     "wrong-package", "wrong-target", "non-test", "ambiguous-artifact",
+                     "fail-list", "missing-test", "extra-test", "fail-run", "zero-tests", "ignored-test"):
+            with self.subTest(mode=mode):
+                result, calls, _ = self.probe(mode)
+                self.assertNotEqual(result.returncode, 0)
+                native = [c for c in calls if c["kind"] == "native"]
+                if mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
+                            "wrong-package", "wrong-target", "non-test", "ambiguous-artifact"):
+                    self.assertEqual(native, [])
+                else:
+                    self.assertTrue(native, "must actually exercise native failure")
+
+    def test_discovery_and_runtime_hangs_kill_process_group_and_fail(self):
+        for mode in ("hang-list", "hang-run"):
+            with self.subTest(mode=mode):
+                result, _, _ = self.probe(mode, timeout_probe=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TimeoutExpired", result.stderr)
+        self.assertEqual(self.step["timeout-minutes"], 20)
 
 
 class CallbackDiscoveryTests(unittest.TestCase):

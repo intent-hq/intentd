@@ -26,6 +26,7 @@ export function auditArtifact(record, { run, route, oversized, runtime = false }
     ids.add(child.invocationId);
     assert.ok(Number.isInteger(child.pid) && child.pid > 0, 'Missing actual child PID');
     assert.ok(child.route, 'Missing invocation route');
+    assert.ok(!child.observerError, 'Independent child observer failed');
     assert.ok(child.close, 'Missing actual child close');
     assert.ok(['natural', 'harness', 'adapter'].includes(child.close.kind), 'Unknown child close kind');
     const stderr = child.stderr;

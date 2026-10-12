@@ -2,7 +2,7 @@
 // Pi stdin/stdout stay inherited; no ACP/RPC response is synthesized or retried.
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
-const { existsSync, readFileSync, readdirSync } = require('node:fs');
+const { existsSync, readFileSync, readdirSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { Capture, LIMITS, safeText, writeWitness } = require('./pi-diagnostics.cjs');
 const directory = process.env.PI_TEST_WITNESS_DIR;
@@ -19,6 +19,15 @@ const capture = new Capture();
 let requestedSignal;
 const exitKind = () => existsSync(file + '.stop') ? 'harness' : requestedSignal ? 'adapter' : 'natural';
 const publish = final => writeWitness(file, { ...record, stderr: capture.snapshot(final) });
+// The published adapter discards this observer's stderr. Keep a separate,
+// bounded failure record even when replacing the normal witness is what failed.
+// Monitoring preserves Node's original uncaught-exception exit behavior.
+process.on('uncaughtExceptionMonitor', error => {
+  const observerError = safeText(`${error.code ?? error.name}: ${error.syscall ?? ''}\n${error.message}`, { limit: 2048 });
+  const failure = JSON.stringify({ invocationId, runId: record.runId, route: record.route,
+    startedAt: record.startedAt, observerPid: process.pid, pid: record.pid, observerError });
+  try { writeFileSync(file + '.observer-error', failure, { flag: 'wx' }); } catch {}
+});
 const child = spawn(process.execPath, [process.env.PI_TEST_CHILD_ENTRY, ...process.argv.slice(2)], {
   stdio: ['inherit', 'inherit', 'pipe'],
 });
