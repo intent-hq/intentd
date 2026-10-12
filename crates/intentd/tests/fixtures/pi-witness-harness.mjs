@@ -6,16 +6,30 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import diagnostics from './pi-diagnostics.cjs';
-const { LIMITS } = diagnostics;
+const { LIMITS, failureReport, safeText } = diagnostics;
 export function readWitnesses(directory) {
   if (!existsSync(directory)) return [];
-  const files = readdirSync(directory).filter(name => name.endsWith('.json'));
+  const files = [...new Set(readdirSync(directory).filter(name => name.endsWith('.json') || name.endsWith('.json.observer-error'))
+    .map(name => name.replace(/\.observer-error$/, '')))];
   assert.ok(files.length <= LIMITS.invocations, 'Too many fixture invocations');
   return files.map(name => {
     const file = join(directory, name);
+    const errorFile = file + '.observer-error';
+    let failure;
+    if (existsSync(errorFile)) {
+      assert.ok(statSync(errorFile).size <= LIMITS.witness, 'Oversized observer error');
+      failure = JSON.parse(readFileSync(errorFile, 'utf8'));
+    }
+    if (!existsSync(file)) return { ...failure, argv: [], close: null };
     assert.ok(statSync(file).size <= LIMITS.witness, 'Oversized child evidence');
-    return JSON.parse(readFileSync(file, 'utf8'));
+    const record = JSON.parse(readFileSync(file, 'utf8'));
+    return failure ? { ...record, observerError: failure.observerError } : record;
   }).sort((a, b) => a.startedAt - b.startedAt);
+}
+function processState(pid) {
+  if (!pid) return 'no pid';
+  try { process.kill(pid, 0); return 'alive'; }
+  catch (error) { return error.code === 'ESRCH' ? 'exited' : error.code ?? error.message; }
 }
 export async function stopWitnesses(directory) {
   const records = readWitnesses(directory);
@@ -29,12 +43,12 @@ export async function stopWitnesses(directory) {
     if (!JSON.parse(readFileSync(file, 'utf8')).close) {
       if (process.platform === 'win32') {
         const run = spawnSync('taskkill.exe', ['/PID', String(record.pid), '/T', '/F'], { timeout: 3000 });
-        if (run.status !== 0) throw Object.assign(new Error('Fixture child force-stop failed'), {
-          data: { pid: record.pid, status: run.status, signal: run.signal,
-            error: run.error?.message,
-            stdout: diagnostics.safeText(run.stdout?.toString() ?? '', { limit: 512 }),
-            stderr: diagnostics.safeText(run.stderr?.toString() ?? '', { limit: 512 }) },
-        });
+        assert.equal(run.status, 0, failureReport('Fixture child force-stop failed', {
+          status: run.status, signal: run.signal, error: run.error?.message,
+          childState: processState(record.pid), observerState: processState(record.observerPid),
+          stdout: safeText(run.stdout ?? '', { limit: 1024 }),
+          stderr: safeText(run.stderr ?? '', { limit: 1024 }),
+        }, readWitnesses(directory).filter(child => child.invocationId === record.invocationId)));
       } else {
         try { process.kill(record.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }

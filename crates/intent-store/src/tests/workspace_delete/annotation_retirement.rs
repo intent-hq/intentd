@@ -1,7 +1,7 @@
 //! Partial annotation retirement must remain unavailable and resumable.
 use super::{sample_agent_session, seed_heavy_workspace_children, seed_workspace, TempDb};
 use crate::{workspace_annotation_cleanup, Store};
-use intent_core::{note_page::NoteScope, AgentId, Error, NoteId};
+use intent_core::{note_page::NoteScope, AgentId, Error, NoteId, ScriptMonitor};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +15,8 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
         let keeper = seed_workspace(&store, "keeper").await;
         seed_heavy_workspace_children(&store, &doomed, 2).await;
         seed_heavy_workspace_children(&store, &keeper, 2).await;
-        // Both Store runtimes survive reopen; eventual workspace deletion must
-        // retire note artifacts and private desktop authority together.
+        // All three lifecycles survive reopen; eventual workspace deletion must
+        // retire notes, desktop authority and script delivery obligations together.
         let principal = store.get_primary_principal().await.unwrap().id;
         for workspace in [&doomed, &keeper] {
             let agent = AgentId::from(format!("{}-desktop-agent", workspace.as_str()));
@@ -25,6 +25,22 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
             let binding = json!({"workspaceId": workspace, "agentId": agent, "principalId": principal,
                 "clientId": "client", "computerId": "physical"});
             store.desktop_insert_terminal(workspace.as_str(), workspace, &agent, &binding, "hash").await.unwrap();
+            let mut monitor: ScriptMonitor = serde_json::from_value(json!({
+                "monitorId": format!("{workspace}-settled"), "workspaceId": workspace,
+                "agentId": agent, "scriptId": "check", "runId": "run", "scriptName": "Check",
+                "mode": "command", "state": "active", "createdAt": "2026-01-01T00:00:00Z",
+                "expiresAt": "2026-01-02T00:00:00Z"
+            })).unwrap();
+            store.insert_script_monitor(&monitor).await.unwrap();
+            monitor.state = "completed".into();
+            monitor.settled_at = Some("2026-01-01T00:01:00Z".into());
+            monitor.reason = Some("finished".into());
+            assert!(store.settle_script_monitor(&monitor).await.unwrap());
+            monitor.monitor_id = format!("{workspace}-active");
+            monitor.state = "active".into();
+            monitor.settled_at = None;
+            monitor.reason = None;
+            store.insert_script_monitor(&monitor).await.unwrap();
         }
         // The heavy fixture seeds legacy rows directly; prepare their source
         // indexes through the same backfill used when opening a legacy store.
@@ -107,7 +123,15 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
         let store = Store::open(&temporary.path).await.unwrap();
         assert!(matches!(store.note_annotation_epochs(&doomed, &NoteId::from("note-1")).await,
             Err(Error::NotFound(resource)) if resource == "note annotations"));
+        for workspace in [&doomed, &keeper] {
+            assert_eq!(store.script_monitors(workspace, None).await.unwrap().len(), 1);
+            assert!(store.script_monitor_wake_pending(&format!("{workspace}-settled")).await.unwrap());
+        }
         store.delete_workspace(&doomed).await.unwrap();
+        assert!(store.script_monitors(&doomed, None).await.unwrap().is_empty());
+        assert!(!store.script_monitor_wake_pending("doomed-settled").await.unwrap());
+        assert_eq!(store.script_monitors(&keeper, None).await.unwrap().len(), 1);
+        assert!(store.script_monitor_wake_pending("keeper-settled").await.unwrap());
         assert!(store.desktop_terminal("doomed").await.unwrap().is_none());
         assert!(store.desktop_terminal("keeper").await.unwrap().is_some());
         assert!(!store.desktop_permission(&principal, &doomed, &AgentId::from("doomed-desktop-agent"), "physical").await.unwrap());

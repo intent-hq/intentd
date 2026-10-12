@@ -192,14 +192,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Desktop control adds four router methods; reverse methods are counted separately.
 // GitLab checkout repository configuration adds one router method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 436;
+// Compact script lists add two router methods.
+const EXPECTED_TOTAL_METHODS: usize = 438;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 380;
+const EXPECTED_ROUTER_METHODS: usize = 382;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -799,6 +800,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
+    "script.get",
     "script.list",
     "script.output",
     "script.remove",
@@ -810,6 +812,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
+    "scriptMonitor.get",
     "scriptMonitor.list",
     "search.cancel",
     "search.codebase",
@@ -1356,6 +1359,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
+    "script.get",
     "script.list",
     "script.output",
     "script.remove",
@@ -1630,6 +1634,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
+        "script.get",
         "script.list",
         "debug.sampleStacks",
     ] {
@@ -2017,6 +2022,7 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "name": "n", "command": "true", "mode": "command" }),
             ),
             ("script.list", json!({ "workspaceId": ws })),
+            ("script.get", script.clone()),
             ("script.output", script.clone()),
             ("script.remove", script.clone()),
             ("script.restart", script.clone()),

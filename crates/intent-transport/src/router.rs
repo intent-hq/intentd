@@ -4802,15 +4802,13 @@ async fn dispatch_other(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            let archive = params
-                .get("archive")
-                .map(|value| {
-                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
-                })
-                .transpose()
-                .map_err(|e| invalid_params(e.to_string()))?
-                .unwrap_or_default();
-            api.script_list_filtered(ws, archive)
+            api.script_list_view(ws, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "script.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_get(ws, require_str_param(params, "scriptId")?)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4844,8 +4842,17 @@ async fn dispatch_other(
         }
         "scriptMonitor.list" => {
             let ws = require_ws_note(params)?;
-            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
-            api.script_monitor_list(ws, agent)
+            let agent = params
+                .get("agentId")
+                .map(|_| require_str_param(params, "agentId").map(intent_core::AgentId::from))
+                .transpose()?;
+            api.script_monitor_list_view(ws, agent, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_monitor_get(ws, require_str_param(params, "monitorId")?, None)
                 .await
                 .map_err(domain_to_rpc)
         }

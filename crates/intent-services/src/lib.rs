@@ -20383,6 +20383,72 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.list")
+                .await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
+            if options.summary {
+                self.script_manager()
+                    .summary_page(&workspace_id, &options)
+                    .await
+            } else {
+                self.script_manager().list(&workspace_id).await
+            }
+        })
+    }
+    fn script_get(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.get")
+                .await?;
+            self.script_manager().get(&workspace_id, &script_id).await
+        })
+    }
+    fn script_monitor_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
+            if options.summary {
+                self.store
+                    .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
+                    .await
+            } else {
+                self.script_monitor_list(workspace_id, agent_id).await
+            }
+        })
+    }
+    fn script_monitor_get(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let row = self
+                .store
+                .script_monitor(&workspace_id, &monitor_id)
+                .await?;
+            if owner.is_some_and(|id| id != row.agent_id) {
+                return Err(Error::InvalidParams("unknown monitor ID".into()));
+            }
+            serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))
+        })
+    }
+
     fn script_archive(
         &self,
         workspace_id: WorkspaceId,
@@ -20555,6 +20621,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.output")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -20574,6 +20641,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.status")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }

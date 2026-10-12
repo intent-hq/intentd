@@ -135,6 +135,9 @@ impl ScriptManager {
         for id in ids.into_iter().filter(|id| seen.insert(id.clone())) {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            if self.store.script_workspace(&id).await?.as_ref() == Some(ws) {
+                self.ensure_known_locked(ws, &id).await?;
+            }
             // Store scope is checked too: legacy owner operations can move an
             // ID between workspaces while retaining an older runtime entry.
             let durable = self.store.get_script_in_workspace(ws, &id).await?;

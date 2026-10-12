@@ -148,6 +148,16 @@ function writeWitness(file, record) {
   const json = JSON.stringify(record);
   if (Buffer.byteLength(json) > LIMITS.witness) throw new Error('Child witness exceeds byte cap');
   writeFileSync(file + '.tmp', json);
-  renameSync(file + '.tmp', file);
+  // Windows can temporarily deny replacing a witness with EPERM. Keep the
+  // previous complete snapshot intact; retry only this owned-file rename,
+  // never the child or its RPC. Synchronous waits serialize observer callbacks
+  // so a later snapshot cannot overwrite the pending temporary file.
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(file + '.tmp', file); return; }
+    catch (error) {
+      if (error.code !== 'EPERM' || attempt === 4) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
 }
 module.exports = { Capture, LIMITS, SECRET, safeText, safeValue, failureReport, publishEvidence, writeWitness, summarizeStreamErrors };

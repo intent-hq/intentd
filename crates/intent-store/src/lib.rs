@@ -58,6 +58,8 @@ mod repository_lifecycle;
 mod repository_selection_repo;
 mod sandbox_repo;
 mod script_monitor_repo;
+pub use script_monitor_repo::ScriptNotificationJob;
+mod script_list_repo;
 mod script_repo;
 mod settings_repo;
 mod sharing_projection;
