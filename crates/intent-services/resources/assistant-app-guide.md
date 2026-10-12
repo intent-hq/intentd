@@ -302,6 +302,16 @@ the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the
 connected backend does not support cancellable deletion, the note is kept.
 
+In test builds that offer **Edit Raw Markdown** in a note's **…** menu, use it
+to edit Markdown directly; large notes otherwise stay read-only. **Back to
+rendered view** flushes pending edits and waits for the save acknowledgement before
+leaving the editor. Returning does not undo saved changes. If saving fails or
+conflicts, the draft and editor stay open: use **Retry save** after addressing the
+error, then return. A rendered-note loading error is separate from a save failure;
+returning to rendered view does not guarantee that loading error is resolved.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/NoteTabType.svelte; packages/cloudlands-fe/src/lib/components/workspace/NoteWithComments.svelte; packages/cloudlands-fe/messages/en.json. Test-build behavior pending its frontend release. -->
+
 Open a task note and inspect its status and assigned agent first. Select the
 assigned agent to continue existing work. To start an agent for the task, use the
 play button labeled **Run agent** when available. This creates an agent and sends
