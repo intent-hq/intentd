@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Keep macOS cleanup reachable, scoped, and ahead of builds."""
+import importlib.util
 from pathlib import Path
 import unittest
 import yaml
@@ -8,6 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def workflow(name):
+    if name == 'ci.yml':
+        spec = importlib.util.spec_from_file_location('workflow_tests', ROOT / 'scripts/ci-workflow-tests.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.load_ci(ROOT)
     return yaml.safe_load((ROOT / '.github/workflows' / name).read_text())
 
 

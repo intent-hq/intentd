@@ -58,7 +58,9 @@ env:
   LINUX_BURST_THRESHOLD: 8
 
 # Keep identical callers queued without cancelling their native consumers.
-# This caller group is disjoint from the reusable producer lock.
+# This caller group is disjoint from the reusable producer lock. Older source
+# revisions may finish after a newer push, trading extra capacity for retaining
+# every identical caller; the extra proof workflow selects only CI reuse inputs.
 concurrency:
   group: ci-caller-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
@@ -1716,7 +1718,6 @@ jobs:
         run: |
           python3 -I -B scripts/test-ci-native-routing.py
           python3 -I -B scripts/test-ci-native-consumers.py
-          python3 -I -B scripts/test-ci-artifact-reuse.py
           python3 -I -B scripts/test-daemon-lifecycle-proof.py
       - name: Install release cache regression compiler
         shell: bash
@@ -1732,6 +1733,7 @@ jobs:
         run: |
           python3 -I -B scripts/test-ci-build-identity.py
           python3 -I -B scripts/test-ci-test-artifacts.py
+          python3 -I -B scripts/test-ci-artifact-reuse.py
       - name: Install release cache regression wrapper
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
