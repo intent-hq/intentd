@@ -2284,7 +2284,7 @@ async fn cmd_serve_owned(
         match services.heal_stale_agent_sessions().await {
             Ok(0) => {}
             Ok(healed) => {
-                tracing::info!(healed, "healed stale in-flight agent sessions on startup")
+                tracing::info!(healed, "healed stale in-flight agent sessions on startup");
             }
             Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
         }
