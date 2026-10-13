@@ -2497,3 +2497,81 @@ async fn checkout_branch_rejects_corrupt_or_oversized_missing_responses() {
         ));
     }
 }
+
+#[tokio::test]
+async fn remaining_issue_filters_use_exact_current_user_scope_and_isolated_empty_continuation() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    let f = Fixture::new(|request| {
+        let mut result = reply(200, json!([]));
+        result.headers.push((
+            "x-next-page".into(),
+            if request.path.contains("page=1&") {
+                "2"
+            } else {
+                ""
+            }
+            .into(),
+        ));
+        result
+    })
+    .await;
+    let provider = f
+        .provider()
+        .with_pagination_scope("original-account".into());
+    for (filter, scope) in [
+        (IssueInvolvement::Created, "created_by_me"),
+        (IssueInvolvement::Assigned, "assigned_to_me"),
+    ] {
+        let query = IssueQuery {
+            state: Some("closed".into()),
+            search: Some("needle/one".into()),
+            limit: Some(2),
+            ..IssueQuery::default()
+        };
+        let first = provider
+            .list_issues_filtered(&repo(), query.clone(), filter)
+            .await
+            .unwrap();
+        assert!(first.items.is_empty());
+        let cursor = first.next_cursor.unwrap();
+        let continuation = IssueQuery {
+            cursor: Some(cursor),
+            ..query
+        };
+        let before = f.requests().len();
+        let other = if filter == IssueInvolvement::Created {
+            IssueInvolvement::Assigned
+        } else {
+            IssueInvolvement::Created
+        };
+        assert!(matches!(
+            provider
+                .list_issues_filtered(&repo(), continuation.clone(), other)
+                .await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            f.provider()
+                .with_pagination_scope("replacement".into())
+                .list_issues_filtered(&repo(), continuation.clone(), filter)
+                .await,
+            Err(Error::Config(_))
+        ));
+        assert_eq!(f.requests().len(), before);
+        let last = provider
+            .list_issues_filtered(&repo(), continuation, filter)
+            .await
+            .unwrap();
+        assert!(last.next_cursor.is_none());
+        let requests = f.requests();
+        assert!(requests[before - 1].path.contains(&format!(
+            "scope={scope}&state=closed&search=needle%2Fone&page=1&per_page=2"
+        )));
+        assert!(requests[before].path.contains("page=2&per_page=2"));
+    }
+    assert_eq!(
+        f.requests().len(),
+        4,
+        "no user-identity or participant probe"
+    );
+}

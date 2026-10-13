@@ -411,6 +411,14 @@ pub struct Issue {
     pub updated_at: String,
 }
 
+/// Exact authenticated-user filters supported by GitLab issue listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueInvolvement {
+    Created,
+    Assigned,
+}
+
 /// Filter for listing issues.
 ///
 /// When `search` or `extra_repos` is set, listing routes through

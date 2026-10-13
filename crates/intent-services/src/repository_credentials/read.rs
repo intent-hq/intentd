@@ -595,6 +595,10 @@ impl RepositoryReadOperation {
 pub(crate) enum RepositoryCollectionQuery {
     Reviews(PrQuery),
     Issues(IssueQuery),
+    FilteredIssues {
+        query: IssueQuery,
+        involvement: intent_sourcecontrol::IssueInvolvement,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -611,7 +615,8 @@ impl RepositoryCollectionTarget {
     pub(crate) fn kind(&self) -> RepositoryResourceKind {
         match &self.query {
             RepositoryCollectionQuery::Reviews(_) => RepositoryResourceKind::MergeRequest,
-            RepositoryCollectionQuery::Issues(_) => RepositoryResourceKind::Issue,
+            RepositoryCollectionQuery::Issues(_)
+            | RepositoryCollectionQuery::FilteredIssues { .. } => RepositoryResourceKind::Issue,
         }
     }
 }
@@ -641,7 +646,8 @@ impl RepositoryCollectionReadOperation {
         let scope = RepositoryReadScope::capture(directory, &admission)?;
         let extras = match &query {
             RepositoryCollectionQuery::Reviews(query) => &query.extra_repos,
-            RepositoryCollectionQuery::Issues(query) => &query.extra_repos,
+            RepositoryCollectionQuery::Issues(query)
+            | RepositoryCollectionQuery::FilteredIssues { query, .. } => &query.extra_repos,
         };
         if !extras.is_empty() {
             return Err(RepositoryCredentialError::BoundaryMismatch);
@@ -666,7 +672,8 @@ impl RepositoryCollectionReadOperation {
     pub(crate) async fn reviews(self) -> RepositoryProviderRead<Page<PullRequest>> {
         let query = match &self.target.query {
             RepositoryCollectionQuery::Reviews(query) => Some(query.clone()),
-            RepositoryCollectionQuery::Issues(_) => None,
+            RepositoryCollectionQuery::Issues(_)
+            | RepositoryCollectionQuery::FilteredIssues { .. } => None,
         };
         self.perform(move |provider, repo| {
             Box::pin(async move {
@@ -683,17 +690,24 @@ impl RepositoryCollectionReadOperation {
 
     pub(crate) async fn issues(self) -> RepositoryProviderRead<Page<Issue>> {
         let query = match &self.target.query {
-            RepositoryCollectionQuery::Issues(query) => Some(query.clone()),
+            RepositoryCollectionQuery::Issues(query) => Some((query.clone(), None)),
+            RepositoryCollectionQuery::FilteredIssues { query, involvement } => {
+                Some((query.clone(), Some(*involvement)))
+            }
             RepositoryCollectionQuery::Reviews(_) => None,
         };
         self.perform(move |provider, repo| {
             Box::pin(async move {
-                provider
-                    .list_issues(
-                        repo,
-                        query.ok_or(RepositoryCredentialError::BoundaryMismatch)?,
-                    )
-                    .await
+                let (query, involvement) =
+                    query.ok_or(RepositoryCredentialError::BoundaryMismatch)?;
+                match involvement {
+                    Some(involvement) => {
+                        provider
+                            .list_issues_filtered(repo, query, involvement)
+                            .await
+                    }
+                    None => provider.list_issues(repo, query).await,
+                }
             })
         })
         .await

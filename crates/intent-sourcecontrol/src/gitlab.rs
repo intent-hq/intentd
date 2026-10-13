@@ -884,6 +884,64 @@ fn discussion_tally(discussions: &[Value]) -> Result<(ReviewThreadTally, i64)> {
     Ok((tally, conversation_count))
 }
 
+impl GitLabSourceControl {
+    /// Uses the authenticated user's provider scope without a separate identity
+    /// probe or an approximate participants search.
+    ///
+    /// # Errors
+    /// Returns the same configuration, credential, HTTP, or decoding errors as
+    /// ordinary issue listing.
+    pub async fn list_issues_filtered(
+        &self,
+        repo: &RepoRef,
+        query: IssueQuery,
+        involvement: crate::IssueInvolvement,
+    ) -> Result<Page<Issue>> {
+        let scope = match involvement {
+            crate::IssueInvolvement::Created => "created_by_me",
+            crate::IssueInvolvement::Assigned => "assigned_to_me",
+        };
+        self.issue_list(repo, query, scope).await
+    }
+
+    async fn issue_list(
+        &self,
+        repo: &RepoRef,
+        query: IssueQuery,
+        scope: &str,
+    ) -> Result<Page<Issue>> {
+        let mut params = vec![("scope".into(), scope.into())];
+        if let Some(state) = query.state {
+            params.push((
+                "state".into(),
+                if state == "open" {
+                    "opened".into()
+                } else {
+                    state
+                },
+            ));
+        }
+        if let Some(labels) = query.labels {
+            params.push(("labels".into(), labels));
+        }
+        if let Some(search) = query.search {
+            params.push(("search".into(), search));
+        }
+        let page = PageParams {
+            limit: query.limit.unwrap_or(30),
+            cursor: query.cursor,
+        };
+        let result = if query.extra_repos.is_empty() {
+            self.page(&format!("{}/issues", project(repo)), params, page)
+                .await?
+        } else {
+            self.search_projects(repo, &query.extra_repos, "issues", params, page, None)
+                .await?
+        };
+        map_page(result, to_issue)
+    }
+}
+
 #[async_trait]
 impl SourceControl for GitLabSourceControl {
     fn provider_id(&self) -> &'static str {
@@ -1269,35 +1327,7 @@ impl SourceControl for GitLabSourceControl {
     }
 
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
-        let mut params = vec![("scope".into(), "all".into())];
-        if let Some(state) = query.state {
-            params.push((
-                "state".into(),
-                if state == "open" {
-                    "opened".into()
-                } else {
-                    state
-                },
-            ));
-        }
-        if let Some(labels) = query.labels {
-            params.push(("labels".into(), labels));
-        }
-        if let Some(search) = query.search {
-            params.push(("search".into(), search));
-        }
-        let page = PageParams {
-            limit: query.limit.unwrap_or(30),
-            cursor: query.cursor,
-        };
-        let result = if query.extra_repos.is_empty() {
-            self.page(&format!("{}/issues", project(repo)), params, page)
-                .await?
-        } else {
-            self.search_projects(repo, &query.extra_repos, "issues", params, page, None)
-                .await?
-        };
-        map_page(result, to_issue)
+        self.issue_list(repo, query, "all").await
     }
     async fn create_pr(&self, repo: &RepoRef, input: NewPullRequest) -> Result<PullRequest> {
         self.create_legacy(repo, input).await

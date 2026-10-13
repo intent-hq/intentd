@@ -4172,3 +4172,124 @@ async fn managed_issue_cursor_continues_refresh_but_not_account_replacement() {
 async fn managed_discussion_cursor_continues_refresh_but_not_account_replacement() {
     managed_cursor_refresh_and_replacement(2).await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn filtered_issue_collection_keeps_exact_filter_target_and_empty_page_evidence() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let query = RepositoryCollectionQuery::FilteredIssues {
+        query: IssueQuery::default(),
+        involvement: IssueInvolvement::Created,
+    };
+    let first_path = format!("{PROJECT}/issues?scope=created_by_me&page=1&per_page=30");
+    s.replies
+        .next_pages
+        .lock()
+        .unwrap()
+        .insert(first_path, "2".into());
+    let (e, operation, target) = f.collection(&s, query);
+    assert_eq!(target.kind(), RepositoryResourceKind::Issue);
+    assert_eq!(s.count(), 0);
+    let (result, quota, receipt) = operation.issues().await.into_parts();
+    let page = result.unwrap();
+    assert!(page.items.is_empty());
+    let cursor = page.next_cursor.unwrap();
+    assert_eq!(quota.remaining, Some(23));
+    assert_eq!(
+        collection_applied(&e, &receipt, &target).unwrap(),
+        D::NoDenial
+    );
+    let (_, wrong, wrong_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::FilteredIssues {
+            query: IssueQuery {
+                cursor: Some(cursor.clone()),
+                ..IssueQuery::default()
+            },
+            involvement: IssueInvolvement::Assigned,
+        },
+    );
+    assert_eq!(
+        collection_applied(&e, &receipt, &wrong_target),
+        Err(Error::BoundaryMismatch)
+    );
+    assert!(matches!(
+        wrong.issues().await.into_parts().0,
+        Err(ScError::Config(_))
+    ));
+    assert_eq!(s.count(), 1);
+    let (_, next, _) = f.collection(
+        &s,
+        RepositoryCollectionQuery::FilteredIssues {
+            query: IssueQuery {
+                cursor: Some(cursor),
+                ..IssueQuery::default()
+            },
+            involvement: IssueInvolvement::Created,
+        },
+    );
+    assert!(next
+        .issues()
+        .await
+        .into_parts()
+        .0
+        .unwrap()
+        .next_cursor
+        .is_none());
+    assert_eq!(s.count(), 2);
+}
+
+#[intent_test_macros::daemon_test]
+async fn filtered_issue_denials_preserve_actual_error_quota_and_acquired_revision() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    for stale in [false, true] {
+        for status in [401, 403, 404] {
+            let s = ReadServer::new().await;
+            let f = ReadFixture::new(&s, stale).await;
+            let path = format!("{PROJECT}/issues?scope=assigned_to_me&page=1&per_page=30");
+            s.status(&path, status);
+            if stale {
+                s.pause(&path);
+            }
+            let (e, op, target) = f.collection(
+                &s,
+                RepositoryCollectionQuery::FilteredIssues {
+                    query: IssueQuery::default(),
+                    involvement: IssueInvolvement::Assigned,
+                },
+            );
+            let pending = tokio::spawn(op.issues());
+            if stale {
+                s.entered().await;
+                f.refresh(&s).await;
+                s.resume();
+            }
+            let (result, quota, receipt) = pending.await.unwrap().into_parts();
+            denial(
+                &result,
+                if status == 401 {
+                    ProviderFailureKind::CredentialRejected
+                } else {
+                    ProviderFailureKind::ResourceDenied
+                },
+                status,
+            );
+            assert_eq!(quota.remaining, Some(23));
+            assert_eq!(
+                collection_applied(&e, &receipt, &target).unwrap(),
+                if stale {
+                    D::NotApplied
+                } else if status == 401 {
+                    D::AcceptedCredentialRejection
+                } else {
+                    D::CurrentResourceDenial
+                }
+            );
+            assert_eq!(s.count(), 1);
+            if stale {
+                e.check().unwrap();
+            }
+        }
+    }
+}
