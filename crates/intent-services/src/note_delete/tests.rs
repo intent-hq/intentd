@@ -990,3 +990,44 @@ async fn dropped_schedule_request_does_not_abandon_owned_admission_or_rearm() {
     );
     cleanup(&svc).await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn task_push_grace_parent_deletion_detaches_children() {
+    let (_tmp, svc, ws, parent_id) = crate::tests::setup_versioned("ordinary parent").await;
+    let mut child = svc.store.get_note(&ws, &parent_id).await.unwrap();
+    child.id = NoteId::from("child");
+    child.parent_id = Some(parent_id.clone());
+    child.metadata.task = Some(intent_core::TaskMetadata::default());
+    svc.store.insert_note(&child).await.unwrap();
+    let bus = crate::EventBus::new(svc.store.clone());
+    let svc = svc.with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec![intent_core::events::TASK_UPDATED.into()],
+        workspace_id: Some(ws.to_string()),
+        ..Default::default()
+    });
+    let (request, _) = schedule(&svc, &ws, &parent_id, 1).await;
+    assert_eq!(
+        settled(&svc, &request).await.state,
+        NoteDeleteState::Deleted
+    );
+    let expected = svc.task_list(ws, None).await.unwrap();
+    assert!(expected.tasks[0].parent_id.is_none());
+    let event = grace_event(&mut sub).await;
+    assert_eq!(
+        event["data"]["tasks"],
+        serde_json::to_value(expected.tasks).unwrap()
+    );
+    assert_eq!(event["data"]["removedIds"], serde_json::json!([]));
+    let stats = svc
+        .store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec![intent_core::events::WORKSPACE_TASK_STATS_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(stats.is_empty());
+    bus.shutdown().await.unwrap();
+    cleanup(&svc).await;
+}

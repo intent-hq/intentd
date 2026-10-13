@@ -260,3 +260,38 @@ async fn task_push_rejected_write_emits_nothing_and_generic_metadata_is_current(
         .all(|e| e.data["note"]["title"] == "current"));
     bus.shutdown().await.unwrap();
 }
+
+#[intent_test_macros::daemon_test]
+async fn task_push_ordinary_parent_deletion_detaches_children() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::from("task-parent-deletion");
+    store.insert_workspace(&workspace(&ws)).await.unwrap();
+    let parent = note(&ws, "parent", "ordinary note");
+    store.insert_note(&parent).await.unwrap();
+    for id in ["child-a", "child-b"] {
+        let mut child = note(&ws, id, "task body");
+        child.parent_id = Some(parent.id.clone());
+        child.metadata.task = Some(TaskMetadata::default());
+        store.insert_note(&child).await.unwrap();
+    }
+    let bus = EventBus::new(store.clone());
+    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    services
+        .delete_note(ws.clone(), parent.id, None)
+        .await
+        .unwrap();
+    let expected = services.task_list(ws, None).await.unwrap();
+    assert!(expected.tasks.iter().all(|task| task.parent_id.is_none()));
+    let pushed = events(&store, "task:updated").await;
+    assert_eq!(pushed.len(), 1, "detached tasks must be pushed");
+    assert_eq!(
+        pushed[0].data["tasks"],
+        serde_json::to_value(expected.tasks).unwrap()
+    );
+    assert_eq!(pushed[0].data["removedIds"], serde_json::json!([]));
+    assert!(events(&store, "workspace:task-stats-changed")
+        .await
+        .is_empty());
+    bus.shutdown().await.unwrap();
+}
