@@ -111,7 +111,7 @@ mod tests {
             json!({"content":"x".repeat(2_000_000)}),
         );
         let weak = Arc::downgrade(&large);
-        sender.send(large).unwrap();
+        assert!(sender.send(large).is_ok());
         assert!(
             tokio::time::timeout(Duration::from_secs(10), subscription.changed())
                 .await
@@ -135,7 +135,7 @@ mod tests {
         let mut subscription =
             InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
         for _ in 0..100 {
-            sender.send(event("ws", "note:updated", json!({}))).unwrap();
+            assert!(sender.send(event("ws", "note:updated", json!({}))).is_ok());
         }
         drop(sender);
         // Wait for actual worker settlement before consuming the coalesced bit.
@@ -165,11 +165,9 @@ mod tests {
         let weak = Arc::downgrade(&large);
         // No await on this current-thread runtime: overwrite the matching
         // event before the worker can inspect it. Remaining events don't match.
-        sender.send(large).unwrap();
+        assert!(sender.send(large).is_ok());
         for _ in 0..8 {
-            sender
-                .send(event("ws", "comment:added", json!({})))
-                .unwrap();
+            assert!(sender.send(event("ws", "comment:added", json!({}))).is_ok());
         }
         assert!(weak.upgrade().is_none());
         drop(sender);
@@ -200,9 +198,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            sender
-                .send(event(workspace, event_type, json!({})))
-                .unwrap();
+            assert!(sender.send(event(workspace, event_type, json!({}))).is_ok());
             drop(sender);
             tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
                 .await
@@ -237,12 +233,12 @@ mod tests {
             source: Arc::new(PrivateSource),
         }));
         let weak = Arc::downgrade(&private);
-        sender.send(private).unwrap();
-        sender
+        assert!(sender.send(private).is_ok());
+        assert!(sender
             .send(Arc::new(BroadcastEvent::HistoryChanged(
                 "original-agent".into(),
             )))
-            .unwrap();
+            .is_ok());
         drop(sender);
         tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
             .await
