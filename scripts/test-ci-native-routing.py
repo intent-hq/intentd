@@ -26,7 +26,7 @@ RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
     "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
-    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
@@ -38,6 +38,16 @@ NATIVE_STEPS = {
     "Codex focused diagnostics (macOS runtime)": {"macOS"},
     "Retained workspace CoW fixtures (macOS runtime)": {"macOS"},
 }
+MACOS_SERVICE_STEPS = {
+    "Codex focused diagnostics (macOS runtime)",
+    "Retained workspace CoW fixtures (macOS runtime)",
+}
+
+
+def native_step_job(name):
+    return "macos-services-runtime" if name in MACOS_SERVICE_STEPS else "build"
+
+
 GITLAB_STEP = "GitLab auth, invitations and checkout over real sockets with explicit test transports"
 GITLAB_COMMAND = (
     "cargo test --locked -p intentd --features repository-test-fixtures "
@@ -157,8 +167,9 @@ def native_errors(workflow):
     if targets != {"aarch64-apple-darwin", "x86_64-pc-windows-msvc"}:
         errors.append("missing native target")
     for name, platforms in NATIVE_STEPS.items():
-        step = steps.get(name)
-        if not step or step.get("continue-on-error") or not step.get("run"):
+        owner = workflow["jobs"][native_step_job(name)]
+        step = next((s for s in owner["steps"] if s.get("name") == name), None)
+        if not step or owner.get("continue-on-error") or step.get("continue-on-error") or not step.get("run"):
             errors.append(f"{name}: missing required proof")
             continue
         for event in ("merge_group", "push"):
@@ -354,7 +365,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["windows_burst"], "true")
 
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
-        for job_id in ("build", "daemon-lifecycle"):
+        for job_id in ("build", "daemon-lifecycle", "macos-services-runtime"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
                 expected = ["macos-15"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
                     ["gh-linux-16x"] if row.get("platform") == "linux" else ["gh-windows-16x"])
@@ -593,7 +604,7 @@ class NativeRoutingTests(unittest.TestCase):
             for mutation in ("remove", "skip", "pr-only", "optional", "empty"):
                 with self.subTest(step=name, mutation=mutation):
                     workflow = copy.deepcopy(self.workflow)
-                    steps = workflow["jobs"]["build"]["steps"]
+                    steps = workflow["jobs"][native_step_job(name)]["steps"]
                     step = next(s for s in steps if s.get("name") == name)
                     if mutation == "remove":
                         steps.remove(step)
@@ -622,6 +633,30 @@ class NativeRoutingTests(unittest.TestCase):
                             if s.get("name") == "Check (native production configuration)")
                 step["run"] += " " + arguments
                 self.assertIn("native check must compile the non-test production configuration", native_errors(workflow))
+
+    def test_services_runtime_has_independent_required_budget(self):
+        job = self.workflow["jobs"]["macos-services-runtime"]
+        self.assertEqual(job["timeout-minutes"], 60)
+        self.assertNotIn("build", job["needs"])
+        self.assertFalse(job.get("continue-on-error", False))
+        self.assertEqual(job["strategy"]["matrix"]["include"][0]["target"], "aarch64-apple-darwin")
+        for name in MACOS_SERVICE_STEPS:
+            self.assertFalse(any(s.get("name") == name for s in self.workflow["jobs"]["build"]["steps"]))
+        directory = next(s["run"] for s in job["steps"] if s.get("name", "").startswith("Point CARGO_TARGET_DIR"))
+        self.assertIn("/macos-services-runtime-", directory)
+        for mutation in ("skip", "ignore", "dependency"):
+            workflow = copy.deepcopy(self.workflow)
+            if mutation == "skip":
+                workflow["jobs"]["macos-services-runtime"]["if"] = False
+                self.assertTrue(routing_errors(workflow))
+            elif mutation == "ignore":
+                step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
+                step["run"] = step["run"].replace("${{ needs.macos-services-runtime.result }}", "success")
+                self.assertIn("merge_group: macos-services-runtime=skipped", gate_errors(workflow))
+                self.assertIn("merge_group: macos-services-runtime=failure", gate_errors(workflow))
+            else:
+                workflow["jobs"]["gate"]["needs"].remove("macos-services-runtime")
+                self.assertIn("gate dependencies changed", gate_errors(workflow))
 
     def test_mutation_cannot_accept_skipped_queue_build(self):
         workflow = copy.deepcopy(self.workflow)

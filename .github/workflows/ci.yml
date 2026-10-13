@@ -959,6 +959,58 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+      - name: Build (release)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Warm merge queue check cache
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo check --workspace --target ${{ matrix.target }}
+
+  # Services test code generation must not share the native check/Clippy
+  # budget: a cold macOS queue run reached discovery compilation with only
+  # 23 minutes left and hit the 60-minute job limit before any test ran.
+  # Keep all diagnostics and CoW assertions mandatory, with their own bounded
+  # job and independent target directory rather than extending timeouts.
+  macos-services-runtime:
+    name: macOS Services runtime
+    needs: [release-fast-path, route]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-15"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/macos-services-runtime-${{ matrix.target }}" >> "$GITHUB_ENV"
+      - name: Ensure macOS CI disk headroom
+        if: contains(matrix.os, 'self-hosted')
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+      - name: Rust cache (GitHub-hosted runner only)
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gh-macos-services-runtime-${{ matrix.target }}
       # macOS supports read-only metadata and rejects process probes before
       # auth/npm setup. Require both a service rejection case and a real doctor
       # case in discovery so a cfg/filter change cannot silently run zero tests.
@@ -1034,12 +1086,6 @@ jobs:
             fi
           done
           exit "$status"
-      - name: Build (release)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
-        run: cargo build --workspace --release --target ${{ matrix.target }}
-      - name: Warm merge queue check cache
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
-        run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
     # merge_group-ONLY (see the `merge_group` trigger comment): the
@@ -2234,7 +2280,7 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [daemon-lifecycle, check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2261,6 +2307,17 @@ jobs:
           elif [ "${{ needs.build.result }}" != "success" ]; then
             echo "build must succeed outright on merge_group / push"
             exit 1
+          fi
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            if [ "${{ needs.macos-services-runtime.result }}" != "success" ]; then
+              echo "macos-services-runtime must succeed outright on merge_group"
+              exit 1
+            fi
+          else
+            case "${{ needs.macos-services-runtime.result }}" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
           fi
           if [ "${{ needs.deb-packaging.result }}" != "success" ] || \
              [ "${{ needs.release-scripts.result }}" != "success" ] || \

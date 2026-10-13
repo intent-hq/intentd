@@ -24,13 +24,13 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
 INDIRECT_TEST_STEPS = {
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"),
+    ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"),
 }
 COMMAND = re.compile(
     r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
@@ -96,10 +96,10 @@ REQUIRED_TEST_STEPS = {
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
+    ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"): None,
     ("build", "Headless workspace setup (Windows runtime)"): 1,
     ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
-    ("build", "Codex focused diagnostics (macOS runtime)"): 2,
+    ("macos-services-runtime", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,
     ("coverage-changed", "Run changed tests under llvm-cov"): 1,
@@ -151,9 +151,10 @@ class CiPolicyTests(unittest.TestCase):
                           "Retained workspace CoW fixtures (macOS runtime)"):
             with self.subTest(step=step_name):
                 workflow = copy.deepcopy(self.workflow)
-                step = next(s for s in workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                owner = "macos-services-runtime" if step_name.startswith("Retained workspace") else "build"
+                step = next(s for s in workflow['jobs'][owner]['steps'] if s.get('name') == step_name)
                 step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
-                self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
+                self.assertIn(f"{owner}: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
     def test_callback_scope_changes_select_validation_without_rust_changes(self):
         job = self.workflow["jobs"]["coverage-changed"]
@@ -303,7 +304,7 @@ else:
                     "print('CoW fixture assertions passed: '+test.split('::')[-1])\n"
                 )
                 stub.chmod(0o755)
-                step = next(s for s in self.workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                step = next(s for s in self.workflow['jobs']['macos-services-runtime']['steps'] if s.get('name') == step_name)
                 env = {**os.environ, 'INTENTD_ASSERT_BOUND_CALLER': '0', **step.get('env', {})}
                 env = {k: re.sub(r'\$\{\{.*?\}\}', 'fixture', str(v)) for k, v in env.items()}
                 env.update(PATH=str(root)+os.pathsep+os.environ['PATH'], RUNNER_TEMP=str(root), POLICY_CHILD_LOG=str(root/'children.jsonl'))
