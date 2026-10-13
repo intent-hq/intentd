@@ -35,6 +35,9 @@ pub mod ids;
 pub mod model;
 pub mod native_review;
 pub mod nodes;
+pub mod note_annotation;
+pub mod note_delete;
+pub mod note_page;
 pub mod path_utils;
 pub mod process_policy;
 #[doc(hidden)]
@@ -42,6 +45,7 @@ pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod review_monitor;
+pub mod script_lists;
 pub mod script_monitor;
 pub mod script_output;
 pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};

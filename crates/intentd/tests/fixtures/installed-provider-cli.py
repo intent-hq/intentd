@@ -86,6 +86,8 @@ for line in sys.stdin:
                             'skills/extraRoots/set', 'mcpServer/reload']:
             raise AssertionError('unexpected Codex request: ' + method)
         send(dict(id=request['id'], result=result))
+        if method == 'thread/name/set':
+            send(dict(method='thread/name/updated', params=dict(threadId=params['threadId'], threadName=params['name'])))
         if method in ['thread/start', 'thread/resume']:
             for name in params.get('config', {}).get('mcp_servers', {}):
                 send(dict(method='mcpServer/startupStatus/updated',

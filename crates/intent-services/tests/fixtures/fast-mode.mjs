@@ -26,6 +26,12 @@ readline.createInterface({input:process.stdin, terminal:false}).on('line', line 
   const msg = JSON.parse(line);
   const p = msg.params ?? {};
   if (!msg.method) return;
+  if (provider === 'codex' && msg.method === 'session/prompt' && p.prompt?.[0]?.text?.startsWith('/rename ')) {
+    record({method:'fixture/title_control', params:p, pid:process.pid});
+    send({jsonrpc:'2.0', method:'session/update', params:{sessionId:sid,
+      update:{sessionUpdate:'session_info_update', title:p.prompt[0].text.slice(8).trim()}}});
+    return result(msg.id, {stopReason:'end_turn'});
+  }
   record({method:msg.method, params:p, pid:process.pid});
   switch (msg.method) {
     case 'initialize':

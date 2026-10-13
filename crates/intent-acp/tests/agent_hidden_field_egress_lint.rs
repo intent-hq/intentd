@@ -101,6 +101,10 @@ const ALLOWLIST: Allowlist<'static> = Allowlist {
             "crates/intent-acp/src/mcp_server/bindings/app/agents.rs",
             "ws.app.agents.",
         ),
+        (
+            "crates/intent-acp/src/mcp_server/bindings/app/chats.rs",
+            "ws.app.chats.",
+        ),
     ],
     hand_picked_bindings: &[(
         "crates/intent-acp/src/mcp_server/bindings/workspace.rs",

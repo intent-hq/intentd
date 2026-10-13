@@ -20,6 +20,7 @@ const MODEL_LIMIT: usize = 2000;
 pub enum CatalogFailure {
     AdapterUnavailable,
     RuntimeUnverified,
+    RuntimeBelowMinimum,
     AuthenticationUnavailable,
     UnsupportedCapability,
     UnsupportedPlatform,
@@ -41,6 +42,7 @@ impl CatalogFailure {
         match self {
             Self::AdapterUnavailable => "selected adapter is unavailable",
             Self::RuntimeUnverified => "selected adapter's runtime could not be verified",
+            Self::RuntimeBelowMinimum => "installed Codex CLI is below the adapter minimum; provider discovery reports the detected and required versions",
             Self::AuthenticationUnavailable => "authentication is unavailable for this probe",
             Self::UnsupportedCapability => "provider does not support this diagnostic conversation",
             Self::UnsupportedPlatform => UnknownReason::UnsupportedPlatform.message(),
@@ -453,6 +455,12 @@ impl CodexLaunch {
                 .observe_with_dependency(&command, Some(dependency))
                 .await
                 .map_err(|_| CatalogFailure::RuntimeUnverified)?;
+            context
+                .validate_launch_version(&version)
+                .map_err(|reason| {
+                    tracing::warn!(%reason, "Codex catalog probe rejected before launch");
+                    CatalogFailure::RuntimeBelowMinimum
+                })?;
             let measured = super::parse_version(version.as_bytes(), super::VersionKind::Runtime)
                 .map_or(
                     super::VersionMeasurement::Unknown(UnknownReason::InvalidVersion),

@@ -3,6 +3,7 @@
 #
 #   scripts/changed-tests.sh [--dry-run] [--base REF] [--instrumented]
 #                            [--build-jobs N] [--test-threads N] [--runner CMD]
+#                            [--plan-json PATH]
 #
 # Each flag falls back to an environment variable: DRY_RUN=1, BASE (default
 # origin/main), BUILD_JOBS, TEST_THREADS, NEXTEST_RUNNER. NEXTEST_SHOW_PROGRESS /
@@ -75,9 +76,10 @@ test_threads=${TEST_THREADS:-}
 dry_run=${DRY_RUN:-}
 runner=${NEXTEST_RUNNER:-}
 instrumented=""
+plan_json=""
 
 usage() {
-  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD]" >&2
+  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH]" >&2
   exit 2
 }
 
@@ -89,13 +91,15 @@ while (($# > 0)); do
     --build-jobs=*) build_jobs=${1#--build-jobs=} ;;
     --test-threads=*) test_threads=${1#--test-threads=} ;;
     --runner=*) runner=${1#--runner=} ;;
-    --base | --build-jobs | --test-threads | --runner)
+    --plan-json=*) plan_json=${1#--plan-json=} ;;
+    --base | --build-jobs | --test-threads | --runner | --plan-json)
       [[ $# -ge 2 && -n "$2" ]] || usage
       case "$1" in
         --base) base=$2 ;;
         --build-jobs) build_jobs=$2 ;;
         --test-threads) test_threads=$2 ;;
         --runner) runner=$2 ;;
+        --plan-json) plan_json=$2 ;;
       esac
       shift
       ;;
@@ -125,6 +129,24 @@ cd "$repo_root"
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
 merge_base=$(git merge-base HEAD "$base" 2>/dev/null) ||
   die 4 "cannot resolve BASE '$base'; run 'git fetch origin main' or set BASE=<ref>"
+
+# Optional machine-readable argv, including an empty selection. It describes
+# only the original plans; callback scope derivation cannot change execution.
+# Resolve output relative to the caller, consistently with --runner.
+[[ -z "$plan_json" || "$plan_json" == /* ]] || plan_json="$caller_dir/$plan_json"
+export_plans() {
+  [[ -n "$plan_json" ]] || return 0
+  local head
+  head=$(git rev-parse HEAD) || die 2 "cannot identify plan HEAD"
+  python3 -I -B -S - "$plan_json" "$head" "$merge_base" "${plans-}" <<'PYTHON'
+import json, pathlib, sys
+path, head, base, plans = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({
+    "version": 1, "head": head, "mergeBase": base,
+    "plans": [line.split() for line in plans.splitlines() if line.strip()],
+}, indent=2) + "\n")
+PYTHON
+}
 
 # Paths outside crates/ that no test can observe.
 is_inert() {
@@ -226,6 +248,7 @@ crates=$(printf '%s' "$crates" | sort -u)
 
 if [[ -z "$crates" ]]; then
   log "nothing to test (no Rust changes vs $base)"
+  export_plans
   exit 0
 fi
 
@@ -279,6 +302,8 @@ while IFS=$'\t' read -r crate filter; do
   done <<<"$selections"
   plans+="$members$filter"$'\n'
 done <<<"$selections"
+
+export_plans
 
 extra=""
 [[ -n "$build_jobs" ]] && extra+=" --build-jobs $build_jobs"

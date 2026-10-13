@@ -2,6 +2,85 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.45] - 2026-10-13
+
+### 📚 Documentation
+
+- Clarify browser primary selection and switching ([#2391](https://github.com/intent-hq/intentd/pull/2391))
+
+
+## [0.10.44] - 2026-10-13
+
+### 🚀 Features
+
+- *(scripts)* Add compact active lists and durable monitor cleanup ([#2393](https://github.com/intent-hq/intentd/pull/2393))
+- Let Assistant manage MCP servers and chats ([#2384](https://github.com/intent-hq/intentd/pull/2384))
+
+### 🐛 Bug Fixes
+
+- Preserve note index lockfile inputs during packaging ([#2399](https://github.com/intent-hq/intentd/pull/2399))
+- Publish sufficient state for push-driven client updates ([#2392](https://github.com/intent-hq/intentd/pull/2392))
+
+### 📚 Documentation
+
+- Explain workspace cycling from Home ([#2390](https://github.com/intent-hq/intentd/pull/2390))
+- Explain composer prompt recall ([#7068](https://github.com/intent-hq/intentd/pull/7068)) ([#2388](https://github.com/intent-hq/intentd/pull/2388))
+
+### 🧪 Testing
+
+- Preserve final Pi child evidence during fixture cleanup ([#2398](https://github.com/intent-hq/intentd/pull/2398))
+
+
+## [0.10.43] - 2026-10-11
+
+### 🚀 Features
+
+- Add bounded note viewing and cancellable deletion ([#2298](https://github.com/intent-hq/intentd/pull/2298))
+
+
+## [0.10.42] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Emit compact monitor required-check counts ([#2380](https://github.com/intent-hq/intentd/pull/2380))
+
+### 📚 Documentation
+
+- Explain unsupported binary artifact downloads ([#2373](https://github.com/intent-hq/intentd/pull/2373))
+
+
+## [0.10.41] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain hardware workspace numbering and assignment ([#2369](https://github.com/intent-hq/intentd/pull/2369))
+
+
+## [0.10.40] - 2026-10-10
+
+### 🧪 Testing
+
+- Retain bounded Pi startup diagnostics in CI ([#2370](https://github.com/intent-hq/intentd/pull/2370))
+
+
+## [0.10.39] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain browser recovery after reconnect ([#7004](https://github.com/intent-hq/intentd/pull/7004)) ([#2371](https://github.com/intent-hq/intentd/pull/2371))
+
+### 🧪 Testing
+
+- Wait for durable idle before model recreation ([#2377](https://github.com/intent-hq/intentd/pull/2377))
+
+
+## [0.10.38] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Enforce adapter-derived Codex CLI compatibility ([#2372](https://github.com/intent-hq/intentd/pull/2372))
+
+
 ## [0.10.37] - 2026-10-09
 
 ### 🚀 Features

@@ -5131,13 +5131,13 @@ pub enum ScriptPurpose {
     OneOff,
 }
 
-/// Archive selection. Omitted wire filters preserve legacy lists.
+/// Archive selection. Lists support only unarchived definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptArchiveFilter {
+    #[default]
     Active,
     Archived,
-    #[default]
     All,
 }
 

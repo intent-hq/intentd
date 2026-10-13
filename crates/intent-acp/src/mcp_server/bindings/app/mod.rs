@@ -8,7 +8,7 @@
 //! sub-agent callers are denied one layer up, in the dispatch host).
 //!
 //! Structure: `app/mod.rs` owns the PRELUDE assembly and top-level dispatch
-//! routing to submodules (`workspaces`, `agents`, `settings`, `specialists`).
+//! routing to submodules (`workspaces`, `agents`, `chats`, `mcp`, and settings).
 //! Each submodule implements its own chief-gating check and dispatch.
 
 use std::sync::Arc;
@@ -18,6 +18,8 @@ use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
 pub(crate) mod agents;
+pub(crate) mod chats;
+pub(crate) mod mcp;
 pub(crate) mod proposal;
 pub(crate) mod question;
 pub(crate) mod settings;
@@ -25,12 +27,14 @@ pub(crate) mod specialists;
 pub(crate) mod ui;
 pub(crate) mod workspaces;
 
-/// Assemble the `ws.app.*` PRELUDE from all submodules. Each submodule
+/// Assemble the shared `ws.app.*` PRELUDE. Each submodule
 /// installs its portion of the namespace (e.g., `ws.app.workspaces`,
 /// `ws.app.agents`). The prelude is unconditional (chief-gating is enforced
 /// server-side in dispatch) with ONE exception: `ws.app.question` is omitted
 /// when `agentFeatures.structuredQuestions` is off, so a disabled bridge
 /// fails with a clear `ws.app.question is undefined` `TypeError`.
+/// `ws.app.mcp` and `ws.app.chats` are added by the workspace-aware prelude, only for
+/// the Assistant; its dispatcher also enforces that scope.
 pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
     let mut fragments = vec![workspaces::PRELUDE, agents::PRELUDE, proposal::PRELUDE];
     if features.structured_questions {
@@ -73,6 +77,11 @@ pub(crate) async fn try_dispatch(
             .await
             .map(Some);
     }
+    if let Some(rest) = method.strip_prefix("chats.") {
+        return chats::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
+    }
     if let Some(rest) = method.strip_prefix("proposal.") {
         return proposal::dispatch(api, workspace_id, rest, args).map(Some);
     }
@@ -80,6 +89,9 @@ pub(crate) async fn try_dispatch(
         return settings::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("mcp.") {
+        return mcp::dispatch(api, workspace_id, rest, args).await.map(Some);
     }
     if let Some(rest) = method.strip_prefix("specialists.") {
         return specialists::dispatch(api, workspace_id, rest, args)

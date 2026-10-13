@@ -78,16 +78,16 @@ jobs:
   # deliberate trade-off. The same probe also places the build job's Windows
   # matrix entry (intent-hq/intent#5518): the self-hosted 5090pc runner when
   # it is confirmed online, the org-hosted gh-windows-16x runner otherwise —
-  # same fail-open rule, no queue-depth check (5090pc is single-slot). The
-  # mac build is intentionally not routed — it runs on the self-hosted m1mac
-  # (see the build job's matrix).
+  # same fail-open rule, no queue-depth check (5090pc is single-slot).
+  # Both macOS native consumers use m1mac only when an online, idle ARM64
+  # runner is confirmed; otherwise they use GitHub-hosted macos-15 (ARM64).
   route:
     # Runs on push / merge_group / same-repo pull_request. Linux PR checks
-    # consume its decision; the native Windows entry uses it on push and
+    # consume its decision; the native build entries use it on push and
     # merge_group (intent-hq/intent#5518). On push its Linux consumers
     # (check / coverage-e2e / coverage-all / coverage-changed) are
     # push-skipped by their own `if`s (see the `on: push` comment), so only
-    # the Windows decision is used there.
+    # the native build decisions are used there.
     # Skipped on fork PRs (see the `pull_request` trigger comment): route's
     # skip cascades over the needs chain, skipping check / coverage-e2e /
     # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
@@ -108,6 +108,8 @@ jobs:
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
       windows_labels: ${{ steps.decide.outputs.windows_labels }}
       windows_burst: ${{ steps.decide.outputs.windows_burst }}
+      macos_labels: ${{ steps.decide.outputs.macos_labels }}
+      macos_burst: ${{ steps.decide.outputs.macos_burst }}
     steps:
       - id: decide
         uses: actions/github-script@v9
@@ -147,6 +149,9 @@ jobs:
             // image.
             const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
             const windowsBurst = ["gh-windows-16x"];
+            const macosSelfHosted = ["self-hosted", "macOS", "ARM64"];
+            // Pinned standard Apple Silicon image, not macos-15-intel.
+            const macosBurst = ["macos-15"];
             const threshold = parseInt(process.env.THRESHOLD || "8", 10);
             // FAIL OPEN TO BURST: tinybox is only selected when the probe
             // positively confirms (a) an online self-hosted Linux runner
@@ -170,7 +175,8 @@ jobs:
             // repo can access, so the probe assumes every online
             // self-hosted+Linux+X64 org runner is the tinybox fleet in a
             // group visible to this repo (and likewise every online
-            // self-hosted+Windows+X64 runner is 5090pc). Ops invariant:
+            // self-hosted+Windows+X64 runner is 5090pc and every
+            // self-hosted+macOS+ARM64 runner is m1mac). Ops invariant:
             // keep the fleet's group visible to the CI repos, and never
             // register generically-labeled org runners outside it — a
             // matching but inaccessible runner would route jobs onto
@@ -199,9 +205,11 @@ jobs:
             } catch (e) {
               runnerListError = e;
             }
-            const onlineWith = (labels) => (runners || []).filter(r =>
+            const onlineWith = (labels, ignoreCase = false) => (runners || []).filter(r =>
               r.status === "online" &&
-              labels.every(l => (r.labels || []).some(x => x.name === l))
+              labels.every(l => (r.labels || []).some(x => ignoreCase
+                ? typeof x.name === "string" && x.name.toLowerCase() === l.toLowerCase()
+                : x.name === l))
             );
             let useBurst = true;
             let reason = "fail-open default";
@@ -270,6 +278,28 @@ jobs:
             core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
             core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
             core.setOutput("windows_burst", String(windowsUseBurst));
+            // macOS has no queue budget: only explicit idle availability
+            // selects self-hosted. Missing busy state is not proof of a
+            // free slot. Labels are case-insensitive in Actions; keep the
+            // existing Linux/Windows matching semantics above unchanged.
+            let macosUseBurst = true;
+            let macosReason = "fail-open default";
+            try {
+              if (runnerListError) throw runnerListError;
+              const idle = onlineWith(macosSelfHosted, true).filter(r => r.busy === false);
+              if (idle.length === 0) {
+                macosReason = `no idle online self-hosted macOS ARM64 runner (${runnerSource} list)`;
+              } else {
+                macosUseBurst = false;
+                macosReason = `idle=${idle.length} (${runnerSource} list)`;
+              }
+            } catch (e) {
+              macosUseBurst = true;
+              macosReason = `probe failed (${e.message})`;
+            }
+            core.info(`macos routing: burst=${macosUseBurst} (${macosReason})`);
+            core.setOutput("macos_labels", JSON.stringify(macosUseBurst ? macosBurst : macosSelfHosted));
+            core.setOutput("macos_burst", String(macosUseBurst));
 
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
@@ -280,9 +310,10 @@ jobs:
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    # Cold burst builds plus the socket suites can use nearly 15 minutes;
-    # leave time for post-job cache saving after the checks finish.
-    timeout-minutes: 20
+    # The cold-cache check job exhausted its 20-minute budget after its tests
+    # passed in run 37305697722. Allow completion/cache margin without changing
+    # individual test timeouts.
+    timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -666,10 +697,10 @@ jobs:
     # pushes retain release builds. The explicit event allowlist prevents
     # matrix expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
-    # dependencies: release metadata is PR-only, and Windows has a hosted
+    # dependencies: release metadata is PR-only, and each native OS has a hosted
     # fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
-    # `route` places the Windows entry (intent-hq/intent#5518; see the
+    # `route` places the native entries (Windows: intent-hq/intent#5518; see the
     # matrix) and runs on every event this job runs on. route runs on
     # ubuntu-latest, so this dependency can never queue behind the
     # self-hosted runners it decides about.
@@ -683,10 +714,11 @@ jobs:
           # temporarily disabled — re-enable when needed
           # - target: x86_64-unknown-linux-gnu
           #   os: ubuntu-latest
-          # Self-hosted Apple Silicon runner (m1mac). The explicit name below
-          # predates a temporary macos-14 stint; retain it for check history.
+          # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
+          # use pinned hosted ARM64. Empty route output also falls back to
+          # hosted. Retain the historical macos-14 check name for continuity.
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64]
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-15"]') }}
             name: build (aarch64-apple-darwin, macos-14)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
@@ -811,7 +843,8 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: |
           python3 -I -B -S - <<'PYTHON'
-          import os, signal, subprocess
+          import json, os, signal, subprocess
+          from pathlib import Path
 
           cargo = ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"],
                    "cargo", "test", "--locked", "--target", os.environ["INTENTD_TUNNEL_TARGET"]]
@@ -830,9 +863,11 @@ jobs:
               ]),
           ]
 
-          def bounded(command):
+          def bounded(command, package_dir, env):
+              print("+ " + repr(command), flush=True)
               child = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       cwd=package_dir, env=env)
               try:
                   output, _ = child.communicate(timeout=30)
                   print(output, end="", flush=True)
@@ -844,14 +879,46 @@ jobs:
                   print(output, end="", flush=True)
                   raise
 
+          rust_lib = subprocess.check_output(
+              ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"], "rustc",
+               "--print", "target-libdir", "--target", os.environ["INTENTD_TUNNEL_TARGET"]], text=True).strip()
           for package, tests in groups:
-              subprocess.run(cargo + package + ["--no-run"], check=True)
+              # Compilation has the step's budget. A later Cargo invocation
+              # can rebuild even after --no-run (e.g. missing watched Git
+              # metadata); never charge that work to the 30s runtime proof.
+              built = subprocess.run(cargo + package + ["--no-run", "--message-format=json-render-diagnostics"],
+                                     check=True, stdout=subprocess.PIPE, text=True)
+              messages = [json.loads(line) for line in built.stdout.splitlines() if line.startswith("{")]
+              package_dir = Path("crates", package[1]).resolve()
+              kind = "lib" if "--lib" in package else "test"
+              name = package[1].replace("-", "_") if kind == "lib" else package[package.index("--test") + 1]
+              artifacts = [m for m in messages if m.get("reason") == "compiler-artifact"
+                           and m.get("profile", {}).get("test") is True and m.get("executable")
+                           and m.get("target", {}).get("kind") == [kind] and m["target"].get("name") == name
+                           and m.get("manifest_path") == str(package_dir / "Cargo.toml")]
+              assert len(artifacts) == 1, ("expected one current native test executable", artifacts)
+              binary = Path(artifacts[0]["executable"])
+              assert binary.is_file() and os.access(binary, os.X_OK), binary
+              print("Using native test executable: " + str(binary), flush=True)
+              # Match Cargo's package cwd and native library search roots.
+              env = dict(os.environ)
+              libraries = []
+              # Explicit --target puts the binary at target/triple/profile/deps.
+              for message in messages:
+                  if message.get("reason") == "build-script-executed":
+                      for linked in message.get("linked_paths", []):
+                          path = Path(linked.split("=", 1)[-1] if not linked.startswith("/") else linked).resolve()
+                          if path.is_relative_to(binary.parents[3]):
+                              libraries.append(str(path))
+              libraries.extend([str(binary.parent), str(binary.parent.parent), rust_lib])
+              env["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(libraries + [env.get(
+                  "DYLD_FALLBACK_LIBRARY_PATH", str(Path.home() / "lib") + ":/usr/local/lib:/usr/lib")])
               for test in tests:
-                  command = cargo + package + [test, "--", "--exact"]
-                  listed = bounded(command + ["--list"])
+                  command = [str(binary), test, "--exact"]
+                  listed = bounded(command + ["--list"], package_dir, env)
                   assert test + ": test" in listed.splitlines(), listed
                   assert "1 test, 0 benchmarks" in listed.splitlines(), listed
-                  output = bounded(command + ["--nocapture", "--test-threads=1"])
+                  output = bounded(command + ["--nocapture", "--test-threads=1"], package_dir, env)
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
@@ -1459,7 +1526,7 @@ jobs:
           set -euo pipefail
           plan="$RUNNER_TEMP/coverage-changed-plan.txt"
           status=0
-          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" | tee "$plan" || status=$?
+          ./scripts/changed-tests.sh --instrumented --dry-run --base "$BASE_SHA" --plan-json "$RUNNER_TEMP/coverage-changed-plan.json" | tee "$plan" || status=$?
           if [ "$status" -eq 4 ]; then
             echo "::error title=coverage-changed: base unresolvable::changed-tests.sh could not connect BASE $BASE_SHA to HEAD $(git rev-parse HEAD) — a checkout/fetch problem in this job, not a test failure (intent-hq/intent#5414)"
           fi
@@ -1469,6 +1536,9 @@ jobs:
           git diff --quiet "$BASE_SHA" HEAD -- \
             scripts/prepare-acp-callback-fixture.py \
             scripts/test-prepare-acp-callback-fixture.py \
+            scripts/changed-tests.sh \
+            scripts/callback-build-scope.py \
+            scripts/test-callback-build-scope.py \
             crates/intent-acp/tests/fixtures/claude-callback-adapter.json \
             crates/intent-acp/tests/fixtures/claude-callback-canonical.patch \
             crates/intent-acp/tests/fixtures/claude-callback-files.json \
@@ -1636,6 +1706,14 @@ jobs:
         run: |
           set -euo pipefail
           filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
+          # Reuse the compatible changed-plan scope instead of narrowing the
+          # Cargo feature graph back to just the callback packages. Validate
+          # structured argv before reading it; process substitution would hide
+          # a failed producer. Both commands below use this exact array.
+          python3 -I -B -S scripts/callback-build-scope.py \
+            "$RUNNER_TEMP/coverage-changed-plan.json" "$(git rev-parse HEAD)" \
+            > "$RUNNER_TEMP/callback-build-args.txt"
+          mapfile -t callback_scope < "$RUNNER_TEMP/callback-build-args.txt"
           # show-env defaults to Cargo's target dir, but llvm-cov nextest adds
           # llvm-cov-target. Share the latter explicitly so discovery builds
           # exactly the instrumented binaries execution will reuse.
@@ -1648,7 +1726,7 @@ jobs:
             # show-env exports Cargo metadata's target dir even with a coverage override.
             coverage_env=$(CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR" cargo llvm-cov show-env --sh)
             eval "$coverage_env"
-            cargo nextest list -p intent-acp -p intent-services --lib \
+            cargo nextest list "${callback_scope[@]}" \
               --target-dir "$CARGO_LLVM_COV_TARGET_DIR" \
               -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
           )
@@ -1660,7 +1738,7 @@ jobs:
                       if case["filter-match"]["status"] == "matches"]
           assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
           PYTHON
-          cargo llvm-cov --no-report nextest -p intent-acp -p intent-services --lib \
+          cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
             -E "$filter" --no-fail-fast --retries 0 --show-progress none \
             --status-level pass --final-status-level fail
       # Release the `.in-use` marker — see the `check` job's last step
@@ -1871,6 +1949,7 @@ jobs:
         run: |
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
+          python3 -I -B -S scripts/test-callback-build-scope.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
@@ -1903,12 +1982,16 @@ jobs:
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the Codex ACP rolling pin PR automation
-        run: python3 -S scripts/test-auto-pin-codex-acp.py
+        run: |
+          python3 -S scripts/test-auto-pin-codex-acp.py
+          python3 -S scripts/test-provider-cli-metadata.py
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.3.162
+      - name: Test Cargo packaging and historical baseline compatibility
+        run: python3 -S scripts/test-release-plz-packaging.py
       - name: Test new-package release baseline and retirement
         run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation
@@ -1976,6 +2059,11 @@ jobs:
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    env:
+      PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
+      PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+      PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
+      PI_DIAGNOSTICS_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.os }}-${{ matrix.node }}
     defaults:
       run:
         shell: bash
@@ -1991,25 +2079,30 @@ jobs:
           printf '%s\n' "$pin" > pi-path-evidence/package.txt
           npm install --prefix .pi-acp-test --no-save --ignore-scripts --no-audit --no-fund "$pin"
           cp .pi-acp-test/node_modules/.package-lock.json pi-path-evidence/package-lock.json
+          node crates/intentd/tests/fixtures/pi-artifact-audit.mjs --record-package
       - name: Test the pinned adapter (strict)
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs | tee pi-path-evidence/test.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs test.tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs
       - name: Test cleanup failure observability
         if: ${{ !cancelled() }}
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs | tee pi-path-evidence/cleanup-checks.tap
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs cleanup-checks.tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs
+      - name: Test bounded diagnostics and independent audit failure paths
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs diagnostic-checks.tap crates/intentd/tests/fixtures/pi-diagnostics.test.mjs crates/intentd/tests/fixtures/pi-artifact-audit.test.mjs
+      - name: Prove original startup errors through the supported fixture launcher
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs startup.tap crates/intentd/tests/fixtures/pi-startup-diagnostics.test.mjs
       - name: Install the real minimum Pi CLI
+        if: ${{ !cancelled() }}
         run: |
           minimum=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_CLI_MIN_VERSION: &str = "([^"]+)";/); if (!m) throw new Error("Missing Pi CLI minimum"); console.log(m[1]);')
           npm install --prefix .pi-runtime-test --no-save --ignore-scripts --no-audit --no-fund "@earendil-works/pi-coding-agent@$minimum" "@earendil-works/pi-agent-core@$minimum" "@earendil-works/pi-ai@$minimum" "@earendil-works/pi-tui@$minimum"
           cp .pi-runtime-test/node_modules/.package-lock.json pi-path-evidence/pi-package-lock.json
       - name: Test real Pi lifecycle and supported MCP extension delivery
-        env:
-          PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
-          PI_CLI_TEST_ENTRY: ${{ github.workspace }}/.pi-runtime-test/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
-          PI_ACP_EVIDENCE_DIR: ${{ github.workspace }}/pi-path-evidence
-        run: node --test --test-reporter=tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs | tee pi-path-evidence/runtime.tap
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs runtime.tap crates/intentd/tests/fixtures/pi-runtime-compat.test.mjs
+      - name: Independently audit diagnostics, replay, cleanup and unchanged package bytes
+        if: ${{ !cancelled() }}
+        run: node crates/intentd/tests/fixtures/pi-artifact-audit.mjs
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -2028,7 +2121,7 @@ jobs:
           - platform: linux
             os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
           - platform: macos
-            os: [self-hosted, macOS, ARM64]
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-15"]') }}
           - platform: windows
             os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
     runs-on: ${{ matrix.os }}
@@ -2043,6 +2136,60 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      # Persistent per-job outputs survive checkout's git clean. Linux uses
+      # /raid and a runner-slot key, with the same prune/marker rails as check.
+      - name: Disk-space preflight (tinybox only)
+        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
+        env:
+          NEED_GIB: 15
+          JOB_TARGET_SUBDIR: daemon-lifecycle
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Same two tiers as the `check` job's preflight (see its comment):
+          # selection in scripts/ci-target-slot.sh purge-candidates, a live
+          # is-purgeable recheck before each rm, this loop only deletes
+          # until the need is met.
+          evict_until_free() {
+            local verb="$1" quiet_min="$2" dir
+            shift 2
+            while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
+          }
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
+          fi
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
+      - name: Point lifecycle target outside checkout (Linux)
+        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
+      # These runners have one slot. Prefer the native Windows home path:
+      # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
+      - name: Point lifecycle target outside checkout (macOS and Windows)
+        if: runner.os != 'Linux' && contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
+      - name: Ensure macOS CI disk headroom
+        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -2053,7 +2200,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Rust cache (GitHub-hosted runner only)
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: daemon-lifecycle-${{ matrix.platform }}
       - name: Native lifecycle lint and runtime proof
@@ -2061,6 +2210,10 @@ jobs:
         run: |
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
+      - name: Release lifecycle target dir
+        if: ${{ always() && runner.os == 'Linux' && contains(matrix.os, 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
+        shell: bash
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.

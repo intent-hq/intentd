@@ -321,3 +321,189 @@ async fn replace_group_swaps_and_firehose_coexists() {
     let _ = shutdown_tx.send(());
     let _ = server.await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn note_delete_grace_uds_events_errors_scope_and_legacy_delete() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+    let (rd, mut wr) = connect_retry(&socket).await.into_split();
+    let mut rd = BufReader::new(rd);
+    let hello = rpc(&mut wr, &mut rd, 1, "client.hello", json!({})).await;
+    assert_eq!(hello["server"]["capabilities"]["noteDeleteGrace"], 1);
+    let mut fixtures = Vec::new();
+    for i in 0..2 {
+        let workspace = rpc(
+            &mut wr,
+            &mut rd,
+            10 + i,
+            "workspace.create",
+            json!({"title":format!("grace-{i}")}),
+        )
+        .await;
+        let ws = workspace["workspace"]["id"].as_str().unwrap().to_string();
+        let created = rpc(
+            &mut wr,
+            &mut rd,
+            20 + i,
+            "note.create",
+            json!({"workspaceId":ws,"title":"kept","content":"😀 exact\r\nbody"}),
+        )
+        .await;
+        let note = created["note"]["id"].as_str().unwrap().to_string();
+        let status = rpc(
+            &mut wr,
+            &mut rd,
+            30 + i,
+            "note.deleteStatus",
+            json!({"workspaceId":ws,"noteId":note}),
+        )
+        .await;
+        let key = json!({"epoch":status["epoch"],"issuedTickMs":status["serverTickMs"],"nonce":uuid::Uuid::new_v4().to_string()});
+        let schedule = json!({"workspaceId":ws,"noteId":note,"operationKey":key,"noteInstanceId":status["current"]["noteInstanceId"],"sourceRevision":status["current"]["sourceRevision"],"expectedVersion":status["current"]["revision"],"undoDelayMs":60000});
+        fixtures.push((ws, note, key, schedule));
+    }
+    let (er, mut ew) = connect_retry(&socket).await.into_split();
+    let mut er = BufReader::new(er);
+    rpc(
+        &mut ew,
+        &mut er,
+        40,
+        "events.subscribe",
+        json!({"workspaceId":fixtures[0].0,"eventTypes":["note:delete-operation"]}),
+    )
+    .await;
+    // Reject malformed controls before any destructive admission. Unknown old
+    // methods have no fallback to legacy immediate note.delete.
+    for (method, params, code) in [
+        (
+            "note.deleteSchedule",
+            {
+                let mut p = fixtures[0].3.clone();
+                p["undoDelayMs"] = json!(60001);
+                p
+            },
+            -32602,
+        ),
+        (
+            "note.deleteSchedule",
+            {
+                let mut p = fixtures[0].3.clone();
+                p["expectedVersion"] = json!(9_007_199_254_740_992_u64);
+                p
+            },
+            -32602,
+        ),
+        ("note.deleteFutureUnknown", fixtures[0].3.clone(), -32601),
+    ] {
+        send(
+            &mut wr,
+            &json!({"jsonrpc":"2.0","id":50,"method":method,"params":params}).to_string(),
+        )
+        .await;
+        let response = read_json(&mut rd).await;
+        assert_eq!(response["error"]["code"], code);
+    }
+    rpc(
+        &mut wr,
+        &mut rd,
+        60,
+        "note.deleteSchedule",
+        fixtures[1].3.clone(),
+    )
+    .await;
+    // Long JSON-RPC ids remain transport-owned; the grace 512KiB limit is on
+    // result only, not a new 128-byte request-id constraint.
+    let long_id = "i".repeat(1024);
+    send(&mut wr,&json!({"jsonrpc":"2.0","id":long_id,"method":"note.deleteSchedule","params":fixtures[0].3}).to_string()).await;
+    let scheduled = read_json(&mut rd).await;
+    assert_eq!(scheduled["id"], long_id);
+    assert!(scheduled.get("error").is_none());
+    assert!(serde_json::to_vec(&scheduled["result"]).unwrap().len() < 524_288);
+    let event = read_json(&mut er).await;
+    assert_eq!(event["method"], "events.event");
+    assert_eq!(event["params"]["event"]["type"], "note:delete-operation");
+    let data = &event["params"]["event"]["data"];
+    assert_eq!(data["workspaceId"], fixtures[0].0);
+    assert_eq!(data["operationKey"], fixtures[0].2);
+    assert_eq!(data["state"], "PENDING");
+    assert_eq!(data.as_object().unwrap().len(), 8);
+    let snapshot = rpc(
+        &mut wr,
+        &mut rd,
+        61,
+        "note.deleteStatus",
+        json!({"workspaceId":fixtures[0].0}),
+    )
+    .await;
+    assert_eq!(snapshot["pending"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["pending"][0]["canCancel"], true);
+    assert!(snapshot["sequence"].as_u64().unwrap() >= data["sequence"].as_u64().unwrap());
+    for (ws, note, key, _) in &fixtures {
+        let cancelled = rpc(
+            &mut wr,
+            &mut rd,
+            70,
+            "note.deleteCancel",
+            json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+        )
+        .await;
+        assert_eq!(cancelled["operation"]["state"], "CANCELLED");
+        timeout(DEADLINE, async {
+            loop {
+                let status = rpc(
+                    &mut wr,
+                    &mut rd,
+                    71,
+                    "note.deleteStatus",
+                    json!({"workspaceId":ws,"noteId":note,"operationKey":key}),
+                )
+                .await;
+                if status["operation"]["expiresTickMs"].is_number() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let note = rpc(
+            &mut wr,
+            &mut rd,
+            72,
+            "note.get",
+            json!({"workspaceId":ws,"noteId":note}),
+        )
+        .await;
+        assert_eq!(note["note"]["content"], "😀 exact\r\nbody");
+    }
+    let cancelled = read_json(&mut er).await;
+    assert_eq!(cancelled["params"]["event"]["data"]["state"], "CANCELLED");
+    // Legacy delete remains immediate, without a grace operation or recreate.
+    rpc(
+        &mut wr,
+        &mut rd,
+        80,
+        "note.delete",
+        json!({"workspaceId":fixtures[0].0,"noteId":fixtures[0].1}),
+    )
+    .await;
+    let absent = rpc(
+        &mut wr,
+        &mut rd,
+        81,
+        "note.deleteStatus",
+        json!({"workspaceId":fixtures[0].0,"noteId":fixtures[0].1}),
+    )
+    .await;
+    assert!(absent["current"].is_null());
+    assert_eq!(absent["pending"], json!([]));
+    drop(wr);
+    drop(rd);
+    drop(ew);
+    drop(er);
+    shutdown_tx.send(()).unwrap();
+    timeout(DEADLINE, server).await.unwrap().unwrap();
+    bus.store().close().await;
+}

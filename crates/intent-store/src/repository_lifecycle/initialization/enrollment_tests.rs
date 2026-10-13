@@ -453,7 +453,7 @@ async fn private_native_family_migration_seeds_only_existing_private_enrollment(
     sqlx::raw_sql("CREATE TABLE agent_session(acp_session_id TEXT); INSERT INTO agent_session VALUES('ordinary-public'); CREATE TABLE review_context_enrollment(acp_session_id TEXT); INSERT INTO review_context_enrollment VALUES('original-private');")
         .execute(&mut conn).await.unwrap();
     sqlx::raw_sql(include_str!(
-        "../../../migrations/0151_review_context_private_families.sql"
+        "../../../migrations/0160_review_context_private_families.sql"
     ))
     .execute(&mut conn)
     .await
@@ -492,7 +492,7 @@ async fn private_native_family_real_sqlx_upgrade_preserves_original_enrollment()
         migrations: Cow::Owned(
             crate::MIGRATOR
                 .iter()
-                .filter(|migration| migration.version <= 150)
+                .filter(|migration| migration.version <= 159)
                 .cloned()
                 .collect(),
         ),
@@ -506,7 +506,7 @@ async fn private_native_family_real_sqlx_upgrade_preserves_original_enrollment()
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(before.last().unwrap().0, 150);
+    assert_eq!(before.last().unwrap().0, 159);
     sqlx::query("INSERT INTO workspace(id,title,branch,status,created_at,updated_at) VALUES('upgrade-workspace','Upgrade','main','Active','2026-01-01','2026-01-01')")
         .execute(&pool).await.unwrap();
     for (agent, session) in [
@@ -528,7 +528,7 @@ async fn private_native_family_real_sqlx_upgrade_preserves_original_enrollment()
             .await
             .unwrap();
     assert_eq!(&after[..before.len()], before.as_slice());
-    assert!(after.iter().any(|(version, _)| *version == 151));
+    assert!(after.iter().any(|(version, _)| *version == 160));
     let workspace = intent_core::WorkspaceId("upgrade-workspace".into());
     let private = intent_core::AgentId("private-agent".into());
     let ordinary = intent_core::AgentId("ordinary-agent".into());

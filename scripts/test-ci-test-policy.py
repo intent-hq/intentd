@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -154,9 +155,132 @@ class CiPolicyTests(unittest.TestCase):
                 step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
                 self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
+    def test_callback_scope_changes_select_validation_without_rust_changes(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        step = next(s for s in job["steps"] if s.get("name") == "Select changed tests (dry run)")
+        paths = ("scripts/callback-build-scope.py", "scripts/changed-tests.sh",
+                 "scripts/test-callback-build-scope.py", "scripts/unrelated.txt")
+        for path in paths:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                repo = root / "repo"
+                (repo / "scripts").mkdir(parents=True)
+                for name in paths:
+                    (repo / name).write_text((ROOT / name).read_text() if (ROOT / name).exists() else "unrelated")
+                (repo / "scripts/changed-tests.sh").chmod(0o755)
+                env = {**os.environ, **{k: str(v) for k, v in job["env"].items()},
+                       "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                       "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+                       "RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "output"),
+                       "GITHUB_STEP_SUMMARY": str(root / "summary")}
+                for args in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "fixture"]):
+                    subprocess.run(["git", *args], cwd=repo, env=env, check=True)
+                env["BASE_SHA"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, env=env, text=True).strip()
+                with (repo / path).open("a") as file:
+                    file.write("\n# changed\n")
+                subprocess.run(["git", "add", "."], cwd=repo, env=env, check=True)
+                subprocess.run(["git", "commit", "-q", "-m", "change"], cwd=repo, env=env, check=True)
+                result = subprocess.run(["bash", "-c", step["run"]], cwd=repo, env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = "false" if path.endswith("unrelated.txt") else "true"
+                output = (root / "output").read_text()
+                self.assertIn("callback_fixture_changed=" + expected, output)
+                self.assertIn("has_selection=" + expected, output)
+                self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
+
+    def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
+        self.assertEqual(job["timeout-minutes"], 30)
+        names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
+        self.assertEqual(len(names), 6)
+        for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):
+            for override in (False, True):
+                with self.subTest(mode=mode, override=override), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    stub = root / "cargo"
+                    stub.write_text(
+                        f"#!{sys.executable} -S\n" + r'''
+import json, os, shlex, sys
+args = sys.argv[1:]
+mode = os.environ["INVENTORY_TEST_MODE"]
+with open(os.environ["INVENTORY_TEST_LOG"], "a") as log:
+    log.write(json.dumps({"args": args, "target": os.environ.get("CARGO_TARGET_DIR"),
+                         "cov_target": os.environ.get("CARGO_LLVM_COV_TARGET_DIR"),
+                         "instrumented": os.environ.get("INVENTORY_TEST_INSTRUMENTED"),
+                         "caller": os.environ.get("INTENTD_ASSERT_BOUND_CALLER")}) + "\n")
+if args[0] == "metadata":
+    if mode == "metadata-failure": sys.exit(41)
+    print(json.dumps({"target_directory": os.environ["INVENTORY_TEST_TARGET"]}))
+elif args[:2] == ["llvm-cov", "show-env"]:
+    if mode == "env-failure": sys.exit(42)
+    print("export INVENTORY_TEST_INSTRUMENTED=1")
+    print("export CARGO_LLVM_COV_TARGET_DIR=" + shlex.quote(os.environ["CARGO_TARGET_DIR"]))
+elif args[:2] == ["nextest", "list"]:
+    if mode == "list-failure": sys.exit(43)
+    names = os.environ["CALLBACK_FIXTURE_TESTS"].split()
+    if mode == "missing": names.pop()
+    if mode == "extra": names.append("unexpected::test")
+    cases = {name: {"filter-match": {"status": "matches"}} for name in names}
+    suites = {"first": {"testcases": cases}}
+    if mode == "duplicate": suites["second"] = {"testcases": {names[0]: cases[names[0]]}}
+    print(json.dumps({"rust-suites": suites}))
+elif args[:3] == ["llvm-cov", "--no-report", "nextest"]:
+    if mode == "run-failure": sys.exit(44)
+else:
+    sys.exit("unexpected cargo call: " + repr(args))
+'''
+                    )
+                    stub.chmod(0o755)
+                    env = {**os.environ, **{k: str(v) for k, v in job["env"].items()}, **step["env"],
+                           "PATH": str(root) + os.pathsep + os.environ["PATH"], "RUNNER_TEMP": str(root),
+                           "CARGO_TARGET_DIR": str(root / "slot with spaces"),
+                           "INVENTORY_TEST_TARGET": str(root / "slot with spaces"),
+                           "INVENTORY_TEST_MODE": mode, "INVENTORY_TEST_LOG": str(root / "calls.jsonl")}
+                    env.pop("CARGO_LLVM_COV_TARGET_DIR", None)
+                    env.pop("INVENTORY_TEST_INSTRUMENTED", None)
+                    if override:
+                        env["CARGO_LLVM_COV_TARGET_DIR"] = str(root / "explicit coverage")
+                    original_scope = ["-p", "intent-core", "-p", "intent-services",
+                                      "-p", "intent-transport", "--lib", "--bins", "--tests"]
+                    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+                    (root / "coverage-changed-plan.json").write_text(json.dumps({
+                        "version": 1, "head": head, "mergeBase": head,
+                        "plans": [original_scope, ["-p", "intent-store"]],
+                    }))
+                    result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=ROOT,
+                                            capture_output=True, text=True, timeout=10)
+                    calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+                    executions = [c for c in calls if c["args"][:3] == ["llvm-cov", "--no-report", "nextest"]]
+                    self.assertEqual(result.returncode == 0, mode == "valid" or (mode == "metadata-failure" and override), result.stderr)
+                    if mode not in ("valid", "run-failure") and not (mode == "metadata-failure" and override):
+                        self.assertEqual(executions, [])
+                        continue
+                    self.assertEqual(len(executions), 1)
+                    inventory = next(c for c in calls if c["args"][:2] == ["nextest", "list"])
+                    expected_target = env.get("CARGO_LLVM_COV_TARGET_DIR", env["CARGO_TARGET_DIR"] + "/llvm-cov-target")
+                    self.assertEqual(inventory["target"], env["CARGO_TARGET_DIR"])
+                    self.assertEqual(inventory["args"][inventory["args"].index("--target-dir") + 1], expected_target)
+                    self.assertEqual(inventory["cov_target"], expected_target)
+                    self.assertEqual(inventory["instrumented"], "1")
+                    execution = executions[0]
+                    self.assertIsNone(execution["instrumented"])
+                    self.assertEqual(execution["target"], env["CARGO_TARGET_DIR"])
+                    self.assertEqual(execution["cov_target"], expected_target)
+                    self.assertEqual(inventory["caller"], "1")
+                    self.assertEqual(execution["caller"], "1")
+                    inventory_filter = inventory["args"].index("-E")
+                    execution_filter = execution["args"].index("-E")
+                    expected_scope = original_scope + ["-p", "intent-acp"]
+                    self.assertEqual(inventory["args"][2:inventory_filter], expected_scope + ["--target-dir", expected_target])
+                    self.assertEqual(execution["args"][3:execution_filter], expected_scope)
+                    self.assertEqual(inventory["args"][inventory_filter + 1], execution["args"][execution_filter + 1])
+                    self.assertEqual(execution["args"][execution_filter + 2:], ["--no-fail-fast", "--retries", "0", "--show-progress", "none", "--status-level", "pass", "--final-status-level", "fail"])
+
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
-            ("Tunnel deadline and TLS controls (macOS runtime)", 8),
             ("Retained workspace CoW fixtures (macOS runtime)", 6),
         ):
             with self.subTest(step=step_name), tempfile.TemporaryDirectory() as tmp:
@@ -228,6 +352,181 @@ class CiPolicyTests(unittest.TestCase):
             self.assertTrue(any(script in error for error in violations(workflow, "1")))
 
 
+class TunnelArtifactTests(unittest.TestCase):
+    """Execute the real tunnel workflow with Cargo artifacts and native children."""
+
+    TESTS = {
+        "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
+        "tunnel::tests::connect_reset_preserves_error_before_deadline",
+        "tunnel::tests::connect_success_before_deadline_relays",
+        "tunnel_open_echo_eof_close_lifecycle",
+        "tunnel_open_err_for_closed_port_keeps_connection_alive",
+        "tunnel_close_tears_down_and_frees_stream_id",
+        "tunnel_connections_counted_in_health_and_stopped",
+        "tunnel_unauthenticated_upgrade_rejected",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.step = next(s for s in workflow["jobs"]["build"]["steps"]
+                        if s.get("name") == "Tunnel deadline and TLS controls (macOS runtime)")
+
+    def probe(self, mode="valid", *, inherited_libraries=False, timeout_probe=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "fixture binary"
+            binary.write_text(f"#!{sys.executable} -S\n" + r'''
+import json, os, signal, subprocess, sys
+args = sys.argv[1:]
+mode = os.environ["TUNNEL_MODE"]
+with open(os.environ["TUNNEL_LOG"], "a") as log:
+    log.write(json.dumps({"kind": "native", "args": args, "cwd": os.getcwd(),
+                         "policy": os.environ.get("INTENTD_ASSERT_BOUND_CALLER"),
+                         "libraries": os.environ.get("DYLD_FALLBACK_LIBRARY_PATH")}) + "\n")
+test = args[0]
+phase = "list" if "--list" in args else "run"
+if mode == "hang-" + phase:
+    child = subprocess.Popen([sys.executable, "-S", "-c", "import signal; signal.pause()"])
+    with open(os.environ["TUNNEL_PIDS"], "w") as f: json.dump([os.getpid(), child.pid], f)
+    signal.pause()
+if mode == "fail-" + phase: sys.exit(24)
+if phase == "list":
+    if mode != "missing-test": print(test + ": test")
+    print("2 tests, 0 benchmarks" if mode == "extra-test" else "1 test, 0 benchmarks")
+else:
+    print("running 0 tests" if mode == "zero-tests" else "running 1 test")
+    print("test result: ok. 0 passed; 0 failed; 1 ignored;" if mode == "ignored-test"
+          else "test result: ok. 1 passed; 0 failed; 0 ignored;")
+''')
+            binary.chmod(0o755)
+            stub = root / "rustup"
+            stub.write_text(f"#!{sys.executable} -S\n" + r'''
+import json, os, pathlib, shutil, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["TUNNEL_ROOT"])
+mode = os.environ["TUNNEL_MODE"]
+with open(os.environ["TUNNEL_LOG"], "a") as log:
+    log.write(json.dumps({"kind": "rustup", "args": args,
+                         "policy": os.environ.get("INTENTD_ASSERT_BOUND_CALLER")}) + "\n")
+assert args[:2] == ["run", "pinned-channel"], args
+if args[2:] == ["rustc", "--print", "target-libdir", "--target", "aarch64-apple-darwin"]:
+    print(root / "toolchain lib"); sys.exit(0)
+assert args[2:5] == ["cargo", "test", "--locked"], args
+assert args[args.index("--target") + 1] == "aarch64-apple-darwin", args
+if "--no-run" not in args:
+    sys.exit("unexpected recompilation in bounded discovery/runtime")
+if mode == "build-failure": sys.exit(25)
+package = args[args.index("-p") + 1]
+kind = "lib" if "--lib" in args else "test"
+name = package.replace("-", "_") if kind == "lib" else args[args.index("--test") + 1]
+package_dir = root / "crates" / package
+package_dir.mkdir(parents=True, exist_ok=True)
+(package_dir / "Cargo.toml").touch()
+executable = root / "target with spaces" / "aarch64-apple-darwin" / "debug" / "deps" / name
+executable.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(root / "fixture binary", executable)
+artifact = {"reason": "compiler-artifact", "manifest_path": str(package_dir / "Cargo.toml"),
+            "target": {"kind": [kind], "name": name}, "profile": {"test": True},
+            "executable": str(executable)}
+print(json.dumps({"reason": "compiler-artifact", "profile": {"test": False}, "executable": "/wrong"}))
+print(json.dumps({"reason": "build-script-executed", "linked_paths": [
+    "native=" + str(executable.parent.parent / "build/native lib"), "/outside/target"]}))
+if mode == "wrong-target": artifact["target"]["name"] = "other_test"
+if mode == "wrong-package": artifact["manifest_path"] = str(root / "other/Cargo.toml")
+if mode == "non-test": artifact["profile"]["test"] = False
+if mode == "missing-file": executable.unlink()
+if mode == "missing-executable": artifact["executable"] = None
+if mode != "missing-artifact": print(json.dumps(artifact))
+if mode == "ambiguous-artifact": print(json.dumps(artifact))
+print(json.dumps({"reason": "build-finished", "success": True}))
+''')
+            stub.chmod(0o755)
+            env = {**os.environ, **self.step["env"], "INTENTD_TUNNEL_TOOLCHAIN": "pinned-channel",
+                   "INTENTD_TUNNEL_TARGET": "aarch64-apple-darwin", "TUNNEL_ROOT": tmp,
+                   "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
+                   "TUNNEL_PIDS": str(root / "pids.json"), "PATH": tmp + os.pathsep + os.environ["PATH"]}
+            env.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+            if inherited_libraries:
+                env["DYLD_FALLBACK_LIBRARY_PATH"] = str(root / "existing lib")
+            body = self.step["run"]
+            if timeout_probe:
+                self.assertIn("communicate(timeout=30)", body)
+                body = body.replace("communicate(timeout=30)", "communicate(timeout=0.5)")
+            states = []
+            try:
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body],
+                                        cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            finally:
+                # A broken timeout wrapper must not leak the regression's children.
+                if (root / "pids.json").exists():
+                    pids = json.loads((root / "pids.json").read_text())
+                    states = [subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip() for pid in pids]
+                    try:
+                        os.killpg(pids[0], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if mode.startswith("hang-"):
+                self.assertTrue((root / "pids.json").exists(), result.stdout + result.stderr)
+                for state in states:
+                    self.assertTrue(not state or state.startswith("Z"), f"timed out process still alive: {state}")
+            return result, calls, tmp
+
+    def test_built_artifacts_are_reused_without_cargo_inside_runtime_budget(self):
+        for inherited in (False, True):
+            with self.subTest(inherited_libraries=inherited):
+                result, calls, tmp = self.probe(inherited_libraries=inherited)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                builds = [c for c in calls if c["kind"] == "rustup" and "cargo" in c["args"]]
+                self.assertEqual(len(builds), 2)
+                for call in builds:
+                    self.assertIn("--no-run", call["args"])
+                    self.assertIn("--message-format=json-render-diagnostics", call["args"])
+                native = [c for c in calls if c["kind"] == "native"]
+                self.assertEqual(len(native), 16)
+                self.assertEqual({c["args"][0] for c in native if "--list" in c["args"]}, self.TESTS)
+                self.assertEqual({c["args"][0] for c in native if "--nocapture" in c["args"]}, self.TESTS)
+                for call in native:
+                    test = call["args"][0]
+                    package = "intent-transport" if test.startswith("tunnel::") else "intentd"
+                    self.assertEqual(call["cwd"], str(Path(tmp) / "crates" / package))
+                    self.assertEqual(call["policy"], "1")
+                    self.assertIn("--exact", call["args"])
+                    libraries = call["libraries"].split(os.pathsep)
+                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/deps"), libraries)
+                    self.assertIn(str(Path(tmp) / "toolchain lib"), libraries)
+                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/build/native lib"), libraries)
+                    self.assertNotIn("/outside/target", libraries)
+                    self.assertIn(str(Path(tmp) / "existing lib") if inherited else "/usr/lib", libraries)
+                    if "--list" not in call["args"]:
+                        self.assertIn("--nocapture", call["args"])
+                        self.assertIn("--test-threads=1", call["args"])
+
+    def test_artifact_or_test_failure_cannot_become_success(self):
+        for mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
+                     "wrong-package", "wrong-target", "non-test", "ambiguous-artifact",
+                     "fail-list", "missing-test", "extra-test", "fail-run", "zero-tests", "ignored-test"):
+            with self.subTest(mode=mode):
+                result, calls, _ = self.probe(mode)
+                self.assertNotEqual(result.returncode, 0)
+                native = [c for c in calls if c["kind"] == "native"]
+                if mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
+                            "wrong-package", "wrong-target", "non-test", "ambiguous-artifact"):
+                    self.assertEqual(native, [])
+                else:
+                    self.assertTrue(native, "must actually exercise native failure")
+
+    def test_discovery_and_runtime_hangs_kill_process_group_and_fail(self):
+        for mode in ("hang-list", "hang-run"):
+            with self.subTest(mode=mode):
+                result, _, _ = self.probe(mode, timeout_probe=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TimeoutExpired", result.stderr)
+        self.assertEqual(self.step["timeout-minutes"], 20)
+
+
 class CallbackDiscoveryTests(unittest.TestCase):
     """Execute the actual workflow shell; stub only Cargo and selection inputs."""
 
@@ -237,7 +536,7 @@ class CallbackDiscoveryTests(unittest.TestCase):
         cls.job = cls.workflow["jobs"]["coverage-changed"]
         cls.step = next(s for s in cls.job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
 
-    def probe(self, *, target=None, coverage_target=None, listing="exact", failure=None, style="wrapper"):
+    def probe(self, *, target=None, coverage_target=None, listing="exact", failure=None, style="wrapper", plans=None):
         with tempfile.TemporaryDirectory(prefix="callback-discovery-") as tmp:
             root = Path(tmp)
             stub = root / "cargo"
@@ -286,8 +585,13 @@ else:
                        RUSTFLAGS="--cfg=existing", RUSTC_WRAPPER="existing-wrapper")
             if target: env["CARGO_TARGET_DIR"] = str(root / target)
             if coverage_target: env["CARGO_LLVM_COV_TARGET_DIR"] = str(root / coverage_target)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+            (root / "coverage-changed-plan.json").write_text(json.dumps({
+                "version": 1, "head": head, "mergeBase": head,
+                "plans": [] if plans is None else plans,
+            }))
             result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", self.step["run"]],
-                                    env=env, cwd=root, capture_output=True, text=True, timeout=10)
+                                    env=env, cwd=ROOT, capture_output=True, text=True, timeout=10)
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             expected_target = str(root / (coverage_target or ((target or "target") + "/llvm-cov-target")))
             return result, calls, expected_target
@@ -322,6 +626,20 @@ else:
                     self.assertEqual(listing["args"][listing["args"].index("-E") + 1], run["args"][run["args"].index("-E") + 1])
                     self.assertEqual(run["args"][run["args"].index("--retries") + 1], "0")
                     self.assertIn("--no-fail-fast", run["args"])
+
+    def test_shared_scope_keeps_packages_targets_and_coverage_directory(self):
+        scope = ["-p", "intent-core", "-p", "intent-services", "-p", "intent-transport",
+                 "--lib", "--bins", "--tests"]
+        result, calls, target = self.probe(plans=[scope], coverage_target="coverage override")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listing = next(c for c in calls if c["args"][:2] == ["nextest", "list"])
+        run = next(c for c in calls if c["args"][:3] == ["llvm-cov", "--no-report", "nextest"])
+        expected = scope + ["-p", "intent-acp"]
+        self.assertEqual(listing["args"][2:listing["args"].index("-E")],
+                         expected + ["--target-dir", target])
+        self.assertEqual(run["args"][3:run["args"].index("-E")], expected)
+        self.assertEqual(run["env"]["CARGO_LLVM_COV_TARGET_DIR"], target)
+        self.assertIsNone(run["env"]["CARGO_LLVM_COV_SHOW_ENV"])
 
     def test_exact_selection_and_discovery_failures_prevent_execution(self):
         for mode in ("missing", "extra", "wrong", "empty", "duplicate"):

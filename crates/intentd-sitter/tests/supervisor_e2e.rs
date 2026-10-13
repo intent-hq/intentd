@@ -459,7 +459,19 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
         let log = dir.path().join(format!("daemon-{index}.log"));
         // Exercise restart_once's long-running second invocation.
         fs::write(format!("{}.restarted", log.display()), b"").unwrap();
-        // Add only a readiness marker immediately before the real wait.
+        // Parent readiness proves ownership of $!, but the child may still be
+        // resetting inherited traps after fork. Require its own acknowledgement
+        // after checked TERM reset before exercising graceful shutdown.
+        let child_ready = Barrier::new(dir.path(), &format!("child-ready-{index}"));
+        assert_eq!(script.matches("sleep 60 &").count(), 1);
+        let parked_child = format!(
+            // timing-guard: owned child parks until signalled; readiness and shutdown use explicit barriers
+            "(trap - TERM && {arrive} && {{ {hold}; }} && printf ready >&2 && exec sleep 60) &",
+            arrive = child_ready.sh_arrive(),
+            hold = child_ready.sh_wait(),
+        );
+        let script = script.replace("sleep 60 &", &parked_child);
+        // Preserve the parent's marker after it has assigned sleep_pid.
         let script = script
             .replace("wait $!", "printf ready; wait $!")
             .replace(
@@ -474,6 +486,10 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
         reader
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
+        let (mut child_reader, child_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        child_reader
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -481,11 +497,31 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
             .env(FAKE_DAEMON_LOG, &log)
             .stdin(Stdio::null())
             .stdout(Stdio::from(OwnedFd::from(writer)))
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(OwnedFd::from(child_writer)));
         let mut child = spawn_guarded(&mut command);
         drop(command);
+        // Hold the child before acknowledgement to prove the parent's marker
+        // alone is insufficient. Release even if a held-phase assertion fails.
+        let held = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut ready = [0; 5];
+            reader.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
+            wait_until(
+                "child reached readiness hold",
+                Duration::from_secs(3),
+                || child_ready.entered(),
+            );
+            child_reader.set_nonblocking(true).unwrap();
+            let error = child_reader.read(&mut [0; 1]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            child_reader.set_nonblocking(false).unwrap();
+        }));
+        child_ready.release();
+        if let Err(payload) = held {
+            panic::resume_unwind(payload);
+        }
         let mut ready = [0; 5];
-        reader.read_exact(&mut ready).unwrap();
+        child_reader.read_exact(&mut ready).unwrap();
         assert_eq!(&ready, b"ready");
         child.signal(Signal::SIGTERM).unwrap();
         assert_eq!(

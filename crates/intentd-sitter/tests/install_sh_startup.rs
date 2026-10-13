@@ -102,6 +102,137 @@ fn run_owner_check_full(
     stub_bin: Option<&Path>,
     service_name: Option<&str>,
 ) -> Output {
+    run_owner_check_diagnostic(cwd, os, home, data_dir, stub_bin, service_name, false)
+}
+
+/// Diagnostic-only terminal markers in the extracted fixture copy.
+fn owner_capture_frame(os: &str, output: &std::process::Output) -> String {
+    const CAP: usize = 8192;
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut encoded = String::with_capacity(bytes.len().min(CAP) * 2);
+        for byte in bytes.iter().take(CAP) {
+            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        encoded
+    }
+    let status = output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+    format!(
+        "INTENT_OWNER_CAPTURE_V3 os={os} status={status} stdout_len={} stderr_len={} truncated={} stdout_hex={} stderr_hex={} END\n",
+        output.stdout.len(), output.stderr.len(),
+        u8::from(output.stdout.len() > CAP || output.stderr.len() > CAP),
+        hex(&output.stdout), hex(&output.stderr)
+    )
+}
+
+fn owner_refusal_diagnostic_driver(mut driver: String) -> String {
+    {
+        let original = sh_function(&driver, "pid_under");
+        let mut marked = original.clone();
+        for (before, after) in [
+            (
+                r#"    if [ "$probe" = "$2" ]; then
+      return 0"#,
+                r#"    if [ "$probe" = "$2" ]; then
+      _intent_diag_emit walk matched_service NA "${owner_pid-UNSET}" "$2" "$probe" UNREAD "$probe_elapsed" UNREAD "$hops"
+      return 0"#,
+            ),
+            (
+                r"'' | 0 | 1 | *[!0-9]*) return 1 ;;",
+                r#"'' | 0 | 1 | *[!0-9]*) _intent_diag_emit walk invalid_or_root_parent NA "${owner_pid-UNSET}" "$2" "$probe" "$parent" "$probe_elapsed" UNREAD "$hops"; return 1 ;;"#,
+            ),
+            (
+                r#"[ -n "$probe_elapsed" ] && [ -n "$parent_elapsed" ] || return 1"#,
+                r#"[ -n "$probe_elapsed" ] && [ -n "$parent_elapsed" ] || { _intent_diag_emit walk missing_elapsed NA "${owner_pid-UNSET}" "$2" "$probe" "$parent" "$probe_elapsed" "$parent_elapsed" "$hops"; return 1; }"#,
+            ),
+            (
+                r#"[ "$parent_elapsed" -ge "$probe_elapsed" ] || return 1"#,
+                r#"[ "$parent_elapsed" -ge "$probe_elapsed" ] || { _intent_diag_emit walk comparison_rejected "$?" "${owner_pid-UNSET}" "$2" "$probe" "$parent" "$probe_elapsed" "$parent_elapsed" "$hops"; return 1; }"#,
+            ),
+            (
+                r"  done
+  return 1",
+                r#"  done
+  _intent_diag_emit walk hop_limit NA "${owner_pid-UNSET}" "$2" "$probe" UNREAD "$probe_elapsed" UNREAD "$hops"
+  return 1"#,
+            ),
+        ] {
+            assert_eq!(
+                marked.matches(before).count(),
+                1,
+                "diagnostic anchor: {before}"
+            );
+            marked = marked.replacen(before, after, 1);
+        }
+        assert_eq!(driver.matches(&original).count(), 1);
+        driver = driver.replacen(&original, &marked, 1);
+    }
+    {
+        let original = sh_function(&driver, "check_data_dir_not_owned");
+        let mut marked = original.clone();
+        for (before, after) in [
+            (
+                r#"[ -n "$owner_pid" ] || return 0"#,
+                r#"[ -n "$owner_pid" ] || { _intent_diag_emit check owner_absent NA "$owner_pid" UNREAD UNREAD UNREAD UNREAD UNREAD UNREAD; return 0; }"#,
+            ),
+            (
+                r#"    info "the running daemon (pid $owner_pid)"#,
+                r#"    _intent_diag_emit check allowed NA "$owner_pid" "$service_pid" UNREAD UNREAD UNREAD UNREAD UNREAD
+    info "the running daemon (pid $owner_pid)"#,
+            ),
+            (
+                r#"  owner_path=$(process_path "$owner_pid")"#,
+                r#"  _intent_diag_emit check final_refusal NA "$owner_pid" "$service_pid" UNREAD UNREAD UNREAD UNREAD UNREAD
+  owner_path=$(process_path "$owner_pid")"#,
+            ),
+        ] {
+            assert_eq!(
+                marked.matches(before).count(),
+                1,
+                "diagnostic anchor: {before}"
+            );
+            marked = marked.replacen(before, after, 1);
+        }
+        assert_eq!(driver.matches(&original).count(), 1);
+        driver = driver.replacen(&original, &marked, 1);
+    }
+    let diagnostic = r#"_intent_diag_emit() {
+  _intent_diag_stage=$1
+  _intent_diag_reason=$2
+  _intent_diag_comparison=$3
+  shift 3
+  _intent_diag_valid=1
+  for _intent_diag_value do
+    case "$_intent_diag_value" in
+      '' | UNREAD | UNSET) ;;
+      *[!0-9]*) _intent_diag_valid=0 ;;
+    esac
+    [ "${#_intent_diag_value}" -le 64 ] || _intent_diag_valid=0
+  done
+  if [ "$_intent_diag_valid" = 0 ]; then
+    set -- INVALID INVALID INVALID INVALID INVALID INVALID INVALID
+  fi
+  printf 'INTENT_OWNER_DIAG_V2 stage=%.5s reason=%.32s comparison=%.3s valid=%.1s os=%.6s owner=<%.64s> service=<%.64s> probe=<%.64s> parent=<%.64s> probe_elapsed=<%.64s> parent_elapsed=<%.64s> hops=<%.64s> END\n' \
+    "$_intent_diag_stage" "$_intent_diag_reason" "$_intent_diag_comparison" "$_intent_diag_valid" "$os" "$@" >&2 || :
+}
+"#;
+    let check = "check_data_dir_not_owned\n";
+    assert_eq!(driver.matches(check).count(), 1);
+    driver.replacen(check, &format!("{diagnostic}{check}"), 1)
+}
+
+fn run_owner_check_diagnostic(
+    cwd: Option<&Path>,
+    os: &str,
+    home: &Path,
+    data_dir: Option<&str>,
+    stub_bin: Option<&Path>,
+    service_name: Option<&str>,
+    diagnostic: bool,
+) -> Output {
     let driver = format!(
         "set -eu\n\
          info() {{ printf '%s\\n' \"install.sh: $*\"; }}\n\
@@ -123,6 +254,11 @@ fn run_owner_check_full(
             "check_data_dir_not_owned",
         ]),
     );
+    let driver = if diagnostic {
+        owner_refusal_diagnostic_driver(driver)
+    } else {
+        driver
+    };
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(driver)
@@ -726,14 +862,18 @@ fn an_owner_descended_from_the_services_main_pid_lets_the_install_proceed() {
         write_pid_file(&data_dir, &format!("{}\n", owner.pid()));
         let stub = service_manager_stub(dir.path(), os, SERVICE_NAME, std::process::id());
 
-        let output = run_owner_check_full(
+        let output = run_owner_check_diagnostic(
             None,
             os,
             dir.path(),
             Some(data_dir.to_str().unwrap()),
             Some(&stub),
             Some(SERVICE_NAME),
+            true,
         );
+
+        // Frame original status and bounded byte captures before unchanged assertions.
+        eprint!("{}", owner_capture_frame(os, &output));
 
         assert_eq!(
             output.status.code(),

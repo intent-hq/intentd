@@ -7769,6 +7769,31 @@ impl Services {
             }
         }
         self.park_queue_mutation_gate(gate.as_ref()).await;
+        // Serialize suppression with notification dispatch/admission. Commit
+        // cancellation before removing the local row or acknowledging success.
+        let monitor_lane = self.script_locks.monitor_lane.lock().await;
+        let monitor = {
+            let queues = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            let entry = queues
+                .get(&agent_id)
+                .and_then(|queue| queue.iter().find(|m| m.matches_submission(&message_id)));
+            if let Some(entry) = entry {
+                if let Some(gate) = gate.as_ref() {
+                    gate.check(entry)?;
+                }
+            }
+            entry
+                .and_then(|entry| {
+                    crate::script_monitor::monitor_id(entry.message_metadata.as_ref())
+                })
+                .map(str::to_owned)
+        };
+        if let Some(id) = monitor {
+            self.store.finish_script_monitor_wake(&id, true).await?;
+        }
         let removed = {
             let mut guard = self
                 .agent_queues
@@ -7788,6 +7813,7 @@ impl Services {
                 None => false,
             }
         };
+        drop(monitor_lane);
         if removed {
             self.publish_queue_updated(&agent_id).await;
             // monorepo#1280: a retraction that empties the ready-to-send
