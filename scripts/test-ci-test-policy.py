@@ -62,6 +62,12 @@ def coverage_budget_violations(workflow):
         steps = [step for step in job["steps"] if step.get("name") == name]
         if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != limit:
             errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
+    combined = workflow["jobs"]["coverage-all"]
+    steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 40:
+        errors.append("coverage-all must reserve 2m outside its 38m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 38:
+        errors.append("coverage-all must retain its 38m compile/test/report bound")
     return errors
 
 
@@ -218,6 +224,21 @@ class CiPolicyTests(unittest.TestCase):
                     workflow = copy.deepcopy(self.workflow)
                     job = workflow["jobs"]["coverage-changed"]
                     target = job if name is None else next(s for s in job["steps"] if s.get("name") == name)
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_combined_coverage_budget_rejects_lost_bounds_and_report_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for phase in (False, True):
+            for limit in (None, 0, True, 30, 60):
+                with self.subTest(phase=phase, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-all"]
+                    target = next(s for s in job["steps"] if s.get("name") == "Run combined coverage") if phase else job
                     if limit is None:
                         target.pop("timeout-minutes")
                     else:

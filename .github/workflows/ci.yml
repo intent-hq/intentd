@@ -1322,7 +1322,11 @@ jobs:
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    # Queue run 38462708249 finished every test and printed the coverage
+    # floor report, but the 30m job expired before report processes exited.
+    # Allow bounded compile/test/report work plus setup and post-action time;
+    # preserve the full selection, per-test deadlines and 80% coverage floor.
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1463,6 +1467,7 @@ jobs:
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Run combined coverage
+        timeout-minutes: 38
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
