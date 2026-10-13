@@ -613,7 +613,10 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 /// Complete fixture constructor for tests that must bind the settings-file port.
 /// Sets no TCP-port env override, preserving explicit pins and listener restarts.
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd

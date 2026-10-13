@@ -38,7 +38,12 @@ use intentd_sitter::supervisor::{
 };
 use intentd_test_support::{Barrier, GuardedChild};
 
-const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
+fn sitter_bin() -> std::path::PathBuf {
+    intentd_test_support::runtime_paths::binary_path(
+        "intentd-sitter",
+        env!("CARGO_BIN_EXE_intentd-sitter"),
+    )
+}
 
 /// Env var the fake daemon scripts log to (set on the sitter, inherited by
 /// the child — which doubles as an env-inheritance check).
@@ -539,7 +544,7 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
 /// Sitter command wired to a temp data dir, a manifest base URL, and the
 /// fake-daemon log path; stderr goes to `<data_dir>/sitter-stderr.log`.
 fn sitter_command(data_dir: &Path, base_url: &str) -> Command {
-    let mut cmd = Command::new(SITTER_BIN);
+    let mut cmd = Command::new(sitter_bin());
     cmd.env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)
         .env(FAKE_DAEMON_LOG, daemon_log_path(data_dir))
@@ -1365,7 +1370,7 @@ const INSTALL_LOG_CONTRACT: [&str; 4] = [
 /// emitted, verbatim, by the two behavioral tests below.
 #[test]
 fn install_log_contract_scripts_and_supervisor_match() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
     let sources = [
         (root.join("src/supervisor.rs"), "//"),
         (root.join("../../scripts/install.sh"), "#"),
@@ -2848,7 +2853,7 @@ fn one_shot_with_nothing_installed_fails_fast_without_installing() {
 /// Run a second sitter process to completion against the same data dir,
 /// capturing stdout/stderr (without truncating the serve sitter's logs).
 fn run_one_shot(data_dir: &Path, base_url: &str, args: &[&str]) -> std::process::Output {
-    Command::new(SITTER_BIN)
+    Command::new(sitter_bin())
         .env_remove(CHANNEL_ENV)
         .env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)

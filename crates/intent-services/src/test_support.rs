@@ -39,7 +39,7 @@ pub(crate) fn quick_action_effort_adapter(
     let log = dir.path().join("requests.jsonl");
     let config = dir.path().join("behavior.json");
     std::fs::write(&config, behavior.to_string()).unwrap();
-    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("../intentd/tests/fixtures/mock-quick-action-effort.mjs");
     let bin = dir.path().join("claude-agent-acp");
     std::fs::write(&bin, format!("#!/bin/sh\nMOCK_EFFORT_BEHAVIOR=\"$(cat {config:?})\" MOCK_EFFORT_LOG={log:?} exec node {fixture:?}\n")).unwrap();

@@ -35,6 +35,7 @@
 mod barrier;
 #[cfg(unix)]
 mod guarded_child;
+pub mod runtime_paths;
 pub mod source_lint;
 
 pub use barrier::Barrier;

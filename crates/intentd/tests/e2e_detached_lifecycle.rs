@@ -216,7 +216,11 @@ async fn detached_sitter_lifecycle_over_wss() {
     let _session = SessionGuard(paths.pid_path.clone());
     let binary = paths.daemon_binary(env!("CARGO_PKG_VERSION"));
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_intentd"), &binary).unwrap();
+    std::fs::copy(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+        &binary,
+    )
+    .unwrap();
     state::save(
         &paths.state_path,
         &state::SitterState {
@@ -784,7 +788,11 @@ async fn local_status(
 ) -> Value {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+        let mut command =
+            tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd"),
+            ));
         command
             .args(["call", "system.status"])
             .env("INTENTD_DATA_DIR", data)
@@ -827,11 +835,14 @@ async fn windows_stop_confirms_graceful_exit_without_supervisor() {
     .await;
     let output = timeout(
         Duration::from_secs(20),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("stop")
-            .env("INTENTD_DATA_DIR", dir.path())
-            .kill_on_drop(true)
-            .output(),
+        tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("stop")
+        .env("INTENTD_DATA_DIR", dir.path())
+        .kill_on_drop(true)
+        .output(),
     )
     .await
     .expect("unsupervised stop timed out")
@@ -900,11 +911,14 @@ async fn windows_stop_bounds_hung_rpc_and_only_terminates_owned_process() {
         });
         let output = timeout(
             Duration::from_secs(20),
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-                .arg("stop")
-                .env("INTENTD_DATA_DIR", dir.path())
-                .kill_on_drop(true)
-                .output(),
+            tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd"),
+            ))
+            .arg("stop")
+            .env("INTENTD_DATA_DIR", dir.path())
+            .kill_on_drop(true)
+            .output(),
         )
         .await
         .unwrap()

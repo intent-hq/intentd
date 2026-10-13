@@ -14,12 +14,15 @@ fn lifecycle_help_is_available_without_installation_or_state_changes() {
         (vec!["restart", "--help"], "Usage: intentd restart"),
         (vec!["restart", "-h"], "Usage: intentd restart"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd-sitter"))
-            .args(&args)
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .env_remove("INTENTD_CHANNEL")
-            .output()
-            .unwrap();
+        let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd-sitter",
+            env!("CARGO_BIN_EXE_intentd-sitter"),
+        ))
+        .args(&args)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env_remove("INTENTD_CHANNEL")
+        .output()
+        .unwrap();
         assert!(output.status.success(), "{args:?}: {output:?}");
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(help.contains(usage), "{help}");
@@ -64,12 +67,15 @@ fn root_help_lists_lifecycle_and_start_help_lists_serve_options() {
             ],
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd-sitter"))
-            .args(args)
-            .env("INTENTD_DATA_DIR", dir.path())
-            .env_remove("INTENTD_CHANNEL")
-            .output()
-            .unwrap();
+        let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd-sitter",
+            env!("CARGO_BIN_EXE_intentd-sitter"),
+        ))
+        .args(args)
+        .env("INTENTD_DATA_DIR", dir.path())
+        .env_remove("INTENTD_CHANNEL")
+        .output()
+        .unwrap();
         assert!(output.status.success(), "{output:?}");
         let help = String::from_utf8(output.stdout).unwrap();
         assert!(!help.contains("intentd serve --help"), "{help}");

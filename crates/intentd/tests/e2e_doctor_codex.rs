@@ -271,7 +271,10 @@ impl Fixture {
             self.run_command(preflight).0,
             "fixture selection preflight failed"
         );
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+        let mut command = self.command(&intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ));
         command.arg("doctor");
         if live {
             command.arg("--codex-models");
@@ -823,10 +826,13 @@ fn daemon_health_failure_still_fails_with_catalog_diagnostics_enabled() {
 
 #[test]
 fn doctor_help_discloses_opt_in_and_its_limits() {
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["doctor", "--help"])
-        .output()
-        .unwrap();
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["doctor", "--help"])
+    .output()
+    .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     for expected in [
