@@ -495,6 +495,7 @@ impl RepositoryReadRetirements for Receiver {
                                 for id in ids { c.retire_id(&id); }
                             }
                             Some(crate::Delivery::Lagged(_)) | None => c.close(),
+                            Some(crate::Delivery::Fence(_)) => {},
                         }
                     },
                     changed = async { match &mut self.settings { Some(settings) => settings.changed().await, None => std::future::pending().await } } => {

@@ -29,6 +29,11 @@ use uuid::Uuid;
 
 use super::filter::{event_matches, SubscriptionFilter};
 
+mod fence;
+pub use fence::FenceHandle;
+use fence::FenceRequest;
+pub(crate) use fence::RawBus;
+
 mod invalidation;
 pub use invalidation::InvalidationSubscription;
 
@@ -120,7 +125,7 @@ pub(crate) type WriterRequest = (NewEvent, oneshot::Sender<Result<Event>>);
 #[derive(Clone)]
 pub struct EventBus {
     store: Store,
-    tx: broadcast::Sender<Arc<Event>>,
+    tx: RawBus,
     writer_tx: Arc<Mutex<Option<mpsc::Sender<WriterRequest>>>>,
     writer: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Attribution names by principal, each with its load time; entries
@@ -132,7 +137,19 @@ impl EventBus {
     /// Wire a bus over a persistence handle and spawn the writer task.
     #[must_use]
     pub fn new(store: Store) -> Self {
-        let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        Self::with_broadcast_capacity(store, BROADCAST_CAPACITY)
+    }
+
+    /// Wire a bus with an explicit raw ring capacity for deterministic loss tests.
+    /// Production callers use [`Self::new`].
+    ///
+    /// # Panics
+    /// Panics when `capacity` is zero.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_broadcast_capacity(store: Store, capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(capacity);
+        let tx = RawBus::from(tx);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         // Spawn the writer task that drains events and batch-persists them.
         let writer = intent_core::spawn_daemon(writer_task(store.clone(), writer_rx, tx.clone()));
@@ -323,7 +340,7 @@ impl EventBus {
         };
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
-        let _ = self.tx.send(Arc::new(event.clone()));
+        self.tx.send(Arc::new(event.clone()));
         event
     }
 
@@ -332,10 +349,15 @@ impl EventBus {
     /// is delivered immediately as a single-element batch.
     #[must_use]
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
-        let rx = self.tx.subscribe();
+        let (rx, observed, fence, controls) = self.tx.receiver();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-        let handle = intent_core::spawn_daemon(delivery_task(rx, filter, out_tx));
-        Subscription { rx: out_rx, handle }
+        let handle =
+            intent_core::spawn_daemon(delivery_task(rx, filter, out_tx, observed, controls));
+        Subscription {
+            rx: out_rx,
+            handle,
+            fence,
+        }
     }
 }
 
@@ -362,16 +384,25 @@ pub enum Delivery {
     /// forwarder) recover with a bounded re-read; [`Subscription::recv`]
     /// consumers see no marker (skipped transparently).
     Lagged(u64),
+    /// Private ordered control receipt, emitted after all preceding raw items.
+    Fence(oneshot::Sender<()>),
 }
 
 /// A live subscription. Yields filtered (and optionally batched) events via
 /// [`Subscription::recv`]; dropping it aborts the backing delivery task.
 pub struct Subscription {
     rx: mpsc::Receiver<Delivery>,
+    fence: FenceHandle,
     handle: JoinHandle<()>,
 }
 
 impl Subscription {
+    /// Obtain the private control handle for this receiver.
+    #[must_use]
+    pub fn fence_handle(&self) -> FenceHandle {
+        self.fence.clone()
+    }
+
     /// Await the next batch of matched events. Returns `None` once the bus is
     /// dropped and all buffered batches have been drained. Lag markers are
     /// skipped transparently — consumers that must react to upstream loss
@@ -380,7 +411,7 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) => {}
+                Delivery::Lagged(_) | Delivery::Fence(_) => {}
             }
         }
     }
@@ -422,11 +453,7 @@ impl Drop for Subscription {
 /// iteration flushes `pending` before looping, and `recv()` keeps returning
 /// buffered events after the channel closes (before yielding `None`), so no
 /// event is dropped at shutdown.
-async fn writer_task(
-    store: Store,
-    rx: mpsc::Receiver<WriterRequest>,
-    broadcast_tx: broadcast::Sender<Arc<Event>>,
-) {
+async fn writer_task(store: Store, rx: mpsc::Receiver<WriterRequest>, broadcast_tx: RawBus) {
     writer_loop(
         move |events: Arc<[NewEvent]>| {
             let store = store.clone();
@@ -446,7 +473,7 @@ async fn writer_task(
 pub(crate) async fn writer_loop<F, Fut>(
     insert: F,
     mut rx: mpsc::Receiver<WriterRequest>,
-    broadcast_tx: broadcast::Sender<Arc<Event>>,
+    broadcast_tx: RawBus,
 ) where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -478,11 +505,8 @@ pub(crate) async fn writer_loop<F, Fut>(
 /// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
 /// returned event) keeps the original full payload so live consumers (§7.1
 /// tool-block synthesis) are unaffected.
-async fn flush_batch<F, Fut>(
-    insert: &F,
-    pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &broadcast::Sender<Arc<Event>>,
-) where
+async fn flush_batch<F, Fut>(insert: &F, pending: &mut Vec<WriterRequest>, broadcast_tx: &RawBus)
+where
     F: Fn(Arc<[NewEvent]>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
 {
@@ -527,7 +551,7 @@ async fn flush_batch<F, Fut>(
 pub(crate) async fn flush_prepared<F, Fut>(
     mut insert: F,
     pending: &mut Vec<WriterRequest>,
-    broadcast_tx: &broadcast::Sender<Arc<Event>>,
+    broadcast_tx: &RawBus,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Vec<Event>>>,
@@ -566,7 +590,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
                 evt.data = orig.data;
                 let _ = tx.send(Ok(evt.clone()));
                 // Broadcast in insertion order (append-then-broadcast semantics).
-                let _ = broadcast_tx.send(Arc::new(evt));
+                broadcast_tx.send(Arc::new(evt));
             }
         }
         Err(e) => {
@@ -646,16 +670,38 @@ async fn delivery_task(
     mut rx: broadcast::Receiver<Arc<Event>>,
     filter: SubscriptionFilter,
     out: mpsc::Sender<Delivery>,
+    mut observed: u128,
+    mut controls: mpsc::Receiver<FenceRequest>,
 ) {
+    let mut pending: Option<FenceRequest> = None;
+    let mut controls_open = true;
     let batch_window = filter.batch_window;
     let mut buffer: Vec<Event> = Vec::new();
     let mut lag_warn = LagWarnThrottle::default();
     // A pending flush deadline, armed on the first matched event of a batch.
     let mut deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     loop {
+        if pending.as_ref().is_some_and(|f| f.boundary <= observed) {
+            if !fence::flush_fence(pending.take().expect("pending fence"), &mut buffer, &out).await
+            {
+                return;
+            }
+            // A cancelled private receipt leaves ordinary batching untouched.
+            // Clear the timer only when the fence actually drained the batch.
+            if buffer.is_empty() {
+                deadline = None;
+            }
+        }
         tokio::select! {
+            control = controls.recv(), if pending.is_none() && controls_open => {
+                match control {
+                    Some(request) => pending = Some(request),
+                    None => controls_open = false,
+                }
+            }
             recv = rx.recv() => match recv {
                 Ok(ev) => {
+                    observed += 1;
                     if !event_matches(&filter, &ev) {
                         continue;
                     }
@@ -688,6 +734,7 @@ async fn delivery_task(
                 // logs only that count plus the already-in-memory filter
                 // summary — no store reads, no per-dropped-event work.
                 Err(broadcast::error::RecvError::Lagged(n)) => {
+                    observed += u128::from(n);
                     if let Some(skipped) = lag_warn.record(n, Instant::now()) {
                         tracing::warn!(
                             skipped,

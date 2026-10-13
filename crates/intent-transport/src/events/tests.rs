@@ -739,6 +739,32 @@ mod collaborator_fan_out {
             assert!(intent_core::events::is_collaborator_event_type(ty), "{ty}");
         }
     }
+    #[tokio::test]
+    async fn recovery_loss_without_later_matching_event() {
+        let mut h = subscribe(
+            Caller::Wire {
+                principal_id: PrincipalId::from("owner"),
+                host_role: intent_core::HostRole::Owner,
+            },
+            &[],
+            json!({"eventTypes":["file:*"],"workspaceId":"ws-a","lossRecovery":1}),
+        )
+        .await;
+        for _ in 0..2048 {
+            let _ = h.bus.publish_transient(&event("note:updated", "foreign"));
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(2), h.rx.bulk.recv())
+            .await
+            .expect("loss must wake a quiet filtered stream")
+            .unwrap();
+        let value: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(
+            value,
+            json!({"jsonrpc":"2.0","method":"events.lost","params":{
+                "subscriptionId":h.subscription_id,"generation":"1","scope":{"workspaceId":"ws-a"}
+            }})
+        );
+    }
 }
 
 /// The transport half of the per-user queue visibility contract
@@ -1786,4 +1812,41 @@ async fn permission_delivery_rechecks_guest_management_without_visibility_cache(
         assert!(gate.allows(&ev).await, "member behavior retained");
     })
     .await;
+}
+
+#[test]
+fn recovery_rejects_invalid_opt_in() {
+    for value in [json!(null), json!(true), json!(0), json!("1"), json!(2)] {
+        let params = json!({"eventTypes":["file:*"],"lossRecovery":value});
+        assert!(
+            super::parse_subscribe_params(params.as_object().unwrap()).is_err(),
+            "{params}"
+        );
+    }
+}
+
+/// Frozen monorepo contract: 531eb9ee2f231f383fcd192f7c33b022bb795ead.
+/// Keep this byte-for-byte corpus shared with the frontend consumer.
+#[test]
+fn recovery_fixture_provenance() {
+    use sha2::{Digest, Sha256};
+    let bytes = include_bytes!("fixtures/event-stream-recovery.json");
+    assert_eq!(
+        hex::encode(Sha256::digest(bytes)),
+        "972219db1abdff8b90e62800ab50b2806c8701c382569fdc556f7fbe022435a9"
+    );
+    let corpus: Value = serde_json::from_slice(bytes).unwrap();
+    for case in corpus["requestValidation"].as_array().unwrap() {
+        // Presence of an id is connection admission, checked by the transport
+        // test; pure params validation covers the remaining canonical cases.
+        if case["hasRequestId"] == false {
+            continue;
+        }
+        assert_eq!(
+            parse_subscribe_params(case["params"].as_object().unwrap()).is_ok(),
+            case["accepted"].as_bool().unwrap(),
+            "{}",
+            case["id"]
+        );
+    }
 }

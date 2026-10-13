@@ -442,6 +442,7 @@ async fn store_close_preserves_an_admitted_event_after_publisher_cancellation() 
 async fn idle_publish_resolves_without_batch_window_delay() {
     const PUBLISHES: usize = 20;
     let (btx, mut brx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+    let btx = super::bus::RawBus::from(btx);
     let (wtx, wrx) = tokio::sync::mpsc::channel::<super::bus::WriterRequest>(16);
 
     let inserted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -899,6 +900,7 @@ fn transient_classification_matches_insert_events_wording() {
 #[tokio::test(start_paused = true)]
 async fn transient_batch_insert_failure_retries_and_delivers() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let stored = stored_event("evt-1", &ev);
@@ -939,6 +941,7 @@ async fn transient_batch_insert_failure_retries_and_delivers() {
 #[tokio::test(start_paused = true)]
 async fn permanent_batch_insert_failure_does_not_retry() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
@@ -993,6 +996,7 @@ const WRITE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
     const STARVED_FOR: std::time::Duration = std::time::Duration::from_secs(45);
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let stored = stored_event("evt-1", &ev);
@@ -1041,6 +1045,7 @@ async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
 #[tokio::test(start_paused = true)]
 async fn transient_batch_insert_failure_exhausts_retries() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
@@ -1231,7 +1236,9 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             n, OVERFLOW as u64,
             "marker carries the ring's exact skipped count"
         ),
-        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+        Delivery::Batch(_) | Delivery::Fence(_) => {
+            panic!("expected the lag marker before any surviving event")
+        }
     }
     let second = timeout(Duration::from_secs(5), sub.recv_delivery())
         .await
@@ -1264,4 +1271,52 @@ async fn recv_skips_lag_markers_transparently() {
         !batch.is_empty(),
         "recv yields the surviving events, never a marker"
     );
+}
+
+/// A fence covers the finite raw tail, including transient/filtered entries,
+/// and flushes batching without waiting for another matching event.
+#[tokio::test]
+async fn recovery_fence_flushes_filtered_quiet_tail() {
+    let (_tmp, bus) = bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        batch_window: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let _ = bus.publish_transient(&new_event("file:changed", None, ActorType::System));
+    let _ = bus.publish_transient(&new_event("note:updated", None, ActorType::System));
+    let mut receipt = sub.fence_handle().request().expect("capture tail");
+    assert!(receipt.try_recv().is_err());
+    assert!(matches!(sub.recv_delivery().await, Some(Delivery::Batch(ref b)) if b.len() == 1));
+    let Some(Delivery::Fence(ack)) = sub.recv_delivery().await else {
+        panic!("ordered fence")
+    };
+    ack.send(()).unwrap();
+    receipt.await.unwrap();
+    assert!(
+        sub.try_recv_delivery().is_none(),
+        "no domain frame for control/filtered items"
+    );
+}
+
+#[tokio::test]
+async fn recovery_fence_cannot_skip_lost_filtered_tail() {
+    let (_tmp, bus) = bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        ..Default::default()
+    });
+    for _ in 0..(BROADCAST_CAPACITY + 8) {
+        let _ = bus.publish_transient(&new_event("note:updated", None, ActorType::System));
+    }
+    let receipt = sub.fence_handle().request().unwrap();
+    assert!(matches!(
+        sub.recv_delivery().await,
+        Some(Delivery::Lagged(8))
+    ));
+    let Some(Delivery::Fence(ack)) = sub.recv_delivery().await else {
+        panic!("loss before fence")
+    };
+    ack.send(()).unwrap();
+    receipt.await.unwrap();
 }
