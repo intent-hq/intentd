@@ -1218,7 +1218,7 @@ async fn remaining_read_discussions_include_each_kind_with_canonical_identity_an
     let f = Fixture::new(|r| {
         assert!(r.path.contains("/merge_requests/7/discussions?"));
         let mut diff = complete_note(4, json!("DiffNote"), true, json!(false));
-        diff["position"] = json!({"new_path":"src/a.rs","new_line":9});
+        diff["position"] = json!({"new_path":"src/a.rs","new_line":9,"head_sha":"a".repeat(40)});
         reply(200, json!([
             {"id":"standalone","individual_note":true,"notes":[complete_note(1, Value::Null, false, json!(false))]},
             {"id":"general","individual_note":false,"notes":[complete_note(2,json!("DiscussionNote"),false,Value::Null),complete_note(3,json!("DiscussionNote"),false,Value::Null)]},
@@ -1239,6 +1239,7 @@ async fn remaining_read_discussions_include_each_kind_with_canonical_identity_an
     assert!(!standalone.notes[0].resolvable);
     assert_eq!(standalone.notes[0].resolved, None);
     assert_eq!(standalone.notes[0].path, None);
+    assert_eq!(standalone.notes[0].position_head_sha, None);
     let general = &page.items[1];
     assert_eq!(
         general.notes[1].in_reply_to_id.as_ref(),
@@ -1251,6 +1252,10 @@ async fn remaining_read_discussions_include_each_kind_with_canonical_identity_an
     let diff = &page.items[2];
     assert_eq!(diff.notes[0].path.as_deref(), Some("src/a.rs"));
     assert_eq!(diff.notes[0].line, Some(9));
+    assert_eq!(
+        diff.notes[0].position_head_sha.as_deref(),
+        Some("a".repeat(40).as_str())
+    );
     assert_eq!(diff.notes[0].resolved, Some(false));
     assert_eq!(
         diff.notes[1].in_reply_to_id.as_ref(),
@@ -1260,6 +1265,7 @@ async fn remaining_read_discussions_include_each_kind_with_canonical_identity_an
         diff.notes[1].path, None,
         "a reply does not invent its own diff anchor"
     );
+    assert_eq!(diff.notes[1].position_head_sha, None);
     assert_eq!(page.items[3].notes[0].resolved, Some(true));
     assert_eq!(page.items[4].notes[0].resolved, None);
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD

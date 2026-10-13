@@ -57,6 +57,7 @@ impl RepositoryAuthorityFence for InjectedFence {
 #[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
+    next_pages: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
     release: Notify,
@@ -180,7 +181,13 @@ impl ReadServer {
                     } else {
                         ""
                     };
-                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}Connection: close\r\n\r\n{body}",body.len());
+                    let next = control
+                        .next_pages
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .map_or_else(String::new, |next| format!("X-Next-Page: {next}\r\n"));
+                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}{next}Connection: close\r\n\r\n{body}",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -4047,4 +4054,121 @@ async fn collection_old_denials_after_actual_refresh_cannot_apply_to_successor()
         e.check().unwrap();
         assert_eq!(s.count(), 1);
     }
+}
+
+async fn managed_page_cursor(
+    fixture: &ReadFixture,
+    server: &ReadServer,
+    mode: u8,
+    cursor: Option<String>,
+) -> intent_sourcecontrol::Result<Option<String>> {
+    match mode {
+        0 => {
+            let (_, operation, _) = fixture.collection(
+                server,
+                RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+                    cursor,
+                    ..Default::default()
+                }),
+            );
+            operation
+                .reviews()
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+        1 => {
+            let (_, operation, _) = fixture.collection(
+                server,
+                RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery {
+                    cursor,
+                    ..Default::default()
+                }),
+            );
+            operation
+                .issues()
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+        _ => {
+            let (_, operation, _) = fixture.operation(server, RepositoryResourceKind::MergeRequest);
+            operation
+                .review_discussions(intent_sourcecontrol::PageParams { limit: 30, cursor })
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+    }
+}
+
+async fn managed_cursor_refresh_and_replacement(mode: u8) {
+    let server = ReadServer::new().await;
+    let fixture = ReadFixture::new(&server, true).await;
+    let path = match mode {
+        0 => format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30"),
+        1 => format!("{PROJECT}/issues?scope=all&page=1&per_page=30"),
+        _ => format!("{MR}/discussions?page=1&per_page=30"),
+    };
+    server
+        .replies
+        .next_pages
+        .lock()
+        .unwrap()
+        .insert(path, "2".into());
+    let cursor = managed_page_cursor(&fixture, &server, mode, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let original = fixture.auth.request();
+    fixture.refresh(&server).await;
+    assert_eq!(fixture.auth.request().binding, original.binding);
+    assert!(fixture.auth.request().secret_revision > original.secret_revision);
+    assert_eq!(
+        managed_page_cursor(&fixture, &server, mode, Some(cursor.clone()))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(server.count(), 2);
+    fixture
+        .auth
+        .service
+        .gitlab_connect_pat(server.fixture.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    assert_ne!(fixture.auth.request().binding, original.binding);
+    assert!(matches!(
+        managed_page_cursor(&fixture, &server, mode, Some(cursor.clone())).await,
+        Err(ScError::Config(_))
+    ));
+    assert_eq!(
+        server.count(),
+        2,
+        "old connection cursor must refuse before HTTP"
+    );
+    let fresh = managed_page_cursor(&fixture, &server, mode, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(fresh, cursor);
+    assert_eq!(server.count(), 3);
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_review_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(0).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_issue_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(1).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_discussion_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(2).await;
 }

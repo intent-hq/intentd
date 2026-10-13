@@ -72,6 +72,7 @@ impl GitLabSourceControl {
                     created_at: note.created_at,
                     path: note.path,
                     line: note.line,
+                    position_head_sha: raw["position"]["head_sha"].as_str().map(str::to_owned),
                     url: note.url,
                     resolvable,
                     resolved: if resolvable {

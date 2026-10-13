@@ -375,6 +375,8 @@ pub struct DiscussionNote {
     pub created_at: String,
     pub path: Option<String>,
     pub line: Option<u64>,
+    /// Diff-position provenance, not an attestation of the current MR head.
+    pub position_head_sha: Option<String>,
     pub url: Option<String>,
     pub resolvable: bool,
     pub resolved: Option<bool>,

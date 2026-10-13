@@ -103,6 +103,22 @@ impl RepositoryOutputBatch<'_> {
 }
 
 impl RepositoryReadScope {
+    /// Pagination metadata only. R still captures the caller/session/query and
+    /// revalidates every request. Actual binding changes cannot reuse a cursor;
+    /// a verified refresh on the same binding deliberately remains continuable.
+    fn pagination_scope(&self) -> String {
+        let binding = &self.admission.binding;
+        serde_json::json!([
+            "repository-read-v1",
+            binding.daemon_id,
+            binding.account.instance_base_url,
+            binding.account.account_id,
+            binding.scope.connection_id,
+            binding.scope.connection_generation
+        ])
+        .to_string()
+    }
+
     /// Allocation planning only. The two owner-facing entry points separately
     /// enforce required-nonempty versus a future proven ordinary output branch.
     pub(crate) fn prepare_output<'a>(
@@ -528,6 +544,7 @@ impl RepositoryReadOperation {
         call: impl for<'a> FnOnce(&'a GitLabSourceControl, &'a RepoRef, u64) -> ProviderFuture<'a, T>,
     ) -> RepositoryProviderRead<T> {
         let sink = Arc::new(ReadReceiptSink::default());
+        let cursor_scope = self.scope.pagination_scope();
         let provider = if self.target.kind == kind {
             BoundGitlabRequestCredentials::for_read(
                 self.scope.directory.clone(),
@@ -538,6 +555,7 @@ impl RepositoryReadOperation {
             )
             .map_err(intent_sourcecontrol::Error::from)
             .and_then(BoundGitlabRequestCredentials::into_provider)
+            .map(|provider| provider.with_pagination_scope(cursor_scope))
         } else {
             Err(RepositoryCredentialError::BoundaryMismatch.into())
         };
@@ -686,6 +704,7 @@ impl RepositoryCollectionReadOperation {
         call: impl for<'a> FnOnce(&'a GitLabSourceControl, &'a RepoRef) -> ProviderFuture<'a, T>,
     ) -> RepositoryProviderRead<T> {
         let sink = Arc::new(ReadReceiptSink::default());
+        let cursor_scope = self.scope.pagination_scope();
         let provider = BoundGitlabRequestCredentials::for_read(
             self.scope.directory.clone(),
             self.admission,
@@ -694,7 +713,8 @@ impl RepositoryCollectionReadOperation {
             sink.clone(),
         )
         .map_err(intent_sourcecontrol::Error::from)
-        .and_then(BoundGitlabRequestCredentials::into_provider);
+        .and_then(BoundGitlabRequestCredentials::into_provider)
+        .map(|provider| provider.with_pagination_scope(cursor_scope));
         let (result, quota) = match provider {
             Ok(provider) => {
                 let (owner, name) = self
