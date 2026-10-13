@@ -118,6 +118,21 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
     out
 }
 
+/// Install Assistant management tools only in the daemon-selected Assistant workspace.
+#[must_use]
+pub fn prelude_for_workspace(
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    workspace_id: &WorkspaceId,
+) -> String {
+    let mut prelude = prelude_for_bridge(features, is_sub_agent);
+    if workspace_id.is_chief() {
+        prelude.push_str(app::mcp::PRELUDE);
+        prelude.push_str(app::chats::PRELUDE);
+    }
+    prelude
+}
+
 /// The enclosing eval's wall-clock budget: its total duration and the
 /// absolute deadline it counts toward. One eval issues many host frames,
 /// and every frame before this one already consumed budget, so a binding

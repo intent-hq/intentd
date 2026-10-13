@@ -322,6 +322,8 @@ enum ServerRuntime {
     },
     /// A remote (`http`/`sse`) endpoint probed over the network — no process.
     Remote,
+    /// A failed stdio start has no process; retain its error until stopped or retried.
+    FailedStdio,
 }
 
 /// A tracked MCP server: its config, transport runtime, the last published
@@ -430,7 +432,7 @@ impl McpHub {
         }
     }
 
-    /// Live status for `id` (running snapshot, else `stopped`).
+    /// Last runtime status for `id`, or `stopped` when untracked.
     pub fn status(&self, id: &str) -> Value {
         self.inner
             .servers
@@ -461,7 +463,7 @@ impl McpHub {
         }
     }
 
-    /// Stop `id`, emitting `stopped` when a server was actually running.
+    /// Stop `id`, emitting `stopped` when a server was tracked.
     pub async fn stop(&self, id: &str) -> bool {
         let existed = self.stop_inner(id).await;
         if existed {
@@ -511,6 +513,14 @@ impl McpHub {
             }
             Err(e) => {
                 let status = status_error(&id, &e.to_string());
+                let rs = RunningServer {
+                    config,
+                    runtime: ServerRuntime::FailedStdio,
+                    status: status.clone(),
+                    failures: 0,
+                    generation: self.next_generation(),
+                };
+                self.register_runtime(id, rs).await;
                 self.publish_status(&status).await;
                 status
             }
@@ -518,9 +528,8 @@ impl McpHub {
     }
 
     /// Probe a remote (`http`/`sse`) config and register the outcome. Unlike a
-    /// failed stdio spawn, a failed probe keeps the entry tracked (state
-    /// `error`) so the health sweep re-probes it — there is no process to
-    /// restart, only status to flip.
+    /// failed stdio spawn, a failed probe is retried by the health sweep —
+    /// there is no process to restart, only status to flip.
     async fn start_remote(&self, id: String, config: Value) -> Value {
         let status = self.remote_probe_status(&id, &config).await;
         let rs = RunningServer {
@@ -566,12 +575,13 @@ impl McpHub {
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, rs)| {
+            .filter_map(|(id, rs)| {
                 let probe = match &rs.runtime {
                     ServerRuntime::Stdio { conn, .. } => Probe::Stdio(conn.clone()),
                     ServerRuntime::Remote => Probe::Remote(rs.config.clone()),
+                    ServerRuntime::FailedStdio => return None,
                 };
-                (id.clone(), probe)
+                Some((id.clone(), probe))
             })
             .collect();
         // Remote probes run concurrently (each bounded by [`PROBE_TIMEOUT`]),
@@ -700,6 +710,9 @@ impl McpHub {
             .ok_or_else(|| Error::NotFound(format!("mcp server {server_id} is not running")))?;
         match &rs.runtime {
             ServerRuntime::Stdio { conn, .. } => Ok(ToolTarget::Stdio(conn.clone())),
+            ServerRuntime::FailedStdio => Err(Error::NotFound(format!(
+                "mcp server {server_id} is not running (state: error)"
+            ))),
             ServerRuntime::Remote => {
                 let transport = rs
                     .config
@@ -2298,15 +2311,28 @@ mod tests {
             msg.contains(BOGUS_CMD),
             "lastError should mention command: {msg}"
         );
-        // Failed spawn does not insert into the live map.
+        assert_eq!(h.status("err"), status);
+        let generation = h.inner.servers.lock().unwrap()["err"].generation;
+        h.health_tick().await;
+        assert_eq!(h.status("err"), status);
+        assert_eq!(
+            h.inner.servers.lock().unwrap()["err"].generation,
+            generation
+        );
+        assert!(matches!(h.list_tools("err").await, Err(Error::NotFound(_))));
+        assert!(matches!(
+            h.call_tool("err", "echo", json!({}), None).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(h.stop("err").await);
         assert_eq!(h.status("err"), status_stopped("err"));
+        assert!(!h.stop("err").await);
     }
 
     #[tokio::test]
     async fn hub_start_non_stdio_transport_probes_and_stays_tracked_on_error() {
         // Non-stdio configs are probed, not rejected. A failed probe keeps the
-        // entry tracked in `error` (the sweep re-probes it) — unlike a failed
-        // stdio spawn, which drops the entry back to `stopped`.
+        // entry tracked in `error` and the sweep re-probes it.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -2328,13 +2354,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("requires a command"));
+        assert_eq!(h.status("h"), status);
     }
 
     #[tokio::test]
     async fn hub_restart_with_disabled_gate_returns_stopped() {
         let h = McpHub::new();
+        assert_eq!(
+            h.start(stdio_cfg("r1", BOGUS_CMD), true).await["state"],
+            "error"
+        );
         let status = h.restart(stdio_cfg("r1", BOGUS_CMD), false).await;
         assert_eq!(status, status_stopped("r1"));
+        assert_eq!(h.status("r1"), status);
     }
 
     #[cfg(unix)]
@@ -3346,8 +3378,11 @@ for line in sys.stdin:
         write_configs(&secrets, &m).await.unwrap();
 
         svc(None, &secrets, &h).start_enabled().await;
-        // Spawn failed → no live entry → status stays stopped.
-        assert_eq!(h.status("go"), status_stopped("go"));
+        assert_eq!(h.status("go")["state"], "error");
+        assert!(h.status("go")["lastError"]
+            .as_str()
+            .unwrap()
+            .contains(BOGUS_CMD));
     }
 
     // -- agent surface (ws.mcp.*) -------------------------------------------
@@ -4288,7 +4323,9 @@ for line in sys.stdin:
     fn stdio_conn(h: &McpHub, id: &str) -> Arc<Connection> {
         match &h.inner.servers.lock().unwrap()[id].runtime {
             ServerRuntime::Stdio { conn, .. } => Arc::clone(conn),
-            ServerRuntime::Remote => panic!("{id} is not a stdio server"),
+            ServerRuntime::Remote | ServerRuntime::FailedStdio => {
+                panic!("{id} is not a running stdio server")
+            }
         }
     }
 
