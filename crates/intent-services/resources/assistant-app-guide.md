@@ -221,6 +221,14 @@ message is present, **Up Arrow** in an empty composer edits that message first.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/TipTapEditor.svelte; src/lib/utils/user-message-presentation.ts. -->
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceControls,HomeWorkspaceDashboard,HomeWorkspaceSettings}.svelte; src/features/home/home-workspaces-selectors.ts; messages/en.json. -->
+
+In **Home → Workspaces**, choose **Dashboard view** beside **List view** and
+**Board view** for cards with live workspace summaries, status, and task progress
+when available. Cards adapt to the available width and follow **View options →
+Group by**: status, repository, or none. Search and filters continue to apply when
+you switch views.
+
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
 unless you scroll away; older-history loading becomes available when that initial
