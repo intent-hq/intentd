@@ -2119,4 +2119,5 @@ async fn joint_local_records_action_panic_never_retries_or_recovers_required_out
     joint_probe(JointMode::Panic).await;
 }
 
+#[path = "sql_effects.rs"]
 mod sql_effects;
