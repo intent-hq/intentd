@@ -139,6 +139,7 @@ def platform_facts(native_platform):
 
 def produce(source, root, native_platform, event):
     source, root = Path(source).resolve(), Path(root).resolve()
+    original_jobs = os.environ.get('CARGO_BUILD_JOBS')
     if native_platform == 'macos':
         # Preserve the bounded native test-build parallelism across all variants.
         os.environ.setdefault('CARGO_BUILD_JOBS', '2')
@@ -154,7 +155,12 @@ def produce(source, root, native_platform, event):
     (root / 'requests.json').write_text(json.dumps(requests, indent=2) + '\n')
     # Every variant is staged before the following build can replace binaries.
     # Publish before linting too: a lint failure must not discard good archives.
-    archives.produce(list(requests.values()), source, target, root / 'published')
+    try:
+        archives.produce(list(requests.values()), source, target, root / 'published')
+    finally:
+        if native_platform == 'macos' and original_jobs is None:
+            # Original native check/Clippy used Cargo's default parallelism.
+            os.environ.pop('CARGO_BUILD_JOBS', None)
     for command in check_commands(native_platform, event, facts['platform']['target'], target):
         print('+ ' + repr(command), flush=True)
         subprocess.run(command, cwd=source, check=True)

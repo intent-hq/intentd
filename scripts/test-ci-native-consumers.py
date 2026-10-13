@@ -85,6 +85,40 @@ class ConsumerTests(unittest.TestCase):
             self.assertNotIn('--all-targets', calls[1][1])
             self.assertIn('--all-targets', calls[2][1])
 
+    def test_macos_lints_restore_original_job_parallelism(self):
+        facts = {'platform': {'target': 'native-target'}, 'native_tools': {}}
+        for original in (None, '5'):
+            with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+                root = Path(temporary)
+                if original is None:
+                    os.environ.pop('CARGO_BUILD_JOBS', None)
+                else:
+                    os.environ['CARGO_BUILD_JOBS'] = original
+                seen = []
+                with patch.object(self.native, 'platform_facts', return_value=facts), \
+                     patch.object(self.native.archives, 'capture_request', side_effect=lambda source, platform, recipe, **kw: recipe), \
+                     patch.object(self.native.archives, 'produce', side_effect=lambda *a: seen.append(os.environ.get('CARGO_BUILD_JOBS'))), \
+                     patch.object(self.native.subprocess, 'run', side_effect=lambda *a, **kw: seen.append(os.environ.get('CARGO_BUILD_JOBS'))):
+                    self.native.produce(ROOT, root, 'macos', 'merge_group')
+                self.assertEqual(seen, [original or '2', original, original])
+
+    def test_hosted_cache_mapping_points_to_actual_external_target(self):
+        import yaml
+        steps = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['daemon-lifecycle']['steps']
+        setup = next(step for step in steps if step.get('name') == 'Set hosted native target outside checkout')
+        cache = next(step for step in steps if step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / 'workspace/repo'; source.mkdir(parents=True)
+            output = root / 'environment'
+            subprocess.run(['bash', '-e', '-c', setup['run']], cwd=source,
+                           env=dict(os.environ, RUNNER_TEMP=str(root / 'temp'), GITHUB_ENV=str(output)), check=True)
+            values = dict(line.split('=', 1) for line in output.read_text().splitlines())
+            relative = values['NATIVE_CACHE_TARGET']
+            self.assertFalse(Path(relative).is_absolute())
+            self.assertEqual((source / relative).resolve(), Path(values['CARGO_TARGET_DIR']).resolve())
+            self.assertEqual(cache['with']['workspaces'], '. -> ${{ env.NATIVE_CACHE_TARGET }}')
+
     def test_workflow_publishes_before_consumers_and_retains_failures(self):
         import yaml
         job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['daemon-lifecycle']
