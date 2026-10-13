@@ -1,6 +1,5 @@
 //! Payload-free subscriptions for consumers that re-read authoritative state.
-use super::{event_matches, EventBus, SubscriptionFilter};
-use intent_core::Event;
+use super::{event_matches, BroadcastEvent, EventBus, SubscriptionFilter};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -14,7 +13,7 @@ pub struct InvalidationSubscription {
 
 impl InvalidationSubscription {
     fn from_receiver(
-        receiver: broadcast::Receiver<Arc<Event>>,
+        receiver: broadcast::Receiver<Arc<BroadcastEvent>>,
         filter: SubscriptionFilter,
     ) -> Self {
         let (sender, changes) = watch::channel(());
@@ -51,14 +50,17 @@ impl EventBus {
 }
 
 async fn deliver(
-    mut receiver: broadcast::Receiver<Arc<Event>>,
+    mut receiver: broadcast::Receiver<Arc<BroadcastEvent>>,
     filter: SubscriptionFilter,
     sender: watch::Sender<()>,
 ) {
     loop {
         let dirty = match receiver.recv().await {
             Ok(event) => {
-                let matched = event_matches(&filter, &event);
+                let matched = match event.as_ref() {
+                    BroadcastEvent::Public(event) => event_matches(&filter, event),
+                    BroadcastEvent::Monitor(_) | BroadcastEvent::HistoryChanged(_) => false,
+                };
                 // Release even the borrowed broadcast payload before notifying
                 // or awaiting another event. No Event clone enters this path.
                 drop(event);
@@ -76,12 +78,12 @@ async fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{ActorType, EventActor, WorkspaceId};
+    use intent_core::{ActorType, Event, EventActor, WorkspaceId};
     use serde_json::json;
     use std::time::Duration;
 
-    fn event(workspace: &str, event_type: &str, data: serde_json::Value) -> Arc<Event> {
-        Arc::new(Event {
+    fn event(workspace: &str, event_type: &str, data: serde_json::Value) -> Arc<BroadcastEvent> {
+        Arc::new(BroadcastEvent::Public(Event {
             id: "event".into(),
             workspace_id: WorkspaceId::from(workspace),
             timestamp: "2026-10-05T00:00:00Z".into(),
@@ -95,7 +97,7 @@ mod tests {
             parent_event_id: None,
             metadata: None,
             data,
-        })
+        }))
     }
 
     #[tokio::test]
@@ -209,6 +211,45 @@ mod tests {
             assert_eq!(subscription.changed().await, expected);
             assert!(!subscription.changed().await);
         }
+    }
+
+    #[tokio::test]
+    async fn invalidation_discards_private_monitor_and_history_envelopes() {
+        use crate::events::monitor_delivery::MonitorEvent;
+        use intent_core::repository_request::RepositoryMonitorEventSource;
+
+        struct PrivateSource;
+        impl RepositoryMonitorEventSource for PrivateSource {
+            fn with_current(
+                &self,
+                _: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+            ) -> intent_core::Result<()> {
+                panic!("generic invalidation must not project private source authority")
+            }
+        }
+        let (sender, receiver) = broadcast::channel(4);
+        let mut subscription =
+            InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
+        let public = event("ws", "note:updated", json!({"private":"withheld"}));
+        let private = Arc::new(BroadcastEvent::Monitor(MonitorEvent {
+            event: (**public).clone(),
+            binding: None,
+            source: Arc::new(PrivateSource),
+        }));
+        let weak = Arc::downgrade(&private);
+        sender.send(private).unwrap();
+        sender
+            .send(Arc::new(BroadcastEvent::HistoryChanged(
+                "original-agent".into(),
+            )))
+            .unwrap();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(!subscription.changed().await);
     }
 
     #[tokio::test]
