@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.45] - 2026-10-13
+
+### 📚 Documentation
+
+- Clarify browser primary selection and switching ([#2391](https://github.com/intent-hq/intentd/pull/2391))
+
+
 ## [0.10.44] - 2026-10-13
 
 ### 🚀 Features
