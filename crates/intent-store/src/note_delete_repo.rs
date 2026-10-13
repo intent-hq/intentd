@@ -239,6 +239,12 @@ impl Store {
         guard: &NoteDeleteGuard,
         acquire_deadline: tokio::time::Instant,
     ) -> Result<NoteDeleteCommitOutcome> {
+        tokio::time::timeout_at(
+            acquire_deadline,
+            self.prepare_task_events(&request.workspace_id),
+        )
+        .await
+        .map_err(|_| Error::NoteDelete(NoteDeleteError::Unavailable))?;
         let mut conn = NoteWriteConnection::begin_before(self, acquire_deadline).await?;
         let result = async {
             if let Err(error) = authorize(&mut conn, authority, &request.workspace_id).await {

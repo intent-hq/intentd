@@ -38,6 +38,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -312,6 +313,27 @@ impl Store {
         }
     }
 
+    /// Read the note metadata used by change events without loading its body.
+    /// The returned content is empty; emitters omit it from the wire projection.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent note, or a database/decoding error.
+    pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
+        let columns = NOTE_COLUMNS.replace(" content,", " '' AS content,");
+        let row = sqlx::query(&format!(
+            "SELECT {columns} FROM note WHERE id = ? AND workspace_id = ?"
+        ))
+        .bind(id.as_str())
+        .bind(workspace_id.as_str())
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get note metadata failed: {e}")))?;
+        row.as_ref()
+            .map(map_note_row)
+            .transpose()?
+            .ok_or_else(|| Error::NotFound(format!("note {id}")))
+    }
+
     /// Update an existing note (full-row replace, except `id` and
     /// `workspace_id`), or `NotFound`. Unconditional last-writer-wins bump of
     /// `rev`; `metadata.task` is stored opaquely as `task_json` TEXT. The write
@@ -408,6 +430,7 @@ impl Store {
         expected_version: i64,
         agent_id: &AgentId,
     ) -> Result<Option<i64>> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
             let revision = exec_update_note_with_link_guard(
@@ -442,6 +465,7 @@ impl Store {
         expected_version: Option<i64>,
         scope: NoteUpdateScope,
     ) -> Result<i64> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
             let revision = exec_update_note(&mut conn, note, expected_version, scope).await?;
@@ -507,6 +531,7 @@ impl Store {
         id: &NoteId,
         expected_version: Option<i64>,
     ) -> Result<()> {
+        self.prepare_task_events(workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
             // Retain only the IDs detached by the legacy same-workspace trigger.
@@ -806,6 +831,7 @@ impl Store {
         let workspace_id = workspace_id.clone();
 
         crate::with_write_txn_retry(|| async {
+            self.prepare_task_events(&workspace_id).await;
             let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
             let body_result = async {

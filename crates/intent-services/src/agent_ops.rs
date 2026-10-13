@@ -15206,6 +15206,17 @@ impl Services {
             note.metadata.task = Some(task);
             note.updated_at = now;
             self.store.update_note_metadata(&note).await?;
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::note_change_event(
+                    workspace_id,
+                    &note.id,
+                    &note.title,
+                    intent_core::events::NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
         }
         Ok(())
     }

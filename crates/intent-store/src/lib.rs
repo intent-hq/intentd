@@ -65,6 +65,8 @@ mod sharing_projection;
 mod stop_redelivery_repo;
 mod subscription_agent_repo;
 mod task_agent_link_repo;
+mod task_event_repo;
+pub use task_event_repo::TaskEventBaselines;
 mod tracked_changes_repo;
 mod transfer_authorship;
 mod transfer_repo;
@@ -380,6 +382,8 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    task_event_baselines: std::sync::Arc<TaskEventBaselines>,
+    task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -446,6 +450,8 @@ impl Store {
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            task_event_baselines: std::sync::Arc::default(),
+            task_events_enabled: std::sync::Arc::default(),
             write_pool,
             read_pool,
             _daemon_owner: owner,

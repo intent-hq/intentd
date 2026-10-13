@@ -4711,3 +4711,95 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
         assert!(giant.get("contentPreview").is_none(), "no preview: {giant}");
     }
 }
+
+/// Complete task rows and count changes arrive over authenticated WSS without
+/// a follow-up note/task/workspace read.
+#[tokio::test]
+async fn task_push_complete_payloads_and_deletion_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let created = uds_rpc(
+        &socket,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Task pushes", "branch": "main", "skipWorktree": true
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let note = wss_rpc(&mut rpc, 2, "note.create", json!({
+        "workspaceId": ws_id, "title": "Pushed task", "content": "private body", "parentId": "spec"
+    })).await;
+    let note_id = note["note"]["id"].as_str().unwrap();
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(&mut sub, 3, "events.subscribe", json!({
+        "workspaceId": ws_id, "eventTypes": ["task:updated", "workspace:task-stats-changed", "note:updated", "note:deleted"]
+    })).await;
+    let response = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "task.markAsTask",
+        json!({
+            "workspaceId": ws_id, "noteId": note_id, "status": "not_started"
+        }),
+    )
+    .await;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 4);
+    assert_eq!(response["result"]["ok"], true);
+    let metadata = next_event(&mut sub, &["note:updated"], 15).await;
+    assert_eq!(metadata["data"]["note"]["id"], note_id);
+    assert_eq!(
+        metadata["data"]["note"]["metadata"]["task"]["status"],
+        "not_started"
+    );
+    assert!(metadata["data"]["note"].get("content").is_none());
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["workspaceId"], ws_id);
+    let row = &event["data"]["tasks"][0];
+    assert_eq!(row["id"], note_id);
+    assert_eq!(row["title"], "Pushed task");
+    assert_eq!(row["status"], "not_started");
+    assert_eq!(row["parentId"], "spec");
+    assert_eq!(row["specLinked"], false);
+    assert!(row["updatedAt"].is_string());
+    assert_eq!(event["data"]["removedIds"], json!([]));
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"],
+        json!({"workspaceId": ws_id, "taskStats": {"total":1,"completed":0,"inProgress":0}})
+    );
+    wss_rpc(
+        &mut rpc,
+        5,
+        "task.updateNoteStatus",
+        json!({
+            "workspaceId": ws_id, "noteId": note_id, "status": "complete"
+        }),
+    )
+    .await;
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["tasks"][0]["status"], "complete");
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"]["taskStats"],
+        json!({"total":1,"completed":1,"inProgress":0})
+    );
+    wss_rpc(
+        &mut rpc,
+        6,
+        "note.delete",
+        json!({"workspaceId": ws_id, "noteId": note_id}),
+    )
+    .await;
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["tasks"], json!([]));
+    assert_eq!(event["data"]["removedIds"], json!([note_id]));
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"]["taskStats"],
+        json!({"total":0,"completed":0,"inProgress":0})
+    );
+}
