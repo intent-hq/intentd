@@ -108,6 +108,10 @@ fn launch(dir: &Path, gate: &Path) -> (GuardedChild, u16) {
             .env("INTENTD_TAILCAT_BIN", dir.join("tailcat-fixture"))
             .env("INTENTD_TEST_PROXY_PORT", proxy_port.trim());
     }
+    let service_gate = dir.join("service-gate");
+    if service_gate.exists() {
+        command.env("INTENTD_TEST_SETTINGS_WS_START_GATE", service_gate);
+    }
     (GuardedChild::spawn(&mut command).unwrap(), port)
 }
 
@@ -436,6 +440,101 @@ async fn failed_commit_and_shutdown_roll_back_and_restart_resets_attempt() {
         // Reacquiring proves physical database ownership was released at exit.
         drop(Store::prepare_for_daemon(&dir.path().join("intentd.db")).unwrap());
     }
+}
+
+#[tokio::test]
+async fn services_stop_uses_canonical_teardown() {
+    service_startup_exit(false).await;
+}
+
+#[tokio::test]
+async fn services_admission_failure_uses_canonical_teardown() {
+    service_startup_exit(true).await;
+}
+
+async fn service_startup_exit(invalidate_policy: bool) {
+    let dir = common::test_tempdir_in("/tmp", "startup-services-");
+    seed(dir.path()).await;
+    let gate_path = dir.path().join("gate");
+    let indexing = UnixListener::bind(&gate_path).unwrap();
+    let services = UnixListener::bind(dir.path().join("service-gate")).unwrap();
+    let (mut child, _) = launch(dir.path(), &gate_path);
+    for stage in [b'i', b'n', b'c'] {
+        barrier(&indexing, stage)
+            .await
+            .write_u8(b'c')
+            .await
+            .unwrap();
+    }
+    let (mut service_gate, _) = timeout(common::daemon_startup_timeout(), services.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let socket = dir.path().join("intentd.sock");
+    let status = uds_call(&socket, "system.startupStatus").await;
+    assert_eq!(status["result"]["phase"], "finalizing");
+    assert_eq!(status["result"]["finalizingStep"], "services");
+    if invalidate_policy {
+        std::fs::write(dir.path().join("config.toml"), "invalid = [").unwrap();
+        service_gate.write_u8(1).await.unwrap();
+    } else {
+        // Keep setup blocked: shutdown must cancel this unadmitted listener
+        // check while preserving every already-created service cleanup owner.
+        child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    }
+    assert_eq!(
+        child
+            .wait_with_timeout(Duration::from_secs(20))
+            .unwrap()
+            .unwrap()
+            .success(),
+        !invalidate_policy
+    );
+    let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();
+    assert!(log.contains("agent manager ready"), "{log}");
+    assert!(
+        !log.contains("startup completion reconciliation complete"),
+        "{log}"
+    );
+    for phase in [
+        "cleanup",
+        "request_drain",
+        "startup_recovery_join",
+        "agent_shutdown",
+        "writer_drain",
+        "store_close",
+    ] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains(&format!("phase=\"{phase}\" state=\"completed\""))),
+            "missing completed {phase}: {log}"
+        );
+    }
+    assert!(!socket.exists());
+    drop(Store::prepare_for_daemon(&dir.path().join("intentd.db")).unwrap());
+    let db = database(dir.path()).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT rev FROM note WHERE id='spec'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        17
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT indexed_rev FROM note_page_head")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        17
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM client")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    db.close().await;
 }
 
 #[tokio::test]

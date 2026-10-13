@@ -1696,18 +1696,33 @@ async fn cmd_serve(
         Store::prepare_for_daemon(&config.db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut bootstrap = startup::Bootstrap::new(&config);
     let dispatch = bootstrap.dispatch.clone();
-    // Before handoff OS stop must work even if the startup transaction is busy.
-    // After handoff the existing orderly service shutdown owns the signal.
-    let early_stop = async {
+    let cancellation = bootstrap.cancellation.clone();
+    let result = {
+        let serve = cmd_serve_owned(
+            config,
+            insecure,
+            resume_all,
+            locality_override,
+            prepared,
+            &mut bootstrap,
+        );
+        tokio::pin!(serve);
         tokio::select! {
-            biased;
-            () = dispatch.retired() => std::future::pending::<()>().await,
-            () = shutdown_signal() => {},
+            result = &mut serve => result,
+            () = shutdown_signal() => {
+                cancellation.request_stop();
+                dispatch.status().fail();
+                if cancellation.services_owned() {
+                    // Retain initialization and every background owner until
+                    // cooperative stop reaches the canonical teardown below.
+                    serve.await
+                } else {
+                    // Index cancellation owns no service work. The status
+                    // signal cancels/rolls back the separately owned Store open.
+                    Ok(ExitCode::SUCCESS)
+                }
+            },
         }
-    };
-    let result = tokio::select! {
-        result = cmd_serve_owned(config, insecure, resume_all, locality_override, prepared, &mut bootstrap) => result,
-        () = early_stop => Ok(ExitCode::SUCCESS),
     };
     bootstrap.stop().await;
     result
@@ -1908,6 +1923,7 @@ async fn cmd_serve_owned(
         .open(Some(bootstrap.dispatch.status().clone()))
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    bootstrap.cancellation.own_services();
     // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
     // database created before the `auto_vacuum = INCREMENTAL` pragma stays in
     // NONE mode until a full VACUUM rebuilds the file, leaving the retention
@@ -2020,39 +2036,44 @@ async fn cmd_serve_owned(
     // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
     // routes through the same registry via `Services::with_reverse_dispatch`.
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    // One-time carry-over of the renamed `[backgroundAgents]` table into the
-    // `quickActions.*` keys (monorepo#1729), before the legacy import below
-    // discards and strips it. Unset quick-action keys inherit the old value;
-    // already-set ones are left alone.
-    intent_services::migrate_quick_action_settings(&settings_registry)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // One-time removal of the deprecated `providers.active` from config.toml
-    // (comment-preserving rewrite; runs only when the key exists). Its value
-    // is carried over into `model.defaultProvider` (which superseded it)
-    // first; an already-set target is never clobbered.
-    intent_services::migrate_active_provider_setting(&settings_registry)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // One-time legacy handling: retired keys still present in config.toml
-    // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
-    // captured by the load above; import any that still have a catalog entry
-    // into the settings table (currently none), then strip them from the
-    // file with a comment-preserving rewrite. A failed import keeps the file
-    // intact so the next boot retries.
-    intent_services::import_legacy_settings(&settings_registry, &store)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // One-time cleanup of stale SQLite rows for retired settings (e.g. the
-    // per-workspace `model.workspaceOverrides` blob, monorepo#1000).
-    intent_services::cleanup_retired_settings(&store)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // One-time migration for the trimmed `voice.vocabulary` default: a stored
-    // row that only ever persisted the retired 17-term seed default is
-    // deleted so the new `["Intent"]` default applies; user-modified lists
-    // are never touched.
-    intent_services::migrate_default_vocabulary(&store)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut startup_error = async {
+        // One-time carry-over of the renamed `[backgroundAgents]` table into the
+        // `quickActions.*` keys (monorepo#1729), before the legacy import below
+        // discards and strips it. Unset quick-action keys inherit the old value;
+        // already-set ones are left alone.
+        intent_services::migrate_quick_action_settings(&settings_registry)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time removal of the deprecated `providers.active` from config.toml
+        // (comment-preserving rewrite; runs only when the key exists). Its value
+        // is carried over into `model.defaultProvider` (which superseded it)
+        // first; an already-set target is never clobbered.
+        intent_services::migrate_active_provider_setting(&settings_registry)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time legacy handling: retired keys still present in config.toml
+        // (e.g. the `[ai]` table, `model.workspaceOverrides`) were tolerated +
+        // captured by the load above; import any that still have a catalog entry
+        // into the settings table (currently none), then strip them from the
+        // file with a comment-preserving rewrite. A failed import keeps the file
+        // intact so the next boot retries.
+        intent_services::import_legacy_settings(&settings_registry, &store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time cleanup of stale SQLite rows for retired settings (e.g. the
+        // per-workspace `model.workspaceOverrides` blob, monorepo#1000).
+        intent_services::cleanup_retired_settings(&store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        // One-time migration for the trimmed `voice.vocabulary` default: a stored
+        // row that only ever persisted the retired 17-term seed default is
+        // deleted so the new `["Intent"]` default applies; user-modified lists
+        // are never touched.
+        intent_services::migrate_default_vocabulary(&store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await
+    .err();
     // Resolve the concurrent agent cap: positive effective value → explicit
     // override; 0 (the schema default) → auto (RAM-based default_process_cap).
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
@@ -2100,7 +2121,13 @@ async fn cmd_serve_owned(
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
     #[cfg(feature = "repository-test-fixtures")]
-    let fixture_installed = initialize_gitlab_test_transports(&services).await?;
+    let fixture_installed = match initialize_gitlab_test_transports(&services).await {
+        Ok(installed) => installed,
+        Err(error) => {
+            startup_error.get_or_insert(error);
+            false
+        }
+    };
     #[cfg(not(feature = "repository-test-fixtures"))]
     let fixture_installed = false;
     if !fixture_installed {
@@ -2263,7 +2290,13 @@ async fn cmd_serve_owned(
     // explicit kick (resume, sendMessage, queueMessage, retry). Any recovery
     // error is fatal before listeners start: a new queue mutation must never
     // replace durable entries from an unreconciled, empty in-memory map.
-    let rehydrated = restore_startup_queues(&services).await?;
+    let rehydrated = match restore_startup_queues(&services).await {
+        Ok(count) => count,
+        Err(error) => {
+            startup_error.get_or_insert(error.into());
+            0
+        }
+    };
     if rehydrated > 0 {
         tracing::info!(rehydrated, "rehydrated persisted agent queue messages");
     }
@@ -2703,19 +2736,28 @@ async fn cmd_serve_owned(
 
     // Enabled secure WSS is a startup requirement. Preserve the error through
     // the canonical teardown below, without ever publishing UDS readiness.
-    let boot_error = if boot_listener == BootWsListener::SecureWss {
-        match control.start_ws_listener().await {
-            Ok(port) => {
-                tracing::info!(port, "WSS listener auto-started at boot");
-                None
-            }
-            Err(e) => Some(anyhow::anyhow!("secure WSS startup failed: {e}")),
+    let boot_error = if startup_error.is_some() {
+        startup_error
+    } else if boot_listener == BootWsListener::SecureWss {
+        // The early listener remains owned by Bootstrap/runtime state. Cancelling
+        // its idempotent readiness check leaves canonical stop with that handle.
+        tokio::select! {
+            biased;
+            () = bootstrap.dispatch.status().cancelled() => Some(anyhow::anyhow!("startup cancelled")),
+            result = control.start_ws_listener() => match result {
+                Ok(port) => {
+                    tracing::info!(port, "WSS listener auto-started at boot");
+                    None
+                }
+                Err(e) => Some(anyhow::anyhow!("secure WSS startup failed: {e}")),
+            },
         }
     } else {
         None
     };
 
-    let (startup_stop, startup_stopping) = tokio::sync::watch::channel(boot_error.is_some());
+    let (startup_stop, startup_stopping) =
+        tokio::sync::watch::channel(boot_error.is_some() || bootstrap.cancellation.stopping());
     let shutdown = {
         let legacy_import_stopping = legacy_import_stopping.clone();
         let manager = manager.clone();
@@ -2726,11 +2768,12 @@ async fn cmd_serve_owned(
         let stop_merge_retry = stop_merge_retry.clone();
         let mcp_hub = mcp_hub.clone();
         let notify = shutdown_notify.clone();
+        let cancellation = bootstrap.cancellation.clone();
         #[cfg(unix)]
         let idle_update_state = idle_update_state.clone();
         async move {
             tokio::select! {
-                () = shutdown_signal() => {}
+                () = cancellation.stopped() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
             legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2822,34 +2865,25 @@ async fn cmd_serve_owned(
     // relies on (status/stop/doctor, FE sidecar, pairing RPCs).
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     let system_control: Arc<dyn SystemControl> = control.clone();
-    // Wait for the local listener to accept connections before launching the
-    // best-effort repository metadata prewarm. Its candidate read and bounded
-    // blocking probes never gate readiness or the first workspace.list call.
+    // Best-effort work waits for application readiness, not the early status
+    // socket. Failed/stopped attempts never launch resume or metadata work.
     let repository_metadata_prewarm = {
         let services = services.clone();
-        let socket_path = config.socket_path.clone();
+        let dispatch = bootstrap.dispatch.clone();
         intent_core::spawn_daemon(async move {
-            while !uds_is_live(&socket_path).await {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            dispatch.retired().await;
             services.prewarm_repository_metadata().await;
         })
     };
     let startup_recovery = {
         let services = services.clone();
-        let socket_path = config.socket_path.clone();
+        let dispatch = bootstrap.dispatch.clone();
         intent_core::spawn_daemon(async move {
             let mut stopping = startup_stopping;
-            // WSS boot has finished above. Wait for UDS acceptance as well,
-            // rather than relying on the order in which spawned tasks are polled.
             tokio::select! {
                 biased;
                 _ = stopping.wait_for(|stop| *stop) => return,
-                () = async {
-                    while !uds_is_live(&socket_path).await {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                } => {},
+                () = dispatch.retired() => {},
             }
             #[cfg(unix)]
             if let Some(path) = std::env::var_os("INTENTD_TEST_STARTUP_COMPLETION_GATE") {
@@ -2925,37 +2959,43 @@ async fn cmd_serve_owned(
                 .expect("acknowledge response cancellation");
         });
     }
-    let serve_result = if let Some(error) = boot_error {
+    let serve_result = if bootstrap.cancellation.stopping() {
+        Ok(())
+    } else if let Some(error) = boot_error {
         Err(error)
+    } else if !startup::admission_unchanged(&settings_registry, &config.config_path, insecure) {
+        Err(anyhow::anyhow!(
+            "startup admission settings changed; restart required"
+        ))
+    } else if !bootstrap
+        .dispatch
+        .install(intent_transport::startup::ReadyServices {
+            api,
+            bus: bus.clone(),
+            rpc_limiter: rpc_limiter.clone(),
+            control: Some(system_control),
+            server_pairing_info: pairing_info,
+            reverse_registry: reverse_registry.clone(),
+        })
+    {
+        Err(anyhow::anyhow!("startup handoff refused"))
     } else {
-        // External config edits during indexing must not silently retain a
-        // stale admission policy. Fail closed; a retry resolves the new policy.
-        if !startup::admission_unchanged(&settings_registry, &config.config_path, insecure) {
-            anyhow::bail!("startup admission settings changed; restart required");
-        }
-        if !bootstrap
-            .dispatch
-            .install(intent_transport::startup::ReadyServices {
-                api,
-                bus: bus.clone(),
-                rpc_limiter: rpc_limiter.clone(),
-                control: Some(system_control),
-                server_pairing_info: pairing_info,
-                reverse_registry: reverse_registry.clone(),
-            })
-        {
-            anyhow::bail!("startup handoff refused");
-        }
-        let local = bootstrap.local.as_mut().expect("bound local listener");
-        tokio::select! {
-            result = local => result.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from),
+        let mut local = bootstrap.local.take().expect("bound local listener");
+        let joined = tokio::select! {
+            result = &mut local => result,
             () = shutdown => {
                 if let Some(stop) = bootstrap.stop_local.take() { let _ = stop.send(()); }
-                bootstrap.local.as_mut().expect("local listener").await.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from)
+                local.await
             }
-        }
+        };
+        joined
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result.map_err(anyhow::Error::from))
     };
-    bootstrap.local.take();
+    if serve_result.is_err() || bootstrap.cancellation.stopping() {
+        bootstrap.dispatch.status().fail();
+    }
+    bootstrap.stop_local_listener().await;
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
     legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
