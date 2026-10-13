@@ -36,6 +36,23 @@ requires Multiplayer and a refreshed identity; the remote-owner panel needs Remo
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
+## visionOS chat layout (unreleased)
+
+The floating chat composer and raised Intent action cards are unreleased client
+changes. Describe them only when explicitly asked or helping develop or test them;
+do not recommend them as available until the carrying iOS/visionOS client ships.
+A daemon update alone does not make this layout available.
+
+In that client, the composer floats below the chat window, with send, dictation,
+photo/file attachments, and pending attachment previews and removal. Opening the
+bottom-right Intent menu brings its action cards forward and temporarily hides
+the composer and raised unread-workspace activity cards, including new arrivals.
+Dismiss the menu to restore the draft, attachments, and still-applicable activity
+cards; opening the menu does not mark activity read. iPhone and iPad retain their
+existing layout.
+
+<!-- Sources (paths relative to packages/ios): Intent/Views/Conversation/Composer/{FloatingComposerOrnament,ComposerCoverage,MessageInputView}.swift; Intent/Views/Conversation/Transcript/ConversationColumnView.swift; Intent/Views/Workspaces/{WorkspaceActionLauncher,HomeActionTiles,WorkspaceActionMenuDepth,WorkspaceAttentionCue,WorkspaceRowView}.swift. -->
+
 ## Finding things
 
 Answer location questions with the destination and action first. Read settings only
