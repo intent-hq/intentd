@@ -825,6 +825,20 @@ impl RepositorySettledConnection {
             crate::repository_credentials::RepositoryDispatchStamp,
         ) -> Result<T>,
     ) -> Result<T> {
+        self.with_child_current(expected, projects, dispatch, None, action)
+    }
+
+    pub(crate) fn with_child_current<T>(
+        &self,
+        expected: Option<&RepositorySecretRequest>,
+        projects: &[&str],
+        dispatch: bool,
+        child_revision: Option<u64>,
+        action: impl FnOnce(
+            &RepositorySecretRequest,
+            crate::repository_credentials::RepositoryDispatchStamp,
+        ) -> Result<T>,
+    ) -> Result<T> {
         let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
         let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
         let descriptor = self
@@ -832,48 +846,58 @@ impl RepositorySettledConnection {
             .descriptor
             .lock()
             .map_err(|_| Error::Indeterminate)?;
-        self.owner.directory.with_checkout_metadata(
-            &self.selected.binding,
-            expected,
-            dispatch,
-            |actual, selected, stamp| {
-                let proof = self
-                    .owner
-                    .evidence
-                    .published
-                    .lock()
-                    .map_err(|_| Error::Indeterminate)?;
-                if settings.source.is_none()
-                    || settings.store.is_none()
-                    || selected.source != RepositoryCredentialSource::GitlabSecretSlot
-                {
-                    return Err(Error::Unverified);
-                }
-                let proof = proof.as_ref().ok_or(Error::Unverified)?;
-                if proof.request != *selected {
-                    return Err(Error::SecretMismatch);
-                }
-                if descriptor.as_ref() != Some(actual)
-                    || proof.descriptor != *actual
-                    || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
-                        != Some(actual)
-                    || self.descriptor != *actual
-                    || self.selected.source != selected.source
-                {
-                    return Err(Error::BoundaryMismatch);
-                }
-                let denials = self
-                    .owner
-                    .evidence
-                    .checkout_denials
-                    .lock()
-                    .map_err(|_| Error::Indeterminate)?;
-                if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
-                    return Err(Error::AuthorityDenied);
-                }
-                action(selected, stamp)
-            },
-        )
+        let validate = |actual: &GitlabDescriptor, selected: &RepositorySecretRequest, stamp| {
+            let proof = self
+                .owner
+                .evidence
+                .published
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            if settings.source.is_none()
+                || settings.store.is_none()
+                || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+            {
+                return Err(Error::Unverified);
+            }
+            let proof = proof.as_ref().ok_or(Error::Unverified)?;
+            if proof.request != *selected {
+                return Err(Error::SecretMismatch);
+            }
+            if descriptor.as_ref() != Some(actual)
+                || proof.descriptor != *actual
+                || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
+                    != Some(actual)
+                || self.descriptor != *actual
+                || self.selected.source != selected.source
+            {
+                return Err(Error::BoundaryMismatch);
+            }
+            let denials = self
+                .owner
+                .evidence
+                .checkout_denials
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
+                return Err(Error::AuthorityDenied);
+            }
+            action(selected, stamp)
+        };
+        match child_revision {
+            None => self.owner.directory.with_checkout_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                validate,
+            ),
+            Some(revision) => self.owner.directory.with_checkout_child_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                Some(revision),
+                validate,
+            ),
+        }
     }
 
     /// A denial from the actual original response quarantines this source

@@ -230,14 +230,47 @@ async fn default_cwd(
 /// spawn actually uses: the helpers already configured there are re-added
 /// behind intentd's, so a repository-local one stays reachable
 /// (monorepo#3059).
+/// The configured full GitLab root also receives a helper entry. Its owner-only
+/// policy is checked on every request, so already-running terminals observe
+/// later enable/disable/refresh without carrying a daemon token in their env.
 pub(crate) fn git_credential_env(
     settings: Option<&SettingsRegistry>,
     cwd: Option<&Path>,
 ) -> Vec<(String, String)> {
-    if !expose_git_credential(settings) {
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
         return Vec::new();
     }
-    credential_pairs(cwd)
+    let github = if expose_git_credential(settings) {
+        credential_pairs(cwd)
+    } else {
+        Vec::new()
+    };
+    let Some(settings) = settings else {
+        return github;
+    };
+    let config = settings.snapshot().effective.source_control.gitlab.clone();
+    let Ok(instance) = crate::source_control_auth_ops::repository_owner::logical_instance(&config)
+    else {
+        return github;
+    };
+    let Some(intentd) = crate::daemon_exe_path() else {
+        return github;
+    };
+    let inherited = github
+        .iter()
+        .find(|(key, _)| key == intent_git::auth::GIT_CONFIG_PARAMETERS_ENV)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok());
+    let gitlab = intent_git::auth::daemon_gitlab_helper_env(
+        &intentd,
+        instance.as_str(),
+        inherited.as_deref(),
+    );
+    if gitlab.is_empty() {
+        github
+    } else {
+        gitlab
+    }
 }
 
 /// All git env pairs injected under the caller's overlay for a spawn in

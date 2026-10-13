@@ -5,6 +5,8 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod adoption;
+mod child_git;
+pub(crate) use child_git::{GitlabChildPolicyCapture, GitlabChildPolicyStatus};
 #[cfg(not(test))]
 mod secret_reader;
 #[cfg(test)]
@@ -165,7 +167,9 @@ impl GitlabCredentialGate {
                 publication_confirmed: kind != RepositoryMutationKind::Replace,
                 persisted: false,
                 candidate: None,
+                child_choice: ChildChoice::Pending,
             }),
+            kind,
         })
     }
 }
@@ -198,6 +202,7 @@ pub(crate) struct RepositoryWrite {
     #[cfg(test)]
     write_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<WriteState>,
+    kind: RepositoryMutationKind,
 }
 /// Equality evidence for one completed operation, never account authority.
 pub(crate) struct CompletedRepositorySource {
@@ -205,6 +210,12 @@ pub(crate) struct CompletedRepositorySource {
     fingerprint: secret_reader::SourceFingerprint,
     config: Option<intent_core::settings_file::GitlabSettings>,
     descriptor: Option<GitlabDescriptor>,
+}
+
+enum ChildChoice {
+    Pending,
+    Absent,
+    Known(bool),
 }
 
 struct WriteState {
@@ -215,6 +226,7 @@ struct WriteState {
     publication_confirmed: bool,
     persisted: bool,
     candidate: Option<secret_reader::SourceFingerprint>,
+    child_choice: ChildChoice,
 }
 
 impl RepositoryWrite {
@@ -260,6 +272,8 @@ impl RepositoryWrite {
             .as_ref()
             .ok_or(intent_sourcecontrol::Error::AdmissionRetired)?
             .check_current()
+            .map_err(map_owner_error)?;
+        self.prepare_child_choice(&mut state)
             .map_err(map_owner_error)
     }
 
@@ -271,6 +285,7 @@ impl RepositoryWrite {
             .lock()
             .map_err(|_| map_owner_error(RepositoryCredentialError::Indeterminate))?;
         state.disconnected = true;
+        state.child_choice = ChildChoice::Pending;
         state.publication_confirmed = true;
         Ok(())
     }
@@ -426,6 +441,9 @@ impl RepositoryWrite {
                     {
                         tracing::debug!(%error, "repository source evidence remains unavailable");
                     } else if let Some(settings) = self.owner.settings.get() {
+                        if let ChildChoice::Known(enabled) = state.child_choice {
+                            let _ = self.owner.directory.restore_child_policy(&binding, enabled);
+                        }
                         if let Ok(mut source) = settings.source_descriptor.lock() {
                             *source = Some(descriptor.clone());
                         }
