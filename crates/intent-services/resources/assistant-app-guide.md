@@ -247,7 +247,7 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 ## Home workspace status icons
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
 
 In **Home → Workspaces**, the status icon in list and board views describes the
 workspace's current status. Hover over it for an explanation:
