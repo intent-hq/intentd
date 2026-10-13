@@ -222,7 +222,7 @@ async fn setup_finishes_without_terminal_client_input() {
                     rlim_cur: 1024 * 1024,
                     rlim_max: 1024 * 1024,
                 };
-                if libc::setrlimit(libc::RLIMIT_STACK, &limit) == 0 {
+                if libc::setrlimit(libc::RLIMIT_STACK, &raw const limit) == 0 {
                     Ok(())
                 } else {
                     Err(std::io::Error::last_os_error())
