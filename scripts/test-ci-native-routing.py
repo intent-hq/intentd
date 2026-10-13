@@ -23,6 +23,11 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+_workflow_spec = importlib.util.spec_from_file_location('workflow_tests', ROOT / 'scripts/ci-workflow-tests.py')
+_workflow_tests = importlib.util.module_from_spec(_workflow_spec)
+_workflow_spec.loader.exec_module(_workflow_tests)
+
 RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
@@ -173,9 +178,12 @@ def native_errors(workflow):
             errors.append(f"{name}: missing push compilation")
         elif any(condition(step.get("if", True), context(event)) != (event == "push") for event in REQUIRED):
             errors.append(f"{name}: must be push-only")
-    producer = steps.get("Produce native archives and lint in one shared target", {})
-    if producer.get("run") != 'python3 -I -B scripts/ci-native-artifacts.py produce --platform "$NATIVE_PLATFORM" --event "$NATIVE_SCOPE"' or producer.get('if') or producer.get('continue-on-error'):
-        errors.append('native producer must build and lint every demanded variant')
+    producer = steps.get("Produce native archives in one shared target", {})
+    if producer.get("run") != 'python3 -I -B scripts/ci-native-artifacts.py produce --platform "$NATIVE_PLATFORM" --event "$NATIVE_SCOPE" --reuse --archives-only' or producer.get('if') or producer.get('continue-on-error'):
+        errors.append('native producer must build every demanded variant')
+    lint = steps.get('Production check and Clippy in shared target', {})
+    if lint.get('run') != 'python3 -I -B scripts/ci-native-artifacts.py lint --platform "$NATIVE_PLATFORM" --event "$NATIVE_SCOPE"' or lint.get('if') or lint.get('continue-on-error'):
+        errors.append('native production check and Clippy must remain fatal')
     tests = workflow["jobs"]["release-scripts"]
     if tests.get("continue-on-error") or not any(
         re.search(r"^python3 (?:-[IB] )*scripts/test-ci-native-routing.py$", step.get("run", ""), re.M)
@@ -266,7 +274,7 @@ def runner(platform="macOS", arch="ARM64", *, status="online", busy=False):
 class RunnerAvailabilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.workflow = _workflow_tests.load_ci(ROOT)
 
     def assert_mac_route(self, fixture, expected):
         result = run_route(self.workflow, **fixture)
@@ -370,7 +378,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 class LifecycleCacheTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["daemon-lifecycle"]
+        cls.job = _workflow_tests.load_ci(ROOT)["jobs"]["daemon-lifecycle"]
         cls.steps = cls.job["steps"]
 
     def step(self, name):
@@ -522,7 +530,7 @@ class LifecycleCacheTests(unittest.TestCase):
 class NativeRoutingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.workflow = _workflow_tests.load_ci(ROOT)
 
     def test_job_selection_and_route_failures(self):
         self.assertEqual(routing_errors(self.workflow), [])

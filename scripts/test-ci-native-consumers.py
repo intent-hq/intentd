@@ -13,6 +13,11 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
+_workflow_spec = importlib.util.spec_from_file_location('workflow_tests', ROOT / 'scripts/ci-workflow-tests.py')
+_workflow_tests = importlib.util.module_from_spec(_workflow_spec)
+_workflow_spec.loader.exec_module(_workflow_tests)
+
+
 def load(name):
     spec = importlib.util.spec_from_file_location(name, ROOT / 'scripts' / (name + '.py'))
     module = importlib.util.module_from_spec(spec)
@@ -103,8 +108,7 @@ class ConsumerTests(unittest.TestCase):
                 self.assertEqual(seen, [original or '2', original, original])
 
     def test_hosted_cache_mapping_points_to_actual_external_target(self):
-        import yaml
-        steps = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['daemon-lifecycle']['steps']
+        steps = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']['steps']
         setup = next(step for step in steps if step.get('name') == 'Set hosted native target outside checkout')
         cache = next(step for step in steps if step.get('uses', '').startswith('Swatinem/rust-cache@'))
         with tempfile.TemporaryDirectory() as temporary:
@@ -146,11 +150,10 @@ class ConsumerTests(unittest.TestCase):
                 self.assertEqual(pure_path(joined), pure_path(values['CARGO_TARGET_DIR']))
 
     def test_workflow_publishes_before_consumers_and_retains_failures(self):
-        import yaml
-        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['daemon-lifecycle']
+        job = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']
         steps = job['steps']
         names = [step.get('name', '') for step in steps]
-        producer = names.index('Produce native archives and lint in one shared target')
+        producer = names.index('Produce native archives in one shared target')
         upload = names.index('Publish native variants')
         restore = names.index('Restore native executables with compiler tripwires')
         lifecycle = names.index('Native lifecycle runtime proof')
@@ -163,8 +166,7 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual(sum('ci-native-artifacts.py produce' in step.get('run', '') for step in steps), 1)
 
     def test_archive_regressions_run_after_pinned_tooling_in_ci(self):
-        import yaml
-        steps = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['release-scripts']['steps']
+        steps = _workflow_tests.load_ci(ROOT)['jobs']['release-scripts']['steps']
         compiler = next(i for i, step in enumerate(steps) if step.get('name') == 'Install release cache regression compiler')
         nextest = next(i for i, step in enumerate(steps) if step.get('with', {}).get('tool') == 'cargo-nextest@0.9.143')
         for name in ('test-ci-build-identity.py', 'test-ci-test-artifacts.py'):

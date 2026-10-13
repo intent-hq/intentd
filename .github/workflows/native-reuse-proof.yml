@@ -1,0 +1,25 @@
+name: Native reuse proof
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/native-*.yml'
+      - 'scripts/ci-*artifacts.py'
+      - 'scripts/ci-artifact-reuse.py'
+      - 'scripts/test-ci-artifact-reuse.py'
+permissions:
+  contents: read
+  actions: read
+# A second workflow, with the same actual PR merge SHA, exercises the real
+# storage/lock boundary. Each caller reruns its Linux lint and runtime proofs.
+concurrency:
+  group: native-proof-caller-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+  queue: max
+jobs:
+  reuse:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/native-artifacts.yml
+    with:
+      platform: linux
+      runner_labels: '["gh-linux-16x"]'

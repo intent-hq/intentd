@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """One native producer step, followed by compile-free archive consumers.
 
-Publication is local to this run; uploading its directory preserves successful
-variants even if subsequent lint/runtime work fails. Remote reuse/locking is a
-separate layer. Native CI changes opt PRs into the full native proof set.
+The reusable workflow locks before lookup and publishes completed variants
+before lint/runtime work. Exact cross-run hits skip compilation, never tests.
+Native CI changes opt PRs into the full native proof set.
 """
 import argparse
 import fnmatch
@@ -25,6 +25,8 @@ _spec.loader.exec_module(archives)
 
 NATIVE_INPUTS = {'.github/workflows/ci.yml', 'scripts/ci-native-artifacts.py',
                  'scripts/ci-test-artifacts.py', 'scripts/ci-build-identity.py',
+                 'scripts/ci-artifact-reuse.py', 'scripts/test-ci-artifact-reuse.py',
+                 'scripts/ci-workflow-tests.py',
                  'scripts/test-daemon-lifecycle.py', 'scripts/test-ci-native-consumers.py',
                  'scripts/test-ci-native-routing.py', 'scripts/test-ci-test-policy.py',
                  'scripts/test-ci-test-artifacts.py', 'scripts/test-ci-build-identity.py',
@@ -137,7 +139,7 @@ def platform_facts(native_platform):
             'native_tools': {'cc': cc, 'linker': linker}}
 
 
-def produce(source, root, native_platform, event):
+def produce(source, root, native_platform, event, *, reuse=False, lint=True):
     source, root = Path(source).resolve(), Path(root).resolve()
     original_jobs = os.environ.get('CARGO_BUILD_JOBS')
     if native_platform == 'macos':
@@ -153,6 +155,14 @@ def produce(source, root, native_platform, event):
                 config_sha256=config_digest(source), native_tools=facts['native_tools'])
                 for name, recipe in recipes.items()}
     (root / 'requests.json').write_text(json.dumps(requests, indent=2) + '\n')
+    if reuse:
+        spec = importlib.util.spec_from_file_location('reuse', Path(__file__).with_name('ci-artifact-reuse.py'))
+        registry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(registry)
+        api = registry.GitHub(os.environ['GITHUB_REPOSITORY'])
+        expected = registry.context(source, api)
+        (root / 'publication.json').write_text(json.dumps(registry.publication(expected), indent=2) + '\n')
+        registry.restore(requests, root, api, expected, native_platform)
     # Every variant is staged before the following build can replace binaries.
     # Publish before linting too: a lint failure must not discard good archives.
     try:
@@ -161,7 +171,12 @@ def produce(source, root, native_platform, event):
         if native_platform == 'macos' and original_jobs is None:
             # Original native check/Clippy used Cargo's default parallelism.
             os.environ.pop('CARGO_BUILD_JOBS', None)
-    for command in check_commands(native_platform, event, facts['platform']['target'], target):
+    if lint:
+        run_lints(source, native_platform, event, facts['platform']['target'], target)
+
+
+def run_lints(source, native_platform, event, triple, target):
+    for command in check_commands(native_platform, event, triple, target):
         print('+ ' + repr(command), flush=True)
         subprocess.run(command, cwd=source, check=True)
 
@@ -250,11 +265,13 @@ def prepare(source, root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('scope', 'produce', 'prepare', 'libtest', 'receipt'))
+    parser.add_argument('command', choices=('scope', 'produce', 'lint', 'prepare', 'libtest', 'receipt'))
     parser.add_argument('--root', type=Path, default=Path(os.environ.get('RUNNER_TEMP', '.')) / 'native-artifacts')
     parser.add_argument('--source', type=Path, default=Path.cwd())
     parser.add_argument('--platform', choices=('linux', 'macos', 'windows'))
     parser.add_argument('--event', choices=('pull_request', 'merge_group'))
+    parser.add_argument('--reuse', action='store_true')
+    parser.add_argument('--archives-only', action='store_true')
     parser.add_argument('--base')
     parser.add_argument('--variant')
     parser.add_argument('--binary')
@@ -276,7 +293,11 @@ def main():
             output.write('event=' + scope + '\n')
         print('Native demand: ' + scope + (' (native CI verification)' if scope != args.event else ''))
     elif args.command == 'produce':
-        produce(args.source, args.root, args.platform, args.event)
+        produce(args.source, args.root, args.platform, args.event, reuse=args.reuse, lint=not args.archives_only)
+    elif args.command == 'lint':
+        facts = platform_facts(args.platform)
+        target = Path(os.environ.get('CARGO_TARGET_DIR', args.root / 'cargo-target')).resolve()
+        run_lints(args.source, args.platform, args.event, facts['platform']['target'], target)
     elif args.command == 'prepare':
         prepare(args.source, args.root)
     elif args.command == 'libtest':

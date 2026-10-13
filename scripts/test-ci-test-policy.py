@@ -8,6 +8,7 @@ registration plus actual stub-child probes below, not a general shell parser.
 Mutation tests ensure removed/disabled step policy and missing wiring fail.
 """
 
+import importlib.util
 import copy
 import json
 import os
@@ -24,6 +25,11 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_workflow_spec = importlib.util.spec_from_file_location('workflow_tests', ROOT / 'scripts/ci-workflow-tests.py')
+_workflow_tests = importlib.util.module_from_spec(_workflow_spec)
+_workflow_spec.loader.exec_module(_workflow_tests)
+
 JOBS = ("check", "daemon-lifecycle", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
@@ -112,7 +118,7 @@ REQUIRED_TEST_STEPS = {
 class CiPolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.workflow = _workflow_tests.load_ci(ROOT)
 
     def test_required_ci_matches_wrapper(self):
         result = subprocess.run(
@@ -371,7 +377,7 @@ class TunnelArtifactTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        workflow = _workflow_tests.load_ci(ROOT)
         cls.step = next(s for s in workflow["jobs"]["daemon-lifecycle"]["steps"]
                         if s.get("name") == "Tunnel deadline and TLS controls (macOS runtime)")
 
@@ -511,7 +517,7 @@ class CallbackDiscoveryTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        cls.workflow = _workflow_tests.load_ci(ROOT)
         cls.job = cls.workflow["jobs"]["coverage-changed"]
         cls.step = next(s for s in cls.job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
 
