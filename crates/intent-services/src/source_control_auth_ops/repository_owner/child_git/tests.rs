@@ -32,6 +32,25 @@ impl CheckoutAuthority for Caller {
 fn capture(f: &Fixture) -> GitlabChildPolicyCapture {
     f.service.capture_gitlab_child_policy().unwrap()
 }
+fn expected(status: &GitlabChildPolicyStatus) -> GitlabChildPolicyExpected {
+    GitlabChildPolicyExpected {
+        instance_base_url: status.instance_base_url.clone(),
+        account_id: status.account_id.clone(),
+        connection_id: status.connection_id.clone(),
+        connection_generation: status.connection_generation,
+        revision: status.revision,
+    }
+}
+impl GitlabChildPolicyCapture {
+    async fn set_current(
+        self,
+        enabled: bool,
+        authority: Arc<dyn CheckoutAuthority>,
+    ) -> CoreResult<GitlabChildPolicyStatus> {
+        let observed = self.status(authority.as_ref()).await?;
+        self.set(expected(&observed), enabled, authority).await
+    }
+}
 async fn credential(f: &Fixture) -> Option<SecretString> {
     capture(f)
         .credential(
@@ -43,6 +62,7 @@ async fn credential(f: &Fixture) -> Option<SecretString> {
         )
         .await
         .unwrap()
+        .map(|credential| credential.into_parts().0)
 }
 
 #[intent_test_macros::daemon_test]
@@ -62,14 +82,20 @@ async fn child_policy_unset_is_off_and_every_lookup_observes_the_current_choice(
         .load(ACCOUNT)
         .unwrap()
         .is_none());
-    let enabled = capture(&f).set(true, Caller::current()).await.unwrap();
+    let enabled = capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     assert!(enabled.enabled);
     assert!(enabled.revision > initial.revision);
     assert_eq!(enabled.instance_base_url, "https://gitlab.test/forge");
     assert_eq!(enabled.account_id, "42");
     assert_eq!(enabled.connection_id, initial.connection_id);
     assert_eq!(credential(&f).await.unwrap().expose_secret(), "stored-pat");
-    let disabled = capture(&f).set(false, Caller::current()).await.unwrap();
+    let disabled = capture(&f)
+        .set_current(false, Caller::current())
+        .await
+        .unwrap();
     assert!(!disabled.enabled);
     assert!(disabled.revision > enabled.revision);
     assert!(credential(&f).await.is_none());
@@ -109,7 +135,10 @@ async fn child_policy_full_root_and_explicit_identity_are_exact() {
     )
     .unwrap();
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     for (protocol, host, path, username) in [
         ("http", "gitlab.test:8443", "Forge/group/project.git", None),
         ("ssh", "gitlab.test:8443", "Forge/group/project.git", None),
@@ -164,6 +193,8 @@ async fn child_policy_full_root_and_explicit_identity_are_exact() {
             .await
             .unwrap()
             .unwrap()
+            .into_parts()
+            .0
             .expose_secret(),
         "stored-pat"
     );
@@ -186,7 +217,10 @@ async fn child_policy_verified_same_account_refresh_preserves_choice_and_uses_ne
         .await
         .unwrap();
     let old_request = f.request();
-    let enabled = capture(&f).set(true, Caller::current()).await.unwrap();
+    let enabled = capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     let record = f.service.gitlab_secret_store.load(ACCOUNT).unwrap();
     refresh_original(&f.service, &server.host).await;
     let fresh = capture(&f)
@@ -205,7 +239,10 @@ async fn child_policy_verified_same_account_refresh_preserves_choice_and_uses_ne
 async fn child_policy_account_replacement_and_revoke_never_restore_an_old_choice() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     let old = capture(&f);
     f.service
         .gitlab_connect_pat(server.host.clone(), "pat-second".into())
@@ -235,7 +272,10 @@ async fn child_policy_account_replacement_and_revoke_never_restore_an_old_choice
             .unwrap()
             .enabled
     );
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     f.service
         .gitlab_revoke_owned(server.host.clone())
         .await
@@ -259,7 +299,10 @@ async fn child_policy_restart_restores_only_actual_verified_matching_account() {
     for choice in [false, true] {
         let server = Server::new().await;
         let f = Fixture::new(&server).await;
-        capture(&f).set(choice, Caller::current()).await.unwrap();
+        capture(&f)
+            .set_current(choice, Caller::current())
+            .await
+            .unwrap();
         let record = f.service.gitlab_secret_store.load(ACCOUNT).unwrap();
         f.service
             .repository_connection_directory()
@@ -310,7 +353,10 @@ async fn child_policy_restart_restores_only_actual_verified_matching_account() {
 async fn child_policy_invalid_record_cannot_grant_or_block_original_revoke() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     f.service
         .gitlab_secret_store
         .store(ACCOUNT, "invalid-choice")
@@ -349,7 +395,10 @@ async fn child_policy_invalid_record_cannot_grant_or_block_original_revoke() {
 async fn child_policy_source_change_and_restoration_do_not_revive_attestation() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     f.service
         .gitlab_secret_store
         .store(SECRET_ACCOUNT, "unverified-replacement")
@@ -375,7 +424,10 @@ async fn child_policy_source_change_and_restoration_do_not_revive_attestation() 
 async fn child_policy_original_caller_retirement_during_owned_read_releases_no_token() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     let mut paused = PausedRead::install(&f);
     let caller = Caller::current();
     let original = capture(&f);
@@ -407,7 +459,10 @@ async fn child_policy_full_instance_transition_clears_durable_choice_before_unve
     use intent_core::WorkspaceApi;
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     let original = capture(&f);
     f.service
         .settings_update(serde_json::json!([{
@@ -453,7 +508,7 @@ async fn child_policy_cancelled_caller_cannot_abandon_the_admitted_original_writ
         signal.notify_one();
         receive.lock().unwrap().recv().unwrap();
     }));
-    let update = tokio::spawn(async move { original.set(true, Caller::current()).await });
+    let update = tokio::spawn(async move { original.set_current(true, Caller::current()).await });
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
         .unwrap();
@@ -481,7 +536,10 @@ async fn child_policy_cancelled_caller_cannot_abandon_the_admitted_original_writ
 async fn child_policy_cancelled_file_read_retains_lease_until_worker_exits() {
     let server = Server::new().await;
     let f = Fixture::new(&server).await;
-    capture(&f).set(true, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
     let mut paused = PausedRead::install(&f);
     let original = capture(&f);
     let read = tokio::spawn(async move {
@@ -499,7 +557,8 @@ async fn child_policy_cancelled_file_read_retains_lease_until_worker_exits() {
     read.abort();
     assert!(matches!(read.await, Err(error) if error.is_cancelled()));
     let update = capture(&f);
-    let mut disable = tokio::spawn(async move { update.set(false, Caller::current()).await });
+    let mut disable =
+        tokio::spawn(async move { update.set_current(false, Caller::current()).await });
     assert!(
         tokio::time::timeout(Duration::from_millis(30), &mut disable)
             .await
@@ -532,12 +591,273 @@ async fn child_policy_disabled_does_not_disable_native_credentials() {
         .unwrap()
         .with_current(&mut || Ok(()))
         .unwrap();
-    capture(&f).set(true, Caller::current()).await.unwrap();
-    capture(&f).set(false, Caller::current()).await.unwrap();
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
+    capture(&f)
+        .set_current(false, Caller::current())
+        .await
+        .unwrap();
     native
         .native_credential("https://gitlab.test/forge/group/project.git")
         .await
         .unwrap()
         .with_current(&mut || Ok(()))
         .unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_policy_expected_binding_and_revision_are_checked_before_owned_write() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let initial = capture(&f)
+        .status(Caller::current().as_ref())
+        .await
+        .unwrap();
+    let original = expected(&initial);
+    for field in 0..5 {
+        let mut wrong = original.clone();
+        match field {
+            0 => wrong.instance_base_url.push_str("/other"),
+            1 => wrong.account_id.push_str("-other"),
+            2 => wrong.connection_id.push_str("-other"),
+            3 => wrong.connection_generation += 1,
+            _ => wrong.revision += 1,
+        }
+        assert!(capture(&f)
+            .set(wrong, true, Caller::current())
+            .await
+            .is_err());
+        assert!(f
+            .service
+            .gitlab_secret_store
+            .load(ACCOUNT)
+            .unwrap()
+            .is_none());
+    }
+    capture(&f)
+        .set(original.clone(), true, Caller::current())
+        .await
+        .unwrap();
+    let persisted = f.service.gitlab_secret_store.load(ACCOUNT).unwrap();
+    assert!(capture(&f)
+        .set(original, false, Caller::current())
+        .await
+        .is_err());
+    assert_eq!(
+        f.service.gitlab_secret_store.load(ACCOUNT).unwrap(),
+        persisted
+    );
+    assert!(
+        capture(&f)
+            .status(Caller::current().as_ref())
+            .await
+            .unwrap()
+            .enabled
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_credential_final_receipt_refuses_disable_revoke_refresh_replacement_source_and_caller_change(
+) {
+    for change in 0..6 {
+        let server = Server::new().await;
+        let f = if change == 2 {
+            let fixture = Fixture::unadopted(&server).await;
+            fixture
+                .service
+                .gitlab_secret_store
+                .store(REFRESH_SECRET_ACCOUNT, "old-refresh")
+                .unwrap();
+            fixture
+                .service
+                .gitlab_secret_store
+                .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+                .unwrap();
+            fixture
+                .service
+                .reconcile_gitlab_repository_binding()
+                .await
+                .unwrap();
+            fixture
+        } else {
+            Fixture::new(&server).await
+        };
+        capture(&f)
+            .set_current(true, Caller::current())
+            .await
+            .unwrap();
+        let caller = Caller::current();
+        let acquired = capture(&f)
+            .credential(
+                "https",
+                "gitlab.test",
+                "forge/group/project.git",
+                None,
+                caller.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let (token, receipt) = acquired.into_parts();
+        assert_eq!(
+            token.expose_secret(),
+            if change == 2 { "rotated" } else { "stored-pat" }
+        );
+        match change {
+            0 => {
+                capture(&f)
+                    .set_current(false, Caller::current())
+                    .await
+                    .unwrap();
+            }
+            1 => {
+                f.service
+                    .gitlab_revoke_owned(server.host.clone())
+                    .await
+                    .unwrap();
+            }
+            2 => {
+                refresh_original(&f.service, &server.host).await;
+            }
+            3 => {
+                f.service
+                    .gitlab_connect_pat(server.host.clone(), "pat-second".into())
+                    .await
+                    .unwrap();
+            }
+            4 => {
+                f.service
+                    .gitlab_secret_store
+                    .store(SECRET_ACCOUNT, "unverified-external")
+                    .unwrap();
+                assert!(capture(&f)
+                    .credential(
+                        "https",
+                        "gitlab.test",
+                        "forge/group/project.git",
+                        None,
+                        Caller::current()
+                    )
+                    .await
+                    .is_err());
+                f.service
+                    .gitlab_secret_store
+                    .store(SECRET_ACCOUNT, "stored-pat")
+                    .unwrap();
+            }
+            _ => caller.retire(),
+        }
+        let mut outputs = 0;
+        assert!(receipt
+            .with_current(|| {
+                outputs += 1;
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(
+            outputs, 0,
+            "original private token output after change {change}"
+        );
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_credential_final_receipt_keeps_admitted_output_and_action_error_truthful() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    capture(&f)
+        .set_current(true, Caller::current())
+        .await
+        .unwrap();
+    let acquired = capture(&f)
+        .credential(
+            "https",
+            "gitlab.test",
+            "forge/group/project.git",
+            None,
+            Caller::current(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, receipt) = acquired.into_parts();
+    let mut outputs = 0;
+    let failure = receipt.with_current(|| {
+        outputs += 1;
+        Err(CoreError::Internal("original-transfer-failure".into()))
+    });
+    assert!(
+        matches!(failure, Err(CoreError::Internal(message)) if message == "original-transfer-failure")
+    );
+    assert_eq!(outputs, 1);
+    assert!(receipt
+        .with_current(|| {
+            outputs += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(outputs, 1, "an admitted failing transfer is never retried");
+    let (_, receipt) = capture(&f)
+        .credential(
+            "https",
+            "gitlab.test",
+            "forge/group/project.git",
+            None,
+            Caller::current(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
+    receipt
+        .with_current(|| {
+            outputs += 1;
+            Ok(())
+        })
+        .unwrap();
+    f.service
+        .gitlab_revoke_owned(server.host.clone())
+        .await
+        .unwrap();
+    assert_eq!(outputs, 2, "already admitted effects are not recalled");
+    assert!(receipt
+        .with_current(|| {
+            outputs += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(outputs, 2);
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_policy_original_expected_binding_survives_verified_refresh_only() {
+    let server = Server::new().await;
+    let f = Fixture::unadopted(&server).await;
+    f.service
+        .gitlab_secret_store
+        .store(REFRESH_SECRET_ACCOUNT, "old-refresh")
+        .unwrap();
+    f.service
+        .gitlab_secret_store
+        .store(EXPIRES_AT_SECRET_ACCOUNT, "0")
+        .unwrap();
+    f.service
+        .reconcile_gitlab_repository_binding()
+        .await
+        .unwrap();
+    let original = capture(&f);
+    let status = original.status(Caller::current().as_ref()).await.unwrap();
+    let old_secret = f.request();
+    refresh_original(&f.service, &server.host).await;
+    assert_eq!(f.request().binding, old_secret.binding);
+    assert!(f.request().secret_revision > old_secret.secret_revision);
+    let choice = original
+        .set(expected(&status), true, Caller::current())
+        .await
+        .unwrap();
+    assert!(choice.enabled);
+    assert_eq!(choice.connection_generation, status.connection_generation);
+    assert_eq!(credential(&f).await.unwrap().expose_secret(), "rotated");
 }

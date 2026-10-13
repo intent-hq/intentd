@@ -1,5 +1,6 @@
 //! Account-qualified child Git choice in the original paired file. This is not
 //! public settings, a secret source, caller authority or native Git permission.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use super::{
 };
 use crate::repository_credential_writers::RepositoryWriterPreflight;
 use crate::repository_credentials::{
-    RepositoryCredentialError as Error, RepositoryMutationKind, RepositorySecretReader, Result,
+    RepositoryCredentialError as Error, RepositoryMutationKind, RepositorySecretReader,
+    RepositorySecretRequest, Result,
 };
 use crate::source_control_auth_ops::checkout::CheckoutAuthority;
 
@@ -98,19 +100,87 @@ impl RepositoryWrite {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "child policy entry is composed by Services integration"
-    )
-)]
 pub(crate) struct GitlabChildPolicyStatus {
     pub(crate) instance_base_url: String,
     pub(crate) account_id: String,
     pub(crate) connection_id: String,
+    pub(crate) connection_generation: u64,
     pub(crate) revision: u64,
     pub(crate) enabled: bool,
+}
+
+/// Caller-supplied comparison facts only; never an authority or a grant.
+#[derive(Clone)]
+pub(crate) struct GitlabChildPolicyExpected {
+    pub(crate) instance_base_url: String,
+    pub(crate) account_id: String,
+    pub(crate) connection_id: String,
+    pub(crate) connection_generation: u64,
+    pub(crate) revision: u64,
+}
+
+pub(crate) struct GitlabChildCredential {
+    token: SecretString,
+    receipt: GitlabChildCredentialReceipt,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "credential output is composed by the UDS consumer"
+    )
+)]
+impl GitlabChildCredential {
+    pub(crate) fn into_parts(self) -> (SecretString, super::GitlabChildCredentialReceipt) {
+        (self.token, self.receipt)
+    }
+}
+
+/// Original acquired metadata, without the token. R uses this directly at the
+/// final output boundary, not nested beneath the same authority a second time.
+pub(crate) struct GitlabChildCredentialReceipt {
+    original: Arc<RepositorySettledConnection>,
+    selected: RepositorySecretRequest,
+    child_revision: u64,
+    project: String,
+    authority: Arc<dyn CheckoutAuthority>,
+    consumed: AtomicBool,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "final output receipt is composed by the UDS consumer"
+    )
+)]
+impl GitlabChildCredentialReceipt {
+    pub(crate) fn with_current(
+        &self,
+        transfer: impl FnOnce() -> CoreResult<()> + Send,
+    ) -> CoreResult<()> {
+        let mut transfer = Some(transfer);
+        let mut result = None;
+        self.authority.dispatch(&mut || {
+            self.original
+                .with_child_current(
+                    Some(&self.selected),
+                    &[&self.project],
+                    true,
+                    Some(self.child_revision),
+                    |_, _| {
+                        if self.consumed.swap(true, Ordering::AcqRel) {
+                            return Err(Error::Retired);
+                        }
+                        result = Some(transfer.take().ok_or(Error::Retired)?());
+                        Ok(())
+                    },
+                )
+                .map_err(local)
+        })?;
+        result.ok_or_else(|| local(Error::AuthorityUnavailable))?
+    }
 }
 
 pub(crate) struct GitlabChildPolicyCapture {
@@ -185,6 +255,7 @@ impl GitlabChildPolicyCapture {
             instance_base_url: binding.account.instance_base_url.clone(),
             account_id: binding.account.account_id.clone(),
             connection_id: binding.scope.connection_id.clone(),
+            connection_generation: binding.scope.connection_generation,
             revision,
             enabled,
         })
@@ -220,6 +291,7 @@ impl GitlabChildPolicyCapture {
 
     pub(crate) async fn set(
         self,
+        expected: super::GitlabChildPolicyExpected,
         enabled: bool,
         authority: Arc<dyn CheckoutAuthority>,
     ) -> CoreResult<GitlabChildPolicyStatus> {
@@ -229,7 +301,15 @@ impl GitlabChildPolicyCapture {
             if mutation.is_some() {
                 return Err(local(Error::Retired));
             }
-            self.current_status()?;
+            let current = self.current_status()?;
+            if current.instance_base_url != expected.instance_base_url
+                || current.account_id != expected.account_id
+                || current.connection_id != expected.connection_id
+                || current.connection_generation != expected.connection_generation
+                || current.revision != expected.revision
+            {
+                return Err(local(Error::Retired));
+            }
             mutation = self
                 .owner
                 .writers
@@ -277,7 +357,7 @@ impl GitlabChildPolicyCapture {
         path: &str,
         username: Option<&str>,
         authority: Arc<dyn CheckoutAuthority>,
-    ) -> CoreResult<Option<SecretString>> {
+    ) -> CoreResult<Option<super::GitlabChildCredential>> {
         if !protocol.eq_ignore_ascii_case("https")
             || username.is_some_and(|v| v != "oauth2")
             || host.contains(['/', '@', '?', '#', '\\'])
@@ -357,7 +437,17 @@ impl GitlabChildPolicyCapture {
                 )
                 .map_err(local)
         })?;
-        Ok(result)
+        Ok(result.map(|token| GitlabChildCredential {
+            token,
+            receipt: GitlabChildCredentialReceipt {
+                original: self.original,
+                selected: expected,
+                child_revision: status.revision,
+                project: project.into(),
+                authority,
+                consumed: AtomicBool::new(false),
+            },
+        }))
     }
 }
 

@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod adoption;
 mod child_git;
-pub(crate) use child_git::{GitlabChildPolicyCapture, GitlabChildPolicyStatus};
+pub(crate) use child_git::{
+    GitlabChildCredential, GitlabChildCredentialReceipt, GitlabChildPolicyCapture,
+    GitlabChildPolicyExpected, GitlabChildPolicyStatus,
+};
 #[cfg(not(test))]
 mod secret_reader;
 #[cfg(test)]
