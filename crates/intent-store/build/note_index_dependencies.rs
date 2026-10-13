@@ -1,9 +1,36 @@
 //! Dependency input for the note index profile revision.
 //!
-//! Shared by `build.rs` and the crate's unit tests so the tested code is the
-//! code that produces the fingerprint input.
+//! Only dependencies that can change indexed output participate: the audited
+//! [`ROOTS`] and everything they resolve to in Cargo.lock (identity, source,
+//! checksum and edges), plus every manifest declaration that can change those
+//! packages' features. Workspace release numbers, unrelated packages and
+//! lockfile layout are ignored, so a release without index changes keeps the
+//! existing indexes. Shared by `build.rs` and the unit tests so the tested
+//! code is the code that produces the fingerprint input. Never runs cargo.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use toml::{Table, Value};
+
+/// The package whose note index output is fingerprinted.
+pub const PACKAGE: &str = "intent-store";
+
+/// Direct dependencies whose behavior reaches note index output. The index
+/// source audit test keeps this list in sync with the index sources: `sha2`
+/// only hashes the profile, `sqlx` stores rows, `uuid` mints opaque generation
+/// ids and `intent-core` is workspace code outside this fingerprint.
+pub const ROOTS: [&str; 5] = [
+    "base64",
+    "html5ever",
+    "html5gum",
+    "pulldown-cmark",
+    "serde_json",
+];
+
+/// Bump when the canonical representation below changes meaning.
+const FORMAT: &str = "note-index-dependencies:1";
+
+const HELP: &str = "update crates/intent-store/build/note_index_dependencies.rs";
 
 /// Files read from disk for the dependency profile.
 pub struct Inputs {
@@ -12,10 +39,12 @@ pub struct Inputs {
     pub watched: Vec<PathBuf>,
 }
 
-/// Locate the lockfile governing `manifest_dir`.
+/// Read the lockfile governing `manifest_dir` and every manifest of its
+/// workspace (all can unify features of the fingerprinted packages).
 ///
 /// # Errors
-/// Returns an actionable message when a required file is missing or unreadable.
+/// Returns an actionable message when a required file is missing, unreadable
+/// or the workspace layout cannot be resolved without running cargo.
 pub fn collect(manifest_dir: &Path) -> Result<Inputs, String> {
     // Workspace builds use the root lock; cargo package verification has its own
     // lock next to the extracted manifest. Never depend on the checkout layout.
@@ -23,13 +52,124 @@ pub fn collect(manifest_dir: &Path) -> Result<Inputs, String> {
         .ancestors()
         .map(|directory| directory.join("Cargo.lock"))
         .find(|path| path.is_file())
-        .ok_or("Cargo.lock is required for the note index profile revision")?;
-    let lock = read(&lock_path)?;
+        .ok_or("note index profile: Cargo.lock is required next to or above the crate")?;
+    let root = lock_path
+        .parent()
+        .ok_or("note index profile: Cargo.lock has no parent directory")?;
+    let root_manifest = root.join("Cargo.toml");
+    let root_text = read(&root_manifest)?;
+    let root_table = parse_toml(&root_text, &root_manifest.display().to_string())?;
+    let mut paths = vec![root_manifest];
+    if let Some(workspace) = root_table.get("workspace") {
+        paths.extend(workspace_members(root, workspace)?);
+    } else if !same_path(root, manifest_dir)? {
+        return Err(format!(
+            "note index profile: {} has no [workspace] but governs {}; cannot resolve the workspace without cargo",
+            root.display(),
+            manifest_dir.display()
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    paths.retain(|path| seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())));
+    let own = manifest_dir.join("Cargo.toml");
+    if !paths
+        .iter()
+        .any(|path| same_path(path, &own).unwrap_or(false))
+    {
+        return Err(format!(
+            "note index profile: {} is not a member of the workspace at {}",
+            own.display(),
+            root.display()
+        ));
+    }
+    let manifests = paths
+        .iter()
+        .map(|path| read(path))
+        .collect::<Result<_, _>>()?;
+    let mut watched = vec![lock_path.clone()];
+    watched.extend(paths);
     Ok(Inputs {
-        lock,
-        manifests: Vec::new(),
-        watched: vec![lock_path],
+        lock: read(&lock_path)?,
+        manifests,
+        watched,
     })
+}
+
+fn workspace_members(root: &Path, workspace: &Value) -> Result<Vec<PathBuf>, String> {
+    let strings = |key: &str| -> Result<Vec<String>, String> {
+        match workspace.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        format!("note index profile: workspace.{key} must contain strings")
+                    })
+                })
+                .collect(),
+            Some(_) => Err(format!(
+                "note index profile: workspace.{key} must be an array"
+            )),
+        }
+    };
+    let excluded: Vec<PathBuf> = strings("exclude")?
+        .iter()
+        .map(|path| root.join(path))
+        .collect();
+    let mut members = Vec::new();
+    for pattern in strings("members")? {
+        let (directory, glob) = match pattern.strip_suffix("/*") {
+            Some(prefix) => (prefix, true),
+            None => (pattern.as_str(), false),
+        };
+        if directory.contains(['*', '?', '[', ']']) {
+            return Err(format!(
+                "note index profile: unsupported workspace member pattern `{pattern}`; {HELP}"
+            ));
+        }
+        let directory = root.join(directory);
+        let mut candidates = Vec::new();
+        if glob {
+            let entries = std::fs::read_dir(&directory).map_err(|error| {
+                format!(
+                    "note index profile: cannot list {}: {error}",
+                    directory.display()
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!(
+                        "note index profile: cannot list {}: {error}",
+                        directory.display()
+                    )
+                })?;
+                if entry.path().join("Cargo.toml").is_file() {
+                    candidates.push(entry.path());
+                }
+            }
+            candidates.sort();
+        } else {
+            candidates.push(directory);
+        }
+        for candidate in candidates {
+            if !excluded.iter().any(|path| candidate.starts_with(path)) {
+                members.push(candidate.join("Cargo.toml"));
+            }
+        }
+    }
+    Ok(members)
+}
+
+fn same_path(left: &Path, right: &Path) -> Result<bool, String> {
+    let canonical = |path: &Path| {
+        path.canonicalize().map_err(|error| {
+            format!(
+                "note index profile: cannot resolve {}: {error}",
+                path.display()
+            )
+        })
+    };
+    Ok(canonical(left)? == canonical(right)?)
 }
 
 fn read(path: &Path) -> Result<String, String> {
@@ -41,10 +181,359 @@ fn read(path: &Path) -> Result<String, String> {
     })
 }
 
+fn parse_toml(text: &str, label: &str) -> Result<Table, String> {
+    text.parse::<Table>()
+        .map_err(|error| format!("note index profile: cannot parse {label}: {error}"))
+}
+
+struct Package {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+    dependencies: Vec<String>,
+}
+
+impl Package {
+    fn id(&self) -> String {
+        format!(
+            "{} {} ({})",
+            self.name,
+            self.version,
+            self.source.as_deref().unwrap_or("path")
+        )
+    }
+}
+
 /// Canonical dependency profile text hashed into the note index profile.
 ///
 /// # Errors
-/// Returns an actionable message for malformed or ambiguous inputs.
-pub fn dependency_profile(lock: &str, _manifests: &[&str]) -> Result<String, String> {
-    Ok(lock.to_owned())
+/// Returns an actionable message for malformed, ambiguous or unsupported
+/// lockfile or manifest data; inputs are never silently omitted.
+pub fn dependency_profile(lock: &str, manifests: &[&str]) -> Result<String, String> {
+    let packages = parse_lock(lock)?;
+    let own = own_package(&packages)?;
+    let mut lines = BTreeSet::new();
+    let mut closure = BTreeSet::new();
+    let mut pending = Vec::new();
+    for root in ROOTS {
+        let entries: Vec<&String> = packages[own]
+            .dependencies
+            .iter()
+            .filter(|entry| entry_name(entry) == root)
+            .collect();
+        let [entry] = entries[..] else {
+            return Err(format!(
+                "note index profile: {PACKAGE} must resolve exactly one `{root}` in Cargo.lock, found {}; {HELP}",
+                entries.len()
+            ));
+        };
+        let index = resolve(&packages, entry)?;
+        lines.insert(format!("root {root} -> {}", packages[index].id()));
+        pending.push(index);
+    }
+    while let Some(index) = pending.pop() {
+        if !closure.insert(index) {
+            continue;
+        }
+        for entry in &packages[index].dependencies {
+            let dependency = resolve(&packages, entry)?;
+            lines.insert(format!(
+                "edge {} -> {}",
+                packages[index].id(),
+                packages[dependency].id()
+            ));
+            pending.push(dependency);
+        }
+    }
+    for &index in &closure {
+        lines.insert(package_line(&packages[index])?);
+    }
+    let names: BTreeSet<&str> = closure
+        .iter()
+        .map(|&index| packages[index].name.as_str())
+        .collect();
+    for (position, manifest) in manifests.iter().enumerate() {
+        let label = format!("workspace manifest #{position}");
+        declarations(&parse_toml(manifest, &label)?, &label, &names, &mut lines)?;
+    }
+    let mut out = String::from(FORMAT);
+    for line in lines {
+        out.push('\n');
+        out.push_str(&line);
+    }
+    out.push('\n');
+    Ok(out)
+}
+
+fn parse_lock(lock: &str) -> Result<Vec<Package>, String> {
+    let table = parse_toml(lock, "Cargo.lock")?;
+    match table.get("version").and_then(Value::as_integer) {
+        Some(3 | 4) => {}
+        other => {
+            return Err(format!(
+                "note index profile: unsupported Cargo.lock format version {other:?} (expected 3 or 4 with per-package checksums); {HELP}"
+            ))
+        }
+    }
+    let Some(Value::Array(entries)) = table.get("package") else {
+        return Err("note index profile: Cargo.lock has no [[package]] entries".into());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry
+                .as_table()
+                .ok_or("note index profile: Cargo.lock [[package]] must be a table")?;
+            let text = |key: &str| -> Result<Option<String>, String> {
+                match entry.get(key) {
+                    None => Ok(None),
+                    Some(Value::String(value)) => Ok(Some(value.clone())),
+                    Some(_) => Err(format!(
+                        "note index profile: Cargo.lock package field `{key}` must be a string"
+                    )),
+                }
+            };
+            let required = |key: &str| {
+                text(key)?.ok_or_else(|| {
+                    format!("note index profile: Cargo.lock package is missing `{key}`")
+                })
+            };
+            let dependencies = match entry.get("dependencies") {
+                None => Vec::new(),
+                Some(Value::Array(values)) => values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            "note index profile: Cargo.lock dependencies must be strings".to_owned()
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => {
+                    return Err(
+                        "note index profile: Cargo.lock dependencies must be an array".into(),
+                    )
+                }
+            };
+            Ok(Package {
+                name: required("name")?,
+                version: required("version")?,
+                source: text("source")?,
+                checksum: text("checksum")?,
+                dependencies,
+            })
+        })
+        .collect()
+}
+
+fn own_package(packages: &[Package]) -> Result<usize, String> {
+    let matches: Vec<usize> = (0..packages.len())
+        .filter(|&index| packages[index].name == PACKAGE && packages[index].source.is_none())
+        .collect();
+    match matches[..] {
+        [index] => Ok(index),
+        _ => Err(format!(
+            "note index profile: Cargo.lock must contain exactly one local `{PACKAGE}` package, found {}",
+            matches.len()
+        )),
+    }
+}
+
+fn entry_name(entry: &str) -> &str {
+    entry.split(' ').next().unwrap_or(entry)
+}
+
+/// Resolve a Cargo.lock dependency reference: `name`, `name version` or
+/// `name version (source)`. Cargo adds the qualifiers only when needed to
+/// disambiguate, so anything other than exactly one match is an error.
+fn resolve(packages: &[Package], entry: &str) -> Result<usize, String> {
+    let mut parts = entry.splitn(3, ' ');
+    let name = parts.next().unwrap_or_default();
+    let version = parts.next();
+    let source = match parts.next() {
+        None => None,
+        Some(source) => Some(
+            source
+                .strip_prefix('(')
+                .and_then(|source| source.strip_suffix(')'))
+                .ok_or_else(|| {
+                    format!("note index profile: malformed Cargo.lock dependency `{entry}`")
+                })?,
+        ),
+    };
+    let matches: Vec<usize> = (0..packages.len())
+        .filter(|&index| {
+            let package = &packages[index];
+            package.name == name
+                && version.is_none_or(|version| package.version == version)
+                && source.is_none_or(|source| package.source.as_deref() == Some(source))
+        })
+        .collect();
+    match matches[..] {
+        [index] => Ok(index),
+        _ => Err(format!(
+            "note index profile: Cargo.lock dependency `{entry}` matches {} packages; regenerate Cargo.lock",
+            matches.len()
+        )),
+    }
+}
+
+fn package_line(package: &Package) -> Result<String, String> {
+    let id = package.id();
+    match package.source.as_deref() {
+        None => Err(format!(
+            "note index profile: path or workspace package `{id}` is in the note index dependency graph and its sources are not fingerprinted; {HELP}"
+        )),
+        Some(source) if source.starts_with("registry+") || source.starts_with("sparse+") => {
+            match package.checksum.as_deref() {
+                Some(checksum) if !checksum.is_empty() => {
+                    Ok(format!("package {id} checksum={checksum}"))
+                }
+                _ => Err(format!(
+                    "note index profile: registry package `{id}` has no checksum in Cargo.lock; regenerate Cargo.lock"
+                )),
+            }
+        }
+        Some(source) if source.starts_with("git+") => match source.rsplit_once('#') {
+            Some((_, commit)) if !commit.is_empty() => Ok(format!("package {id}")),
+            _ => Err(format!(
+                "note index profile: git package `{id}` has no pinned commit in Cargo.lock"
+            )),
+        },
+        Some(_) => Err(format!(
+            "note index profile: unsupported source for `{id}`; {HELP}"
+        )),
+    }
+}
+
+/// Record manifest settings that can change features of fingerprinted
+/// packages. Version requirements are omitted: Cargo.lock pins resolution.
+fn declarations(
+    manifest: &Table,
+    label: &str,
+    names: &BTreeSet<&str>,
+    lines: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let mut sections: Vec<(String, &Value)> = Vec::new();
+    for kind in [
+        "dependencies",
+        "dev-dependencies",
+        "dev_dependencies",
+        "build-dependencies",
+        "build_dependencies",
+    ] {
+        if let Some(section) = manifest.get(kind) {
+            sections.push((kind.to_owned(), section));
+        }
+        if let Some(Value::Table(targets)) = manifest.get("target") {
+            for (target, table) in targets {
+                if let Some(section) = table.get(kind) {
+                    sections.push((format!("target.{target}.{kind}"), section));
+                }
+            }
+        }
+    }
+    if let Some(section) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
+    {
+        sections.push(("workspace.dependencies".to_owned(), section));
+    }
+    let mut keys = BTreeMap::new();
+    for (section, value) in sections {
+        let table = value
+            .as_table()
+            .ok_or_else(|| format!("note index profile: {label} [{section}] must be a table"))?;
+        for (key, spec) in table {
+            let package = spec
+                .get("package")
+                .map(|package| {
+                    package.as_str().ok_or_else(|| {
+                        format!(
+                            "note index profile: {label} {section}.{key}.package must be a string"
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or(key);
+            keys.insert(key.clone(), package.to_owned());
+            if names.contains(package) {
+                lines.insert(format!(
+                    "declare {section} {package} {}",
+                    declaration(spec).map_err(|error| format!(
+                        "note index profile: {label} {section}.{key}: {error}"
+                    ))?
+                ));
+            }
+        }
+    }
+    let Some(features) = manifest.get("features") else {
+        return Ok(());
+    };
+    let features = features
+        .as_table()
+        .ok_or_else(|| format!("note index profile: {label} [features] must be a table"))?;
+    for (feature, values) in features {
+        let values = values.as_array().ok_or_else(|| {
+            format!("note index profile: {label} features.{feature} must be an array")
+        })?;
+        for value in values {
+            let value = value.as_str().ok_or_else(|| {
+                format!("note index profile: {label} features.{feature} must contain strings")
+            })?;
+            let key = value.strip_prefix("dep:").unwrap_or(value);
+            let key = key.split('/').next().unwrap_or(key).trim_end_matches('?');
+            if let Some(package) = keys
+                .get(key)
+                .filter(|package| names.contains(package.as_str()))
+            {
+                lines.insert(format!("feature {package} {value}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn declaration(spec: &Value) -> Result<String, String> {
+    let Value::Table(spec) = spec else {
+        return match spec {
+            Value::String(_) => {
+                Ok("default=absent optional=absent workspace=absent features=[]".into())
+            }
+            _ => Err("dependency must be a string or table".into()),
+        };
+    };
+    let flag = |keys: &[&str]| -> Result<String, String> {
+        let mut found = None;
+        for key in keys {
+            match spec.get(*key) {
+                None => {}
+                Some(Value::Boolean(value)) if found.is_none() => found = Some(*value),
+                Some(_) => return Err(format!("`{key}` must be a single boolean")),
+            }
+        }
+        Ok(found.map_or_else(|| "absent".to_owned(), |value| value.to_string()))
+    };
+    let mut features = match spec.get("features") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "features must contain strings".to_owned())
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("features must be an array".into()),
+    };
+    features.sort();
+    features.dedup();
+    Ok(format!(
+        "default={} optional={} workspace={} features=[{}]",
+        flag(&["default-features", "default_features"])?,
+        flag(&["optional"])?,
+        flag(&["workspace"])?,
+        features.join(",")
+    ))
 }
