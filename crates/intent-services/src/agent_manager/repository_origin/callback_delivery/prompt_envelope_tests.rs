@@ -651,3 +651,436 @@ async fn prompt_envelope_old_outbound_turn_resume_recovery_and_tools_keep_pinned
         h.finish().await;
     }
 }
+
+#[cfg(unix)]
+mod config_file_delivery {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // This child consumes the real Auggie argv and generated files. It speaks
+    // scripted ordinary ACP, not the Auggie CLI/SDK, and cannot spawn children.
+    // Native package acceptance and the fresh-start version-discovery path are
+    // separate: that discovery probes all installed Auggie candidates.
+    async fn harness(legacy: bool) -> Harness {
+        let git = GitFixture::new().await;
+        let logs = git.dir.path();
+        let script = logs.join("config-consumer.mjs");
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../intentd/tests/fixtures/mock-acp-agent.mjs"),
+        )
+        .unwrap();
+        assert_eq!(
+            source
+                .matches("const SESSION_ID = 'mock-session-1';")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("case 'session/load':").count(), 1);
+        let prelude = r"
+import assert from 'node:assert/strict';
+assert.equal(process.permission.has('child'), false);
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CONFIG_ATTEMPTS_LOG, JSON.stringify(args) + '\n');
+assert(args.includes('--acp') && args.includes('--allow-indexing'));
+assert(!args.includes('--version'));
+const argument = flag => {
+  assert.equal(args.filter(arg => arg === flag).length, 1);
+  const value = args[args.indexOf(flag) + 1];
+  assert(value && !value.startsWith('--'));
+  return value;
+};
+const rulesPath = argument('--rules');
+const mcpPath = argument('--mcp-config');
+const rules = fs.readFileSync(rulesPath, 'utf8');
+const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
+assert(mcp.mcpServers['workspace-mcp']);
+assert(rules.length > 0);
+fs.appendFileSync(process.env.CONFIG_CONSUMER_LOG, JSON.stringify({
+  rulesPath, mcpPath, rules, mcp, argv:args, node:process.version,
+  pid:process.pid, childAllowed:process.permission.has('child')
+}) + '\n');
+let SESSION_ID = `config-session-${process.pid}`;
+";
+        std::fs::write(
+            &script,
+            source
+                .replace("const SESSION_ID = 'mock-session-1';", prelude)
+                .replace(
+                    "case 'session/load':",
+                    "case 'session/load':\nSESSION_ID = msg.params.sessionId;",
+                ),
+        )
+        .unwrap();
+        let node = intent_providers::find_node().expect("Node permission-model prerequisite");
+        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        let launcher = logs.join("scripted-config-consumer");
+        // Pass only fixture inputs; do not inherit account or provider settings
+        // into the scripted executable. The Node permission model rejects any
+        // accidental bridge/provider child spawn in the existing fixture.
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/env -i LANG=C.UTF-8 NODE_DISABLE_COMPILE_CACHE=1 \
+                 DD_TRACE_ENABLED=false DD_INJECTION_ENABLED=false DD_INSTRUMENT_SERVICE_WITH_APM=false \
+                 DD_INJECT_NATIVE=never DD_INSTRUMENTATION_TELEMETRY_ENABLED=false \
+                 MOCK_AGENT_BEHAVIOR='{{\"loadSession\":true,\"response\":\"config completion\"}}' \
+                 MOCK_AGENT_RPC_LOG={} MOCK_AGENT_PROMPT_LOG={} MOCK_AGENT_SESSION_LOG={} \
+                 CONFIG_CONSUMER_LOG={} CONFIG_ATTEMPTS_LOG={} {} --permission --allow-fs-read={} --allow-fs-write={} {} \"$@\"\n",
+                quote(&logs.join("rpc.jsonl")),
+                quote(&logs.join("prompts.jsonl")),
+                quote(&logs.join("sessions.jsonl")),
+                quote(&logs.join("config-consumed.jsonl")),
+                quote(&logs.join("config-attempts.jsonl")),
+                quote(&node),
+                quote(logs),
+                quote(logs),
+                quote(&script),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let env = crate::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_CONFIG_GLOBAL", logs.join("global").to_str()),
+            ("GIT_CONFIG_SYSTEM", logs.join("system").to_str()),
+            ("GIT_CONFIG_COUNT", None),
+            ("GIT_DIR", None),
+            ("GIT_WORK_TREE", None),
+            ("GIT_COMMON_DIR", None),
+        ]);
+        let registry = Arc::new(crate::SettingsRegistry::load(logs.join("config.toml")).unwrap());
+        registry
+            .apply(&[
+                ("model.defaultProvider".into(), json!("auggie")),
+                ("providers.paths".into(), json!({"auggie":launcher})),
+                (
+                    "sourceControl.github.exposeGitCredentialToChildren".into(),
+                    json!(false),
+                ),
+            ])
+            .unwrap();
+        let bus = EventBus::new(git.store.clone());
+        let services = Arc::new(
+            Services::new_with_file_secrets(
+                git.store.clone(),
+                FileSecretStore::with_path(logs.join("secrets.json")),
+            )
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone())
+            .with_workspaces_root(logs.join("workspaces")),
+        );
+        services
+            .initialize_gitlab_repository_binding()
+            .await
+            .unwrap();
+        let row = if legacy {
+            let row: AgentSession = serde_json::from_value(json!({
+                "id":AgentId::new(),"workspaceId":git.workspace.id,
+                "name":"saved config-file session","provider":"auggie","status":"idle",
+                "harnessVersion":"3.1","harnessFeatures":{"stateSnapshot":false},
+                "createdAt":"2026-09-27T00:00:00Z","updatedAt":"2026-09-27T00:00:00Z"
+            }))
+            .unwrap();
+            services.store.insert_agent_session(&row).await.unwrap();
+            row
+        } else {
+            let created = services
+                .agent_create_op(
+                    git.workspace.id.clone(),
+                    Some("config-file session".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    intent_core::AgentCreateExtra {
+                        provider: Some("auggie".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(created["agent"]["harnessVersion"], "3.2");
+            services
+                .store
+                .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
+                .await
+                .unwrap()
+        };
+        let manager = Arc::new(
+            AgentManager::new(
+                services.as_ref().clone(),
+                Arc::new(BusEventSink::new(bus)),
+                4,
+            )
+            .with_mcp_bridge_exe(logs.join("unexecuted-native-bridge"))
+            .with_agent_config_root(logs.join("agent-config")),
+        );
+        services.attach_agent_manager(&manager);
+        Harness {
+            git,
+            services,
+            manager,
+            row,
+            _env: env,
+        }
+    }
+
+    async fn create_and_start(h: &Harness) -> StartedSession {
+        let manager = h.manager.clone();
+        let id = h.row.id.clone();
+        h.daemon(async move {
+            let row = manager.services.store.get_agent_session(&id).await.unwrap();
+            let workspace = manager
+                .services
+                .store
+                .get_workspace(&row.workspace_id)
+                .await
+                .unwrap();
+            let settings = manager.services.effective_settings();
+            let resolved =
+                crate::agent_manager::resolve_spawn(&row, Some(&workspace), &settings, None)
+                    .unwrap();
+            assert_eq!(resolved.provider.id, "auggie");
+            assert_eq!(
+                resolved.provider.injection_mechanism,
+                intent_providers::InjectionMechanism::RulesFileFlag
+            );
+            assert!(resolved.npx_fallback_binary.is_none());
+            let mut opts = intent_acp::SpawnOptions::new(&resolved.provider);
+            opts.cwd = Some(&resolved.cwd);
+            opts.model = resolved.model.as_deref();
+            opts.provider_binary = resolved.provider_binary.as_deref();
+            opts.extra_env = resolved.extra_env;
+            // The public creator installs the actual original manager handle;
+            // no handle/Connection/provider config or caller is injected.
+            manager
+                .create_agent(
+                    row.id.clone(),
+                    row.workspace_id,
+                    row.name,
+                    "default",
+                    resolved.cwd.clone(),
+                    &opts,
+                )
+                .await
+                .unwrap();
+            // A newly created process must initialize/load before the normal
+            // reuse path may consult its stored ACP id. Use the same owning
+            // session-open subpath as ensure_started, retaining its capture.
+            manager
+                .start_session_owned(&row.id, resolved.cwd.clone(), &resolved.provider)
+                .await
+                .unwrap()
+        })
+        .await
+    }
+
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "compare generated config to the original owned bridge"
+    )]
+    async fn assert_consumed(h: &Harness, expected: usize) -> (String, String) {
+        let records = h.records("config-consumed.jsonl");
+        assert_eq!(records.len(), expected);
+        let record = records.last().unwrap();
+        assert_eq!(record["childAllowed"], false);
+        let stored = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        assert_eq!(record["rules"].as_str(), stored.system_prompt.as_deref());
+        assert!(!record["rules"].as_str().unwrap().contains(FACTS));
+        let address = h.manager.handles.lock().unwrap()[&h.row.id]
+            .execution
+            .local
+            .as_ref()
+            .unwrap()
+            .resources
+            .lock()
+            .unwrap()
+            ._mcp_bridge
+            .as_ref()
+            .unwrap()
+            .connect_addr();
+        let server = &record["mcp"]["mcpServers"]["workspace-mcp"];
+        assert_eq!(
+            server["command"],
+            h.git
+                .dir
+                .path()
+                .join("unexecuted-native-bridge")
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(server["args"], json!(["mcp-bridge", "--connect", address]));
+        let origin = h.origin();
+        let (endpoint_absent, context) = {
+            let state = origin.state.lock().unwrap();
+            (state.endpoint.is_none(), state.prompt_context.clone())
+        };
+        assert!(endpoint_absent);
+        if stored.harness_version == "3.2" {
+            let context = context.expect("initialized original prompt owner");
+            assert!(!context.acknowledged.load(Ordering::SeqCst));
+            assert!(!context.requires_callback_ack);
+            assert!(context.owner.is_ok());
+        } else {
+            assert!(context.is_none());
+        }
+        (
+            record["rulesPath"].as_str().unwrap().into(),
+            record["mcpPath"].as_str().unwrap().into(),
+        )
+    }
+
+    async fn turn(h: &Harness, text: &str) {
+        let connection = h.manager.handles.lock().unwrap()[&h.row.id]
+            .execution
+            .connection()
+            .unwrap();
+        let manager = h.manager.clone();
+        let row = h.row.clone();
+        let started = h
+            .daemon(async move {
+                manager
+                    .ensure_started_owned(&row.id, &row.workspace_id)
+                    .await
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "config-file startup: {error}; {:?}",
+                    connection.recent_stderr()
+                )
+            });
+        h.dispatch(started, text).await.unwrap_or_else(|error| {
+            panic!(
+                "config-file prompt: {error}; {:?}",
+                connection.recent_stderr()
+            )
+        });
+    }
+
+    async fn exercise(legacy: bool) {
+        let h = harness(legacy).await;
+        let started = create_and_start(&h).await;
+        h.dispatch(started, "initial config-file turn")
+            .await
+            .unwrap();
+        let first_files = assert_consumed(&h, 1).await;
+        let before = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        let origin = h.origin();
+        let connection = h.manager.handles.lock().unwrap()[&h.row.id]
+            .execution
+            .connection()
+            .unwrap();
+        h.git.git(
+            &h.git.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/team/config-project.git",
+            ],
+        );
+        turn(&h, "same-child continuation after remote change").await;
+        assert_eq!(assert_consumed(&h, 1).await, first_files);
+        assert!(Arc::ptr_eq(&h.origin(), &origin));
+        assert!(Arc::ptr_eq(
+            &h.manager.handles.lock().unwrap()[&h.row.id]
+                .execution
+                .connection()
+                .unwrap(),
+            &connection
+        ));
+        let tool = h.tool("return 'ordinary config-file tool output'").await;
+        assert!(tool
+            .to_string()
+            .contains("ordinary config-file tool output"));
+        assert!(!tool.to_string().contains(FACTS));
+        assert!(!tool.to_string().contains(POLICY));
+        for iteration in [2, 3] {
+            h.retire().await;
+            assert!(!Path::new(&first_files.0).exists());
+            assert!(!Path::new(&first_files.1).exists());
+            if iteration == 3 {
+                h.manager
+                    .force_recreate
+                    .lock()
+                    .unwrap()
+                    .insert(h.row.id.clone());
+            }
+            let started = create_and_start(&h).await;
+            h.dispatch(
+                started,
+                if iteration == 2 {
+                    "saved config-file resume"
+                } else {
+                    "config-file recovery"
+                },
+            )
+            .await
+            .unwrap();
+            assert_ne!(assert_consumed(&h, iteration).await, first_files);
+            assert!(!Arc::ptr_eq(&h.origin(), &origin));
+        }
+        let attempts = h.records("config-attempts.jsonl");
+        assert_eq!(attempts.len(), 3, "only the three configured child starts");
+        assert!(attempts
+            .iter()
+            .all(|args| !args.as_array().unwrap().contains(&json!("--version"))));
+        let sessions = h.records("sessions.jsonl");
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["session/new", "session/load", "session/new"]
+        );
+        assert_eq!(sessions[0]["sessionId"], sessions[1]["sessionId"]);
+        assert_ne!(sessions[1]["sessionId"], sessions[2]["sessionId"]);
+        let prompts = h.records("prompts.jsonl");
+        assert_eq!(prompts.len(), 4);
+        if legacy {
+            assert!(h.guidance().is_empty());
+            for record in h
+                .records("rpc.jsonl")
+                .into_iter()
+                .chain(h.records("config-consumed.jsonl"))
+            {
+                assert!(!record.to_string().contains(FACTS));
+                assert!(!record
+                    .to_string()
+                    .contains("[Repository guidance — harness 3.2]"));
+            }
+        } else {
+            let guidance = h.guidance();
+            assert_eq!(guidance.len(), 4);
+            assert_eq!(root_facts(&guidance[0])["targets"], json!([]));
+            for text in &guidance[1..] {
+                assert!(text.starts_with(POLICY));
+                assert_github_facts(&root_facts(text)["targets"][0], "team/config-project");
+            }
+        }
+        assert!(h
+            .records("rpc.jsonl")
+            .iter()
+            .all(|r| r["method"] != "_intent/session/register_mcp_callback"));
+        let after = h.services.store.get_agent_session(&h.row.id).await.unwrap();
+        assert_eq!(after.harness_version, before.harness_version);
+        assert_eq!(after.harness_features, before.harness_features);
+        assert_eq!(after.system_prompt, before.system_prompt);
+        let final_files = assert_consumed(&h, 3).await;
+        h.finish().await;
+        assert!(!Path::new(&final_files.0).exists());
+        assert!(!Path::new(&final_files.1).exists());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prompt_config_file_created_auggie_turn_resume_recovery() {
+        exercise(false).await;
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn prompt_config_file_saved_auggie_excludes_new_guidance() {
+        exercise(true).await;
+    }
+}
