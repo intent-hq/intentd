@@ -33,7 +33,7 @@ use crate::observation_adapter::{
 use crate::observation_policy::{Coverage, Ineligible};
 
 use super::{
-    retain_pr_cache, PrCache, PrFingerprint, PrKey, PrReadPolicy, PR_MONITOR_MAX_CHEAP_AGE,
+    PrCache, PrFingerprint, PrKey, PrReadPolicy, PR_MONITOR_MAX_CHEAP_AGE,
     PR_MONITOR_MAX_CHEAP_POLLS,
 };
 
@@ -1110,6 +1110,20 @@ pub(crate) fn retain<K: Clone + Eq + Hash, L, T>(
             cache.remove(&key);
         }
     }
+}
+
+/// Collection callers use the existing PR retention policy under the map lock.
+pub(crate) fn retain_pr_cache(
+    cache: &mut CacheMap<PrKey, super::LegacyPrCacheSlot, ReviewObservation>,
+    monitored: &HashSet<PrKey>,
+    now: Instant,
+) {
+    super::retain_pr_cache(cache, monitored, now);
+}
+
+/// Load the existing monitor exemptions before entering cache/provider guards.
+pub(crate) async fn monitored_review_keys(services: &crate::Services) -> HashSet<PrKey> {
+    services.monitored_pr_keys().await
 }
 
 /// Qualified review read with the legacy cheap-poll bounds and fingerprint.

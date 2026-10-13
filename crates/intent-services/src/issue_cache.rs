@@ -87,7 +87,10 @@ fn store_issue(cache: &IssueCache, key: IssueKey, issue: Issue) {
 /// read [`ISSUE_CACHE_MAX_IDLE`] ago or earlier are dropped, then the rest
 /// are bounded by [`ISSUE_CACHE_MAX_ENTRIES`], evicting the oldest
 /// `fetched_at` first.
-fn retain_issue_cache(cache: &mut CacheMap<IssueKey, IssueCacheEntry, Issue>, now: Instant) {
+pub(crate) fn retain_issue_cache(
+    cache: &mut CacheMap<IssueKey, IssueCacheEntry, Issue>,
+    now: Instant,
+) {
     qualified_cache::retain(
         cache,
         |entry| Some(entry.fetched_at),
