@@ -107,15 +107,32 @@ class ConsumerTests(unittest.TestCase):
             root = Path(temporary)
             compiler = root / 'MSVC/cl.exe'
             compiler.parent.mkdir()
-            compiler.touch()
+            compiler.touch(); compiler.chmod(0o755)
+            shadow = root / 'Git/usr/bin'; shadow.mkdir(parents=True)
+            for name in ('link', 'link.exe', 'dumpbin.exe'):
+                tool = shadow / name
+                tool.write_text('#!/bin/sh\nexit 91\n'); tool.chmod(0o755)
             linker = compiler.with_name('link.exe'); linker.touch()
             dumpbin = compiler.with_name('dumpbin.exe'); dumpbin.touch()
-            with patch.object(self.native.shutil, 'which', return_value=str(compiler)):
+            with patch.dict(os.environ, {'PATH': str(shadow) + os.pathsep + str(compiler.parent)}):
                 self.assertEqual(self.native.msvc_tool('link'), str(linker))
                 self.assertEqual(self.native.msvc_tool('dumpbin'), str(dumpbin))
                 linker.unlink()
                 with self.assertRaisesRegex(RuntimeError, 'MSVC'):
                     self.native.msvc_tool('link')
+
+    def test_dependency_inspection_uses_the_provisioned_msvc_tool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'System32').mkdir()
+            (root / 'System32/KERNEL32.dll').touch()
+            binary = root / 'fixture.exe'; binary.touch()
+            with patch.dict(os.environ, {'SystemRoot': str(root), 'DUMPBIN': str(root / 'MSVC/dumpbin.exe')}), \
+                 patch.object(archives.sys, 'platform', 'win32'), \
+                 patch.object(archives, 'output', return_value='    KERNEL32.dll\n') as output:
+                archives.stage_binary_libraries(binary, root)
+                self.assertEqual(output.call_args.args[0][0], str(root / 'MSVC/dumpbin.exe'))
+                self.assertEqual(archives.build_environment()['DUMPBIN'], str(root / 'MSVC/dumpbin.exe'))
 
     def test_windows_tripwires_are_executables_not_cmd_fallbacks(self):
         with tempfile.TemporaryDirectory() as temporary:

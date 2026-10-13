@@ -98,7 +98,8 @@ def platform_facts(native_platform):
     elif native_platform == 'windows':
         cc = probe([msvc_tool('cl')], codes=(0, 2))
         linker = probe([msvc_tool('link'), '/?'])
-        probe([msvc_tool('dumpbin'), '/?'])
+        os.environ['DUMPBIN'] = msvc_tool('dumpbin')
+        probe([os.environ['DUMPBIN'], '/?'])
         os.environ['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'] = msvc_tool('link')
         required = ('VCToolsVersion', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')
         if any(not os.environ.get(name) for name in required):
