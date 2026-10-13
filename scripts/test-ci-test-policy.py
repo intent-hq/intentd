@@ -24,16 +24,17 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "daemon-lifecycle", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
 INDIRECT_TEST_STEPS = {
-    ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"),
+    ("daemon-lifecycle", "Tunnel deadline and TLS controls (macOS runtime)"),
+    ("daemon-lifecycle", "Retained workspace CoW fixtures (macOS runtime)"),
 }
 COMMAND = re.compile(
     r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
+    r"|python3 (?:-[IB] )*scripts/(?:ci-native-artifacts\.py libtest|test-daemon-lifecycle\.py --archives)\b"
     r"|\./scripts/(?:coverage-e2e|coverage-all|changed-tests)\.sh\b)"
 )
 
@@ -95,11 +96,12 @@ REQUIRED_TEST_STEPS = {
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
-    ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
-    ("build", "Headless workspace setup (Windows runtime)"): 1,
-    ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
-    ("build", "Codex focused diagnostics (macOS runtime)"): 2,
+    ("daemon-lifecycle", "Tunnel deadline and TLS controls (macOS runtime)"): None,
+    ("daemon-lifecycle", "Retained workspace CoW fixtures (macOS runtime)"): None,
+    ("daemon-lifecycle", "Native lifecycle runtime proof"): 1,
+    ("daemon-lifecycle", "Headless workspace setup (Windows runtime)"): 1,
+    ("daemon-lifecycle", "Codex diagnostic process ownership (Windows runtime)"): 1,
+    ("daemon-lifecycle", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,
     ("coverage-changed", "Run changed tests under llvm-cov"): 1,
@@ -151,9 +153,9 @@ class CiPolicyTests(unittest.TestCase):
                           "Retained workspace CoW fixtures (macOS runtime)"):
             with self.subTest(step=step_name):
                 workflow = copy.deepcopy(self.workflow)
-                step = next(s for s in workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                step = next(s for s in workflow['jobs']['daemon-lifecycle']['steps'] if s.get('name') == step_name)
                 step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
-                self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
+                self.assertIn(f"daemon-lifecycle: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
     def test_callback_scope_changes_select_validation_without_rust_changes(self):
         job = self.workflow["jobs"]["coverage-changed"]
@@ -252,7 +254,7 @@ else:
                     }))
                     result = subprocess.run(["bash", "-c", step["run"]], env=env, cwd=ROOT,
                                             capture_output=True, text=True, timeout=10)
-                    calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+                    calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()] if (root / "calls.jsonl").exists() else []
                     executions = [c for c in calls if c["args"][:3] == ["llvm-cov", "--no-report", "nextest"]]
                     self.assertEqual(result.returncode == 0, mode == "valid" or (mode == "metadata-failure" and override), result.stderr)
                     if mode not in ("valid", "run-failure") and not (mode == "metadata-failure" and override):
@@ -285,7 +287,8 @@ else:
         ):
             with self.subTest(step=step_name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                stub = root / "rustup"
+                (root / "scripts").mkdir()
+                stub = root / "scripts/ci-native-artifacts.py"
                 stub.write_text(
                     f"#!{sys.executable} -S\n"
                     "import json,os,sys\n"
@@ -293,7 +296,7 @@ else:
                     "with open(os.environ['POLICY_CHILD_LOG'],'a') as log:\n"
                     " log.write(json.dumps([args,os.environ.get('INTENTD_ASSERT_BOUND_CALLER')])+'\\n')\n"
                     "if '--no-run' in args: sys.exit(0)\n"
-                    "test=args[args.index('--')-1]\n"
+                    "test=args[args.index('--')+1]\n"
                     "if '--list' in args:\n"
                     " print(test+': test'); print('1 test, 0 benchmarks'); sys.exit(0)\n"
                     "print('running 1 test')\n"
@@ -303,7 +306,7 @@ else:
                     "print('CoW fixture assertions passed: '+test.split('::')[-1])\n"
                 )
                 stub.chmod(0o755)
-                step = next(s for s in self.workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                step = next(s for s in self.workflow['jobs']['daemon-lifecycle']['steps'] if s.get('name') == step_name)
                 env = {**os.environ, 'INTENTD_ASSERT_BOUND_CALLER': '0', **step.get('env', {})}
                 env = {k: re.sub(r'\$\{\{.*?\}\}', 'fixture', str(v)) for k, v in env.items()}
                 env.update(PATH=str(root)+os.pathsep+os.environ['PATH'], RUNNER_TEMP=str(root), POLICY_CHILD_LOG=str(root/'children.jsonl'))
@@ -326,10 +329,10 @@ else:
         ):
             with self.subTest(command=command):
                 workflow = copy.deepcopy(self.workflow)
-                workflow["jobs"]["build"]["steps"].append({
+                workflow["jobs"]["daemon-lifecycle"]["steps"].append({
                     "name": "New platform tests", "run": command,
                 })
-                self.assertIn("build: New platform tests must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
+                self.assertIn("daemon-lifecycle: New platform tests must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
     def test_unarmed_new_test_step_is_discovered(self):
         workflow = copy.deepcopy(self.workflow)
@@ -369,7 +372,7 @@ class TunnelArtifactTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-        cls.step = next(s for s in workflow["jobs"]["build"]["steps"]
+        cls.step = next(s for s in workflow["jobs"]["daemon-lifecycle"]["steps"]
                         if s.get("name") == "Tunnel deadline and TLS controls (macOS runtime)")
 
     def probe(self, mode="valid", *, inherited_libraries=False, timeout_probe=False):
@@ -400,51 +403,32 @@ else:
           else "test result: ok. 1 passed; 0 failed; 0 ignored;")
 ''')
             binary.chmod(0o755)
-            stub = root / "rustup"
-            stub.write_text(f"#!{sys.executable} -S\n" + r'''
-import json, os, pathlib, shutil, sys
-args = sys.argv[1:]
-root = pathlib.Path(os.environ["TUNNEL_ROOT"])
-mode = os.environ["TUNNEL_MODE"]
-with open(os.environ["TUNNEL_LOG"], "a") as log:
-    log.write(json.dumps({"kind": "rustup", "args": args,
-                         "policy": os.environ.get("INTENTD_ASSERT_BOUND_CALLER")}) + "\n")
-assert args[:2] == ["run", "pinned-channel"], args
-if args[2:] == ["rustc", "--print", "target-libdir", "--target", "aarch64-apple-darwin"]:
-    print(root / "toolchain lib"); sys.exit(0)
-assert args[2:5] == ["cargo", "test", "--locked"], args
-assert args[args.index("--target") + 1] == "aarch64-apple-darwin", args
-if "--no-run" not in args:
-    sys.exit("unexpected recompilation in bounded discovery/runtime")
-if mode == "build-failure": sys.exit(25)
-package = args[args.index("-p") + 1]
-kind = "lib" if "--lib" in args else "test"
-name = package.replace("-", "_") if kind == "lib" else args[args.index("--test") + 1]
-package_dir = root / "crates" / package
-package_dir.mkdir(parents=True, exist_ok=True)
-(package_dir / "Cargo.toml").touch()
-executable = root / "target with spaces" / "aarch64-apple-darwin" / "debug" / "deps" / name
-executable.parent.mkdir(parents=True, exist_ok=True)
-shutil.copy2(root / "fixture binary", executable)
-artifact = {"reason": "compiler-artifact", "manifest_path": str(package_dir / "Cargo.toml"),
-            "target": {"kind": [kind], "name": name}, "profile": {"test": True},
-            "executable": str(executable)}
-print(json.dumps({"reason": "compiler-artifact", "profile": {"test": False}, "executable": "/wrong"}))
-print(json.dumps({"reason": "build-script-executed", "linked_paths": [
-    "native=" + str(executable.parent.parent / "build/native lib"), "/outside/target"]}))
-if mode == "wrong-target": artifact["target"]["name"] = "other_test"
-if mode == "wrong-package": artifact["manifest_path"] = str(root / "other/Cargo.toml")
-if mode == "non-test": artifact["profile"]["test"] = False
-if mode == "missing-file": executable.unlink()
-if mode == "missing-executable": artifact["executable"] = None
-if mode != "missing-artifact": print(json.dumps(artifact))
-if mode == "ambiguous-artifact": print(json.dumps(artifact))
-print(json.dumps({"reason": "build-finished", "success": True}))
-''')
-            stub.chmod(0o755)
+            (root / 'scripts').mkdir()
+            for name in ('ci-native-artifacts.py', 'ci-test-artifacts.py', 'ci-build-identity.py'):
+                (root / 'scripts' / name).write_text((ROOT / 'scripts' / name).read_text())
+            artifact_root = root / 'native-artifacts'
+            artifact_root.mkdir()
+            prepared = {}
+            for variant, package, binary_id in (('transport', 'intent-transport', 'intent-transport'),
+                                                 ('daemon', 'intentd', 'intentd::e2e_wss_tunnel')):
+                package_dir = root / 'crates' / package
+                package_dir.mkdir(parents=True)
+                target = root / 'target with spaces'
+                target.mkdir(exist_ok=True)
+                executable = target / package
+                executable.write_bytes(binary.read_bytes())
+                executable.chmod(0o755)
+                tests = {binary_id: {'path': package, 'cwd': 'crates/' + package}}
+                if mode == 'missing-artifact': tests = {}
+                if mode == 'missing-file': executable.unlink()
+                if mode == 'wrong-package': tests[binary_id]['cwd'] = 'crates/absent'
+                if mode == 'wrong-target': tests[binary_id]['path'] = 'absent'
+                prepared[variant] = {'source': str(root), 'target': str(target), 'producer_group': 'fixture',
+                    'runtime': {'tests': tests, 'companions': {}, 'library_dirs': ['lib', 'deps', 'build/native lib']}}
+            (artifact_root / 'prepared.json').write_text(json.dumps(prepared))
             env = {**os.environ, **self.step["env"], "INTENTD_TUNNEL_TOOLCHAIN": "pinned-channel",
                    "INTENTD_TUNNEL_TARGET": "aarch64-apple-darwin", "TUNNEL_ROOT": tmp,
-                   "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
+                   "RUNNER_TEMP": str(root), "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
                    "TUNNEL_PIDS": str(root / "pids.json"), "PATH": tmp + os.pathsep + os.environ["PATH"]}
             env.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
             if inherited_libraries:
@@ -467,7 +451,7 @@ print(json.dumps({"reason": "build-finished", "success": True}))
                         os.killpg(pids[0], signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()] if (root / "calls.jsonl").exists() else []
             if mode.startswith("hang-"):
                 self.assertTrue((root / "pids.json").exists(), result.stdout + result.stderr)
                 for state in states:
@@ -480,10 +464,7 @@ print(json.dumps({"reason": "build-finished", "success": True}))
                 result, calls, tmp = self.probe(inherited_libraries=inherited)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 builds = [c for c in calls if c["kind"] == "rustup" and "cargo" in c["args"]]
-                self.assertEqual(len(builds), 2)
-                for call in builds:
-                    self.assertIn("--no-run", call["args"])
-                    self.assertIn("--message-format=json-render-diagnostics", call["args"])
+                self.assertEqual(builds, [], 'consumer must never invoke rustup or Cargo')
                 native = [c for c in calls if c["kind"] == "native"]
                 self.assertEqual(len(native), 16)
                 self.assertEqual({c["args"][0] for c in native if "--list" in c["args"]}, self.TESTS)
@@ -495,25 +476,23 @@ print(json.dumps({"reason": "build-finished", "success": True}))
                     self.assertEqual(call["policy"], "1")
                     self.assertIn("--exact", call["args"])
                     libraries = call["libraries"].split(os.pathsep)
-                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/deps"), libraries)
-                    self.assertIn(str(Path(tmp) / "toolchain lib"), libraries)
-                    self.assertIn(str(Path(tmp) / "target with spaces/aarch64-apple-darwin/debug/build/native lib"), libraries)
+                    self.assertIn(str(Path(tmp) / "target with spaces/deps"), libraries)
+                    self.assertIn(str(Path(tmp) / "target with spaces/lib"), libraries)
+                    self.assertIn(str(Path(tmp) / "target with spaces/build/native lib"), libraries)
                     self.assertNotIn("/outside/target", libraries)
-                    self.assertIn(str(Path(tmp) / "existing lib") if inherited else "/usr/lib", libraries)
+                    if inherited: self.assertIn(str(Path(tmp) / "existing lib"), libraries)
                     if "--list" not in call["args"]:
                         self.assertIn("--nocapture", call["args"])
                         self.assertIn("--test-threads=1", call["args"])
 
     def test_artifact_or_test_failure_cannot_become_success(self):
-        for mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
-                     "wrong-package", "wrong-target", "non-test", "ambiguous-artifact",
+        for mode in ("missing-artifact", "missing-file", "wrong-package", "wrong-target",
                      "fail-list", "missing-test", "extra-test", "fail-run", "zero-tests", "ignored-test"):
             with self.subTest(mode=mode):
                 result, calls, _ = self.probe(mode)
                 self.assertNotEqual(result.returncode, 0)
                 native = [c for c in calls if c["kind"] == "native"]
-                if mode in ("build-failure", "missing-artifact", "missing-executable", "missing-file",
-                            "wrong-package", "wrong-target", "non-test", "ambiguous-artifact"):
+                if mode in ("missing-artifact", "missing-file", "wrong-package", "wrong-target"):
                     self.assertEqual(native, [])
                 else:
                     self.assertTrue(native, "must actually exercise native failure")

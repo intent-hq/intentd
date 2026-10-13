@@ -2,6 +2,8 @@
 """Ensure native lifecycle evidence cannot silently pass with zero/skipped tests."""
 import importlib.util
 import io
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -51,6 +53,44 @@ class EvidenceTests(unittest.TestCase):
         for result in ["", "test result: ok. 0 passed; 0 failed; 0 ignored", "test result: ok. 0 passed; 0 failed; 1 ignored", "test result: ok. 1 passed; 0 failed; 1 ignored", "test result: FAILED. 0 passed; 1 failed; 0 ignored"]:
             with self.subTest(result=result), self.assertRaises(RuntimeError):
                 lifecycle.require_passed(result)
+
+    def test_archived_lifecycle_executes_exact_proofs_and_rejects_bad_results(self):
+        for mode in ('pass', 'zero', 'ignored', 'failure'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / 'source'; target = root / 'target'; target.mkdir()
+                binary = target / 'fixture'
+                binary.write_text(f'#!{sys.executable}\n' + "import json,os,pathlib,sys\n"
+                    "assert pathlib.Path.cwd().name in ('intentd','intentd-sitter')\n"
+                    "assert os.environ['INTENTD_ASSERT_BOUND_CALLER']=='1'\n"
+                    "assert pathlib.Path(os.environ['INTENTD_TEST_SITTER_BIN']).is_file()\n"
+                    "with open(os.environ['LIFECYCLE_CALLS'],'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                    + ("raise SystemExit(7)\n" if mode == 'failure' else
+                       "print('test result: ok. " + ('0' if mode == 'zero' else '3') + " passed; 0 failed; " + ('1' if mode == 'ignored' else '0') + " ignored;')\n"))
+                binary.chmod(0o755)
+                prepared = {}
+                for variant, package, ids in (
+                    ('daemon', 'intentd', ['intentd::e2e_detached_lifecycle']),
+                    ('sitter', 'intentd-sitter', ['intentd-sitter', 'intentd-sitter::cli_help', 'intentd-sitter::supervisor_e2e']),
+                    ('sitter-production', 'intentd-sitter', [])):
+                    (source / 'crates' / package).mkdir(parents=True, exist_ok=True)
+                    prepared[variant] = {'source': str(source), 'target': str(target), 'producer_group': 'same',
+                        'runtime': {'tests': {name: {'path': 'fixture', 'cwd': 'crates/' + package} for name in ids},
+                                    'companions': {'intentd-sitter': 'fixture'}, 'library_dirs': ['.']}}
+                (root / 'prepared.json').write_text(json.dumps(prepared))
+                env = {'INTENTD_ASSERT_BOUND_CALLER': '1', 'LIFECYCLE_CALLS': str(root / 'calls')}
+                with patch.dict(os.environ, env), patch('sys.stdout', io.StringIO()):
+                    if mode == 'pass':
+                        lifecycle.archived_lifecycle(root)
+                    else:
+                        with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                            lifecycle.archived_lifecycle(root)
+                calls = [json.loads(line) for line in (root / 'calls').read_text().splitlines()]
+                if mode == 'pass':
+                    self.assertEqual(len(calls), 6)
+                    self.assertEqual(calls[0], ['lifecycle_capture_'])
+                    self.assertEqual(calls[-1], ['--ignored', '--exact', 'detached_sitter_lifecycle_over_wss', '--nocapture'])
+                    self.assertFalse((root / 'compiler-calls.log').exists())
 
 
 if __name__ == "__main__":

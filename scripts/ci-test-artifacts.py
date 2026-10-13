@@ -57,7 +57,7 @@ def native_recipes(platform, event, target):
         return {"kind": "test-archive", "command": ["cargo", "nextest", "archive", *common, "-p", package, *selection, "--cargo-message-format", "json", "--archive-file", "{archive}"], "companions": companions}
     daemon = ["--test", "e2e_detached_lifecycle"]
     if event == "merge_group" and platform == "macos":
-        daemon += ["--test", "e2e_wss_tunnel"]
+        daemon += ["--test", "e2e_wss_tunnel", "--test", "e2e_doctor_codex"]
     if event == "merge_group" and platform == "windows":
         daemon += ["--test", "e2e_wss_setup_headless", "--test", "e2e_doctor_codex"]
     sitter = ["--lib", "--test", "cli_help"]
@@ -76,9 +76,9 @@ def native_recipes(platform, event, target):
 
 def build_environment():
     names = set(identity.REQUIRED_ENV)
-    prefixes = ("CARGO_PROFILE_", "CARGO_TARGET_", "CARGO_BUILD_", "CC_", "CXX_", "AR_", "CFLAGS_", "CXXFLAGS_", "LDFLAGS_", "PKG_CONFIG", "OPENSSL", "LIBZ_", "RUSTC_", "DYLD_")
+    prefixes = ("CARGO_PROFILE_", "CARGO_TARGET_", "CARGO_BUILD_", "CC_", "CXX_", "AR_", "CFLAGS_", "CXXFLAGS_", "LDFLAGS_", "PKG_CONFIG", "OPENSSL", "LIBZ_", "ZLIB_", "VCPKG_", "CMAKE_", "RUSTC_", "DYLD_")
     names.update(name for name in os.environ if name.startswith(prefixes))
-    names.update(("RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIB", "INCLUDE"))
+    names.update(("RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIB", "INCLUDE", "CL", "_CL_", "LINK", "_LINK_", "VCToolsVersion", "VCToolsInstallDir", "WindowsSdkDir", "WindowsSDKVersion", "UniversalCRTSdkDir", "UCRTVersion"))
     names.discard("CARGO_TARGET_DIR")
     return {name: os.environ.get(name) for name in sorted(names)}
 

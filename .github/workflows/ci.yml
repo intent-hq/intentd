@@ -22,16 +22,17 @@ on:
   # monorepo-consumer-checks / deb-packaging / release-scripts) plus
   # coverage-changed, which runs only
   # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
-  # comment); merge_group additionally runs the native build matrix, GitLab
+  # comment); merge_group additionally runs the full native proof set, GitLab
   # feature suite, and full instrumented coverage jobs (coverage-e2e /
   # coverage-all), which are merge_group-ONLY — they no
   # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
   # once, on the merged tree, instead of on every push to the PR. The gate is
   # event-aware about this (see the gate comment): it requires the coverage
   # jobs outright on merge_group and accepts their skip on pull_request /
-  # push, and the reverse for coverage-changed. The native matrix is skipped
-  # at job level on PRs; the focused daemon-lifecycle matrix still runs on
-  # PRs and merge groups with real Windows/macOS/Linux runtime proof.
+  # push, and the reverse for coverage-changed. The daemon-lifecycle matrix
+  # owns one native producer per platform, with focused PR demand and full
+  # merge-group demand. PRs touching native CI/config/harness inputs also run
+  # full native proofs, so the migration can be verified before queue entry.
   # CI Gate requires native check, Clippy and runtime proofs on merge_group,
   # and its release builds on push. CI Gate is the sole required status check.
   # Merge groups are created by the repo's own ruleset from already-filed
@@ -693,9 +694,8 @@ jobs:
           echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
 
   build:
-    # Native Rust validation runs once on the queue's merged tree; main
-    # pushes retain release builds. The explicit event allowlist prevents
-    # matrix expansion for all PRs, including forks and release-shaped PRs.
+    # Release builds remain push-only. Native validation and runtime proofs
+    # share the daemon-lifecycle producer on PRs and merge groups.
     # `!cancelled()` permits skipped release-fast-path and failed route
     # dependencies: release metadata is PR-only, and each native OS has a hosted
     # fallback when routing fails. CI Gate still rejects skipped Linux
@@ -705,7 +705,7 @@ jobs:
     # ubuntu-latest, so this dependency can never queue behind the
     # self-hosted runners it decides about.
     needs: [release-fast-path, route]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
+    if: ${{ !cancelled() && github.event_name == 'push' }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -796,244 +796,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-build-${{ matrix.target }}
-      # Keep the production configuration check separate from all-target
-      # Clippy: intentd's dev-dependency enables repository-test-fixtures in
-      # intent-services under --all-targets, excluding feature-off production
-      # arms. Native --lib tests use cfg(test), so they cannot replace this
-      # non-test check either. Release builds stay push-only; the final check
-      # warms their persistent target dir for the next queue run.
-      - name: Check (native production configuration)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
-        run: cargo check --workspace --target ${{ matrix.target }}
-      # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
-      # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
-      # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
-      # `#[cfg(not(unix))]` code is never compiled, so warnings in
-      # target-only code (including outer `#[allow]`s that only expand there
-      # and trip `clippy::allow_attributes`) land silently and break
-      # `make check` on every macOS or Windows dev box. Linting here (same
-      # invocation as the check job) closes the gap. It runs on
-      # merge-queue runs, not on push: the queue tests the actual merged
-      # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
-      # own PR run) land a Windows-only E0433 via the queue — main's push
-      # run skipped the step, so ~8 open PRs failed the required gate until
-      # intent-hq/intentd#1835 fixed it. Main's push run builds a tree the
-      # queue already linted, so it stays skipped there. It runs on the
-      # native runners rather than as Linux cross-target runs because
-      # `cargo clippy --target <triple>` still executes the native build
-      # scripts (libz-sys and friends try-compile C for the target even when
-      # pkg-config resolves a system lib), which would require a full
-      # darwin / MSVC cross C toolchain on Linux; the native runners need
-      # nothing extra and share this job's warm target dir. release-fast-path
-      # is pull_request-only, so its output is empty on merge_group and the
-      # `!= 'true'` guard lets the step run there.
-      - name: Clippy (target-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && (runner.os == 'macOS' || runner.os == 'Windows')
-        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
-      # Exercise the deterministic deadline oracle and real TLS controls on
-      # macOS; listen backlog saturation cannot guarantee a pending connect.
-      - name: Tunnel deadline and TLS controls (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
-        timeout-minutes: 20
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_TUNNEL_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-          INTENTD_TUNNEL_TARGET: ${{ matrix.target }}
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          python3 -I -B -S - <<'PYTHON'
-          import json, os, signal, subprocess
-          from pathlib import Path
-
-          cargo = ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"],
-                   "cargo", "test", "--locked", "--target", os.environ["INTENTD_TUNNEL_TARGET"]]
-          groups = [
-              (["-p", "intent-transport", "--lib"], [
-                  "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
-                  "tunnel::tests::connect_reset_preserves_error_before_deadline",
-                  "tunnel::tests::connect_success_before_deadline_relays",
-              ]),
-              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
-                  "tunnel_open_echo_eof_close_lifecycle",
-                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
-                  "tunnel_close_tears_down_and_frees_stream_id",
-                  "tunnel_connections_counted_in_health_and_stopped",
-                  "tunnel_unauthenticated_upgrade_rejected",
-              ]),
-          ]
-
-          def bounded(command, package_dir, env):
-              print("+ " + repr(command), flush=True)
-              child = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                                       cwd=package_dir, env=env)
-              try:
-                  output, _ = child.communicate(timeout=30)
-                  print(output, end="", flush=True)
-                  assert child.returncode == 0, (command, child.returncode)
-                  return output
-              except subprocess.TimeoutExpired:
-                  os.killpg(child.pid, signal.SIGKILL)
-                  output, _ = child.communicate()
-                  print(output, end="", flush=True)
-                  raise
-
-          rust_lib = subprocess.check_output(
-              ["rustup", "run", os.environ["INTENTD_TUNNEL_TOOLCHAIN"], "rustc",
-               "--print", "target-libdir", "--target", os.environ["INTENTD_TUNNEL_TARGET"]], text=True).strip()
-          for package, tests in groups:
-              # Compilation has the step's budget. A later Cargo invocation
-              # can rebuild even after --no-run (e.g. missing watched Git
-              # metadata); never charge that work to the 30s runtime proof.
-              built = subprocess.run(cargo + package + ["--no-run", "--message-format=json-render-diagnostics"],
-                                     check=True, stdout=subprocess.PIPE, text=True)
-              messages = [json.loads(line) for line in built.stdout.splitlines() if line.startswith("{")]
-              package_dir = Path("crates", package[1]).resolve()
-              kind = "lib" if "--lib" in package else "test"
-              name = package[1].replace("-", "_") if kind == "lib" else package[package.index("--test") + 1]
-              artifacts = [m for m in messages if m.get("reason") == "compiler-artifact"
-                           and m.get("profile", {}).get("test") is True and m.get("executable")
-                           and m.get("target", {}).get("kind") == [kind] and m["target"].get("name") == name
-                           and m.get("manifest_path") == str(package_dir / "Cargo.toml")]
-              assert len(artifacts) == 1, ("expected one current native test executable", artifacts)
-              binary = Path(artifacts[0]["executable"])
-              assert binary.is_file() and os.access(binary, os.X_OK), binary
-              print("Using native test executable: " + str(binary), flush=True)
-              # Match Cargo's package cwd and native library search roots.
-              env = dict(os.environ)
-              libraries = []
-              # Explicit --target puts the binary at target/triple/profile/deps.
-              for message in messages:
-                  if message.get("reason") == "build-script-executed":
-                      for linked in message.get("linked_paths", []):
-                          path = Path(linked.split("=", 1)[-1] if not linked.startswith("/") else linked).resolve()
-                          if path.is_relative_to(binary.parents[3]):
-                              libraries.append(str(path))
-              libraries.extend([str(binary.parent), str(binary.parent.parent), rust_lib])
-              env["DYLD_FALLBACK_LIBRARY_PATH"] = os.pathsep.join(libraries + [env.get(
-                  "DYLD_FALLBACK_LIBRARY_PATH", str(Path.home() / "lib") + ":/usr/local/lib:/usr/lib")])
-              for test in tests:
-                  command = [str(binary), test, "--exact"]
-                  listed = bounded(command + ["--list"], package_dir, env)
-                  assert test + ": test" in listed.splitlines(), listed
-                  assert "1 test, 0 benchmarks" in listed.splitlines(), listed
-                  output = bounded(command + ["--nocapture", "--test-threads=1"], package_dir, env)
-                  assert "running 1 test" in output.splitlines(), output
-                  assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
-          PYTHON
-      - uses: actions/setup-node@v7
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
-        with:
-          node-version: 24
-      - name: Headless workspace setup (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
-        timeout-minutes: 20
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
-          INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
-      - uses: actions/upload-artifact@v7
-        if: always() && needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
-        with:
-          name: setup-headless-windows
-          path: setup-headless-evidence
-          if-no-files-found: error
-      # Execute the Windows Job Object fixtures on the native runner. They use
-      # this test executable as the child, so no Node/npm/account setup is needed.
-      - name: Codex diagnostic process ownership (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: |
-          set -euo pipefail
-          filter='codex_diagnostics::process::platform::tests::'
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
-          printf '%s\n' "$listed"
-          if ! grep -F "${filter}shared_guard_removes_home_only_after_descendants_stop: test" <<< "$listed" > /dev/null; then
-            echo '::error::Windows diagnostic ownership regression was not selected.'
-            exit 1
-          fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-      # macOS supports read-only metadata and rejects process probes before
-      # auth/npm setup. Require both a service rejection case and a real doctor
-      # case in discovery so a cfg/filter change cannot silently run zero tests.
-      - name: Codex focused diagnostics (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_DIAGNOSTIC_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: |
-          set -euo pipefail
-          filter='codex_diagnostics::'
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --list)
-          printf '%s\n' "$listed"
-          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
-            echo '::error::macOS diagnostic rejection regression was not selected.'
-            exit 1
-          fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
-          printf '%s\n' "$listed"
-          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
-            echo '::error::macOS doctor command regression was not selected.'
-            exit 1
-          fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
-      # These retained workspace fixtures used to skip on Linux before reaching
-      # their unbound caller. Require native CoW operations and original oracles.
-      - name: Retained workspace CoW fixtures (macOS runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'macOS'
-        timeout-minutes: 20
-        shell: bash
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-          INTENTD_COW_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-          INTENTD_TEST_REQUIRE_COW: "1"
-          CARGO_BUILD_JOBS: "2"
-        run: |
-          set -euo pipefail
-          # Keep fixtures armed; the capability probe removes the guard only
-          # in its exact child. Retain scratch cleanup assertions for every case.
-          unset INTENTD_TEST_KEEP_TMP
-          tests=(
-            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
-            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
-            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
-            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
-            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
-            capability::tests::unbound_caller_is_forbidden_on_every_gate
-          )
-          cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
-          status=0
-          for test in "${tests[@]}"; do
-            listed=$("${cargo_test[@]}" "$test" -- --exact --list)
-            printf '%s\n' "$listed"
-            grep -Fx "$test: test" <<< "$listed" > /dev/null
-            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
-            log="$RUNNER_TEMP/cow-${test##*::}.log"
-            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
-            if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
-              status=1
-            fi
-            if rmdir "$scratch"; then
-              echo "CoW fixture scratch cleaned: $test"
-            else
-              echo "::error::Fixture scratch remains at $scratch"
-              status=1
-            fi
-            if [[ "$test" == tests::* ]]; then
-              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
-              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
-              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
-            fi
-          done
-          exit "$status"
       - name: Build (release)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
@@ -1951,13 +1713,24 @@ jobs:
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
       - name: Test native CI routing and gate results
-        run: python3 -I -B scripts/test-ci-native-routing.py
+        run: |
+          python3 -I -B scripts/test-ci-native-routing.py
+          python3 -I -B scripts/test-ci-native-consumers.py
+          python3 -I -B scripts/test-daemon-lifecycle-proof.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - name: Install pinned archive regression runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Test archive identity and compile-free relocation
+        run: |
+          python3 -I -B scripts/test-ci-build-identity.py
+          python3 -I -B scripts/test-ci-test-artifacts.py
       - name: Install release cache regression wrapper
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
@@ -2132,10 +1905,42 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Put Git Bash first on PATH (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Select native proof demand
+        id: native-scope
+        shell: bash
+        env:
+          NATIVE_EVENT: ${{ github.event_name }}
+          NATIVE_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$NATIVE_EVENT" == pull_request ]]; then
+            git fetch --no-tags --depth=1 origin "$NATIVE_BASE" || echo "Native scope will conservatively validate all proofs if base is unavailable"
+            python3 -I -B scripts/ci-native-artifacts.py scope --event "$NATIVE_EVENT" --base "$NATIVE_BASE"
+          else
+            python3 -I -B scripts/ci-native-artifacts.py scope --event "$NATIVE_EVENT"
+          fi
+      - name: Provision native dependency inspection (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! command -v readelf >/dev/null || ! pkg-config --exists openssl zlib; then
+            sudo apt-get update
+            sudo apt-get install -y binutils pkg-config libssl-dev zlib1g-dev
+          fi
+      - name: Provision MSVC and Windows SDK inspection
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
       - name: Disk-space preflight (tinybox only)
@@ -2200,16 +2005,233 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
+      - name: Set hosted native target outside checkout
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        shell: bash
+        run: |
+          python3 -c "import os,pathlib; p=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-target'; open(os.environ['GITHUB_ENV'],'a').write('CARGO_TARGET_DIR='+str(p)+'\n')"
+      - name: Install pinned native archive runner
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
       - name: Rust cache (GitHub-hosted runner only)
         if: ${{ !contains(matrix.os, 'self-hosted') }}
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: daemon-lifecycle-${{ matrix.platform }}
-      - name: Native lifecycle lint and runtime proof
+          workspaces: . -> ${{ env.CARGO_TARGET_DIR }}
+      - name: Produce native archives and lint in one shared target
         shell: bash
+        env:
+          NATIVE_PLATFORM: ${{ matrix.platform }}
+          NATIVE_SCOPE: ${{ steps.native-scope.outputs.event }}
+        run: python3 -I -B scripts/ci-native-artifacts.py produce --platform "$NATIVE_PLATFORM" --event "$NATIVE_SCOPE"
+      # Upload before runtime; successful variants survive later failures.
+      - name: Publish native variants
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/requests.json
+            ${{ runner.temp }}/native-artifacts/compiler-tripwire.exe
+            ${{ runner.temp }}/native-artifacts/published/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Restore native executables with compiler tripwires
+        shell: bash
+        run: python3 -I -B scripts/ci-native-artifacts.py prepare
+      - name: Native lifecycle runtime proof
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$RUNNER_TEMP/native-artifacts"
+      # Exercise the deterministic deadline oracle and real TLS controls on
+      # macOS; listen backlog saturation cannot guarantee a pending connect.
+      - name: Tunnel deadline and TLS controls (macOS runtime)
+        if: steps.native-scope.outputs.event == 'merge_group' && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
-          cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
-          python3 -I -B scripts/test-daemon-lifecycle.py
+          python3 -I -B -S - <<'PYTHON'
+          import json, os, signal, subprocess
+          from pathlib import Path
+
+          import importlib.util
+          spec = importlib.util.spec_from_file_location('native', Path('scripts/ci-native-artifacts.py'))
+          native = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(native)
+          root = Path(os.environ['RUNNER_TEMP']) / 'native-artifacts'
+          prepared = json.loads((root / 'prepared.json').read_text())
+          groups = [
+              (["-p", "intent-transport", "--lib"], [
+                  "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
+                  "tunnel::tests::connect_reset_preserves_error_before_deadline",
+                  "tunnel::tests::connect_success_before_deadline_relays",
+              ]),
+              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
+                  "tunnel_open_echo_eof_close_lifecycle",
+                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "tunnel_close_tears_down_and_frees_stream_id",
+                  "tunnel_connections_counted_in_health_and_stopped",
+                  "tunnel_unauthenticated_upgrade_rejected",
+              ]),
+          ]
+
+          def bounded(command, package_dir, env):
+              print("+ " + repr(command), flush=True)
+              child = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       cwd=package_dir, env=env)
+              try:
+                  output, _ = child.communicate(timeout=30)
+                  print(output, end="", flush=True)
+                  assert child.returncode == 0, (command, child.returncode)
+                  return output
+              except subprocess.TimeoutExpired:
+                  os.killpg(child.pid, signal.SIGKILL)
+                  output, _ = child.communicate()
+                  print(output, end="", flush=True)
+                  raise
+
+          for package, tests in groups:
+              variant = 'transport' if package[1] == 'intent-transport' else 'daemon'
+              binary_id = 'intent-transport' if variant == 'transport' else 'intentd::e2e_wss_tunnel'
+              item = prepared[variant]
+              runtime = item['runtime']['tests'][binary_id]
+              binary = native.archives.safe_join(item['target'], runtime['path'])
+              assert binary.is_file() and os.access(binary, os.X_OK), binary
+              package_dir = native.archives.safe_join(item['source'], runtime['cwd'])
+              print('Using archived native test executable: ' + str(binary), flush=True)
+              env = native.archives.runtime_env(item, native.consumer_environment(root))
+              env['CARGO_MANIFEST_DIR'] = str(package_dir)
+              for test in tests:
+                  command = [str(binary), test, "--exact"]
+                  listed = bounded(command + ["--list"], package_dir, env)
+                  assert test + ": test" in listed.splitlines(), listed
+                  assert "1 test, 0 benchmarks" in listed.splitlines(), listed
+                  output = bounded(command + ["--nocapture", "--test-threads=1"], package_dir, env)
+                  assert "running 1 test" in output.splitlines(), output
+                  assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
+          PYTHON
+      - name: Headless workspace setup (Windows runtime)
+        if: steps.native-scope.outputs.event == 'merge_group' && runner.os == 'Windows'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_SETUP_EVIDENCE_DIR: ${{ runner.temp }}/setup-headless-evidence
+        run: python3 -I -B scripts/ci-native-artifacts.py libtest --variant daemon --binary intentd::e2e_wss_setup_headless -- --nocapture
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.native-scope.outputs.event == 'merge_group' && runner.os == 'Windows'
+        with:
+          name: setup-headless-windows
+          path: ${{ runner.temp }}/setup-headless-evidence
+          if-no-files-found: error
+      # Execute the Windows Job Object fixtures on the native runner. They use
+      # this test executable as the child, so no Node/npm/account setup is needed.
+      - name: Codex diagnostic process ownership (Windows runtime)
+        if: steps.native-scope.outputs.event == 'merge_group' && runner.os == 'Windows'
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::process::platform::tests::'
+          listed=$(python3 -I -B scripts/ci-native-artifacts.py libtest --variant services --binary intent-services -- "$filter" --list)
+          printf '%s\n' "$listed"
+          if ! grep -F "${filter}shared_guard_removes_home_only_after_descendants_stop: test" <<< "$listed" > /dev/null; then
+            echo '::error::Windows diagnostic ownership regression was not selected.'
+            exit 1
+          fi
+          python3 -I -B scripts/ci-native-artifacts.py libtest --variant services --binary intent-services -- "$filter" --nocapture
+      # macOS supports read-only metadata and rejects process probes before
+      # auth/npm setup. Require both a service rejection case and a real doctor
+      # case in discovery so a cfg/filter change cannot silently run zero tests.
+      - name: Codex focused diagnostics (macOS runtime)
+        if: steps.native-scope.outputs.event == 'merge_group' && runner.os == 'macOS'
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: |
+          set -euo pipefail
+          filter='codex_diagnostics::'
+          listed=$(python3 -I -B scripts/ci-native-artifacts.py libtest --variant services --binary intent-services -- "$filter" --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_rejects_process_start_before_retaining_home_or_dependency: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS diagnostic rejection regression was not selected.'
+            exit 1
+          fi
+          python3 -I -B scripts/ci-native-artifacts.py libtest --variant services --binary intent-services -- "$filter" --nocapture
+          listed=$(python3 -I -B scripts/ci-native-artifacts.py libtest --variant daemon --binary intentd::e2e_doctor_codex -- --list)
+          printf '%s\n' "$listed"
+          if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
+            echo '::error::macOS doctor command regression was not selected.'
+            exit 1
+          fi
+          python3 -I -B scripts/ci-native-artifacts.py libtest --variant daemon --binary intentd::e2e_doctor_codex -- --nocapture
+      # These retained workspace fixtures used to skip on Linux before reaching
+      # their unbound caller. Require native CoW operations and original oracles.
+      - name: Retained workspace CoW fixtures (macOS runtime)
+        if: steps.native-scope.outputs.event == 'merge_group' && runner.os == 'macOS'
+        timeout-minutes: 20
+        shell: bash
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENTD_TEST_REQUIRE_COW: "1"
+        run: |
+          set -euo pipefail
+          # Keep fixtures armed; the capability probe removes the guard only
+          # in its exact child. Retain scratch cleanup assertions for every case.
+          unset INTENTD_TEST_KEEP_TMP
+          tests=(
+            tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled
+            tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails
+            tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone
+            capability::tests::unbound_caller_is_forbidden_on_every_gate
+          )
+          archive_test=(python3 -I -B scripts/ci-native-artifacts.py libtest --variant services --binary intent-services --)
+          status=0
+          for test in "${tests[@]}"; do
+            listed=$("${archive_test[@]}" "$test" --exact --list)
+            printf '%s\n' "$listed"
+            grep -Fx "$test: test" <<< "$listed" > /dev/null
+            grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
+            log="$RUNNER_TEMP/cow-${test##*::}.log"
+            scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
+            if ! TMPDIR="$scratch" "${archive_test[@]}" "$test" --exact --nocapture --test-threads=1 2>&1 | tee "$log"; then
+              status=1
+            fi
+            if rmdir "$scratch"; then
+              echo "CoW fixture scratch cleaned: $test"
+            else
+              echo "::error::Fixture scratch remains at $scratch"
+              status=1
+            fi
+            if [[ "$test" == tests::* ]]; then
+              grep -Fx 'CoW fixture clone and independent contents verified' "$log" > /dev/null || status=1
+              grep -Fx 'CoW fixture proof scratch cleaned' "$log" > /dev/null || status=1
+              grep -Fx "CoW fixture assertions passed: ${test##*::}" "$log" > /dev/null || status=1
+            fi
+          done
+          exit "$status"
+      - name: Verify compile-free native consumers
+        shell: bash
+        run: python3 -I -B scripts/ci-native-artifacts.py receipt
+      - name: Upload native consumer evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-consumer-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/consumer-receipt.json
+            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+          if-no-files-found: error
       - name: Release lifecycle target dir
         if: ${{ always() && runner.os == 'Linux' && contains(matrix.os, 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
         shell: bash
@@ -2217,8 +2239,8 @@ jobs:
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
-  # build is required on merge_group (native check, Clippy and runtime proofs) and push
-  # (release compilation); only pull_request accepts its job-level skip.
+  # build is required on push (release compilation); daemon-lifecycle requires
+  # native check, Clippy and runtime proofs on merge_group and focused PR proof.
   # check / monorepo-consumer-checks must succeed on PRs and merge_group.
   # Full coverage is required on merge_group, changed coverage on PRs.
   # pr-title / conflict-markers retain their PR-metadata skip handling.
@@ -2248,9 +2270,9 @@ jobs:
               *) exit 1 ;;
             esac
           fi
-          # PRs deliberately skip the general native build matrix. A skip on
-          # merge_group or push must never pass as native validation.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # Native validation lives in required daemon-lifecycle. The release
+          # build matrix is push-only; a skipped release build must fail push.
+          if [ "${{ github.event_name }}" != "push" ]; then
             case "${{ needs.build.result }}" in
               success|skipped) ;;
               *)
@@ -2259,7 +2281,7 @@ jobs:
                 ;;
             esac
           elif [ "${{ needs.build.result }}" != "success" ]; then
-            echo "build must succeed outright on merge_group / push"
+            echo "build must succeed outright on push"
             exit 1
           fi
           if [ "${{ needs.deb-packaging.result }}" != "success" ] || \

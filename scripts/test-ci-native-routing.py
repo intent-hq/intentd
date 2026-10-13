@@ -9,6 +9,7 @@ while the actual probe JS and gate shell execute against API/result fixtures.
 
 import ast
 import copy
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,13 +27,11 @@ RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
     "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
-    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
 NATIVE_STEPS = {
-    "Check (native production configuration)": {"macOS", "Windows"},
-    "Clippy (target-gated code)": {"macOS", "Windows"},
     "Tunnel deadline and TLS controls (macOS runtime)": {"macOS"},
     "Codex diagnostic process ownership (Windows runtime)": {"Windows"},
     "Codex focused diagnostics (macOS runtime)": {"macOS"},
@@ -55,7 +54,7 @@ def condition(value, context, *, success=True, cancelled=False):
     expression = re.sub(r"\b(always|success|failure|cancelled)\(\)", lambda m: repr(statuses[m[1]]), expression)
     expression = re.sub(r"contains\(matrix.os, 'self-hosted'\)",
                         lambda _: repr("self-hosted" in context.get("matrix.os", [])), expression)
-    expression = re.sub(r"\b(?:github|needs|runner|env)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
+    expression = re.sub(r"\b(?:github|needs|runner|env|steps)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression).strip()
     expression = re.sub(r"\btrue\b|\bfalse\b", lambda m: m[0].title(), expression)
@@ -74,6 +73,7 @@ def context(event, *, fork=False, fast_path="", platform="macOS"):
         "github.event.pull_request.head.repo.full_name": "outside/intentd" if fork else "intent-hq/intentd",
         "needs.release-fast-path.outputs.fast_path": fast_path,
         "runner.os": platform,
+        "steps.native-scope.outputs.event": event,
     }
 
 
@@ -142,7 +142,7 @@ def routing_errors(workflow):
                 errors.append(f"{event}: gate accepted route={route}")
             # Native routing deliberately falls back to hosted Windows on a
             # failed/empty probe. Linux required checks still fail the gate.
-            if event != "pull_request" and jobs["build"] != "success":
+            if event == "push" and jobs["build"] != "success":
                 errors.append(f"{event}: missing native fallback for route={route}")
     return errors
 
@@ -150,7 +150,7 @@ def routing_errors(workflow):
 def native_errors(workflow):
     errors = []
     build = workflow["jobs"]["build"]
-    steps = {step.get("name"): step for step in build["steps"]}
+    steps = {step.get("name"): step for step in workflow["jobs"]["daemon-lifecycle"]["steps"]}
     if build.get("continue-on-error") or build["strategy"]["fail-fast"]:
         errors.append("native matrix must be required and independent")
     targets = {entry["target"] for entry in build["strategy"]["matrix"]["include"]}
@@ -166,25 +166,16 @@ def native_errors(workflow):
                 expected = event == "merge_group" and platform in platforms
                 if condition(step.get("if", True), context(event, platform=platform)) != expected:
                     errors.append(f"{name}: wrong selection for {event}/{platform}")
-    clippy = steps.get("Clippy (target-gated code)", {})
-    if clippy.get("run") != "cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings":
-        errors.append("native Clippy must lint all workspace targets")
-    if clippy.get("env") or clippy.get("working-directory"):
-        errors.append("native Clippy must inherit the job compilation configuration")
     for name, command in (("Build (release)", "cargo build --workspace --release --target ${{ matrix.target }}"),
                           ("Warm merge queue check cache", "cargo check --workspace --target ${{ matrix.target }}")):
-        step = steps.get(name)
+        step = next((s for s in build["steps"] if s.get("name") == name), None)
         if not step or step.get("run") != command or step.get("continue-on-error"):
             errors.append(f"{name}: missing push compilation")
         elif any(condition(step.get("if", True), context(event)) != (event == "push") for event in REQUIRED):
             errors.append(f"{name}: must be push-only")
-    # --all-targets unifies dev-dependency fixture features into intent-services
-    # and omits some feature-off production arms. Keep the non-test check too.
-    check = steps.get("Check (native production configuration)", {})
-    if check.get("run") != "cargo check --workspace --target ${{ matrix.target }}":
-        errors.append("native check must compile the non-test production configuration")
-    if check.get("env") or check.get("working-directory"):
-        errors.append("native check must inherit the job compilation configuration")
+    producer = steps.get("Produce native archives and lint in one shared target", {})
+    if producer.get("run") != 'python3 -I -B scripts/ci-native-artifacts.py produce --platform "$NATIVE_PLATFORM" --event "$NATIVE_SCOPE"' or producer.get('if') or producer.get('continue-on-error'):
+        errors.append('native producer must build and lint every demanded variant')
     tests = workflow["jobs"]["release-scripts"]
     if tests.get("continue-on-error") or not any(
         re.search(r"^python3 (?:-[IB] )*scripts/test-ci-native-routing.py$", step.get("run", ""), re.M)
@@ -593,7 +584,7 @@ class NativeRoutingTests(unittest.TestCase):
             for mutation in ("remove", "skip", "pr-only", "optional", "empty"):
                 with self.subTest(step=name, mutation=mutation):
                     workflow = copy.deepcopy(self.workflow)
-                    steps = workflow["jobs"]["build"]["steps"]
+                    steps = workflow["jobs"]["daemon-lifecycle"]["steps"]
                     step = next(s for s in steps if s.get("name") == name)
                     if mutation == "remove":
                         steps.remove(step)
@@ -608,26 +599,31 @@ class NativeRoutingTests(unittest.TestCase):
                     self.assertTrue(any(name in error for error in native_errors(workflow)))
 
     def test_mutations_cannot_skip_queue_or_enable_pr_matrix(self):
-        for expression in ("github.event_name == 'push'", "always()"):
+        for expression in ("github.event_name == 'merge_group'", "always()"):
             with self.subTest(expression=expression):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["jobs"]["build"]["if"] = expression
                 self.assertTrue(any("wrong jobs" in error for error in routing_errors(workflow)))
 
-    def test_mutations_cannot_replace_production_check_with_fixture_configuration(self):
-        for arguments in ("--all-targets", "--tests", "--features intent-services/repository-test-fixtures"):
-            with self.subTest(arguments=arguments):
-                workflow = copy.deepcopy(self.workflow)
-                step = next(s for s in workflow["jobs"]["build"]["steps"]
-                            if s.get("name") == "Check (native production configuration)")
-                step["run"] += " " + arguments
-                self.assertIn("native check must compile the non-test production configuration", native_errors(workflow))
+    def test_producer_preserves_feature_off_check_and_full_clippy(self):
+        spec = importlib.util.spec_from_file_location('native', ROOT / 'scripts/ci-native-artifacts.py')
+        native = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(native)
+        for platform in ('macos', 'windows'):
+            commands = native.check_commands(platform, 'merge_group', 'native-triple', '/target')
+            self.assertEqual(commands, [
+                ['cargo', 'check', '--workspace', '--locked', '--target', 'native-triple', '--target-dir', '/target'],
+                ['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--target', 'native-triple', '--target-dir', '/target', '--', '-D', 'warnings'],
+            ])
+            self.assertEqual(len(native.check_commands(platform, 'pull_request', 'native-triple', '/target')), 1)
 
     def test_mutation_cannot_accept_skipped_queue_build(self):
         workflow = copy.deepcopy(self.workflow)
         step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
         step["run"] = step["run"].replace('${{ needs.build.result }}', "success")
-        self.assertIn("merge_group: build=skipped", gate_errors(workflow))
+        lifecycle = copy.deepcopy(self.workflow)
+        lifecycle["jobs"]["gate"]["steps"][0]["run"] = step["run"].replace("${{ needs.daemon-lifecycle.result }}", "success")
+        self.assertIn("merge_group: daemon-lifecycle=skipped", gate_errors(lifecycle))
         self.assertIn("push: build=skipped", gate_errors(workflow))
 
     def test_mutation_cannot_drop_gate_dependency(self):
@@ -639,9 +635,9 @@ class NativeRoutingTests(unittest.TestCase):
         job = self.workflow["jobs"]["daemon-lifecycle"]
         self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"linux", "macos", "windows"})
         self.assertFalse(job["strategy"]["fail-fast"])
-        step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle lint and runtime proof")
+        step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle runtime proof")
         self.assertIn("python3 -I -B scripts/test-daemon-lifecycle.py", step["run"])
-        self.assertIn("cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings", step["run"])
+        self.assertIn('--archives "$RUNNER_TEMP/native-artifacts"', step["run"])
         self.assertNotIn("if", step)
         self.assertFalse(step.get("continue-on-error", False))
         for event in ("pull_request", "merge_group"):
