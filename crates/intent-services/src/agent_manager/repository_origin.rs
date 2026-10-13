@@ -17,7 +17,10 @@ use crate::Services;
 use super::{AgentHandle, Handles, ProcessRegistry};
 
 pub(super) mod callback_delivery;
-use callback_delivery::{ConfirmedCallbackAttempt, Endpoint, EndpointBlueprint};
+use callback_delivery::{
+    ConfirmedCallbackAttempt, Endpoint, EndpointBlueprint, LiveContext, ServerBlueprint,
+    SessionDelivery,
+};
 
 struct Original {
     registry: Arc<RepositoryLifecycleRegistry>,
@@ -32,6 +35,8 @@ struct State {
     #[cfg(feature = "repository-test-fixtures")]
     review_runtime_fixture: bool,
     blueprint: Option<Arc<EndpointBlueprint>>,
+    prompt_source: Option<ServerBlueprint>,
+    prompt_context: Option<Arc<LiveContext>>,
     endpoint: Option<Arc<Endpoint>>,
     callback_offer: CallbackOffer,
     attempt: Option<Arc<()>>,
@@ -132,7 +137,11 @@ impl RepositoryOrigin {
                 return None;
             }
             state.attempt = Some(attempt.0.clone());
-            (state.owner.take(), state.endpoint.take())
+            (
+                state.owner.take(),
+                state.endpoint.take(),
+                state.prompt_context.take(),
+            )
         };
         // A previously admitted stage may be draining. Keep the physical slot
         // and the manager map available to other retirement callers meanwhile.
@@ -141,6 +150,9 @@ impl RepositoryOrigin {
         }
         if let Some(endpoint) = previous.1 {
             endpoint.retire();
+        }
+        if let Some(context) = previous.2 {
+            context.retire();
         }
         let mut state = self.state.lock().unwrap();
         if state.retired
@@ -193,6 +205,13 @@ impl RepositoryOrigin {
         let mut state = self.state.lock().unwrap();
         if state.blueprint.is_none() && !state.retired {
             state.blueprint = Some(Arc::new(blueprint));
+        }
+    }
+
+    pub(super) fn configure_prompt_source(&self, source: ServerBlueprint) {
+        let mut state = self.state.lock().unwrap();
+        if state.prompt_source.is_none() && !state.retired {
+            state.prompt_source = Some(source);
         }
     }
 
@@ -293,7 +312,7 @@ impl RepositoryOrigin {
         attempt: SessionAttempt,
         connection: &Arc<intent_acp::Connection>,
         outcome: crate::agent_session::RepositorySessionOutcome<T>,
-    ) -> (T, Option<ConfirmedCallbackAttempt>) {
+    ) -> (T, Option<SessionDelivery>) {
         let mut delivery = None;
         match outcome.owner {
             Ok(owner) => {
@@ -314,18 +333,57 @@ impl RepositoryOrigin {
                         query.pending_review_monitoring(),
                     )
                 });
+                let prompt_context = if outcome.query.is_none() {
+                    let source = self.state.lock().unwrap().prompt_source.clone();
+                    self.original.as_ref().and_then(|original| {
+                        source.as_ref()?.bind_prompt_context(
+                            connection,
+                            &owner,
+                            &original.workspace,
+                            &original.agent,
+                        )
+                    })
+                } else {
+                    None
+                };
                 if self.install(attempt, owner) {
                     if let (Some(query), Some(blueprint)) = (outcome.query, blueprint) {
-                        delivery = Some(ConfirmedCallbackAttempt::new(
-                            self,
-                            original_attempt,
-                            context,
-                            retirement,
-                            blueprint,
-                            query,
-                            live,
-                        ));
+                        delivery = Some(SessionDelivery::Callback(Box::new(
+                            ConfirmedCallbackAttempt::new(
+                                self,
+                                original_attempt,
+                                context,
+                                retirement,
+                                blueprint,
+                                query,
+                                live,
+                            ),
+                        )));
+                    } else if let Some(context) = prompt_context {
+                        // Capture at this original confirmation, before the
+                        // caller awaits replay/model metadata or builds a turn.
+                        let captured = context.capture_prompt(connection);
+                        let installed = {
+                            let mut state = self.state.lock().unwrap();
+                            if !state.retired
+                                && state.attempt.as_ref().is_some_and(|current| {
+                                    Arc::ptr_eq(current, &original_attempt.0)
+                                })
+                            {
+                                state.prompt_context = Some(context.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if installed {
+                            delivery = captured.map(SessionDelivery::Prompt);
+                        } else {
+                            context.retire();
+                        }
                     }
+                } else if let Some(context) = prompt_context {
+                    context.retire();
                 }
             }
             Err(error) => {
@@ -338,7 +396,7 @@ impl RepositoryOrigin {
     /// Every caller joins the SAME R retirement, even if another caller has
     /// already marked this handle retired. No handles-map lock is held here.
     pub(super) fn retire(&self) {
-        let (pending, creations, retirement, endpoint) = {
+        let (pending, creations, retirement, endpoint, prompt_context) = {
             let mut state = self.state.lock().unwrap();
             state.retired = true;
             (
@@ -346,6 +404,7 @@ impl RepositoryOrigin {
                 state.creation_retirements.clone(),
                 state.retirement.clone(),
                 state.endpoint.clone(),
+                state.prompt_context.clone(),
             )
         };
         for creation in creations {
@@ -357,6 +416,9 @@ impl RepositoryOrigin {
         if let Some(endpoint) = endpoint {
             endpoint.retire();
         }
+        if let Some(context) = prompt_context {
+            context.retire();
+        }
         drop(pending);
     }
 
@@ -364,26 +426,32 @@ impl RepositoryOrigin {
         &self,
         connection: &Arc<intent_acp::Connection>,
     ) -> Option<callback_delivery::RepositoryPromptInput> {
-        let endpoint = {
+        let (endpoint, prompt_context) = {
             let state = self.state.lock().unwrap();
             if state.retired {
                 return None;
             }
-            state.endpoint.clone()?
+            (state.endpoint.clone(), state.prompt_context.clone())
         };
-        endpoint.capture_prompt(connection)
+        match endpoint {
+            Some(endpoint) => endpoint.capture_prompt(connection),
+            None => prompt_context?.capture_prompt(connection),
+        }
     }
 
     pub(super) fn interrupt_requests(&self) {
-        let endpoint = {
+        let (endpoint, prompt_context) = {
             let state = self.state.lock().unwrap();
             if let Some(owner) = &state.owner {
                 owner.interrupt_requests();
             }
-            state.endpoint.clone()
+            (state.endpoint.clone(), state.prompt_context.clone())
         };
         if let Some(endpoint) = endpoint {
             endpoint.interrupt_context();
+        }
+        if let Some(context) = prompt_context {
+            context.invalidate_and_drain();
         }
     }
 }
