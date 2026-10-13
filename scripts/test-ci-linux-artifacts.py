@@ -136,7 +136,7 @@ class LinuxTests(unittest.TestCase):
                  mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \
                  mock.patch.object(linux.archives, 'verify_bundle', return_value=item), \
                  mock.patch.object(linux.archives, 'prepare', return_value=item), \
-                 mock.patch.object(linux.coverage, 'build_environment', return_value={}), \
+                 mock.patch.object(linux.coverage, 'build_environment', return_value={}) as environment, \
                  mock.patch.object(linux, 'compiler_inventory', return_value=linux.COMPILER_TESTS), \
                  mock.patch.object(linux.archives, 'run_libtest', side_effect=[0, 0, 41]) as run:
                 for expected in ({'reused': False}, {'reused': True}):
@@ -146,6 +146,7 @@ class LinuxTests(unittest.TestCase):
                     linux.produce(ROOT, root, 'merge_group', None, reuse=False)
                 self.assertEqual(produce.call_count, 3)
                 self.assertEqual(run.call_count, 3)
+                self.assertFalse(environment.call_args.kwargs['remap'])
                 self.assertEqual(run.call_args.args[1:], (binary, []))
                 self.assertIn('compiler-gate-', run.call_args.kwargs['env']['LLVM_PROFILE_FILE'])
                 with self.assertRaises(ValueError):

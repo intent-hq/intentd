@@ -15,7 +15,7 @@ def output(argv, source, env=None):
     return subprocess.check_output(argv, cwd=source, env=env, text=True).strip()
 
 
-def capture(source):
+def capture(source, *, remap=True):
     """Observe llvm-cov's actual flags instead of approximating its wrapper.
 
     Logical paths let another checkout reproduce the same recipe. Profiles are
@@ -25,7 +25,7 @@ def capture(source):
     source = Path(source).resolve()
     target = source.parent / '.intent-coverage-identity-target'
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-    text = output(['cargo', 'llvm-cov', 'show-env', '--sh', '--remap-path-prefix'], source, env)
+    text = output(['cargo', 'llvm-cov', 'show-env', '--sh', *(['--remap-path-prefix'] if remap else [])], source, env)
     values = {}
     for line in text.splitlines():
         words = shlex.split(line)
@@ -54,11 +54,15 @@ def flags(coverage):
     return [name + '=' + value for name, value in sorted(coverage['environment'].items())]
 
 
-def build_environment(coverage, source, target):
+def build_environment(coverage, source, target, *, remap=True):
     if capture(source) != coverage:
         raise ValueError('observed LLVM tools/flags differ from archive identity')
+    # trybuild must render original source spans for its committed diagnostics.
+    # Its fresh child compiler uses llvm-cov's original, unremapped flags, while
+    # the archived test binary keeps the exact requested feature graph.
+    values = coverage['environment'] if remap else capture(source, remap=False)['environment']
     return dict(os.environ, **{name: value.replace('{workspace}', str(source)).replace('{target}', str(target))
-                               for name, value in coverage['environment'].items()})
+                               for name, value in values.items()})
 
 
 def stage_report_objects(stage, target, extraction):
