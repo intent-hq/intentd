@@ -155,6 +155,11 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; messages/en.json. -->
+
+In **Home**, workspaces without a title appear as **Untitled** in the list, board,
+and detail preview until a title is set. The label updates when the title arrives.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use **Next Workspace Tab** (default **Ctrl+Tab**) or **Previous Workspace Tab**
