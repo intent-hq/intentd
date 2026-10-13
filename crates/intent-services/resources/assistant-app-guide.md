@@ -145,7 +145,7 @@ local machine, connect to it first. Enabling access, changing listening addresse
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
 
 When the app and connected daemon support startup progress, the connection screen
 can show **Starting intentd**, **Rebuilding note indexes**, then **Finishing startup**.
@@ -155,6 +155,13 @@ that alone does not mean startup failed. Any remaining-time estimate is approxim
 and covers indexing only. **Startup status unavailable** means fresh status could
 not be received; do not present cached counts as current. For **Daemon startup failed**,
 check the daemon logs. Restarting can repeat uncommitted indexing work.
+
+With matching mobile and daemon support, iPhone and iPad show **Starting Desktop**,
+**Indexing Notes**, and **Finishing Startup** during initial connection or reconnection
+over saved direct or Tailcat routes. Counts and indexing estimates have the same
+limits described above. **Startup status unavailable. Reconnecting securely…** means
+current status is unavailable. For **Startup Failed**, use **Retry Connection** after
+checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
