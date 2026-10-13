@@ -245,6 +245,21 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Home workspace status icons
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; messages/en.json. -->
+
+In **Home → Workspaces**, the status icon in list and board views describes the
+workspace's current status. Hover over it for an explanation:
+
+- **PR Open** (blue pull request icon): a pull request is open.
+- **PR Mergeable** (green pull request icon): a pull request is reported ready to merge.
+- **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Questions, review requests, failures, and blockers can take precedence over PR
+icons. **PR Mergeable** does not grant permission to merge: agents still need the
+user's explicit authorization and must check the current merge requirements.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
