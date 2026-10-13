@@ -119,7 +119,10 @@ impl EventBus {
             ))
             .await?;
         }
-        if previous.map(|p| &p.stats) != Some(&current.stats) {
+        // Writes capture a pre-mutation baseline. A notification without a
+        // preceding write can initialize one, but unknown counts are not a
+        // statistics change (including after restart).
+        if previous.is_some_and(|p| p.stats != current.stats) {
             self.publish_raw(&projection_event(
                 source,
                 WORKSPACE_TASK_STATS_CHANGED,
