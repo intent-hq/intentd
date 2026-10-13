@@ -376,4 +376,3 @@ jobs:
         if: ${{ always() && runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
         shell: bash
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
