@@ -50,7 +50,7 @@ The preview shows a skeleton while its content streams or the sandbox starts.
 Use this for exploring comparisons or changing inputs. Keep simple explanations
 in text and shareable charts in saved files. Visuals use app semantic CSS variables
 for both themes and cannot use external libraries, network access, app APIs,
-navigation, forms, popups, or embedded frames. **View source** shows the code;
+navigation, forms, popups, or embedded frames. **Source** shows the code;
 **Reload** starts the visual again and resets its local inputs.
 
 <!-- Sources: packages/cloudlands-fe/src/features/inline-html/InlineHtmlPreview.svelte; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
