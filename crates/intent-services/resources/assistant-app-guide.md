@@ -137,6 +137,15 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+
+Use **Next Workspace Tab** (default **Ctrl+Tab**) or **Previous Workspace Tab**
+(default **Ctrl+Shift+Tab**) to cycle through open workspace tabs in displayed
+order. From **Home**, next opens the first workspace tab and previous opens the
+last, regardless of which workspace was selected before Home. With no open
+workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
+and shortcuts → Keyboard shortcuts**.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
 When an agent monitors a GitHub pull request, its conversation shows the monitored
@@ -185,6 +194,14 @@ an agent is a particular conversation doing work.
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/questions/QuestionWizard.svelte. -->
 
 When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
+
+In an empty composer, press **Up Arrow** to recall a previous prompt. Recalled
+prompts use the visible message text, without hidden sender or delivery metadata.
+At the start of the text, **Up Arrow** moves to an older prompt; at the end,
+**Down Arrow** moves forward and restores your draft. If an editable queued
+message is present, **Up Arrow** in an empty composer edits that message first.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/TipTapEditor.svelte; src/lib/utils/user-message-presentation.ts. -->
 
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
