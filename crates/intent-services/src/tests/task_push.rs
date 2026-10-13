@@ -89,6 +89,67 @@ async fn task_push_has_complete_rows_and_changed_only_statistics() {
 }
 
 #[intent_test_macros::daemon_test]
+async fn task_push_initial_notification_does_not_invent_statistics_change() {
+    for has_task in [false, true] {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::from("task-notification-push");
+        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        store
+            .insert_note(&note(&ws, "spec", "[Task](intent://local/task/task)"))
+            .await
+            .unwrap();
+        if has_task {
+            let mut task = note(&ws, "task", "body");
+            task.parent_id = Some(NoteId::from("spec"));
+            task.metadata.task = Some(TaskMetadata::default());
+            store.insert_note(&task).await.unwrap();
+        }
+        // Like restart: existing state, but no pre-write baseline yet. A
+        // notification alone must not turn unknown counts into a change.
+        let bus = EventBus::new(store.clone());
+        for _ in 0..2 {
+            bus.publish(&note_change_event(
+                &ws,
+                &NoteId::from("spec"),
+                "Spec",
+                NOTE_UPDATED,
+                "update",
+            ))
+            .await
+            .unwrap();
+            assert!(events(&store, "workspace:task-stats-changed")
+                .await
+                .is_empty());
+        }
+        if has_task {
+            // The initialized baseline still detects the next real change.
+            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            services
+                .task_update_note_status(
+                    ws.clone(),
+                    NoteId::from("task"),
+                    "in_progress".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let stats = events(&store, "workspace:task-stats-changed").await;
+            assert_eq!(stats.len(), 1);
+            assert_eq!(
+                stats[0].data,
+                serde_json::json!({
+                    "workspaceId": ws,
+                    "taskStats": {"total": 1, "completed": 0, "inProgress": 1},
+                })
+            );
+        }
+        bus.shutdown().await.unwrap();
+    }
+}
+
+#[intent_test_macros::daemon_test]
 async fn task_push_first_body_write_does_not_publish_statistics() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
