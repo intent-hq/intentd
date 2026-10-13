@@ -70,6 +70,16 @@ def probe(command, *, codes=(0,)):
     return result.stdout.strip()
 
 
+def msvc_tool(name):
+    compiler = shutil.which('cl.exe')
+    if not compiler:
+        raise RuntimeError('MSVC developer environment must be provisioned')
+    tool = Path(compiler).with_name(name + '.exe')
+    if not tool.is_file():
+        raise RuntimeError('missing provisioned MSVC tool: ' + str(tool))
+    return str(tool)
+
+
 def platform_facts(native_platform):
     rust = probe(['rustc', '-vV'])
     host = next(line.removeprefix('host: ') for line in rust.splitlines() if line.startswith('host: '))
@@ -86,9 +96,10 @@ def platform_facts(native_platform):
         abi = observed['os'] + '\n' + cc
         probe(['otool', '-h', sys.executable])
     elif native_platform == 'windows':
-        cc = probe(['cl'], codes=(0, 2))
-        linker = probe(['link', '/?'])
-        probe(['dumpbin', '/?'])
+        cc = probe([msvc_tool('cl')], codes=(0, 2))
+        linker = probe([msvc_tool('link'), '/?'])
+        probe([msvc_tool('dumpbin'), '/?'])
+        os.environ['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'] = msvc_tool('link')
         required = ('VCToolsVersion', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')
         if any(not os.environ.get(name) for name in required):
             raise RuntimeError('MSVC developer environment and Windows SDK must be provisioned')
@@ -163,7 +174,7 @@ int main(int argc, char **argv) {
     return 97;
 }
 ''')
-    command = ['cl', '/nologo', '/MT', str(source), '/Fe:' + str(root / 'compiler-tripwire.exe'),
+    command = [msvc_tool('cl'), '/nologo', '/MT', str(source), '/Fe:' + str(root / 'compiler-tripwire.exe'),
                '/Fo:' + str(root / 'compiler-tripwire.obj')]
     print('+ ' + repr(command), flush=True)
     subprocess.run(command, cwd=root, check=True)

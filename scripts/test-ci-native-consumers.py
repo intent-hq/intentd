@@ -102,6 +102,21 @@ class ConsumerTests(unittest.TestCase):
             self.assertNotIn('if', steps[index])
             self.assertNotIn('continue-on-error', steps[index])
 
+    def test_windows_tools_resolve_from_msvc_not_git_bash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            compiler = root / 'MSVC/cl.exe'
+            compiler.parent.mkdir()
+            compiler.touch()
+            linker = compiler.with_name('link.exe'); linker.touch()
+            dumpbin = compiler.with_name('dumpbin.exe'); dumpbin.touch()
+            with patch.object(self.native.shutil, 'which', return_value=str(compiler)):
+                self.assertEqual(self.native.msvc_tool('link'), str(linker))
+                self.assertEqual(self.native.msvc_tool('dumpbin'), str(dumpbin))
+                linker.unlink()
+                with self.assertRaisesRegex(RuntimeError, 'MSVC'):
+                    self.native.msvc_tool('link')
+
     def test_windows_tripwires_are_executables_not_cmd_fallbacks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
