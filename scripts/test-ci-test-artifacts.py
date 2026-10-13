@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -22,6 +23,57 @@ artifacts = load("ci-test-artifacts")
 
 
 class ArchiveTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "ELF dependency closure proof")
+    def test_real_recursive_libraries_relocate_without_host_injection(self):
+        with tempfile.TemporaryDirectory(prefix="intent-library-chain-") as tmp:
+            root = Path(tmp)
+            producer, staged = root / "producer", root / "staged"
+            producer.mkdir()
+            staged.mkdir()
+            sources = {
+                "second": "int second(void) { return 42; }",
+                "first": "extern int second(void); int first(void) { return second(); }",
+                "injection": "int unrelated(void) { return 9; }",
+                "main": '#include <stdio.h>\nextern int first(void); int main(void) { printf("%d\\n", first()); return 0; }',
+            }
+            for name, code in sources.items():
+                (producer / (name + ".c")).write_text(code)
+            for name in ("second", "first", "injection"):
+                command = ["cc", "-fPIC", "-shared", str(producer / (name + ".c")), "-Wl,-soname,lib" + name + ".so", "-o", str(producer / ("lib" + name + ".so"))]
+                if name == "first":
+                    command += ["-L" + str(producer), "-lsecond", "-Wl,-rpath," + str(producer)]
+                subprocess.run(command, check=True, capture_output=True)
+            binary = producer / "main"
+            subprocess.run(["cc", str(producer / "main.c"), "-L" + str(producer), "-lfirst", "-Wl,-rpath," + str(producer), "-o", str(binary)], check=True, capture_output=True)
+            with mock.patch.dict(os.environ, {"LD_PRELOAD": str(producer / "libinjection.so")}):
+                dependencies = artifacts.stage_binary_libraries(binary, staged)
+            self.assertEqual(dependencies["bundled"], ["libfirst.so", "libsecond.so"])
+            self.assertEqual(sorted(p.name for p in staged.iterdir()), ["libfirst.so", "libsecond.so"])
+            shutil.copy2(binary, staged / "main")
+            shutil.rmtree(producer)
+            env = dict(os.environ, LD_LIBRARY_PATH=str(staged))
+            env.pop("LD_PRELOAD", None)
+            self.assertEqual(subprocess.check_output([str(staged / "main")], env=env, text=True).strip(), "42")
+
+    def test_archive_implementation_is_part_of_the_recipe_identity(self):
+        recipe = artifacts.native_recipes("linux", "pull_request", "x86_64-unknown-linux-gnu")["sitter"]
+        before = artifacts.recipe_digest(recipe)
+        with mock.patch.object(artifacts, "file_sha", return_value="0" * 64):
+            self.assertNotEqual(artifacts.recipe_digest(recipe), before)
+
+    def test_library_audit_ignores_host_injection_and_records_linker_environment(self):
+        with tempfile.TemporaryDirectory(prefix="intent-library-audit-") as tmp:
+            binary = Path(tmp) / "binary"
+            binary.touch()
+            result = subprocess.CompletedProcess([], 0, "libc.so.6 => /lib/libc.so.6 (0x123)\n/host/injection.so (0x456)\n", "")
+            dynamic = "0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n"
+            with mock.patch.dict(os.environ, {"LD_PRELOAD": "/host/injection.so", "LD_AUDIT": "/host/audit.so", "LIBRARY_PATH": "/custom/linker"}), mock.patch.object(artifacts.sys, "platform", "linux"), mock.patch.object(artifacts.subprocess, "run", return_value=result) as run, mock.patch.object(artifacts, "output", return_value=dynamic):
+                dependencies = artifacts.stage_binary_libraries(binary, Path(tmp))
+                self.assertEqual(dependencies["bundled"], [])
+                self.assertNotIn("LD_PRELOAD", run.call_args.kwargs["env"])
+                self.assertNotIn("LD_AUDIT", run.call_args.kwargs["env"])
+                self.assertEqual(artifacts.build_environment()["LIBRARY_PATH"], "/custom/linker")
+
     def test_unsafe_paths_and_consumer_build_flags_fail_closed(self):
         for name in ("../escape", "/absolute", "C:/drive", "a/../../escape", "a\\escape", ""):
             with self.subTest(name=name), self.assertRaises(ValueError):

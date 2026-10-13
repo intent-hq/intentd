@@ -76,9 +76,9 @@ def native_recipes(platform, event, target):
 
 def build_environment():
     names = set(identity.REQUIRED_ENV)
-    prefixes = ("CARGO_PROFILE_", "CARGO_TARGET_", "CARGO_BUILD_", "CC_", "CXX_", "AR_", "CFLAGS_", "CXXFLAGS_", "LDFLAGS_", "PKG_CONFIG", "OPENSSL", "LIBZ_", "RUSTC_")
+    prefixes = ("CARGO_PROFILE_", "CARGO_TARGET_", "CARGO_BUILD_", "CC_", "CXX_", "AR_", "CFLAGS_", "CXXFLAGS_", "LDFLAGS_", "PKG_CONFIG", "OPENSSL", "LIBZ_", "RUSTC_", "DYLD_")
     names.update(name for name in os.environ if name.startswith(prefixes))
-    names.update(("RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "CARGO_HOME"))
+    names.update(("RUSTC", "RUSTDOC", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "LIB", "INCLUDE"))
     names.discard("CARGO_TARGET_DIR")
     return {name: os.environ.get(name) for name in sorted(names)}
 
@@ -105,7 +105,10 @@ def graph_args(command):
 
 
 def recipe_digest(recipe):
-    return sha(json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode())
+    # --source may be another checkout (including the small functional fixture).
+    # Bind the archiver implementation too, not just Cargo's argv/source SHA.
+    implementation = {"archive": file_sha(__file__), "identity": file_sha(identity.__file__)}
+    return sha(json.dumps({"recipe": recipe, "implementation": implementation}, sort_keys=True, separators=(",", ":")).encode())
 
 
 def validate_request(request):
@@ -217,7 +220,7 @@ def nextest_inventory(destination, source):
     libraries = list(meta["linked-paths"])
     for directory in meta["base-output-directories"]:
         libraries += [directory, directory + "/deps"]
-    libraries += [p.relative_to(target).as_posix() for p in (target / "nextest/libdirs").glob("*") if p.is_dir()]
+    libraries += [p.parent.relative_to(target).as_posix() for p in (target / "nextest/libdirs").rglob("*") if p.is_file()]
     for path in libraries:
         safe_join(target, path)
     if not tests:
@@ -269,19 +272,32 @@ def stage_binary_libraries(binary, destination, seen=None):
                 # Fail explicitly instead of claiming this binary relocates.
                 raise ValueError(f"unsupported standalone Mach-O dependency: {path}")
     else:
-        result = subprocess.run(["ldd", str(binary)], text=True, capture_output=True)
+        # ldd also reports loader-injected host instrumentation. It is not a
+        # DT_NEEDED dependency of this executable and must not be published.
+        env = {name: value for name, value in os.environ.items() if name not in ("LD_PRELOAD", "LD_AUDIT")}
+        result = subprocess.run(["ldd", str(binary)], text=True, capture_output=True, env=env)
         report = result.stdout + result.stderr
         if result.returncode and "statically linked" not in report and "not a dynamic executable" not in report:
             raise ValueError("cannot audit standalone binary libraries: " + report)
-        if "not found" in report:
-            raise ValueError("missing standalone binary library: " + report)
-        for path in re.findall(r"(?:=>\s+|^\s*)(/\S+)", report, re.MULTILINE):
+        # /etc/ld.so.preload can inject libraries even with a clean environment.
+        # Follow only this object's DT_NEEDED edges, using ldd for resolution.
+        needed = re.findall(r"\(NEEDED\).*Shared library: \[([^\]]+)\]", output(["readelf", "--dynamic", str(binary)]))
+        resolved = dict(re.findall(r"^\s*(\S+) => (/\S+)", report, re.MULTILINE))
+        for path in re.findall(r"^\s*(/\S+)\s+\(", report, re.MULTILINE):
+            resolved.setdefault(Path(path).name, path)
+        for name in needed:
+            if "/" in name or name not in resolved:
+                raise ValueError(f"missing or non-relocatable standalone library: {name}")
+            path = resolved[name]
             library = Path(path)
             if path.startswith(("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")):
                 system.append(path)
             else:
                 shutil.copy2(library, destination / library.name)
                 copied.append(library.name)
+                nested = stage_binary_libraries(library, destination, seen)
+                system += nested["system"]
+                copied += nested["bundled"]
     return {"system": sorted(set(system)), "bundled": sorted(set(copied))}
 
 
