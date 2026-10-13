@@ -12,6 +12,69 @@ fn list(capture: &Value, context: &Value) -> Value {
 }
 
 #[intent_test_macros::daemon_test]
+async fn repository_child_git_real_owner_policy_is_default_off_and_bound() {
+    let h = Harness::new().await;
+    let mut owner = h.wss(TOKEN).await;
+    let before = h.server.as_ref().unwrap().count();
+    let first = owner
+        .rpc("sourceControl.gitlab.childGit.get", json!({}))
+        .await;
+    let first = success(&first);
+    assert_eq!(first["kind"], "connected");
+    assert_eq!(first["enabled"], false);
+    assert_eq!(first["effective"], false);
+    assert_eq!(first["binding"]["instanceBaseUrl"], INSTANCE);
+    assert!(first["binding"]["connection"]["connectionGeneration"].is_string());
+    let binding = first["binding"].clone();
+    let set = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":binding,"enabled":true}),
+        )
+        .await;
+    let set = success(&set);
+    assert_eq!(set["enabled"], true);
+    assert_eq!(set["effective"], true);
+    let changed = set["binding"].clone();
+    let stale = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":binding,"enabled":false}),
+        )
+        .await;
+    assert!(
+        stale.get("error").is_some(),
+        "old acknowledged policy revision must not overwrite a later choice"
+    );
+    for token in [MEMBER, GUEST] {
+        let mut caller = h.wss(token).await;
+        let get = caller
+            .rpc("sourceControl.gitlab.childGit.get", json!({}))
+            .await;
+        assert_eq!(get["error"]["code"], -32003);
+        let set = caller
+            .rpc(
+                "sourceControl.gitlab.childGit.set",
+                json!({"binding":changed,"enabled":false}),
+            )
+            .await;
+        assert_eq!(set["error"]["code"], -32003);
+        caller.close().await;
+    }
+    let last = owner
+        .rpc("sourceControl.gitlab.childGit.get", json!({}))
+        .await;
+    assert_eq!(success(&last)["enabled"], true);
+    assert_eq!(
+        h.server.as_ref().unwrap().count(),
+        before,
+        "local policy operations must not probe provider endpoints"
+    );
+    owner.close().await;
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
 async fn repository_pages_real_owner_and_member_wss_lists_discussions_and_release() {
     let h = Harness::new().await;
     for owner in [true, false] {
