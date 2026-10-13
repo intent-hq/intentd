@@ -5636,6 +5636,16 @@ fn spawn_staged_restart_watcher(
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
         use tokio::signal::unix::{signal, SignalKind};
+        // Let the readiness regression hold this task before its first work,
+        // reproducing a scheduler that polls the listener before the watcher.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("INTENTD_TEST_STAGED_RESTART_WATCHER_GATE") {
+            use tokio::io::AsyncReadExt;
+            let mut gate = tokio::net::UnixStream::connect(path)
+                .await
+                .expect("staged restart watcher test gate");
+            gate.read_u8().await.expect("release restart watcher");
+        }
         let mut usr2 = match signal(SignalKind::user_defined2()) {
             Ok(stream) => stream,
             Err(e) => {

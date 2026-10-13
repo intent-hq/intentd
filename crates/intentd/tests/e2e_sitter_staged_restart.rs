@@ -551,6 +551,77 @@ async fn idle_daemon_exits_with_restart_code_on_sigusr2() {
     assert!(log.contains("exiting for staged update restart"), "{log}");
 }
 
+/// Readiness must imply installed signal handling even when the spawned
+/// watcher has not run. The socket gate holds that task at its first poll;
+/// a successful status RPC is the production sitter's readiness criterion.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir = common::test_tempdir("itd-sr-ready-");
+    let gate_path = data_dir.path().join("watcher.sock");
+    let gate = tokio::net::UnixListener::bind(&gate_path).expect("bind watcher gate");
+    let (mut daemon, socket) = launch_daemon_with(
+        data_dir.path(),
+        &script,
+        true,
+        &[(
+            "INTENTD_TEST_STAGED_RESTART_WATCHER_GATE",
+            gate_path.to_str().unwrap(),
+        )],
+    )
+    .await;
+    let (mut release, _) = tokio::time::timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .expect("restart watcher reached gate")
+        .expect("accept watcher gate");
+
+    let status = Client::connect(&socket)
+        .await
+        .rpc(1, "system.status", json!({}))
+        .await;
+    assert!(status["version"].is_string(), "{status}");
+    eprintln!("production readiness passed while restart watcher held: {status}");
+
+    // Queue the signal while the process is stopped, then release the gate
+    // before resuming. Pending signals are delivered before userspace runs:
+    // the unfixed watcher cannot race ahead and install its handler after kill.
+    let pid = Pid::from_raw(daemon.child.id() as i32);
+    daemon.signal(Signal::SIGSTOP);
+    let stopped = tokio::time::timeout(
+        exit_budget(),
+        tokio::task::spawn_blocking(move || waitpid(pid, Some(WaitPidFlag::WUNTRACED))),
+    )
+    .await
+    .expect("daemon stopped")
+    .expect("join stop observer")
+    .expect("observe daemon stop");
+    assert_eq!(stopped, WaitStatus::Stopped(pid, Signal::SIGSTOP));
+    daemon.signal(Signal::SIGUSR2);
+    release.write_u8(1).await.expect("release watcher gate");
+    daemon.signal(Signal::SIGCONT);
+
+    let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
+        panic!(
+            "ready daemon did not exit\n--- daemon log ---\n{}",
+            daemon.log()
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(RESTART_FOR_UPDATE_EXIT_CODE),
+        "readiness preceded restart signal handling: exit={status}, signal={:?}\n--- daemon log ---\n{}",
+        status.signal(),
+        daemon.log()
+    );
+    assert!(daemon.log().contains("staged update restart accepted"));
+}
+
 /// A supervised daemon with a turn in flight accepts SIGUSR2 but keeps
 /// serving until the turn ends, then exits with the restart code.
 #[tokio::test]
