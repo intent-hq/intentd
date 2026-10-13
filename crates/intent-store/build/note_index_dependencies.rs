@@ -2,8 +2,8 @@
 //!
 //! Only dependencies that can change indexed output participate: the audited
 //! [`ROOTS`] and everything they resolve to in Cargo.lock (identity, source,
-//! checksum and edges), plus every manifest declaration that can change those
-//! packages' features. Workspace release numbers, unrelated packages and
+//! checksum and edges), their reverse dependents (which can unify features),
+//! and local manifest declarations and feature chains reaching those packages. Workspace release numbers, unrelated packages and
 //! lockfile layout are ignored, so a release without index changes keeps the
 //! existing indexes. Shared by `build.rs` and the unit tests so the tested
 //! code is the code that produces the fingerprint input. Never runs cargo.
@@ -18,7 +18,8 @@ pub const PACKAGE: &str = "intent-store";
 /// Direct dependencies whose behavior reaches note index output. The index
 /// source audit test keeps this list in sync with the index sources: `sha2`
 /// only hashes the profile, `sqlx` stores rows, `uuid` mints opaque generation
-/// ids and `intent-core` is workspace code outside this fingerprint.
+/// ids and `intent-core` is workspace code. Their declarations still participate
+/// when they can unify features; their implementation is not an output root.
 pub const ROOTS: [&str; 5] = [
     "base64",
     "html5ever",
@@ -28,7 +29,7 @@ pub const ROOTS: [&str; 5] = [
 ];
 
 /// Bump when the canonical representation below changes meaning.
-const FORMAT: &str = "note-index-dependencies:1";
+const FORMAT: &str = "note-index-dependencies:2";
 
 const HELP: &str = "update crates/intent-store/build/note_index_dependencies.rs";
 
@@ -68,6 +69,38 @@ pub fn collect(manifest_dir: &Path) -> Result<Inputs, String> {
             root.display(),
             manifest_dir.display()
         ));
+    }
+    // Cargo also includes path dependencies implicitly. Follow all path
+    // declarations (including excluded/outside-workspace dependencies and local
+    // patches): their manifests can participate in feature unification too.
+    let mut cursor = 0;
+    let mut discovered = BTreeSet::new();
+    while cursor < paths.len() {
+        let path = paths[cursor].canonicalize().map_err(|error| {
+            format!(
+                "note index profile: cannot resolve {}: {error}",
+                paths[cursor].display()
+            )
+        })?;
+        cursor += 1;
+        if !discovered.insert(path.clone()) {
+            continue;
+        }
+        let manifest = parse_toml(&read(&path)?, &path.display().to_string())?;
+        for (_, section) in dependency_sections(&manifest) {
+            for spec in section
+                .as_table()
+                .into_iter()
+                .flat_map(|table| table.values())
+            {
+                if let Some(relative) = spec.get("path") {
+                    let relative = relative
+                        .as_str()
+                        .ok_or("note index profile: dependency path must be a string")?;
+                    paths.push(path.parent().unwrap().join(relative).join("Cargo.toml"));
+                }
+            }
+        }
     }
     let mut seen = BTreeSet::new();
     paths.retain(|path| seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())));
@@ -195,6 +228,15 @@ struct Package {
 }
 
 impl Package {
+    // Workspace release versions never affect feature forwarding.
+    fn activation_id(&self) -> String {
+        if self.source.is_none() {
+            format!("{} (local)", self.name)
+        } else {
+            self.id()
+        }
+    }
+
     fn id(&self) -> String {
         format!(
             "{} {} ({})",
@@ -249,13 +291,102 @@ pub fn dependency_profile(lock: &str, manifests: &[&str]) -> Result<String, Stri
     for &index in &closure {
         lines.insert(package_line(&packages[index])?);
     }
-    let names: BTreeSet<&str> = closure
+    // Any reverse dependent can enable a feature of a selected package.
+    // Lockfiles pin external manifests by identity/checksum, so conservatively
+    // include those identities instead of approximating Cargo's resolver.
+    let edges = packages
+        .iter()
+        .map(|package| {
+            package
+                .dependencies
+                .iter()
+                .map(|entry| resolve(&packages, entry))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut relevant = closure.clone();
+    loop {
+        let before = relevant.len();
+        for (index, dependencies) in edges.iter().enumerate() {
+            if dependencies
+                .iter()
+                .any(|dependency| relevant.contains(dependency))
+            {
+                relevant.insert(index);
+            }
+        }
+        if before == relevant.len() {
+            break;
+        }
+    }
+    let tables = manifests
+        .iter()
+        .enumerate()
+        .map(|(position, manifest)| {
+            parse_toml(manifest, &format!("workspace manifest #{position}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut local_names = BTreeSet::new();
+    for name in tables
+        .iter()
+        .filter_map(|table| table.get("package")?.get("name")?.as_str())
+    {
+        if !local_names.insert(name) {
+            return Err(format!("note index profile: multiple local manifests named `{name}`; cannot distinguish feature owners; {HELP}"));
+        }
+    }
+    for &index in &relevant {
+        let package = &packages[index];
+        if package.source.is_some() {
+            lines.insert(package_line(package)?);
+        } else if index != own && !local_names.contains(package.name.as_str()) {
+            return Err(format!("note index profile: local feature contributor `{}` has no collected manifest; {HELP}", package.name));
+        }
+        for &dependency in &edges[index] {
+            if relevant.contains(&dependency) {
+                lines.insert(format!(
+                    "activation {} -> {}",
+                    package.activation_id(),
+                    packages[dependency].activation_id()
+                ));
+            }
+        }
+    }
+    let names: BTreeSet<&str> = relevant
         .iter()
         .map(|&index| packages[index].name.as_str())
         .collect();
-    for (position, manifest) in manifests.iter().enumerate() {
+    let ambiguous_names: BTreeSet<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| {
+            packages
+                .iter()
+                .filter(|package| package.name == *name)
+                .count()
+                > 1
+        })
+        .collect();
+    let workspace_tables: Vec<&Table> = tables
+        .iter()
+        .filter_map(|table| table.get("workspace")?.as_table())
+        .collect();
+    if workspace_tables.len() > 1 {
+        return Err(format!("note index profile: multiple workspace roots in collected manifests; cannot resolve inherited features; {HELP}"));
+    }
+    let workspace_dependencies = workspace_tables
+        .first()
+        .and_then(|workspace| workspace.get("dependencies")?.as_table());
+    for (position, manifest) in tables.iter().enumerate() {
         let label = format!("workspace manifest #{position}");
-        declarations(&parse_toml(manifest, &label)?, &label, &names, &mut lines)?;
+        declarations(
+            manifest,
+            &label,
+            &names,
+            &ambiguous_names,
+            workspace_dependencies,
+            &mut lines,
+        )?;
     }
     let mut out = String::from(FORMAT);
     for line in lines {
@@ -406,14 +537,8 @@ fn package_line(package: &Package) -> Result<String, String> {
     }
 }
 
-/// Record manifest settings that can change features of fingerprinted
-/// packages. Version requirements are omitted: Cargo.lock pins resolution.
-fn declarations(
-    manifest: &Table,
-    label: &str,
-    names: &BTreeSet<&str>,
-    lines: &mut BTreeSet<String>,
-) -> Result<(), String> {
+/// All places which declare dependency packages, including local overrides.
+fn dependency_sections(manifest: &Table) -> Vec<(String, &Value)> {
     let mut sections: Vec<(String, &Value)> = Vec::new();
     for kind in [
         "dependencies",
@@ -439,14 +564,81 @@ fn declarations(
     {
         sections.push(("workspace.dependencies".to_owned(), section));
     }
-    let mut keys = BTreeMap::new();
+    if let Some(Value::Table(patches)) = manifest.get("patch") {
+        for (source, section) in patches {
+            sections.push((format!("patch.{source}"), section));
+        }
+    }
+    if let Some(section) = manifest.get("replace") {
+        sections.push(("replace".to_owned(), section));
+    }
+    sections
+}
+
+/// Record feature-affecting declarations with their owner and dependency alias.
+/// Version requirements are omitted unless duplicate locked identities need
+/// disambiguation: Cargo.lock otherwise pins resolution.
+fn declarations(
+    manifest: &Table,
+    label: &str,
+    names: &BTreeSet<&str>,
+    ambiguous_names: &BTreeSet<&str>,
+    workspace_dependencies: Option<&Table>,
+    lines: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let owner = manifest
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
+    // Resolver and package selection changes can change unification even when
+    // every dependency declaration and lock entry stays the same.
+    for (section, keys) in [
+        (
+            "workspace",
+            &["resolver", "members", "exclude", "default-members"][..],
+        ),
+        ("package", &["resolver", "edition", "rust-version"][..]),
+    ] {
+        for key in keys {
+            if let Some(value) = manifest.get(section).and_then(|table| table.get(*key)) {
+                let value = if let Some(values) = value.as_array() {
+                    let sorted: BTreeSet<String> = values.iter().map(ToString::to_string).collect();
+                    format!("{sorted:?}")
+                } else {
+                    value.to_string()
+                };
+                lines.insert(format!("configuration {owner} {section}.{key} {value}"));
+            }
+        }
+    }
+    if let Some(package) = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+    {
+        for key in ["edition", "rust-version"] {
+            if let Some(value) = package.get(key) {
+                lines.insert(format!("configuration workspace.package.{key} {value}"));
+            }
+        }
+    }
+    let sections = dependency_sections(manifest);
+    let mut keys = BTreeSet::new();
     for (section, value) in sections {
         let table = value
             .as_table()
             .ok_or_else(|| format!("note index profile: {label} [{section}] must be a table"))?;
         for (key, spec) in table {
+            let inherited = if spec.get("workspace").and_then(Value::as_bool) == Some(true) {
+                Some(workspace_dependencies.and_then(|dependencies| dependencies.get(key)).ok_or_else(|| {
+                    format!("note index profile: {label} cannot resolve inherited dependency `{key}`")
+                })?)
+            } else {
+                None
+            };
             let package = spec
                 .get("package")
+                .or_else(|| inherited.and_then(|spec| spec.get("package")))
                 .map(|package| {
                     package.as_str().ok_or_else(|| {
                         format!(
@@ -456,10 +648,37 @@ fn declarations(
                 })
                 .transpose()?
                 .unwrap_or(key);
-            keys.insert(key.clone(), package.to_owned());
             if names.contains(package) {
+                keys.insert(key.clone());
+                // With duplicate locked identities, constraints route each
+                // alias's features to a particular version/source. Omitting
+                // them would miss swaps which leave all lock edges unchanged.
+                if ambiguous_names.contains(package) {
+                    for field in [
+                        "version",
+                        "registry",
+                        "registry-index",
+                        "git",
+                        "branch",
+                        "tag",
+                        "rev",
+                        "path",
+                    ] {
+                        let value = if field == "version" && spec.is_str() {
+                            Some(spec)
+                        } else {
+                            spec.get(field)
+                                .or_else(|| inherited.and_then(|spec| spec.get(field)))
+                        };
+                        if let Some(value) = value {
+                            lines.insert(format!(
+                                "selection {owner} {section} {key}.{field} {value}"
+                            ));
+                        }
+                    }
+                }
                 lines.insert(format!(
-                    "declare {section} {package} {}",
+                    "declare {owner} {section} {key} -> {package} {}",
                     declaration(spec).map_err(|error| format!(
                         "note index profile: {label} {section}.{key}: {error}"
                     ))?
@@ -473,23 +692,42 @@ fn declarations(
     let features = features
         .as_table()
         .ok_or_else(|| format!("note index profile: {label} [features] must be a table"))?;
+    let mut graph = BTreeMap::new();
     for (feature, values) in features {
         let values = values.as_array().ok_or_else(|| {
             format!("note index profile: {label} features.{feature} must be an array")
         })?;
-        for value in values {
-            let value = value.as_str().ok_or_else(|| {
-                format!("note index profile: {label} features.{feature} must contain strings")
-            })?;
-            let key = value.strip_prefix("dep:").unwrap_or(value);
-            let key = key.split('/').next().unwrap_or(key).trim_end_matches('?');
-            if let Some(package) = keys
-                .get(key)
-                .filter(|package| names.contains(package.as_str()))
-            {
-                lines.insert(format!("feature {package} {value}"));
+        let values = values
+            .iter()
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    format!("note index profile: {label} features.{feature} must contain strings")
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        graph.insert(feature.as_str(), values);
+    }
+    // Reachability only: include every feature that *could* reach a relevant
+    // dependency. This intentionally ignores target/resolver activation rules,
+    // conservatively covering default chains, cycles, dep: and weak dep?/feat.
+    let mut relevant_features = BTreeSet::new();
+    loop {
+        let before = relevant_features.len();
+        for (&feature, values) in &graph {
+            if values.iter().any(|value| {
+                let key = value.strip_prefix("dep:").unwrap_or(value);
+                let key = key.split('/').next().unwrap_or(key).trim_end_matches('?');
+                keys.contains(key) || relevant_features.contains(*value)
+            }) {
+                relevant_features.insert(feature);
             }
         }
+        if before == relevant_features.len() {
+            break;
+        }
+    }
+    for feature in relevant_features {
+        lines.insert(format!("feature {owner} {feature} {:?}", graph[feature]));
     }
     Ok(())
 }
