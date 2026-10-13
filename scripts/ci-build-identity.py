@@ -3,6 +3,8 @@
 
 Usage: ci-build-identity.py key REQUEST.json
        ci-build-identity.py verify EXPECTED.json ACTUAL.json
+       ci-build-identity.py group REQUEST.json
+       ci-build-identity.py plan REQUESTS.json AVAILABLE_KEYS.json
 
 The producer must collect this request AFTER provisioning and BEFORE compiling:
 * source: actual clean checkout SHA, not a PR-head/event SHA substituted for it;
@@ -10,7 +12,8 @@ The producer must collect this request AFTER provisioning and BEFORE compiling:
 * platform: host/target triples, OS/arch, native ABI, SDK and immutable image or
   provisioned self-host environment revision (runner labels alone are unsafe).
 * tools: full rustc -vV, Cargo/nextest/llvm-cov, C compiler and linker versions;
-  use explicit 'none' for tools/SDKs not involved, never an empty/unknown value.
+  use explicit 'none' for absent tools/SDKs, never an empty/unknown value. Record
+  provisioned compiler versions consistently even for variants not using them.
 * build: exact ordered producer argv, Cargo profile (not nextest run profile),
   requested features AND a digest of the resolved host/target feature graph,
   instrumentation flags, recipe digest, effective Cargo config digest (including
@@ -29,8 +32,19 @@ trust, successful publication and an archive digest before executing anything.
 Runtime test selection/results, job/run IDs, and output locations stay outside
 the identity. Lists (especially argv and flags) preserve order conservatively.
 Different scopes/features/profiles never receive automatic superset matching.
-This helper neither deduplicates producers nor skips tests; later workflow
-integration owns those actions. Bump the schema for incompatible contract changes.
+One producer group covers a commit/platform/compiler environment, independent of
+the requested variant set. A group key is ONLY a serialization boundary, never
+an artifact-reuse key. Ancillary nextest/llvm-cov versions and recipe/env/profile
+differences stay in variant identities, so even overlapping requests serialize.
+Run every missing variant sequentially in ONE platform producer step, sharing a
+group-private Cargo target/cache (instrumentation may need its own subdirectory).
+Stage each output before the next recipe can overwrite same-path binaries.
+
+The pure planner accepts keys only from already validated, successfully published
+artifacts. Repeat lookup/planning AFTER acquiring the producer group lock, then
+publish each staged variant. Storage, locking, staging and execution are later
+workflow integration responsibilities; this helper does not implement them.
+Always rerun required tests. Bump the schema for incompatible contract changes.
 """
 import argparse
 import hashlib
@@ -136,10 +150,42 @@ def validate(document):
             raise ValueError(f"environment.{name}: must be unset or equal checkout commit")
 
 
+def hashed_key(prefix, document):
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return prefix + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def build_key(document):
     validate(document)
-    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return "intentd-build-v1-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashed_key("intentd-build-v1-", document)
+
+
+def producer_group_key(document):
+    validate(document)
+    # A broader lock is safe: exact variant keys still govern executable reuse.
+    # Excluding demand/recipe inputs prevents A+B and B+C from racing to build B.
+    group = {"schema": document["schema"], "source": document["source"],
+             "platform": document["platform"],
+             "compiler": {name: document["tools"][name] for name in ("rustc", "cargo", "cc", "linker")}}
+    return hashed_key("intentd-producer-v1-", group)
+
+
+def plan_variants(requests, available_keys):
+    """Plan exact misses, not locks or cache I/O; available keys must be verified."""
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("requests: expected nonempty variant list")
+    if not isinstance(available_keys, list) or any(
+        not isinstance(key, str) or not re.fullmatch(r"intentd-build-v1-[0-9a-f]{64}", key)
+        for key in available_keys
+    ):
+        raise ValueError("available_keys: expected exact validated variant keys")
+    groups = {producer_group_key(request) for request in requests}
+    if len(groups) != 1:
+        raise ValueError("requests: variants require different producer groups")
+    requested = sorted({build_key(request) for request in requests})
+    available = set(available_keys)
+    return {"producer_group": groups.pop(), "requested_keys": requested,
+            "missing_keys": [key for key in requested if key not in available]}
 
 
 def require_compatible(expected, actual):
@@ -165,6 +211,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("key").add_argument("request")
+    commands.add_parser("group").add_argument("request")
+    plan = commands.add_parser("plan")
+    plan.add_argument("requests")
+    plan.add_argument("available_keys")
     verify = commands.add_parser("verify")
     verify.add_argument("expected")
     verify.add_argument("actual")
@@ -172,6 +222,10 @@ def main():
     try:
         if args.command == "key":
             print(build_key(read_request(args.request)))
+        elif args.command == "group":
+            print(producer_group_key(read_request(args.request)))
+        elif args.command == "plan":
+            print(json.dumps(plan_variants(read_request(args.requests), read_request(args.available_keys)), sort_keys=True))
         else:
             require_compatible(read_request(args.expected), read_request(args.actual))
     except (ValueError, OSError) as error:
