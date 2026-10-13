@@ -1323,13 +1323,6 @@ impl RepositoryReadEligibility {
             })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "qualified collection consumer is composed by Services integration"
-        )
-    )]
     pub(crate) fn with_collection_response(
         &self,
         attribution: &RepositoryResponseAttribution,

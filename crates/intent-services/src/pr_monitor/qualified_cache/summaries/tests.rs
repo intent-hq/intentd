@@ -26,6 +26,8 @@ fn an_evicted_receipt_does_not_retain_history_receipt_lifetime_regression() {
     let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
     let cache = PrCache::default();
     let result = reviews(&cache, &request, &begin(&request).unwrap(), &[7]);
+    // Delivery has finished; only the renderer's retained row receipt remains.
+    drop(result.delivery);
     cache.lock().unwrap().clear();
     assert!(!can_serve(
         &cache,
@@ -1222,4 +1224,161 @@ async fn empty_pages_also_expire_when_pending_history_is_lost() {
     .unwrap();
     assert!(fresh.page.items.is_empty());
     assert_eq!(fresh.page.next_cursor.as_deref(), Some("opaque cursor"));
+}
+
+#[test]
+fn summary_delivery_guards_empty_cursor_and_preserves_unrelated_projects() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let other_repo = repository("team/other");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let other = req(
+        &connection,
+        &other_repo,
+        RepositoryResourceKind::MergeRequest,
+    );
+    let cache = PrCache::default();
+    let empty = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    let unrelated = reviews(&cache, &other, &begin(&other).unwrap(), &[]);
+    assert_eq!(empty.page.next_cursor.as_deref(), Some("opaque cursor"));
+    let mut calls = 0;
+    empty
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let _ = failure(
+        &request,
+        &begin(&request).unwrap(),
+        denied(ProviderFailureKind::ProjectDenied),
+        quota(),
+    );
+    assert!(empty
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+    unrelated
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 2);
+    let fresh = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    fresh.delivery.with_current(&mut || Ok(())).unwrap();
+    assert!(empty.delivery.with_current(&mut || Ok(())).is_err());
+    connection.retire();
+    assert!(fresh.delivery.with_current(&mut || Ok(())).is_err());
+    assert!(unrelated.delivery.with_current(&mut || Ok(())).is_err());
+}
+
+#[tokio::test]
+async fn summary_delivery_combines_with_detail_and_rejects_denied_or_reinserted_rows() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    let detail = read_detail(&cache, &request, 7, Duration::ZERO, Ok(detail(7)))
+        .await
+        .unwrap();
+    let page = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    let mut calls = 0;
+    super::super::CacheDelivery::with_all_current(
+        &[&page.delivery, &detail.delivery, &page.delivery],
+        &mut || {
+            assert!(cache.try_lock().is_err());
+            calls += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    deny(&cache, &request, 8, ProviderFailureKind::ResourceDenied).await;
+    assert!(page
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+    detail
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let recovered = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    recovered.delivery.with_current(&mut || Ok(())).unwrap();
+    assert!(page.delivery.with_current(&mut || Ok(())).is_err());
+    cache.lock().unwrap().clear();
+    let reinserted = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    assert!(recovered.delivery.with_current(&mut || Ok(())).is_err());
+    reinserted.delivery.with_current(&mut || Ok(())).unwrap();
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn summary_delivery_validates_partial_rows_without_refreshing_detail() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    warm(&cache, &request, 7).await;
+    let key = CacheKey::Qualified(Box::new(connection.key(target(&request, 7))));
+    let before = match cache.lock().unwrap().get(&key).unwrap() {
+        CacheSlot::Qualified(slot) => slot.payload.as_ref().unwrap().freshness.fetched_at,
+        CacheSlot::Legacy(_) => panic!("qualified detail"),
+    };
+    let partial = finish(
+        &cache,
+        &request,
+        &begin(&request).unwrap(),
+        page(vec![pull(7)]),
+        |p| (target(&request, p.number), false),
+        keep,
+    )
+    .unwrap();
+    assert!(partial.receipts[0].is_none());
+    partial.delivery.with_current(&mut || Ok(())).unwrap();
+    if let CacheSlot::Qualified(slot) = cache.lock().unwrap().get(&key).unwrap() {
+        assert_eq!(slot.payload.as_ref().unwrap().freshness.fetched_at, before);
+    }
+    let _ = failure(
+        &request,
+        &begin(&request).unwrap(),
+        denied(ProviderFailureKind::ResourceDenied),
+        quota(),
+    );
+    assert!(partial.delivery.with_current(&mut || Ok(())).is_err());
+    assert!(
+        !read_detail(
+            &cache,
+            &request,
+            7,
+            FRESH,
+            Err(Error::Api("detail must remain a hit".into()))
+        )
+        .await
+        .unwrap()
+        .fetched
+    );
+}
+
+#[test]
+fn summary_delivery_does_not_retain_project_history_after_transfer() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    let empty = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    assert_eq!(connection.retained_project_count(), 1);
+    empty.delivery.with_current(&mut || Ok(())).unwrap();
+    drop(empty);
+    assert_eq!(connection.retained_project_count(), 0);
 }

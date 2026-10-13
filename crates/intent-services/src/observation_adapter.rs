@@ -108,9 +108,38 @@ struct ProjectState {
     scope: ObservationScope<RepositoryTarget>,
     lists: [ObservationScope<RepositoryResourceKind>; 3],
     history: Mutex<SummaryHistory>,
+    resources: Mutex<HashMap<ReviewTarget, Weak<ObservationScope<ReviewTarget>>>>,
 }
 
 impl ProjectState {
+    fn resource(&self, target: &ReviewTarget) -> Arc<ObservationScope<ReviewTarget>> {
+        let mut resources = self.resources.lock().unwrap();
+        resources.retain(|_, resource| resource.strong_count() > 0);
+        if let Some(resource) = resources.get(target).and_then(Weak::upgrade) {
+            return resource;
+        }
+        let resource = Arc::new(ObservationScope::new(target.clone()));
+        resources.insert(target.clone(), Arc::downgrade(&resource));
+        resource
+    }
+
+    fn deny_resource(&self, target: &ReviewTarget) {
+        if let Some(resource) = self
+            .resources
+            .lock()
+            .unwrap()
+            .get(target)
+            .and_then(Weak::upgrade)
+        {
+            resource.deny();
+        }
+        // A pending list may not have created the item's slot yet.
+        self.history
+            .lock()
+            .unwrap()
+            .record(target.clone(), SummaryChange::Denied);
+    }
+
     fn list(&self, kind: RepositoryResourceKind) -> &ObservationScope<RepositoryResourceKind> {
         &self.lists[match kind {
             RepositoryResourceKind::PullRequest => 0,
@@ -177,6 +206,7 @@ impl ConnectionObservations {
                 ]
                 .map(ObservationScope::new),
                 history: Mutex::new(SummaryHistory::default()),
+                resources: Mutex::new(HashMap::new()),
             });
             projects.insert(repository.clone(), Arc::downgrade(&scope));
             scope
@@ -185,6 +215,56 @@ impl ConnectionObservations {
             repository,
             connection: self.scope.clone(),
             scope,
+        }
+    }
+
+    /// Defense in depth for R's preselected physical-caller recipients. Matching
+    /// counters are not permission: R must keep its original caller/account fence.
+    pub(crate) fn same_connection(&self, original: &Self) -> bool {
+        self.is_active()
+            && self.scope.key().0.daemon_id == original.scope.key().0.daemon_id
+            && self.scope.key().1 == original.scope.key().1
+    }
+
+    pub(crate) fn deny_connection(&self) {
+        self.scope.deny();
+    }
+
+    /// Apply only already-attributed evidence to existing live metadata. There
+    /// is no tombstone for projects with no pending or retained observations.
+    pub(crate) fn deny_project(&self, repository: &RepositoryTarget) {
+        if let Some(project) = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(repository)
+            .and_then(Weak::upgrade)
+        {
+            project.scope.deny();
+        }
+    }
+
+    pub(crate) fn deny_resource(&self, target: &ReviewTarget) {
+        if let Some(project) = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(&target.repository)
+            .and_then(Weak::upgrade)
+        {
+            project.deny_resource(target);
+        }
+    }
+
+    pub(crate) fn deny_list(&self, repository: &RepositoryTarget, kind: RepositoryResourceKind) {
+        if let Some(project) = self
+            .projects
+            .lock()
+            .unwrap()
+            .get(repository)
+            .and_then(Weak::upgrade)
+        {
+            project.list(kind).deny();
         }
     }
 }
@@ -205,6 +285,7 @@ impl ProjectObservations {
             number,
         };
         ReviewObservations {
+            resource_scope: self.scope.resource(&target),
             item: ObservationSlot::new(&self.connection, target.clone()),
             project: ObservationSlot::new(&self.scope.scope, target),
             connection_scope: self.connection.clone(),
@@ -378,12 +459,37 @@ impl ListObservations {
 pub(crate) struct ObservationTicket {
     item: ReadTicket,
     project: ReadTicket,
+    resource: ScopeTicket,
+    connection_scope: ScopeTicket,
+    project_scope: ScopeTicket,
 }
 
 #[derive(Debug)]
 pub(crate) struct ObservationReceipt {
     item: EligibleRead,
     project: EligibleRead,
+    resource: ScopeTicket,
+    connection_scope: ScopeTicket,
+    project_scope: ScopeTicket,
+}
+
+/// Original dynamic denial tokens only. The cache keeps its map lock for the
+/// slot/order proof; R repeats this metadata proof inside its final P fence.
+pub(crate) struct ObservationRevalidation {
+    connection: ObservationScope<QualifiedScope>,
+    project: Arc<ProjectState>,
+    resource: Arc<ObservationScope<ReviewTarget>>,
+    connection_ticket: ScopeTicket,
+    project_ticket: ScopeTicket,
+    resource_ticket: ScopeTicket,
+}
+
+impl ObservationRevalidation {
+    pub(crate) fn validate(&self) -> Result<(), Ineligible> {
+        self.connection.validate(&self.connection_ticket)?;
+        self.project.scope.validate(&self.project_ticket)?;
+        self.resource.validate(&self.resource_ticket)
+    }
 }
 
 /// A partial observation has no complete-cache receipt. Its unchanged quota
@@ -402,6 +508,7 @@ pub(crate) struct ReviewObservations {
     project: ObservationSlot<RepositoryTarget, ReviewTarget>,
     connection_scope: ObservationScope<QualifiedScope>,
     project_scope: Arc<ProjectState>,
+    resource_scope: Arc<ObservationScope<ReviewTarget>>,
 }
 
 impl ReviewObservations {
@@ -410,6 +517,9 @@ impl ReviewObservations {
     }
 
     pub(crate) fn validate(&self, ticket: &ObservationTicket) -> Result<(), Ineligible> {
+        self.connection_scope.validate(&ticket.connection_scope)?;
+        self.project_scope.scope.validate(&ticket.project_scope)?;
+        self.resource_scope.validate(&ticket.resource)?;
         self.item.validate(&ticket.item)?;
         self.project.validate(&ticket.project)
     }
@@ -420,6 +530,9 @@ impl ReviewObservations {
 
     pub(crate) fn begin(&mut self, coverage: Coverage) -> Result<ObservationTicket, Ineligible> {
         Ok(ObservationTicket {
+            connection_scope: self.connection_scope.begin()?,
+            project_scope: self.project_scope.scope.begin()?,
+            resource: self.resource_scope.begin()?,
             item: self.item.begin(coverage)?,
             project: self.project.begin(coverage)?,
         })
@@ -433,6 +546,9 @@ impl ReviewObservations {
     ) -> Result<ObservationReceipt, Ineligible> {
         self.validate(&ticket)?;
         Ok(ObservationReceipt {
+            connection_scope: ticket.connection_scope,
+            project_scope: ticket.project_scope,
+            resource: ticket.resource,
             item: self.item.success(ticket.item)?,
             project: self.project.success(ticket.project)?,
         })
@@ -474,12 +590,9 @@ impl ReviewObservations {
         })?;
         self.project.failure(ticket.project, (), |()| false)?;
         match kind {
-            Some(ProviderFailureKind::ResourceDenied) => self
-                .project_scope
-                .history
-                .lock()
-                .unwrap()
-                .record(self.key().resource.clone(), SummaryChange::Denied),
+            Some(ProviderFailureKind::ResourceDenied) => {
+                self.project_scope.deny_resource(&self.key().resource);
+            }
             Some(ProviderFailureKind::CredentialRejected) => self.connection_scope.deny(),
             Some(ProviderFailureKind::ProjectDenied) => self.project_scope.scope.deny(),
             _ => {}
@@ -516,8 +629,53 @@ impl ReviewObservations {
     ) -> bool {
         self.item.can_serve(&receipt.item, &current.scope)
             && self
+                .connection_scope
+                .validate(&receipt.connection_scope)
+                .is_ok()
+            && self
+                .project_scope
+                .scope
+                .validate(&receipt.project_scope)
+                .is_ok()
+            && self.resource_scope.validate(&receipt.resource).is_ok()
+            && self
                 .project
                 .can_serve(&receipt.project, &self.project_scope.scope)
+    }
+
+    pub(crate) fn revalidate_receipt(
+        &self,
+        receipt: &ObservationReceipt,
+    ) -> ObservationRevalidation {
+        self.revalidation(
+            &receipt.connection_scope,
+            &receipt.project_scope,
+            &receipt.resource,
+        )
+    }
+
+    pub(crate) fn revalidate_ticket(&self, ticket: &ObservationTicket) -> ObservationRevalidation {
+        self.revalidation(
+            &ticket.connection_scope,
+            &ticket.project_scope,
+            &ticket.resource,
+        )
+    }
+
+    fn revalidation(
+        &self,
+        connection: &ScopeTicket,
+        project: &ScopeTicket,
+        resource: &ScopeTicket,
+    ) -> ObservationRevalidation {
+        ObservationRevalidation {
+            connection: self.connection_scope.clone(),
+            project: self.project_scope.clone(),
+            resource: self.resource_scope.clone(),
+            connection_ticket: connection.clone(),
+            project_ticket: project.clone(),
+            resource_ticket: resource.clone(),
+        }
     }
 
     /// Called when the actual cache slot is evicted/replaced, including a slot

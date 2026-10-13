@@ -14,12 +14,18 @@ use std::future::Future;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
+use crate::repository_credentials::read::{
+    RepositoryCollectionTarget, RepositoryProviderRead, RepositoryResponseDisposition,
+};
+use crate::repository_credentials::RepositoryCredentialError;
+use crate::source_control_auth_ops::repository_owner::RepositoryReadEligibility;
 use intent_core::{RepositoryResourceKind, RepositoryTarget, ReviewTarget};
 use intent_sourcecontrol::{Page, RateLimitStatus};
 
 use super::{
-    new_qualified_slot, new_slot, CacheError, CacheFailure, CacheKey, CacheMap, CacheRequest,
-    CacheSlot, ProviderRead, SharedCache,
+    new_qualified_slot, new_slot, observe_denial, page_delivery, CacheAdmissionGuard,
+    CacheDelivery, CacheDenialCoverage, CacheDenialObserver, CacheError, CacheFailure, CacheKey,
+    CacheMap, CacheRequest, CacheSlot, ProviderRead, SharedCache,
 };
 use crate::observation_adapter::{
     ConnectionObservations, ListObservations, ListReceipt, ObservationReceipt, QualifiedKey,
@@ -39,6 +45,10 @@ impl SummaryRequest<'_> {
             cause: CacheError::Admission(e),
             quota,
         })?;
+        self.check_metadata(quota)
+    }
+
+    fn check_metadata(&self, quota: RateLimitStatus) -> Result<(), CacheFailure> {
         if !self.connection.is_active() {
             return Err(CacheFailure::ineligible(Ineligible::RetiredScope, quota));
         }
@@ -47,6 +57,15 @@ impl SummaryRequest<'_> {
 
     fn matches(&self, list: &ListObservations, quota: RateLimitStatus) -> Result<(), CacheFailure> {
         self.check(quota)?;
+        self.matches_metadata(list, quota)
+    }
+
+    fn matches_metadata(
+        &self,
+        list: &ListObservations,
+        quota: RateLimitStatus,
+    ) -> Result<(), CacheFailure> {
+        self.check_metadata(quota)?;
         if !list.matches(self.connection, self.repository, self.kind) {
             return Err(CacheFailure::ineligible(Ineligible::DifferentSlot, quota));
         }
@@ -71,6 +90,9 @@ pub(crate) struct SummaryPage<T> {
     pub(crate) receipts: Vec<Option<SummaryReceipt>>,
     pub(crate) omitted: usize,
     pub(crate) quota: RateLimitStatus,
+    /// Original request and row eligibility through final caller/provider transfer.
+    /// The existing bounded response owner drops this after delivery or expiry.
+    pub(crate) delivery: CacheDelivery,
 }
 
 pub(crate) fn begin(request: &SummaryRequest<'_>) -> Result<ListObservations, CacheFailure> {
@@ -121,6 +143,18 @@ pub(crate) fn row<K: Clone + Eq + Hash, L, D>(
     quota: RateLimitStatus,
 ) -> Result<Option<SummaryReceipt>, CacheFailure> {
     request.matches(list, quota)?;
+    row_in_action(cache, request, list, target, complete, quota)
+}
+
+fn row_in_action<K: Clone + Eq + Hash, L, D>(
+    cache: &mut CacheMap<K, L, D>,
+    request: &SummaryRequest<'_>,
+    list: &ListObservations,
+    target: &ReviewTarget,
+    complete: bool,
+    quota: RateLimitStatus,
+) -> Result<Option<SummaryReceipt>, CacheFailure> {
+    request.matches_metadata(list, quota)?;
     list.validate_row(target)
         .map_err(|e| CacheFailure::ineligible(e, quota))?;
     let detail_request = CacheRequest {
@@ -146,7 +180,7 @@ pub(crate) fn row<K: Clone + Eq + Hash, L, D>(
     // itself: both request-start scope and unknown-item history must still hold.
     list.validate_row(target)
         .map_err(|e| CacheFailure::ineligible(e, quota))?;
-    request.check(quota)?;
+    request.check_metadata(quota)?;
     let receipt = if complete {
         Some(SummaryReceipt {
             key,
@@ -171,7 +205,12 @@ pub(crate) fn row<K: Clone + Eq + Hash, L, D>(
 /// The caller's clamped query limit and pagination behavior remain unchanged.
 /// `describe` supplies confirmed canonical targets and summary completeness;
 /// optional detail fields do not become complete simply because a list arrived.
-pub(crate) fn finish<K: Clone + Eq + Hash, L, D, T>(
+pub(crate) fn finish<
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    D: Send + 'static,
+    T,
+>(
     cache: &SharedCache<K, L, D>,
     request: &SummaryRequest<'_>,
     list: &ListObservations,
@@ -192,17 +231,49 @@ pub(crate) fn finish<K: Clone + Eq + Hash, L, D, T>(
             quota,
         });
     }
-    let mut cache = cache.lock().unwrap();
-    retain(&mut cache);
+    let mut locked = cache.lock().unwrap();
+    let result = finish_in_action(
+        cache,
+        &mut locked,
+        request,
+        list,
+        (page, quota),
+        describe,
+        retain,
+    );
+    request.check(quota)?;
+    result
+}
+
+fn finish_in_action<K, L, D, T>(
+    cache: &SharedCache<K, L, D>,
+    locked: &mut CacheMap<K, L, D>,
+    request: &SummaryRequest<'_>,
+    list: &ListObservations,
+    (page, quota): (Page<T>, RateLimitStatus),
+    describe: impl Fn(&T) -> (ReviewTarget, bool),
+    retain: impl Fn(&mut CacheMap<K, L, D>),
+) -> Result<SummaryPage<T>, CacheFailure>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    D: Send + 'static,
+{
+    request.matches_metadata(list, quota)?;
+    list.validate_start()
+        .map_err(|e| CacheFailure::ineligible(e, quota))?;
+    retain(locked);
     let mut items = Vec::with_capacity(page.items.len());
     let mut receipts = Vec::with_capacity(page.items.len());
+    let mut targets = Vec::with_capacity(page.items.len());
     let mut omitted = 0;
     for value in page.items {
         let (target, complete) = describe(&value);
-        match row(&mut cache, request, list, &target, complete, quota) {
+        match row_in_action(locked, request, list, &target, complete, quota) {
             Ok(receipt) => {
                 items.push(value);
                 receipts.push(receipt);
+                targets.push(target);
             }
             Err(CacheFailure {
                 cause: CacheError::Ineligible(_),
@@ -211,8 +282,8 @@ pub(crate) fn finish<K: Clone + Eq + Hash, L, D, T>(
             Err(error) => return Err(error),
         }
     }
-    retain(&mut cache);
-    request.check(quota)?;
+    retain(locked);
+    request.check_metadata(quota)?;
     Ok(SummaryPage {
         page: Page {
             items,
@@ -221,6 +292,7 @@ pub(crate) fn finish<K: Clone + Eq + Hash, L, D, T>(
         receipts,
         omitted,
         quota,
+        delivery: page_delivery(cache, request.connection, list, targets),
     })
 }
 
@@ -252,7 +324,7 @@ pub(crate) fn can_serve<K: Clone + Eq + Hash, L, D>(
 /// Capture the caller's owned provider query (including filter/search/cursor)
 /// and the admitted project before dispatching. Request ordering in the existing
 /// pager stays with its owner; this adds no query DTO or retained page store.
-pub(crate) async fn read<K: Clone + Eq + Hash, L, D, Q, T, F, Fut>(
+pub(crate) async fn read<K, L, D, Q, T, F, Fut>(
     cache: &SharedCache<K, L, D>,
     request: &SummaryRequest<'_>,
     query: Q,
@@ -261,12 +333,185 @@ pub(crate) async fn read<K: Clone + Eq + Hash, L, D, Q, T, F, Fut>(
     retain: impl Fn(&mut CacheMap<K, L, D>),
 ) -> Result<SummaryPage<T>, CacheFailure>
 where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    D: Send + 'static,
     F: FnOnce(Q) -> Fut,
     Fut: Future<Output = ProviderRead<Page<T>>>,
 {
     let list = begin(request)?;
     let outcome = provider(query).await;
     finish(cache, request, &list, outcome, describe, retain)
+}
+
+/// The opaque provider target owns the exact admitted query/cursor. No copied
+/// query schema, fake resource number, or raw error can authorize invalidation.
+pub(crate) struct ManagedSummaryRequest<'a> {
+    pub(crate) request: SummaryRequest<'a>,
+    pub(crate) target: &'a RepositoryCollectionTarget,
+    pub(crate) eligibility: &'a RepositoryReadEligibility,
+    pub(crate) with_authority: &'a CacheAdmissionGuard<'a>,
+    pub(crate) denials: &'a CacheDenialObserver<'a>,
+}
+
+impl ManagedSummaryRequest<'_> {
+    fn matches_target(&self, quota: RateLimitStatus) -> Result<(), CacheFailure> {
+        self.request.check(quota)?;
+        if self.request.repository != self.target.repository()
+            || self.request.kind != self.target.kind()
+        {
+            return Err(CacheFailure {
+                cause: CacheError::Credential(RepositoryCredentialError::BoundaryMismatch),
+                quota,
+            });
+        }
+        Ok(())
+    }
+
+    fn current<T: Send>(
+        &self,
+        quota: RateLimitStatus,
+        action: impl FnOnce() -> Result<T, CacheFailure> + Send,
+    ) -> Result<T, CacheFailure> {
+        self.matches_target(quota)?;
+        let mut action = Some(action);
+        let mut output = None;
+        (self.with_authority)(&mut || {
+            self.eligibility.with_current(&mut || {
+                output = Some(action
+                    .take()
+                    .ok_or(RepositoryCredentialError::Indeterminate)?(
+                ));
+                Ok(())
+            })
+        })
+        .map_err(|error| CacheFailure {
+            cause: CacheError::Credential(error),
+            quota,
+        })?;
+        output.ok_or_else(|| CacheFailure {
+            cause: CacheError::Credential(RepositoryCredentialError::Indeterminate),
+            quota,
+        })?
+    }
+}
+
+pub(crate) async fn read_managed<K, L, D, T, F, Fut>(
+    cache: &SharedCache<K, L, D>,
+    managed: &ManagedSummaryRequest<'_>,
+    provider: F,
+    describe: impl Fn(&T) -> (ReviewTarget, bool) + Send,
+    retain: impl Fn(&mut CacheMap<K, L, D>) + Send,
+) -> Result<SummaryPage<T>, CacheFailure>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    L: Send + 'static,
+    D: Send + 'static,
+    T: Send,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = RepositoryProviderRead<Page<T>>>,
+{
+    let request = &managed.request;
+    let list = managed.current(RateLimitStatus::default(), || {
+        request
+            .connection
+            .project(request.repository.clone())
+            .begin_list(request.kind)
+            .map_err(|e| CacheFailure::ineligible(e, RateLimitStatus::default()))
+    })?;
+    let (outcome, quota, attribution) = provider().await.into_parts();
+    let page = match outcome {
+        Err(error) => {
+            // Error/observed quota survive even when the original caller,
+            // connection, or response evidence no longer permits application.
+            if managed.matches_target(quota).is_ok() {
+                let _ = (managed.with_authority)(&mut || {
+                    managed.eligibility.with_collection_response(
+                        &attribution,
+                        managed.target,
+                        &mut |d| {
+                            use intent_sourcecontrol::error::ProviderFailureKind as P;
+                            use RepositoryResponseDisposition as R;
+                            let kind = match d {
+                                R::AcceptedCredentialRejection => Some(P::CredentialRejected),
+                                R::CurrentProjectDenial => Some(P::ProjectDenied),
+                                R::CurrentResourceDenial => Some(P::ResourceDenied),
+                                R::NoDenial => None,
+                                R::NotApplied | R::Unattributed | R::Indeterminate => return Ok(()),
+                            };
+                            if list.failure_kind(kind).is_ok() {
+                                observe_denial(
+                                    d,
+                                    request.connection,
+                                    request.repository,
+                                    CacheDenialCoverage::List(request.kind),
+                                    Some(managed.denials),
+                                );
+                            }
+                            Ok(())
+                        },
+                    )
+                });
+            }
+            return Err(CacheFailure {
+                cause: CacheError::Provider(error),
+                quota,
+            });
+        }
+        Ok(page) => page,
+    };
+    managed.matches_target(quota)?;
+    if page.items.len() > usize::from(crate::github_ops::clamp_limit(Some(i64::MAX))) {
+        return Err(CacheFailure {
+            cause: CacheError::PageTooLarge,
+            quota,
+        });
+    }
+    let mut locked = cache.lock().unwrap();
+    let slots = &mut *locked;
+    let mut page = Some(page);
+    let mut describe = Some(describe);
+    let mut retain = Some(retain);
+    let mut output = None;
+    (managed.with_authority)(&mut || {
+        managed
+            .eligibility
+            .with_collection_response(&attribution, managed.target, &mut |d| {
+                if d == RepositoryResponseDisposition::NoDenial {
+                    Ok(())
+                } else {
+                    Err(RepositoryCredentialError::BoundaryMismatch)
+                }
+            })?;
+        managed.eligibility.with_current(&mut || {
+            output = Some(finish_in_action(
+                cache,
+                slots,
+                request,
+                &list,
+                (
+                    page.take()
+                        .ok_or(RepositoryCredentialError::Indeterminate)?,
+                    quota,
+                ),
+                describe
+                    .take()
+                    .ok_or(RepositoryCredentialError::Indeterminate)?,
+                retain
+                    .take()
+                    .ok_or(RepositoryCredentialError::Indeterminate)?,
+            ));
+            Ok(())
+        })
+    })
+    .map_err(|error| CacheFailure {
+        cause: CacheError::Credential(error),
+        quota,
+    })?;
+    output.ok_or_else(|| CacheFailure {
+        cause: CacheError::Credential(RepositoryCredentialError::Indeterminate),
+        quota,
+    })?
 }
 
 #[cfg(test)]
