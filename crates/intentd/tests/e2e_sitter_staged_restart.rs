@@ -647,6 +647,7 @@ async fn signal_registration_failure_prevents_readiness() {
         if advertised {
             command.env(SITTER_IDLE_RESTART_ENV, "1");
         }
+        common::hermetic_fixture_identity(&mut command, data_dir.path());
         let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
         let mut daemon = Daemon { child, log_path };
         let status = daemon
