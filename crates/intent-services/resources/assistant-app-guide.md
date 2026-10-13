@@ -47,13 +47,14 @@ In a supporting development frontend, an agent can put raw, self-contained
 HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
 in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
 The preview shows a skeleton while its content streams or the sandbox starts.
+Scrolling continues through chat when the visual has no more content to scroll.
 Use this for exploring comparisons or changing inputs. Keep simple explanations
 in text and shareable charts in saved files. Visuals use app semantic CSS variables
 for both themes and cannot use external libraries, network access, app APIs,
 navigation, forms, popups, or embedded frames. **Source** shows the code;
 **Reload** starts the visual again and resets its local inputs.
 
-<!-- Sources: packages/cloudlands-fe/src/features/inline-html/InlineHtmlPreview.svelte; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts}; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
 
 ## Finding things
 
