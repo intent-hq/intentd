@@ -119,6 +119,32 @@ class ConsumerTests(unittest.TestCase):
             self.assertEqual((source / relative).resolve(), Path(values['CARGO_TARGET_DIR']).resolve())
             self.assertEqual(cache['with']['workspaces'], '. -> ${{ env.NATIVE_CACHE_TARGET }}')
 
+        # Execute the workflow's actual Python payload using each native path
+        # flavour, then apply the cache action's Node path.join semantics.
+        import ntpath
+        import posixpath
+        from pathlib import PurePosixPath, PureWindowsPath
+        program = setup['run'].split("<<'PYTHON'\n", 1)[1].rsplit('PYTHON', 1)[0]
+        cases = [
+            ('posix', PurePosixPath, posixpath.relpath, '/Users/runner/work/intentd/intentd', '/Users/runner/work/_temp'),
+            ('win32', PureWindowsPath, ntpath.relpath, 'C:/a/intentd/intentd', 'C:/a/_temp'),
+        ]
+        for flavour, pure_path, relpath, source, temporary in cases:
+            with self.subTest(platform=flavour), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'environment'
+                with patch.dict(os.environ, RUNNER_TEMP=temporary, GITHUB_ENV=str(output)), \
+                     patch('pathlib.Path', side_effect=pure_path) as paths, \
+                     patch('os.path.relpath', side_effect=relpath):
+                    paths.cwd.return_value = pure_path(source)
+                    exec(compile(program, '<hosted native target workflow>', 'exec'), {})
+                values = dict(line.split('=', 1) for line in output.read_text().splitlines())
+                relative = values['NATIVE_CACHE_TARGET']
+                self.assertFalse(pure_path(relative).is_absolute())
+                joined = subprocess.check_output(['node', '-e',
+                    "const p=require('node:path')[process.argv[1]]; console.log(p.join(process.argv[2],process.argv[3]));",
+                    flavour, source, relative], text=True).strip()
+                self.assertEqual(pure_path(joined), pure_path(values['CARGO_TARGET_DIR']))
+
     def test_workflow_publishes_before_consumers_and_retains_failures(self):
         import yaml
         job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['daemon-lifecycle']
