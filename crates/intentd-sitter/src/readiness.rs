@@ -444,7 +444,7 @@ mod tests {
         budget.observe(&ProbeStatus::Unavailable);
         budget.observe(&ProbeStatus::Ready("0.1".into()));
         assert_eq!(budget.deadline, deadline);
-        budget.deadline = Instant::now() - Duration::from_secs(1);
+        budget.deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         let expired = budget.deadline;
         budget.observe(&ProbeStatus::Starting {
             attempt_id: "a".into(),
