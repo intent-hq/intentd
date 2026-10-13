@@ -7,7 +7,7 @@ cleaners. Hold Cargo profile locks and preserve their inodes and parent director
 so newly scheduled builds must wait, even with multiple runner listeners. No
 age-based expiry or force flag: unknown ownership fails closed. This is not a general developer cleaner.
 
-Only two exact debug profile paths below the account's CI target are eligible. No
+Only exact build and lifecycle debug profiles below the account's CI target are eligible. No
 release profiles, sources, registry, toolchains, credentials, checkout or other
 repo are pruned.
 Internal symlinks are unlinked relative to held directory descriptors, never
@@ -27,6 +27,7 @@ import subprocess
 
 GIB = 1024 ** 3
 CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
+TARGETS = ('build-aarch64-apple-darwin', 'daemon-lifecycle-macos')
 PROFILES = ('debug', 'aarch64-apple-darwin/debug')
 
 
@@ -202,35 +203,42 @@ def clean(home, min_free_bytes=40 * GIB, apply=False):
         emit(event='before', **report)
         if before < min_free_bytes:
             root = home_dir
-            for component in ('ci-target', 'intentd', 'build-aarch64-apple-darwin'):
+            for component in ('ci-target', 'intentd'):
                 if not has_entry(root, component):
                     root = None
                     break
                 root = root.child(component, stack)
             if root is not None:
                 assert_idle_runner()
-                locks = [stack.enter_context(lock_file(root, '.macos-cleanup.lock', create=True))]
+                targets = root
+                locks = []
                 profiles = []
                 activity = {}
-                # Open/validate/lock every eligible profile before any deletion.
-                for relative in PROFILES:
-                    parent = root
-                    for component in relative.split('/')[:-1]:
-                        if not has_entry(parent, component):
-                            parent = None
-                            break
-                        parent = parent.child(component, stack)
-                    if parent is None or not has_entry(parent, relative.split('/')[-1]):
+                # Validate and lock ALL roots/profiles before deleting anything.
+                # Keep per-root cleaner locks for compatibility with older jobs.
+                for target in TARGETS:
+                    if not has_entry(targets, target):
                         continue
-                    profile = parent.child(relative.split('/')[-1], stack)
-                    validate_profile(profile, root, parent, stack)
-                    activity[profile.fd] = os.fstat(profile.fd).st_mtime_ns
-                    for name in CARGO_LOCKS:
-                        locks.append(stack.enter_context(lock_file(profile, name, create=name != '.cargo-lock')))
-                    profiles.append((profile, parent))
-                profiles.sort(key=lambda pair: (activity[pair[0].fd], str(pair[0].path)))
-                report['candidates'] = [str(profile.path) for profile, _ in profiles]
-                for profile, parent in profiles:
+                    root = targets.child(target, stack)
+                    locks.append(stack.enter_context(lock_file(root, '.macos-cleanup.lock', create=True)))
+                    for relative in PROFILES:
+                        parent = root
+                        for component in relative.split('/')[:-1]:
+                            if not has_entry(parent, component):
+                                parent = None
+                                break
+                            parent = parent.child(component, stack)
+                        if parent is None or not has_entry(parent, relative.split('/')[-1]):
+                            continue
+                        profile = parent.child(relative.split('/')[-1], stack)
+                        validate_profile(profile, root, parent, stack)
+                        activity[profile.fd] = os.fstat(profile.fd).st_mtime_ns
+                        for name in CARGO_LOCKS:
+                            locks.append(stack.enter_context(lock_file(profile, name, create=name != '.cargo-lock')))
+                        profiles.append((profile, root, parent))
+                profiles.sort(key=lambda entry: (activity[entry[0].fd], str(entry[0].path)))
+                report['candidates'] = [str(profile.path) for profile, _, _ in profiles]
+                for profile, root, parent in profiles:
                     emit(event='candidate', path=str(profile.path))
                     if not apply:
                         continue

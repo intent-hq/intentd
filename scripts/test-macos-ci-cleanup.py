@@ -15,13 +15,15 @@ spec.loader.exec_module(cleanup)
 
 
 class CleanupTests(unittest.TestCase):
+    target_name = 'build-aarch64-apple-darwin'
+
     def setUp(self):
         previous_umask = os.umask(0o022)
         self.addCleanup(os.umask, previous_umask)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name).resolve()
-        self.root = self.home / 'ci-target/intentd/build-aarch64-apple-darwin'
+        self.root = self.home / 'ci-target/intentd' / self.target_name
         self.profile = self.root / 'aarch64-apple-darwin/debug'
         (self.profile / 'deps').mkdir(parents=True)
         (self.profile / '.cargo-lock').touch()
@@ -390,6 +392,41 @@ class CleanupTests(unittest.TestCase):
         for value in [0, -1]:
             with self.assertRaises(cleanup.Refusal):
                 cleanup.clean(self.home, min_free_bytes=value, apply=True)
+
+
+class LifecycleCleanupTests(CleanupTests):
+    # Run every existing ownership, lock, symlink and real-Cargo race proof
+    # against the lifecycle root as well as the original build root.
+    target_name = 'daemon-lifecycle-macos'
+
+    def test_both_roots_are_validated_before_any_deletion(self):
+        build = self.root.with_name('build-aarch64-apple-darwin') / 'debug'
+        (build / 'deps').mkdir(parents=True)
+        (build / '.cargo-lock').touch()
+        sentinel = build / 'deps/keep'
+        sentinel.touch()
+        os.utime(build, (1, 1))
+        (self.root / '.in-use').touch()
+        with self.assertRaisesRegex(cleanup.Refusal, 'in-use'):
+            self.run_cleanup()
+        self.assertTrue(sentinel.exists())
+
+    def test_roots_share_oldest_first_headroom_budget(self):
+        build = self.root.with_name('build-aarch64-apple-darwin') / 'debug'
+        (build / 'deps').mkdir(parents=True)
+        (build / '.cargo-lock').touch()
+        os.utime(self.profile, (1, 1))
+        self.free.side_effect = [0, 0, 200, 200]
+        result = self.run_cleanup()
+        self.assertEqual(result['candidates'], [str(self.profile), str(build)])
+        self.assertEqual(result['deleted'], [str(self.profile / 'deps')])
+        self.assertTrue((build / 'deps').exists())
+
+    def test_only_exact_lifecycle_root_is_eligible(self):
+        unknown = self.root.with_name('daemon-lifecycle-macos-other')
+        self.root.rename(unknown)
+        self.assertEqual(self.run_cleanup(False)['candidates'], [])
+        self.assertTrue((unknown / 'aarch64-apple-darwin/debug/deps/old.rmeta').exists())
 
 
 class OwnershipTests(unittest.TestCase):

@@ -23,6 +23,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(index, next(i for i, s in enumerate(steps) if s.get('name') == 'Resolve pinned Rust channel'))
         self.assertFalse(any('cargo ' in s.get('run', '') for s in steps[:index]))
 
+    def test_lifecycle_preflight_precedes_toolchain_and_compilation(self):
+        steps = workflow('ci.yml')['jobs']['daemon-lifecycle']['steps']
+        matches = [(i, s) for i, s in enumerate(steps) if s.get('name') == 'Ensure macOS CI disk headroom']
+        self.assertEqual(len(matches), 1)
+        index, step = matches[0]
+        self.assertEqual(step['run'], 'python3 -I -B scripts/macos-ci-cleanup.py --apply')
+        self.assertIn("runner.os == 'macOS'", step['if'])
+        self.assertIn("contains(matrix.os, 'self-hosted')", step['if'])
+        self.assertLess(index, next(i for i, s in enumerate(steps) if s.get('name') == 'Resolve pinned Rust channel'))
+        self.assertFalse(any('cargo ' in s.get('run', '') for s in steps[:index]))
+
     def test_maintenance_is_serialized_and_manual_defaults_to_dry_run(self):
         data = workflow('macos-prune.yml')
         events = data.get('on', data.get(True))
