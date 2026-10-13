@@ -35,7 +35,7 @@ NATIVE_PATTERNS = ('.github/actions/*', '.github/workflows/*native*', '.cargo/*'
                    'crates/intentd/tests/e2e_detached_lifecycle.rs', 'crates/intentd/tests/e2e_wss_tunnel.rs',
                    'crates/intentd/tests/e2e_wss_setup_headless.rs', 'crates/intentd/tests/e2e_doctor_codex.rs',
                    'crates/intentd-sitter/*', 'crates/intent-services/src/*codex*',
-                   'crates/intent-services/src/tests/*worktree*', 'crates/intent-services/src/tests/*clone*',
+                   'crates/intent-services/src/tests.rs', 'crates/intent-services/src/test_support/*',
                    'crates/intent-services/src/test_support.rs', 'crates/intent-services/src/capability*',
                    'crates/intent-transport/src/tunnel*')
 

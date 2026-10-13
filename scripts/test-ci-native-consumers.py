@@ -55,6 +55,12 @@ class ConsumerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.native.native_scope('push', [])
 
+    def test_existing_cow_proof_and_scratch_sources_request_full_native_pr_validation(self):
+        for path in ('crates/intent-services/src/tests.rs',
+                     'crates/intent-services/src/test_support/scratch.rs'):
+            self.assertTrue((ROOT / path).is_file(), path)
+            self.assertEqual(self.native.native_scope('pull_request', [path]), 'merge_group', path)
+
     def test_producer_passes_all_exact_variants_once_before_lints(self):
         facts = {'platform': {'target': 'native-target'}, 'native_tools': {'cc': 'cc', 'linker': 'linker'}}
         with tempfile.TemporaryDirectory() as temporary:
