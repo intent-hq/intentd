@@ -313,6 +313,8 @@ pub(crate) enum SystemMethod {
         pid: Option<u64>,
         protocol: Option<String>,
         host: Option<String>,
+        path: Option<String>,
+        username: Option<String>,
     },
 }
 
@@ -385,6 +387,8 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 pid,
                 protocol: text("protocol"),
                 host: text("host"),
+                path: text("path"),
+                username: text("username"),
             }
         }
         _ => return None,
@@ -393,6 +397,73 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
         method,
         id_present: id_member.is_some(),
         id_echo: id_member.cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The existing GitHub branch keeps its exact resolver and scope. Other HTTPS
+/// helpers may use only an explicit path through the original local owner.
+pub(crate) fn gitlab_credential_query(
+    req: &SystemRequest,
+) -> Option<intent_core::gitlab_child_git::GitlabChildGitCredentialQuery> {
+    let SystemMethod::GitCredential {
+        pid,
+        protocol,
+        host,
+        path,
+        username,
+    } = &req.method
+    else {
+        return None;
+    };
+    if git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+        return None;
+    }
+    let protocol = protocol.as_ref()?;
+    let host = host.as_ref()?;
+    let path = path.as_ref()?;
+    if !protocol.eq_ignore_ascii_case("https")
+        || host.len() > 2048
+        || path.len() > 4096
+        || username.as_ref().is_some_and(|s| s.len() > 256)
+    {
+        return None;
+    }
+    Some(
+        intent_core::gitlab_child_git::GitlabChildGitCredentialQuery {
+            pid: *pid,
+            protocol: protocol.clone(),
+            host: host.clone(),
+            path: path.clone(),
+            username: username.clone(),
+        },
+    )
+}
+
+/// Only called for actual UDS admission; the Services owner independently
+/// checks the captured local origin. The result uses ordinary private egress.
+pub(crate) async fn prepare_gitlab_credential(
+    req: SystemRequest,
+    query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    api: &dyn intent_core::WorkspaceApi,
+) -> Option<crate::router::PreparedReply> {
+    use intent_core::repository_request::RepositoryReadReplyKind;
+    let result = api.gitlab_child_git_credential(query).await;
+    if !req.id_present {
+        return None;
+    }
+    let (frame, kind) = match result {
+        Ok(result) => (
+            success_frame(&req.id_echo, &serde_json::json!(result)),
+            RepositoryReadReplyKind::Result,
+        ),
+        Err(error) => (
+            crate::router::delivery_error(&req.id_echo, error),
+            RepositoryReadReplyKind::ServiceError,
+        ),
+    };
+    Some(crate::router::PreparedReply {
+        frame,
+        service: Some((kind, req.id_echo)),
     })
 }
 
@@ -656,6 +727,7 @@ pub(crate) async fn handle(
             pid,
             protocol,
             host,
+            ..
         } => {
             // Defense in depth (monorepo#884): the daemon re-checks the
             // helper's scope gate, so an arbitrary local UDS caller cannot

@@ -2,7 +2,10 @@
 
 use intent_core::repository_resource_pages::{RepositoryKnownQuery, RepositoryKnownSelection};
 
-use super::*;
+use super::{
+    denied, entry, unavailable, BoxFuture, Error, Frame, Instant, Ordering, RepositoryReadContext,
+    Result, Services, State, READ,
+};
 
 pub(crate) fn resolve(
     services: &Services,

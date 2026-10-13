@@ -873,6 +873,22 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
         }
+        "sourceControl.gitlab.childGit.get" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_get(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.gitlab.childGit.set" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_set(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "sourceControl.read.resolveKnownRepository" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;

@@ -90,6 +90,41 @@ pub enum GitlabChildGitPolicy {
     Unavailable { reason: GitlabChildGitUnavailable },
 }
 
+/// Scope supplied by the original on-demand helper. The pid is audit metadata,
+/// never process authority; the actual local connection supplies admission.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitlabChildGitCredentialQuery {
+    #[serde(default)]
+    pub pid: Option<u64>,
+    pub protocol: String,
+    pub host: String,
+    pub path: String,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// An internal response, serialized only into an original local private output.
+/// Deliberately not Debug or Deserialize: this carries actual credential bytes.
+#[derive(Serialize)]
+pub struct GitlabChildGitCredential {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct GitlabChildGitCredentialResult {
+    pub credential: Option<GitlabChildGitCredential>,
+}
+
+/// Typed original frame; none of these comparison values establish authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitlabChildGitFrame {
+    Get(GitlabChildGitPolicyQuery),
+    Set(GitlabChildGitPolicySet),
+    Credential(GitlabChildGitCredentialQuery),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

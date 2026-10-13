@@ -137,7 +137,7 @@ fn known_repository_identity_requires_an_original_bounded_path_query() {
     input["workspaceId"] = json!("borrowed");
     assert!(serde_json::from_value::<RepositoryKnownQuery>(input.clone()).is_err());
     input.as_object_mut().unwrap().remove("workspaceId");
-    for path in ["".to_string(), "x".repeat(4097), "bad\npath".to_string()] {
+    for path in [String::new(), "x".repeat(4097), "bad\npath".to_string()] {
         input["path"] = json!(path);
         assert!(serde_json::from_value::<RepositoryKnownQuery>(input.clone()).is_err());
     }

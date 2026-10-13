@@ -1,7 +1,12 @@
 //! Share observations only inside one original physical caller and authority.
 //! Lease expiry/release cannot retire a sibling lease's shared observations.
 
-use super::*;
+use super::{
+    credential, credentials, denied, scoped, unavailable, Arc, AtomicBool, Connection,
+    ConnectionObservations, ExecutionScope, Lease, Mutex, Ordering, RepositoryCredentialError,
+    RepositoryReadContext, RepositoryResourceKind, RepositorySettledConnection, Request, Result,
+    Retired, SettingsSnapshot, Weak, LIMIT,
+};
 
 pub(super) struct Group {
     context: RepositoryReadContext,
@@ -192,11 +197,11 @@ impl Denials {
                     .leases
                     .iter()
                     .filter(|(_, lease)| {
-                        (connection || lease._group.shared)
+                        (connection || lease.group.shared)
                             && recipients
                                 .groups
                                 .iter()
-                                .any(|group| Arc::ptr_eq(group, &lease._group))
+                                .any(|group| Arc::ptr_eq(group, &lease.group))
                     })
                     .map(|(id, _)| id.clone())
                     .collect();

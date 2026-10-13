@@ -11,10 +11,218 @@ fn list(capture: &Value, context: &Value) -> Value {
         "query":{"state":"closed","filter":"all","search":"","limit":1}})
 }
 
+/// Only the legacy GitHub resolver is controlled here. GitLab policy and secret
+/// delivery use the same real Services and original UDS/WSS listeners as pages.
+#[derive(Default)]
+struct HelperControl(AtomicUsize);
+impl intent_transport::SystemControl for HelperControl {
+    fn status(&self) -> intent_transport::SystemStatus {
+        panic!("helper control does not supply daemon status")
+    }
+    fn host_environment(&self) -> intent_transport::HostEnvironment {
+        panic!("helper control does not supply host environment")
+    }
+    fn request_shutdown(&self) {
+        panic!("helper control does not shut down the daemon")
+    }
+    fn request_update(&self) -> Result<(), String> {
+        Err("helper control has no updater".into())
+    }
+    fn import_legacy(
+        &self,
+        _: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
+    {
+        Box::pin(async { Err("helper control has no importer".into()) })
+    }
+    fn git_credential(
+        &self,
+        _: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
+    {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Some(("x-access-token".into(), "github-synthetic".into())) })
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn repository_child_git_real_uds_scope_policy_and_github_compatibility() {
+    let control = Arc::new(HelperControl::default());
+    let h = Harness::with_control(true, Server::new().await, Some(control.clone())).await;
+    let provider_calls = h.server.as_ref().unwrap().count();
+    let mut owner = h.wss(TOKEN).await;
+    let mut helper = h.uds().await;
+    let q = json!({"protocol":"https","host":"forge.test:8443",
+        "path":"install/Team/Sub/Project.git","username":"oauth2","pid":17});
+    let off = helper.rpc("system.gitCredential", q.clone()).await;
+    assert_eq!(success(&off), &json!({"credential":null}));
+    let original = owner
+        .rpc("sourceControl.gitlab.childGit.get", json!({}))
+        .await;
+    let enabled = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":success(&original)["binding"],"enabled":true}),
+        )
+        .await;
+    assert_eq!(success(&enabled)["effective"], true);
+    for _ in 0..2 {
+        let credential = helper.rpc("system.gitCredential", q.clone()).await;
+        assert_eq!(
+            success(&credential),
+            &json!({"credential":{
+            "username":"oauth2","password":"stored-pat"}})
+        );
+    }
+    for (field, value) in [
+        ("host", "forge.test"),
+        ("host", "other.test:8443"),
+        ("path", "elsewhere/Team/Sub/Project.git"),
+        ("username", "another-account"),
+        ("protocol", "http"),
+    ] {
+        let mut wrong = q.clone();
+        wrong[field] = json!(value);
+        let reply = helper.rpc("system.gitCredential", wrong).await;
+        assert_eq!(success(&reply), &json!({"credential":null}));
+    }
+    let remote = owner.rpc("system.gitCredential", q.clone()).await;
+    assert_eq!(remote["error"]["code"], -32001);
+    for token in [MEMBER, GUEST] {
+        let mut remote = h.wss(token).await;
+        let reply = remote.rpc("system.gitCredential", q.clone()).await;
+        assert_eq!(reply["error"]["code"], -32003);
+        remote.close().await;
+    }
+    let disabled = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":success(&enabled)["binding"],"enabled":false}),
+        )
+        .await;
+    assert_eq!(success(&disabled)["effective"], false);
+    let off_again = helper.rpc("system.gitCredential", q).await;
+    assert_eq!(
+        success(&off_again),
+        &json!({"credential":null}),
+        "the existing helper connection observes the new disabled policy"
+    );
+    let github = helper
+        .rpc(
+            "system.gitCredential",
+            json!({"protocol":"https","host":"github.com","pid":18}),
+        )
+        .await;
+    assert_eq!(
+        success(&github),
+        &json!({"credential":{
+        "username":"x-access-token","password":"github-synthetic"}})
+    );
+    assert_eq!(control.0.load(Ordering::SeqCst), 1);
+    assert_eq!(h.server.as_ref().unwrap().count(), provider_calls);
+    helper.close().await;
+    owner.close().await;
+    h.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn repository_child_git_real_uds_partial_write_refuses_remainder_after_disable() {
+    let control = Arc::new(HelperControl::default());
+    let h = Harness::with_control(true, Server::new().await, Some(control.clone())).await;
+    let provider_calls = h.server.as_ref().unwrap().count();
+    let mut owner = h.wss(TOKEN).await;
+    let original = owner
+        .rpc("sourceControl.gitlab.childGit.get", json!({}))
+        .await;
+    let enabled = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":success(&original)["binding"],"enabled":true}),
+        )
+        .await;
+    assert_eq!(success(&enabled)["effective"], true);
+
+    // A bounded large request ID makes this ordinary secret response exceed
+    // the socket buffer without changing the provider token or writer. Read
+    // a success prefix to observe actual publication, then stop draining this socket.
+    let id = "child-output-backpressure-".to_owned() + &"x".repeat(2 * 1024 * 1024);
+    let query = json!({"protocol":"https","host":"forge.test:8443",
+        "path":"install/Team/Sub/Project.git","username":"oauth2","pid":17});
+    let request = json!({"jsonrpc":"2.0","id":id,"method":"system.gitCredential","params":query});
+    let expected = json!({"jsonrpc":"2.0","id":id,"result":{"credential":{
+        "username":"oauth2","password":"stored-pat"}}})
+    .to_string();
+    let mut helper = UnixStream::connect(h.dir.path().join("intentd.sock"))
+        .await
+        .unwrap();
+    tokio::time::timeout(ACQUIRE, helper.write_all(format!("{request}\n").as_bytes()))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut received = vec![0; 128];
+    tokio::time::timeout(ACQUIRE, helper.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(expected.as_bytes().starts_with(&received));
+
+    // This plain response must not flush a retired private frame or continue
+    // on a connection whose private writer has refused the remainder.
+    let sentinel = json!({"jsonrpc":"2.0","id":"after-private-sentinel",
+        "method":"test.publicSentinel","params":{}});
+    tokio::time::timeout(
+        ACQUIRE,
+        helper.write_all(format!("{sentinel}\n").as_bytes()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let disabled = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":success(&enabled)["binding"],"enabled":false}),
+        )
+        .await;
+    assert_eq!(success(&disabled)["effective"], false);
+
+    tokio::time::timeout(ACQUIRE, helper.read_to_end(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        received.len() < expected.len(),
+        "retired private remainder was written"
+    );
+    assert!(expected.as_bytes().starts_with(&received));
+    assert!(
+        !received.contains(&b'\n'),
+        "no complete private or later public frame"
+    );
+    assert_eq!(h.server.as_ref().unwrap().count(), provider_calls);
+    assert_eq!(control.0.load(Ordering::SeqCst), 0);
+    eprintln!(
+        "child original UDS partial output: received={} expected={} then EOF after acknowledged disable",
+        received.len(), expected.len()
+    );
+    drop(helper);
+    owner.close().await;
+    h.finish().await;
+}
+
 #[intent_test_macros::daemon_test]
 async fn repository_child_git_real_owner_policy_is_default_off_and_bound() {
     let h = Harness::new().await;
     let mut owner = h.wss(TOKEN).await;
+    let hello = owner
+        .rpc("client.hello", json!({"name":"child-policy-owner"}))
+        .await;
+    for capability in [
+        "repositoryResourceRead",
+        "repositoryResourcePages",
+        "gitlabChildGitPolicy",
+    ] {
+        assert_eq!(success(&hello)["server"]["capabilities"][capability], 1);
+    }
     let before = h.server.as_ref().unwrap().count();
     let first = owner
         .rpc("sourceControl.gitlab.childGit.get", json!({}))
@@ -36,6 +244,18 @@ async fn repository_child_git_real_owner_policy_is_default_off_and_bound() {
     assert_eq!(set["enabled"], true);
     assert_eq!(set["effective"], true);
     let changed = set["binding"].clone();
+    let mut rewritten = changed.clone();
+    rewritten["revision"] = json!(format!("0{}", changed["revision"].as_str().unwrap()));
+    let rewritten = owner
+        .rpc(
+            "sourceControl.gitlab.childGit.set",
+            json!({"binding":rewritten,"enabled":false}),
+        )
+        .await;
+    assert!(
+        rewritten.get("error").is_some(),
+        "an opaque revision must match exactly"
+    );
     let stale = owner
         .rpc(
             "sourceControl.gitlab.childGit.set",

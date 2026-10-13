@@ -8,7 +8,10 @@ use intent_core::repository_resource_pages::{
 use intent_core::HostRole;
 use intent_store::RepositoryHostAuthoritySnapshot;
 
-use super::*;
+use super::{
+    capture_inner, denied, detail_inner, entry, release_inner, unavailable, BoxFuture, Frame,
+    Released, RepositoryAuthoritySnapshot, Request, Result, Services, ACQUIRE,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Authority {
@@ -22,12 +25,12 @@ impl Authority {
             Self::Workspace(facts) => facts
                 .workspace
                 .revision
-                .map(|r| r.get())
+                .map(intent_store::AuthorityRevision::get)
                 .ok_or_else(unavailable),
             Self::Host(facts) => facts
                 .principal
                 .revision
-                .map(|r| r.get())
+                .map(intent_store::AuthorityRevision::get)
                 .ok_or_else(unavailable),
         }
     }

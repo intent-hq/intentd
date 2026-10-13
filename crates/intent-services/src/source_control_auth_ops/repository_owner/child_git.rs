@@ -135,13 +135,6 @@ pub(crate) struct GitlabChildPolicyReceipt {
     consumed: AtomicBool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "status output is composed by the transport consumer"
-    )
-)]
 impl GitlabChildPolicyReceipt {
     /// Consume this receipt to bind one immutable encoded output frame. The
     /// returned guard may recheck its original facts on every transport phase.
@@ -190,13 +183,6 @@ pub(crate) struct GitlabChildCredential {
     receipt: GitlabChildCredentialReceipt,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "credential output is composed by the UDS consumer"
-    )
-)]
 impl GitlabChildCredential {
     pub(crate) fn into_parts(self) -> (SecretString, super::GitlabChildCredentialReceipt) {
         (self.token, self.receipt)
@@ -214,13 +200,6 @@ pub(crate) struct GitlabChildCredentialReceipt {
     consumed: AtomicBool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "final output receipt is composed by the UDS consumer"
-    )
-)]
 impl GitlabChildCredentialReceipt {
     /// Bind one immutable credential frame; no token is retained in the guard.
     pub(crate) fn into_output(self) -> CoreResult<super::GitlabChildOutputGuard> {
@@ -282,13 +261,6 @@ pub(crate) struct GitlabChildOutputGuard {
     proof: OutputProof,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "bound output phases are composed by the transport consumer"
-    )
-)]
 impl GitlabChildOutputGuard {
     pub(crate) fn with_current(
         &self,
@@ -339,13 +311,6 @@ fn local(error: Error) -> CoreError {
 
 impl crate::Services {
     /// Capture before any permission/lifetime await; no caller-supplied identity.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "child policy entry is composed by Services integration"
-        )
-    )]
     pub(crate) fn capture_gitlab_child_policy(
         &self,
     ) -> CoreResult<super::GitlabChildPolicyCapture> {
@@ -373,13 +338,6 @@ impl crate::Services {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "child policy entry is composed by Services integration"
-    )
-)]
 impl GitlabChildPolicyCapture {
     fn current_status(&self) -> CoreResult<GitlabChildPolicyStatus> {
         self.original

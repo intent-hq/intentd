@@ -58,6 +58,7 @@ tokio::task_local! {
     static IS_TCP: RefCell<bool>;
     static MONITOR_HISTORY: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static CHILD_GIT_FRAME: Option<intent_core::gitlab_child_git::GitlabChildGitFrame>;
     static CHECKOUT_FRAME: Option<intent_core::repository_checkout::CheckoutFrame>;
     static RESOURCE_FRAME: Option<intent_core::repository_request::RepositoryResourceFrame>;
     static REVIEW_FRAME: Option<intent_core::repository_request::NativeReviewFrame>;
@@ -69,6 +70,29 @@ tokio::task_local! {
 /// frame future. The synchronous carrier captures it before any slot wait.
 pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T) -> T {
     use intent_core::repository_request::{RepositoryContextBoundQuery, RepositoryContextQuery};
+    let child_git = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            use intent_core::gitlab_child_git::GitlabChildGitFrame as Frame;
+            let method = value.get("method")?.as_str()?;
+            match method {
+                "sourceControl.gitlab.childGit.get" => {
+                    serde_json::from_value(value.get("params")?.clone())
+                        .ok()
+                        .map(Frame::Get)
+                }
+                "sourceControl.gitlab.childGit.set" => {
+                    serde_json::from_value(value.get("params")?.clone())
+                        .ok()
+                        .map(Frame::Set)
+                }
+                "system.gitCredential" => crate::control::classify(&value)
+                    .as_ref()
+                    .and_then(crate::control::gitlab_credential_query)
+                    .map(Frame::Credential),
+                _ => None,
+            }
+        });
     let query = serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|value| {
@@ -213,11 +237,13 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 _ => None,
             }
         });
-    CHECKOUT_FRAME.sync_scope(checkout, || {
-        RESOURCE_FRAME.sync_scope(resource, || {
-            REVIEW_FRAME.sync_scope(review, || {
-                SELECTION_FRAME
-                    .sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+    CHILD_GIT_FRAME.sync_scope(child_git, || {
+        CHECKOUT_FRAME.sync_scope(checkout, || {
+            RESOURCE_FRAME.sync_scope(resource, || {
+                REVIEW_FRAME.sync_scope(review, || {
+                    SELECTION_FRAME
+                        .sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+                })
             })
         })
     })
@@ -478,6 +504,11 @@ impl CapturedFrame {
             completion: READ_CONNECTION
                 .try_with(|owner| {
                     owner.as_ref().and_then(|owner| {
+                        if let Some(frame) = CHILD_GIT_FRAME.try_with(Clone::clone).ok().flatten() {
+                            return owner
+                                .capture_child_git(&frame)
+                                .map(|scope| Arc::new(RequestCompletion(scope)));
+                        }
                         if let Some(frame) = CHECKOUT_FRAME.try_with(Clone::clone).ok().flatten() {
                             return owner
                                 .capture_checkout(&frame)

@@ -298,13 +298,28 @@ impl Harness {
         Self::from_server(existing, Server::new().await).await
     }
     async fn from_server(existing: bool, server: Server) -> Self {
+        Self::with_control(existing, server, None).await
+    }
+    async fn with_control(
+        existing: bool,
+        server: Server,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
+    ) -> Self {
         let fixtures = vec![server.descriptor.clone()];
-        Self::with_fixtures(existing, server, fixtures).await
+        Self::with_fixtures_and_control(existing, server, fixtures, control).await
     }
     async fn with_fixtures(
         existing: bool,
         server: Server,
         fixtures: Vec<GitlabDescriptor>,
+    ) -> Self {
+        Self::with_fixtures_and_control(existing, server, fixtures, None).await
+    }
+    async fn with_fixtures_and_control(
+        existing: bool,
+        server: Server,
+        fixtures: Vec<GitlabDescriptor>,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
     ) -> Self {
         let dir = common::test_tempdir("itd-resource-wire-");
         let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
@@ -431,7 +446,7 @@ impl Harness {
                     bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
                     ..Default::default()
                 },
-                None,
+                control.clone(),
             )
             .unwrap(),
         );
@@ -439,7 +454,7 @@ impl Harness {
         let socket = dir.path().join("intentd.sock");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let listener = tokio::spawn(async move {
-            intent_transport::serve_uds(api, bus, &socket, None, async move {
+            intent_transport::serve_uds(api, bus, &socket, control, async move {
                 let _ = stopped.await;
             })
             .await

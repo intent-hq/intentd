@@ -12,7 +12,15 @@ use intent_sourcecontrol::{
     RateLimitStatus,
 };
 
-use super::*;
+use super::{
+    credentials, cursors, denied, entry, failure, observations, unavailable, valid_repository,
+    valid_target, validate_resource_url, Arc, AtomicBool, BoxFuture, CacheAdmissionGuard,
+    CacheDelivery, CacheError, CacheFailure, CacheRequest, Frame, Lease, ManagedCacheRequest,
+    Mutex, Ordering, Quota, ReadAuthority, RepositoryAuthorityRequest, RepositoryCollectionTarget,
+    RepositoryCredentialTransport, RepositoryCredentialUse, RepositoryReadEligibility,
+    RepositoryReadOperation, RepositoryResourceKind, RepositoryResponseAttribution, Request,
+    Result, ReviewTarget, Services, State, READ,
+};
 use crate::pr_monitor::qualified_cache::{summaries, CacheDenialObserver};
 use crate::repository_credentials::read::{
     RepositoryCollectionQuery, RepositoryCollectionReadOperation,
@@ -26,7 +34,7 @@ pub(crate) fn list(
         Box::pin(async move {
             valid_repository(&q.repository)?;
             let lease = r.lease(&q.read_lifetime_id)?;
-            if !lease._group.supports_pages() {
+            if !lease.group.supports_pages() {
                 return Err(unavailable());
             }
             *r.state.lock().map_err(denied)? = State::Reading(lease.clone());
@@ -279,7 +287,7 @@ async fn list_inner(
                     cache,
                     &monitored,
                     std::time::Instant::now(),
-                )
+                );
             },
         )
         .await
@@ -444,7 +452,7 @@ pub(crate) fn discussions(
                 return Err(unavailable());
             }
             let lease = r.lease(&q.read_lifetime_id)?;
-            if !lease._group.supports_pages() {
+            if !lease.group.supports_pages() {
                 return Err(unavailable());
             }
             *r.state.lock().map_err(denied)? = State::Reading(lease.clone());

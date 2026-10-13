@@ -321,6 +321,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",

@@ -3,7 +3,11 @@
 
 use intent_core::repository_request::RepositoryPrivateOutput;
 
-use super::*;
+use super::{
+    denied, unavailable, with_response, AdmissionError, Arc, AtomicBool, Connection, Instant,
+    Ordering, RepositoryConnectionFacts, RepositoryCredentialError, RepositoryResponseDisposition,
+    Request, Result, ReviewTarget, State,
+};
 
 pub(super) fn bind(r: &Request, frame: &str) -> Result<Option<Arc<dyn RepositoryPrivateOutput>>> {
     let state = r.state.lock().map_err(denied)?.clone();
@@ -39,9 +43,8 @@ impl RepositoryPrivateOutput for Output {
         if !self.admitted.load(Ordering::Acquire) || Instant::now() >= self.deadline {
             return Err(unavailable());
         }
-        let lease = match &self.state {
-            State::Capture(lease) | State::Read(lease, ..) => lease,
-            _ => return Err(unavailable()),
+        let (State::Capture(lease) | State::Read(lease, ..)) = &self.state else {
+            return Err(unavailable());
         };
         lease.check()?;
         let mut transferred = None;

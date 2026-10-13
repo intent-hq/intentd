@@ -190,14 +190,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 440;
+const EXPECTED_TOTAL_METHODS: usize = 442;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 384;
+const EXPECTED_ROUTER_METHODS: usize = 386;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -840,6 +840,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
@@ -1385,6 +1387,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.resolveKnownRepository",
@@ -2051,6 +2055,13 @@ mod unbound_owner_only_methods {
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
             ("sourceControl.getUser", json!({ "provider": "github" })),
+            ("sourceControl.gitlab.childGit.get", json!({})),
+            (
+                "sourceControl.gitlab.childGit.set",
+                json!({"binding":{"instanceBaseUrl":"https://forge.test/install",
+                    "connection":{"connectionId":"original","accountId":"account",
+                        "connectionGeneration":"1"},"revision":"1"},"enabled":false}),
+            ),
             (
                 "sourceControl.identityProof.create",
                 json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
@@ -2580,6 +2591,8 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.cancelAuth",
         "sourceControl.connect",
         "sourceControl.getUser",
+        "sourceControl.gitlab.childGit.get",
+        "sourceControl.gitlab.childGit.set",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
         "sourceControl.read.resolveKnownRepository",

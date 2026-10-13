@@ -134,6 +134,28 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Owner-only policy on the original native application connection.
+    fn gitlab_child_git_policy_get(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    /// Transport-private helper branch. Implementations require actual local
+    /// owner admission and retain credential proof through final socket output.
+    fn gitlab_child_git_credential(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git credential unavailable".into())) })
+    }
+
     /// Acquire read-only repository context under the original native connection.
     /// Explicit original-socket resource reads; older implementations refuse.
     fn repository_resource_capture(

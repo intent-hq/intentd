@@ -2208,3 +2208,282 @@ async fn resource_frame_read_budget_and_feed_loss_are_bounded() {
     drop(s);
     server.finish().await;
 }
+
+fn child_credential_query() -> intent_core::gitlab_child_git::GitlabChildGitCredentialQuery {
+    intent_core::gitlab_child_git::GitlabChildGitCredentialQuery {
+        pid: Some(17),
+        protocol: "https".into(),
+        host: "forge.test:8443".into(),
+        path: "install/Team/Sub/Project.git".into(),
+        username: None,
+    }
+}
+impl Socket {
+    async fn child_output(
+        &self,
+        services: &Services,
+        frame: intent_core::gitlab_child_git::GitlabChildGitFrame,
+    ) -> (
+        Value,
+        Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>,
+    ) {
+        let (scope, body) = self.child_body(services, frame).await;
+        let encoded = body.as_ref().unwrap().to_string();
+        let output = scope.bind_private_output(&encoded).unwrap().unwrap();
+        assert!(scope.bind_private_output(&encoded).is_err());
+        let (sent, count) = self.transfer(&scope, &body).await;
+        sent.unwrap();
+        assert_eq!(count, 1);
+        scope.retire();
+        (body.unwrap(), output)
+    }
+
+    async fn child_body(
+        &self,
+        services: &Services,
+        frame: intent_core::gitlab_child_git::GitlabChildGitFrame,
+    ) -> (Arc<dyn RepositoryReadRequestScope>, Result<Value>) {
+        use intent_core::gitlab_child_git::GitlabChildGitFrame as ChildFrame;
+        self.entered(async {
+            let scope = self.owner.capture_child_git(&frame).unwrap();
+            let mut result = None;
+            scope
+                .scope(Box::pin(async {
+                    result = Some(match frame {
+                        ChildFrame::Credential(q) => services
+                            .gitlab_child_git_credential(q)
+                            .await
+                            .and_then(|v| serde_json::to_value(v).map_err(denied)),
+                        ChildFrame::Get(q) => services
+                            .gitlab_child_git_policy_get(q)
+                            .await
+                            .and_then(|v| serde_json::to_value(v).map_err(denied)),
+                        ChildFrame::Set(q) => services
+                            .gitlab_child_git_policy_set(q)
+                            .await
+                            .and_then(|v| serde_json::to_value(v).map_err(denied)),
+                    });
+                }))
+                .await;
+            (scope, result.unwrap())
+        })
+        .await
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_git_original_policy_and_credential_guard_every_output_phase() {
+    use intent_core::gitlab_child_git::GitlabChildGitFrame as ChildFrame;
+    let server = Server::new().await;
+    let h = Fixture::new(&server).await;
+    let socket = h.socket().await;
+    let before = server.count();
+    let (off, old_status) = socket
+        .child_output(
+            &h.services,
+            ChildFrame::Get(intent_core::gitlab_child_git::GitlabChildGitPolicyQuery::default()),
+        )
+        .await;
+    assert_eq!(off["enabled"], false);
+    let mut status_phases = 0;
+    for _ in 0..3 {
+        old_status
+            .with_current(&mut || {
+                status_phases += 1;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let (enabled, enabled_output) = socket
+        .child_output(
+            &h.services,
+            ChildFrame::Set(
+                serde_json::from_value(json!({"binding":off["binding"],
+            "enabled":true}))
+                .unwrap(),
+            ),
+        )
+        .await;
+    assert_eq!(enabled["effective"], true);
+    assert!(old_status
+        .with_current(&mut || {
+            status_phases += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(
+        status_phases, 3,
+        "a new choice retires the prior status output"
+    );
+    for _ in 0..3 {
+        enabled_output.with_current(&mut || Ok(())).unwrap();
+    }
+    let (credential, private) = socket
+        .child_output(
+            &h.services,
+            ChildFrame::Credential(child_credential_query()),
+        )
+        .await;
+    assert_eq!(credential["credential"]["password"], "stored-pat");
+    let mut credential_phases = 0;
+    for _ in 0..2 {
+        private
+            .with_current(&mut || {
+                credential_phases += 1;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let (disabled, disabled_output) = socket
+        .child_output(
+            &h.services,
+            ChildFrame::Set(
+                serde_json::from_value(json!({"binding":enabled["binding"],
+            "enabled":false}))
+                .unwrap(),
+            ),
+        )
+        .await;
+    assert_eq!(disabled["effective"], false);
+    assert!(private
+        .with_current(&mut || {
+            credential_phases += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(
+        credential_phases, 2,
+        "disable prevents the next original output phase"
+    );
+    assert!(enabled_output.with_current(&mut || Ok(())).is_err());
+    for _ in 0..3 {
+        disabled_output.with_current(&mut || Ok(())).unwrap();
+    }
+    socket.owner.retire();
+    assert!(disabled_output.with_current(&mut || Ok(())).is_err());
+    assert_eq!(
+        server.count(),
+        before,
+        "no provider permission probe at output"
+    );
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_git_original_local_owner_default_off_has_private_socket_lifetime() {
+    use intent_core::gitlab_child_git::GitlabChildGitFrame as ChildFrame;
+    let server = Server::new().await;
+    let h = Fixture::new(&server).await;
+    let socket = h.socket().await;
+    let before = server.count();
+    let (scope, result) = socket
+        .child_body(
+            &h.services,
+            ChildFrame::Credential(child_credential_query()),
+        )
+        .await;
+    let result = result.unwrap();
+    assert_eq!(result, json!({"credential":null}));
+    let output = scope
+        .bind_private_output(&result.to_string())
+        .unwrap()
+        .unwrap();
+    assert!(scope.bind_private_output("a second packet").is_err());
+    let mut queued = 0;
+    socket
+        .entered(scope.deliver(RepositoryReadReplyKind::Result, &mut || {
+            queued += 1;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+    assert_eq!(queued, 1);
+    scope.retire();
+    let mut written = 0;
+    for _ in 0..3 {
+        output
+            .with_current(&mut || {
+                written += 1;
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        written, 3,
+        "normal frame completion preserves already admitted private output"
+    );
+    socket.owner.retire();
+    assert!(output
+        .with_current(&mut || {
+            written += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(written, 3);
+    assert_eq!(
+        server.count(),
+        before,
+        "an unset grant never loads provider endpoints"
+    );
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn child_git_original_credential_rejects_bearer_owner_member_and_absent_frame() {
+    use intent_core::gitlab_child_git::GitlabChildGitFrame as ChildFrame;
+    let server = Server::new().await;
+    let h = Fixture::new(&server).await;
+    let before = server.count();
+    assert!(h
+        .services
+        .gitlab_child_git_credential(child_credential_query())
+        .await
+        .is_err());
+    let Caller::Wire { principal_id, .. } = &h.owner else {
+        panic!("original fixture owner")
+    };
+    h.services
+        .store
+        .insert_principal_credential(principal_id, "child-owner-hash")
+        .await
+        .unwrap();
+    let bearer = Socket::new(
+        &h.services,
+        h.owner.clone(),
+        Some(WireCredential::Principal {
+            principal_id: principal_id.clone(),
+            token_hash: "child-owner-hash".into(),
+        }),
+    )
+    .await;
+    let (scope, result) = bearer
+        .child_body(
+            &h.services,
+            ChildFrame::Credential(child_credential_query()),
+        )
+        .await;
+    assert!(result.is_err());
+    scope.retire();
+    bearer.owner.retire();
+    for role in [HostRole::Member, HostRole::Guest] {
+        // Each role is a distinct host admission, not a second principal with
+        // the same external identity in the original member's Store.
+        let server = Server::new().await;
+        let h = Fixture::new(&server).await;
+        let before = server.count();
+        let (socket, _) = h.member(role).await;
+        let (scope, result) = socket
+            .child_body(
+                &h.services,
+                ChildFrame::Credential(child_credential_query()),
+            )
+            .await;
+        assert!(result.is_err());
+        scope.retire();
+        socket.owner.retire();
+        assert_eq!(server.count(), before);
+        server.finish().await;
+    }
+    assert_eq!(server.count(), before);
+    server.finish().await;
+}

@@ -296,7 +296,7 @@ struct Lease {
     facts: RepositoryConnectionFacts,
     settled: RepositorySettledConnection,
     observations: ConnectionObservations,
-    _group: Arc<observations::Group>,
+    group: Arc<observations::Group>,
     reads: AtomicUsize,
     cursors: Mutex<cursors::Cursors>,
     published: AtomicBool,
@@ -780,7 +780,7 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
         facts,
         settled,
         observations,
-        _group: group,
+        group,
         reads: AtomicUsize::new(0),
         cursors: Mutex::default(),
         published: AtomicBool::new(false),
@@ -1081,7 +1081,7 @@ async fn read_inner(
     let cache = ManagedCacheRequest {
         request: CacheRequest {
             connection: &lease.observations,
-            target: target,
+            target,
             revalidate: &revalidate,
         },
         eligibility: &eligibility,

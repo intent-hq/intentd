@@ -31,6 +31,15 @@ pub enum RepositoryReadReplyKind {
 
 /// One original authenticated connection, independent of client and RPC ids.
 pub trait RepositoryReadConnection: Send + Sync {
+    /// Capture owner-only policy or local-helper work before the original
+    /// frame's first await. Unsupported service owners fail closed.
+    fn capture_child_git(
+        &self,
+        _frame: &crate::gitlab_child_git::GitlabChildGitFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
+
     /// Replace this physical connection's monitor consumer declaration before
     /// processing a hello. The receipt remains inactive until the successful
     /// hello response has been accepted by the original transport. Unsupported

@@ -6,7 +6,7 @@ use intent_core::repository_resource_pages::{
 };
 use intent_core::{RepositoryTarget, ReviewTarget};
 
-use super::*;
+use super::{unavailable, CacheDelivery, Error, Result, VecDeque, LIMIT};
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum QueryKey {
