@@ -313,7 +313,7 @@ workspace setup script does not resolve it.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar warns when its primary browser client is offline, even if
 the workspace has no browser tabs yet. Hover over the warning for recovery help:
@@ -324,11 +324,14 @@ To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. The action depends on the
-current client's browser capability and your access. After reconnecting, wait
-for the current client and workspace browser state to refresh. A checked action
-means this client is already explicitly primary; an unavailable action can also
-mean the connection, browser capability, or access is not ready. Do not promise
-automatic failover or change the primary client without the user's instruction.
+current client's connection, browser capability and your access. A checkmark
+means the saved primary selection matches the confirmed current client; it does
+not guarantee browser availability. The selection updates when the primary
+changes; after reconnecting, wait for the current client and workspace browser
+state to refresh. When the saved selection is known and this client is not
+selected, the action is available once its connection, browser capability and
+your access are ready. Do not promise automatic failover or change the primary
+client without the user's instruction.
 
 ## Add context, run a task, and find results
 
