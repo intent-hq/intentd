@@ -43,6 +43,7 @@ mod provenance;
 use provenance::RequestProvenance;
 mod avatars;
 mod creation;
+mod discussions;
 mod observation;
 mod search;
 
@@ -1033,13 +1034,25 @@ impl SourceControl for GitLabSourceControl {
     }
 
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>> {
-        let mut params = vec![("scope".into(), "all".into())];
+        let scope = match query.involvement {
+            None => "all",
+            Some(PrInvolvement::Created) => "created_by_me",
+            Some(PrInvolvement::Assigned) => "assigned_to_me",
+            Some(PrInvolvement::ReviewRequested) => "reviews_for_me",
+            Some(PrInvolvement::Involves) => {
+                return Err(Error::Unsupported("GitLab exact involves filter".into()));
+            }
+        };
+        let closed = query.state == Some(PrState::Closed);
+        let mut params = vec![("scope".into(), scope.into())];
         if let Some(state) = query.state {
             params.push((
                 "state".into(),
                 match state {
                     PrState::Open => "opened",
-                    PrState::Closed => "closed",
+                    // GitLab distinguishes merged from unmerged closed. Preserve
+                    // its page boundary even if the union filters out every row.
+                    PrState::Closed => "all",
                     PrState::Merged => "merged",
                 }
                 .into(),
@@ -1055,41 +1068,39 @@ impl SourceControl for GitLabSourceControl {
                 params.push((key.into(), value));
             }
         }
-        let mut involves = None;
-        if let Some(involvement) = query.involvement {
-            let user = self.get_user().await?;
-            let key = match involvement {
-                PrInvolvement::Created => "author_username",
-                PrInvolvement::Assigned => "assignee_username[]",
-                PrInvolvement::ReviewRequested => "reviewer_username",
-                PrInvolvement::Involves => {
-                    involves = Some(user.login.clone());
-                    ""
-                }
-            };
-            if !key.is_empty() {
-                params.push((key.into(), user.login));
-            }
-        }
         let page = PageParams {
             limit: query.limit.unwrap_or(30),
             cursor: query.cursor,
         };
-        let result = if !query.extra_repos.is_empty() || involves.is_some() {
+        let mut result = if query.extra_repos.is_empty() {
+            self.page(&format!("{}/merge_requests", project(repo)), params, page)
+                .await?
+        } else {
             self.search_projects(
                 repo,
                 &query.extra_repos,
                 "merge_requests",
                 params,
                 page,
-                involves.as_deref(),
+                None,
             )
             .await?
-        } else {
-            self.page(&format!("{}/merge_requests", project(repo)), params, page)
-                .await?
         };
+        if closed {
+            result
+                .items
+                .retain(|value| matches!(value["state"].as_str(), Some("closed" | "merged")));
+        }
         map_page(result, |value| Ok(self.details(value)?.review))
+    }
+
+    async fn list_discussions(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        page: PageParams,
+    ) -> Result<Page<crate::ReviewDiscussion>> {
+        self.complete_discussions(repo, number, page).await
     }
 
     async fn list_comments(&self, repo: &RepoRef, number: u64) -> Result<Vec<Comment>> {

@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use super::{GitlabCredentialGate, RepositoryOwner};
 use crate::repository_credentials::authority::CredentialFuture;
 use crate::repository_credentials::read::{
-    RepositoryReadScope, RepositoryResponseAttribution, RepositoryResponseDisposition,
+    RepositoryCollectionTarget, RepositoryReadScope, RepositoryResponseAttribution,
+    RepositoryResponseDisposition,
 };
 use crate::repository_credentials::{
     RepositoryConnectionBinding, RepositoryCredentialAdmission, RepositoryCredentialError as Error,
@@ -1301,6 +1302,49 @@ impl RepositoryReadEligibility {
             .map_err(|_| Error::Indeterminate)?;
         self.scope
             .with_response(attribution, target, &mut |disposition, selected| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if let Some(selected) = selected {
+                    self.check_source(
+                        settings,
+                        &config,
+                        descriptor.as_ref(),
+                        proof.as_deref(),
+                        selected,
+                    )?;
+                }
+                // Rejection's accepted event survives its own directory disconnect.
+                // NoDenial likewise says nothing about successful payload eligibility.
+                apply(disposition)
+            })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "qualified collection consumer is composed by Services integration"
+        )
+    )]
+    pub(crate) fn with_collection_response(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &RepositoryCollectionTarget,
+        apply: &mut (dyn FnMut(RepositoryResponseDisposition) -> Result<()> + Send),
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.scope
+            .with_collection_response(attribution, target, &mut |disposition, selected| {
                 let proof = self
                     .owner
                     .evidence

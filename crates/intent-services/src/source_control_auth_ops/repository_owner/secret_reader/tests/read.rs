@@ -7,6 +7,7 @@ use crate::repository_credentials::authority::{
     RepositoryCredentialTransport,
 };
 use crate::repository_credentials::read::{
+    RepositoryCollectionQuery, RepositoryCollectionReadOperation, RepositoryCollectionTarget,
     RepositoryReadOperation, RepositoryResponseAttribution, RepositoryResponseDisposition as D,
 };
 use crate::repository_credentials::{RepositoryCredentialAdmission, RepositoryCredentialUse};
@@ -158,7 +159,8 @@ impl ReadServer {
                         control.entered.notify_one();
                         control.release.notified().await;
                     }
-                    let body=if path==PROJECT {
+                    let body=if path.starts_with(&format!("{PROJECT}/merge_requests?")) || path.starts_with(&format!("{PROJECT}/issues?")) { json!([]) }
+                    else if path==PROJECT {
                         json!({"id":42,"path_with_namespace":"group/project",
                             "only_allow_merge_if_pipeline_succeeds":false,
                             "only_allow_merge_if_all_discussions_are_resolved":false})
@@ -305,6 +307,32 @@ impl ReadFixture {
         )
         .unwrap();
         (eligibility, operation, target)
+    }
+    fn collection(
+        &self,
+        server: &ReadServer,
+        query: RepositoryCollectionQuery,
+    ) -> (
+        RepositoryReadEligibility,
+        RepositoryCollectionReadOperation,
+        RepositoryCollectionTarget,
+    ) {
+        let admission = self.admission(server);
+        let eligibility = self
+            .auth
+            .service
+            .gitlab_repository_read_eligibility(&admission)
+            .unwrap();
+        let op = RepositoryCollectionReadOperation::new(
+            self.auth.service.repository_connection_directory(),
+            admission,
+            self.auth.service.gitlab_repository_secret_reader().unwrap(),
+            BUDGET,
+            query,
+        )
+        .unwrap();
+        let target = op.target().clone();
+        (eligibility, op, target)
     }
     async fn refresh(&self, server: &ReadServer) {
         refresh_original(&self.auth.service, &server.fixture.host)
@@ -3841,4 +3869,182 @@ async fn native_facts_callback_preserves_original_error_and_owned_effect_once() 
     assert_eq!(calls, 1);
     assert_eq!(output.as_deref(), Some(&42));
     assert_eq!(s.count(), 0);
+}
+
+fn collection_applied(
+    eligibility: &RepositoryReadEligibility,
+    receipt: &RepositoryResponseAttribution,
+    target: &RepositoryCollectionTarget,
+) -> Result<D> {
+    let mut result = None;
+    eligibility.with_collection_response(receipt, target, &mut |d| {
+        assert!(result.replace(d).is_none());
+        Ok(())
+    })?;
+    Ok(result.unwrap())
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_reads_have_real_project_targets_and_separate_lazy_response_evidence() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let (e, op, target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+    );
+    assert_eq!(target.repository().project_path, "group/project");
+    assert_eq!(target.kind(), RepositoryResourceKind::MergeRequest);
+    assert_eq!(s.count(), 0);
+    assert_eq!(f.authority.calls.load(Ordering::SeqCst), 0);
+    let (result, quota, receipt) = op.reviews().await.into_parts();
+    assert!(result.unwrap().items.is_empty());
+    assert_eq!(quota.remaining, Some(23));
+    assert_eq!(
+        collection_applied(&e, &receipt, &target).unwrap(),
+        D::NoDenial
+    );
+    let (issue_e, issue_op, issue_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery::default()),
+    );
+    assert_eq!(issue_target.kind(), RepositoryResourceKind::Issue);
+    assert_eq!(
+        collection_applied(&issue_e, &receipt, &issue_target),
+        Err(Error::BoundaryMismatch)
+    );
+    let (result, _, issue_receipt) = issue_op.issues().await.into_parts();
+    assert!(result.unwrap().items.is_empty());
+    assert_eq!(
+        collection_applied(&issue_e, &issue_receipt, &issue_target).unwrap(),
+        D::NoDenial
+    );
+    let (changed, _, changed_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+            search: Some("another query".into()),
+            ..Default::default()
+        }),
+    );
+    assert_eq!(
+        collection_applied(&changed, &receipt, &changed_target),
+        Err(Error::BoundaryMismatch)
+    );
+    assert_eq!(s.count(), 2);
+    let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+    assert!(op
+        .review_discussions(intent_sourcecontrol::PageParams::first(20))
+        .await
+        .into_parts()
+        .0
+        .unwrap()
+        .items
+        .is_empty());
+    assert_eq!(s.count(), 3);
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_wrong_kind_and_unadmitted_extra_project_never_dispatch() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let (_, op, _) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery::default()),
+    );
+    assert!(matches!(
+        op.reviews().await.into_parts().0,
+        Err(ScError::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::BoundaryMismatch
+        ))
+    ));
+    let query = RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+        extra_repos: vec![intent_sourcecontrol::RepoRef {
+            owner: "other".into(),
+            name: "private".into(),
+        }],
+        ..Default::default()
+    });
+    assert!(matches!(
+        RepositoryCollectionReadOperation::new(
+            f.auth.service.repository_connection_directory(),
+            f.admission(&s),
+            f.auth.service.gitlab_repository_secret_reader().unwrap(),
+            BUDGET,
+            query
+        ),
+        Err(Error::BoundaryMismatch)
+    ));
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_current_denials_keep_the_real_error_quota_and_terminal_kind() {
+    for status in [401, 403, 404] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let path = format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30");
+        s.status(&path, status);
+        let (e, op, target) = f.collection(
+            &s,
+            RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+        );
+        let (result, quota, receipt) = op.reviews().await.into_parts();
+        denial(
+            &result,
+            if status == 401 {
+                ProviderFailureKind::CredentialRejected
+            } else {
+                ProviderFailureKind::ResourceDenied
+            },
+            status,
+        );
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            collection_applied(&e, &receipt, &target).unwrap(),
+            if status == 401 {
+                D::AcceptedCredentialRejection
+            } else {
+                D::CurrentResourceDenial
+            }
+        );
+        assert_eq!(s.count(), 1);
+        if status == 401 {
+            assert!(e.check().is_err());
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_old_denials_after_actual_refresh_cannot_apply_to_successor() {
+    for status in [401, 403, 404] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, true).await;
+        let path = format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30");
+        s.status(&path, status);
+        s.pause(&path);
+        let (e, op, target) = f.collection(
+            &s,
+            RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+        );
+        let work = tokio::spawn(op.reviews());
+        s.entered().await;
+        f.refresh(&s).await;
+        s.resume();
+        let (result, quota, receipt) = work.await.unwrap().into_parts();
+        denial(
+            &result,
+            if status == 401 {
+                ProviderFailureKind::CredentialRejected
+            } else {
+                ProviderFailureKind::ResourceDenied
+            },
+            status,
+        );
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            collection_applied(&e, &receipt, &target).unwrap(),
+            D::NotApplied
+        );
+        e.check().unwrap();
+        assert_eq!(s.count(), 1);
+    }
 }
