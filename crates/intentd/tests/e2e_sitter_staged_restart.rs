@@ -591,7 +591,7 @@ async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
     // Queue the signal while the process is stopped, then release the gate
     // before resuming. Pending signals are delivered before userspace runs:
     // the unfixed watcher cannot race ahead and install its handler after kill.
-    let pid = Pid::from_raw(daemon.child.id() as i32);
+    let pid = Pid::from_raw(daemon.child.id().cast_signed());
     daemon.signal(Signal::SIGSTOP);
     let stopped = tokio::time::timeout(
         exit_budget(),
