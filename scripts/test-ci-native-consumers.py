@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -31,6 +32,11 @@ class NativeDemandTests(unittest.TestCase):
             self.assertEqual(set(recipes), {'daemon', 'sitter', 'sitter-production'})
             self.assertNotIn('e2e_doctor_codex', recipes['daemon']['command'])
             self.assertNotIn('--workspace', recipes['daemon']['command'])
+
+    def test_sitter_relocation_helper_is_available_to_windows_without_production_dependency(self):
+        manifest = tomllib.loads((ROOT / 'crates/intentd-sitter/Cargo.toml').read_text())
+        self.assertIn('intentd-test-support', manifest['dev-dependencies'])
+        self.assertNotIn('intentd-test-support', manifest['dependencies'])
 
     def test_production_sitter_never_inherits_test_graph(self):
         recipe = archives.native_recipes('windows', 'merge_group', 'fixture')['sitter-production']

@@ -353,6 +353,23 @@ def produce(requests, source, target, published):
                         diagnostics.write(line)
                         print(line, end="", file=sys.stderr, flush=True)
                     if process.wait():
+                        log.flush()
+                        diagnostics.flush()
+                        failure = published / "failures" / key
+                        failure.mkdir(parents=True, exist_ok=True)
+                        for name in ("build.jsonl", "build.stderr.log"):
+                            shutil.copy2(stage / name, failure / name)
+                        # Cargo's JSON mode writes rendered compiler errors to
+                        # stdout, while nextest's stderr only reports a summary.
+                        for entry in (stage / "build.jsonl").read_text().splitlines():
+                            try:
+                                item = json.loads(entry)
+                            except json.JSONDecodeError:
+                                continue
+                            if item.get("reason") == "compiler-message":
+                                rendered = item.get("message", {}).get("rendered")
+                                if rendered:
+                                    print(rendered, file=sys.stderr, flush=True)
                         raise subprocess.CalledProcessError(process.returncode, command)
             built = time.monotonic()
             check_source(source, expected)

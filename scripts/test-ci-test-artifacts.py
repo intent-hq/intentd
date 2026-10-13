@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Real nextest relocation, variant staging, and fail-closed publication tests."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -54,6 +56,30 @@ class ArchiveTests(unittest.TestCase):
             env = dict(os.environ, LD_LIBRARY_PATH=str(staged))
             env.pop("LD_PRELOAD", None)
             self.assertEqual(subprocess.check_output([str(staged / "main")], env=env, text=True).strip(), "42")
+
+    def test_failed_build_preserves_and_displays_cargo_json_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"; source.mkdir()
+            request = {"identity": {"tools": {"rustc": "fixture", "cargo": "fixture", "nextest": "fixture"},
+                                    "environment": {}},
+                       "recipe": {"kind": "test-archive", "command": [sys.executable, "-c",
+                           "import json,sys; print(json.dumps({'reason':'compiler-message','message':{'rendered':'error[E0433]: missing test support\\n'}})); sys.exit(101)"]}}
+            errors = io.StringIO()
+            with mock.patch.object(artifacts, "validate_request"), \
+                 mock.patch.object(artifacts.identity, "plan_variants"), \
+                 mock.patch.object(artifacts.identity, "build_key", return_value="fixture-key"), \
+                 mock.patch.object(artifacts, "check_source"), \
+                 mock.patch.object(artifacts, "output", return_value="fixture"), \
+                 mock.patch.object(artifacts, "build_environment", return_value={}), \
+                 contextlib.redirect_stderr(errors):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    artifacts.produce([request], source, root / "target", root / "published")
+            self.assertIn("error[E0433]: missing test support", errors.getvalue())
+            failure = root / "published/failures/fixture-key"
+            self.assertIn("compiler-message", (failure / "build.jsonl").read_text())
+            self.assertTrue((failure / "build.stderr.log").is_file())
+            self.assertFalse((root / "published/fixture-key").exists())
 
     def test_archive_implementation_is_part_of_the_recipe_identity(self):
         recipe = artifacts.native_recipes("linux", "pull_request", "x86_64-unknown-linux-gnu")["sitter"]
