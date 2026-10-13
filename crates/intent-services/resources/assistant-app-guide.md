@@ -247,7 +247,7 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 ## Home workspace status icons
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
 
 In **Home → Workspaces**, the status icon in list and board views describes the
 workspace's current status. Hover over it for an explanation:
@@ -259,6 +259,14 @@ workspace's current status. Hover over it for an explanation:
 Questions, review requests, failures, and blockers can take precedence over PR
 icons. **PR Mergeable** does not grant permission to merge: agents still need the
 user's explicit authorization and must check the current merge requirements.
+
+A muted hourglass indicates waiting on external events or delegated work in the
+workspace; it does not mean every agent is waiting. It replaces an otherwise idle
+dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+hourglass, with additional waiting explained in its tooltip. Waiting is also
+included in accessible status text. The waiting indicator is hidden when the main
+status shows active work, unread updates, a question, a review request, a failure,
+or a blocker.
 
 ## Workspace numbers for Micro keys
 
