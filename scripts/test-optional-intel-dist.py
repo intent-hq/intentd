@@ -38,12 +38,17 @@ def main():
         assert '--target=' + INTEL in flags
         included = dist('build', '--artifacts=global', *flags)
         assert any(INTEL in name for name in included['artifacts'])
+        (artifacts / 'global-dist-manifest.json').write_text(json.dumps(included))
         # Simulate an optional failed upload retaining only its archive: its
         # archive, stale manifest records, checksums and download row must go.
         (artifacts / f'intentd-{INTEL}.tar.xz.sha256').unlink()
         flags = subprocess.check_output(policy, cwd=root, text=True).split()
         assert '--target=' + INTEL not in flags
-        omitted = dist('build', '--artifacts=global', *flags)
+        # Late host/final cleanup must sanitize the already-built aggregate.
+        assert INTEL not in (artifacts / 'sha256.sum').read_text()
+        # Inspect the existing global outputs: rebuilding here would hide late
+        # cleanup defects in the actual host/final publication path.
+        omitted = json.loads((artifacts / 'global-dist-manifest.json').read_text())
         assert not any(INTEL in name for name in omitted['artifacts'])
         assert INTEL not in omitted['announcement_github_body']
         assert INTEL not in (artifacts / 'sha256.sum').read_text()
@@ -53,7 +58,6 @@ def main():
                 assert any(target in name for name in omitted['artifacts']), target
         # The final host manifest is built from the same filtered local/global
         # inputs; use manifest mode to inspect it without any hosting writes.
-        (artifacts / 'global-dist-manifest.json').write_text(json.dumps(omitted))
         final = dist('manifest', '--artifacts=all', *flags)
         assert INTEL not in final['announcement_github_body']
         assert not any(INTEL in name for name in final['artifacts'])

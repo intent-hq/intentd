@@ -73,6 +73,38 @@ def omit_intel_metadata(manifest):
     return manifest
 
 
+def reconcile_aggregate(root, included):
+    """Keep an already-generated cargo-dist aggregate consistent at late cleanup."""
+    aggregate = root / 'sha256.sum'
+    if not aggregate.exists():
+        return
+    retained = []
+    names = set()
+    for line in aggregate.read_text().splitlines(keepends=True):
+        if not line.strip():
+            retained.append(line)
+            continue
+        match = re.fullmatch(r'([0-9a-f]{64}) [ *]([^/\\\r\n]+)\n?', line)
+        if not match:
+            raise ValueError('invalid sha256.sum entry')
+        digest, name = match.groups()
+        if INTEL not in included and INTEL in name:
+            continue
+        path = root / name
+        if name in names or path.is_symlink() or not path.is_file():
+            raise ValueError(f'invalid sha256.sum file: {name}')
+        with path.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
+                raise ValueError(f'invalid sha256.sum checksum: {name}')
+        names.add(name)
+        retained.append(line)
+    for target in included:
+        suffix = 'zip' if 'windows' in target else 'tar.xz'
+        if f'intentd-{target}.{suffix}' not in names:
+            raise ValueError(f'missing sha256.sum archive: {target}')
+    aggregate.write_text(''.join(retained))
+
+
 def validated_targets(root):
     targets = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']['targets']
     included = []
@@ -89,6 +121,7 @@ def validated_targets(root):
     if INTEL not in included:
         for path in root.glob('*dist-manifest.json'):
             path.write_text(json.dumps(omit_intel_metadata(json.loads(path.read_text())), indent=2) + '\n')
+    reconcile_aggregate(root, included)
     return included
 
 

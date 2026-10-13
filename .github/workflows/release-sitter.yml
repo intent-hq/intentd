@@ -282,12 +282,14 @@ jobs:
               --title "intentd sitter $VERSION" \
               --notes "Self-updating supervisor shim for intentd, installed as \`intentd\`. Archives contain the sitter binary renamed to \`intentd\` (\`intentd.exe\` on Windows)."
           fi
+          python3 -I scripts/reconcile-sitter-intel.py "$TAG" artifacts --repo "$GITHUB_REPOSITORY"
           gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
       # Fixed release so install instructions have a stable URL
       # (releases/download/sitter-latest/intentd-<triple>.tar.xz). Asset names
       # are constant. Omitted Intel leaves its previous valid archive/checksum
-      # pair intact; only this run's successful pairs are replaced. Prereleases are not
-      # promoted here, mirroring channel-stable semantics.
+      # pair intact after downloading and verifying it; invalid remote pairs are
+      # removed before upload. Only this run's successful pairs are replaced.
+      # Prereleases are not promoted here, mirroring channel-stable semantics.
       - name: Refresh sitter-latest release
         if: ${{ needs.plan.outputs.prerelease == 'false' }}
         env:
@@ -308,6 +310,7 @@ jobs:
               fi
             fi
           fi
+          python3 -I scripts/reconcile-sitter-intel.py sitter-latest artifacts --repo "$GITHUB_REPOSITORY" --retain-valid
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
           # One-line installer scripts, refreshed alongside the archives so
           # `curl … install.sh | sh` / `irm … install.ps1 | iex` URLs stay
@@ -374,6 +377,7 @@ jobs:
           DEST_REPO: ${{ env.MIRROR_REPO }}
           DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
           ASSET_REGEX: ${{ env.SITTER_ASSET_REGEX }}
+          PRUNE_STALE: "true"
           RELEASE_TITLE: intentd sitter ${{ needs.plan.outputs.version }}
           RELEASE_NOTES: "Mirror of the ${{ needs.plan.outputs.tag }} intentd sitter release: platform archives, Debian packages, and .sha256 sidecars. Archives contain the sitter binary renamed to `intentd` (`intentd.exe` on Windows)."
         run: |

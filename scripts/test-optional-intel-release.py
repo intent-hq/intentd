@@ -79,6 +79,21 @@ class Publication(unittest.TestCase):
         self.assertEqual(result['artifacts'], {'sha256.sum': {}})
         self.assertEqual(result['announcement_github_body'], 'Notes\n')
 
+    def test_late_omission_filters_existing_aggregate_and_checks_remaining_hashes(self):
+        intel = archive(self.root, INTEL)
+        aggregate = self.root / 'sha256.sum'
+        lines = ''.join(path.read_text() for path in sorted(self.root.glob('*.sha256')))
+        aggregate.write_text(lines)
+        intel.with_name(intel.name + '.sha256').unlink()
+        self.policy.validated_targets(self.root)
+        self.assertNotIn(INTEL, aggregate.read_text())
+        self.assertEqual(aggregate.read_text(), ''.join(line for line in lines.splitlines(keepends=True) if INTEL not in line))
+        for target in REQUIRED:
+            self.assertIn(target, aggregate.read_text())
+        aggregate.write_text('0' * 64 + aggregate.read_text()[64:])
+        with self.assertRaises(ValueError):
+            self.policy.validated_targets(self.root)
+
     def test_each_required_target_still_blocks(self):
         for target in REQUIRED:
             with self.subTest(target=target):
@@ -187,8 +202,11 @@ else:
             old_pair = old.read_bytes(), checksum.read_bytes()
             scripts = root / 'scripts'
             scripts.mkdir()
-            for name in ('install.sh', 'install.ps1', 'refresh-release-published-at.sh'):
+            for name in ('install.sh', 'install.ps1', 'refresh-release-published-at.sh', 'optional-intel-release.py'):
                 shutil.copy(ROOT / 'scripts' / name, scripts / name)
+            reconcile = ROOT / 'scripts/reconcile-sitter-intel.py'
+            if reconcile.exists():
+                shutil.copy(reconcile, scripts / reconcile.name)
             bin_dir = root / 'bin'
             bin_dir.mkdir()
             stub = bin_dir / 'gh'
@@ -196,8 +214,26 @@ else:
 import json, os, pathlib, shutil, sys
 args = sys.argv[1:]
 root = pathlib.Path(os.environ['TEST_RELEASES'])
-if args[:2] == ['release', 'view'] or args[0] == 'api':
-    print(json.dumps({'id':42, 'draft':False, 'prerelease':False}))
+if '--repo' in args and args[args.index('--repo')+1] == 'intent-hq/intentd-releases':
+    root = root / 'mirror'
+    root.mkdir(exist_ok=True)
+if args[:2] == ['release', 'view']:
+    dest = root / args[2]
+    dest.mkdir(exist_ok=True)
+    print(json.dumps({'publishedAt':'2026-10-13T00:00:00Z', 'body':'Notes', 'isPrerelease':False, 'assets': [{'name': p.name} for p in dest.iterdir()]}))
+elif args[0] == 'api':
+    if '--include' in args:
+        print('HTTP/2.0 200 OK\\n\\n' + json.dumps({'id':42, 'tag_name':args[1].rsplit('/',1)[1]}))
+    else:
+        print(json.dumps({'id':42, 'draft':False, 'prerelease':False}))
+elif args[:2] == ['release', 'edit']:
+    pass
+elif args[:2] == ['release', 'download']:
+    if os.environ.get('FAIL_DOWNLOAD') == '1':
+        raise SystemExit(1)
+    shutil.copy(root / args[2] / args[args.index('--pattern')+1], args[args.index('--dir')+1])
+elif args[:2] == ['release', 'delete-asset']:
+    (root / args[2] / args[3]).unlink()
 elif args[:2] == ['release', 'upload']:
     dest = root / args[2]
     dest.mkdir(exist_ok=True)
@@ -236,13 +272,65 @@ shutil.copy(pathlib.Path(os.environ['TEST_RELEASES']) / 'sitter-latest' / url.rs
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((install_dir / 'intentd').read_bytes(), payload)
             self.assertIn('1.2.2', result.stdout)
+            # Interrupted versioned upload must disappear on an omitted rerun;
+            # mixed rolling bytes/checksum must never be retained or mirrored.
+            tagged = releases / 'sitter-v1.2.3'
+            for state in ('valid', 'archive-only', 'checksum-only', 'mismatched', 'absent'):
+                with self.subTest(remote_state=state):
+                    for directory in (tagged, latest):
+                        for path in directory.glob(f'*{INTEL}*'):
+                            path.unlink()
+                        if state in ('valid', 'archive-only', 'mismatched'):
+                            (directory / old.name).write_bytes(old_pair[0] if state != 'mismatched' else b'interrupted new archive')
+                        if state in ('valid', 'checksum-only', 'mismatched'):
+                            (directory / checksum.name).write_bytes(old_pair[1])
+                    for label in ('Create GitHub Release on the tag', 'Refresh sitter-latest release'):
+                        step = next(s for s in jobs['publish']['steps'] if s.get('name') == label)
+                        subprocess.run(['bash', '-e', '-c', step['run']], cwd=root, env=env, check=True, capture_output=True)
+                    self.assertFalse(list(tagged.glob(f'*{INTEL}*')))
+                    if state == 'valid':
+                        self.assertEqual((old.read_bytes(), checksum.read_bytes()), old_pair)
+                    else:
+                        self.assertFalse(list(latest.glob(f'*{INTEL}*')))
+                    for directory, label in ((tagged, 'Mirror versioned sitter release to intentd-releases'),
+                                             (latest, 'Mirror sitter-latest release to intentd-releases')):
+                        dest = releases / 'mirror' / directory.name
+                        dest.mkdir(parents=True, exist_ok=True)
+                        (dest / old.name).write_bytes(b'stale mirror archive')
+                        (dest / checksum.name).write_bytes(old_pair[1])
+                        mirror_step = next(s for s in jobs['mirror']['steps'] if s.get('name') == label)
+                        mirror_env = {**env, 'DEST_REPO': 'intent-hq/intentd-releases',
+                                      'DEST_GH_TOKEN': 'placeholder', 'PRUNE_STALE': mirror_step['env'].get('PRUNE_STALE', 'false')}
+                        subprocess.run(['bash', str(ROOT / 'scripts/mirror-release-assets.sh'), directory.name],
+                                       env=mirror_env, check=True, capture_output=True)
+                        for path in directory.glob('intentd-*'):
+                            self.assertEqual((dest / path.name).read_bytes(), path.read_bytes())
+                        self.assertEqual({p.name for p in dest.glob(f'*{INTEL}*')},
+                                         {p.name for p in directory.glob(f'*{INTEL}*')})
+                    for directory in (tagged, latest):
+                        for target in REQUIRED:
+                            self.assertTrue(module('optional-intel-release').valid_archive(directory, target))
             # A first-ever release with no Intel must not install another arch.
-            old.unlink()
-            checksum.unlink()
             (install_dir / 'intentd').unlink()
             result = subprocess.run(installer, env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((install_dir / 'intentd').exists())
+            # A failed download must stop, leaving remote assets unchanged.
+            old.write_bytes(old_pair[0])
+            checksum.write_bytes(old_pair[1])
+            step = next(s for s in jobs['publish']['steps'] if s.get('name') == 'Refresh sitter-latest release')
+            failed = subprocess.run(['bash', '-e', '-c', step['run']], cwd=root,
+                                    env={**env, 'FAIL_DOWNLOAD': '1'}, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual((old.read_bytes(), checksum.read_bytes()), old_pair)
+            # A successful new Intel build replaces both files on both releases.
+            current = archive(artifacts, INTEL)
+            for label in ('Create GitHub Release on the tag', 'Refresh sitter-latest release'):
+                step = next(s for s in jobs['publish']['steps'] if s.get('name') == label)
+                subprocess.run(['bash', '-e', '-c', step['run']], cwd=root, env=env, check=True, capture_output=True)
+            for directory in (tagged, latest):
+                self.assertEqual((directory / current.name).read_bytes(), current.read_bytes())
+                self.assertTrue(module('optional-intel-release').valid_archive(directory, INTEL))
 
 
 class Homebrew(unittest.TestCase):
