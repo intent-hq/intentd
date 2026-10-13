@@ -11,6 +11,8 @@ ci = "github"
 # owned by the sitter release pipeline (release-sitter.yml); the daemon ships
 # archives + checksums + channel manifests only.
 # Target platforms to build apps for (Rust target-triple syntax)
+# Keep Intel isolated so a required target can never inherit optional failure.
+merge-tasks = false
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
@@ -58,6 +60,8 @@ github-custom-job-permissions = { "publish-channel-manifest" = { contents = "wri
 # `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
 # Release writer concurrency is also a local customization: after generation run
 # `python3 scripts/configure-release-concurrency.py` to restore the shared lock.
+# Then run `python3 scripts/configure-optional-intel-release.py` to restore
+# release-only Intel planning, failure isolation, and validated publication targets.
 # scripts/test-prerelease-cleanup-workflow.py enforces the generated block and
 # ensures the post-announce reusable workflow never reacquires the caller lock.
 allow-dirty = ["ci"]

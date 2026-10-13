@@ -4,8 +4,8 @@
 # daemon's dist pipeline (release.yml) never picks it up. Triggered by pushing
 # a `sitter-vX.Y.Z` tag, it:
 #
-# * builds `intentd-sitter` in release mode for the same 5 targets as the
-#   daemon (musl targets cross-built with cargo-zigbuild, mirroring dist)
+# * attempts `intentd-sitter` for the same 5 targets as the
+#   daemon (Intel Mac is optional; the other four targets are required)
 # * renames the binary to `intentd` (`intentd.exe` on Windows) and packages it
 #   as `intentd-<triple>.tar.xz` (unix, nested `intentd-<triple>/` dir like
 #   dist tarballs) / `intentd-<triple>.zip` (Windows, flat like dist zips),
@@ -86,6 +86,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
+    continue-on-error: ${{ matrix.target == 'x86_64-apple-darwin' }}
     needs: plan
     strategy:
       fail-fast: false
@@ -261,6 +262,8 @@ jobs:
           pattern: sitter-*
           path: artifacts
           merge-multiple: true
+      - name: Validate complete platform archives
+        run: python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Create GitHub Release on the tag
         env:
           RELEASE_COMMIT: ${{ github.sha }}
@@ -282,7 +285,8 @@ jobs:
           gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
       # Fixed release so install instructions have a stable URL
       # (releases/download/sitter-latest/intentd-<triple>.tar.xz). Asset names
-      # are constant, so --clobber replaces the full set. Prereleases are not
+      # are constant. Omitted Intel leaves its previous valid archive/checksum
+      # pair intact; only this run's successful pairs are replaced. Prereleases are not
       # promoted here, mirroring channel-stable semantics.
       - name: Refresh sitter-latest release
         if: ${{ needs.plan.outputs.prerelease == 'false' }}
@@ -427,8 +431,16 @@ jobs:
           pattern: sitter-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          repository: intent-hq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: true
+          path: tap
+      - name: Validate complete platform archives
+        run: python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Render formula
-        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb
+        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb tap/Formula/intentd.rb
       - name: Style-check rendered formula (advisory)
         run: |
           export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
@@ -445,12 +457,6 @@ jobs:
           cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
           brew style --formula scratch/sitter/intentd \
             || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
-      - uses: actions/checkout@v7
-        with:
-          repository: intent-hq/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          persist-credentials: true
-          path: tap
       - name: Commit and push formula
         run: |
           install -m 0644 intentd.rb tap/Formula/intentd.rb

@@ -98,7 +98,7 @@ class ProducerContract(unittest.TestCase):
         targets = set(config['targets'])
         sitter = yaml.safe_load((ROOT / '.github/workflows/release-sitter.yml').read_text())['jobs']['build']
         self.assertEqual({r['target'] for r in sitter['strategy']['matrix']['include']}, targets)
-        self.assertEqual(self.workflow['jobs']['sitter']['strategy'], sitter['strategy'])
+        self.assertEqual({r['target'] for r in self.workflow['jobs']['sitter']['strategy']['matrix']['include']}, targets - {'x86_64-apple-darwin'})
         self.assertIn('artifacts_matrix', self.workflow['jobs']['plan']['steps'][-1]['run'])
         self.assertEqual(self.workflow['jobs']['daemon']['strategy']['matrix'], '${{ fromJson(needs.plan.outputs.matrix) }}')
         for job_name in ('daemon', 'sitter'):

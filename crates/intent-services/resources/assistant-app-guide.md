@@ -78,6 +78,17 @@ Check the provider's official setup instructions before choosing a URL or local 
 
 A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
 
+## Mac update availability
+
+Mac update availability can differ by architecture. Intel Macs stay on their last
+compatible available release in the selected update channel when a newer release
+has no Intel build. Older Apple Silicon apps may also remain on an earlier
+compatible release; manually installing a current Apple Silicon build lets them
+receive newer releases. Do not
+suggest an Apple Silicon build for an Intel Mac.
+
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
+
 ## Manage Assistant chats
 
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
