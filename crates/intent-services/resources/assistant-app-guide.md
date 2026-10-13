@@ -46,6 +46,7 @@ in the installed client.
 In a supporting development frontend, an agent can put raw, self-contained
 HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
 in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
+The preview shows a skeleton while its content streams or the sandbox starts.
 Use this for exploring comparisons or changing inputs. Keep simple explanations
 in text and shareable charts in saved files. Visuals use app semantic CSS variables
 for both themes and cannot use external libraries, network access, app APIs,
