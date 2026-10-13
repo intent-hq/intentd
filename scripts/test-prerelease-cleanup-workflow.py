@@ -60,7 +60,7 @@ class WorkflowContract(unittest.TestCase):
         checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["repository"], "intent-hq/intent")
         self.assertRegex(checkout["with"]["ref"], r"^[0-9a-f]{40}$")
-        self.assertEqual(checkout["with"]["ref"], "3cd2e23e904051f8a0c047717fe7a8e843a5c4ea")
+        self.assertEqual(checkout["with"]["ref"], "6b72ba3e3186f7b97e0ee059c87cdffe9662c3b1")
         self.assertEqual(checkout["with"]["token"], "${{ secrets.PRERELEASE_CLEANUP_TOKEN }}")
         self.assertIs(checkout["with"]["persist-credentials"], False)
         self.assertLess(next(i for i, s in enumerate(steps) if s.get("id") == "controls"), steps.index(checkout))
