@@ -36,6 +36,7 @@ nix = { workspace = true, features = ["signal", "process"] }
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 # Workspace-create proposal tests seed real temp repositories to exercise
 # the propose-time base-ref validation against libgit2.

@@ -303,16 +303,16 @@ async fn boot_daemon() -> (
 }
 
 /// The fixture script path, or `None` when the e2e must be skipped.
-fn fixture_script() -> Option<&'static str> {
+fn fixture_script() -> Option<String> {
     if !node_available() {
         eprintln!("skipping mcp oauth refresh WSS E2E: node not on PATH");
         return None;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp oauth refresh WSS E2E: fixture not found at {script}");
         return None;
     }
@@ -347,8 +347,8 @@ async fn test_connection_refreshes_expired_bag_and_persists_it() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
-    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
+    let mut mcp = spawn_fixture(&script, &["--http", "--log-auth"], None).await;
+    let mut token_ep = spawn_fixture(&script, &["--token"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
@@ -431,12 +431,12 @@ async fn lifecycle_probe_refreshes_expired_bag_before_restart() {
         return;
     };
     let mut mcp = spawn_fixture(
-        script,
+        &script,
         &["--http", "--log-auth"],
         Some("Bearer refreshed-token-1"),
     )
     .await;
-    let mut token_ep = spawn_fixture(script, &["--token"], None).await;
+    let mut token_ep = spawn_fixture(&script, &["--token"], None).await;
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;
 
@@ -486,7 +486,7 @@ async fn test_connection_expired_bag_without_refresh_metadata_falls_back() {
     let Some(script) = fixture_script() else {
         return;
     };
-    let mut mcp = spawn_fixture(script, &["--http", "--log-auth"], None).await;
+    let mut mcp = spawn_fixture(&script, &["--http", "--log-auth"], None).await;
 
     let (_daemon, mut ws) = boot_daemon().await;
     let server_id = create_server(&mut ws, 1, &mcp.base_url).await;

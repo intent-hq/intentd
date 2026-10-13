@@ -27,7 +27,12 @@ use intentd_sitter::readiness::TIMEOUT_ENV as READINESS_TIMEOUT_ENV;
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::MANIFEST_BASE_URL_ENV;
 
-const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
+fn sitter_bin() -> std::path::PathBuf {
+    intentd_test_support::runtime_paths::binary_path(
+        "intentd-sitter",
+        env!("CARGO_BIN_EXE_intentd-sitter"),
+    )
+}
 
 /// Env var the fake daemon script logs to; the log file existing at all
 /// proves a daemon was spawned.
@@ -270,7 +275,7 @@ fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
 /// Run the sitter to completion, capturing stdout/stderr. `INTENTD_CHANNEL`
 /// is scrubbed so the host environment never leaks into channel resolution.
 fn run_sitter(data_dir: &Path, base_url: &str, args: &[&str]) -> Output {
-    Command::new(SITTER_BIN)
+    Command::new(sitter_bin())
         .env_remove(CHANNEL_ENV)
         .env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)
@@ -289,7 +294,7 @@ fn run_sitter_with_readiness_timeout(
     timeout_ms: u64,
     args: &[&str],
 ) -> Output {
-    Command::new(SITTER_BIN)
+    Command::new(sitter_bin())
         .env_remove(CHANNEL_ENV)
         .env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)
@@ -307,7 +312,7 @@ fn run_sitter_with_channel_env(
     channel: &str,
     args: &[&str],
 ) -> Output {
-    Command::new(SITTER_BIN)
+    Command::new(sitter_bin())
         .env(CHANNEL_ENV, channel)
         .env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)

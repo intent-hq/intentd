@@ -8384,7 +8384,10 @@ for line in sys.stdin:
     fn count_open_fds_counts_the_live_table() {
         let before = count_open_fds().expect("fd table readable");
         assert!(before >= 3, "at least stdio: {before}");
-        let held = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let held = std::fs::File::open(intentd_test_support::runtime_paths::manifest_dir(env!(
+            "CARGO_MANIFEST_DIR"
+        )))
+        .unwrap();
         let during = count_open_fds().unwrap();
         assert!(during > before, "{during} > {before}");
         drop(held);

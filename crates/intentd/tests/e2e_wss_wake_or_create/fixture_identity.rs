@@ -91,7 +91,8 @@ fn fixture_command_preserves_mock_provider_inputs() {
     }
     assert_eq!(
         command.get_program(),
-        OsStr::new(env!("CARGO_BIN_EXE_intentd"))
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd"))
+            .as_os_str()
     );
     assert_eq!(
         command.get_args().collect::<Vec<_>>(),

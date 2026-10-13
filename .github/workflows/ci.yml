@@ -24,13 +24,11 @@ on:
   # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
   # comment); merge_group additionally runs the full native proof set, GitLab
   # feature suite, and full instrumented coverage jobs (coverage-e2e /
-  # coverage-all), which are merge_group-ONLY — they no
-  # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
-  # once, on the merged tree, instead of on every push to the PR. The gate is
-  # event-aware about this (see the gate comment): it requires the coverage
-  # jobs outright on merge_group and accepts their skip on pull_request /
-  # push, and the reverse for coverage-changed. The daemon-lifecycle matrix
-  # owns one native producer per platform, with focused PR demand and full
+  # coverage-all). PRs changing the Linux artifact pipeline also require both
+  # full reports before queue entry; ordinary Rust PRs retain narrow coverage.
+  # The gate requires requested reports and rejects a missing demand output.
+  # The check job owns Linux production; daemon-lifecycle owns macOS/Windows,
+  # with one producer per platform, focused PR demand and full
   # merge-group demand. PRs touching native CI/config/harness inputs also run
   # full native proofs, so the migration can be verified before queue entry.
   # CI Gate requires native check, Clippy and runtime proofs on merge_group,
@@ -139,12 +137,10 @@ jobs:
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
             // The coverage jobs run the whole instrumented suite, so they
-            // burst to the biggest GH-hosted Linux runner (16-core); check
-            // (fmt + clippy + a couple of tests) doesn't come close to
-            // saturating that, so it bursts to a cheaper 8-core runner
-            // instead.
+            // burst to the 16-core runner. Check now produces their archives
+            // sequentially, so it needs the same compilation capacity.
             const burst = ["gh-linux-16x"];
-            const checkBurst = ["gh-linux-8x"];
+            const checkBurst = ["gh-linux-16x"];
             // The Windows build entry: the self-hosted 5090pc runner, or
             // the org-hosted 16-core Windows runner (the one
             // release-sitter.yml builds on) — cold workspace Clippy
@@ -312,17 +308,44 @@ jobs:
     # exactly as before.
     if: github.event_name != 'push'
     needs: route
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: native-producer-v2-${{ github.repository_id }}-${{ github.sha }}-linux
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      full_coverage: ${{ steps.linux-producer.outputs.full_coverage }}
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    # The cold-cache check job exhausted its 20-minute budget after its tests
-    # passed in run 37305697722. Allow completion/cache margin without changing
-    # individual test timeouts.
-    timeout-minutes: 25
+    # One producer now builds ordinary and instrumented graphs sequentially.
+    # Keep per-test timeouts unchanged; allow the combined cold-build budget.
+    timeout-minutes: 90
     env:
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Resolve PR base from the merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            base=$(git rev-parse 'HEAD^1')
+            echo "base: HEAD^1 (merge-commit parent) = $base"
+          else
+            git fetch --no-tags --unshallow origin \
+              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
+              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
+            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
+            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
+          fi
+          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
       # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
       # slots share one /raid CI-scratch volume, and the per-slot persistent
       # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
@@ -346,14 +369,14 @@ jobs:
       # live dir look idle), and recursive-mtime freshness/activity checks
       # so an unmarked dir a live job is writing to is not deleted either.
       # Fails with an actionable message if space is still short.
-      # Thresholds: 10 GiB here (small target dir with debuginfo off),
-      # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
+      # The combined producer needs room for targets, staged archives and
+      # verified downloads together. Exact no-op on burst
       # runners (step skipped). tinybox-prune.yml does the routine
       # scheduled pruning; this is only the emergency backstop.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
-          NEED_GIB: 10
+          NEED_GIB: 60
           JOB_TARGET_SUBDIR: check
         run: |
           set -euo pipefail
@@ -465,22 +488,72 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there (pure overhead on tinybox, hence burst-gated).
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Key archive tools per runner slot
+        run: echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143,cargo-llvm-cov@0.9.0
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
+      - name: Point hosted shared target outside checkout
+        if: needs.route.outputs.linux_burst == 'true'
+        run: |
+          target="$RUNNER_TEMP/linux-target"
+          echo "CARGO_TARGET_DIR=$target" >> "$GITHUB_ENV"
+          echo "LINUX_CACHE_TARGET=$(realpath --relative-to="$PWD" "$target")" >> "$GITHUB_ENV"
       - name: Rust cache (burst runner only)
+        id: linux-cache
         if: needs.route.outputs.linux_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: gh-burst-check
+          shared-key: gh-burst-linux-artifacts
+          workspaces: . -> ${{ env.LINUX_CACHE_TARGET }}
       - name: Format check
         run: cargo fmt --check
+      - name: Produce Linux variants sequentially in one shared target
+        id: linux-producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINUX_CACHE_EXACT_MATCH: ${{ steps.linux-cache.outputs.cache-hit }}
+        run: python3 -I -B scripts/ci-linux-artifacts.py produce --base "${BASE_SHA:-}"
+      - name: Publish Linux variants before checks and tests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-v2-linux-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/requests.json
+            ${{ runner.temp }}/native-artifacts/publication.json
+            ${{ runner.temp }}/native-artifacts/reuse.json
+            ${{ runner.temp }}/native-artifacts/compiler-gates.json
+            ${{ runner.temp }}/native-artifacts/producer.json
+            ${{ runner.temp }}/native-artifacts/published/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Prepare Linux ordinary test consumers
+        run: python3 -I -B scripts/ci-linux-artifacts.py prepare-check
+      - name: Linux native Clippy in the shared target
+        run: python3 -I -B scripts/ci-native-artifacts.py lint --platform linux --event pull_request
+      - name: Linux lifecycle runtime proof
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$RUNNER_TEMP/native-artifacts"
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Real import and public session contract
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: "cargo test -p intent-services --lib transfer_selection_contract::"
+        run: "python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test -p intent-services --lib transfer_selection_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
       # tinybox slots rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -502,7 +575,7 @@ jobs:
       - name: Source lints
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --workspace --test '*_lint'
+        run: python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test --workspace --test '*_lint'
       # This target requires explicit cold mock authority. Ordinary/default
       # daemon builds never register these transports; keep the feature lane
       # mandatory in the merge queue so default target selection cannot hide
@@ -512,7 +585,7 @@ jobs:
         if: github.event_name == 'merge_group'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
+        run: python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
 
       # Per-slot HOME for install-action — see the coverage-e2e job's comment
       # for the full rationale (shared ~/.install-action tmp/bin race across
@@ -536,9 +609,9 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
-      # The full suite is not run here: coverage-all executes it (instrumented,
-      # via cargo llvm-cov nextest) and is the test gate in the merge queue
-      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # The full runtime suite uses coverage-all's instrumented archives and
+      # reports; the intentional compile-fail test runs freshly in the producer
+      # (full coverage also validates PRs changing the Linux pipeline).
       # Running it plainly here as well would double the critical path. The
       # exception is the tests the coverage scripts skip: they are flaky under
       # llvm-cov instrumentation / heavy parallel load, so they run here
@@ -556,8 +629,8 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
-          cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
-          cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
+          python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test -p intent-core --lib capture_login_shell_path_with_fake_shell
+          python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test -p intentd --test wss_integration wss_note_save_asset_round_trip
       # The install.ps1 guard tests (intentd-sitter's install_ps1_owner.rs)
       # execute the shipped PowerShell and self-skip when `pwsh` is absent —
       # which let the suite "pass" in ~0.014s without running a single block
@@ -647,13 +720,35 @@ jobs:
           XDG_CACHE_HOME: ${{ runner.temp }}/xdg-cache
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
-          cargo test -p intentd-sitter --test install_ps1_owner
+          python3 -I -B scripts/ci-linux-artifacts.py test -- cargo test -p intentd-sitter --test install_ps1_owner
       # Release the `.in-use` marker the CARGO_TARGET_DIR step wrote
       # (intent-hq/intent#5256). `always()` so a failed or cancelled job
       # does not leave a live marker behind; a runner that dies mid-job
       # leaves one that expires on its own after 4 h (see
       # scripts/ci-target-slot.sh). Skipped on burst runners, where
       # CARGO_TARGET_DIR is never set.
+      - name: Verify compile-free Linux consumers
+        run: python3 -I -B scripts/ci-native-artifacts.py receipt
+      - name: Upload Linux consumer evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-consumer-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/consumer-receipt.json
+            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+          if-no-files-found: error
+      - name: Remove producer profile outputs before caching
+        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          target = Path(os.environ['CARGO_TARGET_DIR'])
+          for suffix in ('*.profraw', '*.profdata'):
+              for profile in target.rglob(suffix):
+                  profile.unlink()
+          PY
       - name: Release per-slot target dir
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
@@ -806,24 +901,15 @@ jobs:
         run: cargo check --workspace --target ${{ matrix.target }}
 
   coverage-e2e:
-    # merge_group-ONLY (see the `merge_group` trigger comment): the
-    # instrumented suite runs once, against the queue's merged tree, and is
-    # job-level skipped on every pull_request and push run — a skipped job
-    # still reports its required context, and the gate is event-aware about
-    # the skip (required outright on merge_group, accepted elsewhere). The
-    # event check makes the intent visible; the route.result guard preserves
-    # the pre-existing behavior that a route failure skips this job (and
-    # would skip it on fork PRs anyway, where route itself is skipped).
-    # Nothing here may reference github.event.pull_request — that
-    # context does not exist on merge_group. release-fast-path is no longer a
-    # dependency: it is pull_request-only, so its output is empty on
-    # merge_group and must not be required; the fast-path skip it used to
-    # provide is subsumed by the pull_request skip. Merge groups come from
-    # the repo's own ruleset, so no same-repo fork guard applies.
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
+    # Full reports run on merge groups and PRs changing the Linux pipeline.
+    # The check producer publishes the exact daemon and workspace graphs first.
+    needs: [route, check]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || needs.check.outputs.full_coverage == 'true') && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -840,8 +926,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
+      # rationale (monorepo#1253). 30 GiB here: the executable publication
+      # and fresh extraction are multi-GiB, followed by new profraw files.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -889,21 +975,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -914,16 +985,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - name: Rust cache (burst runner only)
-        if: needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-e2e
-      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
-      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
-      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -947,10 +1008,14 @@ jobs:
           else
             echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.0
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Prepare native startup evidence
@@ -962,6 +1027,10 @@ jobs:
           evidence_dir=$(mktemp -d "$RUNNER_TEMP/native-review-startup-failures.XXXXXX")
           evidence_dir=$(realpath "$evidence_dir")
           printf 'directory=%s\n' "$evidence_dir" >> "$GITHUB_OUTPUT"
+      - name: Download verified Linux executable publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
       - name: Run e2e coverage
         # Arm the bound-caller seam for the test processes themselves, not
         # only the daemons they spawn: a direct-call test that evaluates a
@@ -976,7 +1045,7 @@ jobs:
           NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
         run: |
           cd ${{ github.workspace }}
-          GENERATE_LCOV=1 ./scripts/coverage-e2e.sh 40
+          python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-e2e
       - name: Validate native startup evidence
         id: native-evidence-check
         if: ${{ failure() && steps.native-evidence.outputs.directory != '' }}
@@ -1000,18 +1069,17 @@ jobs:
         if: always()
         run: |
           cd ${{ github.workspace }}
-          echo "## E2E Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # The script tees its summary to coverage-summary.txt; re-running
-          # the report (~30s) is only a fallback for a run that died before
-          # reporting (intent-hq/monorepo#4260).
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## E2E Coverage Report"
+            echo ""
+            echo '```'
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention: the lcov artifact is a debugging aid
       # only, and an org artifact-quota outage must not fail the required
       # check when all tests passed (monorepo#1163).
@@ -1024,23 +1092,26 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
+      - name: Upload coverage execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-e2e-execution-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/download.json
+            ${{ runner.temp }}/native-artifacts/receipt-*.json
+            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+          if-no-files-found: ignore
 
   coverage-all:
-    # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
-    # comment and the `merge_group` trigger comment): job-level skipped on
-    # every pull_request and push run, required outright by the gate on
-    # merge_group. No github.event.pull_request reference (absent on
-    # merge_group) and no release-fast-path dependency (pull_request-only,
-    # empty output on merge_group).
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
+    # Same full-report demand as coverage-e2e; the gate requires both reports.
+    needs: [route, check]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || needs.check.outputs.full_coverage == 'true') && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1057,8 +1128,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
+      # rationale (monorepo#1253). 30 GiB here: the executable publication
+      # and fresh extraction are multi-GiB, followed by new profraw files.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -1115,21 +1186,6 @@ jobs:
       # Relies on the runner user's passwordless sudo, like the step above.
       - name: Raise inotify instance limit
         run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1140,16 +1196,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - name: Rust cache (burst runner only)
-        if: needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-all
-      # Node is required (not preinstalled on tinybox, unlike ubuntu-latest):
-      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
-      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
           node-version: 24.21.0
@@ -1172,35 +1218,44 @@ jobs:
           else
             echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.0
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
+      - name: Download verified Linux executable publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
       - name: Run combined coverage
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
           cd ${{ github.workspace }}
-          GENERATE_LCOV=1 ./scripts/coverage-all.sh 80
+          python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-all
       - name: Generate coverage summary
         if: always()
         run: |
           cd ${{ github.workspace }}
-          echo "## Combined Coverage Report (all tests)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          # Same reuse-or-fallback as coverage-e2e's summary step.
-          if [[ -s coverage-summary.txt ]]; then
-            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          else
-            (cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available") >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Combined Coverage Report (all tests)"
+            echo ""
+            echo '```'
+            if [[ -s coverage-summary.txt ]]; then
+              cat coverage-summary.txt
+            else
+              echo "Coverage data not available"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Non-fatal + short retention — same rationale as coverage-e2e's
       # upload step (monorepo#1163).
       - name: Upload coverage artifact
@@ -1212,11 +1267,16 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
+      - name: Upload coverage execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-all-execution-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/download.json
+            ${{ runner.temp }}/native-artifacts/receipt-*.json
+            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+          if-no-files-found: ignore
 
   # pull_request-ONLY counterpart of coverage-e2e / coverage-all
   # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
@@ -1225,7 +1285,7 @@ jobs:
   # changed paths (scripts/changed-tests.sh --instrumented — the same env,
   # flags and auggie_context_e2e exclusion as scripts/coverage-e2e.sh) under
   # instrumentation before it can be enqueued. The full instrumented suite
-  # stays merge_group-only (intent-hq/intent#4260). Two phases: a cheap
+  # also runs on pipeline-changing PRs. Two phases: a cheap
   # bash+git dry run FIRST computes the selection, and every heavy step
   # (disk preflight, libssl, toolchain, caches, cargo-llvm-cov / nextest
   # install, the run itself) is gated on it having found something, so a PR
@@ -1235,10 +1295,13 @@ jobs:
   # it is job-level skipped by design. github.event.pull_request is only
   # read inside the job (absent on merge_group, where the job never runs).
   coverage-changed:
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
+    needs: [route, check]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1379,21 +1442,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Deliberately SHARES coverage-e2e's per-slot target dir instead of
-      # keying its own: a runner slot executes one job at a time, so the two
-      # never overlap on the same dir, both build the same instrumented
-      # profile, and sharing keeps the multi-GiB instrumented dependency
-      # cache warm across PR runs and queue runs alike (a separate dir would
-      # rebuild it from scratch on every slot). This job never runs `cargo
-      # llvm-cov clean`, so it cannot delete coverage-e2e's artifacts.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         if: steps.select.outputs.has_selection == 'true'
@@ -1406,18 +1454,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      # Own key rather than coverage-e2e's: rust-cache never re-saves on an
-      # exact hit, so a partial cache saved here would shadow the full
-      # coverage-e2e cache until the lockfile changes.
-      - name: Rust cache (burst runner only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-changed
-      # Node is required (not preinstalled on tinybox): the ACP e2e tests
-      # spawn the mock-acp-agent.mjs fixture and self-skip without it.
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
@@ -1443,17 +1479,26 @@ jobs:
           else
             echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
           fi
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.0
         if: steps.select.outputs.has_selection == 'true'
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
         if: steps.select.outputs.has_selection == 'true'
         env:
           HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
+      - name: Download verified Linux executable publication
+        if: steps.select.outputs.has_selection == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The
@@ -1461,56 +1506,26 @@ jobs:
         # test-ci-test-policy.py checks parity with this explicit CI setting.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
+        run: python3 -I -B scripts/ci-linux-artifacts.py coverage --scope changed
       - name: Run callback fixture composition under llvm-cov
         if: steps.select.outputs.callback_fixture_changed == 'true'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TEST_TIMEOUT_MULTIPLIER: "3"
-        run: |
-          set -euo pipefail
-          filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
-          # Reuse the compatible changed-plan scope instead of narrowing the
-          # Cargo feature graph back to just the callback packages. Validate
-          # structured argv before reading it; process substitution would hide
-          # a failed producer. Both commands below use this exact array.
-          python3 -I -B -S scripts/callback-build-scope.py \
-            "$RUNNER_TEMP/coverage-changed-plan.json" "$(git rev-parse HEAD)" \
-            > "$RUNNER_TEMP/callback-build-args.txt"
-          mapfile -t callback_scope < "$RUNNER_TEMP/callback-build-args.txt"
-          # show-env defaults to Cargo's target dir, but llvm-cov nextest adds
-          # llvm-cov-target. Share the latter explicitly so discovery builds
-          # exactly the instrumented binaries execution will reuse.
-          if [ -z "${CARGO_LLVM_COV_TARGET_DIR:-}" ]; then
-            target_dir=$(cargo metadata --no-deps --format-version 1 | python3 -I -B -S -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
-            export CARGO_LLVM_COV_TARGET_DIR="$target_dir/llvm-cov-target"
-          fi
-          (
-            # Keep coverage flags/wrappers out of the later llvm-cov invocation.
-            # show-env exports Cargo metadata's target dir even with a coverage override.
-            coverage_env=$(CARGO_TARGET_DIR="$CARGO_LLVM_COV_TARGET_DIR" cargo llvm-cov show-env --sh)
-            eval "$coverage_env"
-            cargo nextest list "${callback_scope[@]}" \
-              --target-dir "$CARGO_LLVM_COV_TARGET_DIR" \
-              -E "$filter" --message-format json > "$RUNNER_TEMP/callback-fixture-tests.json"
-          )
-          python3 -I -B -S - "$RUNNER_TEMP/callback-fixture-tests.json" <<'PYTHON'
-          import json, os, sys
-          expected = os.environ["CALLBACK_FIXTURE_TESTS"].split()
-          suites = json.load(open(sys.argv[1]))["rust-suites"]
-          selected = [name for suite in suites.values() for name, case in suite["testcases"].items()
-                      if case["filter-match"]["status"] == "matches"]
-          assert len(expected) == len(selected) == 6 and set(selected) == set(expected), selected
-          PYTHON
-          cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
-            -E "$filter" --no-fail-fast --retries 0 --show-progress none \
-            --status-level pass --final-status-level fail
+        run: python3 -I -B scripts/ci-linux-artifacts.py callback
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
       # selection was empty or on burst runners, so this is a no-op there.
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
+      - name: Upload coverage execution evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-changed-execution-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-artifacts/download.json
+            ${{ runner.temp }}/native-artifacts/receipt-*.json
+            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+          if-no-files-found: ignore
 
   pr-title:
     runs-on: ubuntu-latest
@@ -1723,17 +1738,19 @@ jobs:
         shell: bash
         run: |
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
-          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup toolchain install "$channel" --profile minimal --component llvm-tools-preview --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
       - name: Install pinned archive regression runner
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.143
+          tool: cargo-nextest@0.9.143,cargo-llvm-cov@0.9.0
       - name: Test archive identity and compile-free relocation
         run: |
           python3 -I -B scripts/test-ci-build-identity.py
           python3 -I -B scripts/test-ci-test-artifacts.py
           python3 -I -B scripts/test-ci-artifact-reuse.py
+          python3 -I -B scripts/test-ci-coverage-artifacts.py
+          python3 -I -B scripts/test-ci-linux-artifacts.py
       - name: Install release cache regression wrapper
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
@@ -1894,8 +1911,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
           - platform: macos
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-15"]') }}
           - platform: windows
@@ -2010,15 +2025,18 @@ jobs:
                 ;;
             esac
           fi
-          # Event-aware on purpose: coverage-e2e / coverage-all are
-          # merge_group-only, so on merge_group they must succeed outright
-          # (a skip must never let the queue land an untested tree); on
-          # pull_request and push they are job-skipped by design and the
-          # gate accepts skipped.
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
+          # Require full reports on every merge group and whenever the PR
+          # changes the Linux pipeline. A missing demand output fails closed.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            case "${{ needs.check.outputs.full_coverage }}" in
+              true|false) ;;
+              *) echo "Linux full-coverage demand is missing or invalid"; exit 1 ;;
+            esac
+          fi
+          if [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ needs.check.outputs.full_coverage }}" = "true" ]; then
             if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
                [ "${{ needs.coverage-all.result }}" != "success" ]; then
-              echo "coverage-e2e / coverage-all must succeed outright on merge_group"
+              echo "coverage-e2e / coverage-all must succeed outright when full coverage is requested"
               exit 1
             fi
           else

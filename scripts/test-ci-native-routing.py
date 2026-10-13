@@ -96,9 +96,9 @@ def scheduled(workflow, event, *, fork=False, fast_path="", route="success", can
     return results
 
 
-def gate_passes(workflow, event, results):
+def gate_passes(workflow, event, results, full_coverage="false"):
     body = next(s["run"] for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
-    values = {"github.event_name": event, **{f"needs.{k}.result": v for k, v in results.items()}}
+    values = {"github.event_name": event, "needs.check.outputs.full_coverage": full_coverage, **{f"needs.{k}.result": v for k, v in results.items()}}
     body = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], body)
     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], capture_output=True, text=True, timeout=5)
     return result.returncode == 0
@@ -201,7 +201,7 @@ def gitlab_errors(workflow):
     for event in REQUIRED:
         if condition(step.get("if", True), context(event)) != (event == "merge_group"):
             errors.append(f"GitLab suite selected incorrectly on {event}")
-    if step.get("run") != GITLAB_COMMAND:
+    if step.get("run") != "python3 -I -B scripts/ci-linux-artifacts.py test -- " + GITLAB_COMMAND:
         errors.append("GitLab targets, feature, lockfile and thread limit must be retained")
     if step.get("continue-on-error") or workflow["jobs"]["check"].get("continue-on-error"):
         errors.append("GitLab failures must remain fatal")
@@ -337,7 +337,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                               ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"] if linux_burst else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"] if linux_burst else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-16x"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], "false")
@@ -347,7 +347,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(fixture=fixture):
                 outputs = run_route(self.workflow, **fixture)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-16x"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
@@ -568,7 +568,7 @@ class NativeRoutingTests(unittest.TestCase):
     def test_gitlab_child_failure_propagates(self):
         step = next(s for s in self.workflow["jobs"]["check"]["steps"] if s.get("name") == GITLAB_STEP)
         with tempfile.TemporaryDirectory() as tmp:
-            stub = Path(tmp) / "cargo"
+            stub = Path(tmp) / "python3"
             stub.write_text("#!/bin/sh\nexit 29\n")
             stub.chmod(0o755)
             body = "PATH=" + shlex.quote(tmp) + "\n" + step["run"]
@@ -641,7 +641,9 @@ class NativeRoutingTests(unittest.TestCase):
 
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]
-        self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"linux", "macos", "windows"})
+        self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"macos", "windows"})
+        linux = self.workflow["jobs"]["check"]
+        self.assertTrue(any(s.get("name") == "Linux lifecycle runtime proof" and "test-daemon-lifecycle.py --archives" in s.get("run", "") for s in linux["steps"]))
         self.assertFalse(job["strategy"]["fail-fast"])
         step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle runtime proof")
         self.assertIn("python3 -I -B scripts/test-daemon-lifecycle.py", step["run"])

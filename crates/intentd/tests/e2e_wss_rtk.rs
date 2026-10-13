@@ -338,7 +338,9 @@ async fn rtk_prompt_injection_over_wss() {
 
     // Fake rtk shim (outputs `ls, cat, grep, test, help`; test + help excluded)
     // Copy to a temp directory and name it `rtk` so `which rtk` finds it
-    let fake_rtk_src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-rtk.sh");
+    let fake_rtk_src =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake-rtk.sh");
     assert!(fake_rtk_src.exists(), "fake-rtk.sh fixture missing");
 
     let bin_dir = data_dir.join("bin");

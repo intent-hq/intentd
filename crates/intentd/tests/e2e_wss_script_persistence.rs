@@ -1063,7 +1063,14 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     ); // timing-guard: explicit release-file barrier, bounded by command timeout
     let command = format!(
         "{} command-run --record-dir {} --invocation wss-run --timeout-seconds 90 -- /bin/sh -c {}",
-        quote(env!("CARGO_BIN_EXE_intentd")),
+        quote(
+            &intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd")
+            )
+            .display()
+            .to_string()
+        ),
         quote(evidence_root.to_str().unwrap()),
         quote(&shell)
     );
@@ -1113,12 +1120,15 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     })
     .await
     .expect("durable exit receipt");
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["command-result", "--record-dir"])
-        .arg(&evidence_root)
-        .args(["--invocation", "wss-run"])
-        .output()
-        .unwrap();
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["command-result", "--record-dir"])
+    .arg(&evidence_root)
+    .args(["--invocation", "wss-run"])
+    .output()
+    .unwrap();
     let evidence: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(evidence["outcome"], "exited");
     assert_eq!(evidence["exitCode"], 29);

@@ -510,7 +510,7 @@ fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -825,10 +825,10 @@ async fn cancelled_mcp_enable_joins_before_main_hub_teardown() {
     let start_path = data.join("mcp-start-gate.sock");
     let responses = tokio::net::UnixListener::bind(&response_path).unwrap();
     let starts = tokio::net::UnixListener::bind(&start_path).unwrap();
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
+    let fixture = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
     let wrapper = data.join("held-mcp.mjs");
     std::fs::write(
         &wrapper,

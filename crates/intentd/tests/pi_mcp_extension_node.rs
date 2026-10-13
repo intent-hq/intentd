@@ -10,7 +10,6 @@
 // so the spawned node child cannot leave residue at the TMPDIR root.
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
 
 fn node_available() -> bool {
@@ -30,7 +29,7 @@ fn pi_mcp_extension_client_round_trips_against_mock_server() {
         );
         return;
     }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
     let driver = manifest.join("tests/fixtures/pi-mcp-extension-test.mjs");
     let extension = manifest.join("../intent-services/src/pi_mcp_extension.ts");
     let mock = manifest.join("tests/fixtures/mock-mcp-server.mjs");

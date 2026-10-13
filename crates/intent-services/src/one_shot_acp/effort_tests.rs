@@ -1,6 +1,6 @@
 use super::{run_one_shot_acp, OneShotCommand, OneShotEffort, OneShotError};
 use serde_json::{json, Value};
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 async fn run(
     behavior: Value,
@@ -9,7 +9,7 @@ async fn run(
 ) -> (Result<String, OneShotError>, Vec<Value>) {
     let dir = crate::test_support::test_tempdir("one-shot-effort-");
     let log = dir.path().join("requests.jsonl");
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let fixture = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("../intentd/tests/fixtures/mock-quick-action-effort.mjs");
     let cmd = OneShotCommand::binary("node".into(), vec![fixture.to_string_lossy().into_owned()])
         .env("MOCK_EFFORT_BEHAVIOR", behavior.to_string())

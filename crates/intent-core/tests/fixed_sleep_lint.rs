@@ -381,7 +381,9 @@ fn display_rel(rel: &Path) -> String {
 
 #[test]
 fn fixed_sleeps_are_annotated_or_baselined() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
     let baseline_text = fs::read_to_string(root.join(BASELINE_FILE))
         .unwrap_or_else(|e| panic!("read {BASELINE_FILE}: {e}"));
     let baseline =

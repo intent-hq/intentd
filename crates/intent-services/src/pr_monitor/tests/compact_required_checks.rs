@@ -106,7 +106,8 @@ fn producer_cases() -> Value {
 #[test]
 fn compact_required_checks_golden() {
     let actual = producer_cases();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
+    let path =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
     let bytes = format!("{}\n", serde_json::to_string_pretty(&actual).unwrap());
     if std::env::var_os("INTENTD_UPDATE_GOLDENS").is_some_and(|v| v == "1") {
         std::fs::write(&path, &bytes).unwrap();

@@ -81,7 +81,8 @@ fn fixtures_dir() -> PathBuf {
             return path;
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
 }
 
 /// A fresh, unique temp directory used as a session worktree (FS sandbox

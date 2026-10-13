@@ -39,6 +39,7 @@ semver = "1.0.28"
 libc = { workspace = true }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tempfile = "3"

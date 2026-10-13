@@ -127,10 +127,12 @@ fn assert_redacted(value: &Value) {
 /// that an echoed redaction placeholder was replaced with the stored credential.
 async fn authenticated_fixture() -> (tokio::process::Child, String) {
     let mut child = tokio::process::Command::new("node")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/mock-mcp-server.mjs"
-        ))
+        .arg(
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mock-mcp-server.mjs")
+                .display()
+                .to_string(),
+        )
         .arg("--http")
         .env("MOCK_MCP_REQUIRED_AUTH", AUTH_SECRET)
         .stdout(Stdio::piped())
@@ -166,7 +168,7 @@ async fn assistant_mcp_configuration_roundtrip_over_wss() {
     let stdio_config = json!({
         "id": "assistant-mcp-stdio", "name": "Assistant stdio fixture",
         "transport": "stdio", "command": "node",
-        "args": [concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock-mcp-server.mjs")],
+        "args": [intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock-mcp-server.mjs").display().to_string()],
         "env": { "API_KEY": ENV_SECRET },
     });
     let missing_command = data_dir.path().join("missing-mcp-executable");

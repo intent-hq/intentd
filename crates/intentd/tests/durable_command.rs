@@ -13,32 +13,38 @@ use serde_json::Value;
 
 fn run(root: &Path, id: &str, shell: &str, timeout: &str) -> GuardedChild {
     GuardedChild::spawn(
-        Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(["command-run", "--record-dir"])
-            .arg(root)
-            .args([
-                "--invocation",
-                id,
-                "--timeout-seconds",
-                timeout,
-                "--",
-                "/bin/sh",
-                "-c",
-                shell,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
+        Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .args(["command-run", "--record-dir"])
+        .arg(root)
+        .args([
+            "--invocation",
+            id,
+            "--timeout-seconds",
+            timeout,
+            "--",
+            "/bin/sh",
+            "-c",
+            shell,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null()),
     )
     .unwrap()
 }
 
 fn result(root: &Path, id: &str) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["command-result", "--record-dir"])
-        .arg(root)
-        .args(["--invocation", id])
-        .output()
-        .unwrap();
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["command-result", "--record-dir"])
+    .arg(root)
+    .args(["--invocation", id])
+    .output()
+    .unwrap();
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&output.stderr)))
 }
@@ -142,19 +148,22 @@ fn durable_command_rejects_stale_same_id_and_reports_spawn_failure() {
     invocation["startedAt"] = "different-invocation-same-name".into();
     std::fs::write(&invocation_path, serde_json::to_vec(&invocation).unwrap()).unwrap();
     assert_eq!(result(root.path(), "original")["outcome"], "unknown");
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["command-run", "--record-dir"])
-        .arg(root.path())
-        .args([
-            "--invocation",
-            "missing-program",
-            "--timeout-seconds",
-            "10",
-            "--",
-        ])
-        .arg(root.path().join("does-not-exist"))
-        .output()
-        .unwrap();
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["command-run", "--record-dir"])
+    .arg(root.path())
+    .args([
+        "--invocation",
+        "missing-program",
+        "--timeout-seconds",
+        "10",
+        "--",
+    ])
+    .arg(root.path().join("does-not-exist"))
+    .output()
+    .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let evidence = result(root.path(), "missing-program");
     assert_eq!(evidence["outcome"], "spawnFailed");
@@ -163,12 +172,15 @@ fn durable_command_rejects_stale_same_id_and_reports_spawn_failure() {
 }
 
 fn control(root: &Path, id: &str, action: &str) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args([action, "--record-dir"])
-        .arg(root)
-        .args(["--invocation", id])
-        .output()
-        .unwrap()
+    Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args([action, "--record-dir"])
+    .arg(root)
+    .args(["--invocation", id])
+    .output()
+    .unwrap()
 }
 
 #[test]
@@ -212,23 +224,26 @@ fn durable_command_explicit_stop_settles_child_and_cleanup_preserves_tombstone()
 #[test]
 fn durable_command_output_is_capped_without_changing_child_exit() {
     let root = common::test_tempdir("durable-output-cap");
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["command-run", "--record-dir"])
-        .arg(root.path())
-        .args([
-            "--invocation",
-            "large-output",
-            "--timeout-seconds",
-            "10",
-            "--max-output-bytes",
-            "1024",
-            "--",
-            "/bin/sh",
-            "-c",
-            "head -c 32768 /dev/zero; head -c 32768 /dev/zero >&2; exit 23",
-        ])
-        .output()
-        .unwrap();
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["command-run", "--record-dir"])
+    .arg(root.path())
+    .args([
+        "--invocation",
+        "large-output",
+        "--timeout-seconds",
+        "10",
+        "--max-output-bytes",
+        "1024",
+        "--",
+        "/bin/sh",
+        "-c",
+        "head -c 32768 /dev/zero; head -c 32768 /dev/zero >&2; exit 23",
+    ])
+    .output()
+    .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let evidence = result(root.path(), "large-output");
     assert_eq!(evidence["exitCode"], 23);

@@ -36,6 +36,7 @@ html5ever = "=0.29.1"
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 regex = "1"
 trybuild = "1"
 tempfile = "3"

@@ -94,7 +94,7 @@ fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -191,8 +191,9 @@ async fn slow_tool_call_does_not_block_concurrent_tools_list() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -288,14 +289,17 @@ async fn bridge_subprocess_survives_tcp_blip_with_retryable_errors() {
     // real data dir.
     let data_dir = common::test_tempdir("itd-e2e-bridge-log-");
 
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["mcp-bridge", "--connect", &addr.to_string()])
-        .env("INTENTD_DATA_DIR", data_dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn mcp-bridge");
+    let mut child = tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["mcp-bridge", "--connect", &addr.to_string()])
+    .env("INTENTD_DATA_DIR", data_dir.path())
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn mcp-bridge");
     let mut stdin = child.stdin.take().expect("child stdin");
     let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
 
@@ -445,14 +449,17 @@ fn spawn_bridge_subprocess(
     tokio::process::ChildStdin,
     BufReader<tokio::process::ChildStdout>,
 ) {
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["mcp-bridge", "--connect", &addr.to_string()])
-        .env("INTENTD_DATA_DIR", data_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn mcp-bridge");
+    let mut child = tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["mcp-bridge", "--connect", &addr.to_string()])
+    .env("INTENTD_DATA_DIR", data_dir)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn mcp-bridge");
     let stdin = child.stdin.take().expect("child stdin");
     let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
     (child, stdin, stdout)

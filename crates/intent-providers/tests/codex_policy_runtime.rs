@@ -22,10 +22,12 @@ fn codex_policy_real_runtime() {
     for metadata in ["v1", "v2", "none"] {
         let mut command = std::process::Command::new("python3");
         command
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/codex_policy_runtime.py"
-            ))
+            .arg(
+                intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex_policy_runtime.py")
+                    .display()
+                    .to_string(),
+            )
             .args([
                 binary.as_str(),
                 adapter.as_str(),

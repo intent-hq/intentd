@@ -153,7 +153,10 @@ impl Fixture {
 
     fn doctor_output(&self, success: bool) -> String {
         self.preflight();
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+        let mut command = self.command(&intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ));
         command.arg("doctor");
         self.run_expected(command, "doctor", success)
     }
@@ -382,7 +385,10 @@ async fn competing_serve_exits_before_touching_live_payloads() {
     let mut command = common::hermetic_serve_command(&fixture.data_dir());
     // Keep the standard serve builder while replacing its environment with the
     // same fail-closed synthetic routing verified by preflight.
-    let isolated = fixture.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+    let isolated = fixture.command(&intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     command
         .env_clear()
         .envs(isolated.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));

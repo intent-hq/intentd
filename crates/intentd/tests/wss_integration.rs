@@ -12718,7 +12718,7 @@ fn fake_acp_adapter_script(tag: &str, behavior: &str) -> (tempfile::TempDir, std
     use std::os::unix::fs::PermissionsExt;
     let fixture = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     let dir = test_tempdir(&format!("intentd-wss-acp-{tag}-"));
     let bin = dir.path().join("codex-acp");
@@ -12794,7 +12794,7 @@ async fn wss_agent_complete_once_claude_code_sends_slimmed_session_meta() {
     }
     let fixture = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     let dir = test_tempdir("intentd-wss-acp-claude-slim-");
     let session_log = dir.path().join("sessions.jsonl");
@@ -12994,7 +12994,7 @@ fn fake_acp_adapter_script_with_session_log(
     use std::os::unix::fs::PermissionsExt;
     let fixture = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     let dir = test_tempdir(&format!("intentd-wss-acp-{tag}-"));
     let bin = dir.path().join("opencode");
@@ -13171,7 +13171,7 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     let bin = adapter_dir.path().join("codex-acp");
     let fixture = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     std::fs::write(
         &bin,
@@ -23034,7 +23034,7 @@ async fn wss_quick_action_effort_settings_and_execution_contract() {
     std::fs::write(&behavior, "{}").unwrap();
     let fixture = format!(
         "{}/tests/fixtures/mock-quick-action-effort.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     let bin = dir.path().join("claude-agent-acp");
     std::fs::write(&bin, format!("#!/bin/sh\nMOCK_EFFORT_BEHAVIOR=\"$(cat {behavior:?})\" MOCK_EFFORT_LOG={log:?} exec node {fixture:?}\n")).unwrap();

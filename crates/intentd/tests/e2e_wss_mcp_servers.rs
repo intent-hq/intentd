@@ -293,15 +293,15 @@ async fn mcp_servers_remote_probe_over_wss() {
         eprintln!("skipping mcp.servers WSS E2E: node not on PATH");
         return;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp.servers WSS E2E: fixture not found at {script}");
         return;
     }
-    let (_fixture, base_url) = spawn_http_fixture(script).await;
+    let (_fixture, base_url) = spawn_http_fixture(&script).await;
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -469,19 +469,21 @@ async fn mcp_servers_remote_probe_over_wss() {
 #[tokio::test]
 async fn mcp_servers_oauth_auth_required_and_restart_recovery_over_wss() {
     const OAUTH_TOKEN: &str = "wss-lifecycle-oauth-token";
-    let Some(script) = node_available().then_some(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    )) else {
+    let Some(script) = node_available().then_some(
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mock-mcp-server.mjs")
+            .display()
+            .to_string(),
+    ) else {
         eprintln!("skipping mcp oauth lifecycle WSS E2E: node not on PATH");
         return;
     };
-    if !PathBuf::from(script).exists() {
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp oauth lifecycle WSS E2E: fixture missing");
         return;
     }
     let (_fixture, base_url) =
-        spawn_http_fixture_with_auth(script, Some(&format!("Bearer {OAUTH_TOKEN}"))).await;
+        spawn_http_fixture_with_auth(&script, Some(&format!("Bearer {OAUTH_TOKEN}"))).await;
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -637,15 +639,15 @@ async fn mcp_servers_update_preserves_redacted_secrets_over_wss() {
         eprintln!("skipping mcp.servers redaction WSS E2E: node not on PATH");
         return;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp.servers redaction WSS E2E: fixture not found at {script}");
         return;
     }
-    let (_fixture, mut auth_lines, base_url) = spawn_logging_http_fixture(script).await;
+    let (_fixture, mut auth_lines, base_url) = spawn_logging_http_fixture(&script).await;
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -896,15 +898,15 @@ async fn mcp_test_connection_over_wss() {
         eprintln!("skipping mcp.testConnection WSS E2E: node not on PATH");
         return;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp.testConnection WSS E2E: fixture not found at {script}");
         return;
     }
-    let (_fixture, base_url) = spawn_http_fixture(script).await;
+    let (_fixture, base_url) = spawn_http_fixture(&script).await;
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();

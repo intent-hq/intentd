@@ -99,7 +99,10 @@ fn run_cli_with_env(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> std::process::Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     cmd.args(args).env("INTENTD_DATA_DIR", data_dir);
     for (k, v) in env {
         cmd.env(k, v);
@@ -526,7 +529,7 @@ async fn e2e_idle_session_reaping() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {

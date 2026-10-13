@@ -168,8 +168,8 @@ class ConsumerTests(unittest.TestCase):
     def test_archive_regressions_run_after_pinned_tooling_in_ci(self):
         steps = _workflow_tests.load_ci(ROOT)['jobs']['release-scripts']['steps']
         compiler = next(i for i, step in enumerate(steps) if step.get('name') == 'Install release cache regression compiler')
-        nextest = next(i for i, step in enumerate(steps) if step.get('with', {}).get('tool') == 'cargo-nextest@0.9.143')
-        for name in ('test-ci-build-identity.py', 'test-ci-test-artifacts.py', 'test-ci-artifact-reuse.py'):
+        nextest = next(i for i, step in enumerate(steps) if 'cargo-nextest@0.9.143' in step.get('with', {}).get('tool', '').split(','))
+        for name in ('test-ci-build-identity.py', 'test-ci-test-artifacts.py', 'test-ci-artifact-reuse.py', 'test-ci-coverage-artifacts.py', 'test-ci-linux-artifacts.py'):
             index = next(i for i, step in enumerate(steps) if name in step.get('run', ''))
             self.assertGreater(index, compiler)
             self.assertGreater(index, nextest)

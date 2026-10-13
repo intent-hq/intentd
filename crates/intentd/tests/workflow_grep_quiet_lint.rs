@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 const WORKFLOWS_DIR: &str = ".github/workflows";
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("canonicalize workspace root")

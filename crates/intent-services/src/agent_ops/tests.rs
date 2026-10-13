@@ -18318,7 +18318,8 @@ const PERSIST_FORBIDDEN: &[&str] = &[
 /// type guard — no parser dependency or semantic proof is intended.
 #[test]
 fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the_plan() {
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("src");
     let agent_ops = blank_rust_non_code(
         &std::fs::read_to_string(src.join("agent_ops.rs")).expect("read agent_ops.rs"),
     );

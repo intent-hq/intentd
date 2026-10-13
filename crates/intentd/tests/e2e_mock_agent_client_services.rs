@@ -119,7 +119,10 @@ async fn setup_manager(
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let services_arc = Arc::new(services);
     let manager = AgentManager::new((*services_arc).clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"))
+        .with_mcp_bridge_exe(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
         .with_policy(policy);
 
     (services_arc, manager, ws, ws_root, tmp)
@@ -210,7 +213,7 @@ async fn fs_read_write_round_trip() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -274,7 +277,7 @@ async fn permission_request_allow() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -325,7 +328,7 @@ async fn permission_request_deny() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -377,7 +380,7 @@ async fn terminal_lifecycle() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -450,7 +453,7 @@ async fn terminal_kill_running_process() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -505,7 +508,7 @@ async fn terminal_output_truncation() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -578,7 +581,7 @@ async fn terminal_non_zero_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -644,7 +647,7 @@ async fn terminal_release_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -691,7 +694,7 @@ async fn terminal_output_unknown() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -738,7 +741,7 @@ async fn terminal_output_after_exit() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {

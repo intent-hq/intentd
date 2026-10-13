@@ -139,7 +139,7 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
 fn mock_agent_script() -> Option<String> {
     let script = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     if intent_providers::resolve_on_path("node").is_none() || !Path::new(&script).exists() {
         eprintln!("skipping WSS agent.listActive e2e: mock agent unavailable");

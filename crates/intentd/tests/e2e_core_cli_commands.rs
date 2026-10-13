@@ -52,12 +52,15 @@ async fn doctor_checks_data_dir_and_migrations() {
     await_socket(&mut daemon, &socket).await;
 
     // Run `intentd doctor` command
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("doctor")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_TCP_PORT", "0")
-        .output()
-        .expect("run intentd doctor");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("doctor")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .env("INTENTD_TCP_PORT", "0")
+    .output()
+    .expect("run intentd doctor");
 
     assert!(
         output.status.success(),
@@ -91,11 +94,14 @@ async fn status_reports_down_when_daemon_not_running() {
     let data_dir = data_dir_guard.path().to_path_buf();
 
     // Run status without a running daemon
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("status")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .output()
-        .expect("run intentd status");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("status")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .output()
+    .expect("run intentd status");
 
     // Status should exit with failure when daemon is down
     assert!(
@@ -120,11 +126,14 @@ async fn stop_succeeds_when_daemon_not_running() {
     let data_dir = data_dir_guard.path().to_path_buf();
 
     // Run stop without a running daemon
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("stop")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .output()
-        .expect("run intentd stop");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("stop")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .output()
+    .expect("run intentd stop");
 
     // Stop should succeed (idempotent) when daemon is not running
     assert!(
@@ -153,11 +162,14 @@ async fn retained_cli_status_call_and_graceful_stop() {
     await_socket(&mut daemon, &socket).await;
 
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args(args)
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .output()
-            .expect("run isolated CLI")
+        Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .args(args)
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .output()
+        .expect("run isolated CLI")
     };
     let status = run(&["status"]);
     assert!(status.status.success(), "{status:?}");
@@ -177,11 +189,14 @@ async fn retained_cli_status_call_and_graceful_stop() {
     // Reap the daemon concurrently so stop does not mistake its zombie for a
     // live process and escalate. Both children retain cleanup guards on panic.
     let mut stop = GuardedChild::spawn(
-        Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("stop")
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+        Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("stop")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped()),
     )
     .expect("spawn stop");
     let exit = daemon
@@ -288,13 +303,16 @@ esac
 async fn run_pair_until_success(data_dir: &Path, args: &[&str]) -> std::process::Output {
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     loop {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("pair")
-            .args(args)
-            .env("INTENTD_DATA_DIR", data_dir)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run intentd pair");
+        let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("pair")
+        .args(args)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair");
         if output.status.success() || std::time::Instant::now() >= deadline {
             break output;
         }
@@ -439,12 +457,15 @@ async fn pair_without_listener_non_tty_requires_yes_flag() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdin(Stdio::null())
+    .output()
+    .expect("run intentd pair");
 
     assert!(
         !output.status.success(),
@@ -509,13 +530,16 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--yes")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair --yes");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .arg("--yes")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdin(Stdio::null())
+    .output()
+    .expect("run intentd pair --yes");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -553,12 +577,15 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
 
     // A second run finds the listener already up — no prompt, no re-enable —
     // and fails the same way on the missing route.
-    let output2 = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair (second)");
+    let output2 = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdin(Stdio::null())
+    .output()
+    .expect("run intentd pair (second)");
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
     assert!(
         !output2.status.success(),
@@ -579,11 +606,14 @@ async fn pair_fails_when_daemon_down() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
     let data_dir = data_dir_guard.path().to_path_buf();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .output()
-        .expect("run intentd pair");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .output()
+    .expect("run intentd pair");
 
     assert!(
         !output.status.success(),
@@ -694,14 +724,17 @@ async fn pair_rotate_uses_daemon_authority_not_cli_env() {
 
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     let output = loop {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("pair")
-            .arg("--rotate")
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .env("INTENTD_AUTH_TOKEN", "cli-only-env-token-not-the-daemons")
-            .stdin(Stdio::null())
-            .output()
-            .expect("run intentd pair --rotate with CLI-only env var");
+        let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("pair")
+        .arg("--rotate")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .env("INTENTD_AUTH_TOKEN", "cli-only-env-token-not-the-daemons")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair --rotate with CLI-only env var");
         if output.status.success() || std::time::Instant::now() >= deadline {
             break output;
         }
@@ -747,13 +780,16 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     await_socket(&mut daemon, &socket).await;
     let before = await_stored_token(&data_dir).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--rotate")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair --rotate without listener");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .arg("--rotate")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdin(Stdio::null())
+    .output()
+    .expect("run intentd pair --rotate without listener");
 
     assert!(
         !output.status.success(),
@@ -776,15 +812,18 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
 /// picker reads one selection line, so a piped run works without a TTY).
 fn run_select_endpoints(data_dir: &Path, input: &str) -> std::process::Output {
     use std::io::Write;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--select-endpoints")
-        .env("INTENTD_DATA_DIR", data_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn intentd pair --select-endpoints");
+    let mut child = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("pair")
+    .arg("--select-endpoints")
+    .env("INTENTD_DATA_DIR", data_dir)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn intentd pair --select-endpoints");
     child
         .stdin
         .take()
@@ -925,13 +964,16 @@ async fn daemon_binds_loopback_alongside_a_specific_bind() {
     // poll `system.status` (one-shot `intentd call`) until a port shows.
     let deadline = std::time::Instant::now() + common::daemon_startup_timeout();
     let (port, status) = loop {
-        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("call")
-            .arg("system.status")
-            .env("INTENTD_DATA_DIR", &data_dir)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run intentd call system.status");
+        let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("call")
+        .arg("system.status")
+        .env("INTENTD_DATA_DIR", &data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd call system.status");
         let status = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
         if let Some(port) = status.as_ref().and_then(|s| s["port"].as_u64()) {
             break (
@@ -1119,7 +1161,10 @@ async fn pair_select_endpoints_conflicts_with_pairing_flags() {
     // clap-level: --select-endpoints re-runs ONLY the selection, so the
     // pairing-output flags are rejected up front.
     for conflicting in ["--yes", "--rotate", "--png", "--svg"] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+        let mut cmd = Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ));
         cmd.arg("pair").arg("--select-endpoints").arg(conflicting);
         if matches!(conflicting, "--png" | "--svg") {
             cmd.arg("/tmp/out.img");
@@ -1156,13 +1201,16 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
     drop(pipe_read);
     let stdout = Stdio::from(pipe_write);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("status")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdout(stdout)
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn intentd status");
+    let child = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("status")
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdout(stdout)
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn intentd status");
     let output = child.wait_with_output().expect("wait intentd status");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1184,7 +1232,10 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
 /// paths must error instead of hanging.
 fn run_settings(data_dir: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
     use std::io::Write;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut cmd = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     cmd.arg("settings")
         .args(args)
         .env("INTENTD_DATA_DIR", data_dir)

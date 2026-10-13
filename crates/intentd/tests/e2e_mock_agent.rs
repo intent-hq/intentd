@@ -85,7 +85,7 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -180,8 +180,9 @@ async fn mock_agent_full_turn_with_real_mcp_tool_call() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(

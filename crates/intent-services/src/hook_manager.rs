@@ -6556,7 +6556,7 @@ mod tests {
 
         use crate::agent_manager::{AgentManager, BusEventSink, TurnOptions};
 
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
             .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
             .canonicalize()
             .expect("mock-acp-agent.mjs fixture exists")

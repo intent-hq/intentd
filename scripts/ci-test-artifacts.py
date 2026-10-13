@@ -108,6 +108,8 @@ def recipe_digest(recipe):
     # --source may be another checkout (including the small functional fixture).
     # Bind the archiver implementation too, not just Cargo's argv/source SHA.
     implementation = {"archive": file_sha(__file__), "identity": file_sha(identity.__file__)}
+    if "coverage" in recipe:
+        implementation["coverage"] = file_sha(Path(__file__).with_name("ci-coverage-artifacts.py"))
     return sha(json.dumps({"recipe": recipe, "implementation": implementation}, sort_keys=True, separators=(",", ":")).encode())
 
 
@@ -115,7 +117,7 @@ def validate_request(request):
     identity.fields(request, "identity recipe", "request")
     identity.validate(request["identity"])
     recipe, build = request["recipe"], request["identity"]["build"]
-    identity.fields(recipe, "kind command companions", "recipe")
+    identity.fields(recipe, "kind command companions" + (" coverage" if "coverage" in recipe else ""), "recipe")
     identity.string_list(recipe["command"], "recipe.command")
     identity.string_list(recipe["companions"], "recipe.companions")
     if build["commands"] != [recipe["command"]] or build["kind"] != recipe["kind"] or build["recipe_sha256"] != recipe_digest(recipe):
@@ -125,11 +127,28 @@ def validate_request(request):
         raise ValueError("unsupported producer recipe")
     if "{target}" not in recipe["command"] or (recipe["kind"] == "test-archive" and "{archive}" not in recipe["command"]):
         raise ValueError("recipe must use logical target/archive placeholders")
+    coverage = recipe.get("coverage")
+    if coverage is not None:
+        identity.fields(coverage, "environment tools", "recipe.coverage")
+        identity.string_map(coverage["environment"], ("CARGO_LLVM_COV", "LLVM_PROFILE_FILE"), "recipe.coverage.environment")
+        identity.string_map(coverage["tools"], ("cargo-llvm-cov", "llvm-cov", "llvm-profdata"), "recipe.coverage.tools")
+    instrumentation = {"mode": "llvm-cov", "flags": coverage_module().flags(coverage)} if coverage else {"mode": "none", "flags": []}
+    if build["instrumentation"] != instrumentation or request["identity"]["tools"]["llvm_cov"] != (json.dumps(coverage["tools"], sort_keys=True) if coverage else "none"):
+        raise ValueError("instrumentation differs from recipe")
 
 
-def capture_request(source, platform, recipe, *, config_sha256, native_tools=None):
+def coverage_module():
+    spec = importlib.util.spec_from_file_location("coverage_artifacts", Path(__file__).with_name("ci-coverage-artifacts.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def capture_request(source, platform, recipe, *, config_sha256, native_tools=None, instrumented=False):
     source = Path(source).resolve()
     commit = source_commit(source)
+    if instrumented:
+        recipe = dict(recipe, coverage=coverage_module().capture(source))
     command = recipe["command"]
     graph = output(["cargo", "tree", *graph_args(command), "--prefix", "none", "-e", "normal,build,dev", "-f", "{p} features=[{f}]"], source).replace(str(source), "{workspace}")
     files = output(["git", "ls-files"], source).splitlines()
@@ -151,9 +170,9 @@ def capture_request(source, platform, recipe, *, config_sha256, native_tools=Non
     identity.fields(native_tools, "cc linker", "native_tools")
     document = {"schema": 1, "source": {"repository": "intent-hq/intentd", "commit": commit, "embedded_commit": commit, "dirty": False},
         "platform": platform, "tools": {"rustc": output(["rustc", "-vV"], source), "cargo": output(["cargo", "--version"], source),
-        "nextest": output(["cargo-nextest", "nextest", "--version"], source), "llvm_cov": "none", **native_tools},
+        "nextest": output(["cargo-nextest", "nextest", "--version"], source), "llvm_cov": json.dumps(recipe["coverage"]["tools"], sort_keys=True) if instrumented else "none", **native_tools},
         "build": {"kind": recipe["kind"], "profile": profile, "commands": [command], "features": {"default_features": "--no-default-features" not in command, "all_features": "--all-features" in command, "requested": features},
-        "resolved_features_sha256": sha(graph.encode()), "instrumentation": {"mode": "none", "flags": []}, "recipe_sha256": recipe_digest(recipe), "cargo_config_sha256": config_sha256, "inputs": inputs},
+        "resolved_features_sha256": sha(graph.encode()), "instrumentation": {"mode": "llvm-cov", "flags": coverage_module().flags(recipe["coverage"])} if instrumented else {"mode": "none", "flags": []}, "recipe_sha256": recipe_digest(recipe), "cargo_config_sha256": config_sha256, "inputs": inputs},
         "environment": build_environment()}
     request = {"identity": document, "recipe": recipe}
     validate_request(request)
@@ -345,10 +364,12 @@ def produce(requests, source, target, published):
         with tempfile.TemporaryDirectory(prefix=".staging-", dir=published) as temporary:
             stage = Path(temporary)
             archive = stage / ("tests.tar.zst" if recipe["kind"] == "test-archive" else "binaries.tar.gz")
-            command = [str(archive) if x == "{archive}" else str(target) if x == "{target}" else x for x in recipe["command"]]
+            variant_target = target / "llvm-cov-target" if "coverage" in recipe else target
+            environment = coverage_module().build_environment(recipe["coverage"], source, variant_target) if "coverage" in recipe else os.environ
+            command = [str(archive) if x == "{archive}" else str(variant_target) if x == "{target}" else x for x in recipe["command"]]
             started = time.monotonic()
             with (stage / "build.jsonl").open("w") as log, (stage / "build.stderr.log").open("w") as diagnostics:
-                with subprocess.Popen(command, cwd=source, env=dict(os.environ, CARGO_TERM_COLOR="never", CARGO_TERM_PROGRESS_WHEN="never"), stdout=log, stderr=subprocess.PIPE, text=True) as process:
+                with subprocess.Popen(command, cwd=source, env=dict(environment, CARGO_TERM_COLOR="never", CARGO_TERM_PROGRESS_WHEN="never"), stdout=log, stderr=subprocess.PIPE, text=True) as process:
                     for line in process.stderr:
                         diagnostics.write(line)
                         print(line, end="", file=sys.stderr, flush=True)

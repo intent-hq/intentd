@@ -79,7 +79,14 @@ fn both_constructors_supply_complete_identity_and_preserve_port_behavior() {
         let dir = common::test_tempdir("serve-contract-");
         let mut cmd = fixture_command(dir.path(), fixed);
         assert_eq!(identity_contract(&cmd, dir.path()), Ok(()));
-        assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+        assert_eq!(
+            cmd.get_program(),
+            intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd")
+            )
+            .as_os_str()
+        );
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), [OsStr::new("serve")]);
         assert_eq!(
             explicit_env(&cmd, "INTENTD_DATA_DIR"),

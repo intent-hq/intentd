@@ -219,7 +219,14 @@ mod fixture_command_tests {
                 ("INTENTD_AUTH_TOKEN", TOKEN),
             ],
         );
-        assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+        assert_eq!(
+            cmd.get_program(),
+            intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd")
+            )
+            .as_os_str()
+        );
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
             vec![OsStr::new("serve")]
@@ -416,7 +423,7 @@ fn gate(test: &str) -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {

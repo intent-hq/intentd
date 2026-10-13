@@ -36,7 +36,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn component_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn fixture_root() -> PathBuf {

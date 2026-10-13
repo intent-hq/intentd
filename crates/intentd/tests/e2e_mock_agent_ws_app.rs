@@ -80,7 +80,7 @@ fn gate() -> Option<String> {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
     if intent_providers::resolve_on_path("node").is_none() {
@@ -183,8 +183,9 @@ async fn chief_agent_ws_app_workspaces_list() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -351,8 +352,9 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -523,8 +525,9 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -693,8 +696,9 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -867,8 +871,9 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(
@@ -1046,8 +1051,9 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     // Capture the live `agent:tool:call` events for the turn.
     let mut tool_events = bus.subscribe(SubscriptionFilter {
@@ -1278,8 +1284,9 @@ async fn non_chief_agent_ws_app_gating_error() {
     opts.extra_env = extra_env;
 
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    let manager = AgentManager::new(services.clone(), sink, 8).with_mcp_bridge_exe(
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
 
     manager
         .create_agent(

@@ -263,7 +263,7 @@ async fn scenario_with_image(
 ) {
     let script = format!(
         "{}/tests/fixtures/mock-acp-agent.mjs",
-        env!("CARGO_MANIFEST_DIR")
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
     );
     assert!(
         intent_providers::resolve_on_path("node").is_some(),

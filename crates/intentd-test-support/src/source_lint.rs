@@ -780,10 +780,10 @@ pub fn split_statements(text: &str) -> Vec<Statement> {
 /// lint gets the same answer whichever crate it lives in.
 #[must_use]
 pub fn workspace_root() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = crate::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
     match manifest.ancestors().nth(2) {
         Some(root) => root.to_path_buf(),
-        None => manifest.to_path_buf(),
+        None => manifest,
     }
 }
 

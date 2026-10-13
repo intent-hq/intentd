@@ -18496,7 +18496,7 @@ mod dead_child_respawn_tests {
     /// Path to the deterministic mock ACP agent fixture (the node E2E mock),
     /// reused here so the respawn fall-through spawns a real child.
     pub(super) fn mock_agent_script() -> String {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
             .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
             .canonicalize()
             .expect("mock-acp-agent.mjs fixture exists")

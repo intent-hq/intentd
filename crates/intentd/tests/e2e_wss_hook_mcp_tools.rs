@@ -256,14 +256,13 @@ fn gate(test: &str) -> Option<(String, String)> {
     let agent_script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
-            env!("CARGO_MANIFEST_DIR")
+            intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).display()
         )
     });
-    let mcp_script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    )
-    .to_string();
+    let mcp_script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
     if intent_providers::resolve_on_path("node").is_none() {
         eprintln!("skipping {test}: node not on PATH");
         return None;

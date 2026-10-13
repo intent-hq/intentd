@@ -21,7 +21,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn install_sh() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
+    let path = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/install.sh");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 

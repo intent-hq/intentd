@@ -121,11 +121,11 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
         eprintln!("skipping mcp.servers E2E: node not on PATH");
         return;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp.servers E2E: fixture not found at {script}");
         return;
     }
@@ -333,15 +333,15 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
         eprintln!("skipping mcp.servers http E2E: node not on PATH");
         return;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping mcp.servers http E2E: fixture not found at {script}");
         return;
     }
-    let (_fixture, base_url) = spawn_http_fixture(script).await;
+    let (_fixture, base_url) = spawn_http_fixture(&script).await;
 
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");

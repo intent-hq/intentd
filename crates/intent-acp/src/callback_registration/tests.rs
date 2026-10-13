@@ -513,7 +513,7 @@ impl NodePeer {
             .expect("set INTENT_ACP_CALLBACK_ADAPTER_FIXTURE to the frozen da577fff local fixture");
         let adapter = std::fs::canonicalize(adapter).unwrap();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let fixture = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/claude_callback_peer.mjs");
         let scratch = tempfile::Builder::new()
             .prefix("intent-acp-callback-")

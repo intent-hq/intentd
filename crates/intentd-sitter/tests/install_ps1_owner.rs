@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 fn install_ps1() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1");
+    let path = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/install.ps1");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 

@@ -85,16 +85,19 @@ async fn await_uds(socket: &Path) -> bool {
 /// daemon over UDS, never from the helper's own environment.
 fn run_helper(data_dir: &Path, operation: &str, input: &str) -> (bool, String) {
     use std::io::Write;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["git-credential", operation])
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn intentd git-credential");
+    let mut child = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["git-credential", operation])
+    .env("INTENTD_DATA_DIR", data_dir)
+    .env_remove("GITHUB_TOKEN")
+    .env_remove("GH_TOKEN")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("spawn intentd git-credential");
     child
         .stdin
         .take()
@@ -261,14 +264,17 @@ async fn revoke_applies_to_next_helper_get() {
     );
 
     // Revoke over the same UDS control plane the helper uses.
-    let revoke = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["call", "github.revoke"])
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .expect("run intentd call github.revoke");
+    let revoke = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["call", "github.revoke"])
+    .env("INTENTD_DATA_DIR", &data_dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .expect("run intentd call github.revoke");
     assert!(revoke.status.success(), "github.revoke must succeed");
 
     // After revocation: no stored token, no env fallback (tokenSource is

@@ -2940,8 +2940,11 @@ mod tests {
     /// it can be taught which override governs this crate.
     #[test]
     fn liveness_deadline_fits_inside_nextest_terminate_budget() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.config/nextest.toml");
-        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        let path = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.config/nextest.toml")
+            .display()
+            .to_string();
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!(
                 "cannot read nextest config {path}: {e} — LIVENESS is bounded by its slow-timeout"
             )

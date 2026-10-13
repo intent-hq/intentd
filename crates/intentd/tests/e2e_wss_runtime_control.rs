@@ -128,7 +128,10 @@ fn spawn_serve_under_stand_in_sitter(
     cmd.arg("-c")
         .arg(r#""$1" serve & echo "$!" > "$2"; wait"#)
         .arg("intentd-sitter")
-        .arg(env!("CARGO_BIN_EXE_intentd"))
+        .arg(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
         .arg(daemon_pid_path);
     configure_serve(&mut cmd, data_dir, listen, env);
     spawn_retrying_etxtbsy(&mut cmd, "stand-in sitter wrapper")
@@ -150,7 +153,11 @@ fn serve_command_builders_own_the_tcp_port_seam() {
 
     let dir = common::test_tempdir("port-contract-");
     let cmd = common::hermetic_serve_command(dir.path());
-    assert_eq!(cmd.get_program(), OsStr::new(env!("CARGO_BIN_EXE_intentd")));
+    assert_eq!(
+        cmd.get_program(),
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd"))
+            .as_os_str()
+    );
     assert_eq!(
         cmd.get_args().collect::<Vec<_>>(),
         vec![OsStr::new("serve")],
@@ -165,7 +172,8 @@ fn serve_command_builders_own_the_tcp_port_seam() {
     let fixed = common::hermetic_serve_command_fixed_port(dir.path());
     assert_eq!(
         fixed.get_program(),
-        OsStr::new(env!("CARGO_BIN_EXE_intentd"))
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd"))
+            .as_os_str()
     );
     assert_eq!(
         fixed.get_args().collect::<Vec<_>>(),

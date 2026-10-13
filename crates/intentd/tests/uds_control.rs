@@ -205,11 +205,14 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
     // the supervisor reaps it — a test-only artifact).
     let stop_data = data_dir.clone();
     let stop = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .arg("stop")
-            .env("INTENTD_DATA_DIR", &stop_data)
-            .output()
-            .expect("run intentd stop")
+        Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .arg("stop")
+        .env("INTENTD_DATA_DIR", &stop_data)
+        .output()
+        .expect("run intentd stop")
     });
     let reaped = timeout(Duration::from_secs(15), async {
         loop {

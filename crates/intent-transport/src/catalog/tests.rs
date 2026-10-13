@@ -24,8 +24,9 @@ use std::fmt::Write as _;
 /// hyphenated (`accept-changes.*`, `file-tracking.*`).
 fn extract_router_methods() -> HashSet<String> {
     // Read source at runtime to detect drift even after the test is compiled
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let router_path = std::path::Path::new(manifest_dir).join("src/router.rs");
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    let router_path = manifest_dir.join("src/router.rs");
     let source =
         std::fs::read_to_string(&router_path).expect("Failed to read router.rs at test time");
 
@@ -62,8 +63,9 @@ fn extract_router_methods() -> HashSet<String> {
 /// exclusively from one namespace prefix (e.g., events.rs contains only events.* methods).
 fn extract_fastpath_methods() -> HashSet<String> {
     let mut methods = HashSet::new();
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let base_path = std::path::Path::new(manifest_dir).join("src");
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    let base_path = manifest_dir.join("src");
 
     // Extract from each fast-path module
     // Look for match arms and direct comparisons (like client.hello)
@@ -974,8 +976,9 @@ fn chat_write_classification(catalog: &[&str]) -> (Vec<String>, Vec<String>, Vec
 /// arm's method name(s). Same single-line-arm assumption as
 /// [`extract_router_methods`].
 fn router_arms_reading_message_metadata() -> HashSet<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let router_path = std::path::Path::new(manifest_dir).join("src/router.rs");
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    let router_path = manifest_dir.join("src/router.rs");
     let source =
         std::fs::read_to_string(&router_path).expect("Failed to read router.rs at test time");
     let mut current: Vec<String> = Vec::new();
@@ -1135,8 +1138,9 @@ fn content_only_new_method_is_reported_unclassified() {
 /// unclassified. `agent.subscribe` / `agent.unsubscribe` also have router
 /// arms and are already cataloged there.
 fn extract_subscription_channel_methods() -> HashSet<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = std::path::Path::new(manifest_dir).join("src/subscriptions.rs");
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest_dir.join("src/subscriptions.rs");
     let source =
         std::fs::read_to_string(&path).expect("Failed to read subscriptions.rs at test time");
     let mut methods = HashSet::new();

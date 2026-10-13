@@ -1404,7 +1404,7 @@ mod emit_path_taxonomy {
     }
 
     fn crate_src(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crates dir")
             .join(name)

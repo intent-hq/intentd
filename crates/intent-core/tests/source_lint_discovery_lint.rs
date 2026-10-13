@@ -65,7 +65,7 @@ const SCAFFOLDING_FNS: [&str; 5] = [
 ];
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("canonicalize workspace root")

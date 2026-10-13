@@ -29,7 +29,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use intent_context::{discovery, AuggieContextEngine, ContextEngine, EngineAvailability};
@@ -80,7 +80,8 @@ async fn auggie_context_engine_real_retrieve_e2e() {
 
     // Search over this cargo workspace (`packages/intentd`), which is full of
     // Rust source, using an obvious query that must match real code here.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
     let workspace_path = manifest_dir
         .ancestors()
         .nth(2)

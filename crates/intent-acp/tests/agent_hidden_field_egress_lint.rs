@@ -821,7 +821,7 @@ fn check(root: &Path, allow: &Allowlist<'_>) -> Vec<String> {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("crates/intent-acp has a workspace root")

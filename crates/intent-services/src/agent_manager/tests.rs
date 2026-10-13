@@ -15509,7 +15509,7 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
 /// can exercise a REAL successful turn (node child, ACP handshake, default
 /// "Mock agent completed." response) through the drain paths.
 fn mock_agent_script() -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
         .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
         .canonicalize()
         .expect("mock-acp-agent.mjs fixture exists")

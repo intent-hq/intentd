@@ -131,7 +131,10 @@ async fn failed_checkpoint_is_distinct_from_successful_pool_closure() {
 fn one_shot_command_has_no_daemon_lifecycle_logs() {
     let dir = common::test_tempdir("shutdown-oneshot-");
     let log_path = dir.path().join("stderr.log");
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut command = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     command
         .arg("settings")
         .env("INTENTD_DATA_DIR", dir.path())
@@ -241,7 +244,10 @@ fn one_shot_legacy_dry_run_closes_fresh_store_without_timing_logs() {
     std::fs::create_dir_all(&app).unwrap();
     std::fs::create_dir_all(&data).unwrap();
     let stderr = data.join("stderr.log");
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+    let mut command = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ));
     command
         .args(["import-legacy", "--dry-run", "--root"])
         .arg(&root)

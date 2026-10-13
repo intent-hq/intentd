@@ -273,15 +273,18 @@ async fn collaboration_github_requests_only_gist_reports_broader_grant_and_isola
     .await;
     assert_eq!(v["error"]["data"]["code"], "github-not-connected", "{v}");
     // Exercise the real child-facing executable, not merely the secret file.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["git-credential", "get"])
-        .env("INTENTD_DATA_DIR", h.secrets_file.parent().unwrap())
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["git-credential", "get"])
+    .env("INTENTD_DATA_DIR", h.secrets_file.parent().unwrap())
+    .env_remove("GITHUB_TOKEN")
+    .env_remove("GH_TOKEN")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
     child
         .stdin
         .take()

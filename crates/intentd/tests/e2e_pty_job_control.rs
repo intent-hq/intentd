@@ -167,7 +167,7 @@ fn node_available() -> bool {
 }
 
 /// The fixture script path, or `None` when the e2e must be skipped.
-fn fixture_script() -> Option<&'static str> {
+fn fixture_script() -> Option<String> {
     if !node_available() {
         eprintln!("skipping PTY job-control E2E: node not on PATH");
         return None;
@@ -184,11 +184,11 @@ fn fixture_script() -> Option<&'static str> {
         );
         return None;
     }
-    let script = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mock-mcp-server.mjs"
-    );
-    if !PathBuf::from(script).exists() {
+    let script = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mock-mcp-server.mjs")
+        .display()
+        .to_string();
+    if !PathBuf::from(&script).exists() {
         eprintln!("skipping PTY job-control E2E: fixture not found at {script}");
         return None;
     }
@@ -518,7 +518,10 @@ fn spawn_driver(dir: tempfile::TempDir, fixture: &str) -> Harness {
     cmd.cwd(&data_dir);
     cmd.env("D", &data_dir);
     cmd.env("FIXTURE", fixture);
-    cmd.env("INTENTD_BIN", env!("CARGO_BIN_EXE_intentd"));
+    cmd.env(
+        "INTENTD_BIN",
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd")),
+    );
     cmd.env("INTENTD_WORKSPACES_DIR", &workspaces_dir);
     cmd.env("INTENTD_ASSERT_HERMETIC_ROOT", "1");
     cmd.env("INTENTD_AUTH_TOKEN", TOKEN);
@@ -616,7 +619,7 @@ async fn daemon_in_background_pty_process_group_never_stops_the_session() {
     // Clamped: `daemon_startup_timeout()` alone is 180 s at multiplier 3.
     let setup_deadline = (started + common::daemon_startup_timeout()).min(budget_end);
 
-    let mut h = spawn_driver(common::test_tempdir_in("/tmp", "itd-pty-jc-"), fixture);
+    let mut h = spawn_driver(common::test_tempdir_in("/tmp", "itd-pty-jc-"), &fixture);
 
     // Layout preconditions: the job is a background group of the driver's
     // session on a real controlling tty, and the driver keeps the foreground.

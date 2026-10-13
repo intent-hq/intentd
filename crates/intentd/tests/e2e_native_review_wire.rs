@@ -1539,7 +1539,8 @@ fn driver_source_hash() -> String {
 }
 
 fn driver_identity() -> Value {
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repository =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join("../..");
     json!({"sourceCommit":startup_milestones::call(startup_milestones::Phase::IdentityCommit, || git(&repository,&["rev-parse","HEAD"])),
         "sourceTree":startup_milestones::call(startup_milestones::Phase::IdentityTree, || git(&repository,&["rev-parse","HEAD^{tree}"])),
         "sourceSha256":startup_milestones::call(startup_milestones::Phase::IdentitySource, driver_source_hash),

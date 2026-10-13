@@ -8,13 +8,13 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::Path;
 use std::process::{Command, Output};
 
 /// Extract the body of `report_installed_version()` from install.sh
 /// (function header through the first column-0 `}`).
 fn probe_function() -> String {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
+    let script_path = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/install.sh");
     let script = fs::read_to_string(&script_path).unwrap();
     let start = script
         .find("report_installed_version() {")

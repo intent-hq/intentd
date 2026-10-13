@@ -173,12 +173,15 @@ fn doctor_reports_secret_presence_as_boolean_not_value() {
     const SENTINEL: &str = "ghp_SECRETvalue000111222333444555666777";
     let dir = temp_data_dir("doctor");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("doctor")
-        .env("INTENTD_DATA_DIR", dir.path())
-        .env("GITHUB_TOKEN", SENTINEL)
-        .output()
-        .expect("run intentd doctor");
+    let output = Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("doctor")
+    .env("INTENTD_DATA_DIR", dir.path())
+    .env("GITHUB_TOKEN", SENTINEL)
+    .output()
+    .expect("run intentd doctor");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

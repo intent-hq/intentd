@@ -16,7 +16,7 @@ const UPDATE_ENV: &str = "INTENTD_UPDATE_GOLDENS";
 const GOLDEN_VERSION: u64 = 1;
 
 fn golden_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(GOLDEN_REL)
+    intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR")).join(GOLDEN_REL)
 }
 
 fn regenerate_hint() -> String {

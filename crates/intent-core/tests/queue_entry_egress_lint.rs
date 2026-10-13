@@ -646,7 +646,9 @@ fn display_rel(rel: &Path) -> String {
 
 #[test]
 fn every_queue_entry_egress_is_registered_in_the_contract_table() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+    let root = intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
     let contract_path = root.join(CONTRACT_FILE);
     let contract = fs::read_to_string(&contract_path).unwrap_or_else(|e| {
         panic!("read {CONTRACT_FILE}: {e} — the contract table moved; update `CONTRACT_FILE` in {SELF_FILE}")
