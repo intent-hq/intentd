@@ -14,8 +14,7 @@ use intent_core::{
     ReviewTarget,
 };
 use intent_sourcecontrol::{
-    error::{ProviderFailure, ProviderFailureKind},
-    Error, ProviderAvailability, RateLimitStatus, ReviewObservation,
+    error::ProviderFailureKind, Error, ProviderAvailability, RateLimitStatus, ReviewObservation,
 };
 
 use super::observation_policy::{
@@ -346,6 +345,17 @@ impl ListObservations {
     /// about a specific item or the parent project. Only the provider's explicit
     /// `ProjectDenied` / `CredentialRejected` evidence has that broader meaning.
     pub(crate) fn failure(&self, error: Error) -> Result<Error, Ineligible> {
+        let kind = match &error {
+            Error::Provider(failure) => Some(failure.kind),
+            _ => None,
+        };
+        self.failure_kind(kind)?;
+        Ok(error)
+    }
+
+    /// Apply already-attributed breadth without taking ownership of the actual
+    /// response error. Refusing application must not erase that error or quota.
+    pub(crate) fn failure_kind(&self, kind: Option<ProviderFailureKind>) -> Result<(), Ineligible> {
         self.project
             .connection
             .validate_owner(&self.connection_ticket)?;
@@ -353,22 +363,13 @@ impl ListObservations {
             .scope
             .scope
             .validate_owner(&self.project_ticket)?;
-        match &error {
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::CredentialRejected,
-                ..
-            }) => self.project.connection.deny(),
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::ProjectDenied,
-                ..
-            }) => self.project.scope.scope.deny(),
-            Error::Provider(ProviderFailure {
-                kind: ProviderFailureKind::ResourceDenied,
-                ..
-            }) => self.project.scope.list(self.kind).deny(),
+        match kind {
+            Some(ProviderFailureKind::CredentialRejected) => self.project.connection.deny(),
+            Some(ProviderFailureKind::ProjectDenied) => self.project.scope.scope.deny(),
+            Some(ProviderFailureKind::ResourceDenied) => self.project.scope.list(self.kind).deny(),
             _ => {}
         }
-        Ok(error)
+        Ok(())
     }
 }
 

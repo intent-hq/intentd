@@ -94,15 +94,18 @@ pub(crate) fn failure(
     error: intent_sourcecontrol::Error,
     quota: RateLimitStatus,
 ) -> CacheFailure {
-    if let Err(error) = request.matches(list, quota) {
-        return error;
+    if request.matches(list, quota).is_ok() {
+        let kind = match &error {
+            intent_sourcecontrol::Error::Provider(failure) => Some(failure.kind),
+            _ => None,
+        };
+        let _ = list.failure_kind(kind);
     }
-    match list.failure(error) {
-        Ok(error) => CacheFailure {
-            cause: CacheError::Provider(error),
-            quota,
-        },
-        Err(error) => CacheFailure::ineligible(error, quota),
+    // This response has already arrived. A local refusal may suppress its
+    // cache effect, but it must not replace the provider's error or quota.
+    CacheFailure {
+        cause: CacheError::Provider(error),
+        quota,
     }
 }
 
@@ -177,8 +180,8 @@ pub(crate) fn finish<K: Clone + Eq + Hash, L, D, T>(
     retain: impl Fn(&mut CacheMap<K, L, D>),
 ) -> Result<SummaryPage<T>, CacheFailure> {
     let (outcome, quota) = outcome;
-    request.matches(list, quota)?;
     let page = outcome.map_err(|error| failure(request, list, error, quota))?;
+    request.matches(list, quota)?;
     // Empty pages/cursors also belong to the original request. An empty late
     // response must not clear a newer page after losing its scope/history proof.
     list.validate_start()

@@ -698,6 +698,113 @@ fn original_admission_is_checked_at_start_application_and_summary_hit() {
 }
 
 #[test]
+fn observed_summary_failure_survives_caller_refusal_without_invalidating_retained_rows() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let authorized = AtomicBool::new(true);
+    let check = || {
+        if authorized.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(intent_core::Error::Forbidden("caller retired".into()))
+        }
+    };
+    let request = SummaryRequest {
+        revalidate: &check,
+        ..req(&connection, &repo, RepositoryResourceKind::MergeRequest)
+    };
+    let cache = PrCache::default();
+    let retained = reviews(&cache, &request, &begin(&request).unwrap(), &[7]);
+    let pending = begin(&request).unwrap();
+    authorized.store(false, Ordering::SeqCst);
+    let result: Result<SummaryPage<PullRequest>, _> = finish(
+        &cache,
+        &request,
+        &pending,
+        (Err(denied(ProviderFailureKind::ProjectDenied)), quota()),
+        |p| (target(&request, p.number), true),
+        keep,
+    );
+    let failure = result.unwrap_err();
+    assert!(matches!(
+        failure.cause,
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::ProjectDenied,
+            status: Some(403),
+        }))
+    ));
+    assert_eq!(failure.quota, quota());
+    // Inspect the metadata separately from the refused caller. The refused
+    // operation neither grants a hit nor applies a denial to these rows.
+    let inspected = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    assert!(can_serve(
+        &cache,
+        &inspected,
+        retained.receipts[0].as_ref().unwrap(),
+        FRESH
+    )
+    .unwrap());
+}
+
+#[test]
+fn observed_summary_failure_survives_wrong_list_without_denying_replacement() {
+    let original = connection("alice");
+    let replacement = connection("alice");
+    let repo = repository("team/app");
+    let old = req(&original, &repo, RepositoryResourceKind::MergeRequest);
+    let current = req(&replacement, &repo, RepositoryResourceKind::MergeRequest);
+    let pending = begin(&old).unwrap();
+    let cache = PrCache::default();
+    let retained = reviews(&cache, &current, &begin(&current).unwrap(), &[7]);
+    let failure = failure(
+        &current,
+        &pending,
+        Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            status: Some(401),
+        }),
+        quota(),
+    );
+    assert!(matches!(
+        failure.cause,
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            status: Some(401),
+        }))
+    ));
+    assert_eq!(failure.quota, quota());
+    assert!(can_serve(
+        &cache,
+        &current,
+        retained.receipts[0].as_ref().unwrap(),
+        FRESH
+    )
+    .unwrap());
+}
+
+#[test]
+fn observed_summary_failure_preserves_rate_limit_after_scope_retirement() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let pending = begin(&request).unwrap();
+    connection.retire();
+    let result: Result<SummaryPage<PullRequest>, _> = finish(
+        &PrCache::default(),
+        &request,
+        &pending,
+        (Err(Error::RateLimited("Retry-After: 90".into())), quota()),
+        |p| (target(&request, p.number), true),
+        keep,
+    );
+    let failure = result.unwrap_err();
+    assert!(
+        matches!(failure.cause, CacheError::Provider(Error::RateLimited(ref message)) if message == "Retry-After: 90")
+    );
+    assert_eq!(failure.quota, quota());
+}
+
+#[test]
 fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
     let connection = connection("alice");
     let replacement = self::connection("alice");
@@ -728,7 +835,10 @@ fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
             quota()
         )
         .cause,
-        CacheError::Ineligible(Ineligible::DifferentSlot)
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            ..
+        }))
     ));
     connection.retire();
     assert!(matches!(
@@ -739,7 +849,10 @@ fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
             quota()
         )
         .cause,
-        CacheError::Ineligible(Ineligible::RetiredScope)
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            ..
+        }))
     ));
     assert!(can_serve(&cache, &new, fresh.receipts[0].as_ref().unwrap(), FRESH).unwrap());
 }
