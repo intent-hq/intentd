@@ -177,7 +177,27 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("not ready (indexing)"));
+    // Old installed sitters execute this NEW binary for their liveness probe.
+    // The CLI may confirm liveness, but the protected wire stays not-ready.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .args(["call", "system.status"])
+        .env("INTENTD_DATA_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(cli["ready"], false);
+    assert_eq!(cli["startup"]["phase"], "indexing");
     let socket = dir.path().join("intentd.sock");
+    assert_eq!(
+        uds_call(&socket, "system.status").await["error"]["code"],
+        -32012
+    );
     assert_eq!(
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
         0o600
@@ -694,4 +714,117 @@ async fn bootstrap_disable_failure_and_owner_token_rotation() {
     let rejected = https_request(port, cfg, &upgrade_req("/ws", None, Some(TOKEN))).await;
     assert_eq!(status_code(&rejected), 503);
     server.stop().await;
+}
+
+/// Opt-in because the historical binary must be built from frozen b6fc9f881,
+/// not rebuilt from this PR. The fixture drives its actual start/serve/update
+/// entrypoints against the current daemon, without mocking its readiness code.
+#[tokio::test]
+#[ignore = "requires INTENTD_TEST_LEGACY_SITTER pointing to the frozen released sitter"]
+async fn frozen_sitter_preserves_new_daemon_startup() {
+    let seed_dir = common::test_tempdir_in("/tmp", "legacy-sitter-seed-");
+    seed(seed_dir.path()).await;
+    let sitter =
+        std::env::var("INTENTD_TEST_LEGACY_SITTER").expect("frozen sitter binary required");
+    let budget = std::env::var("INTENTD_TEST_LEGACY_BUDGET_MS").unwrap_or_else(|_| "2000".into());
+    let millis: u64 = budget.parse().unwrap();
+    let daemon = std::env::var("INTENTD_TEST_LEGACY_DAEMON")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentd").to_owned());
+    let mut command = std::process::Command::new("python3");
+    command.args([
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy-sitter-startup.py"
+        ),
+        &sitter,
+        &daemon,
+        intentd_sitter::manifest::TARGET_TRIPLE,
+        &budget,
+        seed_dir.path().join("intentd.db").to_str().unwrap(),
+    ]);
+    let mut child = GuardedChild::spawn(&mut command).unwrap();
+    assert!(child
+        .wait_with_timeout(Duration::from_millis(millis * 4) + Duration::from_secs(90))
+        .unwrap()
+        .unwrap()
+        .success());
+}
+
+#[tokio::test]
+async fn cli_startup_liveness_uses_server_identity_and_rejects_invalid_probes() {
+    for (method, params, kind, success) in [
+        ("system.status", "{}", "starting", true),
+        ("system.status", "{}", "missing-version", false),
+        ("system.status", "{}", "bad-envelope", false),
+        ("system.status", "{}", "result-and-error", false),
+        ("system.status", "{}", "missing-message", false),
+        ("system.status", "{}", "failed", false),
+        ("system.status", "{\"extra\":true}", "starting", false),
+        ("system.status", "null", "starting", false),
+        ("client.hello", "{}", "starting", false),
+        ("note.add", "{}", "starting", false),
+    ] {
+        let dir = common::test_tempdir_in("/tmp", "cli-startup-identity-");
+        let listener = UnixListener::bind(dir.path().join("intentd.sock")).unwrap();
+        let status = intent_core::startup::StartupStatus::with_daemon_version("0.0.7");
+        if kind == "failed" {
+            status.fail();
+        }
+        let mut error = json!({"code":-32012,"message":"Daemon not ready","data":{
+            "code":if kind == "failed" {"daemon-startup-failed"} else {"daemon-not-ready"},
+            "retryable":kind != "failed","retryAfterMs":1000,"startup":status.snapshot()}});
+        if kind == "missing-version" {
+            error["data"]["startup"]
+                .as_object_mut()
+                .unwrap()
+                .remove("daemonVersion");
+        }
+        let server = async {
+            let (peer, _) = listener.accept().await.unwrap();
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], method);
+            let mut response = json!({"jsonrpc":"2.0","id":request["id"],"error":error});
+            match kind {
+                "bad-envelope" => response["jsonrpc"] = json!("1.0"),
+                "result-and-error" => response["result"] = json!({"version":"0.0.7"}),
+                "missing-message" => {
+                    response["error"].as_object_mut().unwrap().remove("message");
+                }
+                _ => {}
+            }
+            peer.get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        };
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+        command
+            .args(["call", method, "--params", params])
+            .env("INTENTD_DATA_DIR", dir.path())
+            .kill_on_drop(true);
+        let ((), output) = timeout(Duration::from_secs(5), async {
+            tokio::join!(server, command.output())
+        })
+        .await
+        .unwrap();
+        let output = output.unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{method} {params} {kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_ne!(env!("CARGO_PKG_VERSION"), "0.0.7");
+            assert_eq!(
+                actual["version"], "0.0.7",
+                "never use this CLI's build version"
+            );
+            assert_eq!(actual["ready"], false);
+        }
+    }
 }

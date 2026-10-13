@@ -6488,8 +6488,20 @@ async fn cmd_call(method: &str, params: Option<&str>) -> anyhow::Result<()> {
         }
         None => json!({}),
     };
-    let response = rpc_call(&config.socket_path, method, params).await?;
+    let response = rpc_call(&config.socket_path, method, params.clone()).await?;
     if let Some(error) = response.get("error") {
+        // Only a valid correlated error envelope may become CLI liveness.
+        // In particular, never accept an ambiguous result-plus-error reply.
+        if response["jsonrpc"] != "2.0"
+            || response.get("result").is_some()
+            || error["message"].as_str().is_none()
+        {
+            anyhow::bail!("invalid response from daemon");
+        }
+        if let Some(liveness) = client::startup_liveness_result(method, &params, error) {
+            println!("{}", serde_json::to_string_pretty(&liveness)?);
+            return Ok(());
+        }
         eprintln!("{}", serde_json::to_string_pretty(error)?);
         anyhow::bail!("rpc error");
     }

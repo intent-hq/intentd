@@ -38,6 +38,7 @@ pub struct StartupProgress {
 #[serde(rename_all = "camelCase")]
 pub struct StartupSnapshot {
     pub startup_status: u8,
+    pub daemon_version: String,
     pub attempt_id: String,
     pub phase: StartupPhase,
     pub elapsed_ms: u64,
@@ -62,6 +63,7 @@ pub struct StartupFailure {
 }
 
 struct State {
+    daemon_version: String,
     attempt_id: String,
     started: Instant,
     phase_started: Instant,
@@ -89,9 +91,17 @@ impl Default for StartupStatus {
 impl StartupStatus {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_daemon_version(env!("CARGO_PKG_VERSION"))
+    }
+
+    /// The composition root supplies the responding daemon's build version;
+    /// callers must never substitute the version of a probing CLI binary.
+    #[must_use]
+    pub fn with_daemon_version(version: impl Into<String>) -> Self {
         let now = Instant::now();
         Self(
             Arc::new(Mutex::new(State {
+                daemon_version: version.into(),
                 attempt_id: uuid::Uuid::new_v4().to_string(),
                 started: now,
                 phase_started: now,
@@ -129,6 +139,7 @@ impl StartupStatus {
         let end = s.terminal.unwrap_or(now);
         StartupSnapshot {
             startup_status: 1,
+            daemon_version: s.daemon_version.clone(),
             attempt_id: s.attempt_id.clone(),
             phase: s.phase,
             elapsed_ms: millis(end.saturating_duration_since(s.started)),

@@ -19,7 +19,9 @@ pub struct Bootstrap {
 impl Bootstrap {
     pub fn new(config: &intent_core::Config) -> Self {
         Self {
-            dispatch: StartupDispatch::new(StartupStatus::new()),
+            dispatch: StartupDispatch::new(StartupStatus::with_daemon_version(env!(
+                "CARGO_PKG_VERSION"
+            ))),
             cancellation: Cancellation::new(),
             ws: None,
             port: None,

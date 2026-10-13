@@ -58,28 +58,32 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
         };
     }
 
-    let deadline = Instant::now() + readiness::timeout_from_env();
+    let mut budget = readiness::StartupBudget::new(readiness::timeout_from_env());
     std::fs::create_dir_all(&paths.sitter_dir)?;
-    let _lock = lock_start(paths, deadline)?;
-    if probe(paths, deadline) {
+    let _lock = lock_start(paths, budget.deadline)?;
+    if probe(paths, &mut budget)? {
         println!("intentd is already running; launch options apply on the next start");
         return Ok(());
     }
     // An existing serve may still be booting or restarting. Never stop it and
     // never launch a second supervisor merely because readiness is delayed.
-    if supervisor::read_live_pid(&paths.pid_path).is_some() {
+    let existing_supervisor = supervisor::read_live_pid(&paths.pid_path);
+    if existing_supervisor.is_some() || budget.has_started() {
         loop {
-            if probe(paths, deadline) {
+            if probe(paths, &mut budget)? {
                 println!("intentd is running");
                 return Ok(());
             }
-            if Instant::now() >= deadline || supervisor::read_live_pid(&paths.pid_path).is_none() {
+            if Instant::now() >= budget.deadline
+                || (existing_supervisor.is_some()
+                    && supervisor::read_live_pid(&paths.pid_path) != existing_supervisor)
+            {
                 return Err(io::Error::other("existing supervisor did not become ready"));
             }
-            pause(deadline);
+            pause(budget.deadline);
         }
     }
-    if Instant::now() >= deadline {
+    if Instant::now() >= budget.deadline {
         return Err(io::Error::other("startup readiness timed out"));
     }
     let mut options = OpenOptions::new();
@@ -105,7 +109,7 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
         if child_exited(&child)? {
             break Err(io::Error::other("supervisor exited before readiness"));
         }
-        if probe(paths, deadline) {
+        if probe(paths, &mut budget)? {
             // Avoid accepting a response from a child that has already exited.
             if !child_exited(&child)?
                 && supervisor::read_live_pid(&paths.pid_path)
@@ -118,10 +122,10 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
                 return Ok(());
             }
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= budget.deadline {
             break Err(io::Error::other("startup readiness timed out"));
         }
-        pause(deadline);
+        pause(budget.deadline);
     })();
     if outcome.is_err() {
         let owned_pid = child.id().cast_signed();
@@ -130,7 +134,7 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
         // a no-op. Probe after cleaning our group so an owned orphan cannot
         // supply that response. Never signal the other owner's PID.
         if supervisor::read_live_pid(&paths.pid_path).is_some_and(|pid| pid.as_raw() != owned_pid)
-            && probe(paths, deadline)
+            && probe(paths, &mut budget)?
         {
             println!("intentd is already running under another supervisor");
             return Ok(());
@@ -162,18 +166,21 @@ fn acquire_start_lock(
     }
 }
 
-fn probe(paths: &SitterPaths, deadline: std::time::Instant) -> bool {
-    crate::state::load(&paths.state_path)
-        .current_version
-        .is_some_and(|version| {
-            crate::readiness::probe_daemon_version_with_timeout(
-                &paths.daemon_binary(&version),
-                deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .min(crate::readiness::PROBE_TIMEOUT),
-            )
-            .is_some()
-        })
+fn probe(
+    paths: &SitterPaths,
+    budget: &mut crate::readiness::StartupBudget,
+) -> std::io::Result<bool> {
+    use crate::readiness::{probe_status, versions_match, ProbeStatus};
+    let Some(version) = crate::state::load(&paths.state_path).current_version else {
+        return Ok(false);
+    };
+    let status = probe_status(&paths.daemon_binary(&version), budget.probe_timeout());
+    budget.observe(&status);
+    match status {
+        ProbeStatus::Ready(actual) => Ok(versions_match(&actual, &version)),
+        ProbeStatus::Failed => Err(std::io::Error::other("daemon startup failed")),
+        _ => Ok(false),
+    }
 }
 
 fn pause(deadline: std::time::Instant) {
@@ -331,8 +338,8 @@ fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path)
 #[must_use]
 pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     let result = (|| -> std::io::Result<bool> {
-        let deadline = std::time::Instant::now() + crate::readiness::timeout_from_env();
-        let _lock = lock_start(paths, deadline)?;
+        let mut budget = crate::readiness::StartupBudget::new(crate::readiness::timeout_from_env());
+        let _lock = lock_start(paths, budget.deadline)?;
         let Some(pid) = crate::supervisor::read_live_pid(&paths.pid_path) else {
             return Ok(false);
         };
@@ -351,12 +358,14 @@ pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
                 println!("intentd restarted and ready");
                 return Ok(true);
             }
-            if std::time::Instant::now() >= deadline {
+            // Only the nonce acknowledgment proves this replacement is ready.
+            let _ = probe(paths, &mut budget)?;
+            if std::time::Instant::now() >= budget.deadline {
                 return Err(std::io::Error::other(
                     "replacement daemon did not become ready",
                 ));
             }
-            pause(deadline);
+            pause(budget.deadline);
         }
     })();
     match result {

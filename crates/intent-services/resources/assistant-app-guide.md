@@ -399,11 +399,16 @@ already stopped succeeds), and `intentd restart` to replace the supervised daemo
 or start it if stopped. These commands act on the
 host where they run; stopping the daemon disconnects its clients.
 
-`start` waits for readiness (60-second default budget); starting a healthy daemon
+Startup-aware launchers keep waiting while fresh indexing status arrives, with a
+60-second budget for silence. Older launchers can return once the daemon is alive
+but still indexing; check `intentd status` before using it. Starting a healthy daemon
 again succeeds without restarting it. Startup errors return nonzero and point to
 `<data-dir>/sitter/start.log`. `restart` from stopped uses that same startup path.
 For a running supervisor, restart retains its launch options; Windows waits for
 replacement readiness, while macOS/Linux return after signaling, so check `status`.
+During startup, `intentd status` reports not ready. The scripting command
+`intentd call system.status` can return successful liveness JSON with `ready: false`;
+that is not application readiness. This preserves running indexing with older launchers.
 This also works with supervisors launched by services or Windows Scheduled Tasks.
 Background start/restart does not install or enable boot/login services or tasks;
 stop does not disable an existing one.
