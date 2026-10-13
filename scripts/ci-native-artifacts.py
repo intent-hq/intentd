@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,21 @@ def msvc_tool(name):
     return str(tool)
 
 
+def msvc_help(name):
+    # MSVC help can return nonzero even when it successfully prints its version.
+    # Validate the tool-specific banner and usage instead of treating help as a
+    # build. Actual compilation and dependency inspection still require exit 0.
+    banners = {'link': 'Incremental Linker', 'dumpbin': 'COFF/PE Dumper'}
+    command = [msvc_tool(name), '/?']
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = result.stdout.strip()
+    banner = r'^Microsoft \(R\) ' + re.escape(banners[name]) + r' Version [0-9]+(?:\.[0-9]+)+'
+    usage = r'(?im)^\s*usage:\s*' + name + r'\s'
+    if not re.search(banner, output) or not re.search(usage, output) or re.search(r'(?i)\berror\b', output):
+        raise RuntimeError(f'cannot fingerprint MSVC prerequisite {command} (exit {result.returncode}): {output}')
+    return output
+
+
 def platform_facts(native_platform):
     rust = probe(['rustc', '-vV'])
     host = next(line.removeprefix('host: ') for line in rust.splitlines() if line.startswith('host: '))
@@ -97,9 +113,9 @@ def platform_facts(native_platform):
         probe(['otool', '-h', sys.executable])
     elif native_platform == 'windows':
         cc = probe([msvc_tool('cl')], codes=(0, 2))
-        linker = probe([msvc_tool('link'), '/?'])
+        linker = msvc_help('link')
         os.environ['DUMPBIN'] = msvc_tool('dumpbin')
-        probe([os.environ['DUMPBIN'], '/?'])
+        msvc_help('dumpbin')
         os.environ['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'] = msvc_tool('link')
         required = ('VCToolsVersion', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')
         if any(not os.environ.get(name) for name in required):

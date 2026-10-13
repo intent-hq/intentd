@@ -127,6 +127,20 @@ class ConsumerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'MSVC'):
                     self.native.msvc_tool('link')
 
+    def test_msvc_help_nonzero_exit_requires_valid_tool_banner_and_usage(self):
+        banners = {'link': 'Incremental Linker', 'dumpbin': 'COFF/PE Dumper'}
+        for name, banner in banners.items():
+            help_text = f'Microsoft (R) {banner} Version 14.44.35229.0\n usage: {name.upper()} [options] [files]\n'
+            with patch.object(self.native, 'msvc_tool', return_value=f'/MSVC/{name}.exe'), \
+                 patch.object(self.native.subprocess, 'run') as run:
+                run.return_value = subprocess.CompletedProcess([], 1100, help_text)
+                self.assertEqual(self.native.msvc_help(name), help_text.strip())
+                self.assertEqual(run.call_args.args[0], [f'/MSVC/{name}.exe', '/?'])
+                for invalid in ('link: missing operand', help_text + 'LINK : fatal error LNK1104: cannot open file'):
+                    run.return_value = subprocess.CompletedProcess([], 1, invalid)
+                    with self.assertRaises(RuntimeError):
+                        self.native.msvc_help(name)
+
     def test_dependency_inspection_uses_the_provisioned_msvc_tool(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
