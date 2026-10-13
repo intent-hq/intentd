@@ -48,7 +48,7 @@ def owner_cleanup(path):
     starts = [r for r in events if r['event'] == 'owner_start']
     ends = [r for r in events if r['event'] == 'owner_cleanup']
     keys = [(r['pid'], r['root']) for r in starts]
-    if len(keys) != len(set(keys)) or len(starts) != len(ends):
+    if not starts or len(keys) != len(set(keys)) or len(starts) != len(ends):
         return False
     return all(sum(e['pid'] == s['pid'] and e['root'] == s['root']
                    and e['cleaned'] is True and e['scratch_exists'] is False
@@ -63,9 +63,11 @@ def group_members(pgid, timeout=2):
     result = []
     for line in text.splitlines():
         fields = line.split(None, 4)
-        if len(fields) == 5 and int(fields[2]) == pgid:
+        if len(fields) < 4:
+            raise RuntimeError('partial process-group observation')
+        if int(fields[2]) == pgid:
             result.append(dict(pid=int(fields[0]), ppid=int(fields[1]), pgid=pgid,
-                               state=fields[3], executable=fields[4]))
+                               state=fields[3], executable=fields[4] if len(fields) == 5 else ''))
     return result
 
 
@@ -77,13 +79,44 @@ def signal_owned(process, sig):
         pass
 
 
+def checked_owned_group(members, pgid):
+    identities = [r['pid'] for r in members]
+    if (pgid not in identities or len(identities) != len(set(identities))
+            or any(r['pgid'] != pgid or not r['state']
+                   or r['state'][0] not in 'RSDIUTZW' for r in members)):
+        raise RuntimeError('owned group observation missing anchor or ambiguous')
+    return members
+
+
+def quiescent_owned_group(pgid, deadline, observations):
+    # Retain the unreaped anchor. EOF or a zombie leader alone says nothing
+    # about its other group members. Only two stable FULL all-zombie snapshots
+    # allow skipping signals (Darwin can return EPERM for such a dead group).
+    previous = None
+    for _ in range(2):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('cleanup budget exhausted before group observation')
+        members = group_members(pgid, min(2, max(.001, deadline-time.monotonic())))
+        observations.append(members)
+        checked_owned_group(members, pgid)
+        if not all(r['state'].startswith('Z') for r in members):
+            return False
+        identities = sorted((r['pid'], r['ppid'], r['pgid']) for r in members)
+        if previous is not None:
+            return previous == identities
+        previous = identities
+        time.sleep(min(.02, max(0, deadline-time.monotonic())))
+    return False
+
+
 def wait_frozen(pgid, deadline):
     # A delivered stop signal is not an acknowledgment. Require two stable
     # snapshots of stopped/zombie members before reading owner registrations.
     previous = None
     while time.monotonic() < deadline:
         members = group_members(pgid, min(2, max(.001, deadline-time.monotonic())))
-        identities = {r['pid'] for r in members}
+        checked_owned_group(members, pgid)
+        identities = {(r['pid'], r['ppid'], r['pgid']) for r in members}
         stopped = all(r['state'].startswith(('T', 'Z')) for r in members)
         if stopped and identities == previous:
             return members
@@ -139,16 +172,23 @@ def supervised(command, env, output, deadline, owner_log=None, cancel=None, clea
                     record['unexpected_live_leader_after_eof'] = True
             # Freeze our owned group before inspecting registration; a parent
             # cannot race that inspection by launching a new worker afterward.
-            frozen = True
-            signal_owned(process, signal.SIGSTOP)
-            record['frozen_group_members'] = wait_frozen(process.pid, cleanup_deadline)
+            record['quiescent_group_observations'] = []
+            quiescent = quiescent_owned_group(process.pid, cleanup_deadline,
+                                              record['quiescent_group_observations'])
+            record['cleanup_path'] = 'already_quiescent' if quiescent else 'freeze_owned_group'
+            if not quiescent:
+                frozen = True
+                signal_owned(process, signal.SIGSTOP)
+                record['frozen_group_members'] = wait_frozen(process.pid, cleanup_deadline)
             if owner_log is not None and not owner_cleanup(owner_log):
                 raise RuntimeError('native owner cleanup unconfirmed; refused unsafe external worker-group signal')
-            signal_owned(process, signal.SIGKILL)
-            frozen = False  # Owner cleanup is proven; never resume after reap.
+            if not quiescent:
+                signal_owned(process, signal.SIGKILL)
+                frozen = False  # Owner cleanup is proven; never resume after reap.
             while time.monotonic() < cleanup_deadline:
                 members = group_members(process.pid, min(2, max(.001, cleanup_deadline-time.monotonic())))
                 record['last_group_members'] = members
+                checked_owned_group(members, process.pid)
                 if not any(not r['state'].startswith('Z') for r in members):
                     record['exit_code'] = process.wait(timeout=max(.01, cleanup_deadline-time.monotonic()))
                     record['cleaned'] = True

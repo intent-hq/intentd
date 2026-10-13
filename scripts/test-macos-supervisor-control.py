@@ -124,19 +124,19 @@ class Controls(unittest.TestCase):
         self.assertIn('signal.setitimer(signal.ITIMER_REAL, SECONDS-10)',source)
         self.assertIn("for name in ('normal_exit', 'live_child'):",source)
 
-    def test_frozen_diagnostic_is_byte_identical(self):
+    def test_original_control_and_normal_ci_are_byte_identical(self):
         import subprocess
-        for name in ['scripts/context-boundary-diagnostic.py', '.github/workflows/ci.yml']:
-            old=subprocess.check_output(['git','show','89d41513:'+name],cwd=ROOT)
+        for name in ['scripts/macos-supervisor-control.py', '.github/workflows/ci.yml']:
+            old=subprocess.check_output(['git','show','59f230c5:'+name],cwd=ROOT)
             self.assertEqual((ROOT/name).read_bytes(),old)
 
     def test_workflow_route_is_separate_and_bounded(self):
         workflow=yaml.safe_load((ROOT/'.github/workflows/m1mac-smoke.yml').read_text())
         jobs=workflow['jobs']
-        self.assertEqual(jobs['smoke']['if'],'${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control }}')
-        self.assertEqual(jobs['context-boundary-diagnostic']['if'],'${{ inputs.context_boundary_diagnostic && !inputs.supervisor_control }}')
+        self.assertEqual(jobs['smoke']['if'],'${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control && !inputs.supervisor_validation }}')
+        self.assertEqual(jobs['context-boundary-diagnostic']['if'],'${{ inputs.context_boundary_diagnostic && !inputs.supervisor_control && !inputs.supervisor_validation }}')
         job=jobs['supervisor-control']
-        self.assertEqual(job['if'],'${{ inputs.supervisor_control && !inputs.context_boundary_diagnostic }}')
+        self.assertEqual(job['if'],'${{ inputs.supervisor_control && !inputs.context_boundary_diagnostic && !inputs.supervisor_validation }}')
         self.assertEqual(job['runs-on'],'macos-15')
         self.assertLessEqual(job['timeout-minutes'],5)
         execute=[s for s in job['steps'] if s.get('run')][0]

@@ -96,6 +96,69 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(r['exit_code'],0,r);self.assertTrue(r['cleaned']);self.assertFalse(r['timeout'])
             self.assertEqual(d.group_members(r['pid']),[])
 
+    def test_quiescent_actual_supervised_path_never_signals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            original=d.subprocess.Popen; anchors=[]
+            def retain(*args,**kwargs):
+                process=original(*args,**kwargs)
+                if kwargs.get('start_new_session'):anchors.append(process)
+                return process
+            try:
+                with patch.object(d.subprocess,'Popen',side_effect=retain), patch.object(d,'signal_owned',side_effect=PermissionError(1,'group contains only zombie')) as sent:
+                    result=d.supervised([sys.executable,'-I','-S','-c','pass'],dict(os.environ),root/'out',time.monotonic()+3,cleanup_seconds=3)
+                self.assertTrue(result['cleaned']);self.assertEqual(result['exit_code'],0)
+                self.assertEqual(result['cleanup_path'],'already_quiescent')
+                self.assertEqual(len(result['quiescent_group_observations']),2)
+                self.assertTrue(all(any(m['pid']==result['pid'] for m in view) and all(m['state'].startswith('Z') for m in view) for view in result['quiescent_group_observations']))
+                sent.assert_not_called()
+            finally:
+                for process in anchors:
+                    if process.returncode is None:
+                        try:os.killpg(process.pid,d.signal.SIGCONT);os.killpg(process.pid,d.signal.SIGKILL)
+                        except ProcessLookupError:pass
+                        process.wait(timeout=2)
+                    if process in d.UNCONFIRMED:d.UNCONFIRMED.remove(process)
+
+    def test_quiescent_path_still_requires_owner_acknowledgment(self):
+        for payload in [None,'', '{"event":', 'invalid json\n', json.dumps(dict(event='owner_start',pid=999,root='/missing'))+'\n']:
+            with self.subTest(payload=payload),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);owner=root/'owners'
+                if payload is not None:owner.write_text(payload)
+                anchors=[];original=d.subprocess.Popen
+                def retain(*args,**kwargs):
+                    process=original(*args,**kwargs)
+                    if kwargs.get('start_new_session'):anchors.append(process)
+                    return process
+                try:
+                    with patch.object(d.subprocess,'Popen',side_effect=retain),patch.object(d,'signal_owned') as sent:
+                        with self.assertRaises((RuntimeError,json.JSONDecodeError)):
+                            d.supervised([sys.executable,'-I','-S','-c','pass'],dict(os.environ),root/'out',time.monotonic()+3,owner,root/'cancel',cleanup_seconds=3)
+                    self.assertFalse(json.loads((root/'out.process.json').read_text())['cleaned'])
+                    sent.assert_not_called()
+                finally:
+                    for process in anchors:
+                        if process.returncode is None:process.wait(timeout=2)
+                        if process in d.UNCONFIRMED:d.UNCONFIRMED.remove(process)
+
+    def test_quiescent_requires_stable_full_group_with_anchor(self):
+        zombie=dict(pid=10,ppid=1,pgid=10,state='Z',executable='child')
+        live=dict(pid=11,ppid=10,pgid=10,state='S',executable='child')
+        cases=[([zombie],[zombie],True),([zombie],[zombie,dict(live,state='Z')],False),([zombie,live],None,False),([dict(zombie,state='T')],None,False)]
+        for first,second,expected in cases:
+            observed=[]
+            with patch.object(d,'group_members',side_effect=[first,second]),patch.object(d.time,'sleep'):
+                self.assertEqual(d.quiescent_owned_group(10,time.monotonic()+1,observed),expected)
+        for members in [[],[dict(zombie,pid=11)],[dict(zombie,state='?')]]:
+            with patch.object(d,'group_members',return_value=members),self.assertRaises(RuntimeError):
+                d.quiescent_owned_group(10,time.monotonic()+1,[])
+
+    def test_full_group_observation_keeps_empty_command_and_rejects_partial_rows(self):
+        with patch.object(d.subprocess,'check_output',return_value='10 1 10 Z\n11 10 10 S /child\n'):
+            self.assertEqual([r['pid'] for r in d.group_members(10)],[10,11])
+        with patch.object(d.subprocess,'check_output',return_value='10 1 10 Z\npartial\n'),self.assertRaises(RuntimeError):
+            d.group_members(10)
+
     def test_timeout_kills_owned_cargo_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             r=d.supervised([sys.executable,'-I','-S','-c','import time; time.sleep(5)'],dict(os.environ),Path(tmp)/'out',time.monotonic()+.1,cleanup_seconds=2)
@@ -129,7 +192,7 @@ event('owner_cleanup',cleaned=True,scratch_exists=False)
             with patch.object(d,'signal_owned',observe):
                 with self.assertRaisesRegex(RuntimeError,'native owner cleanup unconfirmed'):
                     d.supervised([sys.executable,'-I','-S','-c','pass'],dict(os.environ),root/'out',time.monotonic()+2,owner,root/'cancel',cleanup_seconds=2)
-            self.assertTrue(sent);self.assertTrue(all(pid!=987654 for pid,sig in sent))
+            self.assertEqual(sent,[])
             # Failure deliberately preserves unconfirmed ownership; reap our
             # already exited fake owner to avoid the unit test itself leaking.
             d.UNCONFIRMED.pop().wait(timeout=2)
@@ -176,7 +239,7 @@ while True:
                                               unit_final_survivors=survivors)))
 
     def test_registration_inspection_waits_for_stopped_state(self):
-        observations=iter([[dict(pid=1,state='R')],[dict(pid=1,state='T')],[dict(pid=1,state='T')]])
+        observations=iter([[dict(pid=1,ppid=2,pgid=1,state='R')],[dict(pid=1,ppid=2,pgid=1,state='T')],[dict(pid=1,ppid=2,pgid=1,state='T')]])
         seen=[]
         with patch.object(d,'group_members',side_effect=lambda *args:next(observations)),patch.object(d.time,'sleep',side_effect=lambda seconds:seen.append(seconds)):
             members=d.wait_frozen(1,time.monotonic()+1)
@@ -245,7 +308,7 @@ while True:
             self.assertIn(text,workflow)
         self.assertNotIn('pull_request:',workflow);self.assertNotIn('push:',workflow)
         old_smoke=subprocess.check_output(['git','show','7f73b4d5:.github/workflows/m1mac-smoke.yml'],cwd=ROOT,text=True).split('  smoke:',1)[1]
-        new_smoke=workflow.split('  smoke:',1)[1].split('  context-boundary-diagnostic:',1)[0].replace('    if: ${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control }}\n','')
+        new_smoke=workflow.split('  smoke:',1)[1].split('  context-boundary-diagnostic:',1)[0].replace('    if: ${{ !inputs.context_boundary_diagnostic && !inputs.supervisor_control && !inputs.supervisor_validation }}\n','')
         self.assertEqual(old_smoke.strip(),new_smoke.strip())
         old=subprocess.check_output(['git','show','7f73b4d5:.github/workflows/ci.yml'],cwd=ROOT)
         self.assertEqual((ROOT/'.github/workflows/ci.yml').read_bytes(),old)
