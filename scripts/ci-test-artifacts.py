@@ -323,7 +323,7 @@ def stage_binary_libraries(binary, destination, seen=None):
 def verify_bundle(bundle, request):
     validate_request(request)
     manifest = identity.read_request(bundle / "manifest.json")
-    identity.fields(manifest, "schema key identity recipe archive archive_sha256 archive_bytes files runtime timings", "manifest")
+    identity.fields(manifest, "schema key identity recipe archive archive_sha256 archive_bytes files runtime timings" + (" report_archive" if "coverage" in request["recipe"] else ""), "manifest")
     if manifest["schema"] != 1:
         raise ValueError("unsupported artifact schema")
     identity.require_compatible(request["identity"], manifest["identity"])
@@ -332,6 +332,14 @@ def verify_bundle(bundle, request):
     archive = safe_join(bundle, manifest["archive"])
     if archive.stat().st_size != manifest["archive_bytes"] or file_sha(archive) != manifest["archive_sha256"]:
         raise ValueError("archive size/digest mismatch")
+    if "report_archive" in manifest:
+        extra = manifest["report_archive"]
+        identity.fields(extra, "name sha256 bytes", "report_archive")
+        if extra["name"] != "report-objects.tar.gz":
+            raise ValueError("invalid report archive name")
+        path = bundle / extra["name"]
+        if path.stat().st_size != extra["bytes"] or file_sha(path) != extra["sha256"]:
+            raise ValueError("report archive size/digest mismatch")
     return manifest
 
 
@@ -425,11 +433,18 @@ def produce(requests, source, target, published):
                 archive_seconds = time.monotonic()-archive_started
             if set(recipe["companions"]) - runtime["companions"].keys():
                 raise ValueError("archive missing required companion binaries")
+            report_archive = None
+            if "coverage" in recipe:
+                coverage_module().stage_report_objects(stage, variant_target, extraction)
+                extra = stage / "report-objects.tar.gz"
+                report_archive = {"name": extra.name, "sha256": file_sha(extra), "bytes": extra.stat().st_size}
             files = inventory_files(extraction)
             shutil.rmtree(extraction)
             manifest = {"schema": 1, "key": key, "identity": expected, "recipe": recipe,
                 "archive": archive.name, "archive_sha256": file_sha(archive), "archive_bytes": archive.stat().st_size,
                 "files": files, "runtime": runtime, "timings": {"build_command_seconds": built-started, "compile_seconds": compile_seconds, "archive_seconds": archive_seconds, "validation_and_staging_seconds": time.monotonic()-built}}
+            if report_archive is not None:
+                manifest["report_archive"] = report_archive
             (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True)+"\n")
             verify_bundle(stage, request)
             stage.rename(destination)
@@ -457,6 +472,13 @@ def prepare(bundle, request, source, destination, *, env=None):
                     raise ValueError("unsupported archive member")
             tar.extractall(destination, filter="data")
         runtime = manifest["runtime"]
+    if "report_archive" in manifest:
+        with tarfile.open(bundle / manifest["report_archive"]["name"], "r:gz") as tar:
+            for member in tar.getmembers():
+                path = safe_join(destination, member.name)
+                if not member.isfile() or not member.name.startswith("target/") or path.suffix != ".so" or path.exists():
+                    raise ValueError("invalid or colliding coverage report object")
+            tar.extractall(destination, filter="data")
     if inventory_files(destination) != manifest["files"]:
         raise ValueError("extracted file inventory/digest mismatch")
     if runtime != manifest["runtime"]:

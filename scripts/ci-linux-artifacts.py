@@ -38,6 +38,19 @@ CALLBACK_PATHS = ('scripts/prepare-acp-callback-fixture.py', 'scripts/test-prepa
 FULL_PROOF_PATHS = ('.github/workflows/ci.yml', 'scripts/ci-linux-artifacts.py',
                     'scripts/ci-coverage-artifacts.py', 'scripts/ci-test-artifacts.py',
                     'scripts/test-ci-linux-artifacts.py', 'scripts/test-ci-coverage-artifacts.py')
+COMPILER_TESTS = ['pool_escape_apis_are_rejected']
+
+
+def compiler_inventory(item, binary, env):
+    test = item['runtime']['tests'][binary]
+    cwd = archives.safe_join(item['source'], test['cwd'])
+    executable = archives.safe_join(item['target'], test['path'])
+    listing = archives.output([str(executable), '--list', '--format', 'terse'], cwd,
+        archives.runtime_env(item, dict(env, CARGO_MANIFEST_DIR=str(cwd))))
+    names = [line.removesuffix(': test') for line in listing.splitlines() if line.endswith(': test')]
+    if names != COMPILER_TESTS:
+        raise ValueError('compiler gate inventory changed: ' + repr(names))
+    return names
 
 
 def full_proof(changed):
@@ -50,7 +63,9 @@ def recipes(target, event, plan, *, callback_changed=False, full_proof=False):
         raise ValueError('unsupported Linux event')
     result = {name: (recipe, False) for name, recipe in archives.native_recipes('linux', event, target).items()}
     def add(name, args, instrumented=False):
-        result[name] = ({'kind': 'test-archive', 'command': ['cargo', 'nextest', 'archive', '--locked', '--target', target,
+        # Keep implicit host targeting for LLVM: an explicit --target stops
+        # instrumenting host procedural macros and narrows the old report.
+        result[name] = ({'kind': 'test-archive', 'command': ['cargo', 'nextest', 'archive', '--locked', *([] if instrumented else ['--target', target]),
                            '--target-dir', '{target}', *args, '--cargo-message-format', 'json', '--archive-file', '{archive}'], 'companions': []}, instrumented)
     # Retain package feature graphs. A standalone service library differs from
     # the workspace and daemon graphs even when it names the same test.
@@ -153,8 +168,9 @@ def compiler_gates(requests, source, target, root):
                            CARGO_TARGET_DIR=str(target / 'llvm-cov-target'),
                            LLVM_PROFILE_FILE=str(Path(tmp) / 'compiler-gate-%p-%m.profraw'))
                 started = time.monotonic()
+                tests = compiler_inventory(item, binary, env)
                 result = archives.run_libtest(item, binary, [], env=env)
-                receipt['gates'][name] = {'key': key, 'binary': binary, 'exit_code': result,
+                receipt['gates'][name] = {'key': key, 'binary': binary, 'tests': tests, 'exit_code': result,
                                            'seconds': time.monotonic() - started}
                 if result:
                     raise subprocess.CalledProcessError(result, ['fresh-compiler-gate', name, binary])
@@ -168,7 +184,7 @@ def compiler_exclusion(root, name, request, item):
         return None
     receipt = archives.identity.read_request(root / 'compiler-gates.json')
     gate = receipt['gates'].get(name)
-    if receipt['source'] != request['identity']['source']['commit'] or not gate or gate['key'] != archives.identity.build_key(request['identity']) or gate['binary'] != binary or gate['exit_code'] != 0:
+    if receipt['source'] != request['identity']['source']['commit'] or not gate or gate['key'] != archives.identity.build_key(request['identity']) or gate['binary'] != binary or gate['exit_code'] != 0 or gate.get('tests') != COMPILER_TESTS:
         raise ValueError('compile-fail test has no successful fresh producer gate')
     return 'not binary(=store_pool_api)'
 
@@ -239,8 +255,11 @@ def run_coverage(source, root, scope):
             if exclusion:
                 args = ['-E', '(' + args[1] + ') and ' + exclusion] if args else ['-E', exclusion]
             started = time.monotonic()
-            result = archives.run_nextest(item, args, env=env)
+            compiler_only = bool(exclusion) and len(item['runtime']['tests']) == 1
+            result = 0 if compiler_only else archives.run_nextest(item, args, env=env)
             timing = {'test_seconds': time.monotonic() - started, 'extract_seconds': item['extract_seconds'], 'test_exit_code': result, 'fresh_compiler_gate': bool(exclusion)}
+            timing['producer_test_inventory'] = COMPILER_TESTS if exclusion else []
+            timing['compiler_only_selection'] = compiler_only
             receipt['variants'][name] = timing
             if result:
                 raise subprocess.CalledProcessError(result, ['archive-tests', name])

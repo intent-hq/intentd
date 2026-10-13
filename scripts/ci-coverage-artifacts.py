@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 
 
@@ -58,6 +59,34 @@ def build_environment(coverage, source, target):
         raise ValueError('observed LLVM tools/flags differ from archive identity')
     return dict(os.environ, **{name: value.replace('{workspace}', str(source)).replace('{target}', str(target))
                                for name, value in coverage['environment'].items()})
+
+
+def stage_report_objects(stage, target, extraction):
+    """Keep workspace procedural macros in the original LLVM report scope.
+
+    nextest needs no procedural-macro library at runtime and omits it. LLVM
+    reports include these workspace objects, so snapshot the exact Cargo
+    outputs before another feature graph can replace them. Never copy profiles.
+    """
+    metadata = json.loads((extraction / 'target/nextest/cargo-metadata.json').read_text())
+    members = set(metadata['workspace_members'])
+    objects = set()
+    for line in (stage / 'build.jsonl').read_text().splitlines():
+        try:
+            artifact = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if artifact.get('reason') == 'compiler-artifact' and artifact['package_id'] in members and 'proc-macro' in artifact['target']['kind']:
+            objects.update(Path(path) for path in artifact['filenames'] if Path(path).suffix == '.so')
+    with tarfile.open(stage / 'report-objects.tar.gz', 'w:gz') as tar:
+        for path in sorted(objects):
+            relative = path.resolve().relative_to(target.resolve())
+            destination = extraction / 'target' / relative
+            if destination.exists():
+                continue  # Already part of nextest's authenticated inventory.
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+            tar.add(destination, arcname='target/' + relative.as_posix(), recursive=False)
 
 
 def report_environment(root):

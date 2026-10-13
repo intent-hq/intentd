@@ -1391,9 +1391,8 @@ jobs:
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB like coverage-e2e: this job shares
-      # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
-      # outside the work dir" below), so the own-dir skip must name it.
+      # rationale (monorepo#1253). Allow room for the publication, fresh
+      # extraction and isolated profiles, as in coverage-e2e.
       - name: Disk-space preflight (tinybox only)
         if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
         env:

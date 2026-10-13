@@ -64,6 +64,7 @@ class LinuxTests(unittest.TestCase):
         for part in selected:
             self.assertIn(part, command)
         self.assertNotIn('--workspace', command)
+        self.assertNotIn('--target', command)
         self.assertFalse(any(mode for recipe, mode in linux.recipes('host', 'pull_request', self.plan([])).values()))
 
     def test_full_graphs_and_callback_scope_remain_distinct(self):
@@ -136,6 +137,7 @@ class LinuxTests(unittest.TestCase):
                  mock.patch.object(linux.archives, 'verify_bundle', return_value=item), \
                  mock.patch.object(linux.archives, 'prepare', return_value=item), \
                  mock.patch.object(linux.coverage, 'build_environment', return_value={}), \
+                 mock.patch.object(linux, 'compiler_inventory', return_value=linux.COMPILER_TESTS), \
                  mock.patch.object(linux.archives, 'run_libtest', side_effect=[0, 0, 41]) as run:
                 for expected in ({'reused': False}, {'reused': True}):
                     self.assertEqual(linux.produce(ROOT, root, 'merge_group', None, reuse=False), [expected])
@@ -153,11 +155,12 @@ class LinuxTests(unittest.TestCase):
         request = {'identity': {'source': {'commit': 'a' * 40}}}
         binary = 'intent-store::store_pool_api'
         item = {'runtime': {'tests': {binary: {}}}}
-        receipt = {'source': 'a' * 40, 'gates': {'changed-0': {'key': 'key', 'binary': binary, 'exit_code': 0}}}
+        receipt = {'source': 'a' * 40, 'gates': {'changed-0': {'key': 'key', 'binary': binary, 'tests': linux.COMPILER_TESTS, 'exit_code': 0}}}
         mutations = [lambda r: r.update(source='b' * 40), lambda r: r['gates'].clear(),
                      lambda r: r['gates']['changed-0'].update(key='other'),
                      lambda r: r['gates']['changed-0'].update(binary='other'),
-                     lambda r: r['gates']['changed-0'].update(exit_code=1)]
+                     lambda r: r['gates']['changed-0'].update(exit_code=1),
+                     lambda r: r['gates']['changed-0'].update(tests=[])]
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(linux.archives.identity, 'build_key', return_value='key'):
             root = Path(tmp)
             for mutate in mutations:
@@ -192,6 +195,35 @@ class LinuxTests(unittest.TestCase):
                     self.assertEqual(receipt['compiler_calls'], int(compiler_attempt))
                     self.assertEqual(receipt['variants']['changed-0']['test_exit_code'], 100)
                     self.assertGreaterEqual(receipt['variants']['changed-0']['test_seconds'], 0)
+
+    def test_compiler_gate_accounts_for_exact_test_inventory(self):
+        item = {'source': str(ROOT), 'target': '/tmp/archive-target',
+                'runtime': {'tests': {'intent-store::store_pool_api': {'cwd': 'crates/intent-store', 'path': 'gate'}}}}
+        for listing in ('pool_escape_apis_are_rejected: test\n', '', 'new_test: test\n',
+                        'pool_escape_apis_are_rejected: test\nnew_test: test\n'):
+            with mock.patch.object(linux.archives, 'output', return_value=listing), \
+                 mock.patch.object(linux.archives, 'runtime_env', side_effect=lambda item, env: env):
+                if listing == 'pool_escape_apis_are_rejected: test\n':
+                    self.assertEqual(linux.compiler_inventory(item, 'intent-store::store_pool_api', {}), linux.COMPILER_TESTS)
+                else:
+                    with self.assertRaises(ValueError):
+                        linux.compiler_inventory(item, 'intent-store::store_pool_api', {})
+
+    def test_narrow_compiler_only_demand_is_accounted_for_without_empty_runtime_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'requests.json').write_text(json.dumps({'changed-0': {}}))
+            item = {'target': str(root / 'restored/changed-0/target'), 'extract_seconds': 0,
+                    'runtime': {'tests': {'intent-store::store_pool_api': {}}}}
+            with mock.patch.object(linux, 'prepare', return_value={'changed-0': item}), \
+                 mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
+                 mock.patch.object(linux, 'compiler_exclusion', return_value='not binary(=store_pool_api)'), \
+                 mock.patch.object(linux.archives, 'run_nextest') as run:
+                linux.run_coverage(ROOT, root, 'changed')
+                run.assert_not_called()
+                receipt = json.loads((root / 'receipt-changed.json').read_text())['variants']['changed-0']
+                self.assertTrue(receipt['compiler_only_selection'])
+                self.assertEqual(receipt['producer_test_inventory'], linux.COMPILER_TESTS)
 
     def test_callback_inventory_and_failure_prevent_execution(self):
         names = WORKFLOW['jobs']['coverage-changed']['env']['CALLBACK_FIXTURE_TESTS'].split()

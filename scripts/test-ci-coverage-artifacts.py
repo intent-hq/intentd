@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -24,6 +25,53 @@ native = load('ci-native-artifacts')
 
 
 class CoverageTests(unittest.TestCase):
+    def test_package_report_keeps_original_workspace_proc_macro_scope(self):
+        with tempfile.TemporaryDirectory(prefix='intent-coverage-scope-') as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            (source / 'library/src').mkdir(parents=True)
+            (source / 'macros/src').mkdir(parents=True)
+            (source / '.gitignore').write_text('lcov.info\ncoverage-summary.txt\n')
+            (source / 'Cargo.toml').write_text('[workspace]\nresolver="2"\nmembers=["library","macros"]\n')
+            (source / 'library/Cargo.toml').write_text('[package]\nname="scope-library"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nscope-macros={path="../macros"}\n')
+            (source / 'macros/Cargo.toml').write_text('[package]\nname="scope-macros"\nversion="0.1.0"\nedition="2021"\n[lib]\nproc-macro=true\n')
+            (source / 'macros/src/lib.rs').write_text('use proc_macro::TokenStream;\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream { "42u8".parse().unwrap() }\n')
+            (source / 'library/src/lib.rs').write_text('pub fn answer() -> u8 { scope_macros::answer!() }\n#[test] fn test_answer() { assert_eq!(answer(), 42); }\n')
+            subprocess.run(['cargo', 'generate-lockfile', '--offline'], cwd=source, check=True, capture_output=True)
+            for argv in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture']):
+                subprocess.run(['git', *argv], cwd=source, check=True, capture_output=True)
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / 'baseline'))
+            subprocess.run(['cargo', 'llvm-cov', '--no-report', '--remap-path-prefix', 'nextest', '-p', 'scope-library'], cwd=source, env=env, check=True)
+            baseline = root / 'baseline.info'
+            subprocess.run(['cargo', 'llvm-cov', 'report', '--remap-path-prefix', '--lcov', '--output-path', str(baseline)], cwd=source, env=env, check=True)
+            facts = native.platform_facts('linux')
+            recipe = dict(kind='test-archive', command=['cargo', 'nextest', 'archive', '--locked', '--offline', '-p', 'scope-library', '--target-dir', '{target}', '--cargo-message-format', 'json', '--archive-file', '{archive}'], companions=[])
+            request = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True)
+            record = archives.produce([request], source, root / 'archive-target', root / 'published')[0]
+            bundle = root / 'published' / record['key']
+            run = root / 'run'
+            prepared = archives.prepare(bundle, request, source, run)
+            runtime = dict(native.consumer_environment(root / 'guard'), LLVM_PROFILE_FILE=str(run / 'coverage-%p-%m.profraw'))
+            self.assertEqual(archives.run_nextest(prepared, [], env=runtime), 0)
+            self.assertEqual(coverage.report(bundle, prepared, request, 0)['exit_code'], 0)
+            def source_lines(path):
+                result, current = {}, None
+                for line in path.read_text().splitlines():
+                    if line.startswith('SF:'):
+                        current = line[3:]
+                        result[current] = set()
+                    elif line.startswith('DA:'):
+                        result[current].add(int(line[3:].split(',')[0]))
+                return result
+            self.assertEqual(source_lines(source / 'lcov.info'), source_lines(baseline))
+            extra = bundle / 'report-objects.tar.gz'
+            with tarfile.open(extra) as tar:
+                self.assertTrue(tar.getmembers())
+                self.assertTrue(all(member.name.endswith('.so') for member in tar.getmembers()))
+            extra.write_bytes(extra.read_bytes() + b'tampered')
+            with self.assertRaisesRegex(ValueError, 'report archive size/digest mismatch'):
+                archives.verify_bundle(bundle, request)
+
     def test_real_relocated_archives_fresh_profiles_and_floors(self):
         with tempfile.TemporaryDirectory(prefix='intent-coverage-archive-') as tmp:
             root = Path(tmp)
