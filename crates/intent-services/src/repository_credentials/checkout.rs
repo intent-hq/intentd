@@ -79,16 +79,40 @@ impl RepositoryConnectionDirectory {
         action(&published.verified.descriptor, &selected, stamp)
     }
 
-    pub(crate) fn child_policy_status(
+    /// Metadata output accepts disabled policy too, but retains the original
+    /// binding and child mutation/revision guards through the caller's action.
+    pub(crate) fn with_child_policy_metadata<T>(
         &self,
-        binding: &RepositoryConnectionBinding,
-    ) -> Result<(bool, u64)> {
+        original: &RepositoryConnectionBinding,
+        expected: Option<(bool, u64)>,
+        action: impl FnOnce(&GitlabDescriptor, &RepositorySecretRequest, bool, u64) -> Result<T>,
+    ) -> Result<T> {
         let state = self.lock()?;
-        if &state.ready()?.binding != binding {
+        if state.status == RepositoryConnectionState::Retired
+            || original.daemon_id != self.daemon_id
+            || state.generation != original.scope.connection_generation
+            || state
+                .published
+                .as_ref()
+                .is_none_or(|p| p.binding != *original)
+        {
             return Err(RepositoryCredentialError::Retired);
         }
+        let published = state.ready()?;
         state.child_idle()?;
-        Ok((state.child_enabled, state.child_revision))
+        if expected.is_some_and(|choice| choice != (state.child_enabled, state.child_revision)) {
+            return Err(RepositoryCredentialError::Retired);
+        }
+        action(
+            &published.verified.descriptor,
+            &RepositorySecretRequest {
+                binding: published.binding.clone(),
+                secret_revision: state.secret_revision,
+                source: published.verified.source,
+            },
+            state.child_enabled,
+            state.child_revision,
+        )
     }
 
     /// Hydration from the original writer's durable, account-qualified choice.

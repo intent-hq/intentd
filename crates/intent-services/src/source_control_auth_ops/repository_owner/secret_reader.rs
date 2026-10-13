@@ -853,25 +853,13 @@ impl RepositorySettledConnection {
                 .published
                 .lock()
                 .map_err(|_| Error::Indeterminate)?;
-            if settings.source.is_none()
-                || settings.store.is_none()
-                || selected.source != RepositoryCredentialSource::GitlabSecretSlot
-            {
-                return Err(Error::Unverified);
-            }
-            let proof = proof.as_ref().ok_or(Error::Unverified)?;
-            if proof.request != *selected {
-                return Err(Error::SecretMismatch);
-            }
-            if descriptor.as_ref() != Some(actual)
-                || proof.descriptor != *actual
-                || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
-                    != Some(actual)
-                || self.descriptor != *actual
-                || self.selected.source != selected.source
-            {
-                return Err(Error::BoundaryMismatch);
-            }
+            self.check_checkout_proof(
+                &config,
+                descriptor.as_ref(),
+                actual,
+                selected,
+                proof.as_deref(),
+            )?;
             let denials = self
                 .owner
                 .evidence
@@ -898,6 +886,73 @@ impl RepositorySettledConnection {
                 validate,
             ),
         }
+    }
+
+    fn check_checkout_proof(
+        &self,
+        config: &intent_core::settings_file::GitlabSettings,
+        descriptor: Option<&GitlabDescriptor>,
+        actual: &GitlabDescriptor,
+        selected: &RepositorySecretRequest,
+        proof: Option<&AttestedSource>,
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        if settings.source.is_none()
+            || settings.store.is_none()
+            || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+        {
+            return Err(Error::Unverified);
+        }
+        let proof = proof.ok_or(Error::Unverified)?;
+        if proof.request != *selected {
+            return Err(Error::SecretMismatch);
+        }
+        if descriptor != Some(actual)
+            || proof.descriptor != *actual
+            || super::adoption::approved_descriptor(config, &settings.fixtures).as_ref()
+                != Some(actual)
+            || self.descriptor != *actual
+            || self.selected.source != selected.source
+        {
+            return Err(Error::BoundaryMismatch);
+        }
+        Ok(())
+    }
+
+    /// Keep the original source proof and disabled/enabled child metadata under
+    /// the same ranked locks until a single synchronous output transfer finishes.
+    pub(crate) fn with_child_policy_status<T>(
+        &self,
+        expected: Option<(bool, u64)>,
+        action: impl FnOnce(bool, u64) -> Result<T>,
+    ) -> Result<T> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.owner.directory.with_child_policy_metadata(
+            &self.selected.binding,
+            expected,
+            |actual, selected, enabled, revision| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                self.check_checkout_proof(
+                    &config,
+                    descriptor.as_ref(),
+                    actual,
+                    selected,
+                    proof.as_deref(),
+                )?;
+                action(enabled, revision)
+            },
+        )
     }
 
     /// A denial from the actual original response quarantines this source

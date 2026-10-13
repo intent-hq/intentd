@@ -109,6 +109,72 @@ pub(crate) struct GitlabChildPolicyStatus {
     pub(crate) enabled: bool,
 }
 
+/// Owned status plus its original final-delivery proof. No caller constructor.
+pub(crate) struct GitlabChildPolicyOutput {
+    status: GitlabChildPolicyStatus,
+    receipt: GitlabChildPolicyReceipt,
+}
+
+impl GitlabChildPolicyOutput {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        super::GitlabChildPolicyStatus,
+        super::GitlabChildPolicyReceipt,
+    ) {
+        (self.status, self.receipt)
+    }
+}
+
+/// Token-free, one-use metadata output. The action must not await, do I/O,
+/// spawn, or recursively take the retained R authority or P metadata locks.
+pub(crate) struct GitlabChildPolicyReceipt {
+    original: Arc<RepositorySettledConnection>,
+    choice: (bool, u64),
+    authority: Arc<dyn CheckoutAuthority>,
+    consumed: AtomicBool,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "status output is composed by the transport consumer"
+    )
+)]
+impl GitlabChildPolicyReceipt {
+    /// Consume this receipt to bind one immutable encoded output frame. The
+    /// returned guard may recheck its original facts on every transport phase.
+    pub(crate) fn into_output(self) -> CoreResult<super::GitlabChildOutputGuard> {
+        self.with_current(|| Ok(()))?;
+        Ok(GitlabChildOutputGuard {
+            original: self.original,
+            authority: self.authority,
+            proof: OutputProof::Policy(self.choice),
+        })
+    }
+
+    pub(crate) fn with_current(
+        &self,
+        transfer: impl FnOnce() -> CoreResult<()> + Send,
+    ) -> CoreResult<()> {
+        let mut transfer = Some(transfer);
+        let mut result = None;
+        self.authority.dispatch(&mut || {
+            self.original
+                .with_child_policy_status(Some(self.choice), |_, _| {
+                    if self.consumed.swap(true, Ordering::AcqRel) {
+                        return Err(Error::Retired);
+                    }
+                    result = Some(transfer.take().ok_or(Error::Retired)?());
+                    Ok(())
+                })
+                .map_err(local)
+        })?;
+        result.ok_or_else(|| local(Error::AuthorityUnavailable))?
+    }
+}
+
 /// Caller-supplied comparison facts only; never an authority or a grant.
 #[derive(Clone)]
 pub(crate) struct GitlabChildPolicyExpected {
@@ -156,6 +222,20 @@ pub(crate) struct GitlabChildCredentialReceipt {
     )
 )]
 impl GitlabChildCredentialReceipt {
+    /// Bind one immutable credential frame; no token is retained in the guard.
+    pub(crate) fn into_output(self) -> CoreResult<super::GitlabChildOutputGuard> {
+        self.with_current(|| Ok(()))?;
+        Ok(GitlabChildOutputGuard {
+            original: self.original,
+            authority: self.authority,
+            proof: OutputProof::Credential {
+                selected: Box::new(self.selected),
+                child_revision: self.child_revision,
+                project: self.project,
+            },
+        })
+    }
+
     pub(crate) fn with_current(
         &self,
         transfer: impl FnOnce() -> CoreResult<()> + Send,
@@ -178,6 +258,66 @@ impl GitlabChildCredentialReceipt {
                     },
                 )
                 .map_err(local)
+        })?;
+        result.ok_or_else(|| local(Error::AuthorityUnavailable))?
+    }
+}
+
+enum OutputProof {
+    Policy((bool, u64)),
+    Credential {
+        selected: Box<RepositorySecretRequest>,
+        child_revision: u64,
+        project: String,
+    },
+}
+
+/// A nonsecret guard for ONE immutable frame owned by R. It is not cloneable
+/// and cannot recapture an owner or rotate a credential. Every synchronous
+/// nonblocking write/readiness/flush phase re-enters the original R/P fence;
+/// no lock guard is retained while transport is Pending; no await/spawn is allowed.
+pub(crate) struct GitlabChildOutputGuard {
+    original: Arc<RepositorySettledConnection>,
+    authority: Arc<dyn CheckoutAuthority>,
+    proof: OutputProof,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "bound output phases are composed by the transport consumer"
+    )
+)]
+impl GitlabChildOutputGuard {
+    pub(crate) fn with_current(
+        &self,
+        action: impl FnOnce() -> CoreResult<()> + Send,
+    ) -> CoreResult<()> {
+        let mut action = Some(action);
+        let mut result = None;
+        let mut transfer = || {
+            result = Some(action.take().ok_or(Error::Retired)?());
+            Ok(())
+        };
+        self.authority.dispatch(&mut || {
+            match &self.proof {
+                OutputProof::Policy(choice) => self
+                    .original
+                    .with_child_policy_status(Some(*choice), |_, _| transfer()),
+                OutputProof::Credential {
+                    selected,
+                    child_revision,
+                    project,
+                } => self.original.with_child_current(
+                    Some(selected),
+                    &[project],
+                    true,
+                    Some(*child_revision),
+                    |_, _| transfer(),
+                ),
+            }
+            .map_err(local)
         })?;
         result.ok_or_else(|| local(Error::AuthorityUnavailable))?
     }
@@ -243,28 +383,53 @@ impl crate::Services {
 impl GitlabChildPolicyCapture {
     fn current_status(&self) -> CoreResult<GitlabChildPolicyStatus> {
         self.original
-            .with_checkout_current(None, &[], false, |_, _| Ok(()))
-            .map_err(local)?;
-        let binding = &self.original.selected().binding;
-        let (enabled, revision) = self
-            .owner
-            .directory
-            .child_policy_status(binding)
-            .map_err(local)?;
-        Ok(GitlabChildPolicyStatus {
-            instance_base_url: binding.account.instance_base_url.clone(),
-            account_id: binding.account.account_id.clone(),
-            connection_id: binding.scope.connection_id.clone(),
-            connection_generation: binding.scope.connection_generation,
-            revision,
-            enabled,
-        })
+            .with_child_policy_status(None, |enabled, revision| {
+                let binding = &self.original.selected().binding;
+                Ok(GitlabChildPolicyStatus {
+                    instance_base_url: binding.account.instance_base_url.clone(),
+                    account_id: binding.account.account_id.clone(),
+                    connection_id: binding.scope.connection_id.clone(),
+                    connection_generation: binding.scope.connection_generation,
+                    revision,
+                    enabled,
+                })
+            })
+            .map_err(local)
+    }
+
+    fn status_output(
+        &self,
+        grant: Option<&Grant>,
+        authority: &Arc<dyn CheckoutAuthority>,
+    ) -> CoreResult<super::GitlabChildPolicyOutput> {
+        let mut result = None;
+        authority.dispatch(&mut || {
+            if result.is_some() {
+                return Err(local(Error::Retired));
+            }
+            let mut status = self.current_status()?;
+            let choice = (status.enabled, status.revision);
+            status.enabled &= grant.is_some_and(|grant| {
+                grant.enabled && grant.matches(&status.instance_base_url, &status.account_id)
+            });
+            result = Some(GitlabChildPolicyOutput {
+                status,
+                receipt: GitlabChildPolicyReceipt {
+                    original: self.original.clone(),
+                    choice,
+                    authority: authority.clone(),
+                    consumed: AtomicBool::new(false),
+                },
+            });
+            Ok(())
+        })?;
+        result.ok_or_else(|| local(Error::AuthorityUnavailable))
     }
 
     pub(crate) async fn status(
         &self,
-        authority: &dyn CheckoutAuthority,
-    ) -> CoreResult<super::GitlabChildPolicyStatus> {
+        authority: Arc<dyn CheckoutAuthority>,
+    ) -> CoreResult<super::GitlabChildPolicyOutput> {
         let guard = self.gate.lock().await;
         let store = self.store.clone();
         let lease = guard.lease();
@@ -274,19 +439,7 @@ impl GitlabChildPolicyCapture {
         })
         .await
         .map_err(|_| local(Error::Indeterminate))??;
-        let mut result = None;
-        authority.dispatch(&mut || {
-            if result.is_some() {
-                return Err(local(Error::Retired));
-            }
-            let mut status = self.current_status()?;
-            status.enabled &= grant.as_ref().is_some_and(|grant| {
-                grant.enabled && grant.matches(&status.instance_base_url, &status.account_id)
-            });
-            result = Some(status);
-            Ok(())
-        })?;
-        result.ok_or_else(|| local(Error::AuthorityUnavailable))
+        self.status_output(grant.as_ref(), &authority)
     }
 
     pub(crate) async fn set(
@@ -294,7 +447,7 @@ impl GitlabChildPolicyCapture {
         expected: super::GitlabChildPolicyExpected,
         enabled: bool,
         authority: Arc<dyn CheckoutAuthority>,
-    ) -> CoreResult<GitlabChildPolicyStatus> {
+    ) -> CoreResult<super::GitlabChildPolicyOutput> {
         let guard = self.gate.lock().await;
         let mut mutation = None;
         authority.dispatch(&mut || {
@@ -344,8 +497,7 @@ impl GitlabChildPolicyCapture {
             mutation.complete(enabled).map_err(local)
         });
         job.await.map_err(|_| local(Error::Indeterminate))??;
-        drop(guard);
-        self.status(authority.as_ref()).await
+        self.status_output(Some(&grant), &authority)
     }
 
     /// Resolve only the currently enabled original account's exact HTTPS root.
@@ -391,7 +543,7 @@ impl GitlabChildPolicyCapture {
         {
             return Ok(None);
         }
-        let status = self.status(authority.as_ref()).await?;
+        let (status, _) = self.status(authority.clone()).await?.into_parts();
         if !status.enabled {
             return Ok(None);
         }
