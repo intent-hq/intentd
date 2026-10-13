@@ -30,7 +30,7 @@ curl --fail --silent --show-error --location --max-time 120 \
 tar -xzf "$RUNNER_TEMP/fingerprint-nextest.tar.gz" -C "$RUNNER_TEMP/fingerprint-nextest"
 export PATH="$RUNNER_TEMP/fingerprint-nextest:$PATH"
 cargo nextest --version
-test "$(cargo nextest --version | cut -d ' ' -f 2)" = 0.9.143
+test "$(cargo nextest --version | awk 'NR == 1 { print $2 }')" = 0.9.143
 fixture=$(python3 -I -B -S "$component/scripts/prepare-acp-callback-fixture.py" \
   --cache-dir "$RUNNER_TEMP/fingerprint-callback" --build-from-source \
   2> "$evidence/callback-build.log")

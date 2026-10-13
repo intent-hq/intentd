@@ -4,6 +4,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -57,6 +59,18 @@ class GuardTests(unittest.TestCase):
             guard.stop_group(child)
         self.assertEqual(kill.call_args_list[0].args, (123456, guard.signal.SIGTERM))
         self.assertEqual(kill.call_args_list[1].args, (123456, guard.signal.SIGKILL))
+
+    def test_pinned_nextest_accepts_multiline_version_and_rejects_wrong_version(self):
+        script = Path(__file__).with_name("fingerprint-native-run.sh").read_text()
+        assertion = next(line for line in script.splitlines()
+                         if line.startswith('test "$(cargo nextest --version'))
+        for version, expected in [("0.9.143", 0), ("0.9.144", 1)]:
+            output = (f"cargo-nextest {version} (60fa45f63 2026-08-04)\n"
+                      f"release: {version}\ncommit-hash: 60fa45f63\n"
+                      "commit-date: 2026-08-04\nhost: x86_64-unknown-linux-gnu\n")
+            command = "cargo() { printf '%s' " + shlex.quote(output) + "; }; " + assertion
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", command], check=False)
+            self.assertEqual(result.returncode, expected, version)
 
     def test_exact_filter_and_receipt_membership(self):
         targets = json.loads(Path(__file__).with_name("fingerprint-native-targets.json").read_text())
