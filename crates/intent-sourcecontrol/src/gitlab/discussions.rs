@@ -19,7 +19,12 @@ impl GitLabSourceControl {
             return Err(Error::Config("review number must be positive".into()));
         }
         let page = self
-            .page(&format!("{}/discussions", mr(repo, iid)), vec![], page)
+            .page_for(
+                &format!("{}/discussions", mr(repo, iid)),
+                vec![],
+                page,
+                super::http::Purpose::Optional,
+            )
             .await?;
         let mut seen_threads = HashSet::new();
         let mut seen_notes = HashSet::new();

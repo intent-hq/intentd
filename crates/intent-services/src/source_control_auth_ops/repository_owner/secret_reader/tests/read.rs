@@ -4293,3 +4293,43 @@ async fn filtered_issue_denials_preserve_actual_error_quota_and_acquired_revisio
         }
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn managed_complete_discussion_optional_errors_preserve_primary_and_actual_receipt() {
+    for (status, kind) in [
+        (403, ProviderFailureKind::OptionalRestricted),
+        (404, ProviderFailureKind::OptionalUnavailable),
+        (405, ProviderFailureKind::OptionalUnavailable),
+        (501, ProviderFailureKind::OptionalUnavailable),
+        (401, ProviderFailureKind::CredentialRejected),
+    ] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let (_, primary, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        assert!(primary.review_details().await.into_parts().0.is_ok());
+        s.status(&format!("{MR}/discussions?page=1&per_page=20"), status);
+        let (eligibility, operation, target) =
+            f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let (result, quota, receipt) = operation
+            .review_discussions(intent_sourcecontrol::PageParams::first(20))
+            .await
+            .into_parts();
+        denial(&result, kind, status);
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            applied(&eligibility, &receipt, &target).unwrap(),
+            if status == 401 {
+                D::AcceptedCredentialRejection
+            } else {
+                D::NoDenial
+            }
+        );
+        if status == 401 {
+            assert!(eligibility.check().is_err());
+        } else {
+            eligibility.check().unwrap();
+            let (_, primary, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+            assert!(primary.review_details().await.into_parts().0.is_ok());
+        }
+    }
+}

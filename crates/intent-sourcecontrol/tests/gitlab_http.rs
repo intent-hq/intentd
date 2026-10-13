@@ -2575,3 +2575,35 @@ async fn remaining_issue_filters_use_exact_current_user_scope_and_isolated_empty
         "no user-identity or participant probe"
     );
 }
+
+#[tokio::test]
+async fn complete_discussion_failures_use_optional_scope_without_losing_auth_or_quota() {
+    for (status, kind) in [
+        (403, ProviderFailureKind::OptionalRestricted),
+        (404, ProviderFailureKind::OptionalUnavailable),
+        (405, ProviderFailureKind::OptionalUnavailable),
+        (501, ProviderFailureKind::OptionalUnavailable),
+        (401, ProviderFailureKind::CredentialRejected),
+    ] {
+        let f = Fixture::new(move |_| {
+            let mut response = reply(status, json!({"message":"unavailable"}));
+            response
+                .headers
+                .push(("ratelimit-remaining".into(), "23".into()));
+            response
+        })
+        .await;
+        let provider = f.provider();
+        let result = provider
+            .list_discussions(&repo(), 7, PageParams::first(20))
+            .await;
+        assert!(
+            matches!(result, Err(Error::Provider(ProviderFailure { kind:k, status:Some(s) })) if k == kind && s == status)
+        );
+        assert_eq!(
+            provider.rate_limit_status().await.unwrap().remaining,
+            Some(23)
+        );
+        assert_eq!(f.requests().len(), 1);
+    }
+}
