@@ -27,7 +27,7 @@ pub(crate) fn profile_revision() -> &'static str {
             include_str!("note_page_html/primitive.rs"),
             include_str!("tests/fixtures/note_html_native.json"),
             include_str!("tests/fixtures/note_primitive_native.json"),
-            include_str!(concat!(env!("OUT_DIR"), "/profile-Cargo.lock")),
+            include_str!(concat!(env!("OUT_DIR"), "/note-index-dependencies.txt")),
         ] {
             digest.update(input.as_bytes());
             digest.update([0]);
