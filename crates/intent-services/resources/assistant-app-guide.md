@@ -359,7 +359,10 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
-Workspace file links open a file panel. Excel workbooks and other binary files
+Workspace file links open a file panel. Markdown files open in a read-only preview
+that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
 Binary files are not editable in the file panel or Files view. Delete is unavailable
@@ -367,7 +370,7 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
 
 ## Daemon lifecycle from the terminal
 
