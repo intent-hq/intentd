@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """LLVM archive build identity and isolated, compile-free coverage reporting."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -52,6 +53,14 @@ def tool_versions(source, env=None):
 
 def flags(coverage):
     return [name + '=' + value for name, value in sorted(coverage['environment'].items())]
+
+
+def target_directory(base, captured):
+    # llvm-cov's rustc wrapper injects flags that Cargo does not fingerprint.
+    # Keep incompatible wrapper flags/tools apart while sharing one target for
+    # every feature graph with identical instrumentation. No source SHA here.
+    digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()
+    return Path(base) / 'llvm-cov-target' / digest
 
 
 def build_environment(coverage, source, target, *, remap=True):

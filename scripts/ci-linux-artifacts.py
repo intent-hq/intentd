@@ -163,9 +163,10 @@ def compiler_gates(requests, source, target, root):
                 continue
             with tempfile.TemporaryDirectory(prefix='compiler-gate-', dir=root) as tmp:
                 item = archives.prepare(bundle, request, source, Path(tmp) / 'archive')
-                env = coverage.build_environment(request['recipe']['coverage'], source, target / 'llvm-cov-target', remap=False)
+                diagnostic_target = coverage.target_directory(target, coverage.capture(source, remap=False))
+                env = coverage.build_environment(request['recipe']['coverage'], source, diagnostic_target, remap=False)
                 env.update(INTENTD_ASSERT_BOUND_CALLER='1', INTENTD_TEST_TIMEOUT_MULTIPLIER='3',
-                           CARGO_TARGET_DIR=str(target / 'llvm-cov-target'),
+                           CARGO_TARGET_DIR=str(diagnostic_target),
                            LLVM_PROFILE_FILE=str(Path(tmp) / 'compiler-gate-%p-%m.profraw'))
                 started = time.monotonic()
                 tests = compiler_inventory(item, binary, env)

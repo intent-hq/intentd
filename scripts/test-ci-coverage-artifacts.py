@@ -25,6 +25,15 @@ native = load('ci-native-artifacts')
 
 
 class CoverageTests(unittest.TestCase):
+    def test_wrapper_flags_and_tools_isolate_cargo_cache_without_source_or_feature_partition(self):
+        captured = {'environment': {'wrapper-flags': 'coverage remap'}, 'tools': {'llvm': 'v1'}}
+        same = {'tools': {'llvm': 'v1'}, 'environment': {'wrapper-flags': 'coverage remap'}}
+        original = coverage.target_directory(Path('/tmp/shared'), captured)
+        self.assertEqual(original, coverage.target_directory(Path('/tmp/shared'), same))
+        for other in ({'environment': {'wrapper-flags': 'coverage'}, 'tools': {'llvm': 'v1'}},
+                      {'environment': captured['environment'], 'tools': {'llvm': 'v2'}}):
+            self.assertNotEqual(original, coverage.target_directory(Path('/tmp/shared'), other))
+
     def test_package_report_keeps_original_workspace_proc_macro_scope(self):
         with tempfile.TemporaryDirectory(prefix='intent-coverage-scope-') as tmp:
             root = Path(tmp)

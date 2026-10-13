@@ -372,7 +372,7 @@ def produce(requests, source, target, published):
         with tempfile.TemporaryDirectory(prefix=".staging-", dir=published) as temporary:
             stage = Path(temporary)
             archive = stage / ("tests.tar.zst" if recipe["kind"] == "test-archive" else "binaries.tar.gz")
-            variant_target = target / "llvm-cov-target" if "coverage" in recipe else target
+            variant_target = coverage_module().target_directory(target, recipe["coverage"]) if "coverage" in recipe else target
             environment = coverage_module().build_environment(recipe["coverage"], source, variant_target) if "coverage" in recipe else os.environ
             command = [str(archive) if x == "{archive}" else str(variant_target) if x == "{target}" else x for x in recipe["command"]]
             started = time.monotonic()

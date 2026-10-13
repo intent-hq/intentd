@@ -136,6 +136,7 @@ class LinuxTests(unittest.TestCase):
                  mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \
                  mock.patch.object(linux.archives, 'verify_bundle', return_value=item), \
                  mock.patch.object(linux.archives, 'prepare', return_value=item), \
+                 mock.patch.object(linux.coverage, 'capture', return_value={}), \
                  mock.patch.object(linux.coverage, 'build_environment', return_value={}) as environment, \
                  mock.patch.object(linux, 'compiler_inventory', return_value=linux.COMPILER_TESTS), \
                  mock.patch.object(linux.archives, 'run_libtest', side_effect=[0, 0, 41]) as run:
