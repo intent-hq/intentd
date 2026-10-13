@@ -252,9 +252,12 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 In **Home → Workspaces**, the status icon in list and board views describes the
 workspace's current status. Hover over it for an explanation:
 
-- **PR Open** (blue pull request icon): a pull request is open.
-- **PR Mergeable** (green pull request icon): a pull request is reported ready to merge.
+- **PR Open** (pull request icon): a pull request is open.
+- **PR Mergeable** (pull request icon): a pull request is reported ready to merge.
 - **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Colors follow the current theme: Open and Queued use its informational color;
+Mergeable uses its success color. Use the label and tooltip to identify the state.
 
 Questions, review requests, failures, and blockers can take precedence over PR
 icons. **PR Mergeable** does not grant permission to merge: agents still need the
