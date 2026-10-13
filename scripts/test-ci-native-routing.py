@@ -55,7 +55,7 @@ def condition(value, context, *, success=True, cancelled=False):
     expression = re.sub(r"\b(always|success|failure|cancelled)\(\)", lambda m: repr(statuses[m[1]]), expression)
     expression = re.sub(r"contains\(matrix.os, 'self-hosted'\)",
                         lambda _: repr("self-hosted" in context.get("matrix.os", [])), expression)
-    expression = re.sub(r"\b(?:github|needs|runner)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
+    expression = re.sub(r"\b(?:github|needs|runner|env)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression).strip()
     expression = re.sub(r"\btrue\b|\bfalse\b", lambda m: m[0].title(), expression)
@@ -376,6 +376,158 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                  fast_path != "true" and "self-hosted" not in labels)
 
 
+class LifecycleCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.job = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["daemon-lifecycle"]
+        cls.steps = cls.job["steps"]
+
+    def step(self, name):
+        matches = [s for s in self.steps if s.get("name") == name]
+        self.assertEqual(len(matches), 1, name)
+        return matches[0]
+
+    def test_remote_cache_runs_only_on_hosted_runners(self):
+        cache = next(s for s in self.steps if s.get("uses", "").startswith("Swatinem/rust-cache@"))
+        self.assertEqual(cache["with"]["shared-key"], "daemon-lifecycle-${{ matrix.platform }}")
+        for platform in ("Linux", "macOS", "Windows"):
+            for hosted in (False, True):
+                values = {**context("pull_request", platform=platform),
+                          "matrix.os": [platform] if hosted else ["self-hosted", platform]}
+                with self.subTest(platform=platform, hosted=hosted):
+                    self.assertEqual(condition(cache.get("if", True), values), hosted)
+
+    def test_persistent_paths_are_platform_scoped_and_precede_compilation(self):
+        names = {"Point lifecycle target outside checkout (Linux)": {"Linux"},
+                 "Point lifecycle target outside checkout (macOS and Windows)": {"macOS", "Windows"},
+                 "Disk-space preflight (tinybox only)": {"Linux"},
+                 "Ensure macOS CI disk headroom": {"macOS"}}
+        toolchain = self.steps.index(self.step("Resolve pinned Rust channel"))
+        for name, platforms in names.items():
+            step = self.step(name)
+            self.assertLess(self.steps.index(step), toolchain)
+            self.assertFalse(step.get("continue-on-error", False))
+            for platform in ("Linux", "macOS", "Windows"):
+                for hosted in (False, True):
+                    values = {**context("merge_group", platform=platform),
+                              "matrix.os": [platform] if hosted else ["self-hosted", platform]}
+                    self.assertEqual(condition(step.get("if", True), values), not hosted and platform in platforms)
+        self.assertLess(self.steps.index(self.step("Disk-space preflight (tinybox only)")),
+                        self.steps.index(self.step("Point lifecycle target outside checkout (Linux)")))
+
+    def test_linux_slot_targets_survive_checkout_and_release_after_failure(self):
+        step = self.step("Point lifecycle target outside checkout (Linux)")
+        self.assertIn('/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle', step["run"])
+        release = self.step("Release lifecycle target dir")
+        self.assertEqual(self.steps[-1], release)
+        for platform in ("Linux", "macOS", "Windows"):
+            for marked in (False, True):
+                values = {**context("pull_request", platform=platform),
+                          "matrix.os": ["self-hosted", platform],
+                          "env.CARGO_TARGET_DIR": "/fixture/target" if marked else ""}
+                for success in (False, True):
+                    self.assertEqual(condition(release["if"], values, success=success, cancelled=True),
+                                     platform == "Linux" and marked)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            targets = []
+            for slot in ("slot1", "slot2"):
+                envfile = root / (slot + ".env")
+                body = step["run"].replace("/raid/ci-target", str(root / "ci-target"))
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
+                                        env={**os.environ, "RUNNER_NAME": slot, "GITHUB_ENV": str(envfile)},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                target = Path(envfile.read_text().strip().removeprefix("CARGO_TARGET_DIR="))
+                self.assertEqual(target, root / "ci-target/intentd" / slot / "daemon-lifecycle")
+                self.assertTrue((target / ".in-use").is_file())
+                artifact = target / "warm-artifact"
+                artifact.touch()
+                disposable = checkout / "target"
+                disposable.mkdir()
+                (disposable / "cold-artifact").touch()
+                subprocess.run(["git", "-C", str(checkout), "clean", "-ffdx"], check=True, capture_output=True)
+                self.assertFalse(disposable.exists())
+                self.assertTrue(artifact.exists())
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", release["run"]], cwd=ROOT,
+                                        env={**os.environ, "CARGO_TARGET_DIR": str(target)}, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((target / ".in-use").exists())
+                self.assertTrue(artifact.exists())
+                targets.append(target)
+            self.assertNotEqual(*targets)
+
+    def test_macos_and_windows_keep_native_persistent_paths(self):
+        step = self.step("Point lifecycle target outside checkout (macOS and Windows)")
+        self.assertEqual(step["shell"], "bash")
+        bash = self.step("Put Git Bash first on PATH (Windows)")
+        self.assertLess(self.steps.index(bash), self.steps.index(step))
+        for platform, profile in (("macos", ""), ("windows", "C:\\Users\\CI User")):
+            with tempfile.TemporaryDirectory() as tmp:
+                envfile = Path(tmp) / "env"
+                body = step["run"].replace("${{ matrix.platform }}", platform)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
+                                        env={**os.environ, "USERPROFILE": profile, "GITHUB_ENV": str(envfile)},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(envfile.read_text().strip(),
+                                 f"CARGO_TARGET_DIR={profile or os.environ['HOME']}/ci-target/intentd/daemon-lifecycle-{platform}")
+
+    def test_linux_preflight_executes_only_safe_fixture_evictions(self):
+        step = self.step("Disk-space preflight (tinybox only)")
+        for scenario, age_minutes in (("adequate", 5000), ("stale", 5000), ("lru", 60), ("exhausted", 0)):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                raid = root / "raid"
+                targets = raid / "ci-target/intentd"
+                own = targets / "self/daemon-lifecycle"
+                live = targets / "other/daemon-lifecycle"
+                idle = targets / "idle/daemon-lifecycle"
+                for target in (own, live, idle):
+                    (target / "debug/deps").mkdir(parents=True)
+                    (target / "debug/deps/artifact").touch()
+                    for entry in sorted(target.rglob("*"), reverse=True):
+                        os.utime(entry, (1, 1))
+                    os.utime(target, (1, 1))
+                (live / ".in-use").touch()
+                now = (live / ".in-use").stat().st_mtime
+                for entry in [idle, *idle.rglob("*")]:
+                    os.utime(entry, (now - age_minutes * 60,) * 2)
+                stub = root / "df"
+                available = 20 if scenario == "adequate" else 5
+                stub.write_text("#!/bin/sh\nblocks=" + str(available * 1048576) +
+                                "\n[ -d " + shlex.quote(str(idle)) + " ] || blocks=20971520\n" +
+                                "printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 99999999 0 %s 0%% /fixture\n' \"$blocks\"\n")
+                stub.chmod(0o755)
+                # Rewrite every absolute production root before running deletion.
+                body = step["run"].replace("/raid", str(raid))
+                self.assertNotIn("/raid/ci-target", body.replace(str(raid), "FIXTURE"))
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
+                                        env={**os.environ, **{k: str(v) for k, v in step["env"].items()},
+                                             "RUNNER_NAME": "self", "PATH": str(root) + os.pathsep + os.environ["PATH"]},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1 if scenario == "exhausted" else 0, result.stdout + result.stderr)
+                self.assertEqual(idle.exists(), scenario in ("adequate", "exhausted"))
+                self.assertTrue((own / "debug/deps/artifact").exists())
+                self.assertTrue((live / "debug/deps/artifact").exists())
+
+    def test_linux_preflight_keeps_existing_prune_rails(self):
+        step = self.step("Disk-space preflight (tinybox only)")
+        self.assertEqual(step["env"]["JOB_TARGET_SUBDIR"], "daemon-lifecycle")
+        self.assertGreaterEqual(int(step["env"]["NEED_GIB"]), 15)
+        body = step["run"]
+        for required in ('/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR',
+                         'is-purgeable "$dir" --quiet-min "$quiet_min"',
+                         'purge-candidates /raid/ci-target',
+                         'evict_until_free pruning 2880 --skip-dir "$own_dir"',
+                         'evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"', 'exit 1'):
+            self.assertIn(required, body)
+        self.assertLess(body.index('is-purgeable'), body.index('rm -rf'))
+
+
 class NativeRoutingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -489,6 +641,8 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertFalse(job["strategy"]["fail-fast"])
         step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle lint and runtime proof")
         self.assertIn("python3 -I -B scripts/test-daemon-lifecycle.py", step["run"])
+        self.assertIn("cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings", step["run"])
+        self.assertNotIn("if", step)
         self.assertFalse(step.get("continue-on-error", False))
         for event in ("pull_request", "merge_group"):
             workflow = copy.deepcopy(self.workflow)
