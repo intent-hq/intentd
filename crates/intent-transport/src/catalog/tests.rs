@@ -190,14 +190,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 434;
+const EXPECTED_TOTAL_METHODS: usize = 440;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+const EXPECTED_ROUTER_METHODS: usize = 384;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -843,8 +843,14 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1381,6 +1387,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.getUser",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -2052,6 +2059,10 @@ mod unbound_owner_only_methods {
                 "sourceControl.identityProof.delete",
                 json!({ "provider": "github", "proofId": "g" }),
             ),
+            (
+                "sourceControl.read.resolveKnownRepository",
+                json!({ "context": { "kind": "host" }, "readLifetimeId": "original", "path": dir }),
+            ),
             ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
             ("specialist.delete", json!({ "id": "s", "scope": "global" })),
@@ -2571,6 +2582,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.getUser",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
+        "sourceControl.read.resolveKnownRepository",
         "sourceControl.revoke",
         "specialist.create",
         "specialist.delete",

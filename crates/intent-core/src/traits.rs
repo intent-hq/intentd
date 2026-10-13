@@ -167,6 +167,68 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    fn repository_resource_resolve_known(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryKnownSelection>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource read unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedCapture>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedDetail>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_list(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryResourceList>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_discussions(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryDiscussions>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
     fn repository_context_capture(
         &self,
         query: crate::repository_request::RepositoryContextQuery,

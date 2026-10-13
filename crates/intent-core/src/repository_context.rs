@@ -14,7 +14,7 @@ use crate::{WorkspaceGitRootId, WorkspaceId};
 
 // These new opaque counters must retain every bit across JavaScript transports.
 // Numeric JSON and noncanonical decimal spellings are deliberately rejected.
-mod decimal_u64 {
+pub(crate) mod decimal_u64 {
     use serde::{de::Error, Deserialize, Deserializer, Serializer};
 
     #[expect(

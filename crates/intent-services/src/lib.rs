@@ -18502,6 +18502,34 @@ impl WorkspaceApi for Services {
         repository_native_wire::resource::release(self, query)
     }
 
+    fn repository_resource_resolve_known(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryKnownSelection>>
+    {
+        repository_native_wire::resource::known::resolve(self, query)
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedCapture>>
+    {
+        repository_native_wire::resource::scoped::capture(self, query)
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedDetail>> {
+        repository_native_wire::resource::scoped::detail(self, query)
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::scoped::release(self, query)
+    }
+
     fn repository_context_capture(
         &self,
         query: intent_core::repository_request::RepositoryContextQuery,

@@ -139,6 +139,22 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
             use intent_core::repository_request::RepositoryResourceFrame as Frame;
             let params = value.get("params")?.clone();
             match value.get("method")?.as_str()? {
+                "sourceControl.read.resolveKnownRepository" => {
+                    serde_json::from_value(params).ok().map(Frame::ResolveKnown)
+                }
+                "sourceControl.read.captureScoped" => serde_json::from_value(params)
+                    .ok()
+                    .map(Frame::CaptureScoped),
+                "sourceControl.read.detailScoped" => {
+                    serde_json::from_value(params).ok().map(Frame::DetailScoped)
+                }
+                "sourceControl.read.releaseScoped" => serde_json::from_value(params)
+                    .ok()
+                    .map(Frame::ReleaseScoped),
+                "sourceControl.read.list" => serde_json::from_value(params).ok().map(Frame::List),
+                "sourceControl.read.discussions" => {
+                    serde_json::from_value(params).ok().map(Frame::Discussions)
+                }
                 "sourceControl.read.capture" => {
                     serde_json::from_value(params).ok().map(Frame::Capture)
                 }

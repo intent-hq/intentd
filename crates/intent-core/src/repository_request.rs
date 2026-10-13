@@ -938,7 +938,7 @@ pub struct RepositoryResourceBoundQuery {
     pub read_lifetime_id: String,
 }
 
-fn resource_lifetime<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn resource_lifetime<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<String, D::Error> {
     let value = <String as serde::Deserialize>::deserialize(d)?;
@@ -961,7 +961,7 @@ pub struct RepositoryResourceDetailQuery {
     pub refresh: bool,
 }
 
-fn resource_target<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn resource_target<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<crate::ReviewTarget, D::Error> {
     #[derive(serde::Deserialize)]
@@ -1006,14 +1006,43 @@ pub enum RepositoryResourceFrame {
     Capture(RepositoryResourceQuery),
     Detail(RepositoryResourceDetailQuery),
     Release(RepositoryResourceBoundQuery),
+    CaptureScoped(crate::repository_resource_pages::RepositoryScopedCaptureQuery),
+    ResolveKnown(crate::repository_resource_pages::RepositoryKnownQuery),
+    DetailScoped(crate::repository_resource_pages::RepositoryScopedDetailQuery),
+    ReleaseScoped(crate::repository_resource_pages::RepositoryScopedBoundQuery),
+    List(crate::repository_resource_pages::RepositoryResourceListQuery),
+    Discussions(crate::repository_resource_pages::RepositoryDiscussionsQuery),
 }
 impl RepositoryResourceFrame {
     #[must_use]
-    pub fn workspace_id(&self) -> &crate::WorkspaceId {
+    pub fn context(&self) -> crate::repository_resource_pages::RepositoryReadContext {
+        use crate::repository_resource_pages::RepositoryReadContext as Context;
         match self {
-            Self::Capture(q) => &q.workspace_id,
-            Self::Detail(q) => &q.workspace_id,
-            Self::Release(q) => &q.workspace_id,
+            Self::Capture(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::Detail(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::Release(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::CaptureScoped(q) => q.context.clone(),
+            Self::ResolveKnown(q) => q.context.clone(),
+            Self::DetailScoped(q) => q.context.clone(),
+            Self::ReleaseScoped(q) => q.context.clone(),
+            Self::List(q) => q.context.clone(),
+            Self::Discussions(q) => q.context.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn resource_target(&self) -> Option<&crate::ReviewTarget> {
+        match self {
+            Self::Detail(q) => Some(&q.target),
+            Self::DetailScoped(q) => Some(&q.target),
+            Self::Discussions(q) => Some(&q.target),
+            _ => None,
         }
     }
 }
@@ -1098,4 +1127,14 @@ pub struct RepositoryResourceRetired {
 
 pub trait RepositoryResourceRetirements: Send {
     fn next(&mut self) -> BoxFuture<'_, Option<RepositoryResourceRetired>>;
+
+    fn next_event(
+        &mut self,
+    ) -> BoxFuture<'_, Option<crate::repository_resource_pages::RepositoryResourceEvent>> {
+        Box::pin(async move {
+            self.next()
+                .await
+                .map(crate::repository_resource_pages::RepositoryResourceEvent::Retired)
+        })
+    }
 }
