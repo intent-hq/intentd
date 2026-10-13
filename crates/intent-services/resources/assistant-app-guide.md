@@ -221,7 +221,7 @@ message is present, **Up Arrow** in an empty composer edits that message first.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/TipTapEditor.svelte; src/lib/utils/user-message-presentation.ts. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceControls,HomeWorkspaceDashboard,HomeWorkspaceSettings}.svelte; src/features/home/home-workspaces-selectors.ts; src/store/renderer/slices/token-usage/token-usage-selectors.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceControls,HomeWorkspaceDashboard,HomeWorkspaceDashboardCard,HomeWorkspaceSettings}.svelte; src/features/home/home-workspaces-selectors.ts; src/store/renderer/slices/hud/hud-selectors.ts (selectDashboardWorkspaceDetails); messages/en.json. -->
 
 In **Home → Workspaces**, choose **Dashboard view** beside **List view** and
 **Board view** for cards with live workspace summaries, status, and available task
