@@ -929,6 +929,170 @@ async fn scoped_page_reads_deliver_general_standalone_and_diff_discussions_once(
 }
 
 #[intent_test_macros::daemon_test]
+async fn scoped_page_reads_issue_filters_keep_exact_self_scope_and_unsupported_truth() {
+    use intent_core::repository_resource_pages::{
+        RepositoryListFilter, RepositoryListKind, RepositoryListState,
+    };
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let s = f.socket().await;
+    let c = s.capture_scoped(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/issues";
+    server.set(path, 200, json!([resource("issues")]));
+    let before = server.count();
+    let mut q = list_query(&f, &c);
+    q.kind = RepositoryListKind::Issue;
+    q.query.state = RepositoryListState::Open;
+    for (filter, scope) in [
+        (RepositoryListFilter::Created, "created_by_me"),
+        (RepositoryListFilter::Assigned, "assigned_to_me"),
+    ] {
+        q.query.filter = filter;
+        let result = s
+            .request(&f.services, Frame::List(q.clone()))
+            .await
+            .unwrap();
+        assert_eq!(result["outcome"]["items"][0]["number"], 7);
+        let route = server
+            .state
+            .routes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        assert!(route.starts_with(path));
+        assert!(route.contains(&format!("scope={scope}")), "{route}");
+    }
+    assert_eq!(
+        server.count(),
+        before + 2,
+        "no current-user probe per filtered read"
+    );
+    for (state, filter) in [
+        (
+            RepositoryListState::Open,
+            RepositoryListFilter::ReviewRequested,
+        ),
+        (RepositoryListState::Open, RepositoryListFilter::Involves),
+        (RepositoryListState::Merged, RepositoryListFilter::All),
+    ] {
+        q.query.state = state;
+        q.query.filter = filter;
+        let result = s
+            .request(&f.services, Frame::List(q.clone()))
+            .await
+            .unwrap();
+        assert_eq!(result["outcome"]["code"], "unsupported");
+    }
+    assert_eq!(server.count(), before + 2);
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_connection_rejection_keeps_response_and_retires_sibling_contexts() {
+    use intent_core::repository_resource_pages::RepositoryResourceEvent;
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let mut s = f.socket().await;
+    let host = s.capture_host(&f).await;
+    let workspace = s.capture_scoped(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
+    server.set(path, 401, json!({"message":"private failure"}));
+    let before = server.count();
+    let rejected = s
+        .request(&f.services, Frame::List(list_query(&f, &workspace)))
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected["outcome"],
+        json!({"kind":"failure","code":"authentication","status":401})
+    );
+    assert_eq!(rejected["quota"]["remaining"], "17");
+    let event = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    let RepositoryResourceEvent::Retired(notice) = event else {
+        panic!("credential rejection retires matching context handles")
+    };
+    assert_eq!(notice.read_lifetime_ids.len(), 2);
+    assert!(notice.read_lifetime_ids.contains(&host.read_lifetime_id));
+    assert!(notice
+        .read_lifetime_ids
+        .contains(&workspace.read_lifetime_id));
+    let mut q = list_query(&f, &host);
+    q.context = RepositoryReadContext::Host {};
+    assert!(s.request(&f.services, Frame::List(q)).await.is_err());
+    assert_eq!(server.count(), before + 1);
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_optional_discussion_denial_preserves_readable_detail() {
+    use intent_core::repository_resource_pages::{
+        RepositoryDiscussionsQuery, RepositoryPageQuery, RepositoryScopedDetailQuery,
+    };
+    for (status, code) in [(403, "optional-restricted"), (404, "optional-unavailable")] {
+        let server = Server::new().await;
+        let f = Fixture::new(&server).await;
+        let s = f.socket().await;
+        let c = s.capture_scoped(&f).await;
+        let target = f
+            .detail(&c, RepositoryResourceKind::MergeRequest, false)
+            .target;
+        let context = RepositoryReadContext::Workspace {
+            workspace_id: f.workspace.clone(),
+        };
+        let detail = Frame::DetailScoped(RepositoryScopedDetailQuery {
+            context: context.clone(),
+            read_lifetime_id: c.read_lifetime_id.clone(),
+            target: target.clone(),
+            refresh: false,
+        });
+        let warmed = s.request(&f.services, detail.clone()).await.unwrap();
+        assert_eq!(warmed["outcome"]["kind"], "merge-request");
+        server.set(
+            &format!("{}/discussions", route("merge_requests")),
+            status,
+            json!({"message":"section restricted or unsupported"}),
+        );
+        let before = server.count();
+        let denied = s
+            .request(
+                &f.services,
+                Frame::Discussions(RepositoryDiscussionsQuery {
+                    context,
+                    read_lifetime_id: c.read_lifetime_id.clone(),
+                    target,
+                    page: RepositoryPageQuery {
+                        limit: 50,
+                        cursor: None,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied["outcome"],
+            json!({"kind":"failure","code":code,"status":status})
+        );
+        let readable = s.request(&f.services, detail).await.unwrap();
+        assert_eq!(readable, warmed);
+        assert_eq!(
+            server.count(),
+            before + 1,
+            "optional section denial cannot discard or refresh detail"
+        );
+        drop(s);
+        server.finish().await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
 async fn resource_known_repo_is_original_host_local_identity_and_guards_queued_output() {
     use intent_core::repository_resource_pages::{
         RepositoryKnownQuery, RepositoryScopedBoundQuery, RepositoryScopedCapture,

@@ -8,7 +8,8 @@ use intent_core::repository_resource_pages::{
 };
 use intent_core::RepositoryTarget;
 use intent_sourcecontrol::{
-    IssueQuery, Page, PageParams, PrInvolvement, PrQuery, PrState, RateLimitStatus,
+    IssueInvolvement, IssueQuery, Page, PageParams, PrInvolvement, PrQuery, PrState,
+    RateLimitStatus,
 };
 
 use super::*;
@@ -160,7 +161,10 @@ async fn list_inner(
     // unsupported result is neither an empty page nor an authentication denial.
     if q.kind == RepositoryListKind::Issue
         && (q.query.state == RepositoryListState::Merged
-            || q.query.filter != RepositoryListFilter::All)
+            || matches!(
+                q.query.filter,
+                RepositoryListFilter::ReviewRequested | RepositoryListFilter::Involves
+            ))
     {
         *r.state.lock().map_err(denied)? =
             State::Read(lease.clone(), eligibility, None, false, None, None);
@@ -183,18 +187,34 @@ async fn list_inner(
         RepositoryListKind::MergeRequest => {
             RepositoryCollectionQuery::Reviews(review_query(&q, cursor))
         }
-        RepositoryListKind::Issue => RepositoryCollectionQuery::Issues(IssueQuery {
-            state: match q.query.state {
-                RepositoryListState::All => None,
-                RepositoryListState::Open => Some("open".into()),
-                RepositoryListState::Closed => Some("closed".into()),
-                RepositoryListState::Merged => unreachable!(),
-            },
-            search: Some(q.query.search.clone()),
-            limit: Some(q.query.limit),
-            cursor,
-            ..Default::default()
-        }),
+        RepositoryListKind::Issue => {
+            let query = IssueQuery {
+                state: match q.query.state {
+                    RepositoryListState::All => None,
+                    RepositoryListState::Open => Some("open".into()),
+                    RepositoryListState::Closed => Some("closed".into()),
+                    RepositoryListState::Merged => unreachable!(),
+                },
+                search: Some(q.query.search.clone()),
+                limit: Some(q.query.limit),
+                cursor,
+                ..Default::default()
+            };
+            match q.query.filter {
+                RepositoryListFilter::Created => RepositoryCollectionQuery::FilteredIssues {
+                    query,
+                    involvement: IssueInvolvement::Created,
+                },
+                RepositoryListFilter::Assigned => RepositoryCollectionQuery::FilteredIssues {
+                    query,
+                    involvement: IssueInvolvement::Assigned,
+                },
+                RepositoryListFilter::All => RepositoryCollectionQuery::Issues(query),
+                RepositoryListFilter::ReviewRequested | RepositoryListFilter::Involves => {
+                    unreachable!()
+                }
+            }
+        }
     };
     let operation = RepositoryCollectionReadOperation::new(
         c.services.repository_connection_directory(),

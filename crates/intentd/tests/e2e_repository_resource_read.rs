@@ -105,7 +105,7 @@ impl Server {
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
                             if pause {state.entered.notify_one();state.release.notified().await;}
                             let body=reply.1.to_string();
-                            let next=state.next_pages.lock().unwrap().get(&path).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default();
+                            let next={let pages=state.next_pages.lock().unwrap();pages.get(&path).or_else(||pages.get(route)).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default()};
                             let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{next}RateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
                         });
@@ -773,3 +773,6 @@ async fn repository_resource_real_failure_classes_keep_original_wire_evidence() 
 
 #[path = "e2e_repository_resource_read/checkout.rs"]
 mod checkout;
+
+#[path = "e2e_repository_resource_read/pages.rs"]
+mod pages;
