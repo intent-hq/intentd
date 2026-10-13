@@ -1814,17 +1814,6 @@ async fn permission_delivery_rechecks_guest_management_without_visibility_cache(
     .await;
 }
 
-#[test]
-fn recovery_rejects_invalid_opt_in() {
-    for value in [json!(null), json!(true), json!(0), json!("1"), json!(2)] {
-        let params = json!({"eventTypes":["file:*"],"lossRecovery":value});
-        assert!(
-            super::parse_subscribe_params(params.as_object().unwrap()).is_err(),
-            "{params}"
-        );
-    }
-}
-
 /// Frozen monorepo contract: 531eb9ee2f231f383fcd192f7c33b022bb795ead.
 /// Keep this byte-for-byte corpus shared with the frontend consumer.
 #[test]

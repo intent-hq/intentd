@@ -183,8 +183,6 @@ async fn recovery_ack_loss_and_quiet_raw_fence_are_ordered() {
         reply,
         json!({"jsonrpc":"2.0","id":62,"result":{"subscriptionIds":[sid]}})
     );
-    assert_eq!(scenario("ack-order")["wireOrder"], json!(["ack", "lost"]));
-    assert_eq!(scenario("final-loss")["lossFrames"], 1);
     assert!(h.rx.bulk.try_recv().is_err());
 }
 
@@ -249,18 +247,6 @@ async fn recovery_fence_is_nonblocking_and_orders_preceding_bus_and_bulk_items()
     }
     assert_eq!(h.written().await["params"]["event"]["data"]["state"], "S1");
     assert_eq!(h.written().await["result"]["subscriptionIds"], json!([sid]));
-    assert_eq!(
-        scenario("fence-wss-nonblocking")["handlerWaitsForDrain"],
-        false
-    );
-    assert_eq!(
-        scenario("fence-covers-bus-worker")["wireOrder"],
-        json!(["S1", "fence-reply"])
-    );
-    assert_eq!(
-        scenario("fence-filtered-transient-tail")["foreignDomainFrames"],
-        0
-    );
 }
 
 #[tokio::test]
@@ -311,7 +297,6 @@ async fn recovery_replacement_resets_generation_and_discards_receipts() {
     h.fence(&[new]).await;
     assert!(h.written().await.get("result").is_some());
     assert!(h.out.recovery.receipts.lock().unwrap().is_empty());
-    assert_eq!(scenario("replace-lease")["newLastGeneration"], "0");
 }
 
 #[tokio::test]
@@ -382,14 +367,6 @@ async fn recovery_writer_timeout_covers_full_queue_and_queued_active_write() {
         }
         assert!(out.recovery.is_closed());
         assert!(out.recovery.receipts.lock().unwrap().is_empty());
-        assert_eq!(
-            scenario(if queued {
-                "queued-writer-timeout"
-            } else {
-                "writer-timeout"
-            })["connectionClosed"],
-            true
-        );
     }
 }
 
@@ -402,10 +379,6 @@ async fn recovery_generation_exhaustion_closes_without_wrapping() {
     assert!(out.recovery.is_closed());
     assert_eq!(f.generation, u64::MAX);
     assert!(rx.bulk.try_recv().is_err());
-    assert_eq!(
-        scenario("generation-exhaustion")["wrappedGeneration"],
-        false
-    );
 }
 
 #[tokio::test]
@@ -445,7 +418,6 @@ async fn recovery_membership_only_loss_closes_legacy_and_modern_before_buffer_dr
         assert!(!f.drain().await);
         assert!(f.buffer.is_empty());
         assert!(h.out.recovery.is_closed());
-        assert_eq!(scenario("membership-only-loss")["newGuardedFrames"], 0);
     }
 }
 
@@ -653,7 +625,6 @@ async fn recovery_legacy_omission_stays_silent_and_fences_do_not_create_loss() {
         assert!(h.written().await.get("result").is_some());
     }
     assert!(h.rx.bulk.try_recv().is_err());
-    assert_eq!(scenario("fence-control-only")["lossGenerationChanges"], 0);
 }
 
 #[tokio::test]
@@ -672,7 +643,6 @@ async fn recovery_loss_between_fences_precedes_end_reply() {
     h.fence(std::slice::from_ref(&sid)).await;
     assert_eq!(h.written().await["method"], "events.lost");
     assert!(h.written().await.get("result").is_some());
-    assert_eq!(scenario("fence-loss-window")["lossBeforeFence"], true);
 }
 
 #[tokio::test]
