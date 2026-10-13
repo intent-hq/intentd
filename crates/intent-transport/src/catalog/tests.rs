@@ -206,7 +206,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 56;
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 5;
+const EXPECTED_NOTIFICATIONS: usize = 6;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;

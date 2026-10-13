@@ -19,6 +19,7 @@ const PROJECT: &str = "Team/Sub/Project";
 struct Provider {
     routes: Mutex<Vec<(String, String)>>,
     replies: Mutex<HashMap<String, (u16, Value)>>,
+    headers: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
     release: Notify,
@@ -77,10 +78,11 @@ impl Server {
                             // The response belongs to this original request, even if a newer
                             // request changes the configured reply before this hold is released.
                             let reply=state.replies.lock().unwrap().get(route).cloned().unwrap_or_else(||default_reply(route));
+                            let extra=state.headers.lock().unwrap().get(route).cloned().unwrap_or_default();
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
                             if pause {state.entered.notify_one();state.release.notified().await;}
                             let body=reply.1.to_string();
-                            let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
+                            let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\n{extra}Connection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
                         });
                     },
@@ -112,6 +114,13 @@ impl Server {
     }
     fn pause(&self, route: &str) {
         *self.state.pause.lock().unwrap() = Some(route.into());
+    }
+    fn headers(&self, route: &str, headers: &str) {
+        self.state
+            .headers
+            .lock()
+            .unwrap()
+            .insert(route.into(), headers.into());
     }
     async fn entered(&self) {
         tokio::time::timeout(ACQUIRE, self.state.entered.notified())
@@ -419,10 +428,12 @@ impl Socket {
                         Frame::ReleaseScoped(q) => scoped::release(services, q)
                             .await
                             .and_then(|v| serde_json::to_value(v).map_err(denied)),
-                        Frame::List(q) => services.repository_resource_list(q)
+                        Frame::List(q) => services
+                            .repository_resource_list(q)
                             .await
                             .and_then(|v| serde_json::to_value(v).map_err(denied)),
-                        Frame::Discussions(q) => services.repository_resource_discussions(q)
+                        Frame::Discussions(q) => services
+                            .repository_resource_discussions(q)
                             .await
                             .and_then(|v| serde_json::to_value(v).map_err(denied)),
                         Frame::Capture(q) => capture(services, q)
@@ -492,6 +503,23 @@ impl Socket {
         .unwrap();
         captured.capture
     }
+    async fn capture_host(&self, f: &Fixture) -> Capture {
+        use intent_core::repository_resource_pages::{
+            RepositoryScopedCapture, RepositoryScopedCaptureQuery,
+        };
+        let captured: RepositoryScopedCapture = serde_json::from_value(
+            self.request(
+                &f.services,
+                Frame::CaptureScoped(RepositoryScopedCaptureQuery {
+                    context: RepositoryReadContext::Host {},
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        captured.capture
+    }
     async fn capture(&self, f: &Fixture) -> Capture {
         serde_json::from_value(
             self.request(&f.services, Frame::Capture(f.query()))
@@ -526,14 +554,156 @@ async fn fixed_clock<T>(work: impl Future<Output = T>) -> T {
     result
 }
 
-fn list_query(f: &Fixture, c: &Capture) -> intent_core::repository_resource_pages::RepositoryResourceListQuery {
+fn list_query(
+    f: &Fixture,
+    c: &Capture,
+) -> intent_core::repository_resource_pages::RepositoryResourceListQuery {
     serde_json::from_value(json!({
         "context":{"kind":"workspace","workspaceId":f.workspace},
         "readLifetimeId":c.read_lifetime_id,
         "repository":{"provider":"gitlab","instanceBaseUrl":INSTANCE,"projectPath":PROJECT},
         "kind":"merge-request",
         "query":{"state":"all","filter":"all","search":"","limit":50}
-    })).unwrap()
+    }))
+    .unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_closed_union_continues_empty_pages_and_binds_query() {
+    use intent_core::repository_resource_pages::RepositoryListState;
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let s = f.socket().await;
+    let c = s.capture_host(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
+    server.set(path, 200, json!([resource("merge_requests")]));
+    server.headers(path, "X-Next-Page: 2\r\n");
+    let mut q = list_query(&f, &c);
+    q.context = RepositoryReadContext::Host {};
+    q.query.state = RepositoryListState::Closed;
+    q.query.limit = 1;
+    let before = server.count();
+    let first = s
+        .request(&f.services, Frame::List(q.clone()))
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"]["items"], json!([]));
+    let cursor = first["outcome"]["nextCursor"].as_str().unwrap().to_owned();
+    assert_ne!(cursor, "2");
+    let mut merged = resource("merge_requests");
+    merged["state"] = json!("merged");
+    server.set(path, 200, json!([merged]));
+    server.headers(path, "X-Next-Page: \r\n");
+    q.query.cursor = Some(cursor.clone());
+    let second = s
+        .request(&f.services, Frame::List(q.clone()))
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"]["items"][0]["state"], "merged");
+    assert!(second["outcome"]["nextCursor"].is_null());
+    assert_eq!(server.count(), before + 2);
+    let last = server
+        .state
+        .routes
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .clone();
+    assert!(last.contains("state=all"));
+    assert!(last.contains("page=2"));
+    let other = s.capture_host(&f).await;
+    let mut foreign = q.clone();
+    foreign.read_lifetime_id = other.read_lifetime_id;
+    assert!(s.request(&f.services, Frame::List(foreign)).await.is_err());
+    q.query.search = "different query".into();
+    assert!(s.request(&f.services, Frame::List(q)).await.is_err());
+    assert_eq!(
+        server.count(),
+        before + 2,
+        "foreign/query-mismatched continuation must fail before provider IO"
+    );
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_list_denial_fans_out_without_retiring_detail() {
+    use intent_core::repository_resource_pages::{
+        RepositoryInvalidationCoverage, RepositoryResourceEvent, RepositoryScopedDetailQuery,
+    };
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let mut s = f.socket().await;
+    let host = s.capture_host(&f).await;
+    let workspace = s.capture_scoped(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
+    server.set(path, 200, json!([resource("merge_requests")]));
+    let target = f
+        .detail(&host, RepositoryResourceKind::MergeRequest, false)
+        .target;
+    let detail = Frame::DetailScoped(RepositoryScopedDetailQuery {
+        context: RepositoryReadContext::Host {},
+        read_lifetime_id: host.read_lifetime_id.clone(),
+        target,
+        refresh: false,
+    });
+    s.request(&f.services, detail.clone()).await.unwrap();
+    let mut host_query = list_query(&f, &host);
+    host_query.context = RepositoryReadContext::Host {};
+    let (page_scope, page) = s.body(&f.services, Frame::List(host_query)).await;
+    assert!(page.is_ok());
+    let output = page_scope
+        .bind_private_output("queued-page")
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.transfer(&page_scope, &page).await.1, 1);
+    page_scope.retire();
+    server.set(path, 403, json!({"message":"list forbidden"}));
+    let before = server.count();
+    let denied = s
+        .request(&f.services, Frame::List(list_query(&f, &workspace)))
+        .await
+        .unwrap();
+    assert_eq!(denied["outcome"]["code"], "resource-denied");
+    assert_eq!(server.count(), before + 1);
+    let mut transfers = 0;
+    assert!(output
+        .with_current(&mut || {
+            transfers += 1;
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(transfers, 0);
+    let event = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    let RepositoryResourceEvent::Invalidated(notice) = event else {
+        panic!("list denial must not retire its contexts")
+    };
+    assert!(matches!(
+        notice.coverage,
+        RepositoryInvalidationCoverage::List { .. }
+    ));
+    assert_eq!(notice.repository.project_path, PROJECT);
+    assert_eq!(notice.read_lifetime_ids.len(), 2);
+    assert!(notice.read_lifetime_ids.contains(&host.read_lifetime_id));
+    assert!(notice
+        .read_lifetime_ids
+        .contains(&workspace.read_lifetime_id));
+    let cached = s.request(&f.services, detail).await.unwrap();
+    assert_eq!(cached["outcome"]["kind"], "merge-request");
+    assert_eq!(
+        server.count(),
+        before + 1,
+        "a denied collection cannot erase a readable detail cache"
+    );
+    drop(output);
+    drop(page_scope);
+    drop(s);
+    server.finish().await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -545,17 +715,147 @@ async fn scoped_page_reads_deliver_actual_list_and_keep_detail_independent() {
     let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
     server.set(path, 200, json!([resource("merge_requests")]));
     let before = server.count();
-    let value = s.request(&f.services, Frame::List(list_query(&f, &c))).await.unwrap();
+    let value = s
+        .request(&f.services, Frame::List(list_query(&f, &c)))
+        .await
+        .unwrap();
     assert_eq!(value["outcome"]["kind"], "page");
     assert_eq!(value["outcome"]["items"][0]["number"], 7);
-    assert_eq!(value["outcome"]["items"][0]["url"], format!("{INSTANCE}/{PROJECT}/-/merge_requests/7"));
+    assert_eq!(
+        value["outcome"]["items"][0]["url"],
+        format!("{INSTANCE}/{PROJECT}/-/merge_requests/7")
+    );
     assert_eq!(value["outcome"]["omitted"], 0);
     assert!(value["outcome"]["nextCursor"].is_null());
     assert_eq!(server.count(), before + 1);
-    assert!(server.state.routes.lock().unwrap().last().unwrap().1.starts_with(path));
-    let detailed = s.request(&f.services, scoped_detail(&f, &c, false)).await.unwrap();
+    assert!(server
+        .state
+        .routes
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .starts_with(path));
+    let detailed = s
+        .request(&f.services, scoped_detail(&f, &c, false))
+        .await
+        .unwrap();
     assert_eq!(detailed["outcome"]["kind"], "issue");
     assert_eq!(server.count(), before + 2);
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_continue_beyond_bounded_cursor_history() {
+    use intent_core::repository_resource_pages::RepositoryListState;
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let s = f.socket().await;
+    let c = s.capture_scoped(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
+    let mut q = list_query(&f, &c);
+    q.query.state = RepositoryListState::Closed;
+    q.query.limit = 1;
+    let before = server.count();
+    let mut first_cursor = None;
+    for page in 1..=66 {
+        let mut item = resource("merge_requests");
+        if page == 66 {
+            item["state"] = json!("merged");
+            server.headers(path, "X-Next-Page: \r\n");
+        } else {
+            server.headers(path, &format!("X-Next-Page: {}\r\n", page + 1));
+        }
+        server.set(path, 200, json!([item]));
+        let result = s
+            .request(&f.services, Frame::List(q.clone()))
+            .await
+            .unwrap();
+        if page == 66 {
+            assert_eq!(result["outcome"]["items"][0]["state"], "merged");
+            assert!(result["outcome"]["nextCursor"].is_null());
+        } else {
+            assert_eq!(result["outcome"]["items"], json!([]));
+            q.query.cursor = Some(result["outcome"]["nextCursor"].as_str().unwrap().into());
+            if page == 1 {
+                first_cursor.clone_from(&q.query.cursor);
+            }
+        }
+    }
+    assert_eq!(server.count(), before + 66);
+    q.query.cursor = first_cursor;
+    assert!(s.request(&f.services, Frame::List(q)).await.is_err());
+    assert_eq!(
+        server.count(),
+        before + 66,
+        "evicted cursor fails before HTTP"
+    );
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_fresh_denial_wins_over_held_older_success() {
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let mut s = f.socket().await;
+    let host = s.capture_host(&f).await;
+    let workspace = s.capture_scoped(&f).await;
+    let path = "/api/v4/projects/Team%2FSub%2FProject/merge_requests";
+    server.set(path, 200, json!([resource("merge_requests")]));
+    server.pause(path);
+    let mut old = list_query(&f, &host);
+    old.context = RepositoryReadContext::Host {};
+    let (old_result, ()) = tokio::join!(s.request(&f.services, Frame::List(old)), async {
+        server.entered().await;
+        server.set(path, 403, json!({"message":"new collection denial"}));
+        let rejected = s
+            .request(&f.services, Frame::List(list_query(&f, &workspace)))
+            .await
+            .unwrap();
+        assert_eq!(rejected["outcome"]["code"], "resource-denied");
+        server.state.release.notify_one();
+    });
+    assert!(
+        old_result.is_err(),
+        "held older success cannot clear a fresh denial"
+    );
+    let notice = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        notice,
+        intent_core::repository_resource_pages::RepositoryResourceEvent::Invalidated(_)
+    ));
+    drop(s);
+    server.finish().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn scoped_page_reads_unsupported_filter_is_explicit_without_http() {
+    use intent_core::repository_resource_pages::RepositoryListFilter;
+    let server = Server::new().await;
+    let f = Fixture::new(&server).await;
+    let s = f.socket().await;
+    let c = s.capture_scoped(&f).await;
+    let mut q = list_query(&f, &c);
+    q.query.filter = RepositoryListFilter::Involves;
+    let before = server.count();
+    let result = s.request(&f.services, Frame::List(q)).await.unwrap();
+    assert_eq!(
+        result["outcome"],
+        json!({"kind":"failure","code":"unsupported","status":null})
+    );
+    assert_eq!(server.count(), before);
+    let detail = s
+        .request(&f.services, scoped_detail(&f, &c, false))
+        .await
+        .unwrap();
+    assert_eq!(detail["outcome"]["kind"], "issue");
+    assert_eq!(server.count(), before + 1);
     drop(s);
     server.finish().await;
 }
@@ -567,11 +867,13 @@ async fn scoped_page_reads_deliver_general_standalone_and_diff_discussions_once(
     let f = Fixture::new(&server).await;
     let s = f.socket().await;
     let c = s.capture_scoped(&f).await;
-    let note = |id, body: &str, resolvable| json!({
-        "id":id,"author":{"username":"fixture"},"body":body,"system":false,
-        "created_at":"2026-01-01T00:00:00Z","resolvable":resolvable,"resolved":false
-    });
-    let mut diff = note(41,"diff",true);
+    let note = |id, body: &str, resolvable| {
+        json!({
+            "id":id,"author":{"username":"fixture"},"body":body,"system":false,
+            "created_at":"2026-01-01T00:00:00Z","resolvable":resolvable,"resolved":false
+        })
+    };
+    let mut diff = note(41, "diff", true);
     diff["position"] = json!({"new_path":"src/lib.rs","new_line":8,"head_sha":"0123456789012345678901234567890123456789"});
     let path = format!("{}/discussions", route("merge_requests"));
     server.set(&path, 200, json!([
@@ -580,24 +882,48 @@ async fn scoped_page_reads_deliver_general_standalone_and_diff_discussions_once(
         {"id":"diff","individual_note":false,"notes":[diff]}
     ]));
     let before = server.count();
-    let value = s.request(&f.services, Frame::Discussions(RepositoryDiscussionsQuery {
-        context: RepositoryReadContext::Workspace { workspace_id:f.workspace.clone() },
-        read_lifetime_id:c.read_lifetime_id.clone(),
-        target:f.detail(&c, RepositoryResourceKind::MergeRequest,false).target,
-        page:RepositoryPageQuery {limit:50,cursor:None},
-    })).await.unwrap();
+    let value = s
+        .request(
+            &f.services,
+            Frame::Discussions(RepositoryDiscussionsQuery {
+                context: RepositoryReadContext::Workspace {
+                    workspace_id: f.workspace.clone(),
+                },
+                read_lifetime_id: c.read_lifetime_id.clone(),
+                target: f
+                    .detail(&c, RepositoryResourceKind::MergeRequest, false)
+                    .target,
+                page: RepositoryPageQuery {
+                    limit: 50,
+                    cursor: None,
+                },
+            }),
+        )
+        .await
+        .unwrap();
     let items = value["outcome"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 3);
     assert_eq!(items[0]["notes"][0]["body"], "standalone");
     assert_eq!(items[0]["notes"][0]["resolvable"], false);
     assert!(items[0]["notes"][0]["resolved"].is_null());
-    assert_eq!(items[1]["notes"][1]["inReplyToId"], items[1]["notes"][0]["id"]);
+    assert_eq!(
+        items[1]["notes"][1]["inReplyToId"],
+        items[1]["notes"][0]["id"]
+    );
     assert_ne!(items[0]["notes"][0]["id"], items[1]["notes"][0]["id"]);
     assert_eq!(items[2]["notes"][0]["path"], "src/lib.rs");
     assert_eq!(items[2]["notes"][0]["line"], 8);
     assert_eq!(items[2]["notes"][0]["resolved"], false);
     assert_eq!(server.count(), before + 1);
-    assert!(server.state.routes.lock().unwrap().last().unwrap().1.starts_with(&path));
+    assert!(server
+        .state
+        .routes
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .starts_with(&path));
     drop(s);
     server.finish().await;
 }

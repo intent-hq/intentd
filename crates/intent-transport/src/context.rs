@@ -331,9 +331,12 @@ impl ReadConnectionGuard {
         });
         let resource = self.0.as_ref().and_then(|owner| owner.take_resource_retirements()).map(|mut receiver| {
             tokio::spawn(async move {
-                while let Some(notice) = receiver.next().await {
-                    let terminal = notice.terminal;
-                    let frame = serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string();
+                while let Some(event) = receiver.next_event().await {
+                    use intent_core::repository_resource_pages::RepositoryResourceEvent;
+                    let (terminal, frame) = match event {
+                        RepositoryResourceEvent::Retired(notice) => (notice.terminal, serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string()),
+                        RepositoryResourceEvent::Invalidated(notice) => (false, serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.invalidated","params":notice}).to_string()),
+                    };
                     if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })

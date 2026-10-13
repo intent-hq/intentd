@@ -516,6 +516,7 @@ pub(crate) const NOTIFICATIONS: &[&str] = &[
     "accept-changes.retired",
     "events.event",
     "sourceControl.read.retired",
+    "sourceControl.read.invalidated",
     "workspace.repositoryContext.retired",
     "workspace.repositorySelection.retired",
 ];

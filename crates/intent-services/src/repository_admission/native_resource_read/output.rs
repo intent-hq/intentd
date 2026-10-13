@@ -45,7 +45,9 @@ impl RepositoryPrivateOutput for Output {
         };
         lease.check()?;
         let mut transferred = None;
-        let mut guarded = || {
+        let mut guarded = |check: &crate::pr_monitor::qualified_cache::CacheRevalidationCheck<
+            '_,
+        >| {
             self.connection.parent.native_dispatch(|| {
                 lease.lifetime.retirement().native_dispatch(|| {
                     if Instant::now() >= lease.deadline || Instant::now() >= self.deadline {
@@ -56,6 +58,7 @@ impl RepositoryPrivateOutput for Output {
                             return Err(AdmissionError::Retired);
                         }
                         let mut action = || {
+                            check()?;
                             transferred = Some(transfer());
                             Ok(())
                         };
@@ -63,11 +66,11 @@ impl RepositoryPrivateOutput for Output {
                             State::Capture(_) => RepositoryConnectionFacts::with_native_context_current(Some(&lease.facts), |current| {
                                 if current { action() } else { Err(RepositoryCredentialError::Retired) }
                             }),
-                            State::Read(_, eligibility, response, failure, _) => {
+                            State::Read(_, eligibility, response, failure, _, collection) => {
                                 if *failure {
                                     if let Some(response) = response {
                                         let mut accepted_rejection = false;
-                                        eligibility.with_response(response, self.target.as_ref().ok_or(AdmissionError::Retired)?, &mut |disposition| {
+                                        with_response(eligibility, response, self.target.as_ref(), collection.as_deref(), &mut |disposition| {
                                             accepted_rejection = disposition == RepositoryResponseDisposition::AcceptedCredentialRejection;
                                             if matches!(disposition, RepositoryResponseDisposition::NotApplied | RepositoryResponseDisposition::Unattributed | RepositoryResponseDisposition::Indeterminate) {
                                                 return Err(RepositoryCredentialError::Retired);
@@ -86,10 +89,10 @@ impl RepositoryPrivateOutput for Output {
                 })
             }).map_err(|_| RepositoryCredentialError::Retired)?
         };
-        if let State::Read(_, _, _, false, Some(delivery)) = &self.state {
-            delivery.with_current(&mut guarded).map_err(denied)?;
+        if let State::Read(_, _, _, false, Some(delivery), _) = &self.state {
+            delivery.with_revalidation(&mut guarded).map_err(denied)?;
         } else {
-            guarded().map_err(denied)?;
+            guarded(&|| Ok(())).map_err(denied)?;
         }
         transferred.ok_or_else(unavailable)?
     }

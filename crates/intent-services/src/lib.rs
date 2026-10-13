@@ -18530,6 +18530,20 @@ impl WorkspaceApi for Services {
         repository_native_wire::resource::scoped::release(self, query)
     }
 
+    fn repository_resource_list(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryResourceList>> {
+        repository_native_wire::resource::pages::list(self, query)
+    }
+
+    fn repository_resource_discussions(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryDiscussions>> {
+        repository_native_wire::resource::pages::discussions(self, query)
+    }
+
     fn repository_context_capture(
         &self,
         query: intent_core::repository_request::RepositoryContextQuery,

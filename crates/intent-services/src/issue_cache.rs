@@ -145,6 +145,10 @@ where
 
 /// Managed issue reads retain the provider's opaque response evidence until
 /// the existing slot is borrowed and the original caller/response guards run.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "retained cache control without denial observer")
+)]
 pub(crate) async fn read_managed_issue<F, Fut>(
     cache: &IssueCache,
     request: &qualified_cache::ManagedCacheRequest<'_>,
@@ -166,13 +170,6 @@ where
 }
 
 /// Same issue cache path with response-guarded denial notification for R.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "scoped resource consumer is composed by Services integration"
-    )
-)]
 pub(crate) async fn read_managed_issue_observed<F, Fut>(
     cache: &IssueCache,
     request: &qualified_cache::ManagedCacheRequest<'_>,
