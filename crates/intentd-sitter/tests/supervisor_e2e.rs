@@ -3870,6 +3870,101 @@ fn live_indexing_deadline_case(detached: bool, terminal: &str) {
 }
 
 #[test]
+fn live_indexing_concurrent_start_without_status_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let file = fs::File::create(fixture.paths.sitter_dir.join("start.lock")).unwrap();
+    let _lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+    let mut command = sitter_command(dir.path(), &dead_url());
+    command
+        .arg("start")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "800");
+    let mut child = spawn_guarded(&mut command);
+    assert!(!child
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    assert!(read_or_empty(&daemon_log_path(dir.path())).is_empty());
+}
+
+#[test]
+fn live_indexing_concurrent_start_waits_for_owner_and_real_readiness() {
+    for terminal in ["ready", "lost", "failed", "cancel"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = indexing_fixture(dir.path());
+        let base = dead_url();
+        let launch = || {
+            let mut command = sitter_command(dir.path(), &base);
+            command
+                .arg("start")
+                .env(intentd_sitter::readiness::TIMEOUT_ENV, "800")
+                .env(KILL_TIMEOUT_ENV, "100");
+            spawn_guarded(&mut command)
+        };
+        let mut first = launch();
+        wait_until("owner indexing", Duration::from_secs(5), || {
+            dir.path().join("probes").exists()
+        });
+        let owner = fs::read_to_string(&fixture.paths.pid_path).unwrap();
+        let mut second = launch();
+        let started = Instant::now();
+        wait_until(
+            "both callers beyond deadline",
+            Duration::from_secs(5),
+            || {
+                assert!(
+                    first.try_wait().unwrap().is_none(),
+                    "owner exited: {terminal}"
+                );
+                assert!(
+                    second.try_wait().unwrap().is_none(),
+                    "contender exited: {terminal}"
+                );
+                assert_eq!(fs::read_to_string(&fixture.paths.pid_path).unwrap(), owner);
+                started.elapsed() > Duration::from_millis(1800)
+            },
+        );
+        match terminal {
+            "ready" => fs::write(dir.path().join("release-indexing"), "ready").unwrap(),
+            "cancel" => assert!(background_call(dir.path(), &base, &["stop"])
+                .status
+                .success()),
+            _ => fs::write(dir.path().join(terminal), "stop answering").unwrap(),
+        }
+        for caller in [&mut first, &mut second] {
+            assert_eq!(
+                caller
+                    .wait_with_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .success(),
+                terminal == "ready",
+                "{terminal}"
+            );
+        }
+        assert_eq!(
+            read_or_empty(&daemon_log_path(dir.path()))
+                .lines()
+                .filter(|line| line.starts_with("spawn "))
+                .count(),
+            1,
+            "a contending caller must never spawn a replacement: {terminal}"
+        );
+        if terminal == "ready" {
+            assert_eq!(fs::read_to_string(&fixture.paths.pid_path).unwrap(), owner);
+            assert!(background_call(dir.path(), &base, &["stop"])
+                .status
+                .success());
+        }
+        wait_until("single owner cleaned", Duration::from_secs(5), || {
+            !fixture.paths.pid_path.exists()
+        });
+    }
+}
+
+#[test]
 fn live_indexing_preserves_outer_start_deadline_until_real_ready() {
     live_indexing_deadline_case(true, "ready");
 }

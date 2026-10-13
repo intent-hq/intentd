@@ -60,7 +60,7 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
 
     let mut budget = readiness::StartupBudget::new(readiness::timeout_from_env());
     std::fs::create_dir_all(&paths.sitter_dir)?;
-    let _lock = lock_start(paths, budget.deadline)?;
+    let _lock = lock_start(paths, &mut budget)?;
     if probe(paths, &mut budget)? {
         println!("intentd is already running; launch options apply on the next start");
         return Ok(());
@@ -143,27 +143,44 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
     outcome
 }
 
-#[cfg(unix)]
-fn acquire_start_lock(
-    mut file: std::fs::File,
-    deadline: std::time::Instant,
-) -> std::io::Result<nix::fcntl::Flock<std::fs::File>> {
+/// Common contention loop for Unix flock and Windows exclusive-share opens.
+/// A probe can renew the wait, but only acquiring the lock allows progress.
+fn wait_for_start_lock<T>(
+    budget: &mut crate::readiness::StartupBudget,
+    mut acquire: impl FnMut() -> std::io::Result<Option<T>>,
+    mut observe: impl FnMut(&mut crate::readiness::StartupBudget) -> std::io::Result<()>,
+) -> std::io::Result<T> {
+    let mut contended = false;
     loop {
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Ok(lock),
-            Err((returned, nix::errno::Errno::EWOULDBLOCK))
-                if std::time::Instant::now() < deadline =>
-            {
-                file = returned;
-                pause(deadline);
-            }
-            Err((_, error)) => {
-                return Err(std::io::Error::other(format!(
-                    "cannot acquire startup lock: {error}"
-                )))
+        if contended {
+            observe(budget)?;
+            if std::time::Instant::now() >= budget.deadline {
+                return Err(std::io::Error::other("startup lock readiness timed out"));
             }
         }
+        if let Some(lock) = acquire()? {
+            return Ok(lock);
+        }
+        contended = true;
+        pause(budget.deadline);
     }
+}
+
+fn observe_start_lock_owner(
+    paths: &SitterPaths,
+    budget: &mut crate::readiness::StartupBudget,
+    owner: &mut Option<i32>,
+) -> std::io::Result<()> {
+    let current = crate::supervisor::read_live_pid(&paths.pid_path).map(|pid| pid.as_raw());
+    if owner.is_some() && current != *owner {
+        return Err(std::io::Error::other(
+            "startup lock owner exited or changed",
+        ));
+    }
+    *owner = owner.or(current);
+    // Ready alone never grants the lock, and starting never grants readiness.
+    let _ = probe(paths, budget)?;
+    Ok(())
 }
 
 fn probe(
@@ -265,7 +282,7 @@ fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path)
 #[cfg(unix)]
 fn lock_start(
     paths: &SitterPaths,
-    deadline: std::time::Instant,
+    budget: &mut crate::readiness::StartupBudget,
 ) -> std::io::Result<nix::fcntl::Flock<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -274,33 +291,53 @@ fn lock_start(
         .write(true)
         .mode(0o600)
         .open(paths.sitter_dir.join("start.lock"))?;
-    acquire_start_lock(file, deadline)
+    let mut file = Some(file);
+    let mut owner = None;
+    wait_for_start_lock(
+        budget,
+        || {
+            let file_to_lock = file
+                .take()
+                .ok_or_else(|| std::io::Error::other("startup lock file missing"))?;
+            match nix::fcntl::Flock::lock(file_to_lock, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            {
+                Ok(lock) => Ok(Some(lock)),
+                Err((returned, nix::errno::Errno::EWOULDBLOCK)) => {
+                    file = Some(returned);
+                    Ok(None)
+                }
+                Err((_, error)) => Err(std::io::Error::other(format!(
+                    "cannot acquire startup lock: {error}"
+                ))),
+            }
+        },
+        |budget| observe_start_lock_owner(paths, budget, &mut owner),
+    )
 }
 
 #[cfg(windows)]
 pub(crate) fn lock_start(
     paths: &SitterPaths,
-    deadline: std::time::Instant,
+    budget: &mut crate::readiness::StartupBudget,
 ) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::create_dir_all(&paths.sitter_dir)?;
-    loop {
-        match std::fs::OpenOptions::new()
+    let mut owner = None;
+    wait_for_start_lock(
+        budget,
+        || match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .share_mode(0)
             .open(paths.sitter_dir.join("start.lock"))
         {
-            Ok(file) => return Ok(file),
-            Err(error)
-                if error.raw_os_error() == Some(32) && std::time::Instant::now() < deadline =>
-            {
-                pause(deadline);
-            }
-            Err(error) => return Err(error),
-        }
-    }
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.raw_os_error() == Some(32) => Ok(None),
+            Err(error) => Err(error),
+        },
+        |budget| observe_start_lock_owner(paths, budget, &mut owner),
+    )
 }
 #[cfg(windows)]
 fn detach(command: &mut std::process::Command) {
@@ -339,7 +376,7 @@ fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path)
 pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     let result = (|| -> std::io::Result<bool> {
         let mut budget = crate::readiness::StartupBudget::new(crate::readiness::timeout_from_env());
-        let _lock = lock_start(paths, budget.deadline)?;
+        let _lock = lock_start(paths, &mut budget)?;
         let Some(pid) = crate::supervisor::read_live_pid(&paths.pid_path) else {
             return Ok(false);
         };
@@ -374,6 +411,60 @@ pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
         Err(error) => {
             eprintln!("intentd-sitter: restart failed: {error}");
             1
+        }
+    }
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::wait_for_start_lock;
+    use crate::readiness::{ProbeStatus, StartupBudget};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unix_and_windows_contention_wait_for_lock_despite_fresh_starting() {
+        let attempts = Cell::new(0);
+        let started = Instant::now();
+        let mut budget = StartupBudget::new(Duration::from_secs(1));
+        let lock = wait_for_start_lock(
+            &mut budget,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok((attempts.get() == 23).then_some(42))
+            },
+            |budget| {
+                budget.observe(&ProbeStatus::Starting {
+                    attempt_id: "unchanged".into(),
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(lock, 42);
+        assert_eq!(attempts.get(), 23);
+        assert!(started.elapsed() > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn unix_and_windows_contention_bounds_missing_ready_failed_and_cancelled() {
+        for observation in ["missing", "ready", "failed", "cancelled"] {
+            let started = Instant::now();
+            let mut budget = StartupBudget::new(Duration::from_millis(100));
+            let result = wait_for_start_lock::<()>(
+                &mut budget,
+                || Ok(None),
+                |budget| {
+                    match observation {
+                        "failed" | "cancelled" => return Err(std::io::Error::other(observation)),
+                        "ready" => budget.observe(&ProbeStatus::Ready("0.1.0".into())),
+                        _ => budget.observe(&ProbeStatus::Unavailable),
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{observation} must not bypass a held lock");
+            assert!(started.elapsed() < Duration::from_secs(2));
         }
     }
 }
