@@ -2134,6 +2134,60 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      # Persistent per-job outputs survive checkout's git clean. Linux uses
+      # /raid and a runner-slot key, with the same prune/marker rails as check.
+      - name: Disk-space preflight (tinybox only)
+        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
+        env:
+          NEED_GIB: 15
+          JOB_TARGET_SUBDIR: daemon-lifecycle
+        run: |
+          set -euo pipefail
+          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
+          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
+          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
+          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
+          # Same two tiers as the `check` job's preflight (see its comment):
+          # selection in scripts/ci-target-slot.sh purge-candidates, a live
+          # is-purgeable recheck before each rm, this loop only deletes
+          # until the need is met.
+          evict_until_free() {
+            local verb="$1" quiet_min="$2" dir
+            shift 2
+            while IFS= read -r dir; do
+              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
+              echo "$verb: $dir"
+              rm -rf -- "$dir" || true
+              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
+            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
+          }
+          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
+          evict_until_free pruning 2880 --skip-dir "$own_dir"
+          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
+            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
+            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
+          fi
+          free="$(free_gib)"
+          if [ "$free" -lt "$NEED_GIB" ]; then
+            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
+            exit 1
+          fi
+      - name: Point lifecycle target outside checkout (Linux)
+        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: |
+          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          ./scripts/ci-target-slot.sh mark "$target_dir"
+      # These runners have one slot. Prefer the native Windows home path:
+      # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
+      - name: Point lifecycle target outside checkout (macOS and Windows)
+        if: runner.os != 'Linux' && contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
+      - name: Ensure macOS CI disk headroom
+        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -2144,7 +2198,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Rust cache (GitHub-hosted runner only)
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: daemon-lifecycle-${{ matrix.platform }}
       - name: Native lifecycle lint and runtime proof
@@ -2152,6 +2208,10 @@ jobs:
         run: |
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
+      - name: Release lifecycle target dir
+        if: ${{ always() && runner.os == 'Linux' && contains(matrix.os, 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
+        shell: bash
+        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   # CI Gate is the sole required status check. Every failed/cancelled result
   # fails it; skips are accepted only for jobs intentionally absent by event.
