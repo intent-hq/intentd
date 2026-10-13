@@ -2130,7 +2130,7 @@ async fn cmd_serve_owned(
     };
     #[cfg(not(feature = "repository-test-fixtures"))]
     let fixture_installed = false;
-    if !fixture_installed {
+    if !fixture_installed && startup_error.is_none() && !bootstrap.cancellation.stopping() {
         if let Err(error) = services.initialize_gitlab_repository_binding().await {
             tracing::debug!(%error, "repository GitLab binding remains unavailable at startup");
         }
@@ -2165,7 +2165,9 @@ async fn cmd_serve_owned(
     // Seed the service-owned capability cache off the RPC path. The earlier
     // process-wide probe warms intent-git's low-level result; this detached
     // handoff makes workspace/list capability reads cache-only.
-    services.prewarm_cow_supported();
+    if startup_error.is_none() && !bootstrap.cancellation.stopping() {
+        services.prewarm_cow_supported();
+    }
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -2267,22 +2269,27 @@ async fn cmd_serve_owned(
     // survive a daemon restart — they are process-local). Any is_active=1 flag
     // after boot is stale. This runs BEFORE heal_stale_agent_sessions so the
     // stale-status heal sees is_active=0 rows across the board.
-    match services.store().reset_all_active_flags().await {
-        Ok(0) => {}
-        Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
-        Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+    if startup_error.is_none() && !bootstrap.cancellation.stopping() {
+        match services.store().reset_all_active_flags().await {
+            Ok(0) => {}
+            Ok(reset) => tracing::warn!(reset, "reset stale is_active=1 flags on startup"),
+            Err(e) => tracing::warn!(error = %e, "is_active reset failed"),
+        }
+        // Heal stale in-flight conversations from any prior crash BEFORE the chat
+        // subscription path can observe them (iter#1c). Sessions left in an
+        // active status (`Active`/`Processing`/`Waiting`) without a live worker
+        // would otherwise drive the FE's `isActiveAgentThread` selector and
+        // surface a phantom "Thinking" indicator. Best-effort: a failure is
+        // logged but never aborts startup.
+        match services.heal_stale_agent_sessions().await {
+            Ok(0) => {}
+            Ok(healed) => {
+                tracing::info!(healed, "healed stale in-flight agent sessions on startup")
+            }
+            Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
+        }
     }
-    // Heal stale in-flight conversations from any prior crash BEFORE the chat
-    // subscription path can observe them (iter#1c). Sessions left in an
-    // active status (`Active`/`Processing`/`Waiting`) without a live worker
-    // would otherwise drive the FE's `isActiveAgentThread` selector and
-    // surface a phantom "Thinking" indicator. Best-effort: a failure is
-    // logged but never aborts startup.
-    match services.heal_stale_agent_sessions().await {
-        Ok(0) => {}
-        Ok(healed) => tracing::info!(healed, "healed stale in-flight agent sessions on startup"),
-        Err(e) => tracing::warn!(error = %e, "stale agent session heal sweep failed"),
-    }
+
     // Rehydrate persisted agent send queues (write-through `agent_queue`
     // table) into the in-memory map before any listener serves RPCs, so
     // messages queued at the previous shutdown survive the restart. This only
@@ -2290,13 +2297,22 @@ async fn cmd_serve_owned(
     // explicit kick (resume, sendMessage, queueMessage, retry). Any recovery
     // error is fatal before listeners start: a new queue mutation must never
     // replace durable entries from an unreconciled, empty in-memory map.
-    let rehydrated = match restore_startup_queues(&services).await {
-        Ok(count) => count,
-        Err(error) => {
-            startup_error.get_or_insert(error.into());
-            0
+    let rehydrated = if startup_error.is_none() && !bootstrap.cancellation.stopping() {
+        match restore_startup_queues(&services).await {
+            Ok(count) => count,
+            Err(error) => {
+                startup_error.get_or_insert(error.into());
+                0
+            }
         }
+    } else {
+        0
     };
+    let startup_work =
+        startup::WorkAdmission::new(startup_error.is_none(), bootstrap.cancellation.clone());
+    if !startup_work.allowed() {
+        bootstrap.dispatch.status().fail();
+    }
     if rehydrated > 0 {
         tracing::info!(rehydrated, "rehydrated persisted agent queue messages");
     }
@@ -2305,14 +2321,17 @@ async fn cmd_serve_owned(
     // before the restart still redelivers the stopped message on the next
     // turn. Restore-only, like the queue rehydration above: it never starts a
     // turn. Best-effort: a failure is logged but never aborts startup.
-    match manager.rehydrate_stop_redeliveries().await {
-        Ok(0) => {}
-        Ok(rehydrated) => tracing::info!(
-            rehydrated,
-            "rehydrated persisted stop-redelivery payloads on startup"
-        ),
-        Err(e) => tracing::warn!(error = %e, "stop-redelivery rehydration failed"),
+    if startup_work.allowed() {
+        match manager.rehydrate_stop_redeliveries().await {
+            Ok(0) => {}
+            Ok(rehydrated) => tracing::info!(
+                rehydrated,
+                "rehydrated persisted stop-redelivery payloads on startup"
+            ),
+            Err(e) => tracing::warn!(error = %e, "stop-redelivery rehydration failed"),
+        }
     }
+
     // Reserve the boot-time candidates before exposing any listener. Only the
     // bounded candidate read gates startup; per-agent service work runs below
     // in an owned background sweep. Reservations prevent a manual-dialog flash.
@@ -2332,7 +2351,7 @@ async fn cmd_serve_owned(
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
     );
-    let startup_candidates = if resume_on_start {
+    let startup_candidates = if resume_on_start && startup_work.allowed() {
         match services.prepare_startup_resume().await {
             Ok(candidates) => Some(candidates),
             Err(error) => {
@@ -2346,82 +2365,106 @@ async fn cmd_serve_owned(
 
     // Restore groups before watches, without reconciling or waking agents.
     // Live requests must see the complete registries as soon as listeners open.
-    let startup_completions = services.prepare_startup_completion_recovery().await;
+    let startup_completions = if startup_work.allowed() {
+        Some(services.prepare_startup_completion_recovery().await)
+    } else {
+        None
+    };
     // Rehydrate persisted event subscriptions (monorepo#937) so `event.subscribe`
     // registrations survive daemon restarts; rows whose subscriber agent is
     // gone are pruned. Best-effort: a failure is logged but never aborts
     // startup (agents can re-subscribe).
-    match services.heal_event_subscriptions_on_startup().await {
-        Ok(0) => {}
-        Ok(loaded) => tracing::info!(
-            loaded,
-            "rehydrated persisted event subscriptions on startup"
-        ),
-        Err(e) => tracing::warn!(error = %e, "event subscription startup rehydration failed"),
+    if startup_work.allowed() {
+        match services.heal_event_subscriptions_on_startup().await {
+            Ok(0) => {}
+            Ok(loaded) => tracing::info!(
+                loaded,
+                "rehydrated persisted event subscriptions on startup"
+            ),
+            Err(e) => tracing::warn!(error = %e, "event subscription startup rehydration failed"),
+        }
     }
+
     // Hydrate the script registry from the persisted definitions (§5.8) so
     // `script.*` survives daemon restarts. Best-effort: a failure is logged
     // but never aborts startup (scripts can still be re-created live).
-    match services.hydrate_scripts().await {
-        Ok(0) => {}
-        Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
-        Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
+    if startup_work.allowed() {
+        match services.hydrate_scripts().await {
+            Ok(0) => {}
+            Ok(loaded) => tracing::info!(loaded, "hydrated persisted script definitions"),
+            Err(e) => tracing::warn!(error = %e, "script registry hydration failed"),
+        }
     }
+
     // Rehydrate active background hooks (`scheduled`/`running` rows) so their
     // schedules resume after a restart; hooks whose owning agent is gone are
     // cancelled instead. Best-effort: a failure is logged but never aborts
     // startup (agents can re-schedule).
-    match services.rehydrate_hooks().await {
-        Ok(0) => {}
-        Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
-        Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
+    if startup_work.allowed() {
+        match services.rehydrate_hooks().await {
+            Ok(0) => {}
+            Ok(resumed) => tracing::info!(resumed, "rehydrated active background hooks on startup"),
+            Err(e) => tracing::warn!(error = %e, "background hook rehydration failed"),
+        }
     }
+
     // Rehydrate active PR monitors (`ws.pr.monitor`) so watches resume after a
     // restart; monitors whose owning agent is gone are cancelled. Each resumed
     // monitor is marked for catch-up, so its first poll delivers any change
     // detected across the downtime immediately (no debounce). Best-effort: a
     // failure is logged but never aborts startup.
-    match services.rehydrate_pr_monitors().await {
-        Ok(0) => {}
-        Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
-        Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
+    if startup_work.allowed() {
+        match services.rehydrate_pr_monitors().await {
+            Ok(0) => {}
+            Ok(resumed) => tracing::info!(resumed, "rehydrated active PR monitors on startup"),
+            Err(e) => tracing::warn!(error = %e, "PR monitor rehydration failed"),
+        }
     }
+
     // Populate the primary principal's GitHub identity once at boot when the
     // row still predates the GitHub connection (`login: null`), so roster
     // reads do not wait for a `principal.me` (intent-hq/intent#5534).
     // Fire-and-forget: only spawns the bounded off-path refresh (one refresh
     // per IDENTITY_REFRESH_INTERVAL across all trigger sites); a no-op
     // without GitHub auth and never a startup failure.
-    services.refresh_primary_identity_at_startup().await;
+    if startup_work.allowed() {
+        services.refresh_primary_identity_at_startup().await;
+    }
     // Sweep orphaned `*.deleting-*` worktree trash dirs left behind when a
     // prior daemon crashed between the locked detach rename and the unlocked
     // recursive removal (monorepo#473). Spawned so the potentially multi-GB
     // removal never blocks startup; best-effort throughout — a failure never
     // aborts startup, and a missing workspaces root is a silent no-op.
     let services_trash_sweep = services.clone();
-    intent_core::spawn_daemon(async move {
-        let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
-        if removed > 0 {
-            tracing::info!(
-                removed,
-                "startup sweep removed orphaned worktree trash dirs"
-            );
-        }
+    startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            let removed = services_trash_sweep.sweep_orphaned_worktree_trash().await;
+            if removed > 0 {
+                tracing::info!(
+                    removed,
+                    "startup sweep removed orphaned worktree trash dirs"
+                );
+            }
+        })
     });
     // Sweep stale export staging dirs (workspace.export.*): export sessions
     // are in-memory only, so after a restart every leftover staging dir is an
     // orphan. Spawned + best-effort like the worktree trash sweep above.
     let services_export_sweep = services.clone();
-    intent_core::spawn_daemon(async move {
-        services_export_sweep.sweep_stale_export_staging().await;
+    startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            services_export_sweep.sweep_stale_export_staging().await;
+        })
     });
     // Sweep expired attachment idempotency-key bindings (7-day retention,
     // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
     let services_idempotency_sweep = services.clone();
-    let attachment_retention = intent_core::spawn_daemon(async move {
-        services_idempotency_sweep
-            .sweep_expired_attachment_idempotency_keys()
-            .await;
+    let attachment_retention = startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            services_idempotency_sweep
+                .sweep_expired_attachment_idempotency_keys()
+                .await;
+        })
     });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
@@ -2431,7 +2474,8 @@ async fn cmd_serve_owned(
     // (~30 min). Safe when source control is unconfigured (a sweep with due
     // workspaces logs and swallows the missing-provider error). Aborted on
     // clean shutdown.
-    let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60));
+    let pr_refresh =
+        startup_work.spawn(|| services.spawn_pr_refresh_loop(std::time::Duration::from_secs(60)));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
     // pollSeconds` (read live, floor 10s), poll the due active monitors —
     // each PR on an effective interval stretched to fit the `[prMonitor]
@@ -2443,34 +2487,38 @@ async fn cmd_serve_owned(
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
-    let pr_monitor_loop = services.spawn_pr_monitor_loop();
+    let pr_monitor_loop = startup_work.spawn(|| services.spawn_pr_monitor_loop());
     // Daemon-internal token-usage scan (§5.23/§19.1): every 300s, re-tally each
     // workspace's per-agent/per-model token usage, persist the durable
     // `tokenUsage` field, and emit `workspace:tokenUsage-changed` on deltas.
     // There is no scan RPC. Aborted on clean shutdown.
-    let token_usage_scan =
-        services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300));
+    let token_usage_scan = startup_work
+        .spawn(|| services.spawn_token_usage_scan_loop(std::time::Duration::from_secs(300)));
     // Completion-delivery worker (AS-3): wake parents holding a
     // completion watch when their delegated child finishes. No-op-safe without
     // an event bus. Held for the process lifetime and aborted on clean shutdown.
-    let completion_delivery = services.spawn_completion_delivery_loop();
+    let completion_delivery = startup_work.spawn(|| services.spawn_completion_delivery_loop());
     // Auto-commit-on-idle worker (LNI-1, §5.6): subscribe to `agent:idle` and
     // commit each task-linked agent's changes with `Agent-Id:` and
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
-    let auto_commit_loop = services.spawn_auto_commit_loop();
+    let auto_commit_loop = startup_work.spawn(|| services.spawn_auto_commit_loop());
     // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
     // status, auto-commit policy, and tracked-change events and publish the
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
-    let agent_locks_loop = services.spawn_agent_locks_loop();
-    let execution_context_loop = services.spawn_execution_context_loop();
+    let agent_locks_loop = startup_work.spawn(|| services.spawn_agent_locks_loop());
+    let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
     // largest-first while over budget without waiting for the TTL. Disabled
     // entirely when `agents.idleReapMinutes == 0` AND no budget is installed.
-    let reap_task = spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled);
+    let reap_task = if startup_work.allowed() {
+        spawn_idle_reap_loop(manager.clone(), config.idle_reap_minutes, budget_enabled)
+    } else {
+        None
+    };
     // Event retention/compaction (§10.2 / finding F4): periodically delete
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
@@ -2479,39 +2527,47 @@ async fn cmd_serve_owned(
     // sweep is disabled when `events.streamRetentionHours == 0`, but the loop
     // still ticks so the tool-payload retention sweep (read live from
     // `agents.toolPayloadRetentionDays`) can run.
-    let retention_task = spawn_stream_retention_loop(
-        retention_store,
-        config.stream_retention_hours,
-        settings_registry.clone(),
-    );
+    let retention_task = startup_work.spawn(|| {
+        spawn_stream_retention_loop(
+            retention_store,
+            config.stream_retention_hours,
+            settings_registry.clone(),
+        )
+    });
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
     // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
     // per-agent stderr capture files older than 7 days (STAB-53); the first tick
     // fires immediately so both sweeps run on startup. Aborted on clean shutdown.
-    let idempotency_reap_task = spawn_idempotency_reap_loop(
-        idempotency_store,
-        intent_core::agent_logs_root(&config.data_dir),
-    );
+    let idempotency_reap_task = startup_work.spawn(|| {
+        spawn_idempotency_reap_loop(
+            idempotency_store,
+            intent_core::agent_logs_root(&config.data_dir),
+        )
+    });
     // Merge-pending retry sweep: periodically retry merge-back for sandboxes
     // stranded `merge_pending` (daemon restart mid-merge, historical failures
     // like the pre-#592 fetch bug). First tick fires immediately so stuck
     // sandboxes self-heal on startup. Shutdown stops new ticks and joins the active sweep.
     let (stop_merge_retry, merge_retry_stopping) = tokio::sync::watch::channel(false);
-    let merge_retry_task = spawn_sandbox_merge_retry_loop(services.clone(), merge_retry_stopping);
+    let merge_retry_task = startup_work
+        .spawn(|| spawn_sandbox_merge_retry_loop(services.clone(), merge_retry_stopping));
     // External MCP servers (§18.3): the health monitor (periodic ping +
     // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
     // starting the enabled servers themselves is deferred to the background
     // init below because each handshake can take seconds. The hub is reaped on
     // shutdown so no orphan server processes remain (PTY-host reaping parity).
     let mcp_hub = services.mcp_hub();
-    let mcp_monitor = mcp_hub.spawn_health_monitor();
+    let mcp_monitor = startup_work.spawn(|| mcp_hub.spawn_health_monitor());
 
     // Build api Arc early so it can be cloned for runtime control (§5.12).
     // ServerControl is attached after DaemonControl is built via the OnceLock seam.
     let api_services = Arc::new(services.clone());
-    if let Err(error) = api_services.initialize_repository_wire().await {
-        tracing::debug!(%error, "native repository context remains unavailable at startup");
+    if startup_work.allowed() {
+        if let Err(error) = api_services.initialize_repository_wire().await {
+            tracing::debug!(%error, "native repository context remains unavailable at startup");
+        }
     }
+
     let api: Arc<dyn WorkspaceApi> = api_services;
     // Bridge `file:*` → debounced `changes:git-status` (monorepo#1397): external
     // file edits refresh the FE Changes panel without any in-app git action.
@@ -2529,10 +2585,10 @@ async fn cmd_serve_owned(
     // timeout) and the watcher registry (serial FSEvents registrations, which on
     // a loaded macOS `fseventsd` cost seconds each). Shutdown stops new work
     // cooperatively and joins the current operation before closing the store.
-    let mcp_start_task = {
+    let mcp_start_task = startup_work.spawn(|| {
         let services = services.clone();
         intent_core::spawn_daemon(async move { services.start_enabled_mcp_servers().await })
-    };
+    });
     // Watch-health handle created BEFORE the backgrounded registry start so
     // DaemonControl can hold it now; it snapshots `None` (fileWatch absent
     // from system.status) until the registry attaches the shared hub. The hub
@@ -2542,14 +2598,16 @@ async fn cmd_serve_owned(
     let watch_health = intent_services::WatchHealth::default();
     let watch_hub = intent_services::SharedWatchHub::new();
     let (stop_watchers, watcher_shutdown) = tokio::sync::oneshot::channel();
-    let watcher_init_task = spawn_watcher_registry_init(
-        Arc::clone(&watch_hub),
-        bus.clone(),
-        api.clone(),
-        Arc::clone(&git_status_refresher),
-        watch_health.clone(),
-        watcher_shutdown,
-    );
+    let watcher_init_task = startup_work.spawn(|| {
+        spawn_watcher_registry_init(
+            Arc::clone(&watch_hub),
+            bus.clone(),
+            api.clone(),
+            Arc::clone(&git_status_refresher),
+            watch_health.clone(),
+            watcher_shutdown,
+        )
+    });
 
     // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
     // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
@@ -2897,9 +2955,11 @@ async fn cmd_serve_owned(
                     } => {},
                 }
             }
-            services
-                .reconcile_startup_completions(startup_completions, &stopping)
-                .await;
+            if let Some(completions) = startup_completions {
+                services
+                    .reconcile_startup_completions(completions, &stopping)
+                    .await;
+            }
             if let Some(candidates) = startup_candidates {
                 run_startup_resume_sweep(&services, candidates, stopping).await;
             }

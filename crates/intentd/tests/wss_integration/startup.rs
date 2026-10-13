@@ -448,6 +448,93 @@ async fn services_stop_uses_canonical_teardown() {
 }
 
 #[tokio::test]
+async fn queue_restore_failure_never_activates_operational_work() {
+    let dir = common::test_tempdir_in("/tmp", "startup-queue-failure-");
+    seed(dir.path()).await;
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("intentd.db")),
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES ('review-agent','startup','review','idle','2026-10-13T00:00:00Z','2026-10-13T00:00:00Z')").execute(&db).await.unwrap();
+    sqlx::query("INSERT INTO hook(hook_id,workspace_id,agent_id,name,code,delay_ms,state,created_at,expires_at) VALUES ('review-hook','startup','review-agent','review hook','return {dispatch:false}',1000,'scheduled','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')").execute(&db).await.unwrap();
+    sqlx::query("ALTER TABLE agent_queue RENAME TO saved_agent_queue")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO saved_agent_queue(id,agent_id,position,payload,created_at) VALUES ('retained','review-agent',0,'{}','now')").execute(&db).await.unwrap();
+    db.close().await;
+    let marker = dir.path().join("mcp-started");
+    intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"))
+        .store(
+            "mcp.servers",
+            &json!({"review-mcp": {
+                "id":"review-mcp", "name":"review MCP", "transport":"stdio",
+                "command":"/bin/sh", "args":["-c", "touch \"$1\"", "fixture", marker],
+                "enabled":true
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    let gate_path = dir.path().join("gate");
+    let indexing = UnixListener::bind(&gate_path).unwrap();
+    let (mut child, _) = launch(dir.path(), &gate_path);
+    for stage in [b'i', b'n', b'c'] {
+        barrier(&indexing, stage)
+            .await
+            .write_u8(b'c')
+            .await
+            .unwrap();
+    }
+    assert!(!child
+        .wait_with_timeout(Duration::from_secs(20))
+        .unwrap()
+        .unwrap()
+        .success());
+    let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();
+    for phase in ["cleanup", "agent_shutdown", "writer_drain", "store_close"] {
+        assert!(
+            log.contains(&format!("phase=\"{phase}\" state=\"completed\"")),
+            "{log}"
+        );
+    }
+    let db = database(dir.path()).await;
+    let hook: (String, i64) =
+        sqlx::query_as("SELECT state,run_count FROM hook WHERE hook_id='review-hook'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        hook,
+        ("scheduled".into(), 0),
+        "fatal startup must not consume a hook wake: {log}"
+    );
+    let agent: (String, i64) =
+        sqlx::query_as("SELECT status,message_count FROM agent_session WHERE id='review-agent'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        agent,
+        ("idle".into(), 0),
+        "no wake/provider activation: {log}"
+    );
+    let queue: (String, String) = sqlx::query_as("SELECT id,payload FROM saved_agent_queue")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(queue, ("retained".into(), "{}".into()));
+    assert!(
+        !marker.exists(),
+        "MCP must not start after fatal prerequisites: {log}"
+    );
+    db.close().await;
+    drop(Store::prepare_for_daemon(&dir.path().join("intentd.db")).unwrap());
+}
+
+#[tokio::test]
 async fn services_admission_failure_uses_canonical_teardown() {
     service_startup_exit(true).await;
 }

@@ -92,6 +92,39 @@ impl Cancellation {
     }
 }
 
+/// Operational startup is separate from constructing the owners needed for
+/// cleanup. A failed prerequisite must never activate hooks, providers or MCP.
+pub struct WorkAdmission {
+    prerequisites_ok: bool,
+    cancellation: Cancellation,
+}
+
+impl WorkAdmission {
+    pub fn new(prerequisites_ok: bool, cancellation: Cancellation) -> Self {
+        Self {
+            prerequisites_ok,
+            cancellation,
+        }
+    }
+
+    pub fn allowed(&self) -> bool {
+        self.prerequisites_ok && !self.cancellation.stopping()
+    }
+
+    pub fn spawn(
+        &self,
+        start: impl FnOnce() -> tokio::task::JoinHandle<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        if self.allowed() {
+            start()
+        } else {
+            // Keep the normal cleanup join graph without constructing or
+            // polling the rejected operational task.
+            intent_core::spawn_daemon(async {})
+        }
+    }
+}
+
 /// A file edit affecting admission invalidates this bootstrap attempt. Other
 /// settings keep their ordinary post-start live-reload behavior.
 pub fn admission_unchanged(
@@ -117,4 +150,36 @@ pub fn admission_unchanged(
     ]
     .iter()
     .all(|key| fresh.get(key) == expected.get(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn work_admission_rejects_failure_and_latched_stop_but_settles_admitted_work() {
+        let cancellation = Cancellation::new();
+        WorkAdmission::new(false, cancellation.clone())
+            .spawn(|| panic!("failed prerequisites must not activate work"))
+            .await
+            .unwrap();
+        let admission = WorkAdmission::new(true, cancellation.clone());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let settled = Arc::new(AtomicBool::new(false));
+        let observed = settled.clone();
+        let admitted = admission.spawn(|| {
+            intent_core::spawn_daemon(async move {
+                wait.await.unwrap();
+                observed.store(true, Ordering::Release);
+            })
+        });
+        cancellation.request_stop();
+        admission
+            .spawn(|| panic!("latched stop must not activate work"))
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        admitted.await.unwrap();
+        assert!(settled.load(Ordering::Acquire));
+    }
 }
