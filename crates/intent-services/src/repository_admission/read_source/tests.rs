@@ -27,6 +27,7 @@ pub(crate) mod native_monitor;
 #[path = "tests/polling.rs"]
 mod polling;
 
+#[cfg(target_os = "linux")]
 pub(crate) async fn admit_original_monitor(
     services: &Arc<Services>,
     retained: Arc<RepositoryReadRequest>,

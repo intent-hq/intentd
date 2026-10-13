@@ -133,6 +133,7 @@ impl NativeRecipient {
         }).await
     }
 
+    #[cfg(unix)]
     pub(crate) async fn history_api(
         &self,
         agent: AgentId,
@@ -195,10 +196,12 @@ impl NativeRecipient {
         .await
     }
 
+    #[cfg(unix)]
     pub(crate) fn retire(&self) {
         self.connection.retire();
     }
 
+    #[cfg(unix)]
     pub(crate) async fn flush(
         &self,
         workspace: WorkspaceId,

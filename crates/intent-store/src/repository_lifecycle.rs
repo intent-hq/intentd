@@ -357,7 +357,7 @@ impl LifecycleWrite {
         self.serial.take();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn settle(mut self) {
         if let Some(ticket) = self.ticket.take() {
             ticket.settle_confirmed();
