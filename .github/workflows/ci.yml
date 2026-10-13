@@ -1520,7 +1520,11 @@ jobs:
     needs: route
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    # Hosted run 38448232349 completed both instrumented phases (23m16s +
+    # 5m29s), but setup and cache/checkout cleanup exhausted the old 30m job.
+    # Bound the phases separately and reserve 2m for setup/post actions;
+    # nextest deadlines, retry policy and coverage commands stay unchanged.
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1737,6 +1741,7 @@ jobs:
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Run changed tests under llvm-cov
+        timeout-minutes: 30
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The
         # script also enforces the same policy at its test launch boundary.
@@ -1745,6 +1750,7 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: ./scripts/changed-tests.sh --instrumented --base "$BASE_SHA"
       - name: Run callback fixture composition under llvm-cov
+        timeout-minutes: 8
         if: steps.select.outputs.callback_fixture_changed == 'true'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"

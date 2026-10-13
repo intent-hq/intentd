@@ -47,8 +47,26 @@ def test_steps(workflow):
                 yield name, job, step
 
 
-def violations(workflow, policy):
+def coverage_budget_violations(workflow):
+    """Keep the combined instrumented lane finite, with post-action headroom."""
+    job = workflow["jobs"]["coverage-changed"]
+    limits = {
+        "Run changed tests under llvm-cov": 30,
+        "Run callback fixture composition under llvm-cov": 8,
+    }
     errors = []
+    total = job.get("timeout-minutes")
+    if type(total) is not int or total != sum(limits.values()) + 2:
+        errors.append("coverage-changed must reserve 2m outside its bounded test phases")
+    for name, limit in limits.items():
+        steps = [step for step in job["steps"] if step.get("name") == name]
+        if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != limit:
+            errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
+    return errors
+
+
+def violations(workflow, policy):
+    errors = coverage_budget_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -191,10 +209,26 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn("has_selection=" + expected, output)
                 self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
 
+    def test_coverage_budget_rejects_lost_bounds_and_cleanup_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for name in (None, "Run changed tests under llvm-cov",
+                     "Run callback fixture composition under llvm-cov"):
+            for limit in (None, 0, True, 30 if name is None else 60):
+                with self.subTest(phase=name, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-changed"]
+                    target = job if name is None else next(s for s in job["steps"] if s.get("name") == name)
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
-        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
         names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
         self.assertEqual(len(names), 6)
         for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):
