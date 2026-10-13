@@ -18,6 +18,9 @@
 //! neither unix nor windows, `serve_uds` still returns an `Unsupported` error
 //! at runtime.
 
+mod startup;
+pub use startup::StartupLocalListener;
+
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;

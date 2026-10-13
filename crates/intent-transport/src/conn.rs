@@ -469,6 +469,25 @@ async fn process_captured_frame(
     let out_tx = &outbound;
     let parsed = serde_json::from_str::<Value>(raw).ok();
     if let Some(value) = &parsed {
+        if let crate::router::EnvelopeCheck::Valid {
+            echo_id,
+            method: "system.startupStatus",
+            is_notification,
+        } = crate::router::check_envelope(value)
+        {
+            if is_notification {
+                return true;
+            }
+            if let Some(status) = control.and_then(|c| c.startup_status()) {
+                let frame = if crate::context::current_caller().is_none_or(|c| c.is_administrator())
+                {
+                    crate::startup::status_response(&status, &echo_id, value.get("params"))
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0","id":echo_id,"error":{"code":-32003,"message":"Forbidden"}}).to_string()
+                };
+                return out_tx.send_priority(frame).await.is_ok();
+            }
+        }
         // Admit opt-in state subscriptions before classifiers clone params/id.
         if matches!(
             value["method"].as_str(),
@@ -775,7 +794,18 @@ async fn process_captured_frame(
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
                 let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
                 bound = outcome.bound;
-                outcome.frame
+                if control.and_then(|c| c.startup_status()).is_some() {
+                    outcome.frame.map(|frame| {
+                        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
+                        if value.get("result").is_some() {
+                            value["result"]["server"]["capabilities"]["startupStatus"] =
+                                serde_json::json!(1);
+                        }
+                        value.to_string()
+                    })
+                } else {
+                    outcome.frame
+                }
             })
             .await;
             // REV-2: bind the hello'd identity onto the registry entry; the

@@ -559,6 +559,24 @@ pub(crate) fn rebuild<'a>(
     rev: i64,
     content_changed: bool,
 ) -> BoxFuture<'a, Result<()>> {
+    rebuild_impl(conn, note, rev, content_changed, false)
+}
+
+fn project_content(source: &str, mut entries: Entries) -> (Vec<Piece>, Entries, usize) {
+    let parts = pieces(source);
+    entries.serial = 0;
+    context_entries(source, &parts, &mut entries);
+    let task_count = task_entries(source, &mut entries);
+    (parts, entries, task_count)
+}
+
+fn rebuild_impl<'a>(
+    conn: &'a mut SqliteConnection,
+    note: &'a Note,
+    rev: i64,
+    content_changed: bool,
+    offload: bool,
+) -> BoxFuture<'a, Result<()>> {
     Box::pin(async move {
         let ws = &note.workspace_id.0;
         let id = &note.id.0;
@@ -588,7 +606,34 @@ pub(crate) fn rebuild<'a>(
                 .await
                 .map_err(db_error)?;
             sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'c:%' OR collection LIKE 'd:%' OR collection LIKE 't:%' OR collection LIKE 'h:%' OR collection < 'f:0000010000000000')").bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
-            let parts = pieces(&note.content);
+            // Startup parsing/projection can be CPU-heavy for one large note.
+            // Keep it off the listener runtime, including single-worker hosts.
+            let (parts, projected, task_count) = if offload {
+                let source = note.content.clone();
+                // One projection at a time. This thread owns only copied source
+                // and derived data, never SQLite or daemon ownership. Unlike a
+                // Tokio blocking task, it cannot pin runtime shutdown after the
+                // startup transaction is cancelled; its dropped result is inert.
+                let (send, receive) = tokio::sync::oneshot::channel();
+                std::thread::Builder::new()
+                    .name("startup-note-projection".into())
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        let result = (|| {
+                            #[cfg(all(unix, debug_assertions))]
+                            crate::startup_test_gate::projection()?;
+                            Ok::<_, Error>(project_content(&source, entries))
+                        })();
+                        let _ = send.send(result);
+                    })
+                    .map_err(|e| Error::Internal(format!("note projection thread: {e}")))?;
+                receive
+                    .await
+                    .map_err(|e| Error::Internal(format!("note projection failed: {e}")))??
+            } else {
+                project_content(&note.content, entries)
+            };
+            entries = projected;
             for part in &parts {
                 sqlx::query("INSERT INTO note_page_piece(workspace_id,note_id,start,end,text,byte_start,scalar_start,lf_start,content_generation) VALUES (?,?,?,?,?,?,?,?,?)")
                     .bind(ws)
@@ -604,9 +649,6 @@ pub(crate) fn rebuild<'a>(
                     .await
                     .map_err(db_error)?;
             }
-            entries.serial = 0;
-            context_entries(&note.content, &parts, &mut entries);
-            let task_count = task_entries(&note.content, &mut entries);
             sqlx::query("UPDATE note_page_head SET task_count=?,source_length=?,source_bytes=?,scalar_count=?,lf_count=?,content_generation=? WHERE workspace_id=? AND note_id=?")
             .bind(sql_offset(task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(&content_generation).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
         }
@@ -648,13 +690,45 @@ pub(crate) fn rebuild<'a>(
 /// Used only during open/import/adoption, never from a read RPC. One legacy row
 /// at a time bounds migration memory independently of workspace note count.
 pub(crate) async fn rebuild_pending(conn: &mut SqliteConnection) -> Result<()> {
+    rebuild_pending_with_progress(conn, None).await
+}
+
+pub(crate) async fn rebuild_pending_with_progress(
+    conn: &mut SqliteConnection,
+    startup: Option<&intent_core::startup::StartupStatus>,
+) -> Result<()> {
+    use intent_core::startup::StartupProgress;
+    let mut progress = StartupProgress::default();
+    if let Some(status) = startup {
+        let row = sqlx::query("SELECT COUNT(*), COALESCE(SUM(length(CAST(n.content AS BLOB))),0) FROM note n JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE h.indexed_rev=-1")
+            .fetch_one(&mut *conn).await.map_err(db_error)?;
+        progress.total_notes =
+            u64::try_from(row.get::<i64, _>(0)).map_err(|e| Error::Internal(e.to_string()))?;
+        progress.total_source_bytes =
+            u64::try_from(row.get::<i64, _>(1)).map_err(|e| Error::Internal(e.to_string()))?;
+        status.indexing(progress);
+        #[cfg(all(unix, debug_assertions))]
+        crate::startup_test_gate::reach(b'i', conn).await?;
+    }
     loop {
         let row = sqlx::query("SELECT n.* FROM note n JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE h.indexed_rev = -1 LIMIT 1").fetch_optional(&mut *conn).await.map_err(db_error)?;
         let Some(row) = row else {
             break;
         };
         let note = crate::note_repo::map_note_row(&row)?;
-        rebuild(conn, &note, row.try_get("rev").map_err(db_error)?, true).await?;
+        rebuild_impl(
+            conn,
+            &note,
+            row.try_get("rev").map_err(db_error)?,
+            true,
+            startup.is_some(),
+        )
+        .await?;
+        if let Some(status) = startup {
+            progress.completed_notes += 1;
+            progress.processed_source_bytes += note.content.len() as u64;
+            status.indexing(progress);
+        }
     }
     Ok(())
 }

@@ -145,6 +145,17 @@ local machine, connect to it first. Enabling access, changing listening addresse
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json. -->
+
+When the app and connected daemon support startup progress, the connection screen
+can show **Starting intentd**, **Rebuilding note indexes**, then **Finishing startup**.
+Keep the app open; it reconnects when ready. Completed-note counts describe work
+in this attempt, not committed progress. A large note can leave the count unchanged;
+that alone does not mean startup failed. Any remaining-time estimate is approximate
+and covers indexing only. **Startup status unavailable** means fresh status could
+not be received; do not present cached counts as current. For **Daemon startup failed**,
+check the daemon logs. Restarting can repeat uncommitted indexing work.
+
 ## Start or continue work
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->

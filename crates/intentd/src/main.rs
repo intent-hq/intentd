@@ -24,9 +24,9 @@ use intent_store::Store;
 use intent_transport::{
     advertised_hosts, collect_local_ips, collect_local_ipv6s, detect_has_display,
     detect_host_environment, ensure_tls_certificate, get_or_create_token, local_hostname,
-    pretty_hostname, serve_uds_with_reverse, AsyncTokenStore, CertStatus, FileTokenStore,
-    HostEnvironment, PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore,
-    WsApiServer, WsOptions,
+    pretty_hostname, AsyncTokenStore, CertStatus, FileTokenStore, HostEnvironment,
+    PrimaryReverseRegistry, RpcLimiter, SystemControl, SystemStatus, TokenStore, WsApiServer,
+    WsOptions,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -42,6 +42,7 @@ mod legacy_import;
 mod provider;
 mod rpc_profile;
 mod shutdown;
+mod startup;
 mod suspend;
 mod tunnel;
 use client::rpc_call;
@@ -1691,22 +1692,232 @@ async fn cmd_serve(
     // UDS or a live pid holds the pidfile; clean a stale socket/pidfile whose
     // owner is gone. The returned guard removes our pidfile on shutdown.
     let _pidfile = acquire_single_instance(&config).await?;
+    let prepared =
+        Store::prepare_for_daemon(&config.db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut bootstrap = startup::Bootstrap::new(&config);
+    let dispatch = bootstrap.dispatch.clone();
+    // Before handoff OS stop must work even if the startup transaction is busy.
+    // After handoff the existing orderly service shutdown owns the signal.
+    let early_stop = async {
+        tokio::select! {
+            biased;
+            () = dispatch.retired() => std::future::pending::<()>().await,
+            () = shutdown_signal() => {},
+        }
+    };
+    let result = tokio::select! {
+        result = cmd_serve_owned(config, insecure, resume_all, locality_override, prepared, &mut bootstrap) => result,
+        () = early_stop => Ok(ExitCode::SUCCESS),
+    };
+    bootstrap.stop().await;
+    result
+}
+
+async fn cmd_serve_owned(
+    config: Config,
+    insecure: bool,
+    resume_all: bool,
+    locality_override: Option<bool>,
+    prepared: intent_store::PreparedDaemonStore,
+    bootstrap: &mut startup::Bootstrap,
+) -> anyhow::Result<ExitCode> {
+    // Layered `config.toml` registry backing the TOML-backed `settings.*` keys
+    // (defaults < file < startup pins). `Config::resolve()` above already
+    // parsed the file strictly (malformed file → startup error), so a load
+    // failure here is unexpected and equally fatal.
+    let settings_registry = Arc::new(
+        intent_services::SettingsRegistry::load(&config.config_path)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    );
+    // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
+    // pinned keys take the flag value, report origin `flag` on the wire,
+    // reject `settings.update`, and ignore the file value on live-reload. An
+    // invalid pin value (e.g. out-of-range INTENTD_TCP_PORT) refuses startup.
+    apply_startup_pins(&settings_registry, insecure)?;
+    // Snapshot of the effective boot settings for the boot-time reads below
+    // (agents.maxConcurrent, server.wsApi.enabled).
+    let boot_settings = settings_registry.snapshot();
+    // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
+    // construction args ALWAYS so settings can toggle the listener on/off at
+    // runtime. Boot-time auto-start of the listener (see [`boot_ws_listener`]):
+    // `--insecure` → the plain-ws TCP listener always starts (dev posture);
+    // otherwise the WSS listener starts ONLY if the effective
+    // server.wsApi.enabled is true (config.toml / persisted toggle state
+    // honored across relaunches). Env (INTENTD_TCP_PORT) takes precedence
+    // over persisted settings for the port.
+    let mut ws_options = ws_options_from_env();
+    ws_options.locality_override = locality_override;
+    // Preserve the configured bind set. Invalid settings fail startup rather
+    // than substituting a different endpoint for the protected bootstrap.
+    ws_options.bind_addresses = boot_settings
+        .effective
+        .server
+        .bind_address
+        .resolve()
+        .map_err(|e| anyhow::anyhow!("invalid server.bindAddress: {e}"))?;
+    // Tunnel-only mode (server.tunnel.only): the listener accepts
+    // tunnel-forwarded traffic only, so bind loopback regardless of
+    // server.bindAddress. The runtime start path (`start_ws_listener`)
+    // applies the same override from the persisted setting.
+    if boot_settings.effective.server.tunnel.only {
+        let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        if ws_options.bind_addresses != loopback {
+            tracing::info!(
+                "server.tunnel.only=true: WSS listener binding loopback only \
+                 (server.bindAddress ignored while tunnel-only is on)"
+            );
+            ws_options.bind_addresses = loopback;
+        }
+    }
+    // The loopback guarantee ([`ensure_loopback_bind`]): 127.0.0.1 is always
+    // bound alongside the configured set — local clients and the tailcat
+    // sidecar must reach the daemon whatever endpoints were selected. The
+    // runtime start path (`start_ws_listener`) applies the same guarantee.
+    ensure_loopback_bind(&mut ws_options.bind_addresses);
+    // Loud upgrade-path warning (monorepo#2900): the old config template wrote
+    // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
+    // file-origin wide bind that predates the loopback default. When that wide
+    // bind will actually be served (listener enabled), say so prominently.
+    // Fires only when the effective set contains an unspecified address —
+    // which the settings validation constrains to being the sole entry.
+    if ws_options
+        .bind_addresses
+        .iter()
+        .any(std::net::IpAddr::is_unspecified)
+        && boot_settings.effective.server.ws_api.enabled
+        && !insecure
+    {
+        tracing::warn!(
+            "server.bindAddress = \"{}\" exposes the WSS listener on EVERY interface, \
+             including untrusted networks and possibly the internet. If this is not \
+             intentional, set bindAddress = \"127.0.0.1\" under [server] in config.toml \
+             (or re-run `intentd pair` and pick an interface)",
+            boot_settings.effective.server.bind_address
+        );
+    }
+    // Guest connection caps (`sharing.maxGuestConnections` /
+    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): ONE live cell built
+    // here (like `rpc_limiter`) and carried by every listener the runtime
+    // toggle builds later, so a toggle keeps the current values. The follower
+    // task applies `settings.update` / config.toml live-reload changes to the
+    // cell; they reach the next guest upgrade without a listener restart and
+    // never evict an admitted connection.
+    let guest_limits =
+        intent_transport::SharedGuestLimits::new(intent_transport::GuestConnectionLimits {
+            max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
+            max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
+        });
+    let guest_limits_task = guest_limits.follow(settings_registry.clone());
+    ws_options.guest_limits = guest_limits;
+
+    // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
+    // the token store for auth layers (§5.2/§5.3). Always provision for runtime
+    // toggle, even when the listener is not boot-started (it can be started
+    // later via settings).
+    let (tls_cert, token_store) = if insecure {
+        tracing::warn!(
+            "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
+            ws_options
+                .bind_addresses
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            ws_options.base_port
+        );
+        (None, None)
+    } else {
+        let tls =
+            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
+        get_or_create_token(&async_token_store)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        (Some(tls), Some(async_token_store))
+    };
+
+    {
+        let registry = settings_registry.clone();
+        let path = config.config_path.clone();
+        assert!(bootstrap.dispatch.set_policy_check(Arc::new(move || {
+            startup::admission_unchanged(&registry, &path, insecure)
+        })));
+    }
+    // Ownership, effective file settings, TLS and the normal owner token are
+    // resolved before binding. No database-dependent principal can enter yet.
+    let boot_listener = boot_ws_listener(insecure, boot_settings.effective.server.ws_api.enabled);
+    let local = intent_transport::listener::StartupLocalListener::bind(&config.socket_path)?;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    bootstrap.stop_local = Some(stop);
+    let dispatch = bootstrap.dispatch.clone();
+    bootstrap.local = Some(tokio::spawn(local.serve(dispatch, async {
+        let _ = stopped.await;
+    })));
+    if boot_listener != BootWsListener::None {
+        let snapshot = settings_registry.snapshot();
+        let desired = resolve_ws_listener_port(
+            std::env::var("INTENTD_TCP_PORT").ok().as_deref(),
+            Some(snapshot.effective.server.ws_api.port),
+            ws_options.base_port,
+        );
+        ws_options.base_port = desired;
+        let server = WsApiServer::new_startup(
+            bootstrap.dispatch.clone(),
+            tls_cert.as_ref(),
+            token_store.as_ref(),
+            ws_options.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        bootstrap.ws = Some(server.clone());
+        let assign = !insecure
+            && desired != 0
+            && snapshot.ws_api_port_policy() == intent_services::WsApiPortPolicy::Unassigned;
+        let port = if assign {
+            let registry = settings_registry.clone();
+            server
+                .start_with_port_assignment(move |port| {
+                    registry
+                        .persist_selected_ws_api_port(&snapshot, port)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                })
+                .await?
+        } else {
+            server.start().await?
+        };
+        bootstrap.port = Some(port);
+        if boot_settings.effective.server.tunnel.enabled {
+            let relay = boot_settings
+                .effective
+                .server
+                .tunnel
+                .derp_url
+                .clone()
+                .filter(|v| !v.is_empty());
+            match bootstrap.tunnel.start(port, relay).await {
+                Ok(_) => tracing::info!("saved Tailcat route serving protected startup status"),
+                Err(e) => {
+                    tracing::warn!(error=%e,"Tailcat startup failed; configured route unavailable");
+                }
+            }
+        }
+    }
     // Snapshot DB-file existence before `Store::open` creates it: the one-time
     // legacy workspace import below fires only on a truly fresh database.
     let db_existed = config.db_path.exists();
-    let store = Store::open_for_daemon(&config.db_path)
+    let store = prepared
+        .open(Some(bootstrap.dispatch.status().clone()))
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
     // database created before the `auto_vacuum = INCREMENTAL` pragma stays in
     // NONE mode until a full VACUUM rebuilds the file, leaving the retention
     // loop's bounded incremental_vacuum a no-op. Run it now — before any
-    // listener serves — so no client is blocked by the rebuild and no
+    // application listener serves — protected startup status remains available and no
     // transaction is open on the write connection (a VACUUM requirement).
     // Failure is non-fatal: the daemon runs degraded exactly as before
     // (freelist pages are simply never returned to the filesystem).
     // Pre-log the rebuild (PR #500 review): on a large legacy DB the VACUUM
-    // can take a while with no socket accepting yet, so an operator tailing
+    // can take a while in finalizing, so an operator tailing
     // the log needs to see why startup is slow before it completes.
     if let Ok(row) = sqlx::query("PRAGMA auto_vacuum")
         .fetch_one(store.write_pool())
@@ -1809,14 +2020,6 @@ async fn cmd_serve(
     // per-connection `ReverseChannel` here; agent-initiated `browser.exec`
     // routes through the same registry via `Services::with_reverse_dispatch`.
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    // Layered `config.toml` registry backing the TOML-backed `settings.*` keys
-    // (defaults < file < startup pins). `Config::resolve()` above already
-    // parsed the file strictly (malformed file → startup error), so a load
-    // failure here is unexpected and equally fatal.
-    let settings_registry = Arc::new(
-        intent_services::SettingsRegistry::load(&config.config_path)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-    );
     // One-time carry-over of the renamed `[backgroundAgents]` table into the
     // `quickActions.*` keys (monorepo#1729), before the legacy import below
     // discards and strips it. Unset quick-action keys inherit the old value;
@@ -1850,14 +2053,6 @@ async fn cmd_serve(
     intent_services::migrate_default_vocabulary(&store)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
-    // pinned keys take the flag value, report origin `flag` on the wire,
-    // reject `settings.update`, and ignore the file value on live-reload. An
-    // invalid pin value (e.g. out-of-range INTENTD_TCP_PORT) refuses startup.
-    apply_startup_pins(&settings_registry, insecure)?;
-    // Snapshot of the effective boot settings for the boot-time reads below
-    // (agents.maxConcurrent, server.wsApi.enabled).
-    let boot_settings = settings_registry.snapshot();
     // Resolve the concurrent agent cap: positive effective value → explicit
     // override; 0 (the schema default) → auto (RAM-based default_process_cap).
     // The setting applies on daemon restart (§9.8 agents.maxConcurrent).
@@ -2323,68 +2518,6 @@ async fn cmd_serve(
         watcher_shutdown,
     );
 
-    // Prepare runtime control for the HTTPS+WSS listener (§5.12). Build the
-    // construction args ALWAYS so settings can toggle the listener on/off at
-    // runtime. Boot-time auto-start of the listener (see [`boot_ws_listener`]):
-    // `--insecure` → the plain-ws TCP listener always starts (dev posture);
-    // otherwise the WSS listener starts ONLY if the effective
-    // server.wsApi.enabled is true (config.toml / persisted toggle state
-    // honored across relaunches). Env (INTENTD_TCP_PORT) takes precedence
-    // over persisted settings for the port.
-    let mut ws_options = ws_options_from_env();
-    ws_options.locality_override = locality_override;
-    // Apply the effective server.bindAddress (default 127.0.0.1 — loopback;
-    // monorepo#2900). A single IP or a list of IPs (one listener per address,
-    // same port; monorepo#3314). An invalid persisted set falls back to
-    // loopback with a warning rather than silently widening the bind (defense
-    // in depth — SettingsFile::validate rejects invalid sets at load time).
-    match boot_settings.effective.server.bind_address.resolve() {
-        Ok(addrs) => ws_options.bind_addresses = addrs,
-        Err(msg) => tracing::warn!(
-            value = %boot_settings.effective.server.bind_address,
-            "server.bindAddress is invalid ({msg}); binding loopback (127.0.0.1)"
-        ),
-    }
-    // Tunnel-only mode (server.tunnel.only): the listener accepts
-    // tunnel-forwarded traffic only, so bind loopback regardless of
-    // server.bindAddress. The runtime start path (`start_ws_listener`)
-    // applies the same override from the persisted setting.
-    if boot_settings.effective.server.tunnel.only {
-        let loopback = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
-        if ws_options.bind_addresses != loopback {
-            tracing::info!(
-                "server.tunnel.only=true: WSS listener binding loopback only \
-                 (server.bindAddress ignored while tunnel-only is on)"
-            );
-            ws_options.bind_addresses = loopback;
-        }
-    }
-    // The loopback guarantee ([`ensure_loopback_bind`]): 127.0.0.1 is always
-    // bound alongside the configured set — local clients and the tailcat
-    // sidecar must reach the daemon whatever endpoints were selected. The
-    // runtime start path (`start_ws_listener`) applies the same guarantee.
-    ensure_loopback_bind(&mut ws_options.bind_addresses);
-    // Loud upgrade-path warning (monorepo#2900): the old config template wrote
-    // an uncommented `bindAddress = "0.0.0.0"`, so existing installs carry a
-    // file-origin wide bind that predates the loopback default. When that wide
-    // bind will actually be served (listener enabled), say so prominently.
-    // Fires only when the effective set contains an unspecified address —
-    // which the settings validation constrains to being the sole entry.
-    if ws_options
-        .bind_addresses
-        .iter()
-        .any(std::net::IpAddr::is_unspecified)
-        && boot_settings.effective.server.ws_api.enabled
-        && !insecure
-    {
-        tracing::warn!(
-            "server.bindAddress = \"{}\" exposes the WSS listener on EVERY interface, \
-             including untrusted networks and possibly the internet. If this is not \
-             intentional, set bindAddress = \"127.0.0.1\" under [server] in config.toml \
-             (or re-run `intentd pair` and pick an interface)",
-            boot_settings.effective.server.bind_address
-        );
-    }
     // ONE daemon-wide outstanding-slow-path-RPC cap (`server.maxOutstandingRpcs`,
     // 0 = unlimited) shared by the UDS and WSS listeners so the limit is global,
     // not per-connection or per-transport.
@@ -2398,47 +2531,6 @@ async fn cmd_serve(
         );
     }
     ws_options.rpc_limiter = rpc_limiter.clone();
-    // Guest connection caps (`sharing.maxGuestConnections` /
-    // `sharing.maxConnectionsPerGuest`, 0 = unlimited): ONE live cell built
-    // here (like `rpc_limiter`) and carried by every listener the runtime
-    // toggle builds later, so a toggle keeps the current values. The follower
-    // task applies `settings.update` / config.toml live-reload changes to the
-    // cell; they reach the next guest upgrade without a listener restart and
-    // never evict an admitted connection.
-    let guest_limits =
-        intent_transport::SharedGuestLimits::new(intent_transport::GuestConnectionLimits {
-            max_guest_connections: boot_settings.effective.sharing.max_guest_connections,
-            max_connections_per_guest: boot_settings.effective.sharing.max_connections_per_guest,
-        });
-    let guest_limits_task = guest_limits.follow(settings_registry.clone());
-    ws_options.guest_limits = guest_limits;
-
-    // TLS + bearer auth: provision the cert (lazy; cert stays on disk) + build
-    // the token store for auth layers (§5.2/§5.3). Always provision for runtime
-    // toggle, even when the listener is not boot-started (it can be started
-    // later via settings).
-    let (tls_cert, token_store) = if insecure {
-        tracing::warn!(
-            "intentd INSECURE dev mode: TLS disabled, bearer-token auth disabled, plain ws:// on {}:{} — do NOT use outside local dev",
-            ws_options
-                .bind_addresses
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            ws_options.base_port
-        );
-        (None, None)
-    } else {
-        let tls =
-            ensure_tls_certificate(&config.data_dir).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        let async_token_store = Arc::new(AsyncTokenStore::new(resolve_token_store()));
-        get_or_create_token(&async_token_store)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        (Some(tls), Some(async_token_store))
-    };
-
     // Build runtime control struct (always, regardless of boot listener state)
     let runtime = Arc::new(WsRuntimeControl {
         api: api.clone(),
@@ -2450,9 +2542,9 @@ async fn cmd_serve(
         reverse_registry: reverse_registry.clone(),
         data_dir: config.data_dir.clone(),
         state: tokio::sync::Mutex::new(WsRuntimeState {
-            ws_server: None,
-            port: None,
-            bind_addresses: None,
+            ws_server: bootstrap.ws.clone(),
+            port: bootstrap.port,
+            bind_addresses: bootstrap.port.map(|_| ws_options.bind_addresses.clone()),
         }),
         control: std::sync::OnceLock::new(),
         start_gate: tokio::sync::Mutex::new(()),
@@ -2493,12 +2585,7 @@ async fn cmd_serve(
         None => Arc::new(WorkspacesDiskUsage::default()),
     };
 
-    // Hoisted out of DaemonControl so the pairing provider below can share
-    // the same supervisor (pairing surfaces advertise the live tc address).
-    let tunnel_supervisor = Arc::new(tunnel::TunnelSupervisor::new(
-        tunnel::resolve_tailcat_bin(),
-        &config.data_dir.join("tunnel"),
-    ));
+    let tunnel_supervisor = bootstrap.tunnel.clone();
 
     // Sitter idle-update handshake state (unix only), created ahead of the
     // control surface so `system.status` can report it; the requester and
@@ -2509,6 +2596,7 @@ async fn cmd_serve(
     ));
 
     let control = Arc::new(DaemonControl {
+        startup: Some(bootstrap.dispatch.status().clone()),
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
@@ -2590,37 +2678,6 @@ async fn cmd_serve(
         )));
     }
 
-    // Resolve the boot-time TCP listener decision once: `--insecure` always
-    // starts the plain-ws listener; otherwise the secure WSS listener starts
-    // iff the effective server.wsApi.enabled is true (handled further below,
-    // after the config watcher is up).
-    let boot_listener = boot_ws_listener(insecure, boot_settings.effective.server.ws_api.enabled);
-
-    // Boot-time plain-ws listener start under --insecure (dev posture): binds
-    // exactly ws_options.base_port (INTENTD_TCP_PORT honored, 0 = ephemeral)
-    // and any bind error is fatal (no port walking). No pairing provider —
-    // pairing is a secure-mode surface.
-    if boot_listener == BootWsListener::InsecurePlainWs {
-        let system_control: Arc<dyn SystemControl> = control.clone();
-        let server = WsApiServer::new_insecure_with_reverse(
-            api.clone(),
-            bus.clone(),
-            ws_options.clone(),
-            reverse_registry.clone(),
-            Some(system_control),
-        );
-        let port = server.start().await?;
-        tracing::info!(port, "intentd WS listening (insecure, no TLS)");
-
-        // Store the server in runtime state
-        {
-            let mut state = runtime.state.lock().await;
-            state.ws_server = Some(server);
-            state.port = Some(port);
-            state.bind_addresses = Some(ws_options.bind_addresses.clone());
-        }
-    }
-
     // Live-reload of config.toml (§9.8): watch the file's parent directory
     // (survives editor rename/atomic-save), debounce, and strictly re-parse.
     // Valid external edits update the registry, run the same server runtime
@@ -2630,12 +2687,19 @@ async fn cmd_serve(
     // background task for the lifetime of `serve`; shutdown stops recurrence
     // and joins the admitted callback before listener teardown.
     let (stop_config, config_shutdown) = tokio::sync::oneshot::channel();
-    let config_watcher_task = spawn_config_watcher_init(
-        watch_hub,
-        settings_registry.clone(),
-        services.clone(),
-        config_shutdown,
-    );
+    let config_watcher_task = {
+        let dispatch = bootstrap.dispatch.clone();
+        let registry = settings_registry.clone();
+        let services = services.clone();
+        tokio::spawn(async move {
+            let mut config_shutdown = config_shutdown;
+            tokio::select! {
+                () = dispatch.retired() => {},
+                _ = &mut config_shutdown => return,
+            }
+            let _ = spawn_config_watcher_init(watch_hub, registry, services, config_shutdown).await;
+        })
+    };
 
     // Enabled secure WSS is a startup requirement. Preserve the error through
     // the canonical teardown below, without ever publishing UDS readiness.
@@ -2650,28 +2714,6 @@ async fn cmd_serve(
     } else {
         None
     };
-
-    // Boot-time tailcat tunnel auto-start when the effective
-    // server.tunnel.enabled is true. Requires the WSS listener up (checked by
-    // start_tunnel); a start failure at boot is non-fatal — setting stays
-    // true, warning logged, toggle OFF→ON to retry.
-    if boot_error.is_none() && boot_settings.effective.server.tunnel.enabled {
-        match intent_core::ServerControl::start_tunnel(control.as_ref()).await {
-            Ok(address) => {
-                tracing::info!(
-                    address = %address,
-                    "tailcat tunnel auto-started at boot (persisted server.tunnel.enabled=true)"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to auto-start tailcat tunnel at boot (persisted enabled=true); \
-                     setting remains true, toggle OFF→ON to retry"
-                );
-            }
-        }
-    }
 
     let (startup_stop, startup_stopping) = tokio::sync::watch::channel(boot_error.is_some());
     let shutdown = {
@@ -2886,19 +2928,34 @@ async fn cmd_serve(
     let serve_result = if let Some(error) = boot_error {
         Err(error)
     } else {
-        serve_uds_with_reverse(
-            api,
-            bus.clone(),
-            &config.socket_path,
-            Some(system_control),
-            pairing_info,
-            reverse_registry.clone(),
-            rpc_limiter.clone(),
-            shutdown,
-        )
-        .await
-        .map_err(anyhow::Error::from)
+        // External config edits during indexing must not silently retain a
+        // stale admission policy. Fail closed; a retry resolves the new policy.
+        if !startup::admission_unchanged(&settings_registry, &config.config_path, insecure) {
+            anyhow::bail!("startup admission settings changed; restart required");
+        }
+        if !bootstrap
+            .dispatch
+            .install(intent_transport::startup::ReadyServices {
+                api,
+                bus: bus.clone(),
+                rpc_limiter: rpc_limiter.clone(),
+                control: Some(system_control),
+                server_pairing_info: pairing_info,
+                reverse_registry: reverse_registry.clone(),
+            })
+        {
+            anyhow::bail!("startup handoff refused");
+        }
+        let local = bootstrap.local.as_mut().expect("bound local listener");
+        tokio::select! {
+            result = local => result.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from),
+            () = shutdown => {
+                if let Some(stop) = bootstrap.stop_local.take() { let _ = stop.send(()); }
+                bootstrap.local.as_mut().expect("local listener").await.map_err(anyhow::Error::from)?.map_err(anyhow::Error::from)
+            }
+        }
     };
+    bootstrap.local.take();
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
     legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3077,6 +3134,7 @@ async fn cmd_serve(
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
+    startup: Option<intent_core::startup::StartupStatus>,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
@@ -4218,6 +4276,9 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 }
 
 impl SystemControl for DaemonControl {
+    fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
+        self.startup.clone()
+    }
     fn collaboration_name(&self) -> Option<String> {
         self.settings_registry
             .snapshot()
@@ -6818,6 +6879,20 @@ async fn cmd_status() -> ExitCode {
         Ok(resp) if resp.get("result").is_some() => {
             print_status(&config, &resp["result"]);
             ExitCode::SUCCESS
+        }
+        Ok(resp)
+            if resp["error"]["code"] == -32012
+                && matches!(
+                    resp["error"]["data"]["code"].as_str(),
+                    Some("daemon-not-ready" | "daemon-startup-failed")
+                ) =>
+        {
+            let phase = resp["error"]["data"]["startup"]["phase"]
+                .as_str()
+                .unwrap_or("starting");
+            println!("intentd: not ready ({phase})");
+            println!("  socket: {} (reachable)", config.socket_path.display());
+            ExitCode::FAILURE
         }
         Ok(resp) => {
             // Reachable but the control method is unavailable (older daemon): the

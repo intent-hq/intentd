@@ -347,6 +347,9 @@ pub(crate) async fn commit_with_rollback_guard<T>(
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(unix, debug_assertions))]
+mod startup_test_gate;
+
 /// Embedded schema migrations (§9.4).
 ///
 /// **Adding workspace state? Transfer checklist.** A migration that adds a
@@ -386,6 +389,31 @@ pub struct Store {
     >,
 }
 
+/// Exclusive database ownership prepared without opening `SQLite`.
+/// Dropping this before open releases the lock; after open every pool retains it.
+pub struct PreparedDaemonStore {
+    physical: std::path::PathBuf,
+    owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
+}
+
+impl PreparedDaemonStore {
+    /// Open/migrate/rebuild while publishing only aggregate startup observations.
+    ///
+    /// # Errors
+    /// Returns initialization errors, preserving the database ownership guard.
+    pub async fn open(self, startup: Option<intent_core::startup::StartupStatus>) -> Result<Store> {
+        // SQLite initialization callbacks retain ownership even if this caller
+        // disappears, matching open_for_daemon's existing cancellation guarantee.
+        tokio::spawn(Store::finish_owned_startup(
+            self.physical,
+            self.owner,
+            startup,
+        ))
+        .await
+        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+    }
+}
+
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
     /// Builds two pools: a single-connection write pool and a 32-connection read pool.
@@ -394,12 +422,13 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
-        Self::open_with_owner(db_path, None).await
+        Self::open_with_owner(db_path, None, None).await
     }
 
     async fn open_with_owner(
         db_path: &Path,
         owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+        startup: Option<intent_core::startup::StartupStatus>,
     ) -> Result<Self> {
         let write_pool = match &owner {
             Some(_) => connect_write_owned(db_path, WRITE_ACQUIRE_TIMEOUT, owner.clone()).await?,
@@ -427,21 +456,49 @@ impl Store {
         // and leave the read pool cold until the first actual read.
         let note_pages = std::sync::Arc::new(
             Box::pin(async {
-                let mut index_conn =
-                    note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
-                let indexed = async {
-                    note_page_index::retire_changed_profiles(&mut index_conn).await?;
-                    note_page_index::rebuild_pending(&mut index_conn).await?;
-                    note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
+                let initialize: futures_util::future::BoxFuture<'_, Result<_>> = Box::pin(async {
+                    let mut index_conn =
+                        note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
+                    let indexed = async {
+                        note_page_index::retire_changed_profiles(&mut index_conn).await?;
+                        note_page_index::rebuild_pending_with_progress(
+                            &mut index_conn,
+                            startup.as_ref(),
+                        )
+                        .await?;
+                        if let Some(status) = &startup {
+                            status.finalizing(intent_core::startup::FinalizingStep::Anchors);
+                        }
+                        note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
+                    }
+                    .await;
+                    if indexed.is_ok() {
+                        if let Some(status) = &startup {
+                            status.finalizing(intent_core::startup::FinalizingStep::Committing);
+                            #[cfg(all(unix, debug_assertions))]
+                            startup_test_gate::reach(b'c', &mut index_conn).await?;
+                        }
+                    }
+                    index_conn
+                        .finish(indexed, "note index backfill commit")
+                        .await?;
+                    note_page_repo::Runtime::open(&write_pool).await
+                });
+                if let Some(status) = &startup {
+                    tokio::select! {
+                        biased;
+                        () = status.cancelled() => Err(Error::Internal("startup cancelled".into())),
+                        result = initialize => result,
+                    }
+                } else {
+                    initialize.await
                 }
-                .await;
-                index_conn
-                    .finish(indexed, "note index backfill commit")
-                    .await?;
-                note_page_repo::Runtime::open(&write_pool).await
             })
             .await?,
         );
+        if let Some(status) = &startup {
+            status.finalizing(intent_core::startup::FinalizingStep::Services);
+        }
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
@@ -465,6 +522,14 @@ impl Store {
     /// Returns an error if another daemon owns this database, locking is unsupported,
     /// or opening/migrating/sweeping the database fails.
     pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
+        Self::prepare_for_daemon(db_path)?.open(None).await
+    }
+
+    /// Acquire database ownership before exposing startup listeners.
+    ///
+    /// # Errors
+    /// Refuses aliases, unsupported locking, and a competing daemon owner.
+    pub fn prepare_for_daemon(db_path: &Path) -> Result<PreparedDaemonStore> {
         // Resolve symlinks (including parent aliases for a new DB) before deriving
         // the lock path, so different config paths cannot acquire different locks.
         // exists() follows symlinks: a dangling final alias would otherwise get
@@ -490,24 +555,18 @@ impl Store {
         let mut lock_path = physical.as_os_str().to_os_string();
         lock_path.push(".daemon.lock");
         let owner = daemon_ownership::DaemonOwnership::acquire(Path::new(&lock_path))?;
-        // SQLx installs connection callbacks after its initial PRAGMAs. Keep
-        // initialization owned even if the caller cancels while those run.
-        // Dropping a JoinHandle detaches this startup task; no Store escapes
-        // until migrations and cleanup finish. Its result is dropped if the
-        // caller has gone away.
-        tokio::spawn(Self::finish_owned_startup(
+        Ok(PreparedDaemonStore {
             physical,
-            std::sync::Arc::new(owner),
-        ))
-        .await
-        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+            owner: std::sync::Arc::new(owner),
+        })
     }
 
     async fn finish_owned_startup(
         physical: std::path::PathBuf,
         owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
+        startup: Option<intent_core::startup::StartupStatus>,
     ) -> Result<Self> {
-        let store = Self::open_with_owner(&physical, Some(owner)).await?;
+        let store = Self::open_with_owner(&physical, Some(owner), startup).await?;
         // No Store has escaped this constructor yet, and the OS lock excludes
         // competing daemon startups. The delete trigger rebalances byte counts.
         let reaped = sqlx::query(
