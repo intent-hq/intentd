@@ -50,7 +50,18 @@ impl EventBus {
         let previous = baseline.as_ref();
         let affects_tasks = is_task
             || id == Some("spec")
-            || previous.is_some_and(|p| p.tasks.iter().any(|t| Some(t.id.as_str()) == id));
+            || previous.is_some_and(|p| {
+                p.tasks.iter().any(|task| {
+                    Some(task.id.as_str()) == id
+                        // Deleting an ordinary parent detaches task children
+                        // through the store trigger, without child note events.
+                        || (source.event_type == NOTE_DELETED
+                            && task
+                                .parent_id
+                                .as_ref()
+                                .is_some_and(|parent| Some(parent.as_str()) == id))
+                })
+            });
         let current = if affects_tasks {
             match self
                 .store
