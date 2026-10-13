@@ -226,7 +226,8 @@ impl EventBus {
                 | intent_core::events::TASK_CREATED
                 | intent_core::events::TASK_STATUS_CHANGED
         ) {
-            return self.publish_note_and_task_changes(ev).await;
+            // Keep projection futures off the deeply nested agent delivery stack.
+            return Box::pin(self.publish_note_and_task_changes(ev)).await;
         }
         if ev.event_type == intent_core::events::WORKSPACE_DELETED {
             self.task_event_baselines.remove(&ev.workspace_id);

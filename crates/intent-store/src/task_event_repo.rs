@@ -66,7 +66,7 @@ impl Store {
         if baseline.is_some() {
             return;
         }
-        match self.list_workspace_tasks(workspace_id, None).await {
+        match Box::pin(self.list_workspace_tasks(workspace_id, None)).await {
             Ok(snapshot) => {
                 *baseline = Some(snapshot);
             }

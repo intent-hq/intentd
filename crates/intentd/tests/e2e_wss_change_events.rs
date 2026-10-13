@@ -1871,9 +1871,12 @@ async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
     // Exactly one note:updated for the rewrite, with the §6.5 payload shape.
     let evt = next_event(&mut sub, &["note:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());
+    let mut expected_note = read["note"].clone();
+    expected_note.as_object_mut().unwrap().remove("content");
+    expected_note["metadata"] = json!({});
     assert_eq!(
         evt["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+        json!({ "noteId": note_id, "title": "Note", "action": "update", "note": expected_note })
     );
     let extra = drain_extra(&mut sub, "note:updated", 500).await;
     assert!(

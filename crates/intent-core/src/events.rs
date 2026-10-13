@@ -935,9 +935,9 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (TASK_AGENT_LINKED, "Task: an agent was assigned to a task note."),
     (TASK_AGENT_UNLINKED, "Task: a task note lost its agent."),
     (TASK_CREATED, "Task: a task note was created."),
-    (TASK_UPDATED, "Task: complete changed task summaries and removed ids."),
     (TASK_READY_TASKS_CHANGED, "Task: the startable task set changed; task ids."),
     (TASK_STATUS_CHANGED, "Task: a task's status changed."),
+    (TASK_UPDATED, "Task: complete changed task summaries and removed ids."),
     (WORKSPACE_ACTIVITY, "Workspace: activity heartbeat of a workspace the guest is a member of."),
     (WORKSPACE_ACTIVITY_CHANGED, "Workspace: the aggregated activity marker changed (workspace channel delta)."),
     (WORKSPACE_ATTENTION_CHANGED, "Workspace: the attention marker changed (workspace channel delta)."),
@@ -951,10 +951,10 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
+    (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
     (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
-    (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),
 ];
 
 /// True iff a non-administrator principal may receive `event_type` (it is

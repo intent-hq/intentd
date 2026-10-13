@@ -10411,6 +10411,18 @@ mod change_event_parity {
     /// Subscribe to this workspace with immediate (un-batched) delivery.
     fn subscribe(h: &Harness) -> Subscription {
         h.bus.subscribe(SubscriptionFilter {
+            // This suite asserts the legacy event sequence; task_push tests
+            // assert the additive projections independently.
+            event_types: intent_core::events::ALL_EVENT_TYPES
+                .iter()
+                .filter(|event_type| {
+                    !matches!(
+                        **event_type,
+                        "task:updated" | "workspace:task-stats-changed"
+                    )
+                })
+                .map(|event_type| (*event_type).to_owned())
+                .collect(),
             workspace_id: Some(h.ws.0.clone()),
             ..Default::default()
         })
@@ -10459,9 +10471,12 @@ mod change_event_parity {
             .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
+        let mut expected_note = serde_json::to_value(&created).unwrap();
+        expected_note.as_object_mut().unwrap().remove("content");
+        expected_note["metadata"] = json!({});
         assert_eq!(
             ev["data"],
-            json!({ "noteId": created.id.0, "title": "Note", "action": "create" })
+            json!({ "noteId": created.id.0, "title": "Note", "action": "create", "note": expected_note })
         );
     }
 
@@ -11867,10 +11882,12 @@ mod change_event_parity {
         assert_eq!(added.note_rev, 1);
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:updated");
-        assert_eq!(
-            ev["data"],
-            json!({ "noteId": "n-1", "title": "Title", "action": "update" })
-        );
+        assert_eq!(ev["data"]["noteId"], "n-1");
+        assert_eq!(ev["data"]["title"], "Title");
+        assert_eq!(ev["data"]["action"], "update");
+        assert_eq!(ev["data"]["note"]["id"], "n-1");
+        assert_eq!(ev["data"]["note"]["rev"], added.note_rev);
+        assert!(ev["data"]["note"].get("content").is_none());
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
         assert_eq!(
