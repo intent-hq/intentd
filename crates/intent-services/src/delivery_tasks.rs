@@ -86,10 +86,13 @@ impl DeliveryTasks {
         let (finished, receiver) = oneshot::channel();
         // Capture the sender BEFORE spawning: cancellation before the first poll
         // must also signal completion. Callers may still own/abort the JoinHandle.
-        let owned = async move {
+        // Pin before the caller wrappers: moving a large delivery future through
+        // their by-value scopes can overflow Windows' 1 MiB main stack while
+        // starting the completion worker, before Tokio can box the task.
+        let owned = Box::pin(async move {
             let _finished = finished;
             future.await
-        };
+        });
         let handle = if preserve_caller {
             intent_core::caller::spawn_with_current_caller(owned)
         } else {
