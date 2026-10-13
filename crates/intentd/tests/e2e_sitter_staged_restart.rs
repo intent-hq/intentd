@@ -622,6 +622,49 @@ async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
     assert!(daemon.log().contains("staged update restart accepted"));
 }
 
+/// Registration errors must stop startup before readiness, whether or not
+/// the sitter advertised the handshake. Use an invalid signal to exercise
+/// Tokio's real error path rather than bypassing registration.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn signal_registration_failure_prevents_readiness() {
+    for advertised in [false, true] {
+        let data_dir = common::test_tempdir("itd-sr-signal-error-");
+        common::enable_ws_api(data_dir.path());
+        let log_path = data_dir.path().join("daemon.log");
+        let log = std::fs::File::create(&log_path).expect("create daemon log");
+        let workspaces = data_dir.path().join("workspaces");
+        std::fs::create_dir_all(&workspaces).expect("mkdir workspaces");
+        let mut command = common::hermetic_serve_command(data_dir.path());
+        command
+            .env("INTENTD_WORKSPACES_DIR", &workspaces)
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_TEST_STAGED_RESTART_SIGNAL_ERROR", "1")
+            .env("RUST_LOG", "info")
+            .env_remove(SITTER_IDLE_RESTART_ENV)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        if advertised {
+            command.env(SITTER_IDLE_RESTART_ENV, "1");
+        }
+        let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
+        let mut daemon = Daemon { child, log_path };
+        let status = daemon
+            .wait_exit(common::daemon_startup_timeout())
+            .await
+            .unwrap_or_else(|| panic!("startup did not fail\n{}", daemon.log()));
+        let log = daemon.log();
+        assert_eq!(status.code(), Some(1), "{status}\n{log}");
+        assert!(
+            log.contains("failed to install the SIGUSR2 handler"),
+            "{log}"
+        );
+        assert!(log.contains("Refusing to register signal -1"), "{log}");
+        assert!(!log.contains("listening"), "false readiness: {log}");
+        assert!(!data_dir.path().join("intentd.sock").exists(), "{log}");
+    }
+}
+
 /// A supervised daemon with a turn in flight accepts SIGUSR2 but keeps
 /// serving until the turn ends, then exits with the restart code.
 #[tokio::test]

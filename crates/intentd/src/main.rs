@@ -2551,7 +2551,7 @@ async fn cmd_serve(
         manager.clone(),
         idle_update_state.clone(),
         shutdown_notify.clone(),
-    );
+    )?;
     #[cfg(unix)]
     let idle_update_requester = spawn_idle_update_requester(
         manager.clone(),
@@ -5621,6 +5621,8 @@ fn spawn_idle_update_requester(
 /// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
 /// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
 /// disposition; it is then logged and ignored.
+/// Registration is synchronous and fallible so no listener can advertise
+/// readiness before the handler is installed, even if the task is not polled.
 ///
 /// The exit-when-idle competes for the write-once
 /// [`IdleUpdateState::shutdown_cause`] latch: once a requested stop has
@@ -5633,9 +5635,19 @@ fn spawn_staged_restart_watcher(
     manager: Arc<AgentManager>,
     state: Arc<IdleUpdateState>,
     shutdown: Arc<tokio::sync::Notify>,
-) -> tokio::task::JoinHandle<()> {
-    intent_core::spawn_daemon(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let kind = SignalKind::user_defined2();
+    // Exercise the real registration error and startup propagation in e2e tests.
+    #[cfg(debug_assertions)]
+    let kind = if std::env::var_os("INTENTD_TEST_STAGED_RESTART_SIGNAL_ERROR").is_some() {
+        SignalKind::from_raw(-1)
+    } else {
+        kind
+    };
+    let mut usr2 =
+        signal(kind).map_err(|e| anyhow::anyhow!("failed to install the SIGUSR2 handler: {e}"))?;
+    Ok(intent_core::spawn_daemon(async move {
         // Let the readiness regression hold this task before its first work,
         // reproducing a scheduler that polls the listener before the watcher.
         #[cfg(debug_assertions)]
@@ -5646,13 +5658,6 @@ fn spawn_staged_restart_watcher(
                 .expect("staged restart watcher test gate");
             gate.read_u8().await.expect("release restart watcher");
         }
-        let mut usr2 = match signal(SignalKind::user_defined2()) {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to install the SIGUSR2 handler; staged update restarts disabled");
-                return;
-            }
-        };
         loop {
             if usr2.recv().await.is_none() {
                 return;
@@ -5705,7 +5710,7 @@ fn spawn_staged_restart_watcher(
             shutdown.notify_one();
             return;
         }
-    })
+    }))
 }
 
 /// Local-transport liveness probe: a successful connect means a daemon is
