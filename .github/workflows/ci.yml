@@ -1510,6 +1510,9 @@ jobs:
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # Share the full-coverage pool: nextest launches one process per test.
+      # Bound retained raw profiles per binary without dropping execution counts.
+      LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
@@ -1720,6 +1723,9 @@ jobs:
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
+      - name: Verify bounded coverage profile pooling
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/test-coverage-profile-pool.py
       - name: Run changed tests under llvm-cov
         timeout-minutes: 50
         if: steps.select.outputs.has_selection == 'true'

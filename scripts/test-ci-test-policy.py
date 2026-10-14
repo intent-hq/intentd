@@ -71,8 +71,34 @@ def coverage_budget_violations(workflow):
     return errors
 
 
+def profile_pool_violations(workflow):
+    errors = []
+    for job_id, first_test, condition in (
+        ("coverage-all", "Run combined coverage", None),
+        ("coverage-changed", "Run changed tests under llvm-cov", "steps.select.outputs.has_selection == 'true'"),
+    ):
+        job = workflow["jobs"][job_id]
+        steps = job["steps"]
+        proofs = [s for s in steps if s.get("name") == "Verify bounded coverage profile pooling"]
+        if (job.get("env", {}).get("LLVM_PROFILE_FILE_NAME") != "intent-%8m.profraw"
+                or "LLVM_PROFILE_FILE" in job.get("env", {})):
+            errors.append(f"{job_id}: retain the bounded profile pool")
+        if len(proofs) != 1:
+            errors.append(f"{job_id}: require exactly one profile pooling proof")
+            continue
+        proof = proofs[0]
+        if (proof.get("run") != "python3 -I -B scripts/test-coverage-profile-pool.py"
+                or proof.get("if") != condition or proof.get("continue-on-error")
+                or steps.index(proof) >= next(i for i, s in enumerate(steps) if s.get("name") == first_test)):
+            errors.append(f"{job_id}: require the profile proof before instrumented tests")
+        for step in steps:
+            if any(key in step.get("env", {}) for key in ("LLVM_PROFILE_FILE_NAME", "LLVM_PROFILE_FILE")):
+                errors.append(f"{job_id}: do not override the job profile pool in a step")
+    return errors
+
+
 def violations(workflow, policy):
-    errors = coverage_budget_violations(workflow)
+    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -249,15 +275,35 @@ class CiPolicyTests(unittest.TestCase):
     def test_full_coverage_budget_includes_report_generation(self):
         self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
 
-    def test_full_coverage_uses_verified_bounded_profile_pool(self):
-        job = self.workflow["jobs"]["coverage-all"]
-        self.assertEqual(job["env"].get("LLVM_PROFILE_FILE_NAME"), "intent-%8m.profraw")
-        proof = next(s for s in job["steps"] if s.get("name") == "Verify bounded coverage profile pooling")
-        self.assertEqual(proof["run"], "python3 -I -B scripts/test-coverage-profile-pool.py")
-        self.assertFalse(proof.get("if"))
-        self.assertFalse(proof.get("continue-on-error"))
-        names = [s.get("name") for s in job["steps"]]
-        self.assertLess(names.index(proof["name"]), names.index("Run combined coverage"))
+    def test_coverage_profile_pool_rejects_unbounded_or_unverified_collection(self):
+        self.assertEqual(profile_pool_violations(self.workflow), [])
+        for job_id in ("coverage-all", "coverage-changed"):
+            for mutation in ("missing-env", "per-process", "direct-profile", "missing-proof", "skipped-proof",
+                             "ignored-proof", "late-proof", "step-override"):
+                with self.subTest(job=job_id, mutation=mutation):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"][job_id]
+                    steps = job["steps"]
+                    proof = next(s for s in steps if s.get("name") == "Verify bounded coverage profile pooling")
+                    if mutation == "missing-env":
+                        job["env"].pop("LLVM_PROFILE_FILE_NAME")
+                    elif mutation == "per-process":
+                        job["env"]["LLVM_PROFILE_FILE_NAME"] = "intent-%p-%32m.profraw"
+                    elif mutation == "direct-profile":
+                        job["env"]["LLVM_PROFILE_FILE"] = "intent-%p.profraw"
+                    elif mutation == "missing-proof":
+                        steps.remove(proof)
+                    elif mutation == "skipped-proof":
+                        proof["if"] = False
+                    elif mutation == "ignored-proof":
+                        proof["continue-on-error"] = True
+                    elif mutation == "late-proof":
+                        steps.remove(proof)
+                        steps.append(proof)
+                    else:
+                        proof["env"] = {"LLVM_PROFILE_FILE_NAME": "intent-%p.profraw"}
+                    self.assertTrue(profile_pool_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
 
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
