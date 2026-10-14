@@ -253,7 +253,7 @@ In **Home → Workspaces**, open **View options → Group by** in either list or
 view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
 groups. In list view, **Status** groups workspace statuses in this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
-**In progress**, **PR open**, **PR Mergeable**, **PR Queued**, **PR merged**, then
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
 **Done & idle** (idle or complete).
 **Repository** groups by repository; **None** removes grouping.
 
