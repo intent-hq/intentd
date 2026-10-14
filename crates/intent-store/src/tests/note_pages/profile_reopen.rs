@@ -1,4 +1,4 @@
-//! Startup must reuse valid projections and rebuild retired ones exactly once.
+//! Startup preserves projections; demand rebuilds each retired note exactly once.
 use super::{assert_error, page, request, setup, Store};
 use intent_core::note_page::NotePageError;
 use serde_json::{json, Value};
@@ -109,7 +109,7 @@ async fn equivalent_profile_reopen_preserves_rows_and_performs_no_index_writes()
     drop(store);
 
     // Use the daemon-owned startup entry point too: both delegate to the same
-    // migration/retirement/rebuild path, with independent freshly opened pools.
+    // migration path, with independent freshly opened pools and no conversion.
     let reopened = Store::open_for_daemon(&tmp.path).await.unwrap();
     assert!(writes(&reopened).await.is_empty());
     assert_eq!(rows(&reopened, "note").await, canonical);
@@ -139,11 +139,25 @@ async fn retired_profile_rebuilds_once(retired: &str) {
         .await
         .unwrap();
     assert_expired(&store, &original).await;
+    let retired_rows = derived_rows(&store).await;
     audit_writes(&store).await;
     store.close().await;
     drop(store);
 
     let reopened = Store::open(&tmp.path).await.unwrap();
+    assert!(writes(&reopened).await.is_empty());
+    assert_eq!(derived_rows(&reopened).await, retired_rows);
+    assert_eq!(rows(&reopened, "note").await, canonical);
+    assert_expired(&reopened, &original).await;
+    assert!(
+        writes(&reopened).await.is_empty(),
+        "expired references create no demand"
+    );
+
+    super::demand_rebuild::settled(&reopened).await.unwrap();
+    let current = page(&reopened, json!({"kind":"source"})).await;
+    assert_eq!(current["sourceRevision"], original["sourceRevision"]);
+    assert_eq!(current["text"], original["text"]);
     let mutations = writes(&reopened).await;
     assert!(!mutations.iter().any(|(table, _)| table == "note"));
     for table in ["note_page_piece", "note_page_entry", "note_artifact_source"] {
@@ -154,26 +168,32 @@ async fn retired_profile_rebuilds_once(retired: &str) {
             );
         }
     }
-    let heads: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT content_generation,profile_revision,current_rev,indexed_rev \
+    let heads: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT note_id,content_generation,profile_revision,current_rev,indexed_rev \
          FROM note_page_head ORDER BY note_id",
     )
     .fetch_all(reopened.read_pool())
     .await
     .unwrap();
     assert_eq!(heads.len(), generations.len());
-    for ((generation, profile, current, indexed), previous) in heads.iter().zip(generations) {
-        assert_ne!(*generation, previous);
-        assert_eq!(profile, crate::note_page_index::profile_revision());
+    for ((id, generation, profile, current, indexed), previous) in heads.iter().zip(generations) {
+        if id == "spec" {
+            assert_ne!(*generation, previous);
+            assert_eq!(profile, crate::note_page_index::profile_revision());
+        } else {
+            assert_eq!(id, "empty");
+            assert_eq!(
+                *generation, previous,
+                "unopened note retains its generation"
+            );
+            assert_eq!(profile, retired, "unopened note remains retired");
+        }
         assert_eq!(current, indexed);
     }
     assert_eq!(rows(&reopened, "note").await, canonical);
     assert_eq!(rows(&reopened, "note_page_entry").await, entries);
     assert_eq!(rows(&reopened, "note_artifact_source").await, artifacts);
     assert_expired(&reopened, &original).await;
-    let current = page(&reopened, json!({"kind":"source"})).await;
-    assert_eq!(current["sourceRevision"], original["sourceRevision"]);
-    assert_eq!(current["text"], original["text"]);
     let rebuilt = derived_rows(&reopened).await;
     sqlx::query("DELETE FROM reopen_audit")
         .execute(reopened.write_pool())
@@ -191,18 +211,53 @@ async fn retired_profile_rebuilds_once(retired: &str) {
         page(&reused, json!({"kind":"source"})).await["sourceRevision"],
         original["sourceRevision"]
     );
+    assert!(
+        writes(&reused).await.is_empty(),
+        "ready note is reused after restart"
+    );
+
+    // Even across restart, the unopened empty note stays retired until accessed.
+    let empty_profile: String =
+        sqlx::query_scalar("SELECT profile_revision FROM note_page_head WHERE note_id='empty'")
+            .fetch_one(reused.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(empty_profile, retired);
+    let empty = reused
+        .read_note_page(
+            "pages",
+            "empty",
+            "alice",
+            request(json!({"kind":"source"})),
+            &json!(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty["text"], "");
+    assert_eq!(rows(&reused, "note").await, canonical);
+    let after_empty = derived_rows(&reused).await;
+    sqlx::query("DELETE FROM reopen_audit")
+        .execute(reused.write_pool())
+        .await
+        .unwrap();
+    reused
+        .ensure_note_index("pages", "empty", true)
+        .await
+        .unwrap();
+    assert!(writes(&reused).await.is_empty());
+    assert_eq!(derived_rows(&reused).await, after_empty);
     reused.close().await;
 }
 
 #[tokio::test]
-async fn changed_profile_reopen_rebuilds_without_canonical_writes_then_reuses() {
+async fn changed_profile_reopen_defers_each_rebuild_until_demand_then_reuses() {
     retired_profile_rebuilds_once("retired-parser-profile").await;
 }
 
 #[tokio::test]
-async fn legacy_profile_reopen_rebuilds_without_canonical_writes_then_reuses() {
+async fn legacy_profile_reopen_defers_each_rebuild_until_demand_then_reuses() {
     // Actual whole-lock profile shipped in v0.10.46 (b6fc9f881). There is no
-    // compatibility relabel: the transition intentionally rebuilds once.
+    // compatibility relabel: each note transitions once, only on demand.
     retired_profile_rebuilds_once(
         "c79f8abc1ce46156d4a032355bf4946cec1ea4813c1e111e403260a6f8949476",
     )
