@@ -13,6 +13,7 @@ use std::sync::{
 
 mod anchor_lifecycle;
 mod delete_grace;
+mod demand_rebuild;
 mod guarded_metadata;
 mod immediate_delete;
 mod plain_markdown;
@@ -425,6 +426,9 @@ async fn indexed_note_pages_migrate_existing_notes_and_preserve_legacy_text() {
     sqlx::query("INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at) VALUES ('spec','pages','original',?,17,'now','now')").bind(&text).execute(&pool).await.unwrap();
     pool.close().await;
     let store = Store::open(&tmp.path).await.unwrap();
+    // Migration leaves source-derived rows pending; first access may return
+    // Preparing while the existing multiline source is converted.
+    demand_rebuild::settled(&store).await.unwrap();
     let got = page(&store, json!({"kind":"source","at":3,"maxSourceBytes":4})).await;
     assert!(got["sourceRevision"].as_str().unwrap().starts_with("r:17:"));
     assert_eq!(got["text"], "\r\n");

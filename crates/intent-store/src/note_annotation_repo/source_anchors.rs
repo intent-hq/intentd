@@ -4,7 +4,7 @@ use super::{
     db_error, head, invalid, publish_anchors_in_transaction, stale, AnchorOccurrence, SourceRange,
 };
 use intent_core::{Error, NoteId, Result, WorkspaceId};
-use sqlx::SqliteConnection;
+use sqlx::{Row, SqliteConnection};
 
 #[cfg(test)]
 #[derive(Default)]
@@ -35,9 +35,11 @@ pub fn anchor_occurrences(
 ) -> Result<Vec<AnchorOccurrence>> {
     let mut occurrences = Vec::new();
     for &id in eligible_root_ids {
+        crate::note_index_budget::charge(id.len() * 3 + 128);
         let open = format!("<!--anchor:{id}:start-->");
         let close = format!("<!--anchor:{id}:end-->");
         for (at, _) in source.match_indices(&open) {
+            crate::note_index_budget::charge(id.len() + 256);
             let start = at + open.len();
             if let Some(relative) = source[start..].find(&close) {
                 occurrences.push(AnchorOccurrence {
@@ -52,6 +54,7 @@ pub fn anchor_occurrences(
         }
         let point = format!("<!--anchor:{id}:point-->");
         for (at, _) in source.match_indices(&point) {
+            crate::note_index_budget::charge(id.len() + 256);
             let position = utf16_offset(source, at)?;
             occurrences.push(AnchorOccurrence {
                 comment_id: id.into(),
@@ -93,17 +96,22 @@ pub(crate) async fn rebuild_note_anchors(
         pause.entered.notify_one();
         pause.release.notified().await;
     }
-    let length: i64 = sqlx::query_scalar(
-        "SELECT source_length FROM note_page_head WHERE workspace_id=? AND note_id=? \
-         AND indexed_rev=current_rev AND current_rev=?",
-    )
-    .bind(workspace.as_str())
-    .bind(note.as_str())
-    .bind(epochs.source_revision)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(db_error)?
-    .ok_or_else(stale)?;
+    let index = sqlx::query("SELECT source_length,indexed_rev,current_rev,profile_revision FROM note_page_head WHERE workspace_id=? AND note_id=?")
+        .bind(workspace.as_str()).bind(note.as_str()).fetch_optional(&mut *conn).await.map_err(db_error)?.ok_or_else(stale)?;
+    if index.try_get::<i64, _>("current_rev").map_err(db_error)? != epochs.source_revision {
+        return Err(stale());
+    }
+    // Canonical/root writers may touch an unopened stale note. Leave its
+    // derived anchors unavailable until demand prepares the matching source.
+    if index.try_get::<i64, _>("indexed_rev").map_err(db_error)? != epochs.source_revision
+        || index
+            .try_get::<String, _>("profile_revision")
+            .map_err(db_error)?
+            != crate::note_page_index::profile_revision()
+    {
+        return Ok(());
+    }
+    let length: i64 = index.try_get("source_length").map_err(db_error)?;
     if epochs.anchors_ready {
         return Ok(());
     }
@@ -145,23 +153,6 @@ pub(crate) async fn rebuild_note_anchors(
         anchor_occurrences(source, &ids)?
     };
     publish_anchors_in_transaction(conn, workspace, note, &epochs, &occurrences).await
-}
-
-/// Startup-only repair of derived readiness. The keyset retains one note's
-/// identity and body at a time; retirement is durable and must not be resumed
-/// by publishing partial annotations. This remains write-sized backfill work.
-pub(crate) async fn rebuild_pending_source_anchors(conn: &mut SqliteConnection) -> Result<()> {
-    let mut after = 0_i64;
-    loop {
-        let next: Option<(i64, String, String)> = sqlx::query_as(
-            "SELECT h.id,h.workspace_id,h.note_id FROM note_annotation_head h WHERE h.id>? AND h.anchors_rev!=h.source_rev AND NOT EXISTS(SELECT 1 FROM note_annotation_workspace_retirement r WHERE r.workspace_id=h.workspace_id) ORDER BY h.id LIMIT 1"
-        ).bind(after).fetch_optional(&mut *conn).await.map_err(db_error)?;
-        let Some((id, workspace, note)) = next else {
-            return Ok(());
-        };
-        rebuild_note_anchors(conn, &WorkspaceId(workspace), &NoteId(note), None).await?;
-        after = id;
-    }
 }
 
 #[cfg(test)]

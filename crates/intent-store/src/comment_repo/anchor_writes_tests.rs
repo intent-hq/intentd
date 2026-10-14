@@ -189,7 +189,7 @@ async fn later_note_finalizer_failure_rolls_back_all_thread_changes() {
     // First note can publish, second cannot. All status/epoch/index changes
     // must still disappear when the helper returns its finalizer error.
     sqlx::query(
-        "UPDATE note_page_head SET indexed_rev=-1 WHERE workspace_id='owner' AND note_id='b'",
+        "CREATE TRIGGER reject_second_anchor_ready BEFORE UPDATE OF anchors_rev ON note_annotation_head WHEN NEW.workspace_id='owner' AND NEW.note_id='b' AND NEW.anchors_rev=NEW.source_rev BEGIN SELECT RAISE(ABORT,'second note finalizer rejected'); END",
     )
     .execute(store.write_pool())
     .await
