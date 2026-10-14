@@ -1966,7 +1966,7 @@ struct BudgetHosts {
 }
 
 // Temporary diagnostic: retain both TCP paths for the request owner's final trace.
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct BudgetAdmissionStage {
     path: &'static str,
     stage: &'static str,
@@ -2064,9 +2064,13 @@ impl<'a> BudgetRequestTrace<'a> {
 impl Drop for BudgetRequestTrace<'_> {
     fn drop(&mut self) {
         let hosts = self.control.budget_hosts.as_ref().unwrap();
-        let events = self.control.events.lock().unwrap();
-        let tail = &events[events.len().saturating_sub(6)..];
-        eprintln!("budget-request end subcase={} iterations={} elapsed_ms={} returned={} unwinding={} host_scopes_started={} host_scopes_returned={} boundary_count={} last_boundaries={tail:?} last_admission={:?}", self.subcase, self.count, self.started.elapsed().as_millis(), self.returned, std::thread::panicking(), hosts.started.load(Ordering::SeqCst), hosts.returned.load(Ordering::SeqCst), events.len(), *hosts.admission.lock().unwrap());
+        let (event_count, tail) = {
+            let events = self.control.events.lock().unwrap();
+            (events.len(), events[events.len().saturating_sub(6)..].to_vec())
+        };
+        let admission = *hosts.admission.lock().unwrap();
+        let stages = hosts.diagnostic_stages.lock().unwrap().clone();
+        eprintln!("budget-request end subcase={} iterations={} elapsed_ms={} returned={} unwinding={} host_scopes_started={} host_scopes_returned={} boundary_count={} last_boundaries={tail:?} last_admission={admission:?}", self.subcase, self.count, self.started.elapsed().as_millis(), self.returned, std::thread::panicking(), hosts.started.load(Ordering::SeqCst), hosts.returned.load(Ordering::SeqCst), event_count);
         eprintln!(
             "budget-admission-trace {}",
             json!({
@@ -2074,7 +2078,7 @@ impl Drop for BudgetRequestTrace<'_> {
                 "iterations": self.count,
                 "returned": self.returned,
                 "unwinding": std::thread::panicking(),
-                "stages": &*hosts.diagnostic_stages.lock().unwrap(),
+                "stages": stages,
             })
         );
     }
