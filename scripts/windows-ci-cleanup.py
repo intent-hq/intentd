@@ -110,13 +110,18 @@ class Native:
         token = W.HANDLE()
         self.check(self.a.OpenProcessToken(self.k.GetCurrentProcess(), 8, ctypes.byref(token)))
         try:
-            size = W.DWORD()
-            self.a.GetTokenInformation(token, 4, None, 0, ctypes.byref(size))  # TokenOwner
-            if not size.value:
-                raise Refusal('Cannot resolve account owner')
-            self.owner_buffer = ctypes.create_string_buffer(size.value)
-            self.check(self.a.GetTokenInformation(token, 4, self.owner_buffer, size, ctypes.byref(size)))
-            self.owner = ctypes.cast(self.owner_buffer, ctypes.POINTER(W.LPVOID))[0]
+            # Elevated accounts can have Administrators as TokenOwner while
+            # their existing profile and artifacts remain owned by TokenUser.
+            self.owner_buffers, self.owners = [], []
+            for token_class in (1, 4):  # TokenUser, TokenOwner: both start with a SID pointer
+                size = W.DWORD()
+                self.a.GetTokenInformation(token, token_class, None, 0, ctypes.byref(size))
+                if not size.value:
+                    raise Refusal('Cannot resolve account owner')
+                buffer = ctypes.create_string_buffer(size.value)
+                self.check(self.a.GetTokenInformation(token, token_class, buffer, size, ctypes.byref(size)))
+                self.owner_buffers.append(buffer)
+                self.owners.append(ctypes.cast(buffer, ctypes.POINTER(W.LPVOID))[0])
             size = W.DWORD()
             self.u.GetUserProfileDirectoryW(token, None, ctypes.byref(size))
             if not size.value:
@@ -137,14 +142,14 @@ class Native:
         self.check(self.k.GetFileInformationByHandle(handle, ctypes.byref(info)))
         return info
 
-    def owned(self, handle):
+    def owned(self, handle, path):
         owner, descriptor = W.LPVOID(), W.LPVOID()
         error = self.a.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(descriptor))
         if error:
             raise ctypes.WinError(error)
         try:
-            if not owner or not self.a.EqualSid(owner, self.owner):
-                raise Refusal('Path is not owned by this account’s default owner')
+            if not owner or not any(self.a.EqualSid(owner, allowed) for allowed in self.owners):
+                raise Refusal('Path has an unrelated owner: ' + str(path))
         finally:
             if descriptor:
                 self.k.LocalFree(descriptor)
@@ -174,7 +179,7 @@ class Native:
             if not directory and info.links != 1:
                 raise Refusal('Multiply-linked file refused: ' + str(path))
             if owned:
-                self.owned(handle)
+                self.owned(handle, path)
             yield handle
         finally:
             self.k.CloseHandle(handle)

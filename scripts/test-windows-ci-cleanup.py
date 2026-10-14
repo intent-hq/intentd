@@ -71,6 +71,42 @@ class NativeTests(unittest.TestCase):
     def clean(self, apply=False):
         return cleanup.clean(self.home, 100, apply, self.api)
 
+    def test_current_user_owned_profile_is_allowed_with_elevated_default_owner(self):
+        # The account profile belongs to TokenUser even when elevated newly
+        # created artifacts use the Administrators TokenOwner instead.
+        import ctypes
+        W = cleanup.W
+        token = W.HANDLE()
+        self.api.check(self.api.a.OpenProcessToken(self.api.k.GetCurrentProcess(), 8, ctypes.byref(token)))
+        try:
+            size = W.DWORD()
+            self.api.a.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+            buffer = ctypes.create_string_buffer(size.value)
+            self.api.check(self.api.a.GetTokenInformation(token, 1, buffer, size, ctypes.byref(size)))
+            user = ctypes.cast(buffer, ctypes.POINTER(W.LPVOID))[0]
+            handle = self.api.k.CreateFileW(str(self.file), 0x80000 | 0x20000, 3, None, 3, 0, None)
+            if handle == ctypes.c_void_p(-1).value:
+                self.api.check(False)
+            try:
+                setter = self.api.a.SetSecurityInfo
+                setter.argtypes = [W.HANDLE, ctypes.c_int, W.DWORD, W.LPVOID, W.LPVOID, W.LPVOID, W.LPVOID]
+                setter.restype = W.DWORD
+                error = setter(handle, 1, 1, user, None, None, None)
+                if error:
+                    raise ctypes.WinError(error)
+            finally:
+                self.api.k.CloseHandle(handle)
+            with self.api.open(self.file):
+                pass
+        finally:
+            self.api.k.CloseHandle(token)
+
+    def test_unrelated_owner_is_rejected(self):
+        with patch.object(self.api.a, 'EqualSid', return_value=False):
+            with self.assertRaisesRegex(cleanup.Refusal, 'owner'):
+                self.clean(True)
+        self.assertTrue(self.file.exists())
+
     def test_dry_run_reports_and_preserves_content(self):
         result = self.clean()
         self.assertEqual(result['candidates'], [str(self.profile)])
