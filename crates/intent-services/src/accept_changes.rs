@@ -222,6 +222,9 @@ pub(crate) fn build_git_status_value_with(
         .and_then(|url| GitRemoteUrl::parse(url)?.github_repo())
         .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
 
+    let identity_started = std::time::Instant::now();
+    let history_identity = history_refresh_identity(worktree, ws);
+    let identity_ms = u64::try_from(identity_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::debug!(
         files = status.files.len(),
         local_commits = local_commits.len(),
@@ -230,11 +233,12 @@ pub(crate) fn build_git_status_value_with(
         trunk_resolve_ms = trunk_ms,
         ahead_behind_ms,
         history_walk_ms = history_ms,
+        history_identity_ms = identity_ms,
         total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "accept-changes.getStatus: status scan + remote/trunk resolve + history walk"
     );
 
-    Ok(json!({
+    let mut value = json!({
         "branch": branch,
         "trunkBranch": trunk,
         "aheadOfTrunk": ahead,
@@ -248,6 +252,145 @@ pub(crate) fn build_git_status_value_with(
         "remoteUrl": remote_url,
         "owner": owner,
         "repo": repo,
+        "gitStatus": status.as_ref(),
+    });
+    if let Some(identity) = history_identity {
+        value["historyIdentity"] = Value::String(identity);
+    }
+    Ok(value)
+}
+
+/// Equality-only identity for `file-tracking.loadCommits`, not the capped
+/// trunk range above. Resolves refs and a merge-base, never walks history.
+/// Missing/error states deliberately have no identity: consumers must recover.
+fn history_refresh_identity(worktree: &Path, ws: &Workspace) -> Option<String> {
+    history_refresh_snapshot(worktree, ws).map(|snapshot| snapshot.identity)
+}
+
+/// The token and immutable objects must travel together through a history read.
+pub(crate) struct HistoryRefreshSnapshot {
+    pub identity: String,
+    pub history: intent_git::history::HistorySnapshot,
+}
+
+pub(crate) fn history_refresh_snapshot(
+    worktree: &Path,
+    ws: &Workspace,
+) -> Option<HistoryRefreshSnapshot> {
+    history_refresh_snapshot_with(worktree, ws, |repo, inputs| {
+        intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).ok()
+    })
+}
+
+fn history_refresh_snapshot_with(
+    worktree: &Path,
+    ws: &Workspace,
+    resolve_boundary: impl FnOnce(
+        &git2::Repository,
+        &intent_git::history::WorkspaceBoundarySnapshot,
+    ) -> Option<Option<git2::Oid>>,
+) -> Option<HistoryRefreshSnapshot> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let repo = git2::Repository::open(worktree).ok()?;
+    // Deepening a shallow clone changes its visible graph without moving refs.
+    // Until complete, retain the unversioned recovery path.
+    if repo.is_shallow() {
+        return None;
+    }
+    let before = history_ref_inputs(&repo, ws)?;
+    let inputs = intent_git::history::WorkspaceBoundarySnapshot {
+        head: git2::Oid::from_str(before["head"].as_str()?).ok()?,
+        base_candidates: before["boundaryRefs"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(git2::Oid::from_str)
+            .collect::<std::result::Result<_, _>>()
+            .ok()?,
+        fallback: before["fallbackOid"]
+            .as_str()
+            .map(git2::Oid::from_str)
+            .transpose()
+            .ok()?,
+    };
+    let boundary = resolve_boundary(&repo, &inputs)?;
+    if (ws.base_ref.is_some() || ws.base_commit_sha.is_some()) && boundary.is_none() {
+        return None;
+    }
+    // Ref movement during boundary resolution cannot certify a coherent token.
+    if before != history_ref_inputs(&repo, ws)? {
+        return None;
+    }
+    let history = intent_git::history::HistorySnapshot {
+        head: inputs.head,
+        boundary,
+        upstream: before["upstream"]
+            .as_str()
+            .map(git2::Oid::from_str)
+            .transpose()
+            .ok()?,
+    };
+    if let Some(upstream) = history.upstream {
+        repo.find_commit(upstream).ok()?;
+    }
+    let bytes = serde_json::to_vec(&json!([before, boundary.map(|oid| oid.to_string())])).ok()?;
+    let identity = Sha256::digest(bytes)
+        .iter()
+        .fold("v1:".to_string(), |mut token, byte| {
+            let _ = write!(token, "{byte:02x}");
+            token
+        });
+    Some(HistoryRefreshSnapshot { identity, history })
+}
+
+fn history_ref_inputs(repo: &git2::Repository, ws: &Workspace) -> Option<Value> {
+    let head = repo.head().ok()?;
+    let head_oid = head.peel_to_commit().ok()?.id().to_string();
+    let branch = if head.is_branch() {
+        head.shorthand().unwrap_or("")
+    } else {
+        ""
+    };
+    // Match history_bounded's origin/<actual branch> push decoration, including
+    // its no-upstream behavior on detached HEAD (never use ws.branch fallback).
+    let upstream = if branch.is_empty() {
+        None
+    } else {
+        match repo.find_reference(&format!("refs/remotes/origin/{branch}")) {
+            Ok(reference) => reference.target().map(|oid| oid.to_string()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(_) => return None,
+        }
+    };
+    let mut boundary_refs = Vec::new();
+    if let Some(base) = &ws.base_ref {
+        for name in [format!("origin/{base}"), base.clone()] {
+            let oid = match repo.revparse_single(&name) {
+                Ok(object) => Some(object.peel_to_commit().ok()?.id().to_string()),
+                Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+                Err(_) => return None,
+            };
+            boundary_refs.push(oid);
+        }
+    }
+    let fallback = match ws.base_commit_sha.as_deref() {
+        Some(name) => match repo.revparse_single(name) {
+            Ok(object) => Some(object.peel_to_commit().ok()?.id().to_string()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+            Err(_) => return None,
+        },
+        None => None,
+    };
+    Some(json!({
+        "head": head_oid,
+        "branch": branch,
+        "upstream": upstream,
+        "baseRef": ws.base_ref,
+        "baseCommitSha": ws.base_commit_sha,
+        "boundaryRefs": boundary_refs,
+        "fallbackOid": fallback,
     }))
 }
 
@@ -895,6 +1038,344 @@ mod tests {
         assert_eq!(v["hasRemote"], false);
         assert_eq!(v["isPushed"], false);
         assert!(v["localCommits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_refresh_identity_reuses_scan_and_ignores_file_edits() {
+        let dir = init_repo("refresh-files");
+        let ws = mk_workspace();
+        let before = build_git_status_value(dir.path(), &ws).unwrap();
+        assert!(before["historyIdentity"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        std::fs::write(dir.path().join("seed.txt"), "edited\n").unwrap();
+        let scanned = std::sync::Arc::new(intent_git::status::status(dir.path()).unwrap());
+        // A supplied scan is authoritative; the builder must not rescan.
+        std::fs::write(dir.path().join("later.txt"), "later\n").unwrap();
+        let after = build_git_status_value_with(dir.path(), &ws, Some(scanned.clone())).unwrap();
+        assert_eq!(
+            after["gitStatus"],
+            serde_json::to_value(scanned.as_ref()).unwrap()
+        );
+        assert_eq!(before["historyIdentity"], after["historyIdentity"]);
+        assert_ne!(before["gitStatus"], after["gitStatus"]);
+    }
+
+    #[test]
+    fn history_refresh_identity_tracks_head_with_empty_trunk_history() {
+        let dir = init_repo("refresh-head");
+        let ws = mk_workspace();
+        let before = build_git_status_value(dir.path(), &ws).unwrap();
+        commit_file(dir.path(), "next.txt", "next\n", "next");
+        let after = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_eq!(before["localCommits"], json!([]));
+        assert_eq!(after["localCommits"], json!([]));
+        assert_ne!(before["historyIdentity"], after["historyIdentity"]);
+        let repo = Repository::open(dir.path()).unwrap();
+        let parent = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent(0)
+            .unwrap();
+        repo.reset(parent.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        let reset = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_eq!(before["historyIdentity"], reset["historyIdentity"]);
+    }
+
+    #[test]
+    fn history_refresh_identity_tracks_workspace_boundary_beyond_trunk_cap() {
+        let dir = init_repo("refresh-boundary");
+        let repo = Repository::open(dir.path()).unwrap();
+        let seed = repo.head().unwrap().target().unwrap();
+        checkout_new_branch(dir.path(), "feature/long");
+        commit_file(dir.path(), "boundary.txt", "boundary\n", "boundary");
+        let boundary = repo.head().unwrap().target().unwrap();
+        // Cheap empty commits keep both boundaries outside the 200-row trunk page.
+        for i in 0..201 {
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let tree = parent.tree().unwrap();
+            let sig = Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!("commit {i}"),
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        }
+        let mut ws = mk_workspace();
+        ws.base_ref = None;
+        ws.base_commit_sha = Some(seed.to_string());
+        let before = build_git_status_value(dir.path(), &ws).unwrap();
+        ws.base_commit_sha = Some(boundary.to_string());
+        let after = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_eq!(before["localCommits"].as_array().unwrap().len(), 200);
+        assert_eq!(before["localCommits"], after["localCommits"]);
+        assert_ne!(before["historyIdentity"], after["historyIdentity"]);
+    }
+
+    #[test]
+    fn history_refresh_identity_tracks_pushed_metadata_and_detached_head() {
+        let dir = init_repo("refresh-upstream");
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let ws = mk_workspace();
+        let before = build_git_status_value(dir.path(), &ws).unwrap();
+        repo.reference("refs/remotes/origin/main", head, true, "test push")
+            .unwrap();
+        let pushed = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_eq!(before["localCommits"], pushed["localCommits"]);
+        assert_ne!(before["historyIdentity"], pushed["historyIdentity"]);
+        repo.set_head_detached(head).unwrap();
+        let detached = build_git_status_value(dir.path(), &ws).unwrap();
+        assert!(detached["historyIdentity"].is_string());
+        assert_ne!(pushed["historyIdentity"], detached["historyIdentity"]);
+        repo.set_head("refs/heads/main").unwrap();
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert_eq!(
+            before["historyIdentity"],
+            build_git_status_value(dir.path(), &ws).unwrap()["historyIdentity"]
+        );
+    }
+
+    #[test]
+    fn history_refresh_identity_omits_shallow_graphs() {
+        let dir = init_repo("refresh-shallow");
+        let ws = mk_workspace();
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        std::fs::write(repo.path().join("shallow"), format!("{head}\n")).unwrap();
+        assert!(history_refresh_snapshot(dir.path(), &ws).is_none());
+        std::fs::remove_file(repo.path().join("shallow")).unwrap();
+        assert!(history_refresh_snapshot(dir.path(), &ws).is_some());
+    }
+
+    #[test]
+    fn history_refresh_snapshot_binds_response_through_aba() {
+        let dir = init_repo("refresh-response-aba");
+        let repo = Repository::open(dir.path()).unwrap();
+        let ws = mk_workspace();
+        let head_a = repo.head().unwrap().target().unwrap();
+        let identity_a = history_refresh_identity(dir.path(), &ws).unwrap();
+        commit_file(dir.path(), "b.txt", "b\n", "transient B");
+        let snapshot_b = history_refresh_snapshot(dir.path(), &ws).unwrap();
+        repo.reset(
+            &repo.find_object(head_a, None).unwrap(),
+            git2::ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            history_refresh_identity(dir.path(), &ws).unwrap(),
+            identity_a
+        );
+        let page = intent_git::history::history_bounded_snapshot(
+            dir.path(),
+            &snapshot_b.history,
+            50,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(page[0].hash, snapshot_b.history.head.to_string());
+        assert_eq!(page[0].message, "transient B");
+        assert_ne!(snapshot_b.identity, identity_a);
+    }
+
+    #[test]
+    fn history_refresh_snapshot_freezes_boundary_during_aba() {
+        let dir = init_repo("refresh-boundary-aba");
+        let repo = Repository::open(dir.path()).unwrap();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir.path(), "trunk.txt", "trunk\n", "trunk");
+        let trunk = repo.head().unwrap().target().unwrap();
+        checkout_new_branch(dir.path(), "feature/aba");
+        commit_file(dir.path(), "feature.txt", "feature\n", "feature");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let mut ws = mk_workspace();
+        ws.base_ref = Some("main".to_string());
+        let expected = history_refresh_snapshot(dir.path(), &ws).unwrap();
+        let snapshot = history_refresh_snapshot_with(dir.path(), &ws, |snapshot_repo, inputs| {
+            repo.reset(root.as_object(), git2::ResetType::Hard, None)
+                .unwrap();
+            let boundary =
+                intent_git::history::resolve_workspace_boundary_snapshot(snapshot_repo, inputs)
+                    .unwrap();
+            repo.reset(head.as_object(), git2::ResetType::Hard, None)
+                .unwrap();
+            Some(boundary)
+        })
+        .unwrap();
+        assert_eq!(snapshot.history.boundary, Some(trunk));
+        assert_eq!(snapshot.identity, expected.identity);
+        let page = intent_git::history::history_bounded_snapshot(
+            dir.path(),
+            &snapshot.history,
+            50,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].hash, head.id().to_string());
+    }
+
+    #[test]
+    fn history_refresh_snapshot_freezes_base_candidates_and_fallback() {
+        for base_name in [
+            "refs/remotes/origin/base",
+            "refs/heads/base",
+            "refs/heads/fallback",
+        ] {
+            let dir = init_repo("refresh-base-input-aba");
+            let repo = Repository::open(dir.path()).unwrap();
+            let root = repo.head().unwrap().target().unwrap();
+            commit_file(dir.path(), "trunk.txt", "trunk\n", "trunk");
+            let trunk = repo.head().unwrap().target().unwrap();
+            commit_file(dir.path(), "feature.txt", "feature\n", "feature");
+            let head = repo.head().unwrap().target().unwrap();
+            // A distinct fallback verifies origin/base precedence too.
+            let mut ws = mk_workspace();
+            ws.base_ref = Some("base".to_string());
+            ws.base_commit_sha = Some(root.to_string());
+            if base_name.ends_with("fallback") {
+                ws.base_ref = None;
+                ws.base_commit_sha = Some("fallback".to_string());
+            } else if base_name.contains("origin") {
+                repo.reference("refs/heads/base", root, true, "local base")
+                    .unwrap();
+            }
+            repo.reference(base_name, trunk, true, "captured base")
+                .unwrap();
+            let expected = history_refresh_snapshot(dir.path(), &ws).unwrap();
+            let snapshot = history_refresh_snapshot_with(dir.path(), &ws, |repo, inputs| {
+                repo.reference(base_name, root, true, "transient base")
+                    .unwrap();
+                let boundary =
+                    intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).unwrap();
+                repo.reference(base_name, trunk, true, "restore base")
+                    .unwrap();
+                Some(boundary)
+            })
+            .unwrap();
+            assert_eq!(snapshot.history.boundary, Some(trunk), "{base_name}");
+            assert_eq!(snapshot.identity, expected.identity, "{base_name}");
+            let page = intent_git::history::history_bounded_snapshot(
+                dir.path(),
+                &snapshot.history,
+                50,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(page.len(), 1, "{base_name}");
+            assert_eq!(page[0].hash, head.to_string());
+        }
+    }
+
+    #[test]
+    fn history_refresh_identity_rejects_ref_movement_during_resolution() {
+        let dir = init_repo("refresh-race");
+        let mut ws = mk_workspace();
+        ws.base_ref = Some("main".to_string());
+        assert!(history_refresh_snapshot_with(dir.path(), &ws, |_, _| None).is_none());
+        let raced = history_refresh_snapshot_with(dir.path(), &ws, |repo, inputs| {
+            let boundary =
+                intent_git::history::resolve_workspace_boundary_snapshot(repo, inputs).unwrap();
+            commit_file(dir.path(), "next.txt", "next\n", "moved during resolve");
+            Some(boundary)
+        });
+        assert!(raced.is_none());
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().target().unwrap();
+        let raced = history_refresh_snapshot_with(dir.path(), &ws, |repo, _| {
+            repo.reference(
+                "refs/remotes/origin/main",
+                head,
+                true,
+                "push during resolve",
+            )
+            .unwrap();
+            Some(Some(head))
+        });
+        assert!(raced.is_none());
+        assert!(history_refresh_identity(dir.path(), &ws).is_some());
+    }
+
+    #[test]
+    fn history_refresh_identity_tracks_rebase_and_boundary_removal() {
+        let dir = init_repo("refresh-rebase");
+        let repo = Repository::open(dir.path()).unwrap();
+        let seed = repo.head().unwrap().peel_to_commit().unwrap();
+        checkout_new_branch(dir.path(), "feature/rebase");
+        commit_file(dir.path(), "feature.txt", "feature\n", "feature");
+        let mut ws = mk_workspace();
+        ws.base_ref = Some("main".to_string());
+        let before = build_git_status_value(dir.path(), &ws).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        let advanced = repo
+            .commit(
+                Some("refs/heads/main"),
+                &sig,
+                &sig,
+                "trunk advanced",
+                &seed.tree().unwrap(),
+                &[&seed],
+            )
+            .unwrap();
+        let old_head = repo.head().unwrap().peel_to_commit().unwrap();
+        let new_head = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "rebased feature",
+                &old_head.tree().unwrap(),
+                &[&repo.find_commit(advanced).unwrap()],
+            )
+            .unwrap();
+        repo.reference("refs/heads/feature/rebase", new_head, true, "rebase")
+            .unwrap();
+        let rebased = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_ne!(before["historyIdentity"], rebased["historyIdentity"]);
+        assert_eq!(
+            intent_git::history::resolve_workspace_boundary(dir.path(), Some("main"), None)
+                .unwrap(),
+            Some(advanced.to_string())
+        );
+        ws.base_ref = None;
+        let unbounded = build_git_status_value(dir.path(), &ws).unwrap();
+        assert_ne!(rebased["historyIdentity"], unbounded["historyIdentity"]);
+        assert_eq!(rebased["localCommits"], unbounded["localCommits"]);
+    }
+
+    #[test]
+    fn history_refresh_identity_is_absent_when_unavailable() {
+        let dir = TempDir::new("refresh-missing");
+        let mut ws = mk_workspace();
+        let missing = build_git_status_value(dir.path(), &ws).unwrap();
+        assert!(missing.get("historyIdentity").is_none());
+        assert!(missing.get("gitStatus").is_none());
+        Repository::init(dir.path()).unwrap();
+        let unborn = build_git_status_value(dir.path(), &ws).unwrap();
+        assert!(unborn.get("historyIdentity").is_none());
+        assert!(unborn["gitStatus"].is_object());
+        let dir = init_repo("refresh-unresolved");
+        ws.base_ref = Some("missing-boundary".to_string());
+        assert!(build_git_status_value(dir.path(), &ws)
+            .unwrap()
+            .get("historyIdentity")
+            .is_none());
+        std::fs::write(dir.path().join(".git/HEAD"), "broken HEAD\n").unwrap();
+        assert!(build_git_status_value(dir.path(), &ws).is_err());
     }
 
     #[test]

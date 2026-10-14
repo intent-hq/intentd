@@ -586,6 +586,7 @@ mod tests {
             .unwrap();
 
         let ws = test_workspace("ws-repo", &root.path);
+        let before = accept_changes::build_git_status_value(&root.path, &ws).unwrap();
         let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
         let cache = Arc::new(GitStatusCache::new());
         let _refresher = GitStatusRefresher::start(bus.clone(), api, Arc::clone(&cache));
@@ -609,5 +610,14 @@ mod tests {
             .await
             .expect("refresh must leave a cached status");
         assert_eq!(cached.files.len(), 1);
+        assert!(ev.data["status"]["historyIdentity"].is_string());
+        assert_eq!(
+            ev.data["status"]["historyIdentity"],
+            before["historyIdentity"]
+        );
+        assert_eq!(
+            ev.data["status"]["gitStatus"],
+            serde_json::to_value(cached.as_ref()).unwrap()
+        );
     }
 }

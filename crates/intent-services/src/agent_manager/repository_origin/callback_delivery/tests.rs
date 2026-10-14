@@ -399,7 +399,8 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
     }
 
     async fn call(&self, method: &str, params: Value) -> Value {
-        self.call_with_timeout(method, params, WAIT).await
+        self.call_with_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
+            .await
     }
 
     async fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Value {
@@ -5963,7 +5964,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, WAIT)
+            c.request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
                 .await
                 .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }

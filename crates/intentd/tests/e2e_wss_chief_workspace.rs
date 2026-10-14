@@ -38,7 +38,11 @@
 
 #![cfg(unix)]
 
+#[path = "e2e_wss_chief_workspace/chat_management.rs"]
+mod chat_management;
 mod common;
+#[path = "e2e_wss_chief_workspace/mcp_configuration.rs"]
+mod mcp_configuration;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};

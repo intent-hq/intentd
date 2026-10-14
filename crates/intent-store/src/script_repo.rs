@@ -280,6 +280,33 @@ impl Store {
         rows.iter().map(map_script_row).collect()
     }
 
+    /// Hydrate only unarchived definitions; archived output remains a known-ID read.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn list_unarchived_scripts(&self) -> Result<Vec<Script>> {
+        let sql = format!(
+            "SELECT {SCRIPT_COLUMNS} FROM script WHERE archived_at IS NULL ORDER BY created_at,id"
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        rows.iter().map(map_script_row).collect()
+    }
+    /// Read one unarchived definition without fetching an excluded archived body.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn get_active_script(&self, ws: &WorkspaceId, id: &str) -> Result<Option<Script>> {
+        let sql=format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE workspace_id=? AND id=? AND archived_at IS NULL");
+        let row = sqlx::query(&sql)
+            .bind(ws.as_str())
+            .bind(id)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        row.as_ref().map(map_script_row).transpose()
+    }
+
     /// Read one persisted definition only if it belongs to this workspace.
     ///
     /// # Errors

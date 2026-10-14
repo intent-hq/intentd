@@ -7253,26 +7253,81 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Select active, archived or all retained definitions, preserving the list envelope.
+    /// Select only active definitions, preserving the legacy list envelope.
     fn script_list_filtered(
         &self,
         workspace_id: WorkspaceId,
         archive: crate::ScriptArchiveFilter,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if archive != crate::ScriptArchiveFilter::Active {
+                return Err(Error::InvalidParams(
+                    "only active script lists are supported".into(),
+                ));
+            }
             let mut result = self.script_list(workspace_id).await?;
-            if let Some(scripts) = result
-                .get_mut("scripts")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                scripts.retain(|script| match archive {
-                    crate::ScriptArchiveFilter::All => true,
-                    crate::ScriptArchiveFilter::Active => script.get("archivedAt").is_none(),
-                    crate::ScriptArchiveFilter::Archived => script.get("archivedAt").is_some(),
-                });
+            let rows = if result.is_array() {
+                result.as_array_mut()
+            } else {
+                result
+                    .get_mut("scripts")
+                    .and_then(serde_json::Value::as_array_mut)
+            };
+            if let Some(rows) = rows {
+                rows.retain(|row| row.get("archivedAt").is_none_or(serde_json::Value::is_null));
             }
             Ok(result)
         })
+    }
+
+    /// Strict active-only list views.
+    fn script_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let parsed = crate::script_lists::ScriptListOptions::parse(&options, false)?;
+            if parsed.summary {
+                return Err(Error::InvalidParams("summary lists unsupported".into()));
+            }
+            self.script_list_filtered(workspace_id, crate::ScriptArchiveFilter::Active)
+                .await
+        })
+    }
+    /// Selected unarchived definition; never archive history.
+    fn script_get(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
+        Box::pin(async { Err(Error::InvalidParams("script.get unsupported".into())) })
+    }
+    /// Strict active-only monitor list views.
+    fn script_monitor_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let parsed = crate::script_lists::ScriptListOptions::parse(&options, true)?;
+            if parsed.summary {
+                return Err(Error::InvalidParams("summary lists unsupported".into()));
+            }
+            self.script_monitor_list(workspace_id, agent_id).await
+        })
+    }
+    /// Selected active monitor with optional authenticated owner restriction.
+    fn script_monitor_get(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id, owner);
+        Box::pin(async { Err(Error::InvalidParams("scriptMonitor.get unsupported".into())) })
     }
 
     /// Archive an explicit workspace-scoped selection without stopping processes.

@@ -195,14 +195,19 @@ impl PushedCheck {
     /// Whether `oid` — the next (older) commit on the walk's first-parent
     /// chain — is pushed.
     fn check(&mut self, repo: &Repository, oid: Oid) -> bool {
+        self.try_check(repo, oid).unwrap_or(false)
+    }
+
+    fn try_check(&mut self, repo: &Repository, oid: Oid) -> Result<bool> {
         let Some(tip) = self.upstream_tip else {
-            return false;
+            return Ok(false);
         };
         if self.chain_pushed {
-            return true;
+            return Ok(true);
         }
-        self.chain_pushed = oid == tip || repo.graph_descendant_of(tip, oid).unwrap_or(false);
-        self.chain_pushed
+        self.chain_pushed =
+            oid == tip || repo.graph_descendant_of(tip, oid).map_err(map_git_err)?;
+        Ok(self.chain_pushed)
     }
 }
 
@@ -386,6 +391,44 @@ fn resolve_workspace_boundary_inner(
     Ok(None)
 }
 
+/// Captured inputs for workspace boundary resolution, with origin before local
+/// base candidates. No ref names may be resolved after these inputs are captured.
+pub struct WorkspaceBoundarySnapshot {
+    pub head: Oid,
+    pub base_candidates: Vec<Oid>,
+    pub fallback: Option<Oid>,
+}
+
+/// Resolve a boundary using only captured commit objects, never live refs.
+///
+/// # Errors
+///
+/// Returns an error if captured objects or their ancestry cannot be read.
+pub fn resolve_workspace_boundary_snapshot(
+    repo: &Repository,
+    snapshot: &WorkspaceBoundarySnapshot,
+) -> Result<Option<Oid>> {
+    repo.find_commit(snapshot.head).map_err(map_git_err)?;
+    for candidate in &snapshot.base_candidates {
+        repo.find_commit(*candidate).map_err(map_git_err)?;
+        match repo.merge_base(snapshot.head, *candidate) {
+            Ok(boundary) => return Ok(Some(boundary)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
+    }
+    if let Some(fallback) = snapshot.fallback {
+        repo.find_commit(fallback).map_err(map_git_err)?;
+        match repo.merge_base(snapshot.head, fallback) {
+            Ok(boundary) if boundary == fallback => return Ok(Some(fallback)),
+            Ok(_) => {}
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(map_git_err(error)),
+        }
+    }
+    Ok(None)
+}
+
 /// Read history bounded by a workspace boundary (for `file-tracking.loadCommits`).
 ///
 /// Returns commits in the range `boundary..HEAD` (workspace-owned only) when
@@ -407,28 +450,49 @@ pub fn history_bounded(
     include_older: bool,
     include_files: bool,
 ) -> Result<Vec<CommitRecord>> {
-    let started = Instant::now();
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
-    if repo.head().ok().and_then(|h| h.target()).is_none() {
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
         return Ok(Vec::new());
-    }
-
+    };
     let branch = current_branch(&repo);
-    let mut pushed = PushedCheck::new(upstream_tip(&repo, &branch));
+    let snapshot = HistorySnapshot {
+        head,
+        boundary: boundary_sha
+            .and_then(|name| repo.revparse_single(name).ok())
+            .and_then(|object| object.peel_to_commit().ok())
+            .map(|commit| commit.id()),
+        upstream: upstream_tip(&repo, &branch),
+    };
+    history_bounded_from_repo(
+        worktree_path,
+        &repo,
+        &snapshot,
+        limit,
+        include_older,
+        include_files,
+        false,
+    )
+}
 
+fn history_bounded_from_repo(
+    worktree_path: &Path,
+    repo: &Repository,
+    snapshot: &HistorySnapshot,
+    limit: usize,
+    include_older: bool,
+    include_files: bool,
+    strict_pushed: bool,
+) -> Result<Vec<CommitRecord>> {
+    let started = Instant::now();
+    let mut pushed = PushedCheck::new(snapshot.upstream);
     let mut walk = repo.revwalk().map_err(map_git_err)?;
-    walk.push_head().map_err(map_git_err)?;
-
-    if let Some(boundary) = boundary_sha {
-        if let Ok(obj) = repo.revparse_single(boundary) {
-            if include_older {
-                // For "show previous": start FROM the boundary (inclusive) and walk backward
-                walk.reset().map_err(map_git_err)?;
-                walk.push(obj.id()).map_err(map_git_err)?;
-            } else {
-                // Normal case: hide the boundary so we get boundary..HEAD
-                let _ = walk.hide(obj.id());
-            }
+    walk.push(snapshot.head).map_err(map_git_err)?;
+    if let Some(boundary) = snapshot.boundary {
+        if include_older {
+            walk.reset().map_err(map_git_err)?;
+            walk.push(boundary).map_err(map_git_err)?;
+        } else {
+            walk.hide(boundary).map_err(map_git_err)?;
         }
     }
 
@@ -451,14 +515,18 @@ pub fn history_bounded(
         }
         let hash = oid.to_string();
         let pushed_started = timing_enabled.then(Instant::now);
-        let is_pushed = pushed.check(&repo, oid);
+        let is_pushed = if strict_pushed {
+            pushed.try_check(repo, oid)?
+        } else {
+            pushed.check(repo, oid)
+        };
         if let Some(t) = pushed_started {
             pushed_elapsed += t.elapsed();
         }
         let (agent_id, linked_note_id) = parse_trailers(commit.body().ok().flatten().unwrap_or(""));
         let files = if include_files {
             let diff_started = timing_enabled.then(Instant::now);
-            let files = changed_files(&repo, &commit)?;
+            let files = changed_files(repo, &commit)?;
             if let Some(t) = diff_started {
                 diff_elapsed += t.elapsed();
             }
@@ -487,7 +555,7 @@ pub fn history_bounded(
         limit,
         include_older,
         include_files,
-        bounded = boundary_sha.is_some(),
+        bounded = snapshot.boundary.is_some(),
         pushed_check_ms = u64::try_from(pushed_elapsed.as_millis()).unwrap_or(u64::MAX),
         per_commit_diff_ms = u64::try_from(diff_elapsed.as_millis()).unwrap_or(u64::MAX),
         other_ms = u64::try_from(
@@ -510,6 +578,37 @@ pub fn history_bounded(
         );
     }
     Ok(out)
+}
+
+/// Immutable commit objects used by one bounded history read.
+#[derive(Debug, Clone)]
+pub struct HistorySnapshot {
+    pub head: Oid,
+    pub boundary: Option<Oid>,
+    pub upstream: Option<Oid>,
+}
+
+/// Read a captured history range and its captured push decoration.
+///
+/// # Errors
+/// Returns an error when the repository or captured objects cannot be read.
+pub fn history_bounded_snapshot(
+    worktree_path: &Path,
+    snapshot: &HistorySnapshot,
+    limit: usize,
+    include_older: bool,
+    include_files: bool,
+) -> Result<Vec<CommitRecord>> {
+    let repo = Repository::open(worktree_path).map_err(map_git_err)?;
+    history_bounded_from_repo(
+        worktree_path,
+        &repo,
+        snapshot,
+        limit,
+        include_older,
+        include_files,
+        true,
+    )
 }
 
 /// Parse the `Agent-Id:` / `Linked-Note-Id:` trailers from a commit body,
@@ -628,6 +727,75 @@ mod tests {
     }
 
     const T0: i64 = 1_700_000_000;
+
+    #[test]
+    fn history_snapshot_survives_aba_ref_changes() {
+        let dir = init_repo("history-snapshot-aba");
+        let repo = Repository::open(dir.path()).unwrap();
+        commit_file_at(dir.path(), "base.txt", "base\n", T0);
+        let boundary = repo.head().unwrap().target().unwrap();
+        commit_file_at(dir.path(), "a.txt", "a\n", T0 + 1);
+        let head_a = repo.head().unwrap().target().unwrap();
+        set_upstream_ref(dir.path(), &head_a.to_string());
+        commit_file_at(dir.path(), "b.txt", "b\n", T0 + 2);
+        let snapshot_b = HistorySnapshot {
+            head: repo.head().unwrap().target().unwrap(),
+            boundary: Some(boundary),
+            upstream: Some(head_a),
+        };
+        // The queued read captured B; HEAD and upstream are back at A before
+        // its walk starts. It must return B, whose response token identifies B.
+        repo.reset(
+            &repo.find_object(head_a, None).unwrap(),
+            git2::ResetType::Hard,
+            None,
+        )
+        .unwrap();
+        let commits = history_bounded_snapshot(dir.path(), &snapshot_b, 50, false, false).unwrap();
+        assert_eq!(commits[0].hash, snapshot_b.head.to_string());
+        assert!(!commits[0].is_pushed);
+        assert_eq!(commits[1].hash, head_a.to_string());
+        assert!(commits[1].is_pushed);
+        assert_eq!(commits.len(), 2);
+    }
+
+    #[test]
+    fn history_snapshot_rejects_unknown_push_state() {
+        let dir = init_repo("history-snapshot-broken-upstream");
+        commit_file_at(dir.path(), "a.txt", "a\n", T0);
+        let repo = Repository::open(dir.path()).unwrap();
+        let snapshot = HistorySnapshot {
+            head: repo.head().unwrap().target().unwrap(),
+            boundary: None,
+            upstream: Some(Oid::from_str(&"a".repeat(40)).unwrap()),
+        };
+        assert!(history_bounded_snapshot(dir.path(), &snapshot, 50, false, false).is_err());
+    }
+
+    #[test]
+    fn history_snapshot_freezes_push_decoration() {
+        let dir = init_repo("history-snapshot-push");
+        let repo = Repository::open(dir.path()).unwrap();
+        commit_file_at(dir.path(), "base.txt", "base\n", T0);
+        let boundary = repo.head().unwrap().target().unwrap();
+        commit_file_at(dir.path(), "a.txt", "a\n", T0 + 1);
+        let snapshot = HistorySnapshot {
+            head: repo.head().unwrap().target().unwrap(),
+            boundary: Some(boundary),
+            upstream: None,
+        };
+        set_upstream_ref(dir.path(), &snapshot.head.to_string());
+        for older in [false, true] {
+            let commits =
+                history_bounded_snapshot(dir.path(), &snapshot, 50, older, false).unwrap();
+            assert_eq!(commits.len(), 1);
+            assert_eq!(
+                commits[0].hash,
+                if older { boundary } else { snapshot.head }.to_string()
+            );
+            assert!(!commits[0].is_pushed);
+        }
+    }
 
     #[test]
     fn is_pushed_reflects_upstream_tip_and_ancestors() {
@@ -787,6 +955,48 @@ mod tests {
         let err =
             commit_details(dir.path(), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn workspace_boundary_snapshot_preserves_order_and_validates_fallback() {
+        let dir = init_repo("boundary-snapshot-order");
+        commit_file(dir.path(), "a.txt", "base\n");
+        let repo = Repository::open(dir.path()).unwrap();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        commit_file(dir.path(), "b.txt", "trunk\n");
+        let trunk = repo.head().unwrap().target().unwrap();
+        commit_file(dir.path(), "c.txt", "head\n");
+        let head = repo.head().unwrap().target().unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let unrelated = repo
+            .commit(None, &sig, &sig, "unrelated", &root.tree().unwrap(), &[])
+            .unwrap();
+        let mut snapshot = WorkspaceBoundarySnapshot {
+            head,
+            base_candidates: vec![trunk, root.id()],
+            fallback: Some(root.id()),
+        };
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(trunk)
+        );
+        snapshot.base_candidates = vec![unrelated, root.id()];
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(root.id())
+        );
+        snapshot.base_candidates.clear();
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            Some(root.id())
+        );
+        snapshot.fallback = Some(unrelated);
+        assert_eq!(
+            resolve_workspace_boundary_snapshot(&repo, &snapshot).unwrap(),
+            None
+        );
+        snapshot.fallback = Some(Oid::ZERO_SHA1);
+        assert!(resolve_workspace_boundary_snapshot(&repo, &snapshot).is_err());
     }
 
     #[test]

@@ -505,7 +505,16 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         "😀abcdefghijk\r\n".repeat(32768),
     ];
     for (index, source) in samples.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let stage = |name| {
+            eprintln!(
+                "note cancellation sample {index}: {name} at {:?}",
+                started.elapsed()
+            );
+        };
+        stage("setup");
         let (_tmp, svc, ws, id) = crate::tests::setup_versioned(&source).await;
+        stage("metadata");
         let mut note = svc.store.get_note(&ws, &id).await.unwrap();
         note.content_type = if index == 0 {
             intent_core::ContentType::PlainText
@@ -518,8 +527,10 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         svc.store.update_note(&note).await.unwrap();
         let before = svc.store.get_note(&ws, &id).await.unwrap();
         assert_eq!(before.content, source);
+        stage("schedule");
         let (request, response) = schedule(&svc, &ws, &id, 60000).await;
         assert!(serde_json::to_vec(&response).unwrap().len() < 2048);
+        stage("cancel");
         svc.cancel_note_delete(NoteDeleteCancel {
             workspace_id: ws.clone(),
             note_id: id.clone(),
@@ -527,12 +538,15 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         })
         .await
         .unwrap();
+        stage("settle");
         assert_eq!(
             settled(&svc, &request).await.state,
             NoteDeleteState::Cancelled
         );
         assert_eq!(svc.store.get_note(&ws, &id).await.unwrap(), before);
+        stage("cleanup");
         cleanup(&svc).await;
+        stage("complete");
     }
 }
 #[intent_test_macros::daemon_test]

@@ -147,6 +147,8 @@ pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), Manage
 pub(crate) struct ScriptLocks {
     pub(crate) monitor_maintenance: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) monitor_lane: Arc<AsyncMutex<()>>,
+    pub(crate) monitor_workers: Arc<Mutex<HashMap<intent_core::AgentId, String>>>,
+    pub(crate) monitor_completions: Arc<Mutex<HashSet<(intent_core::AgentId, String)>>>,
     monitor_windows: Arc<Mutex<HashMap<String, monitors::Window>>>,
     hydration: Arc<AsyncMutex<()>>,
     workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
@@ -600,7 +602,20 @@ impl ScriptManager {
         // recovering caller gets the chance to publish the committed snapshot.
         let _hydrating = self.locks.hydration.lock().await;
         let recovered = self.recover_commands().await?;
-        let defs = self.store.list_all_scripts().await?;
+        let mut defs = self.store.list_unarchived_scripts().await?;
+        // Recovery knows these exact IDs from unfinished runs. Publish their
+        // terminal snapshots even when one-off settlement just archived them;
+        // do not enumerate unrelated archived definitions.
+        for (ws, id) in &recovered {
+            if !defs
+                .iter()
+                .any(|def| def.workspace_id == ws.as_str() && def.id == *id)
+            {
+                if let Some(def) = self.store.get_script_in_workspace(ws, id).await? {
+                    defs.push(def);
+                }
+            }
+        }
         let mut was_running: HashSet<(String, String)> = self
             .store
             .list_was_running_script_ids()
@@ -690,6 +705,69 @@ impl ScriptManager {
             }
         }
         Ok(loaded)
+    }
+
+    /// Selected known-ID access may lazily load an archived definition; lists never do.
+    pub(crate) async fn ensure_known(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        // Runtime reads must remain available while a mutation joins its supervisor.
+        if self
+            .scripts
+            .lock()
+            .unwrap()
+            .contains_key(&(ws.clone(), id.to_owned()))
+        {
+            return Ok(());
+        }
+        let lock = self.locks.definition_lock(id);
+        let _guard = lock.lock().await;
+        self.ensure_known_locked(ws, id).await
+    }
+    pub(super) async fn ensure_known_locked(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        let key = (ws.clone(), id.to_owned());
+        if self.scripts.lock().unwrap().contains_key(&key) {
+            return Ok(());
+        }
+        let def = self
+            .store
+            .get_script_in_workspace(ws, id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("script {id}")))?;
+        let latest = self.store.latest_script_run(ws, id).await?;
+        let mut state = ScriptRuntimeState::default();
+        if let Some((run, result)) = latest {
+            state.run_id = Some(run);
+            if let Some(result) = result {
+                state.status = ScriptStatus::Exited;
+                state.exit_code = result.exit_code;
+                // Recovery times describe the durable outcome, not an observed
+                // runtime. Keep known-ID reads consistent across later boots.
+                if result.error.as_deref() != Some(LOST_AT_DAEMON_STOP_ERROR) {
+                    state.started_at = result.started_at;
+                    state.stopped_at = Some(result.stopped_at);
+                }
+                state.error = result.error;
+            }
+        }
+        self.scripts.lock().unwrap().insert(
+            key,
+            ManagedScript {
+                def,
+                state,
+                pty_id: None,
+                monitor_attempt: None,
+                stopped_by_user: false,
+                supervisor: None,
+                generation: next_generation(),
+                lost_at_daemon_stop: false,
+                running_at_shutdown: false,
+                run_reserved: None,
+                run_id: None,
+                run_generation: None,
+                cancellation: None,
+                pending_result: None,
+            },
+        );
+        Ok(())
     }
 
     /// Reconcile one committed import without rewriting its persisted definition
@@ -786,8 +864,58 @@ impl ScriptManager {
     /// Bootstrap repo config `scripts[]` only for a workspace that has never
     /// held script definitions. An intentionally emptied workspace stays empty.
     pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
-        self.list_filtered(workspace_id, intent_core::ScriptArchiveFilter::All)
+        self.list_filtered(workspace_id, intent_core::ScriptArchiveFilter::Active)
             .await
+    }
+
+    pub(crate) async fn summary_page(
+        &self,
+        ws: &WorkspaceId,
+        options: &intent_core::script_lists::ScriptListOptions,
+    ) -> Result<Value> {
+        options.boundary(&intent_core::script_lists::scope(
+            "script.list",
+            ws.as_str(),
+            None,
+        ))?;
+        self.list_filtered_inner(ws, intent_core::ScriptArchiveFilter::Active, false)
+            .await?;
+        let mut page = self
+            .store
+            .script_summary_page(ws, None, false, options)
+            .await?;
+        let registry = self.scripts.lock().unwrap();
+        if let Some(rows) = page["scripts"].as_array_mut() {
+            for row in rows {
+                let state = registry
+                    .get(&(
+                        ws.clone(),
+                        row["id"].as_str().unwrap_or_default().to_owned(),
+                    ))
+                    .map(|m| m.state.clone())
+                    .unwrap_or_default();
+                row["runtime"] =
+                    serde_json::to_value(state).map_err(|e| Error::Internal(e.to_string()))?;
+                intent_core::script_lists::bound_error(&mut row["runtime"]);
+            }
+        }
+        Ok(page)
+    }
+
+    pub(crate) async fn get(&self, ws: &WorkspaceId, id: &str) -> Result<Value> {
+        let def = self
+            .store
+            .get_active_script(ws, id)
+            .await?
+            .ok_or_else(|| Error::InvalidParams("unknown script ID".into()))?;
+        let state = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(ws.clone(), id.to_owned()))
+            .map(|m| m.state.clone())
+            .unwrap_or_default();
+        Ok(with_runtime(&def, &state))
     }
 
     pub(crate) async fn list_filtered(
@@ -795,15 +923,28 @@ impl ScriptManager {
         workspace_id: &WorkspaceId,
         archive: intent_core::ScriptArchiveFilter,
     ) -> Result<Value> {
-        let selected = |m: &ManagedScript| match archive {
-            intent_core::ScriptArchiveFilter::All => true,
-            intent_core::ScriptArchiveFilter::Active => m.def.archived_at.is_none(),
-            intent_core::ScriptArchiveFilter::Archived => m.def.archived_at.is_some(),
-        };
+        self.list_filtered_inner(workspace_id, archive, true).await
+    }
+
+    async fn list_filtered_inner(
+        &self,
+        workspace_id: &WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+        serialize: bool,
+    ) -> Result<Value> {
+        if archive != intent_core::ScriptArchiveFilter::Active {
+            return Err(Error::InvalidParams(
+                "only active script lists are supported".into(),
+            ));
+        }
+        let selected = |m: &ManagedScript| m.def.archived_at.is_none();
         // Filter the existing registry before serializing full definitions.
         // Nonempty registries need no initialization read, even if filtered empty.
         {
             let guard = self.scripts.lock().unwrap();
+            if !serialize && guard.keys().any(|(ws, _)| ws == workspace_id) {
+                return Ok(Value::Null);
+            }
             let mut scripts: Vec<(String, Value)> = guard
                 .iter()
                 .filter(|((ws, _), m)| ws == workspace_id && selected(m))
@@ -829,6 +970,9 @@ impl ScriptManager {
                     let guard = self.scripts.lock().unwrap();
                     let scripts_exist = guard.iter().any(|((ws, _), _)| ws == workspace_id);
                     if scripts_exist {
+                        if !serialize {
+                            return Ok(Value::Null);
+                        }
                         // Already bootstrapped by a concurrent caller
                         let mut scripts: Vec<(String, Value)> = guard
                             .iter()
@@ -947,6 +1091,9 @@ impl ScriptManager {
                                 );
                                 self.emit_changed_locked(workspace_id, &id, "created").await;
                             }
+                            if !serialize {
+                                return Ok(Value::Null);
+                            }
                             // Re-read scripts after bootstrapping
                             let guard = self.scripts.lock().unwrap();
                             let mut scripts: Vec<(String, Value)> = guard
@@ -1003,6 +1150,8 @@ impl ScriptManager {
         if scoped && self.store.script_workspace(script_id).await?.as_ref() != Some(workspace_id) {
             return Err(Error::NotFound(format!("script {script_id}")));
         }
+
+        self.ensure_known_locked(workspace_id, script_id).await?;
 
         if self
             .scripts
@@ -1168,6 +1317,7 @@ impl ScriptManager {
         script_id: &str,
         restoring: bool,
     ) -> Result<Value> {
+        self.ensure_known(workspace_id, script_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
@@ -1278,6 +1428,7 @@ impl ScriptManager {
         self.spawn_owned(async move {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
         .await
@@ -1543,6 +1694,7 @@ impl ScriptManager {
     async fn restart_owned(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        self.ensure_known_locked(workspace_id, script_id).await?;
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
         self.stop_inner(workspace_id, script_id, true).await?;
@@ -1581,6 +1733,7 @@ impl ScriptManager {
         max_lines: Option<i64>,
         timeout_seconds: Option<i64>,
     ) -> Result<Value> {
+        self.ensure_known(workspace_id, script_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),
@@ -4377,16 +4530,19 @@ mod tests {
             "a failed relaunch durably clears the lost marker"
         );
 
-        // Fresh boot: plain idle, nothing resurrected as lost.
+        // Archived commands are loaded only on known-ID access after boot.
         let svc3 = Services::new(store.clone());
-        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 1);
+        assert_eq!(svc3.hydrate_scripts().await.expect("hydrate"), 0);
+        assert!(svc3.script_list(h.ws.clone()).await.unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let st = svc3.script_status(h.ws.clone(), id).await.expect("status");
-        assert_eq!(st["status"], "idle", "post-failure hydration: {st}");
+        assert_eq!(st["status"], "exited", "post-failure selected status: {st}");
+        assert_ne!(st["error"], LOST_AT_DAEMON_STOP_ERROR);
         assert!(
-            st.get("exitCode").is_none()
-                && st.get("error").is_none()
-                && st.get("previouslyRunning").is_none(),
-            "no marker-derived reading survives: {st}"
+            st.get("previouslyRunning").is_none(),
+            "no recovery marker survives: {st}"
         );
     }
 

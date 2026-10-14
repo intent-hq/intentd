@@ -5957,6 +5957,9 @@ impl AgentManager {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
+        if sync_store && !self.is_shutting_down() {
+            self.services.settle_script_monitor_worker(agent_id).await;
+        }
         self.services
             .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
             .await;
@@ -6131,6 +6134,7 @@ impl AgentManager {
             worker.abort();
             self.retain_finishing_worker(worker);
         }
+        self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
         // error stash and the handler's take (monorepo#2050); the orphaned
         // context describes the aborted turn, so it must not survive into a
@@ -7043,6 +7047,7 @@ impl AgentManager {
         if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
             return;
         }
+        self.services.track_script_monitor_worker(agent_id, None);
         self.clear_worker(agent_id);
         self.end_turn(agent_id).await;
         drop(starting);
@@ -7053,6 +7058,32 @@ impl AgentManager {
         self.clone()
             .try_drain_queue(agent_id.clone(), workspace_id.clone())
             .await;
+    }
+
+    /// Keep this worker's exact turn while the storage admission gate is
+    /// unavailable. Cancellation aborts the worker; shutdown leaves its durable
+    /// receipt recoverable. Only an explicit lifecycle refusal discards it.
+    async fn retry_script_monitor_admission(
+        &self,
+        agent_id: &AgentId,
+        metadata: Option<&Value>,
+    ) -> bool {
+        loop {
+            if self.is_shutting_down() {
+                return false;
+            }
+            match self
+                .services
+                .admit_script_monitor_turn(agent_id, metadata)
+                .await
+            {
+                Ok(allowed) => return allowed,
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, %error, "retrying monitor turn admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
     }
 
     async fn fail_admitted_persist(
@@ -9195,6 +9226,8 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.services
+            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
         // (intent-hq/monorepo#1757): the stopped turn's user message (text +
         // attachments) is merged into this turn's `prepend_*` options so the
@@ -12710,6 +12743,8 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        mgr.services
+            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         if mgr.services.defer_script_monitor_for_export(
             &agent_id,
             &content,
@@ -12719,15 +12754,22 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        if !mgr
+        match mgr
             .services
             .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
             .await
-            .unwrap_or(false)
         {
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
-            return;
+            Ok(true) => {}
+            Ok(false) => {
+                mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                    .await;
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "retrying monitor delivery check");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue 'outer;
+            }
         }
 
         // Turn-start budget re-check (monorepo#2063 B8): a warm idle process
@@ -12760,8 +12802,7 @@ async fn run_message_worker(
             return;
         }
         if !mgr
-            .services
-            .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+            .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
             .await
         {
             mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
@@ -12872,8 +12913,7 @@ async fn run_message_worker(
                     return;
                 }
                 if !mgr
-                    .services
-                    .admit_script_monitor_turn(&agent_id, options.message_metadata.as_ref())
+                    .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
                     .await
                 {
                     restore_undelivered_context();
@@ -12893,6 +12933,13 @@ async fn run_message_worker(
                     .await
                 {
                     Ok(_stop_reason) => {
+                        if let Some(id) =
+                            crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                        {
+                            mgr.services
+                                .complete_script_monitor_delivery(&agent_id, id)
+                                .await;
+                        }
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
@@ -12960,6 +13007,13 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            if let Some(id) =
+                                crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                            {
+                                mgr.services
+                                    .complete_script_monitor_delivery(&agent_id, id)
+                                    .await;
+                            }
                             // Concurrent stop/cancel won the turn — not a failure.
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
@@ -13098,9 +13152,41 @@ async fn run_message_worker(
                                     false,
                                 )
                                 .await;
+                                if user_persisted {
+                                    if let Some(id) = crate::script_monitor::monitor_id(
+                                        options.message_metadata.as_ref(),
+                                    ) {
+                                        if let Err(error) = mgr
+                                            .services
+                                            .store
+                                            .continue_script_notification(
+                                                &agent_id,
+                                                id,
+                                                &warning_turn_id,
+                                                &warning,
+                                            )
+                                            .await
+                                        {
+                                            handle_terminal_turn_failure(
+                                                &mgr,
+                                                &agent_id,
+                                                &workspace_id,
+                                                &content,
+                                                &options,
+                                                true,
+                                                &error,
+                                            )
+                                            .await;
+                                            mgr.release_in_flight_slot(&agent_id);
+                                            break 'outer;
+                                        }
+                                    }
+                                }
                                 content = warning;
                                 options = TurnOptions {
                                     turn_id: Some(warning_turn_id),
+                                    // The same delivery remains owned until its continuation ends.
+                                    message_metadata: options.message_metadata.clone(),
                                     ..TurnOptions::default()
                                 };
                                 // New message → fresh silent-redrive budget
@@ -14082,14 +14168,17 @@ async fn persist_user(
     if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.
-        if !mgr
+        match mgr
             .services
             .script_monitor_delivery_allowed(agent_id, message_metadata)
             .await
-            .unwrap_or(false)
         {
-            mgr.services.commit_queue_history(agent_id, &id);
-            return true;
+            Ok(true) => {}
+            Ok(false) => {
+                mgr.services.commit_queue_history(agent_id, &id);
+                return true;
+            }
+            Err(_) => return false,
         }
         match mgr
             .services
@@ -14161,12 +14250,12 @@ async fn persist_user(
             }
             Err(e) => {
                 if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
-                    if !mgr
-                        .services
-                        .script_monitor_delivery_allowed(agent_id, message_metadata)
-                        .await
-                        .unwrap_or(false)
-                    {
+                    if matches!(
+                        mgr.services
+                            .script_monitor_delivery_allowed(agent_id, message_metadata)
+                            .await,
+                        Ok(false)
+                    ) {
                         mgr.services.commit_queue_history(agent_id, &id);
                         return true;
                     }
@@ -21403,6 +21492,170 @@ mod agent_retry_tests {
         let services = Services::new(db).with_event_bus(bus.clone());
         let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn monitor_delivery_recovers_each_persistence_boundary_without_duplicate_transcript() {
+        for boundary in [
+            "before-message",
+            "after-message",
+            "after-admission",
+            "after-accept",
+        ] {
+            let agent = AgentId::from("recover-monitor-owner");
+            let ws = WorkspaceId::from("recover-monitor-workspace");
+            let (mgr, db_dir) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+            let row: intent_core::ScriptMonitor = serde_json::from_value(json!({
+                "monitorId":"recover", "workspaceId":ws, "agentId":agent,
+                "scriptId":"script", "runId":"run", "scriptName":"Script", "mode":"command",
+                "state":"active", "createdAt":now_iso(), "expiresAt":"2099-01-01T00:00:00Z"
+            }))
+            .unwrap();
+            mgr.services
+                .store
+                .insert_script_monitor(&row)
+                .await
+                .unwrap();
+            let mut terminal = row;
+            terminal.state = "expired".into();
+            terminal.reason = Some("ttl".into());
+            terminal.settled_at = Some(now_iso());
+            mgr.services
+                .store
+                .settle_script_monitor(&terminal)
+                .await
+                .unwrap();
+            let job = mgr
+                .services
+                .store
+                .script_notification_jobs()
+                .await
+                .unwrap()
+                .remove(0);
+            let (queued, _) = mgr.services.enqueue_message_with_id(
+                &agent,
+                Some(job.wake_id.clone()),
+                job.body.clone(),
+                None,
+                None,
+                Some(job.metadata.clone()),
+                None,
+                false,
+                intent_core::MessageOrigin::Automatic,
+            );
+            if boundary != "before-message" {
+                assert!(
+                    persist_user(
+                        &mgr,
+                        &agent,
+                        &ws,
+                        &queued.content,
+                        None,
+                        None,
+                        queued.message_metadata.as_ref(),
+                        Some(&queued.turn_id),
+                        false
+                    )
+                    .await
+                );
+            }
+            assert!(mgr
+                .services
+                .store
+                .script_monitor_wake_pending("recover")
+                .await
+                .unwrap());
+            let durable = intent_store::AgentQueueRow {
+                id: queued.id.clone(),
+                agent_id: agent.clone(),
+                position: 0,
+                payload: serde_json::to_value(&queued).unwrap(),
+                created_at: queued.queued_at.clone(),
+                turn_id: queued.turn_id.clone(),
+            };
+            if matches!(boundary, "after-admission" | "after-accept") {
+                assert!(mgr
+                    .services
+                    .store
+                    .admit_script_notification(&durable)
+                    .await
+                    .unwrap());
+                mgr.services
+                    .store
+                    .replace_agent_queue(&agent, &[])
+                    .await
+                    .unwrap();
+            }
+            if boundary == "after-accept" {
+                assert!(mgr
+                    .services
+                    .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                    .await
+                    .unwrap());
+            }
+            // Lose all process-local queue state, then use the production restoration path.
+            mgr.services.store.close().await;
+            drop(mgr);
+            let store = Store::open(&db_dir.path().join("store.db")).await.unwrap();
+            if matches!(boundary, "before-message" | "after-message") {
+                assert!(store.script_monitor_wake_pending("recover").await.unwrap());
+                assert!(store.admit_script_notification(&durable).await.unwrap());
+            }
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            let mgr = Arc::new(AgentManager::new(
+                services,
+                Arc::new(BusEventSink::new(bus)),
+                8,
+            ));
+            assert_eq!(
+                mgr.services.rehydrate_agent_queues().await.unwrap(),
+                1,
+                "{boundary}"
+            );
+            let restored = mgr
+                .services
+                .find_queued_message(&agent, &job.wake_id)
+                .unwrap();
+            assert_eq!(restored.turn_id, queued.turn_id);
+            assert!(
+                persist_user(
+                    &mgr,
+                    &agent,
+                    &ws,
+                    &restored.content,
+                    None,
+                    None,
+                    restored.message_metadata.as_ref(),
+                    Some(&restored.turn_id),
+                    false
+                )
+                .await
+            );
+            assert!(mgr
+                .services
+                .admit_script_monitor_turn(&agent, restored.message_metadata.as_ref())
+                .await
+                .unwrap());
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
+                .bind(&job.wake_id)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{boundary}");
+            assert!(store.script_monitors(&ws, None).await.unwrap().is_empty());
+            store
+                .complete_script_notification(&agent, "recover")
+                .await
+                .unwrap();
+            assert!(!mgr
+                .services
+                .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                .await
+                .unwrap());
+            assert!(store.load_all_agent_queues().await.unwrap().is_empty());
+            store.close().await;
+        }
     }
 
     #[intent_test_macros::daemon_test]

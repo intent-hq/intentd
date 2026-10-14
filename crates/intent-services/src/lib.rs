@@ -20410,6 +20410,72 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.list")
+                .await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
+            if options.summary {
+                self.script_manager()
+                    .summary_page(&workspace_id, &options)
+                    .await
+            } else {
+                self.script_manager().list(&workspace_id).await
+            }
+        })
+    }
+    fn script_get(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.get")
+                .await?;
+            self.script_manager().get(&workspace_id, &script_id).await
+        })
+    }
+    fn script_monitor_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
+            if options.summary {
+                self.store
+                    .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
+                    .await
+            } else {
+                self.script_monitor_list(workspace_id, agent_id).await
+            }
+        })
+    }
+    fn script_monitor_get(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let row = self
+                .store
+                .script_monitor(&workspace_id, &monitor_id)
+                .await?;
+            if owner.is_some_and(|id| id != row.agent_id) {
+                return Err(Error::InvalidParams("unknown monitor ID".into()));
+            }
+            serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))
+        })
+    }
+
     fn script_archive(
         &self,
         workspace_id: WorkspaceId,
@@ -20582,6 +20648,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.output")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -20601,6 +20668,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.status")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -34647,11 +34715,16 @@ impl WorkspaceApi for Services {
             let walked = tokio::task::spawn_blocking(move || -> Result<_> {
                 // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
                 let boundary_started = std::time::Instant::now();
-                let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                    &worktree,
-                    base_ref.as_deref(),
-                    base_commit_sha.as_deref(),
-                )?;
+                let snapshot = accept_changes::history_refresh_snapshot(&worktree, &ws);
+                let boundary_sha = if let Some(snapshot) = &snapshot {
+                    snapshot.history.boundary.map(|oid| oid.to_string())
+                } else {
+                    intent_git::history::resolve_workspace_boundary(
+                        &worktree,
+                        base_ref.as_deref(),
+                        base_commit_sha.as_deref(),
+                    )?
+                };
                 let boundary_ms =
                     u64::try_from(boundary_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -34666,21 +34739,41 @@ impl WorkspaceApi for Services {
                 // Metadata-only walk (`include_files = false`): the list
                 // payload skips the O(commits) per-commit tree diff; the FE
                 // fetches per-file data on demand via `git.commitDetails`.
-                let commits = intent_git::history::history_bounded(
-                    &worktree,
-                    boundary_sha.as_deref(),
-                    fetch,
-                    include_older,
-                    false,
-                )?;
+                // Never label a live-ref walk with a separately observed token:
+                // refs can move A -> B -> A between push and response.
+                let commits = if let Some(snapshot) = &snapshot {
+                    intent_git::history::history_bounded_snapshot(
+                        &worktree,
+                        &snapshot.history,
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                } else {
+                    intent_git::history::history_bounded(
+                        &worktree,
+                        boundary_sha.as_deref(),
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                };
+                let history_identity = snapshot.map(|snapshot| snapshot.identity);
                 let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+                Ok(Some((
+                    boundary_sha,
+                    boundary_ms,
+                    commits,
+                    walk_ms,
+                    history_identity,
+                )))
             })
             .await
             .map_err(|e| {
                 Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
             })??;
-            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
+            let Some((boundary_sha, boundary_ms, commits, walk_ms, history_identity)) = walked
+            else {
                 return Ok(empty);
             };
             let has_more = commits.len() > page_end;
@@ -34710,11 +34803,15 @@ impl WorkspaceApi for Services {
                 Some(sha) => serde_json::Value::String(sha),
                 None => serde_json::Value::Null,
             };
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "commits": values,
                 "nextToken": next_token,
                 "boundarySha": boundary_value
-            }))
+            });
+            if let Some(identity) = history_identity {
+                result["historyIdentity"] = serde_json::Value::String(identity);
+            }
+            Ok(result)
         })
     }
 

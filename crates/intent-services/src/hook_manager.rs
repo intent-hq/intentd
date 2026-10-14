@@ -588,7 +588,11 @@ async fn run_hook_script(
     // with a `console.*` shim whose capped line buffer rides back as
     // `__logs`. A user-code throw is caught in-envelope (`__k: 'e'`) so its
     // logs survive; only a timeout/engine failure loses them.
-    let prelude = intent_acp::bindings_prelude_for_bridge(agent_features, is_sub_agent);
+    let prelude = intent_acp::bindings_prelude_for_workspace(
+        agent_features,
+        is_sub_agent,
+        &hook.workspace_id,
+    );
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
