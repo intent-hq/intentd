@@ -17,6 +17,14 @@ REPORT_VERSION = 'cargo-llvm-cov 0.9.0'
 DECODER_MEMORY_MIB = 2048
 
 
+def wait_resources(process):
+    """Reap this owned Linux child and measure it, not earlier Cargo children."""
+    _, status, usage = os.wait4(process.pid, 0)
+    process.returncode = os.waitstatus_to_exitcode(status)
+    return {'user_seconds': usage.ru_utime, 'system_seconds': usage.ru_stime,
+            'max_rss_kib': usage.ru_maxrss}
+
+
 def compression_recipe():
     return {'codec': 'zstd', 'version': output(['zstd', '--version'], None),
             'level': 3, 'window_log': 30, 'threads': 4,
@@ -48,10 +56,19 @@ def compress_archive(archive, recipe):
         with subprocess.Popen(['zstd', '-dq', '-M2048MB', '-c', str(archive)], stdout=subprocess.PIPE) as decoder:
             try:
                 with temporary.open('xb') as stream:
-                    subprocess.run(['zstd', '-q', '-3', '--long=30', '-T4', '-c'],
-                                   stdin=decoder.stdout, stdout=stream, check=True)
+                    command = ['zstd', '-q', '-3', '--long=30', '-T4', '-c']
+                    with subprocess.Popen(command, stdin=decoder.stdout, stdout=stream) as encoder:
+                        try:
+                            encoder_resources = wait_resources(encoder)
+                            if encoder.returncode:
+                                raise subprocess.CalledProcessError(encoder.returncode, command)
+                        finally:
+                            if encoder.poll() is None:
+                                encoder.kill()
+                            encoder.wait()
                 decoder.stdout.close()
-                if decoder.wait():
+                decoder_resources = wait_resources(decoder)
+                if decoder.returncode:
                     raise ValueError('source archive decompression failed')
             finally:
                 if decoder.poll() is None:
@@ -61,16 +78,19 @@ def compress_archive(archive, recipe):
     finally:
         temporary.unlink(missing_ok=True)
     return {'compression_seconds': time.monotonic() - started,
-            'before_compression_bytes': original_bytes}
+            'before_compression_bytes': original_bytes,
+            'compression_encoder_resources': encoder_resources,
+            'compression_decoder_resources': decoder_resources}
 
 
-def report_index(prepared, request):
+def report_index(prepared, request, metrics=None):
     """Give pinned llvm-cov its exact authenticated metadata in a small frame.
 
     Version 0.9.0 reads only base-output-directories from this archive, then
     scans the restored objects (including workspace procedural macros).
     Do not generalize this contract to another report version without proof.
     """
+    started = time.monotonic()
     if request['recipe']['coverage']['tools']['cargo-llvm-cov'] != REPORT_VERSION:
         raise ValueError('unsupported metadata-index report version')
     target = Path(prepared['target']).resolve()
@@ -103,12 +123,17 @@ def report_index(prepared, request):
                     member.mode = 0o644
                     tar.addfile(member, io.BytesIO(data))
                 encoder.stdin.close()
-                if encoder.wait():
+                resources = wait_resources(encoder)
+                if encoder.returncode:
                     raise ValueError('report index compression failed')
             finally:
                 if encoder.poll() is None:
                     encoder.kill()
                 encoder.wait()
+    if metrics is not None:
+        metrics.update(report_index_seconds=time.monotonic() - started,
+                       report_index_bytes=index.stat().st_size,
+                       report_index_encoder_resources=resources)
     return index
 
 
@@ -250,7 +275,8 @@ def report(bundle, prepared, request, floor, *, lcov=True):
         raise ValueError('report LLVM tools differ from instrumented archive')
     env['CARGO_LLVM_COV_TARGET_DIR'] = str(root)
     started = time.monotonic()
-    archive = report_index(prepared, request) if 'compression' in request['recipe'] else Path(bundle) / 'tests.tar.zst'
+    metrics = {}
+    archive = report_index(prepared, request, metrics) if 'compression' in request['recipe'] else Path(bundle) / 'tests.tar.zst'
     command = [shutil.which('cargo-llvm-cov'), 'llvm-cov', 'report', '--remap-path-prefix',
                '--nextest-archive-file', str(archive)]
     if lcov:
@@ -261,4 +287,4 @@ def report(bundle, prepared, request, floor, *, lcov=True):
     print(result.stdout, end='', flush=True)
     if result.returncode:
         print(f'ERROR: coverage report failed (required line coverage {floor}%)', file=sys.stderr)
-    return {'exit_code': result.returncode, 'report_seconds': time.monotonic() - started}
+    return {'exit_code': result.returncode, 'report_seconds': time.monotonic() - started, **metrics}

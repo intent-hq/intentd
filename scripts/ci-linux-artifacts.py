@@ -180,7 +180,8 @@ def compiler_gates(requests, source, target, root):
                 tests = compiler_inventory(item, binary, env)
                 result = archives.run_libtest(item, binary, [], env=env)
                 receipt['gates'][name] = {'key': key, 'binary': binary, 'tests': tests, 'exit_code': result, 'diagnostic_paths': 'original',
-                                           'seconds': time.monotonic() - started}
+                                           'seconds': time.monotonic() - started,
+                                           **{key: item[key] for key in ('decoder_resources', 'decode_and_extract_seconds', 'extract_seconds', 'expansion_validation_seconds') if key in item}}
                 if result:
                     raise subprocess.CalledProcessError(result, ['fresh-compiler-gate', name, binary])
     finally:
@@ -397,7 +398,9 @@ def extract_stream(bundle, manifest, destination, zstd_archive):
                     mode &= ~0o111
             path.chmod(mode)
     archive = bundle / manifest['archive']
+    decoder_metrics = {}
     if zstd_archive:
+        started = time.monotonic()
         with subprocess.Popen(['zstd', '-dq', '-M2048MB', '-c', str(archive)], stdout=subprocess.PIPE) as process:
             try:
                 with tarfile.open(fileobj=process.stdout, mode='r|', bufsize=1024 * 1024) as tar:
@@ -405,7 +408,9 @@ def extract_stream(bundle, manifest, destination, zstd_archive):
                 # Consume the authenticated stream through its checksum/footer.
                 while process.stdout.read(1024 * 1024):
                     pass
-                if process.wait():
+                decoder_metrics['decoder_resources'] = coverage.wait_resources(process)
+                decoder_metrics['decode_and_extract_seconds'] = time.monotonic() - started
+                if process.returncode:
                     raise ValueError('archive decompression failed')
             finally:
                 if process.poll() is None:
@@ -419,6 +424,7 @@ def extract_stream(bundle, manifest, destination, zstd_archive):
             extract(tar, report=True)
     if seen != manifest['files'].keys():
         raise ValueError('expanded archive inventory is incomplete')
+    return decoder_metrics
 
 
 def prepare_streamed(bundle, request, source, destination, *, env=None):
@@ -431,7 +437,7 @@ def prepare_streamed(bundle, request, source, destination, *, env=None):
     validation_seconds = time.monotonic() - started
     started = time.monotonic()
     is_nextest = request['recipe']['kind'] == 'test-archive'
-    extract_stream(bundle, manifest, destination, is_nextest)
+    decoder_metrics = extract_stream(bundle, manifest, destination, is_nextest)
     runtime = archives.nextest_inventory(destination, source) if is_nextest else manifest['runtime']
     if runtime != manifest['runtime']:
         raise ValueError('archive runtime inventory mismatch')
@@ -441,7 +447,7 @@ def prepare_streamed(bundle, request, source, destination, *, env=None):
             'report_metadata': manifest['files'].get('target/nextest/binaries-metadata.json'),
             'producer_group': archives.identity.producer_group_key(manifest['identity']),
             'runtime': runtime, 'extract_seconds': time.monotonic() - started,
-            'expansion_validation_seconds': validation_seconds}
+            'expansion_validation_seconds': validation_seconds, **decoder_metrics}
 
 
 def prepare(source, root, names):
@@ -491,6 +497,7 @@ def run_coverage(source, root, scope):
             result = 0 if compiler_only else archives.run_nextest(item, args, env=env)
             timing = {'test_seconds': time.monotonic() - started, 'extract_seconds': item['extract_seconds'], 'test_exit_code': result, 'producer_compiler_gate': bool(exclusion)}
             timing['validation_seconds'] = item.get('expansion_validation_seconds', 0)
+            timing.update({key: item[key] for key in ('decoder_resources', 'decode_and_extract_seconds') if key in item})
             timing['producer_test_inventory'] = COMPILER_TESTS if exclusion else []
             timing['compiler_only_selection'] = compiler_only
             receipt['variants'][name] = timing
@@ -586,7 +593,8 @@ def run_callback(source, root):
                '--target-dir-remap', str(target), '-E', filterset, '--message-format', 'json']
     receipt = {'test_exit_code': None, 'selected_tests': [],
                'extract_seconds': item.get('extract_seconds', 0),
-               'expansion_validation_seconds': item.get('expansion_validation_seconds', 0)}
+               'expansion_validation_seconds': item.get('expansion_validation_seconds', 0),
+               **{key: item[key] for key in ('decoder_resources', 'decode_and_extract_seconds') if key in item}}
     started = time.monotonic()
     try:
         listing = json.loads(archives.output(command, source, env))

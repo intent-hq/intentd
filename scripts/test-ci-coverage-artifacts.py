@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -28,6 +29,21 @@ linux = load('ci-linux-artifacts')
 
 
 class CoverageTests(unittest.TestCase):
+    def test_resource_receipt_reaps_only_owned_child_and_keeps_failure(self):
+        with subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE) as neighbour:
+            try:
+                for code in (0, 7):
+                    with subprocess.Popen([sys.executable, '-c', f'raise SystemExit({code})']) as child:
+                        resources = coverage.wait_resources(child)
+                        self.assertEqual(child.returncode, code)
+                        self.assertEqual(child.wait(), code)
+                        self.assertGreater(resources['max_rss_kib'], 0)
+                        self.assertGreaterEqual(resources['user_seconds'], 0)
+                    self.assertIsNone(neighbour.poll())
+            finally:
+                neighbour.stdin.close()
+                neighbour.wait(timeout=5)
+
     def test_report_index_authenticates_metadata_version_and_owned_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -43,7 +59,10 @@ class CoverageTests(unittest.TestCase):
             expected = write(document)
             prepared = {'target': str(target), 'report_metadata': expected}
             request = {'recipe': {'coverage': {'tools': {'cargo-llvm-cov': 'cargo-llvm-cov 0.9.0'}}}}
-            index = coverage.report_index(prepared, request)
+            metrics = {}
+            index = coverage.report_index(prepared, request, metrics)
+            self.assertEqual(metrics['report_index_bytes'], index.stat().st_size)
+            self.assertGreater(metrics['report_index_encoder_resources']['max_rss_kib'], 0)
             raw = subprocess.check_output(['zstd', '-dq', '-c', str(index)])
             with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
                 self.assertEqual(tar.getnames(), ['target/nextest/binaries-metadata.json'])
@@ -94,6 +113,8 @@ class CoverageTests(unittest.TestCase):
             subprocess.run(['zstd', '-q', str(raw), '-o', str(archive)], check=True)
             result = coverage.compress_archive(archive, recipe)
             self.assertGreaterEqual(result['compression_seconds'], 0)
+            self.assertGreater(result['compression_encoder_resources']['max_rss_kib'], 0)
+            self.assertGreater(result['compression_decoder_resources']['max_rss_kib'], 0)
             self.assertEqual(subprocess.check_output(['zstd', '-dq', '-M2048MB', '-c', str(archive)]), raw.read_bytes())
             archive.write_bytes(b'invalid archive')
             with self.assertRaises((ValueError, subprocess.CalledProcessError)):
