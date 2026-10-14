@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -525,6 +526,73 @@ class LifecycleCacheTests(unittest.TestCase):
                          'evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"', 'exit 1'):
             self.assertIn(required, body)
         self.assertLess(body.index('is-purgeable'), body.index('rm -rf'))
+
+
+def artifact_python_errors(workflow):
+    errors = []
+    for name, job in workflow['jobs'].items():
+        steps = job.get('steps', [])
+        consumers = [i for i, step in enumerate(steps)
+                     if re.search(r'scripts/(?:test-)?ci-(?:artifact|build-identity|test-artifacts|native|linux|coverage|consumer)',
+                                  step.get('run', ''))]
+        if not consumers:
+            continue
+        setups = [i for i, step in enumerate(steps)
+                  if step.get('uses', '').startswith('actions/setup-python@')
+                  and step.get('with', {}).get('python-version') == '3.12'
+                  and 'if' not in step and not step.get('continue-on-error', False)]
+        if not setups or min(setups) >= min(consumers):
+            errors.append(name)
+    return errors
+
+
+class ArtifactPythonTests(unittest.TestCase):
+    def test_every_artifact_job_provisions_python_before_helpers(self):
+        self.assertEqual(artifact_python_errors(_workflow_tests.load_ci(ROOT)), [])
+
+    def test_missing_late_old_or_optional_interpreter_is_rejected(self):
+        workflow = _workflow_tests.load_ci(ROOT)
+        for job in ('check', 'coverage-e2e', 'coverage-all', 'coverage-changed',
+                    'daemon-lifecycle', 'release-scripts'):
+            for mutation in ('missing', 'late', 'old', 'conditional', 'optional'):
+                with self.subTest(job=job, mutation=mutation):
+                    broken = copy.deepcopy(workflow)
+                    steps = broken['jobs'][job]['steps']
+                    steps[:] = [s for s in steps if not s.get('uses', '').startswith('actions/setup-python@')]
+                    setup = {'uses': 'actions/setup-python@v6', 'with': {'python-version': '3.12'}}
+                    if mutation == 'old':
+                        setup['with']['python-version'] = '3.10'
+                    elif mutation == 'conditional':
+                        setup['if'] = "runner.environment == 'github-hosted'"
+                    elif mutation == 'optional':
+                        setup['continue-on-error'] = True
+                    if mutation != 'missing':
+                        steps.insert(len(steps) if mutation == 'late' else 0, setup)
+                    self.assertIn(job, artifact_python_errors(broken))
+
+    def test_real_interpreter_supports_artifact_integrity_apis(self):
+        code = '''
+import hashlib, importlib.util, io, sys, tarfile, tempfile, tomllib
+from pathlib import Path
+assert sys.version_info >= (3, 12), sys.version
+spec = importlib.util.spec_from_file_location('archives', 'scripts/ci-test-artifacts.py')
+archives = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(archives)
+assert tomllib.loads('schema = 1')['schema'] == 1
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    source = root / 'payload'
+    source.write_bytes(b'authenticated archive fixture')
+    assert archives.file_sha(source) == hashlib.sha256(source.read_bytes()).hexdigest()
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode='w') as archive:
+        archive.add(source, arcname='payload')
+    packed.seek(0)
+    with tarfile.open(fileobj=packed) as archive:
+        archive.extractall(root / 'restored', filter='data')
+    assert (root / 'restored/payload').read_bytes() == source.read_bytes()
+'''
+        subprocess.run([sys.executable, '-I', '-B', '-c', code], cwd=ROOT, check=True)
 
 
 class NativeRoutingTests(unittest.TestCase):

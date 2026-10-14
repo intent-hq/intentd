@@ -436,6 +436,9 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Initialize fresh artifact storage
         shell: bash
         env:
@@ -499,9 +502,6 @@ jobs:
           components: rustfmt, clippy, llvm-tools-preview
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -970,6 +970,9 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Initialize fresh artifact storage
         shell: bash
         env:
@@ -1190,6 +1193,9 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Initialize fresh artifact storage
         shell: bash
         env:
@@ -1471,6 +1477,9 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Initialize fresh artifact storage
         shell: bash
         env:
@@ -1766,6 +1775,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
