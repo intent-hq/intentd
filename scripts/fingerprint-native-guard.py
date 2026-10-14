@@ -103,6 +103,22 @@ def verify_listing(evidence, targets):
     print("Confirmed exact selection of all 13 unresolved tests; full suite not run.")
 
 
+def verify_full(evidence):
+    receipts = list((evidence / "gate-runs").rglob("run.json"))
+    if len(receipts) != 1:
+        raise RuntimeError(f"Expected one full-suite receipt, got {len(receipts)}")
+    receipt = json.loads(receipts[0].read_text())
+    coverage = json.loads(receipts[0].with_name("coverage.json").read_text())
+    if (receipt.get("selections") != [["--workspace"]]
+            or receipt.get("exit_code") != 0 or not receipt.get("finished_at")
+            or coverage.get("complete") is not True or coverage.get("errors")
+            or not coverage["categories"]["executed-passed"]
+            or any(coverage["categories"][key] for key in ("failed", "unfinished", "resumed-passed"))):
+        raise RuntimeError("Missing successful fresh complete full-workspace evidence")
+    print(json.dumps({"full_suite_receipt": str(receipts[0]),
+                      "counts": {key: len(value) for key, value in coverage["categories"].items()}}))
+
+
 def main():
     mode, *args = sys.argv[1:]
     if mode == "preflight":
@@ -111,6 +127,9 @@ def main():
     if mode == "run":
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         return supervise(args[3:], Path(args[0]), Path(args[1]), int(args[2]))
+    if mode == "verify-full":
+        verify_full(Path(args[0]))
+        return 0
     targets = json.loads(Path(args[0]).read_text())
     if mode == "plan":
         import shlex

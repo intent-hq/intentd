@@ -92,6 +92,27 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             guard.verify_listing(self.root, targets)
 
+    def test_full_receipt_rejects_scoped_unfinished_failed_and_resumed_evidence(self):
+        directory = self.root / "gate-runs" / "attempt"
+        directory.mkdir(parents=True)
+        receipt = {"selections": [["--workspace"]], "exit_code": 0, "finished_at": "complete"}
+        coverage = {"complete": True, "errors": [], "categories": {
+            "executed-passed": [["binary", "test"]], "ignored": [],
+            "failed": [], "unfinished": [], "resumed-passed": []}}
+        (directory / "run.json").write_text(json.dumps(receipt))
+        (directory / "coverage.json").write_text(json.dumps(coverage))
+        guard.verify_full(self.root)
+        for changes in ({"selections": [["--workspace", "-E", "test(one)"]]},
+                        {"finished_at": None}, {"exit_code": 100}):
+            (directory / "run.json").write_text(json.dumps({**receipt, **changes}))
+            with self.assertRaises(RuntimeError):
+                guard.verify_full(self.root)
+        (directory / "run.json").write_text(json.dumps(receipt))
+        coverage["categories"]["resumed-passed"] = [["binary", "old"]]
+        (directory / "coverage.json").write_text(json.dumps(coverage))
+        with self.assertRaises(RuntimeError):
+            guard.verify_full(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

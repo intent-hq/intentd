@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Temporary focused native triage only. Full suite/base comparison need evidence review.
+# Temporary full gate after run 38486968362 passed all 13 native triage targets.
 set -euo pipefail
 diagnostic="$GITHUB_WORKSPACE/diagnostic"
 subject="$GITHUB_WORKSPACE/subject"
@@ -31,6 +31,14 @@ tar -xzf "$RUNNER_TEMP/fingerprint-nextest.tar.gz" -C "$RUNNER_TEMP/fingerprint-
 export PATH="$RUNNER_TEMP/fingerprint-nextest:$PATH"
 cargo nextest --version
 test "$(cargo nextest --version | awk 'NR == 1 { print $2 }')" = 0.9.143
+# Hosted Linux CI preinstalls pwsh; fail clearly rather than let its tests self-skip.
+export XDG_CACHE_HOME="$RUNNER_TEMP/fingerprint-xdg-cache"
+mkdir -p "$XDG_CACHE_HOME"
+command -v pwsh
+pwsh --version
+test "$(pwsh -NoProfile -NonInteractive -Command 'Write-Output pwsh-ok')" = pwsh-ok
+# Match the repository's full Linux CI watcher prerequisite on this isolated runner.
+sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
 fixture=$(python3 -I -B -S "$component/scripts/prepare-acp-callback-fixture.py" \
   --cache-dir "$RUNNER_TEMP/fingerprint-callback" --build-from-source \
   2> "$evidence/callback-build.log")
@@ -41,18 +49,15 @@ offline=$(python3 -I -B -S "$component/scripts/prepare-acp-callback-fixture.py" 
 test "$offline" = "$fixture"
 cd "$subject"
 make check-callback-fixture check-transfer-fixture
-plan=$(python3 "$diagnostic/scripts/fingerprint-native-guard.py" plan \
-  "$diagnostic/scripts/fingerprint-native-targets.json")
-printf '%s\n' "$plan" > "$evidence/selection.txt"
+printf '%s\n' 'make test BUILD_JOBS=2 TEST_THREADS=2 NO_FAIL_FAST=1 COMPACT=1' > "$evidence/selection.txt"
+export GATE_CACHE_DIR="$evidence/gate-runs"
 set +e
-bash "$component/scripts/with-test-policy.sh" python3 scripts/resumable_nextest.py \
-  --repo-root "$subject" --intentd-dir "$component" \
-  --cache-dir "$evidence/gate-runs" --resume 0 --force 1 \
-  --no-fail-fast 1 --build-jobs 2 --test-threads 2 --plan "$plan"
+make test BUILD_JOBS=2 TEST_THREADS=2 NO_FAIL_FAST=1 COMPACT=1
 test_status=$?
 set -e
 printf '%s\n' "$test_status" > "$evidence/test-exit-code.txt"
-python3 "$diagnostic/scripts/fingerprint-native-guard.py" verify \
-  "$diagnostic/scripts/fingerprint-native-targets.json" "$evidence"
+if [ "$test_status" -eq 0 ]; then
+  python3 "$diagnostic/scripts/fingerprint-native-guard.py" verify-full "$evidence"
+fi
 git -C "$component" diff --exit-code
 exit "$test_status"
