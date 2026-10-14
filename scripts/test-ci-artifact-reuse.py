@@ -335,7 +335,7 @@ class FunctionalReuse(unittest.TestCase):
             with patch.object(Path, 'is_mount', return_value=True), \
                  patch.object(linux, 'storage', storage, create=True), \
                  patch.object(storage, 'alternate', return_value=alternate), \
-                 patch.object(storage.subprocess, 'run'), patch.object(storage.subprocess, 'Popen'):
+                 patch.object(storage.subprocess, 'run'):
                 linux.fetch(self.source, initial, 'changed')
             exported = dict(line.split('=', 1) for line in Path(env['GITHUB_ENV']).read_text().splitlines())
             final = Path(exported['NATIVE_ARTIFACT_ROOT'])

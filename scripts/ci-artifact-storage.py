@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 
 
 def token():
@@ -49,9 +50,38 @@ def initialize(min_bytes, allow_alternate=False):
 
 
 def launch_watch(root):
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch', '--root', str(root)],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    root = Path(root).resolve()
+    watch_id = uuid.uuid4().hex
+    control = root / 'storage-watch.json'
+    # Register before spawning: even cleanup immediately after launch must wait
+    # for this exact writer. Never signal a PID that could have been recycled.
+    with control.open('x') as stream:
+        json.dump({'id': watch_id}, stream)
+    try:
+        return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch', '--root', str(root), '--watch-id', watch_id],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except Exception:
+        control.unlink()
+        raise
+
+
+def stop_watch(root):
+    control = root / 'storage-watch.json'
+    if not control.exists():
+        return  # initialize() is also used without a background sampler.
+    watch_id = json.loads(control.read_text())['id']
+    if not isinstance(watch_id, str) or not re.fullmatch('[0-9a-f]{32}', watch_id):
+        raise ValueError('invalid artifact sampler identity')
+    (root / 'storage-watch-stop').write_text(watch_id)
+    deadline = time.monotonic() + 30
+    while True:
+        stopped = root / 'storage-watch-stopped'
+        if stopped.is_file() and stopped.read_text() == watch_id:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError('artifact sampler did not stop; preserving owned storage: ' + str(root))
+        time.sleep(0.05)
 
 
 def reselect(root, min_bytes):
@@ -76,6 +106,7 @@ def cleanup(root):
     slot = owner['slot']
     if slot and root.parent != Path(slot):
         raise ValueError('invalid artifact cleanup slot')
+    stop_watch(root)
     shutil.rmtree(root)
     if slot:
         subprocess.run(['bash', str(Path(__file__).with_name('ci-target-slot.sh')), 'unmark', slot], check=True)
@@ -94,12 +125,27 @@ def usage(root):
     return {'logical_bytes': logical, 'allocated_bytes': allocated}
 
 
-def watch(root):
-    root = Path(root)
+def watch(root, watch_id=None):
+    root = Path(root).resolve()
+    if watch_id is not None and json.loads((root / 'storage-watch.json').read_text())['id'] != watch_id:
+        raise ValueError('artifact sampler identity differs from registration')
+    def stopped():
+        stop = root / 'storage-watch-stop'
+        return watch_id is not None and stop.is_file() and stop.read_text() == watch_id
+    try:
+        sample(root, stopped)
+    finally:
+        if watch_id is not None:
+            # Final filesystem operation: acknowledgment means no more writes,
+            # including when sampling raised. Cleanup can now remove the root.
+            (root / 'storage-watch-stopped').write_text(watch_id)
+
+
+def sample(root, stopped):
     high = {'logical_bytes': 0, 'allocated_bytes': 0}
     target_high = {'logical_bytes': 0, 'allocated_bytes': 0}
     samples = 0
-    while root.is_dir():
+    while root.is_dir() and not stopped():
         measured = usage(root)
         sdk = usage(Path(os.environ['RUNNER_TEMP']) / 'intent-artifact-client')
         target_path = root / 'storage-target.json'
@@ -116,7 +162,7 @@ def watch(root):
         measured = {key: value + sdk[key] for key, value in measured.items()}
         high = {key: max(high[key], value) for key, value in measured.items()}
         samples += 1
-        if not root.is_dir():
+        if not root.is_dir() or stopped():
             return
         receipt = {'sample_interval_seconds': 10, 'samples': samples,
                    'scope': 'job artifact root (ZIPs, staging, extracted targets, profiles, reports) plus artifact SDK',
@@ -129,7 +175,10 @@ def watch(root):
             (root / 'storage-usage.json').write_text(json.dumps(receipt, indent=2) + '\n')
         except FileNotFoundError:
             return
-        time.sleep(10)
+        for _ in range(10):
+            if stopped():
+                return
+            time.sleep(1)
 
 
 if __name__ == '__main__':
@@ -138,6 +187,7 @@ if __name__ == '__main__':
     parser.add_argument('--minimum-gib', type=int, default=1)
     parser.add_argument('--allow-alternate', action='store_true')
     parser.add_argument('--root', default=os.environ.get('NATIVE_ARTIFACT_ROOT'))
+    parser.add_argument('--watch-id')
     args = parser.parse_args()
     if args.mode == 'init':
         root = initialize(args.minimum_gib * 1024**3, args.allow_alternate)
@@ -147,4 +197,6 @@ if __name__ == '__main__':
         if args.root and (Path(args.root) / 'storage.json').is_file():
             cleanup(args.root)
     else:
-        watch(args.root)
+        if not args.watch_id:
+            parser.error('watch requires its registered identity')
+        watch(args.root, args.watch_id)

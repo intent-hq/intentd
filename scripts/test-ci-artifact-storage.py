@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -67,6 +68,119 @@ class StorageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'another run'):
                 storage.cleanup(root)
         self.assertTrue(root.exists())
+
+    def test_cleanup_waits_for_sampler_ack_before_removing_owned_root(self):
+        root = storage.initialize(1)
+        watch_id = 'a' * 32
+        (root / 'storage-watch.json').write_text(json.dumps({'id': watch_id}))
+        original_remove = storage.shutil.rmtree
+        def acknowledge(_):
+            self.assertEqual((root / 'storage-watch-stop').read_text(), watch_id)
+            (root / 'storage-watch-stopped').write_text(watch_id)
+        def remove(path):
+            self.assertEqual((root / 'storage-watch-stopped').read_text(), watch_id,
+                             'cleanup must quiesce the writer before deleting its receipt directory')
+            original_remove(path)
+        with patch.object(storage.time, 'sleep', side_effect=acknowledge), \
+             patch.object(storage.shutil, 'rmtree', side_effect=remove):
+            storage.cleanup(root)
+        self.assertFalse(root.exists())
+
+    def test_cleanup_quiesces_actual_sampler_paused_during_measurement(self):
+        root = storage.initialize(1)
+        neighbour = self.root / 'other-run'; neighbour.mkdir()
+        watch_id = 'b' * 32
+        (root / 'storage-watch.json').write_text(json.dumps({'id': watch_id}))
+        measuring, release, stopping = (threading.Event() for _ in range(3))
+        failures = []
+        original_usage, original_stop = storage.usage, storage.stop_watch
+        def measure(path):
+            if path == root:
+                measuring.set()
+                if not release.wait(5):
+                    raise TimeoutError('test did not release sampler')
+            return original_usage(path)
+        def stop(path):
+            stopping.set()
+            original_stop(path)
+        def run(function, *args):
+            try:
+                function(*args)
+            except BaseException as error:
+                failures.append(error)
+        writer = threading.Thread(target=run, args=(storage.watch, root, watch_id))
+        cleaner = threading.Thread(target=run, args=(storage.cleanup, root))
+        with patch.object(storage, 'usage', side_effect=measure), patch.object(storage, 'stop_watch', side_effect=stop):
+            writer.start()
+            try:
+                self.assertTrue(measuring.wait(5))
+                cleaner.start()
+                self.assertTrue(stopping.wait(5))
+                self.assertTrue(root.exists())
+                self.assertTrue(cleaner.is_alive())
+            finally:
+                release.set()
+                writer.join(5)
+                if cleaner.ident is not None:
+                    cleaner.join(5)
+        self.assertFalse(writer.is_alive()); self.assertFalse(cleaner.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(root.exists()); self.assertTrue(neighbour.exists())
+
+    def test_real_sampler_can_be_cleaned_immediately_after_spawn(self):
+        root = storage.initialize(1)
+        neighbour = self.root / 'other-run'; neighbour.mkdir()
+        writer = storage.launch_watch(root)
+        try:
+            storage.cleanup(root)
+            self.assertEqual(writer.wait(timeout=5), 0)
+        finally:
+            if writer.poll() is None:
+                writer.kill(); writer.wait(timeout=5)
+        self.assertFalse(root.exists()); self.assertTrue(neighbour.exists())
+
+    def test_wrong_ack_times_out_without_removal_or_unmark(self):
+        root = storage.initialize(1)
+        (root / 'storage-watch.json').write_text(json.dumps({'id': 'a' * 32}))
+        (root / 'storage-watch-stopped').write_text('b' * 32)
+        with patch.object(storage.time, 'monotonic', side_effect=[0, 31]), \
+             patch.object(storage.shutil, 'rmtree') as remove, patch.object(storage.subprocess, 'run') as unmark:
+            with self.assertRaisesRegex(TimeoutError, 'preserving owned storage'):
+                storage.cleanup(root)
+            remove.assert_not_called(); unmark.assert_not_called()
+        self.assertTrue(root.exists())
+
+    def test_wrong_owner_cannot_stop_sampler(self):
+        root = storage.initialize(1)
+        (root / 'storage-watch.json').write_text(json.dumps({'id': 'a' * 32}))
+        with patch.dict(os.environ, GITHUB_RUN_ID='43'):
+            with self.assertRaisesRegex(ValueError, 'another run'):
+                storage.cleanup(root)
+        self.assertFalse((root / 'storage-watch-stop').exists())
+
+    def test_real_removal_error_is_not_suppressed_after_sampler_stops(self):
+        root = storage.initialize(1)
+        watch_id = 'a' * 32
+        (root / 'storage-watch.json').write_text(json.dumps({'id': watch_id}))
+        (root / 'storage-watch-stopped').write_text(watch_id)
+        with patch.object(storage.shutil, 'rmtree', side_effect=OSError('deletion failed')), \
+             patch.object(storage.subprocess, 'run') as unmark:
+            with self.assertRaisesRegex(OSError, 'deletion failed'):
+                storage.cleanup(root)
+            unmark.assert_not_called()
+        self.assertTrue(root.exists())
+
+    def test_spawn_failure_removes_registration_and_duplicate_launch_is_rejected(self):
+        root = storage.initialize(1)
+        with patch.object(storage.subprocess, 'Popen', side_effect=OSError('spawn failed')):
+            with self.assertRaisesRegex(OSError, 'spawn failed'):
+                storage.launch_watch(root)
+        self.assertFalse((root / 'storage-watch.json').exists())
+        (root / 'storage-watch.json').write_text(json.dumps({'id': 'a' * 32}))
+        with patch.object(storage.subprocess, 'Popen') as spawn:
+            with self.assertRaises(FileExistsError):
+                storage.launch_watch(root)
+            spawn.assert_not_called()
 
     def test_sampler_counts_fresh_profiles_and_separate_compile_target(self):
         root = storage.initialize(1)
