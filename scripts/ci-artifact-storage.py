@@ -136,9 +136,11 @@ def watch(root, watch_id=None):
         sample(root, stopped)
     finally:
         if watch_id is not None:
-            # Final filesystem operation: acknowledgment means no more writes,
-            # including when sampling raised. Cleanup can now remove the root.
-            (root / 'storage-watch-stopped').write_text(watch_id)
+            # Publish only after closing the writer handle (also required for
+            # Windows deletion). Rename is the final filesystem operation.
+            acknowledgment = root / 'storage-watch-stopped.tmp'
+            acknowledgment.write_text(watch_id)
+            acknowledgment.replace(root / 'storage-watch-stopped')
 
 
 def sample(root, stopped):

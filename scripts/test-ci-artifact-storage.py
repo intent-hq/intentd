@@ -139,6 +139,51 @@ class StorageTests(unittest.TestCase):
                 writer.kill(); writer.wait(timeout=5)
         self.assertFalse(root.exists()); self.assertTrue(neighbour.exists())
 
+    def test_acknowledgment_handle_is_closed_before_cleanup_can_remove_files(self):
+        root = storage.initialize(1)
+        watch_id = 'c' * 32
+        (root / 'storage-watch.json').write_text(json.dumps({'id': watch_id}))
+        flushed, release, closed, cleanup_checked = (threading.Event() for _ in range(4))
+        failures = []
+        original_write, original_remove, original_sleep = Path.write_text, storage.shutil.rmtree, storage.time.sleep
+        def write(path, data, *args, **kwargs):
+            if not path.name.startswith('storage-watch-stopped'):
+                return original_write(path, data, *args, **kwargs)
+            with path.open('w') as stream:
+                count = stream.write(data); stream.flush(); flushed.set()
+                if not release.wait(5):
+                    raise TimeoutError('test did not release acknowledgment handle')
+            closed.set()
+            return count
+        def remove(path):
+            cleanup_checked.set()
+            self.assertTrue(closed.is_set(), 'visible acknowledgment must have no open writer handle')
+            original_remove(path)
+        def sleep(seconds):
+            cleanup_checked.set()
+            original_sleep(seconds)
+        def run(function, *args):
+            try:
+                function(*args)
+            except BaseException as error:
+                failures.append(error)
+        writer = threading.Thread(target=run, args=(storage.watch, root, watch_id))
+        cleaner = threading.Thread(target=run, args=(storage.cleanup, root))
+        with patch.object(storage, 'sample'), patch.object(Path, 'write_text', write), \
+             patch.object(storage.shutil, 'rmtree', side_effect=remove), patch.object(storage.time, 'sleep', side_effect=sleep):
+            writer.start()
+            try:
+                self.assertTrue(flushed.wait(5))
+                cleaner.start()
+                self.assertTrue(cleanup_checked.wait(5))
+            finally:
+                release.set(); writer.join(5)
+                if cleaner.ident is not None:
+                    cleaner.join(5)
+        self.assertFalse(writer.is_alive()); self.assertFalse(cleaner.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(root.exists())
+
     def test_wrong_ack_times_out_without_removal_or_unmark(self):
         root = storage.initialize(1)
         (root / 'storage-watch.json').write_text(json.dumps({'id': 'a' * 32}))
