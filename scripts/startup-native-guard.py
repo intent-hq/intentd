@@ -107,9 +107,6 @@ def main():
     if mode == "verify-full":
         verify_full(Path(args[0]))
         return 0
-    if mode == "verify-full":
-        verify_full(Path(args[0]))
-        return 0
     raise ValueError(mode)
 
 
