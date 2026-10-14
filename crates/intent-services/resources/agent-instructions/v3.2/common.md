@@ -143,7 +143,9 @@ The supporting preview inherits app body typography and provides an optional com
 
 Use the layout and drawing classes before adding custom CSS. Authored styles can override the defaults. Prefer body-sized HTML labels outside SVG so text stays readable when the drawing shrinks. Use short connections, soft rounded shapes and thin strokes; avoid oversized canvases, heavy outlines and redundant captions. Keep the SVG viewBox close to its drawing bounds. Reflow controls and labels on narrow screens without overlap or nested scrolling. The wrapper adds no default heading or caption.
 
-Use existing diagram colors directly: `var(--diagram-node-surface)`, `var(--diagram-node-outline)`, `var(--diagram-node-title)`, `var(--diagram-connector)`, and `var(--diagram-canvas)` are full CSS colors, never `hsl(var(--diagram-…))`. Ordinary app variables remain HSL channels: `hsl(var(--background))`, `hsl(var(--foreground))`, `hsl(var(--muted))`, `hsl(var(--muted-foreground))`, `hsl(var(--border))`, `hsl(var(--primary))`, and `hsl(var(--primary-foreground))`. Avoid hard-coded theme colors. Reserve semantic accents for meaningful data or state, with text or shape cues as well as color. Prefer direct manipulation and native keyboard-accessible controls; give range inputs an associated label, a visible value and neutral styling. Preserve focus and local inputs during updates, and respect reduced motion.
+For playback or scrubbing, put the button, range input and output directly in `.visual-controls`. They share one row, with the value beside the track. Keep Play/Pause button width stable. Use `.visual-field` for fields that need a visible label; give an obvious scene-position slider an `aria-label` instead of a redundant Position heading.
+
+Use existing diagram colors directly: `var(--diagram-node-surface)`, `var(--diagram-node-outline)`, `var(--diagram-node-title)`, `var(--diagram-connector)`, and `var(--diagram-canvas)` are full CSS colors, never `hsl(var(--diagram-…))`. Ordinary app variables remain HSL channels: `hsl(var(--background))`, `hsl(var(--foreground))`, `hsl(var(--muted))`, `hsl(var(--muted-foreground))`, `hsl(var(--border))`, `hsl(var(--primary))`, and `hsl(var(--primary-foreground))`. Avoid hard-coded theme colors. Reserve semantic accents for meaningful data or state, with text or shape cues as well as color. Prefer direct manipulation and native keyboard-accessible controls; give range inputs an accessible name, a visible value and neutral styling. Preserve focus and local inputs during updates, and respect reduced motion.
 
 Small starting template for a supporting development frontend; copy its contents into a `ws-block:html` fence:
 
@@ -162,11 +164,8 @@ Small starting template for a supporting development frontend; copy its contents
     <div class="travel-labels"><span>Start</span><span>Finish</span></div>
   </div>
   <div class="visual-controls">
-    <div class="visual-field">
-      <label for="travel-position">Position</label>
-      <output id="travel-value" for="travel-position">50%</output>
-      <input id="travel-position" type="range" min="0" max="100" value="50">
-    </div>
+    <input id="travel-position" type="range" aria-label="Position" min="0" max="100" value="50">
+    <output id="travel-value" for="travel-position">50%</output>
   </div>
 </div>
 <script>
