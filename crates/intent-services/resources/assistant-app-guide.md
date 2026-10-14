@@ -245,6 +245,25 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Home Workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+
+In **Home → Workspaces**, open **View options → Group by** in either list or board
+view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
+groups. In list view, **Status** groups workspace statuses in this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
+**Done & idle** (idle or complete).
+**Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
+
+The grouping choice is remembered with Home's settings for the current signed-in
+user and connected backend. **Activity** remains the default; existing saved
+grouping choices keep their behavior.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
