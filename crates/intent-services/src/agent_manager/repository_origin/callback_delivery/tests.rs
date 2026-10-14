@@ -5904,7 +5904,12 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, WAIT)
+            let wait = if method == "fixture/call" {
+                FIXTURE_CALL_WAIT
+            } else {
+                WAIT
+            };
+            c.request_timeout(method, params, wait)
                 .await
                 .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }
