@@ -82,6 +82,43 @@ class CoordinationRegression(unittest.TestCase):
         self.assertIn('head_sha=' + 'a'*40, calls[0])
         self.assertFalse(any('/3/artifacts' in call for call in calls))
 
+    def test_large_publication_download_has_a_bounded_size_aware_budget(self):
+        api = reuse.GitHub('intent-hq/intentd')
+        observed = []
+        def transfer(command, **kwargs):
+            observed.append(kwargs['timeout'])
+            if kwargs['timeout'] < 180:
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            kwargs['stdout'].write(b'verified separately')
+            return subprocess.CompletedProcess(command, 0, stderr=b'')
+        with tempfile.TemporaryDirectory() as directory, patch.object(reuse.subprocess, 'run', side_effect=transfer):
+            path = Path(directory) / 'publication.zip'
+            api.download({'id': 42, 'size_in_bytes': 26_336_283_909}, path)
+            self.assertEqual(path.read_bytes(), b'verified separately')
+        self.assertGreaterEqual(observed[0], 180)
+        self.assertLessEqual(observed[0], 1800)
+
+    def test_download_timeout_removes_partial_archive_and_fails_explicitly(self):
+        api = reuse.GitHub('intent-hq/intentd')
+        def timeout(command, **kwargs):
+            kwargs['stdout'].write(b'partial')
+            raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        with tempfile.TemporaryDirectory() as directory, patch.object(reuse.subprocess, 'run', side_effect=timeout):
+            path = Path(directory) / 'publication.zip'
+            with self.assertRaisesRegex(reuse.Unavailable, 'timed out'):
+                api.download({'id': 42, 'size_in_bytes': 26_336_283_909}, path)
+            self.assertFalse(path.exists())
+
+    def test_metadata_keeps_short_budget_and_download_budget_is_capped(self):
+        api = reuse.GitHub('intent-hq/intentd')
+        def response(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=b'{}', stderr=b'')
+        with tempfile.TemporaryDirectory() as directory, patch.object(reuse.subprocess, 'run', side_effect=response) as run:
+            self.assertEqual(api.api('actions/runs/1'), {})
+            self.assertEqual(run.call_args.kwargs['timeout'], 120)
+            api.download({'id': 42, 'size_in_bytes': 10**15}, Path(directory) / 'large.zip')
+            self.assertEqual(run.call_args.kwargs['timeout'], 1800)
+
     def test_actual_pr_merge_source_is_distinct_from_event_head(self):
         expected = {'repository': 'intent-hq/intentd', 'source': 'c'*40, 'head_sha': 'a'*40,
                     'base_sha': 'b'*40, 'pull_request': 42, 'event': 'pull_request'}

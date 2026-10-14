@@ -49,13 +49,13 @@ class GitHub:
             raise ValueError('reuse repository is not trusted')
         self.repository = repository
 
-    def api(self, suffix, destination=None):
+    def api(self, suffix, destination=None, *, timeout=120):
         command = ['gh', 'api', f'repos/{self.repository}/{suffix}']
         if destination is None:
             result = subprocess.run(command, capture_output=True, timeout=120)
         else:
             with Path(destination).open('wb') as stream:
-                result = subprocess.run(command, stdout=stream, stderr=subprocess.PIPE, timeout=120)
+                result = subprocess.run(command, stdout=stream, stderr=subprocess.PIPE, timeout=timeout)
         if result.returncode:
             diagnostic = result.stderr.decode(errors='replace')
             if re.search(r'HTTP (404|410)\b', diagnostic):
@@ -89,7 +89,18 @@ class GitHub:
         return self.api(f'actions/runs/{int(run_id)}')
 
     def download(self, artifact, destination):
-        self.api(f'actions/artifacts/{int(artifact["id"])}/zip', destination)
+        # Metadata stays bounded at two minutes; a full coverage publication
+        # can exceed 25 GB. Budget transfer at 32 MiB/s plus setup overhead,
+        # capped at 30 minutes so a stalled endpoint still fails the job.
+        size = artifact['size_in_bytes']
+        if type(size) is not int or size <= 0:
+            raise ValueError('invalid GitHub artifact size')
+        timeout = min(1800, 120 + (size + 32 * 1024**2 - 1) // (32 * 1024**2))
+        try:
+            self.api(f'actions/artifacts/{int(artifact["id"])}/zip', destination, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            Path(destination).unlink(missing_ok=True)
+            raise Unavailable(f'GitHub artifact download timed out after {timeout}s ({size} bytes)') from error
 
 
 def artifact_name(platform, source):
