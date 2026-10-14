@@ -152,10 +152,8 @@ jobs:
           import os
           from pathlib import Path
           target = Path(os.environ['RUNNER_TEMP']) / 'native-target'
-          # rust-cache joins this path to the workspace even when it is absolute.
-          relative = os.path.relpath(target, Path.cwd())
           with open(os.environ['GITHUB_ENV'], 'a') as environment:
-              environment.write(f'CARGO_TARGET_DIR={target}\nNATIVE_CACHE_TARGET={relative}\n')
+              environment.write(f'CARGO_TARGET_DIR={target}\n')
           PYTHON
       - name: Install pinned native archive runner
         uses: taiki-e/install-action@v2

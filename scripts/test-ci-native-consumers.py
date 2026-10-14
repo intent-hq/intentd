@@ -108,10 +108,12 @@ class ConsumerTests(unittest.TestCase):
                     self.native.produce(ROOT, root, 'macos', 'merge_group')
                 self.assertEqual(seen, [original or '2', original, original])
 
-    def test_hosted_cache_mapping_points_to_actual_external_target(self):
+    def test_hosted_external_target_with_managed_cache_on_native_paths(self):
         steps = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']['steps']
         setup = next(step for step in steps if step.get('name') == 'Set hosted native target outside checkout')
-        cache = next(step for step in steps if step.get('uses', '').startswith('Swatinem/rust-cache@'))
+        cache = next(step for step in steps if step.get('name') == 'Configure Depot managed compiler cache')
+        self.assertEqual(cache['run'], 'python3 scripts/setup-depot-sccache.py')
+        self.assertFalse(any('Swatinem/rust-cache' in step.get('uses', '') for step in steps))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / 'workspace/repo'; source.mkdir(parents=True)
@@ -119,36 +121,18 @@ class ConsumerTests(unittest.TestCase):
             subprocess.run(['bash', '-e', '-c', setup['run']], cwd=source,
                            env=dict(os.environ, RUNNER_TEMP=str(root / 'temp'), GITHUB_ENV=str(output)), check=True)
             values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-            relative = values['NATIVE_CACHE_TARGET']
-            self.assertFalse(Path(relative).is_absolute())
-            self.assertEqual((source / relative).resolve(), Path(values['CARGO_TARGET_DIR']).resolve())
-            self.assertEqual(cache['with']['workspaces'], '. -> ${{ env.NATIVE_CACHE_TARGET }}')
-
-        # Execute the workflow's actual Python payload using each native path
-        # flavour, then apply the cache action's Node path.join semantics.
-        import ntpath
-        import posixpath
+            self.assertEqual(Path(values['CARGO_TARGET_DIR']), root / 'temp/native-target')
+            self.assertNotIn('NATIVE_CACHE_TARGET', values)
         from pathlib import PurePosixPath, PureWindowsPath
         program = setup['run'].split("<<'PYTHON'\n", 1)[1].rsplit('PYTHON', 1)[0]
-        cases = [
-            ('posix', PurePosixPath, posixpath.relpath, '/Users/runner/work/intentd/intentd', '/Users/runner/work/_temp'),
-            ('win32', PureWindowsPath, ntpath.relpath, 'C:/a/intentd/intentd', 'C:/a/_temp'),
-        ]
-        for flavour, pure_path, relpath, source, temporary in cases:
-            with self.subTest(platform=flavour), tempfile.TemporaryDirectory() as directory:
+        for pure_path, temporary in [(PurePosixPath, '/Users/runner/work/_temp'), (PureWindowsPath, 'C:/a/_temp')]:
+            with self.subTest(platform=pure_path), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / 'environment'
                 with patch.dict(os.environ, RUNNER_TEMP=temporary, GITHUB_ENV=str(output)), \
-                     patch('pathlib.Path', side_effect=pure_path) as paths, \
-                     patch('os.path.relpath', side_effect=relpath):
-                    paths.cwd.return_value = pure_path(source)
+                     patch('pathlib.Path', side_effect=pure_path):
                     exec(compile(program, '<hosted native target workflow>', 'exec'), {})
                 values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-                relative = values['NATIVE_CACHE_TARGET']
-                self.assertFalse(pure_path(relative).is_absolute())
-                joined = subprocess.check_output(['node', '-e',
-                    "const p=require('node:path')[process.argv[1]]; console.log(p.join(process.argv[2],process.argv[3]));",
-                    flavour, source, relative], text=True).strip()
-                self.assertEqual(pure_path(joined), pure_path(values['CARGO_TARGET_DIR']))
+                self.assertEqual(pure_path(values['CARGO_TARGET_DIR']), pure_path(temporary) / 'native-target')
 
     def test_macos_tunnel_payload_uses_initialized_nondefault_artifact_root(self):
         steps = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']['steps']
