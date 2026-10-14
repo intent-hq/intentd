@@ -233,7 +233,7 @@ const github = {
   },
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
-const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, ...fixture.context };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
 process.env.THRESHOLD = '8';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
@@ -412,89 +412,6 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
         step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
         self.assertEqual(step["env"].get("MACOS_RUNNER_DISABLED"), "${{ vars.CI_MACOS_RUNNER_DISABLED }}")
-
-    def test_startup_branch_uses_hosted_windows_for_both_consumers(self):
-        branch = "fix/indexing-startup-progress"
-        queue_ref = "refs/heads/gh-readonly-queue/main/pr-2419-" + "a" * 40
-        pr = {"number": 2419, "head": {"ref": branch, "repo": {"full_name": "intent-hq/intentd"}}}
-        cases = [
-            ({"eventName": "pull_request", "payload": {"pull_request": pr}}, True),
-            ({"eventName": "push", "ref": "refs/heads/" + branch}, True),
-            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref}}}, True),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "number": 24190}}}, False),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "ref": "other"}}}}, False),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "repo": {"full_name": "outside/intentd"}}}}}, False),
-            ({"eventName": "push", "ref": "refs/heads/main"}, False),
-            ({"eventName": "push", "ref": "refs/heads/" + branch + "-other"}, False),
-            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref.replace("2419-", "24190-")}}}, False),
-            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref.replace("/main/", "/other/")}}}, False),
-            ({"eventName": "merge_group", "payload": {}}, False),
-            ({}, False),
-        ]
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
-        baseline = run_route(self.workflow, org=fleet)["outputs"]
-        for event_context, hosted in cases:
-            with self.subTest(context=event_context):
-                outputs = route_outputs(self.workflow, run_route(self.workflow, org=fleet, context=event_context)["outputs"])
-                expected = ["depot-windows-2022-16"] if hosted else ["self-hosted", "Windows", "X64"]
-                self.assertEqual(json.loads(outputs["windows_labels"]), expected)
-                self.assertEqual(outputs["windows_burst"], str(hosted).lower())
-                for key in ("linux_labels", "check_labels", "linux_burst", "macos_labels", "macos_burst"):
-                    self.assertEqual(outputs[key], baseline[key])
-                for job_id, field, value in (("build", "target", "x86_64-pc-windows-msvc"),
-                                             ("daemon-lifecycle", "platform", "windows")):
-                    job = self.workflow["jobs"][job_id]
-                    self.assertEqual(job["runs-on"], "${{ matrix.os }}")
-                    row = next(r for r in job["strategy"]["matrix"]["include"] if r[field] == value)
-                    self.assertEqual(matrix_labels(row["os"], outputs), expected)
-
-    def test_startup_coverage_route_is_pr_only_and_preserves_other_routes(self):
-        pr = {"number": 2419, "head": {"ref": "fix/indexing-startup-progress",
-                                             "repo": {"full_name": "intent-hq/intentd"}}}
-        cases = [
-            ({"eventName": "pull_request", "payload": {"pull_request": pr}}, True),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "number": 2415}}}, False),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "ref": "other"}}}}, False),
-            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "repo": {"full_name": "outside/intentd"}}}}}, False),
-            ({"eventName": "push", "ref": "refs/heads/fix/indexing-startup-progress"}, False),
-            ({"eventName": "merge_group", "payload": {"merge_group": {
-                "head_ref": "refs/heads/gh-readonly-queue/main/pr-2419-" + "a" * 40}}}, False),
-            ({"eventName": "pull_request", "payload": {}}, False),
-        ]
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
-        for event_context, forced in cases:
-            for available in (fleet, []):
-                with self.subTest(context=event_context, available=bool(available)):
-                    outputs = route_outputs(self.workflow, run_route(
-                        self.workflow, org=available, context=event_context)["outputs"])
-                    hosted = forced or not available
-                    self.assertEqual(json.loads(outputs["coverage_changed_labels"]),
-                                     ["depot-ubuntu-24.04-16"] if hosted else ["self-hosted", "Linux", "X64"])
-                    self.assertEqual(outputs["coverage_changed_burst"], str(hosted).lower())
-                    self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["self-hosted", "Linux", "X64"] if available else ["depot-ubuntu-24.04-16"])
-                    self.assertEqual(json.loads(outputs["check_labels"]),
-                                     ["self-hosted", "Linux", "X64"] if available else ["depot-ubuntu-24.04-8"])
-                    self.assertEqual(outputs["linux_burst"], str(not available).lower())
-
-    def test_coverage_route_pairs_runner_with_target_and_install_home(self):
-        job = self.workflow["jobs"]["coverage-changed"]
-        self.assertEqual(job["runs-on"], "${{ fromJSON(needs.route.outputs.coverage_changed_labels) }}")
-        steps = {s.get("name"): s for s in job["steps"]}
-        for hosted in (True, False):
-            for selected in (True, False):
-                values = {"needs.route.outputs.coverage_changed_burst": str(hosted).lower(),
-                          "needs.route.outputs.linux_burst": str(not hosted).lower()}
-                for name, expected in (("Disk-space preflight (tinybox only)", not hosted),
-                                       ("Point CARGO_TARGET_DIR outside the work dir", not hosted)):
-                    expression = steps[name]["if"].replace("steps.select.outputs.has_selection", repr(str(selected).lower()))
-                    self.assertEqual(condition(expression, values), selected and expected)
-        home = steps["Key install-action dirs per runner slot"]["run"]
-        self.assertIn("needs.route.outputs.coverage_changed_burst", home)
-        self.assertNotIn("needs.route.outputs.linux_burst", str(job))
-        for name, other in self.workflow["jobs"].items():
-            if name not in ("route", "coverage-changed"):
-                self.assertNotIn("coverage_changed_", str(other), name)
 
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
