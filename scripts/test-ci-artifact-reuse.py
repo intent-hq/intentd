@@ -312,6 +312,50 @@ class FunctionalReuse(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'no consumer build fallback'):
                 linux.fetch(self.source, self.directory / 'incomplete', 'coverage-all')
 
+    def test_consumer_reselects_storage_for_exact_authenticated_demand(self):
+        from types import SimpleNamespace
+        linux = load('ci-linux-artifacts')
+        storage = load('ci-artifact-storage')
+        selected_root = self.directory / 'selected'; shutil.copytree(self.built, selected_root)
+        (selected_root / 'requests.json').write_text(json.dumps({'changed-0': self.requests['a']}))
+        self.store.artifacts.clear(); self.store.publish(selected_root, 1)
+        temp = self.directory / 'temp'; temp.mkdir()
+        alternate = self.directory / 'raid'; alternate.mkdir()
+        env = dict(GITHUB_REPOSITORY='intent-hq/intentd', GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='1',
+                   GITHUB_WORKFLOW_REF='intent-hq/intentd/.github/workflows/ci.yml@refs/pull/42/merge',
+                   GITHUB_JOB='coverage-changed', RUNNER_TEMP=str(temp), RUNNER_NAME='fixture',
+                   GITHUB_ENV=str(self.directory / 'env'))
+        def capacity(path):
+            return SimpleNamespace(free=(200 if Path(path).is_relative_to(alternate) else 8) * 1024**3)
+        with patch.dict(os.environ, env), patch.object(linux.registry, 'GitHub', return_value=self.store), \
+             patch.object(linux.registry, 'context', return_value=self.expected), \
+             patch.object(shutil, 'disk_usage', side_effect=capacity):
+            initial = storage.initialize(1024**3, True)
+            self.assertEqual(initial.parent, temp)
+            with patch.object(Path, 'is_mount', return_value=True), \
+                 patch.object(linux, 'storage', storage, create=True), \
+                 patch.object(storage, 'alternate', return_value=alternate), \
+                 patch.object(storage.subprocess, 'run'), patch.object(storage.subprocess, 'Popen'):
+                linux.fetch(self.source, initial, 'changed')
+            exported = dict(line.split('=', 1) for line in Path(env['GITHUB_ENV']).read_text().splitlines())
+            final = Path(exported['NATIVE_ARTIFACT_ROOT'])
+            self.assertTrue(final.is_relative_to(alternate))
+            self.assertFalse(initial.exists())
+            self.assertTrue(json.loads((final / 'download.json').read_text())['complete'])
+            self.assertEqual(len(self.store.downloads), 2)
+            self.assertEqual(len(list((final / 'published').iterdir())), 1)
+            with patch.object(storage.subprocess, 'run'):
+                storage.cleanup(final)
+            self.assertTrue(alternate.exists())
+            self.store.downloads.clear()
+            initial = storage.initialize(1024**3, True)
+            with patch.object(linux, 'storage', storage), patch.object(storage, 'alternate', return_value=None):
+                with self.assertRaisesRegex(ValueError, 'insufficient artifact storage'):
+                    linux.fetch(self.source, initial, 'changed')
+            self.assertEqual(len(self.store.downloads), 1)
+            self.assertFalse(json.loads((initial / 'download.json').read_text())['complete'])
+            storage.cleanup(initial)
+
     def test_real_nextest_expansion_checked_before_extraction(self):
         linux = load('ci-linux-artifacts')
         request = self.requests['a']

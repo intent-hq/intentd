@@ -931,20 +931,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 80 GiB covers the measured full variant, fresh extraction and profiles.
-      # fetch also validates the exact catalog budget on the artifact filesystem.
+      # rationale (monorepo#1253). Keep the existing cache preflight below.
+      # Only the small index is needed initially; fetch selects storage using
+      # its authenticated exact expansion/profile budget before large transfer.
       - name: Initialize fresh artifact storage
         shell: bash
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          args=(--minimum-gib 80)
+          args=(--minimum-gib 1)
           if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
           python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
-          NEED_GIB: 80
+          NEED_GIB: 30
           JOB_TARGET_SUBDIR: coverage-e2e
         run: |
           set -euo pipefail
@@ -1147,20 +1148,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 80 GiB covers the measured full variant, fresh extraction and profiles.
-      # fetch also validates the exact catalog budget on the artifact filesystem.
+      # rationale (monorepo#1253). Keep the existing cache preflight below.
+      # Only the small index is needed initially; fetch selects storage using
+      # its authenticated exact expansion/profile budget before large transfer.
       - name: Initialize fresh artifact storage
         shell: bash
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          args=(--minimum-gib 80)
+          args=(--minimum-gib 1)
           if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
           python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
-          NEED_GIB: 80
+          NEED_GIB: 30
           JOB_TARGET_SUBDIR: coverage-all
         run: |
           set -euo pipefail
@@ -1432,7 +1434,7 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          args=(--minimum-gib 30)
+          args=(--minimum-gib 1)
           if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
           python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)

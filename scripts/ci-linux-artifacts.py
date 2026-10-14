@@ -31,6 +31,7 @@ archives = native.archives
 registry = load('ci-artifact-reuse')
 coverage = load('ci-coverage-artifacts')
 callback = load('callback-build-scope')
+storage = load('ci-artifact-storage')
 
 CALLBACK_PATHS = ('scripts/prepare-acp-callback-fixture.py', 'scripts/test-prepare-acp-callback-fixture.py',
                   'scripts/changed-tests.sh', 'scripts/callback-build-scope.py',
@@ -207,6 +208,7 @@ def fetch(source, root, scope):
     run_id = int(os.environ['GITHUB_RUN_ID'])
     run = api.run(run_id)
     name = registry.artifact_name('linux', expected['source']) + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+    initial_root = root
     receipt = {'scope': scope, 'transfers': [], 'complete': False}
     started = time.monotonic()
     try:
@@ -243,6 +245,10 @@ def fetch(source, root, scope):
             budget = sum(entry['archive_bytes'] for entry in entries) + expanded + max(entry['archive_bytes'] for entry in entries) + max(8 * 1024**3, expanded // 5)
             free = shutil.disk_usage(root).free
             receipt.update(selected_names=list(selected), required_free_bytes=budget, free_bytes_before=free)
+            if free < budget and (root / 'storage.json').is_file():
+                root = storage.reselect(root, budget)
+                free = shutil.disk_usage(root).free
+                receipt.update(initial_root=str(initial_root), selected_root=str(root), free_bytes_before=free)
             if free < budget:
                 raise ValueError(f'selected coverage artifacts need {budget} free bytes at {root}; only {free} available')
             hits, transfers = registry.restore_variants(wanted, root, api, expected, 'linux', candidate, run, content, require=True)
@@ -257,6 +263,8 @@ def fetch(source, root, scope):
         receipt['bytes'] = sum(item['bytes'] for item in receipt['transfers'])
         receipt['download_seconds'] = sum(item['download_seconds'] for item in receipt['transfers'])
         (root / 'download.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        if root != initial_root:
+            storage.cleanup(initial_root)
 
 
 def check_expansion(bundle, request):

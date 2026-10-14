@@ -41,11 +41,31 @@ def initialize(min_bytes, allow_alternate=False):
     if slot:
         subprocess.run(['bash', str(Path(__file__).with_name('ci-target-slot.sh')), 'mark', str(slot)], check=True)
     owner = {'token': token(), 'root': str(root), 'slot': str(slot) if slot else None,
-             'minimum_free_bytes': min_bytes, 'free_bytes_at_start': shutil.disk_usage(root).free}
+             'minimum_free_bytes': min_bytes, 'allow_alternate': allow_alternate, 'free_bytes_at_start': shutil.disk_usage(root).free}
     (root / 'storage.json').write_text(json.dumps(owner, indent=2) + '\n')
     with open(os.environ['GITHUB_ENV'], 'a') as stream:
         stream.write('NATIVE_ARTIFACT_ROOT=' + str(root) + '\n')
     return root
+
+
+def launch_watch(root):
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch', '--root', str(root)],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def reselect(root, min_bytes):
+    """Use authenticated consumer demand; retain the old index until fetch exits."""
+    root = Path(root).resolve()
+    owner = json.loads((root / 'storage.json').read_text())
+    if owner['token'] != token() or owner['root'] != str(root):
+        raise ValueError('refusing storage reselection for another run')
+    replacement = initialize(min_bytes, owner['allow_alternate'])
+    for name in ('storage.json', 'storage-usage.json'):
+        if (root / name).is_file():
+            shutil.copyfile(root / name, replacement / name.replace('storage', 'storage-initial', 1))
+    launch_watch(replacement)
+    return replacement
 
 
 def cleanup(root):
@@ -121,9 +141,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.mode == 'init':
         root = initialize(args.minimum_gib * 1024**3, args.allow_alternate)
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch', '--root', str(root)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        launch_watch(root)
         print(root)
     elif args.mode == 'cleanup':
         if args.root and (Path(args.root) / 'storage.json').is_file():
