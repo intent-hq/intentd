@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Policy tests everywhere; real handle, junction and Cargo tests on Windows."""
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, nullcontext
 import importlib.util
 import json
 import os
@@ -23,6 +23,33 @@ def process(pid, parent, name):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_full_disk_dry_run_never_creates_lock_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            profile = home / 'ci-target/intentd' / cleanup.TARGETS[0] / 'debug'
+            (profile / 'deps').mkdir(parents=True)
+            (profile / '.cargo-lock').touch()
+            locked = []
+
+            @contextmanager
+            def lock(path, create=False):
+                if create:
+                    raise OSError(28, 'No space left on device')
+                self.assertTrue(path.is_file())
+                locked.append(path)
+                yield
+
+            api = Mock()
+            api.open.side_effect = lambda *args, **kwargs: nullcontext()
+            api.lock.side_effect = lock
+            with patch.object(cleanup, 'open_home'), patch.object(cleanup, 'assert_idle_runner'), patch.object(
+                    cleanup, 'free_bytes', return_value=0), patch.object(cleanup, 'emit'):
+                result = cleanup.clean(home, api=api)
+            self.assertEqual(result['candidates'], [str(profile)])
+            self.assertEqual(result['deleted'], [])
+            self.assertEqual(locked, [profile / '.cargo-lock'])
+            self.assertEqual(sorted(p.name for p in profile.iterdir()), ['.cargo-lock', 'deps'])
+
     def test_system_owner_is_allowed_only_for_the_profile_anchor(self):
         api = cleanup.Native.__new__(cleanup.Native)
         api.a, api.k, api.owners = Mock(), Mock(), [7]
@@ -145,6 +172,21 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(result['candidates'], [str(self.profile)])
         self.assertEqual(result['deleted'], [])
         self.assertEqual(self.file.read_text(), 'disposable')
+
+    def test_full_disk_apply_does_not_create_locks(self):
+        native_open = self.api.open
+
+        def no_create(path, **kwargs):
+            if kwargs.get('create'):
+                raise OSError(28, 'No space left on device')
+            return native_open(path, **kwargs)
+
+        self.free_bytes.side_effect = [0, 0, 200]
+        with patch.object(self.api, 'open', side_effect=no_create):
+            result = self.clean(True)
+        self.assertFalse(self.file.exists())
+        self.assertTrue((self.profile / '.cargo-lock').is_file())
+        self.assertEqual(result['after_free_bytes'], 200)
 
     def test_apply_preserves_locks_and_excluded_paths_and_stops_at_headroom(self):
         preserved = [self.home / '.cargo/credentials.toml', self.home / '.rustup/keep',

@@ -272,7 +272,11 @@ def clean(home, min_free_bytes=40 * GIB, apply=False, api=None):
                     break
                 stack.enter_context(api.open(root, directory=True))
             else:
-                stack.enter_context(api.lock(root / '.windows-cleanup.lock', create=True))
+                # A full disk cannot allocate a cleaner lock. Honor an existing
+                # one, while mandatory exclusive Cargo locks serialize cleaners.
+                cleaner_lock = root / '.windows-cleanup.lock'
+                if not missing(cleaner_lock):
+                    stack.enter_context(api.lock(cleaner_lock))
                 profiles = []
                 # Acquire every profile and Cargo lock before deleting anything.
                 for target in TARGETS:
@@ -294,7 +298,12 @@ def clean(home, min_free_bytes=40 * GIB, apply=False, api=None):
                             with api.open(current / 'deps', directory=True):
                                 pass
                             for name in CARGO_LOCKS:
-                                stack.enter_context(api.lock(current / name, create=name != '.cargo-lock'))
+                                # Cargo retains .cargo-lock (shared in newer
+                                # versions); our exclusive lock blocks both old
+                                # and new Cargo. Never create optional locks on
+                                # a full disk, but honor every one already there.
+                                if name == '.cargo-lock' or not missing(current / name):
+                                    stack.enter_context(api.lock(current / name))
                             profiles.append((current.stat().st_mtime_ns, str(current), current, parents))
                 profiles.sort(key=lambda item: item[:2])
                 report['candidates'] = [str(profile) for _, _, profile, _ in profiles]

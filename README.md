@@ -878,6 +878,8 @@ the two intentd CI target directories. It preserves Cargo lock files, release
 profiles, toolchains, registry, credentials and sources. Native Windows safety
 tests run first. A busy runner, compiler, held lock, in-use marker, reparse point,
 unknown owner or insufficient eligible space fails visibly.
+Cleanup locks existing Cargo lock files without allocating new ones, so a full
+disk can still be recovered. The legacy Cargo lock is required for each profile.
 
 Before the new workflow lands, the existing Mac maintenance dispatcher can run
 it from this branch without merging:
