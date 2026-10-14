@@ -195,15 +195,15 @@ class Store:
     def list_artifacts(self, run_id):
         return [a for a in self.artifacts if a['workflow_run']['id'] == run_id]
 
-    def publish(self, root, run_id, *, workflow='.github/workflows/ci.yml', conclusion='success'):
+    def publish(self, root, run_id, *, workflow='.github/workflows/ci.yml', conclusion='success', attempt=1):
         expected = self.expected
-        self.runs[run_id] = {'id': run_id, 'run_attempt': 1, 'repository': {'full_name': self.repository, 'id': 42},
+        self.runs[run_id] = {'id': run_id, 'run_attempt': attempt, 'repository': {'full_name': self.repository, 'id': 42},
                             'head_repository': {'full_name': self.repository}, 'path': workflow,
                             'head_sha': expected['head_sha'], 'event': expected['event'], 'conclusion': conclusion,
                             'pull_requests': [{'number': expected['pull_request'],
                                                'head': {'sha': expected['head_sha'], 'repo': {'id': 42}},
                                                'base': {'sha': expected['base_sha']}}]}
-        marker = {'schema': 1, 'context': expected, 'run_id': run_id, 'attempt': 1, 'workflow': workflow}
+        marker = {'schema': 1, 'context': expected, 'run_id': run_id, 'attempt': attempt, 'workflow': workflow}
         (root / 'publication.json').write_text(json.dumps(marker))
         requests = {}
         for path in (root / 'published').glob('*/manifest.json'):
@@ -214,7 +214,7 @@ class Store:
         plan = reuse.publication_plan(root, 'linux')
         index = None
         for number, upload in enumerate(plan):
-            artifact_id = run_id if number == 0 else run_id*1000 + number
+            artifact_id = (run_id if number == 0 else run_id*1000 + number) + (attempt - 1) * 1000000
             path = self.root / (str(artifact_id) + '.zip')
             with zipfile.ZipFile(path, 'w') as archive:
                 for name in upload['files']:
@@ -274,6 +274,83 @@ class FunctionalReuse(unittest.TestCase):
         self.directory = Path(self.case.name)
         self.store = Store(self.directory, self.expected)
         self.store.publish(self.built, 1)
+
+    def test_consumer_retry_reuses_only_finalized_trusted_attempt_and_prefers_current(self):
+        linux = load('ci-linux-artifacts')
+        self.store.artifacts.clear()
+        publication = self.directory / 'retry-publication'; shutil.copytree(self.built, publication)
+        (publication / 'requests.json').write_text(json.dumps({'coverage-all': self.requests['a']}))
+        self.store.publish(publication, 1)
+        self.store.runs[1]['run_attempt'] = 2
+        env = dict(GITHUB_REPOSITORY='intent-hq/intentd', GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='2',
+                   GITHUB_WORKFLOW_REF='intent-hq/intentd/.github/workflows/ci.yml@refs/pull/42/merge')
+        with patch.dict(os.environ, env), patch.object(linux.registry, 'GitHub', return_value=self.store), \
+             patch.object(linux.registry, 'context', return_value=self.expected):
+            root = self.directory / 'earlier'
+            linux.fetch(self.source, root, 'coverage-all')
+            receipt = json.loads((root / 'download.json').read_text())
+            self.assertEqual((receipt['producer_attempt'], receipt['consumer_attempt']), (1, 2))
+            self.assertEqual(receipt['selected_names'], ['coverage-all'])
+            self.assertFalse(list(root.glob('receipt-*.json')), 'execution results must never be restored')
+            request = self.requests['a']; key = archives.identity.build_key(request['identity'])
+            prepared = linux.prepare_streamed(root / 'published' / key, request, self.source, root / 'runtime')
+            binary = next(iter(prepared['runtime']['tests']))
+            runtime = dict(linux.native.consumer_environment(root), REUSE_TEST_LOG=str(root / 'runtime.log'))
+            self.assertEqual(archives.run_libtest(prepared, binary, [], env=runtime), 0)
+            failed = dict(runtime, REUSE_FAIL='1')
+            self.assertNotEqual(archives.run_libtest(prepared, binary, [], env=failed), 0)
+            self.assertEqual((root / 'runtime.log').read_text().splitlines(), ['ran', 'ran'])
+            self.assertFalse((root / 'compiler-calls.log').exists())
+            self.store.publish(publication, 1, attempt=2)
+            current = self.directory / 'current'
+            linux.fetch(self.source, current, 'coverage-all')
+            self.assertEqual(json.loads((current / 'download.json').read_text())['producer_attempt'], 2)
+            self.store.artifacts = [a for a in self.store.artifacts if not (a['id'] > 1000000 and '-variant-' in a['name'])]
+            with self.assertRaisesRegex(ValueError, 'not finalized'):
+                linux.fetch(self.source, self.directory / 'partial-current', 'coverage-all')
+            self.store.artifacts = [a for a in self.store.artifacts if a['id'] < 1000000]
+            index = self.store.artifacts[0]
+            original = (self.directory / '1.zip').read_bytes()
+            (self.directory / '1.zip').write_bytes(b'corrupt')
+            with self.assertRaisesRegex(ValueError, 'digest'):
+                linux.fetch(self.source, self.directory / 'corrupt-earlier', 'coverage-all')
+            (self.directory / '1.zip').write_bytes(original)
+            self.store.artifacts = [index]
+            with self.assertRaisesRegex(ValueError, 'not finalized'):
+                linux.fetch(self.source, self.directory / 'partial-earlier', 'coverage-all')
+            self.store.expected = dict(self.expected, source='f' * 40)
+            self.store.artifacts.clear(); self.store.publish(publication, 1)
+            self.store.runs[1]['run_attempt'] = 2
+            with self.assertRaisesRegex(ValueError, 'producer index'):
+                linux.fetch(self.source, self.directory / 'wrong-source', 'coverage-all')
+
+    def test_retry_skips_partial_earlier_attempt_but_rejects_mixed_variant_provenance(self):
+        linux = load('ci-linux-artifacts')
+        publication = self.directory / 'retry'; shutil.copytree(self.built, publication)
+        (publication / 'requests.json').write_text(json.dumps({'coverage-all': self.requests['a']}))
+        self.store.artifacts.clear()
+        self.store.publish(publication, 1)
+        self.store.publish(publication, 1, attempt=2)
+        second = [a for a in self.store.artifacts if a['id'] > 1000000]
+        self.store.artifacts = [a for a in self.store.artifacts if a['id'] < 1000000 or '-index-' in a['name']]
+        self.store.runs[1]['run_attempt'] = 3
+        env = dict(GITHUB_REPOSITORY='intent-hq/intentd', GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='3',
+                   GITHUB_WORKFLOW_REF='intent-hq/intentd/.github/workflows/ci.yml@refs/pull/42/merge')
+        with patch.dict(os.environ, env), patch.object(linux.registry, 'GitHub', return_value=self.store), \
+             patch.object(linux.registry, 'context', return_value=self.expected):
+            root = self.directory / 'earlier-complete'
+            linux.fetch(self.source, root, 'coverage-all')
+            receipt = json.loads((root / 'download.json').read_text())
+            self.assertEqual((receipt['producer_attempt'], receipt['consumer_attempt']), (1, 3))
+            # Finalized metadata from attempt2 must not authenticate attempt1 bytes.
+            for artifact in second:
+                if '-variant-' in artifact['name']:
+                    first = next(a for a in self.store.artifacts if a['name'] == artifact['name'][:-1] + '1')
+                    shutil.copyfile(self.directory / (str(first['id']) + '.zip'), self.directory / (str(artifact['id']) + '.zip'))
+                    artifact['digest'] = first['digest']; artifact['size_in_bytes'] = first['size_in_bytes']
+                    self.store.artifacts.append(artifact)
+            with self.assertRaisesRegex(ValueError, 'provenance'):
+                linux.fetch(self.source, self.directory / 'mixed', 'coverage-all')
 
     def restore(self, requests=None):
         return reuse.restore(requests or self.requests, self.directory / 'restore', self.store, self.expected, 'linux')
@@ -361,13 +438,16 @@ class FunctionalReuse(unittest.TestCase):
         request = self.requests['a']
         key = archives.identity.build_key(request['identity'])
         bundle = self.directory / 'bundle'; shutil.copytree(self.built / 'published' / key, bundle)
-        linux.check_expansion(bundle, request)
+        linux.prepare_streamed(bundle, request, self.source, self.directory / 'streamed')
         manifest = json.loads((bundle / 'manifest.json').read_text())
-        next(iter(manifest['files'].values()))['size'] = 0
+        rejected_name = next(iter(manifest['files']))
+        manifest['files'][rejected_name]['size'] = 0
         (bundle / 'manifest.json').write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, 'exceeds manifest'):
-            linux.check_expansion(bundle, request)
-        self.assertFalse((self.directory / 'restored').exists())
+            linux.prepare_streamed(bundle, request, self.source, self.directory / 'rejected')
+        self.assertFalse((self.directory / 'rejected' / rejected_name).exists())
+        self.assertLessEqual(sum(p.stat().st_size for p in (self.directory / 'rejected').rglob('*') if p.is_file()),
+                             sum(item['size'] for item in manifest['files'].values()))
 
     def test_alias_scopes_budget_each_retained_extraction_before_variant_download(self):
         from types import SimpleNamespace

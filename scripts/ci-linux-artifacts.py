@@ -7,6 +7,7 @@ tests/lints. Only executable inputs are reusable; every consumer starts fresh.
 """
 import argparse
 import fnmatch
+import hashlib
 import importlib.util
 import json
 import os
@@ -38,7 +39,7 @@ CALLBACK_PATHS = ('scripts/prepare-acp-callback-fixture.py', 'scripts/test-prepa
                   'scripts/test-callback-build-scope.py', 'crates/intent-acp/tests/fixtures/claude-callback-adapter.json',
                   'crates/intent-acp/tests/fixtures/claude-callback-canonical.patch',
                   'crates/intent-acp/tests/fixtures/claude-callback-files.json', '.github/workflows/ci.yml')
-FULL_PROOF_PATHS = ('.github/workflows/ci.yml', 'scripts/ci-linux-artifacts.py',
+FULL_PROOF_PATHS = ('scripts/ci-consumer-process.py', 'scripts/test-ci-consumer-process.py', '.github/workflows/ci.yml', 'scripts/ci-linux-artifacts.py',
                     'scripts/ci-coverage-artifacts.py', 'scripts/ci-test-artifacts.py',
                     'scripts/test-ci-linux-artifacts.py', 'scripts/test-ci-coverage-artifacts.py',
                     'scripts/ci-artifact-reuse.py', 'scripts/ci-publish-variants.cjs',
@@ -216,24 +217,42 @@ def fetch(source, root, scope):
     expected = registry.context(source, api)
     run_id = int(os.environ['GITHUB_RUN_ID'])
     run = api.run(run_id)
-    name = registry.artifact_name('linux', expected['source']) + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+    prefix = registry.artifact_name('linux', expected['source']) + '-'
+    attempt = int(os.environ['GITHUB_RUN_ATTEMPT'])
     initial_root = root
     receipt = {'scope': scope, 'transfers': [], 'complete': False}
     started = time.monotonic()
     try:
-        candidates = [a for a in api.list_artifacts(run_id) if a['name'] == name and registry.live(a)]
-        if len(candidates) != 1:
+        available = api.list_artifacts(run_id)
+        candidates = [a for a in available if a['name'] == prefix + str(attempt) and registry.live(a)]
+        if not candidates:
+            candidates = [a for a in available if a['name'].startswith(prefix)
+                          and a['name'][len(prefix):].isdigit()
+                          and 1 <= int(a['name'][len(prefix):]) < attempt and registry.live(a)]
+            candidates.sort(key=lambda a: int(a['name'][len(prefix):]), reverse=True)
+        if not candidates or len({a['name'] for a in candidates}) != len(candidates):
             raise ValueError('required Linux producer index missing or ambiguous; no consumer build fallback')
-        candidate = candidates[0]
-        if candidate['size_in_bytes'] > 32 * 1024**2:
-            raise ValueError('publication index exceeds metadata size budget')
         with tempfile.TemporaryDirectory(prefix='verified-index-', dir=root) as tmp:
-            stage = Path(tmp)
-            receipt['transfers'].append(registry.download_verified(api, candidate, stage))
-            content = stage / 'content'
-            marker, catalog = registry.validate_marker(content, candidate, run, expected, 'linux')
-            if marker != registry.publication(expected):
-                raise ValueError('Linux consumer requires its current run and attempt')
+            for candidate in candidates:
+                if candidate['size_in_bytes'] > 32 * 1024**2:
+                    raise ValueError('publication index exceeds metadata size budget')
+                stage = Path(tmp) / str(candidate['id'])
+                receipt['transfers'].append(registry.download_verified(api, candidate, stage))
+                content = stage / 'content'
+                marker, catalog = registry.validate_marker(content, candidate, run, expected, 'linux')
+                if marker != dict(registry.publication(expected), attempt=marker['attempt']):
+                    raise ValueError('Linux consumer requires its current run provenance')
+                requests = archives.identity.read_request(content / 'requests.json')
+                wanted_names = {n: r for n, r in requests.items()
+                                if n == scope or (scope == 'changed' and (n.startswith('changed-') or n == 'callback'))}
+                keys = {archives.identity.build_key(r['identity']) for r in wanted_names.values()}
+                complete = keys and all(key in catalog and any(a['name'] == catalog[key]['name'] and registry.live(a)
+                                                              for a in available) for key in keys)
+                if marker['attempt'] == attempt or complete:
+                    break  # An existing current producer is authoritative, even if partial.
+            else:
+                raise ValueError('required earlier producer variants not finalized; no consumer build fallback')
+            receipt.update(producer_attempt=marker['attempt'], consumer_attempt=attempt)
             requests = archives.identity.read_request(content / 'requests.json')
             for request in requests.values():
                 archives.validate_request(request)
@@ -277,48 +296,96 @@ def fetch(source, root, scope):
             storage.cleanup(initial_root)
 
 
-def check_expansion(bundle, request):
-    """Inspect real tar headers against the authenticated inventory before writing.
+def extract_stream(bundle, manifest, destination, zstd_archive):
+    """One bounded pass: authenticate every byte while writing a fresh target.
 
-    This Linux-only preflight streams decompression with bounded memory. It does
-    not create another expanded copy or replace nextest's relocation semantics.
+    No symlinks, special files, overwrites or unlisted expansion are permitted.
+    Preserve nextest metadata verbatim; run_nextest supplies both remap paths.
     """
-    manifest = archives.verify_bundle(bundle, request)
-    seen = {}
-
-    def inspect(tar):
+    destination.mkdir(parents=True, exist_ok=False)
+    seen, directories = set(), set()
+    allowed_directories = {parent.as_posix() for name in manifest['files'] for parent in Path(name).parents}
+    def extract(tar, report=False):
         for member in tar:
             name = member.name.rstrip('/')
-            archives.safe_join(bundle, name)
-            if member.isdir():
+            path = archives.safe_join(destination, name)
+            if member.isdir() and not report:
+                if name not in allowed_directories or name in directories or name in manifest['files']:
+                    raise ValueError('unlisted, duplicate or colliding archive directory')
+                directories.add(name)
+                path.mkdir(parents=True, exist_ok=True)
                 continue
             if not member.isfile() or name in seen:
                 raise ValueError('unsupported or duplicate expanded archive member')
             expected = manifest['files'].get(name)
-            if expected is None or member.size != expected['size']:
+            if expected is None or member.size != expected['size'] or member.size < 0:
                 raise ValueError('expanded archive member exceeds manifest inventory')
-            seen[name] = member.size
-
+            if report and (not name.startswith('target/') or path.suffix != '.so'):
+                raise ValueError('invalid coverage report object')
+            seen.add(name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha256()
+            with tar.extractfile(member) as incoming, path.open('xb') as output:
+                remaining = member.size
+                while remaining:
+                    chunk = incoming.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError('truncated expanded archive member')
+                    output.write(chunk); digest.update(chunk); remaining -= len(chunk)
+            if digest.hexdigest() != expected['sha256']:
+                raise ValueError('extracted file digest mismatch')
+            mode = member.mode & 0o777
+            if report:
+                # Match the existing Python data-filtered report-object extraction.
+                mode = (mode & 0o755) | 0o600
+                if not member.mode & 0o100:
+                    mode &= ~0o111
+            path.chmod(mode)
     archive = bundle / manifest['archive']
-    if request['recipe']['kind'] == 'test-archive':
-        with subprocess.Popen(['zstd', '-dq', '-c', str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+    if zstd_archive:
+        with subprocess.Popen(['zstd', '-dq', '-c', str(archive)], stdout=subprocess.PIPE) as process:
             try:
-                with tarfile.open(fileobj=process.stdout, mode='r|') as tar:
-                    inspect(tar)
+                with tarfile.open(fileobj=process.stdout, mode='r|', bufsize=1024 * 1024) as tar:
+                    extract(tar)
+                # Consume the authenticated stream through its checksum/footer.
+                while process.stdout.read(1024 * 1024):
+                    pass
+                if process.wait():
+                    raise ValueError('archive decompression failed')
             finally:
-                # Tar end markers can precede zstd stream padding. No output is
-                # written here; the authenticated compressed bytes were checked.
                 if process.poll() is None:
-                    process.terminate()
-                process.communicate()
+                    process.kill()
+                process.wait()
     else:
         with tarfile.open(archive, 'r:gz') as tar:
-            inspect(tar)
+            extract(tar)
     if 'report_archive' in manifest:
         with tarfile.open(bundle / manifest['report_archive']['name'], 'r:gz') as tar:
-            inspect(tar)
-    if seen != {name: item['size'] for name, item in manifest['files'].items()}:
+            extract(tar, report=True)
+    if seen != manifest['files'].keys():
         raise ValueError('expanded archive inventory is incomplete')
+
+
+def prepare_streamed(bundle, request, source, destination, *, env=None):
+    bundle, source, destination = (Path(p).resolve() for p in (bundle, source, destination))
+    started = time.monotonic()
+    manifest = archives.verify_bundle(bundle, request)
+    archives.check_source(source, manifest['identity'])
+    if archives.output([*archives.nextest_command(), '--version'], source, env) != manifest['identity']['tools']['nextest']:
+        raise ValueError('consumer nextest version differs from identity')
+    validation_seconds = time.monotonic() - started
+    started = time.monotonic()
+    is_nextest = request['recipe']['kind'] == 'test-archive'
+    extract_stream(bundle, manifest, destination, is_nextest)
+    runtime = archives.nextest_inventory(destination, source) if is_nextest else manifest['runtime']
+    if runtime != manifest['runtime']:
+        raise ValueError('archive runtime inventory mismatch')
+    if set(request['recipe']['companions']) - runtime['companions'].keys():
+        raise ValueError('archive missing required companions')
+    return {'source': str(source), 'target': str(destination / 'target'),
+            'producer_group': archives.identity.producer_group_key(manifest['identity']),
+            'runtime': runtime, 'extract_seconds': time.monotonic() - started,
+            'expansion_validation_seconds': validation_seconds}
 
 
 def prepare(source, root, names):
@@ -329,12 +396,13 @@ def prepare(source, root, names):
         request = requests[name]
         key = archives.identity.build_key(request['identity'])
         # No overwrite: a previous run's profraw or binaries must never leak in.
-        started = time.monotonic()
-        check_expansion(root / 'published' / key, request)
-        validation_seconds = time.monotonic() - started
-        prepared[name] = archives.prepare(root / 'published' / key, request, source, root / 'restored' / name, env=env)
-        prepared[name]['expansion_validation_seconds'] = validation_seconds
+        prepared[name] = prepare_streamed(root / 'published' / key, request, source, root / 'restored' / name, env=env)
         prepared[name]['request_key'] = key
+        progress = {n: {k: item[k] for k in ('request_key', 'extract_seconds', 'expansion_validation_seconds')}
+                    for n, item in prepared.items()}
+        pending = root / 'preparation-progress.tmp'
+        pending.write_text(json.dumps(progress, indent=2) + '\n')
+        pending.replace(root / 'preparation-progress.json')
     (root / 'prepared.json').write_text(json.dumps(prepared, indent=2) + '\n')
     return prepared
 
@@ -346,7 +414,9 @@ def run_coverage(source, root, scope):
     # can create runtime files. Callback execution remains a separate step.
     prepare_names = names + (['callback'] if scope == 'changed' and 'callback' in requests else [])
     prepared = prepare(source, root, prepare_names)
-    receipt = {'scope': scope, 'compiler_calls': 0, 'variants': {}}
+    download = json.loads((root / 'download.json').read_text()) if (root / 'download.json').is_file() else {}
+    receipt = {'scope': scope, 'compiler_calls': 0, 'variants': {},
+               'producer_attempt': download.get('producer_attempt'), 'consumer_attempt': download.get('consumer_attempt')}
     try:
         for name in names:
             item = prepared[name]
@@ -362,7 +432,8 @@ def run_coverage(source, root, scope):
             started = time.monotonic()
             compiler_only = bool(exclusion) and len(item['runtime']['tests']) == 1
             result = 0 if compiler_only else archives.run_nextest(item, args, env=env)
-            timing = {'test_seconds': time.monotonic() - started, 'extract_seconds': item['extract_seconds'], 'test_exit_code': result, 'fresh_compiler_gate': bool(exclusion)}
+            timing = {'test_seconds': time.monotonic() - started, 'extract_seconds': item['extract_seconds'], 'test_exit_code': result, 'producer_compiler_gate': bool(exclusion)}
+            timing['validation_seconds'] = item.get('expansion_validation_seconds', 0)
             timing['producer_test_inventory'] = COMPILER_TESTS if exclusion else []
             timing['compiler_only_selection'] = compiler_only
             receipt['variants'][name] = timing

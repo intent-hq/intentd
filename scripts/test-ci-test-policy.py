@@ -40,7 +40,7 @@ INDIRECT_TEST_STEPS = {
 }
 COMMAND = re.compile(
     r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
-    r"|python3 (?:-[IB] )*scripts/(?:ci-native-artifacts\.py libtest|ci-linux-artifacts\.py (?:test|coverage|callback)|test-daemon-lifecycle\.py --archives)\b"
+    r"|(?:python3 (?:-[IB] )*scripts/ci-consumer-process\.py -- )?python3 (?:-[IB] )*scripts/(?:ci-native-artifacts\.py libtest|ci-linux-artifacts\.py (?:test|coverage|callback)|test-daemon-lifecycle\.py --archives)\b"
     r"|\./scripts/(?:coverage-e2e|coverage-all|changed-tests)\.sh\b)"
 )
 
@@ -434,7 +434,7 @@ class CallbackDiscoveryTests(unittest.TestCase):
         cls.step = next(s for s in cls.job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
 
     def test_workflow_uses_compile_free_callback_consumer(self):
-        self.assertEqual(self.step["run"], "python3 -I -B scripts/ci-linux-artifacts.py callback")
+        self.assertEqual(self.step["run"], "python3 -I -B scripts/ci-consumer-process.py -- python3 -I -B scripts/ci-linux-artifacts.py callback")
         # Inventory, runtime policy and failure propagation are exercised against
         # the actual archive consumer in test-ci-linux-artifacts.py.
 

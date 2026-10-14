@@ -69,6 +69,15 @@ class StorageTests(unittest.TestCase):
                 storage.cleanup(root)
         self.assertTrue(root.exists())
 
+    def test_active_or_abandoned_consumer_prevents_cleanup(self):
+        root = storage.initialize(1)
+        (root / 'consumer-active.json').write_text('{"id":"owned-writer"}')
+        with patch.object(storage, 'stop_watch') as stop, patch.object(storage.shutil, 'rmtree') as remove:
+            with self.assertRaisesRegex(ValueError, 'consumer.*quiesc'):
+                storage.cleanup(root)
+            stop.assert_not_called(); remove.assert_not_called()
+        self.assertTrue(root.exists())
+
     def test_cleanup_waits_for_sampler_ack_before_removing_owned_root(self):
         root = storage.initialize(1)
         watch_id = 'a' * 32

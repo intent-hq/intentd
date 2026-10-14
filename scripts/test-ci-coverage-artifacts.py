@@ -60,7 +60,14 @@ class CoverageTests(unittest.TestCase):
             record = archives.produce([request], source, root / 'archive-target', root / 'published')[0]
             bundle = root / 'published' / record['key']
             run = root / 'run'
-            prepared = archives.prepare(bundle, request, source, run)
+            prepared = linux.prepare_streamed(bundle, request, source, run)
+            baseline_prepared = archives.prepare(bundle, request, source, root / 'nextest-baseline')
+            self.assertEqual(prepared['runtime'], baseline_prepared['runtime'])
+            self.assertEqual(archives.inventory_files(run), archives.inventory_files(root / 'nextest-baseline'))
+            for path in run.rglob('*'):
+                if path.is_file():
+                    self.assertEqual(path.stat().st_mode & 0o777,
+                        (root / 'nextest-baseline' / path.relative_to(run)).stat().st_mode & 0o777, str(path))
             runtime = dict(native.consumer_environment(root / 'guard'), LLVM_PROFILE_FILE=str(run / 'coverage-%p-%m.profraw'))
             self.assertEqual(archives.run_nextest(prepared, [], env=runtime), 0)
             self.assertEqual(coverage.report(bundle, prepared, request, 0)['exit_code'], 0)
@@ -174,7 +181,7 @@ pub fn uncalled() -> u8 {
             # exercise every branch, then only one branch: 80% must fail again.
             for label, selection, floor, expected in [('all', 'all()', 80, 0), ('partial', 'test(partial)', 80, 1), ('e2e-floor', 'test(partial)', 40, 0), ('low40', 'test(low)', 40, 1), ('low80', 'test(low)', 80, 1)]:
                 run = root / label
-                prepared = archives.prepare(bundle, request, consumer, run, env=native.consumer_environment(root / 'guard'))
+                prepared = linux.prepare_streamed(bundle, request, consumer, run, env=native.consumer_environment(root / 'guard'))
                 env = dict(native.consumer_environment(root / 'guard'), LLVM_PROFILE_FILE=str(run / 'coverage-%p-%m.profraw'), INTENTD_ASSERT_BOUND_CALLER='1')
                 self.assertEqual(archives.run_nextest(prepared, ['-E', selection, '--no-tests', 'fail'], env=env), 0)
                 self.assertTrue(list(run.glob('*.profraw')))
@@ -188,7 +195,7 @@ pub fn uncalled() -> u8 {
             # Both floors reject an actual low report; the isolated empty test
             # run writes zero profiles and must fail, never borrow prior data.
             run = root / 'empty'
-            prepared = archives.prepare(bundle, request, consumer, run, env=native.consumer_environment(root / 'guard'))
+            prepared = linux.prepare_streamed(bundle, request, consumer, run, env=native.consumer_environment(root / 'guard'))
             for floor in (40, 80):
                 with self.assertRaises(subprocess.CalledProcessError):
                     coverage.report(bundle, prepared, request, floor)

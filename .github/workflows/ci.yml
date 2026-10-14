@@ -1059,7 +1059,7 @@ jobs:
           NATIVE_REVIEW_FAILURE_DIR: ${{ steps.native-evidence.outputs.directory }}
         run: |
           cd ${{ github.workspace }}
-          python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-e2e
+          python3 -I -B scripts/ci-consumer-process.py -- python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-e2e
       - name: Validate native startup evidence
         id: native-evidence-check
         if: ${{ failure() && steps.native-evidence.outputs.directory != '' }}
@@ -1115,6 +1115,8 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
@@ -1269,7 +1271,7 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: |
           cd ${{ github.workspace }}
-          python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-all
+          python3 -I -B scripts/ci-consumer-process.py -- python3 -I -B scripts/ci-linux-artifacts.py coverage --scope coverage-all
       - name: Generate coverage summary
         if: always()
         run: |
@@ -1305,6 +1307,8 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
@@ -1549,13 +1553,13 @@ jobs:
         # test-ci-test-policy.py checks parity with this explicit CI setting.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: python3 -I -B scripts/ci-linux-artifacts.py coverage --scope changed
+        run: python3 -I -B scripts/ci-consumer-process.py -- python3 -I -B scripts/ci-linux-artifacts.py coverage --scope changed
       - name: Run callback fixture composition under llvm-cov
         if: steps.select.outputs.callback_fixture_changed == 'true'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_TEST_TIMEOUT_MULTIPLIER: "3"
-        run: python3 -I -B scripts/ci-linux-artifacts.py callback
+        run: python3 -I -B scripts/ci-consumer-process.py -- python3 -I -B scripts/ci-linux-artifacts.py callback
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
       # selection was empty or on burst runners, so this is a no-op there.
@@ -1568,6 +1572,8 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
@@ -1799,6 +1805,7 @@ jobs:
           python3 -I -B scripts/test-ci-test-artifacts.py
           python3 -I -B scripts/test-ci-artifact-reuse.py
           python3 -I -B scripts/test-ci-artifact-storage.py
+          python3 -I -B scripts/test-ci-consumer-process.py
           node --test scripts/test-ci-publish-variants.cjs
           python3 -I -B scripts/test-ci-coverage-artifacts.py
           python3 -I -B scripts/test-ci-linux-artifacts.py

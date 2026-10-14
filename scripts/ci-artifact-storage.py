@@ -106,6 +106,8 @@ def cleanup(root):
     slot = owner['slot']
     if slot and root.parent != Path(slot):
         raise ValueError('invalid artifact cleanup slot')
+    if (root / 'consumer-active.json').exists():
+        raise ValueError('consumer has not acknowledged quiescence; preserving owned storage')
     stop_watch(root)
     shutil.rmtree(root)
     if slot:

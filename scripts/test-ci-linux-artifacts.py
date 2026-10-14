@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Linux demand, gate mutations and archive-only callback execution contracts."""
 import copy
+import hashlib
+import io
+import tarfile
 import importlib.util
 import json
 import os
@@ -249,15 +252,14 @@ class LinuxTests(unittest.TestCase):
             def extract(bundle, request, checkout, destination, **kwargs):
                 self.assertFalse((source / 'default.profraw').exists(), 'preparation must precede runtime outputs')
                 prepared_names.append(destination.name)
-                return {'source': str(source), 'target': str(destination / 'target'), 'extract_seconds': 0.1, 'runtime': {}}
+                return {'source': str(source), 'target': str(destination / 'target'), 'extract_seconds': 0.1, 'expansion_validation_seconds': 0.2, 'runtime': {}}
             def execute(item, args, **kwargs):
                 self.assertEqual(prepared_names, ['changed-0', 'callback'])
                 (source / 'default.profraw').write_bytes(b'fresh runtime output')
                 return 0
             with mock.patch.dict(os.environ, {'CALLBACK_FIXTURE_TESTS': '\n'.join(names)}), \
                  mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \
-                 mock.patch.object(linux, 'check_expansion'), \
-                 mock.patch.object(linux.archives, 'prepare', side_effect=extract) as prepare, \
+                 mock.patch.object(linux, 'prepare_streamed', side_effect=extract) as prepare, \
                  mock.patch.object(linux.native, 'consumer_environment', return_value={}), \
                  mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
                  mock.patch.object(linux, 'compiler_exclusion', return_value=None), \
@@ -342,6 +344,57 @@ class LinuxTests(unittest.TestCase):
                             self.assertEqual(json.loads((root / 'receipt-callback.json').read_text())['compiler_calls'], 1)
                         else:
                             run.assert_not_called()
+
+
+class StreamExtractionTests(unittest.TestCase):
+    def fixture(self, root, members):
+        path = root / 'archive.tar.gz'
+        with tarfile.open(path, 'w:gz') as tar:
+            for name, data, kind in members:
+                member = tarfile.TarInfo(name); member.type = kind; member.mode = 0o755
+                member.size = len(data) if kind == tarfile.REGTYPE else 0
+                member.linkname = '/tmp/outside'
+                tar.addfile(member, io.BytesIO(data) if member.isfile() else None)
+        return {'archive': path.name, 'files': {'target/binary': {'size': 3, 'sha256': hashlib.sha256(b'abc').hexdigest()}}}
+
+    def test_stream_checks_written_bytes_and_preserves_executable_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self.fixture(root, [('target/binary', b'abc', tarfile.REGTYPE)])
+            linux.extract_stream(root, manifest, root / 'out', False)
+            self.assertEqual((root / 'out/target/binary').read_bytes(), b'abc')
+            self.assertEqual((root / 'out/target/binary').stat().st_mode & 0o777, 0o755)
+            with self.assertRaises(FileExistsError):
+                linux.extract_stream(root, manifest, root / 'out', False)
+
+    def test_directories_are_limited_to_unique_manifest_ancestors(self):
+        for directories in ([('outside-inventory', b'', tarfile.DIRTYPE)],
+                            [('target', b'', tarfile.DIRTYPE)] * 2):
+            with self.subTest(directories=directories), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = self.fixture(root, directories + [('target/binary', b'abc', tarfile.REGTYPE)])
+                with self.assertRaisesRegex(ValueError, 'directory'):
+                    linux.extract_stream(root, manifest, root / 'out', False)
+                self.assertFalse((root / 'out/outside-inventory').exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = self.fixture(root, [('target', b'', tarfile.DIRTYPE), ('target/binary', b'abc', tarfile.REGTYPE)])
+            linux.extract_stream(root, manifest, root / 'out', False)
+            self.assertEqual((root / 'out/target/binary').read_bytes(), b'abc')
+
+    def test_stream_rejects_tamper_oversize_missing_links_duplicates_and_escape(self):
+        cases = [[('target/binary', b'abd', tarfile.REGTYPE)],
+                 [('target/binary', b'abcd', tarfile.REGTYPE)], [],
+                 [('target/binary', b'', tarfile.SYMTYPE)], [('target/binary', b'', tarfile.LNKTYPE)],
+                 [('target/binary', b'abc', tarfile.REGTYPE)] * 2,
+                 [('../escape', b'abc', tarfile.REGTYPE)],
+                 [('target/unexpected', b'abc', tarfile.REGTYPE)]]
+        for members in cases:
+            with self.subTest(members=members), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); manifest = self.fixture(root, members)
+                with self.assertRaises(ValueError):
+                    linux.extract_stream(root, manifest, root / 'out', False)
+                self.assertFalse((root / 'escape').exists())
 
 
 if __name__ == '__main__':
