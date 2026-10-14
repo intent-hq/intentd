@@ -722,12 +722,6 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
-        if: needs.release-fast-path.outputs.fast_path != 'true'
-        shell: bash
-        env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
       # runner's Windows-path step scripts. Prepend Git's bin dir so every
@@ -736,6 +730,12 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure Depot managed compiler cache
+        if: needs.release-fast-path.outputs.fast_path != 'true'
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
       # self-hosted runners are single-slot, so no $RUNNER_NAME key. On the
@@ -2097,11 +2097,6 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
-        shell: bash
-        env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
       # runner's Windows-path step scripts. Prepend Git's bin dir so every
@@ -2110,6 +2105,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
       # Fail-fast disk preflight — see the `check` job's comment for the full

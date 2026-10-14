@@ -386,6 +386,13 @@ class LifecycleCacheTests(unittest.TestCase):
         self.assertEqual(len(matches), 1, name)
         return matches[0]
 
+    def test_windows_shell_is_ready_before_cache_setup(self):
+        for name in ('build', 'daemon-lifecycle'):
+            steps = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs'][name]['steps']
+            setup = next(i for i, step in enumerate(steps) if step.get('name') == 'Configure Depot managed compiler cache')
+            git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
+            self.assertLess(git_bash, setup, name)
+
     def test_managed_cache_covers_all_routed_runners(self):
         cache = self.step("Configure Depot managed compiler cache")
         self.assertEqual(cache["run"], "python3 scripts/setup-depot-sccache.py")
