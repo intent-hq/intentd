@@ -106,6 +106,8 @@ jobs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
+      coverage_changed_labels: ${{ steps.decide.outputs.coverage_changed_labels }}
+      coverage_changed_burst: ${{ steps.decide.outputs.coverage_changed_burst }}
       windows_labels: ${{ steps.decide.outputs.windows_labels }}
       windows_burst: ${{ steps.decide.outputs.windows_burst }}
       macos_labels: ${{ steps.decide.outputs.macos_labels }}
@@ -256,6 +258,18 @@ jobs:
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
+            // PR #2419: run the unchanged required coverage job on supported
+            // hosted capacity after tinybox timed out (actions/runs/38523051774).
+            // Keep all other Linux jobs and events on their existing routes.
+            const coveragePr = context.payload?.pull_request;
+            const startupCoverageHosted = context.eventName === "pull_request" &&
+              coveragePr?.number === 2419 &&
+              coveragePr.head?.ref === "fix/indexing-startup-progress" &&
+              coveragePr.head?.repo?.full_name === "intent-hq/intentd";
+            const coverageChangedBurst = useBurst || startupCoverageHosted;
+            core.info(`coverage-changed routing: burst=${coverageChangedBurst} (startup PR=${startupCoverageHosted})`);
+            core.setOutput("coverage_changed_labels", JSON.stringify(coverageChangedBurst ? burst : tinybox));
+            core.setOutput("coverage_changed_burst", String(coverageChangedBurst));
             // Windows (intent-hq/intent#5518): 5090pc is a single-slot
             // runner whose only CI consumer is the build job's Windows
             // entry, so an online runner is selected outright — no queue
@@ -1489,7 +1503,7 @@ jobs:
   coverage-changed:
     needs: route
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.coverage_changed_labels) }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -1584,7 +1598,7 @@ jobs:
       # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
       # outside the work dir" below), so the own-dir skip must name it.
       - name: Disk-space preflight (tinybox only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.coverage_changed_burst != 'true'
         env:
           NEED_GIB: 30
           JOB_TARGET_SUBDIR: coverage-e2e
@@ -1641,7 +1655,7 @@ jobs:
       # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
       # step (intent-hq/intent#5256); released by the job's last step.
       - name: Point CARGO_TARGET_DIR outside the work dir
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.coverage_changed_burst != 'true'
         run: |
           target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
           echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
@@ -1664,7 +1678,7 @@ jobs:
       # exact hit, so a partial cache saved here would shadow the full
       # coverage-e2e cache until the lockfile changes.
       - name: Rust cache (burst runner only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst == 'true'
+        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.coverage_changed_burst == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gh-burst-coverage-changed
@@ -1690,7 +1704,7 @@ jobs:
       - name: Key install-action dirs per runner slot
         if: steps.select.outputs.has_selection == 'true'
         run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
+          if [[ "${{ needs.route.outputs.coverage_changed_burst }}" == "true" ]]; then
             echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
           else
             echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"

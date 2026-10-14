@@ -388,6 +388,55 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     row = next(r for r in job["strategy"]["matrix"]["include"] if r[field] == value)
                     self.assertEqual(matrix_labels(row["os"], outputs), expected)
 
+    def test_startup_coverage_route_is_pr_only_and_preserves_other_routes(self):
+        pr = {"number": 2419, "head": {"ref": "fix/indexing-startup-progress",
+                                             "repo": {"full_name": "intent-hq/intentd"}}}
+        cases = [
+            ({"eventName": "pull_request", "payload": {"pull_request": pr}}, True),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "number": 2415}}}, False),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "ref": "other"}}}}, False),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "repo": {"full_name": "outside/intentd"}}}}}, False),
+            ({"eventName": "push", "ref": "refs/heads/fix/indexing-startup-progress"}, False),
+            ({"eventName": "merge_group", "payload": {"merge_group": {
+                "head_ref": "refs/heads/gh-readonly-queue/main/pr-2419-" + "a" * 40}}}, False),
+            ({"eventName": "pull_request", "payload": {}}, False),
+        ]
+        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        for event_context, forced in cases:
+            for available in (fleet, []):
+                with self.subTest(context=event_context, available=bool(available)):
+                    outputs = route_outputs(self.workflow, run_route(
+                        self.workflow, org=available, context=event_context)["outputs"])
+                    hosted = forced or not available
+                    self.assertEqual(json.loads(outputs["coverage_changed_labels"]),
+                                     ["gh-linux-16x"] if hosted else ["self-hosted", "Linux", "X64"])
+                    self.assertEqual(outputs["coverage_changed_burst"], str(hosted).lower())
+                    self.assertEqual(json.loads(outputs["linux_labels"]),
+                                     ["self-hosted", "Linux", "X64"] if available else ["gh-linux-16x"])
+                    self.assertEqual(json.loads(outputs["check_labels"]),
+                                     ["self-hosted", "Linux", "X64"] if available else ["gh-linux-8x"])
+                    self.assertEqual(outputs["linux_burst"], str(not available).lower())
+
+    def test_coverage_route_pairs_runner_with_cache_and_install_home(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        self.assertEqual(job["runs-on"], "${{ fromJSON(needs.route.outputs.coverage_changed_labels) }}")
+        steps = {s.get("name"): s for s in job["steps"]}
+        for hosted in (True, False):
+            for selected in (True, False):
+                values = {"needs.route.outputs.coverage_changed_burst": str(hosted).lower(),
+                          "needs.route.outputs.linux_burst": str(not hosted).lower()}
+                for name, expected in (("Disk-space preflight (tinybox only)", not hosted),
+                                       ("Point CARGO_TARGET_DIR outside the work dir", not hosted),
+                                       ("Rust cache (burst runner only)", hosted)):
+                    expression = steps[name]["if"].replace("steps.select.outputs.has_selection", repr(str(selected).lower()))
+                    self.assertEqual(condition(expression, values), selected and expected)
+        home = steps["Key install-action dirs per runner slot"]["run"]
+        self.assertIn("needs.route.outputs.coverage_changed_burst", home)
+        self.assertNotIn("needs.route.outputs.linux_burst", str(job))
+        for name, other in self.workflow["jobs"].items():
+            if name not in ("route", "coverage-changed"):
+                self.assertNotIn("coverage_changed_", str(other), name)
+
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
