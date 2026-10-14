@@ -147,12 +147,13 @@ Read current state and respect the user's requested scope.
 
 ## Start or continue work
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
-labels show only the repository name. Local repositories show their name or path.
-Repository-specific views identify the repository in the page heading.
+labels show only the repository name. Narrow lists hide the row label; the selected
+workspace's preview header shows its repository. Local repositories show their name
+or path. Repository-specific views identify the repository in the page heading.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
