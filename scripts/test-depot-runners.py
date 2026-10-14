@@ -57,6 +57,23 @@ class DepotRunners(unittest.TestCase):
         self.assertEqual(len(apply), 1)
         self.assertEqual(apply[0]['if'], "github.event_name == 'schedule' || inputs.apply")
 
+    def test_windows_maintenance_build_is_opt_in_after_cleanup(self):
+        doc = yaml.safe_load((ROOT / '.github/workflows/windows-prune.yml').read_text())
+        events = doc.get('on', doc.get(True))
+        for event in ('workflow_dispatch', 'workflow_call'):
+            self.assertFalse(events[event]['inputs']['verify_build']['default'])
+        steps = doc['jobs']['prune']['steps']
+        cleanup = next(i for i, step in enumerate(steps) if '--apply' in step.get('run', ''))
+        build = next(i for i, step in enumerate(steps) if 'cargo build --locked -p intentd' in step.get('run', ''))
+        cache = next(i for i, step in enumerate(steps) if 'scripts/setup-depot-sccache.py' in step.get('run', ''))
+        self.assertLess(cleanup, cache)
+        self.assertLess(cache, build)
+        for step in steps[cleanup+1:]:
+            self.assertEqual(step['if'], 'inputs.apply && inputs.verify_build')
+        dispatcher = yaml.safe_load((ROOT / '.github/workflows/macos-prune.yml').read_text())
+        self.assertEqual(dispatcher['jobs']['windows']['with']['verify_build'], '${{ inputs.verify_build }}')
+        self.assertEqual(dispatcher['jobs']['windows']['secrets'], 'inherit')
+
     def test_compiling_jobs_configure_managed_cache(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
         for name in ['check', 'build', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:

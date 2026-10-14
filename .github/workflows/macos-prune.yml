@@ -15,6 +15,10 @@ on:
         description: Delete inactive CI artifacts (otherwise dry run)
         type: boolean
         default: false
+      verify_build:
+        description: Verify a Windows build after applying cleanup (5090pc only)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -37,3 +41,5 @@ jobs:
     uses: ./.github/workflows/windows-prune.yml
     with:
       apply: ${{ inputs.apply }}
+      verify_build: ${{ inputs.verify_build }}
+    secrets: inherit

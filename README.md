@@ -884,10 +884,13 @@ it from this branch without merging:
 
 ```sh
 gh workflow run macos-prune.yml --repo intent-hq/intentd --ref ci/depot-managed-cache -f runner=5090pc -f apply=false
-# Inspect the dry-run, then use the same command with -f apply=true.
+# Inspect the dry-run, then use -f apply=true -f verify_build=true.
 ```
 
 Once available on main, invoke `windows-prune.yml` directly. After cleanup,
 verify a self-hosted Windows build before removing the maintenance routing
-variable documented above. The cleanup log reports actual free bytes before
+variable documented above. The optional `verify_build=true` input compiles the
+real daemon with the pinned Rust toolchain after a successful apply; it has no
+effect on dry runs. It uses Depot managed sccache when `DEPOT_TOKEN` is configured.
+The cleanup log reports actual free bytes before
 and after deletion; a rebuild repopulates any evicted debug cache.
