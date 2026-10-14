@@ -619,11 +619,11 @@ fn rebuild_impl<'a>(
                     .name("startup-note-projection".into())
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || {
-                        let result = (|| {
-                            #[cfg(all(unix, debug_assertions))]
-                            crate::startup_test_gate::projection()?;
-                            Ok::<_, Error>(project_content(&source, entries))
-                        })();
+                        #[cfg(all(unix, debug_assertions))]
+                        let result = crate::startup_test_gate::projection()
+                            .map(|()| project_content(&source, entries));
+                        #[cfg(not(all(unix, debug_assertions)))]
+                        let result = Ok::<_, Error>(project_content(&source, entries));
                         let _ = send.send(result);
                     })
                     .map_err(|e| Error::Internal(format!("note projection thread: {e}")))?;
