@@ -2475,6 +2475,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "trybuild",
  "uuid",
