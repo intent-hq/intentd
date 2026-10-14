@@ -486,7 +486,8 @@ def run_coverage(source, root, scope):
             run = Path(item['target']).parent
             # Source-scanning tests legitimately query Cargo metadata. The same
             # strict report guards permit those read-only probes, never builds.
-            env = dict(coverage.report_environment(root), LLVM_PROFILE_FILE=str(run / 'intentd-%p-%32m.profraw'),
+            pattern = 'intent-%8m.profraw' if scope == 'coverage-all' else 'intentd-%p-%32m.profraw'
+            env = dict(coverage.report_environment(root), LLVM_PROFILE_FILE=str(run / pattern),
                        INTENTD_ASSERT_BOUND_CALLER='1', INTENTD_TEST_TIMEOUT_MULTIPLIER='3')
             args = [] if scope == 'coverage-all' else ['-E', 'kind(test) and not binary(intentd) and not binary(auggie_context_e2e)' if scope == 'coverage-e2e' else 'not binary(auggie_context_e2e)']
             exclusion = compiler_exclusion(root, name, requests[name], item)

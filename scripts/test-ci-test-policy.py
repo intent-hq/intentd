@@ -199,6 +199,20 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn("has_selection=" + expected, output)
                 self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
 
+    def test_profile_pool_proof_stays_in_producer_and_consumers_keep_budget(self):
+        job = self.workflow['jobs']['check']
+        proof = [s for s in job['steps'] if 'scripts/test-coverage-profile-pool.py' in s.get('run', '')]
+        self.assertEqual(len(proof), 1)
+        self.assertIn('LLVM_PROFILE_FILE_NAME="intent-%8m.profraw"', proof[0]['run'])
+        self.assertIn('ci-linux-artifacts.py produce', proof[0]['run'])
+        self.assertNotIn('if', proof[0])
+        self.assertNotIn('continue-on-error', proof[0])
+        for name in ('coverage-all', 'coverage-e2e', 'coverage-changed'):
+            consumer = self.workflow['jobs'][name]
+            self.assertEqual(consumer['timeout-minutes'], 30)
+            self.assertFalse(any('test-coverage-profile-pool.py' in s.get('run', '') for s in consumer['steps']))
+        self.assertEqual(self.workflow['jobs']['coverage-all']['env']['LLVM_PROFILE_FILE_NAME'], 'intent-%8m.profraw')
+
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
             ("Retained workspace CoW fixtures (macOS runtime)", 6),

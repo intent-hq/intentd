@@ -31,6 +31,20 @@ WORKFLOW = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
 
 
 class LinuxTests(unittest.TestCase):
+    def test_full_scope_uses_upstream_bounded_profile_pool_in_fresh_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'requests.json').write_text(json.dumps({'coverage-all': {}}))
+            item = {'target': str(root / 'restored/coverage-all/target'), 'extract_seconds': 0}
+            with mock.patch.object(linux, 'prepare', return_value={'coverage-all': item}), \
+                 mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
+                 mock.patch.object(linux, 'compiler_exclusion', return_value=None), \
+                 mock.patch.object(linux.archives, 'run_nextest', return_value=100) as run:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    linux.run_coverage(ROOT, root, 'coverage-all')
+                pattern = run.call_args.kwargs['env']['LLVM_PROFILE_FILE']
+                self.assertEqual(pattern, str(root / 'restored/coverage-all/intent-%8m.profraw'))
+
     def test_real_source_lint_root_uses_relocated_checkout_not_producer_decoy(self):
         with tempfile.TemporaryDirectory(prefix='intent-lint-relocation-') as tmp:
             root = Path(tmp)

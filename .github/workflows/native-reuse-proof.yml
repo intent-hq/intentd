@@ -23,6 +23,8 @@ jobs:
   reuse:
     if: github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/native-artifacts.yml
+    secrets:
+      DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
     with:
       platform: linux
-      runner_labels: '["gh-linux-16x"]'
+      runner_labels: '["depot-ubuntu-24.04-16"]'

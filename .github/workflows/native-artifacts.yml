@@ -1,6 +1,9 @@
 name: Native artifacts
 on:
   workflow_call:
+    secrets:
+      DEPOT_TOKEN:
+        required: false
     inputs:
       platform:
         required: true
@@ -38,6 +41,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Select native proof demand
         id: native-scope
         shell: bash
@@ -153,12 +161,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.143
-      - name: Rust cache (GitHub-hosted runner only)
-        if: ${{ !contains(fromJSON(inputs.runner_labels), 'self-hosted') }}
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: daemon-lifecycle-${{ inputs.platform }}
-          workspaces: . -> ${{ env.NATIVE_CACHE_TARGET }}
       - name: Produce native archives in one shared target
         shell: bash
         env:
