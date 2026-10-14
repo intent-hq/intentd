@@ -172,4 +172,7 @@
     ls -l "$dest"
 # Main and release builds share compiler entries through Depot managed sccache.
 - name: Configure Depot managed compiler cache
-  uses: ./.github/actions/release-rust-cache
+  shell: bash
+  env:
+    DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+  run: python3 scripts/setup-depot-sccache.py

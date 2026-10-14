@@ -153,7 +153,10 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # Main and release builds share Depot managed compiler entries.
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Build (cargo)
         if: ${{ !matrix.zigbuild }}
         shell: bash

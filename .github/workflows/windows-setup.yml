@@ -54,10 +54,10 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-msvc
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-build-x86_64-pc-windows-msvc
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Test cursor parser
         run: |
           mkdir -p setup-headless-evidence

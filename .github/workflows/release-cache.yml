@@ -19,7 +19,7 @@ name: Warm release Rust caches
     - '**/*.cpp'
     - '**/*.h'
     - .github/dist-build-setup.yml
-    - .github/actions/release-rust-cache/**
+    - scripts/setup-depot-sccache.py
     - .github/workflows/release-cache.yml
     - .github/workflows/release-sitter.yml
     - scripts/*release*cache*.py
@@ -189,7 +189,10 @@ jobs:
       shell: bash
       run: ${{ matrix.packages_install }}
     - name: Configure Depot managed compiler cache
-      uses: ./.github/actions/release-rust-cache
+      shell: bash
+      env:
+        DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+      run: python3 scripts/setup-depot-sccache.py
     - name: Build cache inputs
       shell: bash
       run: |
@@ -240,7 +243,10 @@ jobs:
         mkdir -p "$HOME/.local/bin"
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     - name: Configure Depot managed compiler cache
-      uses: ./.github/actions/release-rust-cache
+      shell: bash
+      env:
+        DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+      run: python3 scripts/setup-depot-sccache.py
     - name: Build (cargo)
       if: ${{ !matrix.zigbuild }}
       shell: bash

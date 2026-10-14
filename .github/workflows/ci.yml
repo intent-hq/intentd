@@ -44,20 +44,64 @@ permissions:
   contents: read
   pull-requests: read
 
-# Cancel superseded PR runs; main and merge-queue runs finish independently.
+env:
+  # Burst the Linux jobs to Depot larger runners when more than
+  # this many Linux jobs are queued/running ahead of this run (see the
+  # route job). tinybox runs 8 concurrent runner slots, so the threshold
+  # tolerates one queued/running job per slot before bursting. Note that
+  # jobs still blocked on `needs` are invisible to the jobs API, so only
+  # check/coverage jobs already released to tinybox (queued or running
+  # there) count toward the depth. Bursted jobs don't carry the
+  # self-hosted+Linux labels and stop counting toward the depth, so the
+  # system naturally falls back to tinybox as it frees up.
+  LINUX_BURST_THRESHOLD: 8
 
+# The heavy jobs share the tinybox's 8 self-hosted runner slots, so cancel
+# superseded PR runs instead of letting them back up the queue (push-to-main
+# runs are never cancelled).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Depot selection is deterministic; no runner-inventory credentials are needed.
+  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
+  # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
+  # Depot larger runners otherwise. Runs on a Depot runner so
+  # the burst decision is independent of the tinybox queue: when the probe
+  # ran on tinybox it queued behind the very backlog it measures (and
+  # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:
+  # tinybox is only selected when the probe positively confirms an online
+  # self-hosted Linux runner AND an acceptable queue depth — any API error,
+  # missing permission, or an offline fleet routes to the burst runners, so
+  # CI cannot queue-deadlock when the fleet is down. If the job itself fails
+  # (timeout), the routed Linux jobs are skipped and need a re-run — a
+  # deliberate trade-off. The same probe also places the build job's Windows
+  # matrix entry (intent-hq/intent#5518): the self-hosted 5090pc runner when
+  # it is confirmed online, the org-hosted depot-windows-2022-16 runner otherwise —
+  # same fail-open rule, no queue-depth check (5090pc is single-slot).
+  # Both macOS native consumers use m1mac only when an online, idle ARM64
+  # runner is confirmed; otherwise they use Depot macos-15 (ARM64).
   route:
+    # Runs on push / merge_group / same-repo pull_request. Linux PR checks
+    # consume its decision; the native build entries use it on push and
+    # merge_group (intent-hq/intent#5518). On push its Linux consumers
+    # (check / coverage-e2e / coverage-all / coverage-changed) are
+    # push-skipped by their own `if`s (see the `on: push` comment), so only
+    # the native build decisions are used there.
+    # Skipped on fork PRs (see the `pull_request` trigger comment): route's
+    # skip cascades over the needs chain, skipping check / coverage-e2e /
+    # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
+    # Runs on merge_group (see the trigger comment) — merge groups come from
+    # the repo's own ruleset, so no same-repo guard applies there.
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
+      # Reads the Actions queue; job-level so the other jobs don't inherit
+      # it (the optional cross-repo CI_QUEUE_READ_TOKEN is likewise only
+      # exposed to this job).
+      actions: read
     outputs:
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
@@ -69,15 +113,193 @@ jobs:
     steps:
       - id: decide
         uses: actions/github-script@v9
+        env:
+          THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
         with:
+          # tinybox serves several repos on its runner slots, so the probe
+          # wants to size the queue across all of them — but the default
+          # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
+          # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
+          # on the sibling repos) to enable cross-repo counting; without
+          # it those repos are skipped and contribute 0. Routing to tinybox
+          # additionally requires the token to list the tinybox fleet: the
+          # runners are registered at the ORG level (shared across the
+          # repos via a runner group), so the token needs the org-level
+          # "Self-hosted runners" read permission for the org list to
+          # succeed. The default GITHUB_TOKEN cannot carry that permission,
+          # so without a suitably-scoped CI_QUEUE_READ_TOKEN the org list
+          # errors and the probe falls back to this repo's own runner list
+          # (fine-grained "Administration" repository permission, read) —
+          # currently empty, so every run bursts (safe: burst is the
+          # fail-open default; it just never uses tinybox).
+          github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
-            core.setOutput("linux_labels", JSON.stringify(["depot-ubuntu-24.04-16"]));
-            core.setOutput("check_labels", JSON.stringify(["depot-ubuntu-24.04-8"]));
-            core.setOutput("windows_labels", JSON.stringify(["depot-windows-2022-16"]));
-            core.setOutput("macos_labels", JSON.stringify(["depot-macos-15"]));
-            core.setOutput("linux_burst", "true");
-            core.setOutput("windows_burst", "true");
-            core.setOutput("macos_burst", "true");
+            const tinybox = ["self-hosted", "Linux", "X64"];
+            // The coverage jobs run the whole instrumented suite, so they
+            // burst to the biggest Depot Linux runner (16-core); check
+            // (fmt + clippy + a couple of tests) doesn't come close to
+            // saturating that, so it bursts to a cheaper 8-core runner
+            // instead.
+            const burst = ["depot-ubuntu-24.04-16"];
+            const checkBurst = ["depot-ubuntu-24.04-8"];
+            // The Windows build entry: the self-hosted 5090pc runner, or
+            // the org-hosted 16-core Windows runner (the one
+            // release-sitter.yml builds on) — cold workspace Clippy
+            // is slow on the 4-core windows-latest
+            // image.
+            const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
+            const windowsBurst = ["depot-windows-2022-16"];
+            const macosSelfHosted = ["self-hosted", "macOS", "ARM64"];
+            // Pinned standard Apple Silicon image, not macos-15-intel.
+            const macosBurst = ["depot-macos-15"];
+            const threshold = parseInt(process.env.THRESHOLD || "8", 10);
+            // FAIL OPEN TO BURST: tinybox is only selected when the probe
+            // positively confirms (a) an online self-hosted Linux runner
+            // visible to this repo (org-level list, or the repo-level
+            // fallback) and (b) a queue depth within the threshold. Any
+            // probe error — including a token that cannot list runners —
+            // routes to burst, so CI cannot queue-deadlock when the fleet
+            // is offline or unreadable. The Windows decision below shares
+            // the runner list and rule (a); it has no queue-depth rule.
+            //
+            // The self-hosted runners are registered at the ORG level
+            // (shared across the repos via a runner group), so probe the
+            // org runner list first. That call needs the org-level
+            // "Self-hosted runners" read permission on the token (see the
+            // github-token comment above); when it errors, fall back to
+            // the repo-level list, which only sees repo-registered
+            // runners (currently none — the degraded mode keeps
+            // bursting). An empty list still routes to burst by design
+            // (never deadlock on an invisible fleet).
+            // NOTE: the org list is NOT scoped to the runner groups this
+            // repo can access, so the probe assumes every online
+            // self-hosted+Linux+X64 org runner is the tinybox fleet in a
+            // group visible to this repo (and likewise every online
+            // self-hosted+Windows+X64 runner is 5090pc and every
+            // self-hosted+macOS+ARM64 runner is m1mac). Ops invariant:
+            // keep the fleet's group visible to the CI repos, and never
+            // register generically-labeled org runners outside it — a
+            // matching but inaccessible runner would route jobs onto
+            // labels nothing can serve. (Group-scoped listing via the
+            // runner-groups API was considered and rejected: it needs
+            // extra calls per group and fails on plans without
+            // runner-group support, which would silently regress the
+            // probe to always-burst.)
+            let runners = null;
+            let runnerSource = "org";
+            let runnerListError = null;
+            try {
+              try {
+                runners = await github.paginate(
+                  github.rest.actions.listSelfHostedRunnersForOrg,
+                  { org: context.repo.owner, per_page: 100 }
+                );
+              } catch (e) {
+                core.info(`org runner list failed (${e.message}); falling back to repo-level list`);
+                runnerSource = "repo";
+                runners = await github.paginate(
+                  github.rest.actions.listSelfHostedRunnersForRepo,
+                  { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+                );
+              }
+            } catch (e) {
+              runnerListError = e;
+            }
+            const onlineWith = (labels, ignoreCase = false) => (runners || []).filter(r =>
+              r.status === "online" &&
+              labels.every(l => (r.labels || []).some(x => ignoreCase
+                ? typeof x.name === "string" && x.name.toLowerCase() === l.toLowerCase()
+                : x.name === l))
+            );
+            let useBurst = true;
+            let reason = "fail-open default";
+            try {
+              if (runnerListError) throw runnerListError;
+              const online = onlineWith(tinybox);
+              if (online.length === 0) {
+                reason = `no online self-hosted Linux runner (${runnerSource} list)`;
+              } else {
+                // Count self-hosted Linux jobs that are queued or running in
+                // queued/in-progress runs: a running job occupies a tinybox
+                // slot just as much as a queued one. Depot jobs
+                // — including this route job and bursted heavy jobs — don't
+                // match the self-hosted+Linux label filter, so they never
+                // inflate the depth. Sibling-repo probe failures are the
+                // documented degraded mode (skip, contribute 0); a failure
+                // on this repo's own probe means the depth is unknowable,
+                // so it rethrows into the fail-open burst path.
+                const owner = context.repo.owner;
+                const repos = ["intentd", "cloudlands-fe", "monorepo"];
+                let depth = 0;
+                for (const repo of repos) {
+                  try {
+                    for (const status of ["queued", "in_progress"]) {
+                      const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
+                      for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
+                        const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
+                        depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
+                      }
+                    }
+                  } catch (e) {
+                    if (repo === context.repo.repo) throw e;
+                    core.info(`queue probe skipped ${repo}: ${e.message}`);
+                  }
+                }
+                useBurst = depth > threshold;
+                reason = `queue depth=${depth} threshold=${threshold} online=${online.length} (${runnerSource} list)`;
+              }
+            } catch (e) {
+              useBurst = true;
+              reason = `probe failed (${e.message})`;
+            }
+            core.info(`linux routing: burst=${useBurst} (${reason})`);
+            core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
+            core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
+            core.setOutput("linux_burst", String(useBurst));
+            // Windows (intent-hq/intent#5518): 5090pc is a single-slot
+            // runner whose only CI consumer is the build job's Windows
+            // entry, so an online runner is selected outright — no queue
+            // depth to weigh. Offline, invisible, or unreadable → burst.
+            let windowsUseBurst = true;
+            let windowsReason = "fail-open default";
+            try {
+              if (runnerListError) throw runnerListError;
+              const online = onlineWith(windowsSelfHosted);
+              if (online.length === 0) {
+                windowsReason = `no online self-hosted Windows runner (${runnerSource} list)`;
+              } else {
+                windowsUseBurst = false;
+                windowsReason = `online=${online.length} (${runnerSource} list)`;
+              }
+            } catch (e) {
+              windowsUseBurst = true;
+              windowsReason = `probe failed (${e.message})`;
+            }
+            core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
+            core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
+            core.setOutput("windows_burst", String(windowsUseBurst));
+            // macOS has no queue budget: only explicit idle availability
+            // selects self-hosted. Missing busy state is not proof of a
+            // free slot. Labels are case-insensitive in Actions; keep the
+            // existing Linux/Windows matching semantics above unchanged.
+            let macosUseBurst = true;
+            let macosReason = "fail-open default";
+            try {
+              if (runnerListError) throw runnerListError;
+              const idle = onlineWith(macosSelfHosted, true).filter(r => r.busy === false);
+              if (idle.length === 0) {
+                macosReason = `no idle online self-hosted macOS ARM64 runner (${runnerSource} list)`;
+              } else {
+                macosUseBurst = false;
+                macosReason = `idle=${idle.length} (${runnerSource} list)`;
+              }
+            } catch (e) {
+              macosUseBurst = true;
+              macosReason = `probe failed (${e.message})`;
+            }
+            core.info(`macos routing: burst=${macosUseBurst} (${macosReason})`);
+            core.setOutput("macos_labels", JSON.stringify(macosUseBurst ? macosBurst : macosSelfHosted));
+            core.setOutput("macos_burst", String(macosUseBurst));
 
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
@@ -99,34 +321,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
-      # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
-      # slots share one /raid CI-scratch volume, and the per-slot persistent
-      # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
-      # can fill it — a full volume kills jobs mid-run with ENOSPC. If free
-      # space is below the job's threshold, self-prune in two tiers: first
-      # stale per-slot ci-target dirs (mtime older than 2 days, oldest
-      # first), then — a heavy CI day fills /raid with dirs too fresh for
-      # any age window (the 2026-08-20/08-21 exhaustions: 0 GiB free, every
-      # dir <2 days old, so the stale pass freed nothing and could only
-      # fail) — LRU-evict idle dirs regardless of age until this job's need
-      # is met — the same rails as tinybox-prune.yml's LRU pass, ordered
-      # like the emergency purge that recovered both incidents (intentd
-      # run 32447747968): by the dir's own top-level mtime, not the
-      # prune's recursive last-activity key. Rails in both tiers (selection
-      # lives in scripts/ci-target-slot.sh purge-candidates, shared with
-      # its tests): never anything outside /raid/ci-target (shared caches
-      # like ~/.cargo and ~/.rustup are untouched), never a dir this job
-      # may use, never a dir carrying a fresh `.in-use` marker (written by
-      # every tinybox job's CARGO_TARGET_DIR step and released at job end —
-      # intent-hq/intent#5256; a quiet compile phase can no longer make a
-      # live dir look idle), and recursive-mtime freshness/activity checks
-      # so an unmarked dir a live job is writing to is not deleted either.
-      # Fails with an actionable message if space is still short.
-      # Thresholds: 10 GiB here (small target dir with debuginfo off),
-      # 30 GiB for the instrumented coverage jobs. Exact no-op on burst
-      # runners (step skipped). tinybox-prune.yml does the routine
-      # scheduled pruning; this is only the emergency backstop.
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -243,13 +444,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - name: Rust cache (burst runner only)
-        if: needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-check
       - name: Format check
         run: cargo fmt --check
       - name: Acquire the shared transfer selection contract
@@ -529,8 +723,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
         if: needs.release-fast-path.outputs.fast_path != 'true'
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
       # runner's Windows-path step scripts. Prepend Git's bin dir so every
@@ -573,11 +770,6 @@ jobs:
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
       # burst-runner caching; pure overhead on the self-hosted runners).
-      - name: Rust cache (GitHub-hosted runner only)
-        if: ${{ needs.release-fast-path.outputs.fast_path != 'true' && !contains(matrix.os, 'self-hosted') }}
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-build-${{ matrix.target }}
       # Keep the production configuration check separate from all-target
       # Clippy: intentd's dev-dependency enables repository-test-fixtures in
       # intent-services under --all-targets, excluding feature-off production
@@ -858,7 +1050,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
       # target dirs are multi-GiB and the run also writes profraw files.
@@ -934,16 +1129,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - name: Rust cache (burst runner only)
-        if: needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-e2e
-      # Node is required (not preinstalled on tinybox, unlike depot-ubuntu-24.04):
-      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
-      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -1077,7 +1262,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
       # target dirs are multi-GiB and the run also writes profraw files.
@@ -1162,16 +1350,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
-      - name: Rust cache (burst runner only)
-        if: needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-all
-      # Node is required (not preinstalled on tinybox, unlike depot-ubuntu-24.04):
-      # the ACP e2e tests spawn the mock-acp-agent.mjs fixture and silently
-      # self-skip without it, which silently drops coverage below the floor.
       - uses: actions/setup-node@v7
         with:
           node-version: 24.21.0
@@ -1293,7 +1471,10 @@ jobs:
         with:
           fetch-depth: 2
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Resolve PR base from the merge commit
         run: |
           set -euo pipefail
@@ -1355,6 +1536,9 @@ jobs:
       # rationale (monorepo#1253). 30 GiB like coverage-e2e: this job shares
       # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
       # outside the work dir" below), so the own-dir skip must name it.
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
       - name: Disk-space preflight (tinybox only)
         if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
         env:
@@ -1430,18 +1614,9 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Ephemeral GitHub-hosted runners have no persistent target dir, so
-      # use the GH cache there (pure overhead on tinybox, hence burst-gated).
       # Own key rather than coverage-e2e's: rust-cache never re-saves on an
       # exact hit, so a partial cache saved here would shadow the full
       # coverage-e2e cache until the lockfile changes.
-      - name: Rust cache (burst runner only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-burst-coverage-changed
-      # Node is required (not preinstalled on tinybox): the ACP e2e tests
-      # spawn the mock-acp-agent.mjs fixture and self-skip without it.
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
@@ -1732,6 +1907,7 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+          python3 -B scripts/test-setup-depot-sccache.py
           python3 -B scripts/test-depot-runners.py
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test local and CI caller policy
@@ -1747,11 +1923,11 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - name: Install release cache regression wrapper
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-        with:
-          version: v0.17.0
-          disable_annotations: 'true'
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Test WebDAV compiler reuse and source invalidation
         run: python3 -B scripts/test-release-cache-smoke.py
       - name: Test publish-channel-manifest.sh
@@ -1922,13 +2098,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
+      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
+      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
+      # runner's Windows-path step scripts. Prepend Git's bin dir so every
+      # later `shell: bash` step resolves Git Bash instead.
       - name: Put Git Bash first on PATH (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
+      # Fail-fast disk preflight — see the `check` job's comment for the full
+      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
+      # target dirs are multi-GiB and the run also writes profraw files.
       - name: Disk-space preflight (tinybox only)
         if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
         env:
@@ -1991,11 +2177,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
-      - name: Rust cache (GitHub-hosted runner only)
-        if: ${{ !contains(matrix.os, 'self-hosted') }}
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: daemon-lifecycle-${{ matrix.platform }}
       - name: Native lifecycle lint and runtime proof
         shell: bash
         run: |

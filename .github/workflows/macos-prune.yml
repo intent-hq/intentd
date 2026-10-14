@@ -2,6 +2,8 @@
 # The script fails closed on live/unknown ownership and stops at disk headroom.
 name: macOS CI disk cleanup
 on:
+  schedule:
+    - cron: "15 11,23 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -22,5 +24,5 @@ jobs:
       - name: Report eligible profiles
         run: python3 -I -B scripts/macos-ci-cleanup.py
       - name: Reclaim disk headroom
-        if: inputs.apply
+        if: github.event_name == 'schedule' || inputs.apply
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply

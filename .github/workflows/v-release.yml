@@ -281,8 +281,11 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
-      - name: "Configure Depot managed compiler cache"
-        uses: "./.github/actions/release-rust-cache"
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

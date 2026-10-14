@@ -171,28 +171,14 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
       # Cache Cargo downloads; compiled objects live in Depot managed sccache.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-plz-pr
-          cache-targets: false
-      # All git_only packages run `cargo package --workspace` in separate
-      # temporary worktrees; a shared target dir means only the first one
-      # compiles cold and the rest reuse the build cache. The path must
-      # end in `.../target` so release-plz's packaged-dir fast path
-      # (`is_cargo_packaged_dir`) recognizes `target/package/*` and lists
-      # files from disk instead of re-running `cargo package --list`
-      # (which fails for internal path-only dependencies).
-      #
-      # The workspace-relative default location would do, but release-plz's
-      # temp worktrees need an ABSOLUTE path to share it, so pin it
-      # explicitly. $GITHUB_WORKSPACE is a fixed path on GitHub-hosted
-      # runners, which also keeps the sccache extraction paths below stable
-      # across runs.
       - name: Set shared cargo target dir
         shell: bash
         run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
       - name: Configure Depot managed compiler cache
-        uses: ./.github/actions/release-rust-cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       # Applies to each release-plz package verification build.
       - name: Drop debug info from verify builds
         shell: bash

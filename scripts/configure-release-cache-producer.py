@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / '.github/workflows/release-cache.yml'
 MAIN_ONLY = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
-CACHE_ACTION = './.github/actions/release-rust-cache'
+CACHE_RUN = 'python3 scripts/setup-depot-sccache.py'
 CHECKOUT = {'uses': 'actions/checkout@v7', 'with': {'persist-credentials': False}}
 
 
@@ -43,7 +43,7 @@ def timed_build(step):
 
 def cache_steps(flavor, target, runner, builds):
     return [
-        {'name': 'Configure Depot managed compiler cache', 'uses': CACHE_ACTION},
+        {'name': 'Configure Depot managed compiler cache', 'shell': 'bash', 'env': {'DEPOT_SCCACHE_TOKEN': '${{ secrets.DEPOT_TOKEN }}'}, 'run': CACHE_RUN},
         *[timed_build(step) for step in builds],
         {'name': 'Report compiler cache statistics', 'shell': 'bash',
          'run': 'sccache --show-stats >> "$GITHUB_STEP_SUMMARY"'},
@@ -54,14 +54,14 @@ def generate():
     config = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']
     version = config['cargo-dist-version']
     install = f'curl --proto \'=https\' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v{version}/cargo-dist-installer.sh | sh'
-    # Consumers append CACHE_ACTION to the setup source. Exclude that restore
-    # here: producers call it exactly once with their own output id below.
+    # Consumers append the cache setup script. Exclude that step
+    # here: producers call it exactly once below.
     daemon_setup = [s for s in yaml.safe_load((ROOT / '.github/dist-build-setup.yml').read_text())
-                    if s.get('uses') != CACHE_ACTION]
+                    if s.get('run') != CACHE_RUN]
     sitter_source = yaml.safe_load((ROOT / '.github/workflows/release-sitter.yml').read_text())['jobs']['build']
     source_steps = sitter_source['steps']
     build_start = next(i for i, step in enumerate(source_steps) if step.get('name') == 'Build (cargo)')
-    sitter_setup = [step for step in source_steps[:build_start] if step.get('uses') != CACHE_ACTION]
+    sitter_setup = [step for step in source_steps[:build_start] if step.get('run') != CACHE_RUN]
     sitter_builds = source_steps[build_start:build_start + 2]
     if [step.get('name') for step in sitter_builds] != ['Build (cargo)', 'Build (cargo-zigbuild)']:
         raise ValueError('expected adjacent sitter cargo/zigbuild steps; review the producer boundary')
@@ -72,7 +72,7 @@ def generate():
                 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config*',
                 'dist-workspace.toml', '**/build.rs', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h',
                 '.github/dist-build-setup.yml',
-                '.github/actions/release-rust-cache/**', '.github/workflows/release-cache.yml',
+                'scripts/setup-depot-sccache.py', '.github/workflows/release-cache.yml',
                 '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py',
             ]},
             'workflow_dispatch': {},

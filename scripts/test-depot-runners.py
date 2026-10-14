@@ -32,7 +32,7 @@ class DepotRunners(unittest.TestCase):
             with self.subTest(workflow=path.name):
                 doc = yaml.safe_load(path.read_text())
                 if path.name in MAINTENANCE:
-                    self.assertEqual(set(doc.get('on', doc.get(True))), {'workflow_dispatch'})
+                    self.assertIn('workflow_dispatch', doc.get('on', doc.get(True)))
                     continue
                 for job in doc['jobs'].values():
                     self.assertNotIsInstance(job.get('runs-on'), list)
@@ -46,7 +46,7 @@ class DepotRunners(unittest.TestCase):
         for name in ['check', 'build', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
             with self.subTest(job=name):
                 steps = doc['jobs'][name]['steps']
-                configure = next(i for i, step in enumerate(steps) if step.get('uses') == './.github/actions/release-rust-cache')
+                configure = next(i for i, step in enumerate(steps) if step.get('run') == 'python3 scripts/setup-depot-sccache.py')
                 builds = [i for i, s in enumerate(steps) if re.search(r'\bcargo (?:check|clippy|build|test|nextest|llvm-cov)\b', s.get('run', ''))]
                 self.assertTrue(builds)
                 self.assertLess(configure, min(builds))

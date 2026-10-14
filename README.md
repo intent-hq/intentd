@@ -854,16 +854,14 @@ The design docs live in the monorepo under `docs/`:
 
 ### Depot CI and compiler cache
 
-CI and release builds run on Depot GitHub Actions runners. Linux checks use
-8 CPUs and coverage/release compilation uses 16 CPUs; native platform jobs keep
-their target triples. Local runner availability no longer affects CI routing.
-Machine inventory/provisioning/pruning workflows remain manual host operations.
+Routed jobs prefer the free self-hosted fleet and burst to Depot when the fleet
+is unavailable or busy. Depot Linux checks use 8 CPUs and coverage/release
+compilation uses 16 CPUs. Physical-host pruning remains scheduled.
 
-The shared release-rust-cache action requires the Depot-managed WebDAV endpoint,
-installs pinned sccache, and preserves the runner's short-lived authentication.
-Enable automatic Depot Cache access for this repository in Depot. Rust builds
-set RUSTC_WRAPPER=sccache and CARGO_INCREMENTAL=0; compiler entries are stored
-remotely, without Actions sccache archives or local size/retention policies.
-The build-only release-cache workflow warms the same release inputs. The Depot
-managed cache smoke workflow proves reuse across separate jobs and invalidation
-when source changes; summaries report compiler hits rather than archive hits.
+`scripts/setup-depot-sccache.py` installs pinned, checksum-verified sccache directly.
+Depot supplies its job-scoped WebDAV endpoint. Self-hosted runners use the
+`DEPOT_TOKEN` Actions secret, or existing `SCCACHE_WEBDAV_*` environment settings.
+Without credentials, compilation proceeds uncached with a notice. Rust caches
+use the managed service, without Rust cache actions or Actions cache archives.
+The build-only release-cache workflow warms release inputs; the managed smoke
+workflow verifies compiler hits across jobs and invalidation after source changes.

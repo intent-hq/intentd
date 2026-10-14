@@ -2,7 +2,7 @@ name: Depot managed cache smoke
 on:
   pull_request:
     paths:
-      - '.github/actions/release-rust-cache/**'
+      - 'scripts/setup-depot-sccache.py'
       - '.github/workflows/depot-cache-smoke.yml'
       - 'scripts/test-release-cache-smoke.py'
       - 'rust-toolchain.toml'
@@ -21,7 +21,11 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/release-rust-cache
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase populate
   verify:
     needs: populate
@@ -34,5 +38,9 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/release-rust-cache
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase verify
