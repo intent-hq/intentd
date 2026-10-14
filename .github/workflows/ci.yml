@@ -2054,7 +2054,7 @@ jobs:
         run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs test.tap crates/intentd/tests/fixtures/pi-session-paths.test.mjs
       - name: Test cleanup failure observability
         if: ${{ !cancelled() }}
-        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs cleanup-checks.tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs
+        run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs cleanup-checks.tap crates/intentd/tests/fixtures/pi-session-cleanup.test.mjs crates/intentd/tests/fixtures/pi-windows-shutdown.test.mjs
       - name: Test bounded diagnostics and independent audit failure paths
         if: ${{ !cancelled() }}
         run: node crates/intentd/tests/fixtures/pi-fixture-runner.mjs diagnostic-checks.tap crates/intentd/tests/fixtures/pi-diagnostics.test.mjs crates/intentd/tests/fixtures/pi-artifact-audit.test.mjs
