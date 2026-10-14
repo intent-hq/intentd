@@ -875,7 +875,7 @@ workflow verifies compiler hits across jobs and invalidation after source change
 `windows-prune.yml` maintains 40 GiB of free space on 5090pc twice daily. Manual
 runs default to dry-run; `apply=true` deletes only inactive debug artifacts in
 the two intentd CI target directories. It preserves Cargo lock files, release
-profiles, toolchains, registry, credentials and sources. Native Windows safety
+profiles, hardlinked artifacts, toolchains, registry, credentials and sources. Native Windows safety
 tests run first. A busy runner, compiler, held lock, in-use marker, reparse point,
 unknown owner or insufficient eligible space fails visibly.
 Cleanup locks existing Cargo lock files without allocating new ones, so a full

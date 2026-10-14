@@ -23,6 +23,20 @@ def process(pid, parent, name):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_hardlinked_artifact_is_preserved_without_deletion(self):
+        api = cleanup.Native.__new__(cleanup.Native)
+        api.k = Mock()
+        api.k.CreateFileW.return_value = 1
+        api.info = Mock(return_value=Mock(attributes=0, links=2))
+        api.owned = Mock()
+        api.delete = Mock()
+        path = Mock()
+        path.lstat.return_value.st_file_attributes = 0
+        with patch.object(cleanup, 'emit'):
+            self.assertFalse(cleanup.remove_entry(api, path))
+        api.delete.assert_not_called()
+        api.k.CloseHandle.assert_called_once_with(1)
+
     def test_full_disk_dry_run_never_creates_lock_files(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -288,13 +302,24 @@ class NativeTests(unittest.TestCase):
             self.clean(True)
         self.assertEqual((outside / 'keep').read_text(), 'source')
 
-    def test_hardlink_refused(self):
+    def test_hardlink_and_parent_preserved_while_ordinary_sibling_is_deleted(self):
         outside = self.home / 'source-file'
         outside.write_text('source')
-        os.link(outside, self.profile / 'deps/aaa-hardlink')
+        linked = self.profile / 'deps/aaa-hardlink'
+        os.link(outside, linked)
+        self.free_bytes.side_effect = [0, 0, 200]
+        result = self.clean(True)
+        self.assertEqual(outside.read_text(), 'source')
+        self.assertEqual(linked.read_text(), 'source')
+        self.assertFalse(self.file.exists())
+        self.assertEqual(result['deleted'], [])
+        self.assertEqual(result['preserved'], [str(self.profile / 'deps')])
+
+    def test_hardlinked_cargo_lock_still_refuses_cleanup(self):
+        os.link(self.profile / '.cargo-lock', self.home / 'linked-lock')
         with self.assertRaisesRegex(cleanup.Refusal, 'Multiply-linked'):
             self.clean(True)
-        self.assertEqual(outside.read_text(), 'source')
+        self.assertTrue(self.file.exists())
 
     def test_lock_file_cannot_be_replaced(self):
         path = self.profile / '.cargo-lock'

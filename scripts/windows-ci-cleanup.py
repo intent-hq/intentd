@@ -3,8 +3,8 @@
 
 Default: dry run. Only the two intentd CI targets are eligible. Sources,
 release profiles, toolchains, registry, credentials and other caches are excluded.
-Windows handles pin every ancestor against rename/deletion; reparse points and
-multiply-linked files are refused. Cargo locks survive cleanup and remain held
+Windows handles pin every ancestor against rename/deletion; reparse points are
+refused and multiply-linked artifacts preserved. Cargo locks remain held
 through deletion. An unknown/live runner or compiler refuses cleanup.
 """
 import argparse
@@ -25,6 +25,10 @@ CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
 
 
 class Refusal(RuntimeError):
+    pass
+
+
+class HardlinkedFile(Refusal):
     pass
 
 
@@ -183,7 +187,7 @@ class Native:
             if bool(info.attributes & 0x10) != directory:
                 raise Refusal('Unexpected path type: ' + str(path))
             if not directory and info.links != 1:
-                raise Refusal('Multiply-linked file refused: ' + str(path))
+                raise HardlinkedFile('Multiply-linked file refused: ' + str(path))
             if owned:
                 self.owned(handle, path, allow_system_owner=allow_system_owner)
             yield handle
@@ -242,11 +246,22 @@ def marker_guard(paths):
 def remove_entry(api, path):
     # Ancestors are pinned. Open the entry itself before reading or deleting it.
     directory = bool(path.lstat().st_file_attributes & 0x10)
-    with api.open(path, directory=directory, delete=True) as handle:
-        if directory:
-            for child in sorted(path.iterdir()):
-                remove_entry(api, child)
-        api.delete(handle)
+    try:
+        with api.open(path, directory=directory, delete=True) as handle:
+            preserved = False
+            if directory:
+                for child in sorted(path.iterdir()):
+                    if not remove_entry(api, child):
+                        preserved = True
+            if preserved:
+                return False
+            api.delete(handle)
+            return True
+    except HardlinkedFile:
+        # Cargo hardlinks build-script executables. Leave every link untouched,
+        # including its ancestors, while reclaiming ordinary sibling artifacts.
+        emit(event='preserved', path=str(path), reason='multiply-linked artifact')
+        return False
 
 
 def free_bytes(home):
@@ -261,7 +276,8 @@ def clean(home, min_free_bytes=40 * GIB, apply=False, api=None):
     with ExitStack() as stack:
         open_home(api, home, stack)
         before = free_bytes(home)
-        report = dict(before_free_bytes=before, min_free_bytes=min_free_bytes, candidates=[], deleted=[], apply=apply)
+        report = dict(before_free_bytes=before, min_free_bytes=min_free_bytes,
+                      candidates=[], deleted=[], preserved=[], apply=apply)
         emit(event='before', **report)
         if before < min_free_bytes:
             assert_idle_runner()
@@ -319,8 +335,8 @@ def clean(home, min_free_bytes=40 * GIB, apply=False, api=None):
                         if child.name in CARGO_LOCKS:
                             continue
                         emit(event='deleting', path=str(child))
-                        remove_entry(api, child)
-                        report['deleted'].append(str(child))
+                        removed = remove_entry(api, child)
+                        report['deleted' if removed else 'preserved'].append(str(child))
                     (profile / 'deps').mkdir(exist_ok=True)
         after = free_bytes(home)
         report.update(after_free_bytes=after, recovered_bytes=after-before, adequate_headroom=after >= min_free_bytes)
