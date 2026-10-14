@@ -6,6 +6,5 @@ self-hosted-runner:
     - depot-ubuntu-22.04
     - depot-windows-2022-16
     - depot-windows-2025
-    - depot-macos-14
-    - depot-macos-15
+    - depot-macos-latest
     - m1mac

@@ -115,6 +115,7 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+          WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
         with:
           # tinybox serves several repos on its runner slots, so the probe
           # wants to size the queue across all of them — but the default
@@ -150,8 +151,8 @@ jobs:
             const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
             const windowsBurst = ["depot-windows-2022-16"];
             const macosSelfHosted = ["self-hosted", "macOS", "ARM64"];
-            // Pinned standard Apple Silicon image, not macos-15-intel.
-            const macosBurst = ["depot-macos-15"];
+            // Latest standard Apple Silicon image.
+            const macosBurst = ["depot-macos-latest"];
             const threshold = parseInt(process.env.THRESHOLD || "8", 10);
             // FAIL OPEN TO BURST: tinybox is only selected when the probe
             // positively confirms (a) an online self-hosted Linux runner
@@ -274,6 +275,11 @@ jobs:
             } catch (e) {
               windowsUseBurst = true;
               windowsReason = `probe failed (${e.message})`;
+            }
+            // Allow maintenance without abandoning the free runner preference.
+            if (process.env.WINDOWS_RUNNER_DISABLED === "true") {
+              windowsUseBurst = true;
+              windowsReason = "self-hosted Windows disabled for maintenance";
             }
             core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
             core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
@@ -689,10 +695,10 @@ jobs:
           # - target: x86_64-unknown-linux-gnu
           #   os: depot-ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
-          # use pinned hosted ARM64. Empty route output also falls back to
-          # hosted. Retain the historical depot-macos-14 check name for continuity.
+          # use the latest hosted ARM64 image. Empty route output also falls back to
+          # hosted. Retain the historical macos-14 check name for continuity.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-15"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
             name: build (aarch64-apple-darwin, macos-14)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
@@ -2086,7 +2092,7 @@ jobs:
           - platform: linux
             os: ${{ fromJSON(needs.route.outputs.linux_labels || '["depot-ubuntu-24.04-16"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-15"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
           - platform: windows
             os: ${{ fromJSON(needs.route.outputs.windows_labels || '["depot-windows-2022-16"]') }}
     runs-on: ${{ matrix.os }}

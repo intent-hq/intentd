@@ -73,11 +73,11 @@ github-build-setup = "../dist-build-setup.yml"
 global = "depot-ubuntu-24.04"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
-runner = "depot-macos-14"
+runner = "depot-macos-latest"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
-runner = "depot-macos-14"
+runner = "depot-macos-latest"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
