@@ -59,7 +59,13 @@ async fn demand_wss_authorization_retry_and_one_note_publication() {
         pending["error"]["data"],
         json!({"code":"note-index-preparing","retryAfterMs":1000})
     );
+    // Disconnect while the owned job is blocked on its write connection.
+    // Reconnection starts fresh view demand, not replay of an old snapshot.
+    assert_eq!(current_heads(&srv.store, &ws).await, 0);
+    alice.ws.close(None).await.unwrap();
     drop(writer);
+    let url = format!("wss://localhost:{}/ws?token={}", srv.port, "91".repeat(32));
+    alice.ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
     let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let frame = alice.call("note.get", params.clone()).await;
