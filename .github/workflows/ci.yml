@@ -1463,6 +1463,8 @@ jobs:
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # Reuse the full-suite profile pool; per-process files can exhaust disk.
+      LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
@@ -1673,6 +1675,14 @@ jobs:
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
+      - name: Verify bounded coverage profile pooling
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/test-coverage-profile-pool.py
+      - name: Initialize coverage storage evidence
+        if: steps.select.outputs.has_selection == 'true'
+        run: |
+          python3 -I -B scripts/coverage-storage.py init --output "$RUNNER_TEMP/coverage-storage"
+          echo "COVERAGE_STORAGE_DIR=$RUNNER_TEMP/coverage-storage" >> "$GITHUB_ENV"
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The
@@ -1688,6 +1698,10 @@ jobs:
           INTENTD_TEST_TIMEOUT_MULTIPLIER: "3"
         run: |
           set -euo pipefail
+          if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
+            python3 -I -B scripts/coverage-storage.py snapshot --output "$COVERAGE_STORAGE_DIR" --stage callback --event start
+            trap 'result=$?; python3 -I -B scripts/coverage-storage.py snapshot --output "$COVERAGE_STORAGE_DIR" --stage callback --event exit --exit-code "$result"; exit "$result"' EXIT
+          fi
           filter=$(printf '%s\n' "$CALLBACK_FIXTURE_TESTS" | sed '/^$/d;s/^/test(=/;s/$/)/' | paste -sd '|' -)
           # Reuse the compatible changed-plan scope instead of narrowing the
           # Cargo feature graph back to just the callback packages. Validate
@@ -1724,6 +1738,18 @@ jobs:
           cargo llvm-cov --no-report nextest "${callback_scope[@]}" \
             -E "$filter" --no-fail-fast --retries 0 --show-progress none \
             --status-level pass --final-status-level fail
+      - name: Upload changed coverage evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: changed-coverage-evidence
+          path: |
+            ${{ runner.temp }}/coverage-storage
+            ${{ runner.temp }}/coverage-changed-plan.txt
+            ${{ runner.temp }}/coverage-changed-plan.json
+            ${{ runner.temp }}/callback-fixture-tests.json
+          if-no-files-found: warn
+          retention-days: 7
       # Release the `.in-use` marker — see the `check` job's last step
       # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
       # selection was empty or on burst runners, so this is a no-op there.
@@ -1928,6 +1954,7 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -B scripts/test-setup-depot-sccache.py
+          python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-depot-runners.py
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test local and CI caller policy
