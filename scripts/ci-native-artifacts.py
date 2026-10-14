@@ -27,6 +27,7 @@ NATIVE_INPUTS = {'.github/actions/publish-variants/action.yml', 'scripts/ci-publ
                  '.github/workflows/ci.yml', 'scripts/ci-native-artifacts.py',
                  'scripts/ci-test-artifacts.py', 'scripts/ci-build-identity.py',
                  'scripts/ci-artifact-reuse.py', 'scripts/test-ci-artifact-reuse.py',
+                 'scripts/ci-artifact-storage.py', 'scripts/test-ci-artifact-storage.py',
                  'scripts/ci-workflow-tests.py',
                  'scripts/test-daemon-lifecycle.py', 'scripts/test-ci-native-consumers.py',
                  'scripts/test-ci-native-routing.py', 'scripts/test-ci-test-policy.py',

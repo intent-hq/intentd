@@ -56,6 +56,7 @@ class ConsumerTests(unittest.TestCase):
     def test_scope_is_full_only_for_merge_group_or_native_ci_changes(self):
         for path in ('.github/workflows/ci.yml', 'scripts/ci-test-artifacts.py',
                      'scripts/ci-native-artifacts.py', 'scripts/test-daemon-lifecycle.py',
+                     'scripts/ci-artifact-storage.py',
                      '.github/actions/native/action.yml', '.cargo/config.toml', 'Cargo.lock',
                      'crates/intentd/Cargo.toml', 'crates/intentd/tests/common/mod.rs',
                      'crates/intentd-test-support/src/runtime_paths.rs'):
@@ -148,6 +149,38 @@ class ConsumerTests(unittest.TestCase):
                     "const p=require('node:path')[process.argv[1]]; console.log(p.join(process.argv[2],process.argv[3]));",
                     flavour, source, relative], text=True).strip()
                 self.assertEqual(pure_path(joined), pure_path(values['CARGO_TARGET_DIR']))
+
+    def test_macos_tunnel_payload_uses_initialized_nondefault_artifact_root(self):
+        steps = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']['steps']
+        step = next(s for s in steps if s.get('name') == 'Tunnel deadline and TLS controls (macOS runtime)')
+        storage = load('ci-artifact-storage')
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            environment = dict(os.environ, RUNNER_TEMP=str(temp), GITHUB_ENV=str(temp / 'env'),
+                               GITHUB_RUN_ID='42', GITHUB_RUN_ATTEMPT='3', GITHUB_JOB='native',
+                               RUNNER_NAME='fixture', PAYLOAD_LOG=str(temp / 'calls'))
+            with patch.dict(os.environ, environment):
+                root = storage.initialize(1)
+            self.assertNotEqual(root, temp / 'native-artifacts')
+            binary = root / 'archived-test'
+            binary.write_text('#!' + sys.executable + '\nimport os, sys\n' +
+                'with open(os.environ["PAYLOAD_LOG"], "a") as f: f.write(sys.argv[1] + "\\n")\n' +
+                'if "--list" in sys.argv: print(sys.argv[1] + ": test\\n1 test, 0 benchmarks")\n' +
+                'else: print("running 1 test\\ntest result: ok. 1 passed; 0 failed; 0 ignored;")\n')
+            binary.chmod(0o755)
+            prepared = {}
+            for variant, test_id in [('transport', 'intent-transport'), ('daemon', 'intentd::e2e_wss_tunnel')]:
+                prepared[variant] = {'source': str(ROOT), 'target': str(root), 'runtime': {
+                    'tests': {test_id: {'path': binary.name, 'cwd': '.', 'package': test_id.split('::')[0]}},
+                    'companions': {}, 'library_dirs': []}}
+            (root / 'prepared.json').write_text(json.dumps(prepared))
+            result = subprocess.run(['bash', '-e', '-c', step['run']], cwd=ROOT,
+                                    env=dict(environment, NATIVE_ARTIFACT_ROOT=str(root)), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            calls = (temp / 'calls').read_text().splitlines()
+            self.assertEqual(len(calls), 16)  # list and run for all eight exact controls
+            self.assertEqual(len(set(calls)), 8)
+            self.assertFalse((root / 'compiler-calls.log').exists())
 
     def test_workflow_publishes_before_consumers_and_retains_failures(self):
         job = _workflow_tests.load_ci(ROOT)['jobs']['daemon-lifecycle']

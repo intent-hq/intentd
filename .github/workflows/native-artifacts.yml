@@ -203,7 +203,7 @@ jobs:
           spec = importlib.util.spec_from_file_location('native', Path('scripts/ci-native-artifacts.py'))
           native = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(native)
-          root = Path(os.environ['RUNNER_TEMP']) / 'native-artifacts'
+          root = Path(os.environ['NATIVE_ARTIFACT_ROOT'])
           prepared = json.loads((root / 'prepared.json').read_text())
           groups = [
               (["-p", "intent-transport", "--lib"], [
