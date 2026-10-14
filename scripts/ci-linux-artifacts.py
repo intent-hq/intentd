@@ -443,7 +443,7 @@ def prepare_streamed(bundle, request, source, destination, *, env=None):
         raise ValueError('archive runtime inventory mismatch')
     if set(request['recipe']['companions']) - runtime['companions'].keys():
         raise ValueError('archive missing required companions')
-    return {'source': str(source), 'target': str(destination / 'target'),
+    return {'source': str(source), 'target': str(destination / 'target'), 'extraction_root': str(destination),
             'report_metadata': manifest['files'].get('target/nextest/binaries-metadata.json'),
             'producer_group': archives.identity.producer_group_key(manifest['identity']),
             'runtime': runtime, 'extract_seconds': time.monotonic() - started,

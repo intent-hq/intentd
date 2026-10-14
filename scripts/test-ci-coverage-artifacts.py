@@ -57,7 +57,7 @@ class CoverageTests(unittest.TestCase):
                 metadata.write_bytes(data)
                 return {'size': len(data), 'sha256': archives.sha(data)}
             expected = write(document)
-            prepared = {'target': str(target), 'report_metadata': expected}
+            prepared = {'target': str(target), 'extraction_root': str(target.parent), 'report_metadata': expected}
             request = {'recipe': {'coverage': {'tools': {'cargo-llvm-cov': 'cargo-llvm-cov 0.9.0'}}}}
             metrics = {}
             index = coverage.report_index(prepared, request, metrics)
@@ -94,6 +94,30 @@ class CoverageTests(unittest.TestCase):
             prepared['report_metadata'] = write({'rust-build-meta': {'base-output-directories': ['escape']}})
             with self.assertRaisesRegex(ValueError, 'output'):
                 coverage.report_index(prepared, request)
+
+    def test_report_rejects_replaced_extraction_root_target_or_ancestor(self):
+        for replacement in ('target', 'run', 'ancestor'):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                extraction = root / 'owned/run'
+                target = extraction / 'target'
+                metadata = target / 'nextest/binaries-metadata.json'
+                metadata.parent.mkdir(parents=True)
+                (target / 'debug').mkdir()
+                data = json.dumps({'rust-build-meta': {'base-output-directories': ['debug']}}).encode()
+                metadata.write_bytes(data)
+                prepared = {'target': str(target), 'extraction_root': str(extraction),
+                            'report_metadata': {'size': len(data), 'sha256': archives.sha(data)}}
+                request = {'recipe': {'coverage': {'tools': {'cargo-llvm-cov': 'cargo-llvm-cov 0.9.0'}}}}
+                changed = {'target': target, 'run': extraction, 'ancestor': root / 'owned'}[replacement]
+                moved = root / 'neighbour'
+                changed.rename(moved)
+                changed.symlink_to(moved, target_is_directory=True)
+                before = sorted(str(p.relative_to(moved)) for p in moved.rglob('*'))
+                with self.assertRaisesRegex(ValueError, 'ownership'):
+                    coverage.report_index(prepared, request)
+                self.assertEqual(sorted(str(p.relative_to(moved)) for p in moved.rglob('*')), before)
+                self.assertFalse(list(root.rglob('report-index.tar.zst')))
 
     def test_lossless_transport_identity_and_failed_recompression(self):
         recipe = coverage.compression_recipe()
@@ -163,7 +187,11 @@ class CoverageTests(unittest.TestCase):
             compressed_record = archives.produce([request], source, root / 'archive-target', root / 'published')[0]
             bundle = root / 'published' / compressed_record['key']
             shutil.rmtree(run)
-            prepared = linux.prepare_streamed(bundle, request, source, run)
+            alias = root / 'configured-storage'
+            alias.symlink_to(root, target_is_directory=True)
+            prepared = linux.prepare_streamed(bundle, request, source, alias / 'run')
+            self.assertEqual(prepared['extraction_root'], str(run.resolve()))
+            self.assertEqual(prepared['target'], str(run.resolve() / 'target'))
             self.assertGreaterEqual(compressed_record['compression_seconds'], 0)
 
             self.assertEqual(prepared['runtime'], baseline_prepared['runtime'])

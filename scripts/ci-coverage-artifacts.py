@@ -83,6 +83,21 @@ def compress_archive(archive, recipe):
             'compression_decoder_resources': decoder_resources}
 
 
+def report_target(prepared):
+    # Preparation records canonical paths after resolving configured storage
+    # aliases. Never adopt a new symlink destination after extraction.
+    root = Path(prepared.get('extraction_root', ''))
+    target = root / 'target'
+    try:
+        valid = (root.is_absolute() and Path(prepared['target']) == target and
+                 root.resolve(strict=True) == root and target.resolve(strict=True) == target)
+    except (OSError, RuntimeError):
+        valid = False
+    if not valid:
+        raise ValueError('report extraction ownership changed or is missing')
+    return target
+
+
 def report_index(prepared, request, metrics=None):
     """Give pinned llvm-cov its exact authenticated metadata in a small frame.
 
@@ -93,7 +108,7 @@ def report_index(prepared, request, metrics=None):
     started = time.monotonic()
     if request['recipe']['coverage']['tools']['cargo-llvm-cov'] != REPORT_VERSION:
         raise ValueError('unsupported metadata-index report version')
-    target = Path(prepared['target']).resolve()
+    target = report_target(prepared)
     metadata = target / 'nextest/binaries-metadata.json'
     expected = prepared.get('report_metadata')
     if not metadata.is_file() or metadata.is_symlink() or not metadata.resolve().is_relative_to(target) or not expected:
@@ -114,6 +129,8 @@ def report_index(prepared, request, metrics=None):
             not destination.resolve().is_relative_to(target) or not destination.is_dir()):
         raise ValueError('report output directory escapes or is missing from extraction')
     index = target.parent / 'report-index.tar.zst'
+    if index.is_symlink():
+        raise ValueError('report index ownership changed')
     with index.open('wb') as stream:
         with subprocess.Popen(['zstd', '-q', '-3', '--zstd=wlog=23', '-c'], stdin=subprocess.PIPE, stdout=stream) as encoder:
             try:
@@ -269,7 +286,7 @@ def report(bundle, prepared, request, floor, *, lcov=True):
     if request['identity']['build']['instrumentation']['mode'] != 'llvm-cov':
         raise ValueError('cannot report coverage from ordinary binaries')
     source = Path(prepared['source'])
-    root = Path(prepared['target']).parent
+    root = (report_target(prepared) if 'compression' in request['recipe'] else Path(prepared['target'])).parent
     env = report_environment(root)
     if tool_versions(source, env) != request['recipe']['coverage']['tools']:
         raise ValueError('report LLVM tools differ from instrumented archive')
