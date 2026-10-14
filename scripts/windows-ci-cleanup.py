@@ -153,6 +153,10 @@ class Native:
     def open(self, path, *, directory=False, create=False, delete=False, owned=True, writable=False):
         # No FILE_SHARE_DELETE: an opened object cannot be renamed or replaced.
         access = 0x20000 | 0x80  # READ_CONTROL, FILE_READ_ATTRIBUTES
+        if directory:
+            # Metadata-only opens do not participate in Windows share checks.
+            # FILE_LIST_DIRECTORY makes the no-delete-sharing pin effective.
+            access |= 0x1
         if writable:
             access |= 0x80000000 | 0x40000000
         if delete:
