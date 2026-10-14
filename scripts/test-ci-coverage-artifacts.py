@@ -119,6 +119,39 @@ class CoverageTests(unittest.TestCase):
                 self.assertEqual(sorted(str(p.relative_to(moved)) for p in moved.rglob('*')), before)
                 self.assertFalse(list(root.rglob('report-index.tar.zst')))
 
+    def test_report_index_preserves_alias_targets_and_failed_output(self):
+        for alias in ('symlink', 'hardlink', 'failed'):
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                target = root / 'run/target'
+                metadata = target / 'nextest/binaries-metadata.json'
+                metadata.parent.mkdir(parents=True)
+                (target / 'debug').mkdir()
+                data = json.dumps({'rust-build-meta': {'base-output-directories': ['debug']}}).encode()
+                metadata.write_bytes(data)
+                prepared = {'target': str(target), 'extraction_root': str(target.parent),
+                            'report_metadata': {'size': len(data), 'sha256': archives.sha(data)}}
+                request = {'recipe': {'coverage': {'tools': {'cargo-llvm-cov': 'cargo-llvm-cov 0.9.0'}}}}
+                sentinel = root / 'neighbour'
+                sentinel.write_bytes(b'preserve unrelated bytes')
+                index = target.parent / 'report-index.tar.zst'
+                if alias == 'symlink':
+                    index.symlink_to(sentinel)
+                    with self.assertRaisesRegex(ValueError, 'ownership'):
+                        coverage.report_index(prepared, request)
+                elif alias == 'hardlink':
+                    os.link(sentinel, index)
+                    coverage.report_index(prepared, request)
+                    self.assertFalse(index.samefile(sentinel))
+                else:
+                    index.write_bytes(b'previous complete index')
+                    with mock.patch.object(coverage, 'wait_resources', side_effect=ValueError('encoder failed')):
+                        with self.assertRaisesRegex(ValueError, 'encoder failed'):
+                            coverage.report_index(prepared, request)
+                    self.assertEqual(index.read_bytes(), b'previous complete index')
+                self.assertEqual(sentinel.read_bytes(), b'preserve unrelated bytes')
+                self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ['report-index.tar.zst', 'target'])
+
     def test_lossless_transport_identity_and_failed_recompression(self):
         recipe = coverage.compression_recipe()
         self.assertEqual(recipe['level'], 3)

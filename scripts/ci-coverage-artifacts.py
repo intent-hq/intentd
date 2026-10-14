@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 
@@ -131,22 +132,29 @@ def report_index(prepared, request, metrics=None):
     index = target.parent / 'report-index.tar.zst'
     if index.is_symlink():
         raise ValueError('report index ownership changed')
-    with index.open('wb') as stream:
-        with subprocess.Popen(['zstd', '-q', '-3', '--zstd=wlog=23', '-c'], stdin=subprocess.PIPE, stdout=stream) as encoder:
-            try:
-                with tarfile.open(fileobj=encoder.stdin, mode='w|') as tar:
-                    member = tarfile.TarInfo('target/nextest/binaries-metadata.json')
-                    member.size = len(data)
-                    member.mode = 0o644
-                    tar.addfile(member, io.BytesIO(data))
-                encoder.stdin.close()
-                resources = wait_resources(encoder)
-                if encoder.returncode:
-                    raise ValueError('report index compression failed')
-            finally:
-                if encoder.poll() is None:
-                    encoder.kill()
-                encoder.wait()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=index.parent, prefix='.report-index-', delete=False) as stream:
+            temporary = Path(stream.name)
+            with subprocess.Popen(['zstd', '-q', '-3', '--zstd=wlog=23', '-c'], stdin=subprocess.PIPE, stdout=stream) as encoder:
+                try:
+                    with tarfile.open(fileobj=encoder.stdin, mode='w|') as tar:
+                        member = tarfile.TarInfo('target/nextest/binaries-metadata.json')
+                        member.size = len(data)
+                        member.mode = 0o644
+                        tar.addfile(member, io.BytesIO(data))
+                    encoder.stdin.close()
+                    resources = wait_resources(encoder)
+                    if encoder.returncode:
+                        raise ValueError('report index compression failed')
+                finally:
+                    if encoder.poll() is None:
+                        encoder.kill()
+                    encoder.wait()
+        temporary.replace(index)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     if metrics is not None:
         metrics.update(report_index_seconds=time.monotonic() - started,
                        report_index_bytes=index.stat().st_size,
