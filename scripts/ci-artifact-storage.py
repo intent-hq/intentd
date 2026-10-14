@@ -6,10 +6,70 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
+
+
+def filesystem(path):
+    """Probe an existing ancestor without creating the requested target."""
+    probe = path
+    while not probe.exists():
+        probe = probe.parent
+    return probe.stat().st_dev, probe
+
+
+def producer_capacity(target, root, *, target_bytes=140 * 1024**3,
+                      artifact_bytes=80 * 1024**3, reserve_bytes=10 * 1024**3):
+    """Budget future growth on each actual volume, not each path separately.
+
+    Conservative full-producer envelopes: historical target/artifact sampled
+    maxima were 118.9/66.35 GB. Artifact allowance includes retained archives,
+    validation extraction, compression overlap and fresh compiler-gate profiles.
+    These are planning margins, not measured simultaneous peaks or a promise
+    that a future feature graph fits. Narrow demand still builds only its plan.
+    """
+    target, root = Path(target).resolve(), Path(root).resolve()
+    if root == target or root.is_relative_to(target):
+        raise ValueError('producer storage target must not contain artifact root')
+    if any(type(n) is not int or n <= 0 for n in (target_bytes, artifact_bytes, reserve_bytes)):
+        raise ValueError('producer storage budgets must be positive integers')
+    seen, volumes, components = set(), {}, []
+    receipt_path = root / 'storage-producer-budget.json'
+    for name, path, envelope in [('cargo_target', target, target_bytes), ('artifacts', root, artifact_bytes)]:
+        device, probe = filesystem(path)
+        allocated = 0
+        for directory, directories, files in os.walk(path, followlinks=False):
+            directories[:] = [d for d in directories if not (name == 'artifacts' and Path(directory) / d == target)]
+            for filename in files:
+                entry = Path(directory) / filename
+                if entry == receipt_path:
+                    continue
+                info = entry.lstat()
+                inode = (info.st_dev, info.st_ino)
+                if not stat.S_ISREG(info.st_mode) or inode in seen:
+                    continue
+                if info.st_dev != device:
+                    raise ValueError('producer storage contains an unbudgeted nested filesystem')
+                seen.add(inode)
+                allocated += getattr(info, 'st_blocks', (info.st_size + 4095) // 4096 * 8) * 512
+        credit = min(allocated, envelope)
+        components.append({'name': name, 'path': str(path), 'device': device,
+                           'envelope_bytes': envelope, 'allocated_bytes': allocated, 'credited_bytes': credit})
+        if device not in volumes:
+            volumes[device] = {'device': device, 'probe': str(probe),
+                               'free_bytes': shutil.disk_usage(probe).free, 'required_free_bytes': reserve_bytes}
+        volumes[device]['required_free_bytes'] += envelope - credit
+    receipt = {'basis': 'conservative full-producer envelope; not a current measured peak',
+               'reserve_bytes_per_filesystem': reserve_bytes, 'components': components,
+               'filesystems': list(volumes.values())}
+    receipt_path.write_text(json.dumps(receipt, indent=2) + '\n')
+    failures = [v for v in volumes.values() if v['free_bytes'] < v['required_free_bytes']]
+    if failures:
+        raise ValueError('insufficient aggregate producer storage: ' + json.dumps(failures))
+    return receipt
 
 
 def token():

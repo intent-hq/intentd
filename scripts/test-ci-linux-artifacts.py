@@ -31,6 +31,25 @@ WORKFLOW = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
 
 
 class LinuxTests(unittest.TestCase):
+    def test_producer_rejects_capacity_before_download_or_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, GITHUB_REPOSITORY='intent-hq/intentd'), \
+                 mock.patch.object(linux, 'select', return_value=(self.plan([]), False)), \
+                 mock.patch.object(linux.native, 'platform_facts', return_value={'platform': {'target': 'host'}, 'native_tools': {}}), \
+                 mock.patch.object(linux, 'recipes', return_value={}), \
+                 mock.patch.object(linux.storage, 'producer_capacity', side_effect=ValueError('insufficient producer storage')) as capacity, \
+                 mock.patch.object(linux.registry, 'GitHub') as api, \
+                 mock.patch.object(linux.registry, 'context', return_value={}), \
+                 mock.patch.object(linux.registry, 'publication', return_value={}), \
+                 mock.patch.object(linux.registry, 'restore') as restore, \
+                 mock.patch.object(linux.archives, 'produce', return_value=[]) as build, \
+                 mock.patch.object(linux, 'compiler_gates'):
+                with self.assertRaisesRegex(ValueError, 'producer storage'):
+                    linux.produce(ROOT, root, 'merge_group', None)
+                capacity.assert_called_once()
+                api.assert_not_called(); restore.assert_not_called(); build.assert_not_called()
+
     def test_full_scope_uses_upstream_bounded_profile_pool_in_fresh_extraction(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -148,6 +167,7 @@ class LinuxTests(unittest.TestCase):
                  mock.patch.object(linux.native, 'config_digest', return_value='config'), \
                  mock.patch.object(linux, 'recipes', return_value={'coverage-all': ({}, True)}), \
                  mock.patch.object(linux.archives, 'capture_request', return_value=request), \
+                 mock.patch.object(linux.storage, 'producer_capacity'), \
                  mock.patch.object(linux.archives, 'produce', side_effect=[[{'reused': False}], [{'reused': True}], [{'reused': True}]]) as produce, \
                  mock.patch.object(linux.archives, 'source_commit', return_value='a' * 40), \
                  mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \

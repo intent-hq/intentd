@@ -21,6 +21,52 @@ class StorageTests(unittest.TestCase):
                               GITHUB_RUN_ID='42', GITHUB_RUN_ATTEMPT='1', GITHUB_JOB='coverage-all', RUNNER_NAME='slot')
         self.env.start(); self.addCleanup(self.env.stop)
 
+    def test_producer_aggregates_target_and_artifacts_on_same_volume(self):
+        target, artifacts = self.root / 'target', self.root / 'artifacts'
+        artifacts.mkdir()
+        with patch.object(storage.shutil, 'disk_usage', return_value=SimpleNamespace(free=150)):
+            with self.assertRaisesRegex(ValueError, 'producer storage'):
+                storage.producer_capacity(target, artifacts, target_bytes=100, artifact_bytes=80, reserve_bytes=10)
+        receipt = json.loads((artifacts / 'storage-producer-budget.json').read_text())
+        self.assertEqual(receipt['filesystems'][0]['required_free_bytes'], 190)
+        self.assertFalse(target.exists(), 'preflight must not provision or compile')
+
+    def test_producer_checks_distinct_volumes_independently(self):
+        target, artifacts = self.root / 'target', self.root / 'artifacts'
+        target.mkdir(); artifacts.mkdir()
+        def volume(path):
+            return (1 if path == target else 2), path
+        with patch.object(storage, 'filesystem', side_effect=volume), \
+             patch.object(storage.shutil, 'disk_usage', side_effect=lambda p: SimpleNamespace(free=110 if p == target else 89)):
+            with self.assertRaisesRegex(ValueError, 'producer storage'):
+                storage.producer_capacity(target, artifacts, target_bytes=100, artifact_bytes=80, reserve_bytes=10)
+        with patch.object(storage, 'filesystem', side_effect=volume), \
+             patch.object(storage.shutil, 'disk_usage', return_value=SimpleNamespace(free=110)):
+            receipt = storage.producer_capacity(target, artifacts, target_bytes=100, artifact_bytes=80, reserve_bytes=10)
+        self.assertEqual([v['required_free_bytes'] for v in receipt['filesystems']], [110, 90])
+
+    def test_producer_credits_existing_allocations_once_even_nested_or_linked(self):
+        artifacts = self.root / 'artifacts'; artifacts.mkdir()
+        target = artifacts / 'target'; target.mkdir()
+        payload = target / 'existing'; payload.write_bytes(b'x' * 8192)
+        os.link(payload, artifacts / 'alias')
+        occupied = payload.stat().st_blocks * 512
+        with patch.object(storage.shutil, 'disk_usage', return_value=SimpleNamespace(free=occupied + 100)):
+            receipt = storage.producer_capacity(target, artifacts, target_bytes=occupied, artifact_bytes=occupied, reserve_bytes=100)
+        self.assertEqual(receipt['filesystems'][0]['required_free_bytes'], occupied + 100)
+        self.assertEqual(sum(x['credited_bytes'] for x in receipt['components']), occupied)
+        self.assertTrue(payload.exists()); self.assertTrue((artifacts / 'alias').exists())
+
+    def test_producer_never_credits_unrelated_occupied_space_or_follows_symlinks(self):
+        target, artifacts = self.root / 'target', self.root / 'artifacts'
+        artifacts.mkdir(); target.mkdir()
+        outside = self.root / 'outside'; outside.write_bytes(b'x' * 8192)
+        (target / 'link').symlink_to(outside)
+        with patch.object(storage.shutil, 'disk_usage', return_value=SimpleNamespace(free=100)):
+            with self.assertRaisesRegex(ValueError, 'producer storage'):
+                storage.producer_capacity(target, artifacts, target_bytes=100, artifact_bytes=80, reserve_bytes=10)
+        self.assertEqual(outside.read_bytes(), b'x' * 8192)
+
     def test_existing_disk_preflight_remains_reachable_before_storage_selection(self):
         import yaml
         root = Path(__file__).resolve().parents[1]

@@ -127,13 +127,14 @@ def produce(source, root, event, base, *, reuse=True):
                  config_sha256=native.config_digest(source), native_tools=facts['native_tools'], instrumented=instrumented, compressed=instrumented)
                 for name, (recipe, instrumented) in demand.items()}
     (root / 'requests.json').write_text(json.dumps(requests, indent=2) + '\n')
+    target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'cargo-target')).resolve()
+    (root / 'storage-target.json').write_text(json.dumps({'target': str(target)}))
+    storage.producer_capacity(target, root)
     if reuse:
         api = registry.GitHub(os.environ['GITHUB_REPOSITORY'])
         expected = registry.context(source, api)
         (root / 'publication.json').write_text(json.dumps(registry.publication(expected), indent=2) + '\n')
         registry.restore(requests, root, api, expected, 'linux')
-    target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'cargo-target')).resolve()
-    (root / 'storage-target.json').write_text(json.dumps({'target': str(target)}))
     initial_state = 'populated' if target.exists() and any(p.is_file() for p in target.rglob('*.rlib')) else 'empty'
     started = time.monotonic()
     records = archives.produce(list(requests.values()), source, target, root / 'published')
