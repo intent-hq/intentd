@@ -1,0 +1,102 @@
+name: Temporary startup callback coverage diagnostic
+# Remove after retaining evidence. A separate branch avoids a full PR rerun.
+on:
+  push:
+    branches: [diagnostic/startup-admission-budget]
+    paths:
+      - .github/workflows/startup-callback-diagnostic.yml
+      - scripts/startup-callback-*
+      - scripts/test-startup-callback-*
+permissions:
+  contents: read
+concurrency:
+  group: startup-callback-diagnostic
+  cancel-in-progress: false
+jobs:
+  diagnostic:
+    if: github.repository == 'intent-hq/intentd'
+    runs-on: gh-linux-16x
+    timeout-minutes: 135
+    env:
+      PRODUCT_SHA: 84fe4a8e9325f9f37b86c1ef1636b2f458aa8d98
+      SOURCE_SHA: 1923c052a642610caad1a85db85c0c753d0f24a2
+      ROOT_SHA: b4686a6c1573d83cf2d24003fbf7d8ce4d96f417
+      DIAGNOSTIC_SHA: ${{ github.sha }}
+      CARGO_BUILD_JOBS: '1'
+      NEXTEST_TEST_THREADS: '1'
+      RUST_TEST_THREADS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_PROGRESS_WHEN: never
+      NEXTEST_SHOW_PROGRESS: none
+      INTENTD_ASSERT_BOUND_CALLER: '1'
+      INTENTD_TEST_TIMEOUT_MULTIPLIER: '3'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: diagnostic
+          persist-credentials: false
+      - name: Require native Linux and disk headroom
+        run: |
+          mkdir -p evidence
+          test "$(uname -sm)" = 'Linux x86_64'
+          for path in "$RUNNER_TEMP" "$HOME" /tmp; do
+            test "$(stat -c %d "$GITHUB_WORKSPACE")" = "$(stat -c %d "$path")"
+          done
+          python3 diagnostic/scripts/startup-callback-guard.py preflight "$GITHUB_WORKSPACE" | tee evidence/preflight.log
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 2
+          path: subject
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: intent-hq/intent
+          ref: ${{ env.ROOT_SHA }}
+          path: contract
+          persist-credentials: false
+          sparse-checkout: |
+            docs/protocol/fixtures/transfer-selection
+            scripts/check-transfer-selection-contract.mjs
+          sparse-checkout-cone-mode: false
+      # Match the runtime Node selected by CI's transfer fixture action.
+      - uses: actions/setup-node@v7
+        timeout-minutes: 5
+        with:
+          node-version: 22.23.1
+      - name: Record test runtime location
+        run: echo "CALLBACK_RUNTIME_BIN=$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
+      # The callback fixture builder requires its own pinned Node/npm pair.
+      - uses: actions/setup-node@v7
+        timeout-minutes: 5
+        with:
+          node-version: 24.21.0
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        timeout-minutes: 10
+        with:
+          toolchain: 1.96.0
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.148
+      # No compatible hosted coverage cache was found; never inspect shared host paths.
+      - name: Run one bounded instrumented test
+        timeout-minutes: 92
+        run: |
+          python3 diagnostic/scripts/startup-callback-guard.py run \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/evidence" 5400 \
+            bash "$GITHUB_WORKSPACE/diagnostic/scripts/startup-callback-run.sh"
+      - name: Retain evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        timeout-minutes: 5
+        with:
+          name: startup-callback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
