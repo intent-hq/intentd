@@ -388,6 +388,60 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     row = next(r for r in job["strategy"]["matrix"]["include"] if r[field] == value)
                     self.assertEqual(matrix_labels(row["os"], outputs), expected)
 
+    def test_fingerprint_coverage_all_hosted_only_for_exact_singleton_queue(self):
+        base = "b6fc9f881588d31b3c24084b8cd0a2ebfba1d155"
+        group = {"base_ref": "refs/heads/main", "base_sha": base,
+                 "head_ref": "refs/heads/gh-readonly-queue/main/pr-2415-" + base}
+        event = {"eventName": "merge_group", "payload": {"merge_group": group}}
+        cases = [(event, True), ({}, False),
+                 ({**event, "eventName": "pull_request"}, False),
+                 ({**event, "eventName": "push"}, False),
+                 ({"eventName": "merge_group", "payload": {}}, False)]
+        for changes in ({"base_ref": "refs/heads/other"}, {"base_sha": "a" * 40},
+                        {"head_ref": group["head_ref"].replace("2415-", "2419-")},
+                        {"head_ref": group["head_ref"].replace("2415-", "24150-")},
+                        {"head_ref": group["head_ref"] + "-other"},
+                        {"head_ref": group["head_ref"].replace(base, "a" * 40)},
+                        {"head_ref": group["head_ref"].replace(base, "a" * 40), "base_sha": "a" * 40}):
+            cases.append(({**event, "payload": {"merge_group": {**group, **changes}}}, False))
+        for unavailable in (False, True):
+            fleet = [] if unavailable else [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+            baseline = run_route(self.workflow, org=fleet)["outputs"]
+            for event_context, forced in cases:
+                with self.subTest(context=event_context, unavailable=unavailable):
+                    outputs = route_outputs(self.workflow, run_route(self.workflow, org=fleet, context=event_context)["outputs"])
+                    hosted = forced or unavailable
+                    self.assertEqual(outputs["coverage_all_labels"],
+                                     json.dumps(["gh-linux-16x"], separators=(",", ":")) if hosted else baseline["linux_labels"])
+                    self.assertEqual(outputs["coverage_all_burst"], str(hosted).lower())
+                    for key in ("linux_labels", "check_labels", "linux_burst", "macos_labels", "macos_burst"):
+                        self.assertEqual(outputs[key], baseline[key])
+
+    def test_coverage_all_hosted_setup_tracks_its_own_route(self):
+        job = self.workflow["jobs"]["coverage-all"]
+        self.assertEqual(job["runs-on"], "${{ fromJSON(needs.route.outputs.coverage_all_labels) }}")
+        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["env"]["NEXTEST_TEST_THREADS"], 16)
+        steps = {s.get("name"): s for s in job["steps"]}
+        for hosted in (False, True):
+            values = {"needs.route.outputs.coverage_all_burst": str(hosted).lower(),
+                      "needs.route.outputs.linux_burst": str(not hosted).lower()}
+            for name in ("Disk-space preflight (tinybox only)", "Point CARGO_TARGET_DIR outside the work dir"):
+                self.assertEqual(condition(steps[name]["if"], values), not hosted)
+            self.assertEqual(condition(steps["Rust cache (burst runner only)"]["if"], values), hosted)
+            with tempfile.TemporaryDirectory() as tmp:
+                envfile = Path(tmp) / "env"
+                body = steps["Key install-action dirs per runner slot"]["run"]
+                self.assertNotIn("needs.route.outputs.linux_burst", body)
+                body = body.replace("${{ needs.route.outputs.coverage_all_burst }}", str(hosted).lower())
+                subprocess.run(["bash", "-euo", "pipefail", "-c", body], check=True,
+                               env={**os.environ, "GITHUB_ENV": str(envfile), "RUNNER_NAME": "fixture-slot"})
+                expected = os.environ["HOME"] + ("" if hosted else "/ci-install-action/fixture-slot")
+                self.assertEqual(envfile.read_text().strip(), "INSTALL_ACTION_HOME=" + expected)
+        self.assertEqual(steps["Run combined coverage"]["run"],
+                         'cd ${{ github.workspace }}\nGENERATE_LCOV=1 ./scripts/coverage-all.sh 80\n')
+        self.assertEqual(steps["Run combined coverage"]["env"], {"INTENTD_ASSERT_BOUND_CALLER": "1"})
+
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
