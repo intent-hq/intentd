@@ -116,6 +116,7 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
+          MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
         with:
           # tinybox serves several repos on its runner slots, so the probe
           # wants to size the queue across all of them — but the default
@@ -301,6 +302,10 @@ jobs:
             } catch (e) {
               macosUseBurst = true;
               macosReason = `probe failed (${e.message})`;
+            }
+            if (process.env.MACOS_RUNNER_DISABLED === "true") {
+              macosUseBurst = true;
+              macosReason = "self-hosted macOS disabled for maintenance";
             }
             core.info(`macos routing: burst=${macosUseBurst} (${macosReason})`);
             core.setOutput("macos_labels", JSON.stringify(macosUseBurst ? macosBurst : macosSelfHosted));

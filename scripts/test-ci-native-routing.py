@@ -236,6 +236,7 @@ const core = { info: message => logs.push(message), setOutput: (name, value) => 
 const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
 process.env.THRESHOLD = '8';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
+process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
   .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
@@ -382,6 +383,19 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["windows_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["self-hosted", "Linux", "X64"])
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
+
+    def test_macos_maintenance_override_preserves_other_runner_preferences(self):
+        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        for disabled in ("", "false", "true"):
+            with self.subTest(disabled=disabled):
+                outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
+                self.assertEqual(json.loads(outputs["macos_labels"]),
+                                 ["depot-macos-latest"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
+                self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+        step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
+        self.assertEqual(step["env"].get("MACOS_RUNNER_DISABLED"), "${{ vars.CI_MACOS_RUNNER_DISABLED }}")
 
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
