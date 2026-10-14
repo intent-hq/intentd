@@ -1950,6 +1950,11 @@ jobs:
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+      - name: Test obsolete merge-run policy and workflow integration (offline)
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
