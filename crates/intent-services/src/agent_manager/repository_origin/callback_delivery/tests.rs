@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 const WAIT: Duration = Duration::from_secs(15);
+// Let the 30-second server budget finish, then allow one fixture transport wait.
+const FIXTURE_CALL_WAIT: Duration = Duration::from_secs(30).saturating_add(WAIT);
 const METHOD: &str = "_intent/session/register_mcp_callback";
 
 struct ReadObservation {
@@ -396,8 +398,13 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
     }
 
     async fn call(&self, method: &str, params: Value) -> Value {
+        let wait = if method == "fixture/call" {
+            FIXTURE_CALL_WAIT
+        } else {
+            WAIT
+        };
         self.connection
-            .request_timeout(method, params, WAIT)
+            .request_timeout(method, params, wait)
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -1999,7 +2006,7 @@ impl<'a> BudgetRequestTrace<'a> {
             budget_ms, 30_000,
             "these controls preserve the original server budget"
         );
-        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", WAIT.as_millis());
+        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", FIXTURE_CALL_WAIT.as_millis());
         Self {
             control,
             subcase,
@@ -2478,7 +2485,7 @@ impl NativeHarness {
         let params = json!({"query":query,"name":name,"code":code});
         tokio::spawn(async move {
             connection
-                .request_timeout("fixture/call", params, WAIT)
+                .request_timeout("fixture/call", params, FIXTURE_CALL_WAIT)
                 .await
                 .unwrap()
         })
