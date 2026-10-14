@@ -80,7 +80,7 @@ jobs:
   # it is confirmed online, the org-hosted depot-windows-2022-16 runner otherwise —
   # same fail-open rule, no queue-depth check (5090pc is single-slot).
   # Both macOS native consumers use m1mac only when an online, idle ARM64
-  # runner is confirmed; otherwise they use Depot macos-15 (ARM64).
+  # runner is confirmed; otherwise they use Depot’s latest macOS (ARM64).
   route:
     # Runs on push / merge_group / same-repo pull_request. Linux PR checks
     # consume its decision; the native build entries use it on push and
@@ -1620,9 +1620,6 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: llvm-tools-preview
-      # Own key rather than coverage-e2e's: rust-cache never re-saves on an
-      # exact hit, so a partial cache saved here would shadow the full
-      # coverage-e2e cache until the lockfile changes.
       - uses: actions/setup-node@v7
         if: steps.select.outputs.has_selection == 'true'
         with:
