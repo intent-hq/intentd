@@ -63,9 +63,22 @@ class WorkflowTests(unittest.TestCase):
         run = next(s for s in steps if s.get('id') == 'probe')
         self.assertEqual(run['env']['GH_TOKEN'], '${{ github.token }}')
         self.assertIn('--probe-only', run['run'])
-        self.assertNotIn('secrets.', str(doc))
+        self.assertNotIn('secrets.', str(job))
         self.assertNotIn('--apply', str(doc))
         self.assertNotIn('actions/cache', str(doc))
+
+    def test_existing_read_credential_probe_uses_reviewed_immutable_code(self):
+        job = workflow('retirement-credential-probe.yml')['jobs']['existing-read-credential']
+        self.assertEqual(job['permissions'], {'contents': 'read'})
+        self.assertEqual(job['runs-on'], 'ubuntu-latest')
+        self.assertEqual(job['steps'][0]['with'], {
+            'ref': '62a2a110b7e217151280736acb7fd19a1daf3c71', 'persist-credentials': False})
+        step = next(s for s in job['steps'] if s.get('id') == 'probe')
+        self.assertEqual(step['env']['GH_TOKEN'], '${{ secrets.CI_QUEUE_READ_TOKEN }}')
+        self.assertIn("for name in ('protection', 'activity')", step['run'])
+        self.assertNotIn('reconcile(', step['run'])
+        self.assertIn('read-only probe rejected request', step['run'])
+        self.assertIn("body.get('query') == policy.QUEUE_QUERY", step['run'])
 
     def test_gate_and_protected_events_stay_unchanged(self):
         ci = workflow('ci.yml')
