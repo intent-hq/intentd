@@ -71,15 +71,9 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') }}
         run: |
-          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
-            slot="/raid/ci-target/intentd/$RUNNER_NAME/native-artifacts"
-            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            mkdir -p "$root"
-            ./scripts/ci-target-slot.sh mark "$slot"
-            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
-            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
-          fi
+          args=(--minimum-gib 1)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted')
         env:
@@ -374,20 +368,14 @@ jobs:
         with:
           name: native-consumer-${{ inputs.platform }}-${{ github.run_attempt }}
           path: |
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-receipt.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: error
       - name: Remove this run's uncached artifact storage
         if: always()
         shell: bash
-        run: |
-          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
-            case "$NATIVE_ARTIFACT_ROOT" in
-              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
-              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
-            esac
-            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
-          fi
+        run: python3 -I -B scripts/ci-artifact-storage.py cleanup
       - name: Release lifecycle target dir
         if: ${{ always() && runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
         shell: bash

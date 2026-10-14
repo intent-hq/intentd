@@ -30,3 +30,14 @@ for (const fails of [false, true]) {
     } finally { fs.rmSync(root, {recursive: true, force: true}); }
   });
 }
+
+require('node:test')('artifact SDK and transitive dependencies have reproducible integrity pins', () => {
+  const action = path.join(__dirname, '../.github/actions/publish-variants');
+  const manifest = JSON.parse(fs.readFileSync(path.join(action, 'package.json')));
+  const lock = JSON.parse(fs.readFileSync(path.join(action, 'package-lock.json')));
+  assert.equal(manifest.dependencies['@actions/artifact'], '6.3.1');
+  assert.equal(lock.packages['node_modules/@actions/artifact'].version, '6.3.1');
+  for (const [name, entry] of Object.entries(lock.packages)) {
+    if (name) assert.match(entry.integrity, /^sha512-/);
+  }
+});

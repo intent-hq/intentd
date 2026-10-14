@@ -7,11 +7,14 @@ on:
       - 'scripts/ci-*artifacts.py'
       - 'scripts/ci-artifact-reuse.py'
       - 'scripts/test-ci-artifact-reuse.py'
+      - 'scripts/ci-artifact-storage.py'
+      - 'scripts/ci-publish-variants.cjs'
+      - '.github/actions/publish-variants/**'
 permissions:
   contents: read
   actions: read
 # A second workflow, with the same actual PR merge SHA, exercises the real
-# storage/lock boundary. Each caller reruns its Linux lint and runtime proofs.
+# v3 index/variant storage and lock boundary. Each caller reruns its Linux lint and runtime proofs.
 concurrency:
   group: native-proof-caller-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false

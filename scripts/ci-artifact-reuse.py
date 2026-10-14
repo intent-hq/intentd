@@ -93,12 +93,12 @@ class GitHub:
 
     def download(self, artifact, destination):
         # Metadata stays bounded at two minutes; a full coverage publication
-        # can exceed 25 GB. Budget transfer at 32 MiB/s plus setup overhead,
+        # can exceed 25 GB. Budget transfer at 16 MiB/s plus setup overhead (measured22MB/s),
         # capped at 30 minutes so a stalled endpoint still fails the job.
         size = artifact['size_in_bytes']
         if type(size) is not int or size <= 0:
             raise ValueError('invalid GitHub artifact size')
-        timeout = min(1800, 120 + (size + 32 * 1024**2 - 1) // (32 * 1024**2))
+        timeout = min(1800, 120 + (size + 16 * 1024**2 - 1) // (16 * 1024**2))
         try:
             self.api(f'actions/artifacts/{int(artifact["id"])}/zip', destination, timeout=timeout)
         except subprocess.TimeoutExpired as error:
@@ -156,10 +156,12 @@ def publication(expected):
             'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'workflow': os.environ['GITHUB_WORKFLOW_REF'].split('@')[0].split('/', 2)[2]}
 
 
-def extract_download(archive, destination):
+def extract_download(archive, destination, *, max_bytes):
     """Reject paths/links/duplicates before extracting any untrusted members."""
     with zipfile.ZipFile(archive) as zipped:
         seen = set()
+        if sum(entry.file_size for entry in zipped.infolist()) > max_bytes:
+            raise ValueError("artifact ZIP expanded size exceeds catalog budget")
         for entry in zipped.infolist():
             archives.safe_join(destination, entry.filename.rstrip('/'))
             if entry.filename in seen or (entry.external_attr >> 16) & 0o170000 == 0o120000:
@@ -212,7 +214,7 @@ def live(artifact):
     return not artifact['expired'] and expiry > datetime.datetime.now(datetime.timezone.utc)
 
 
-def download_verified(api, artifact, destination):
+def download_verified(api, artifact, destination, *, max_bytes=32 * 1024**2):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     zipped = destination / 'download.zip'
@@ -222,7 +224,7 @@ def download_verified(api, artifact, destination):
     if artifact.get('digest') != 'sha256:' + archives.file_sha(zipped):
         raise ValueError('download digest mismatch or missing GitHub artifact digest')
     checked = time.monotonic()
-    extract_download(zipped, destination / 'content')
+    extract_download(zipped, destination / 'content', max_bytes=max_bytes)
     zipped.unlink()
     return {'artifact_id': artifact['id'], 'bytes': artifact['size_in_bytes'],
             'download_seconds': downloaded-started, 'digest_seconds': checked-downloaded,
@@ -263,7 +265,7 @@ def restore_variants(requests, root, api, expected, platform, candidate, run, co
         with tempfile.TemporaryDirectory(prefix='variant-download-', dir=root) as tmp:
             stage = Path(tmp)
             try:
-                transfer = download_verified(api, matches[0], stage)
+                transfer = download_verified(api, matches[0], stage, max_bytes=entry['archive_bytes'] + 32 * 1024**2)
             except Deleted:
                 if require:
                     raise

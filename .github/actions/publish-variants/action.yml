@@ -14,7 +14,10 @@ runs:
       run: python3 -I -B scripts/ci-artifact-reuse.py --publication-plan "${NATIVE_ARTIFACT_ROOT:-$RUNNER_TEMP/native-artifacts}" --platform "$PUBLICATION_PLATFORM"
     - name: Install pinned artifact client
       shell: bash
-      run: npm install --prefix "$RUNNER_TEMP/intent-artifact-client" --no-save --ignore-scripts --no-audit --no-fund @actions/artifact@6.3.1
+      run: |
+        mkdir -p "$RUNNER_TEMP/intent-artifact-client"
+        cp .github/actions/publish-variants/package{,-lock}.json "$RUNNER_TEMP/intent-artifact-client/"
+        npm ci --prefix "$RUNNER_TEMP/intent-artifact-client" --ignore-scripts --no-audit --no-fund
     - uses: actions/github-script@v8
       with:
         script: |

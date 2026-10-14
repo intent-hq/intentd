@@ -26,6 +26,19 @@ def load(name):
 
 
 class CoordinationRegression(unittest.TestCase):
+    def test_zip_expansion_is_bounded_before_any_member_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zipped = root / 'bomb.zip'
+            with zipfile.ZipFile(zipped, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('publication.json', 'x' * 4096)
+            with self.assertRaisesRegex(ValueError, 'expanded size'):
+                reuse.extract_download(zipped, root / 'out', max_bytes=100)
+            self.assertFalse((root / 'out').exists())
+            reuse.extract_download(zipped, root / 'good', max_bytes=4096)
+            self.assertEqual((root / 'good/publication.json').stat().st_size, 4096)
+
+
     def test_native_producer_queues_overlapping_requests_without_cancellation(self):
         import yaml
         workflow = yaml.safe_load((ROOT / '.github/workflows/native-artifacts.yml').read_text())
@@ -95,7 +108,8 @@ class CoordinationRegression(unittest.TestCase):
             path = Path(directory) / 'publication.zip'
             api.download({'id': 42, 'size_in_bytes': 26_336_283_909}, path)
             self.assertEqual(path.read_bytes(), b'verified separately')
-        self.assertGreaterEqual(observed[0], 180)
+        # The authenticated old publication took1195.244s at22MB/s.
+        self.assertGreater(observed[0], 1195.244)
         self.assertLessEqual(observed[0], 1800)
 
     def test_download_timeout_removes_partial_archive_and_fails_explicitly(self):
@@ -292,6 +306,39 @@ class FunctionalReuse(unittest.TestCase):
             self.store.artifacts = self.store.artifacts[:1]  # only index finalized
             with self.assertRaisesRegex(ValueError, 'no consumer build fallback'):
                 linux.fetch(self.source, self.directory / 'incomplete', 'coverage-all')
+
+    def test_real_nextest_expansion_checked_before_extraction(self):
+        linux = load('ci-linux-artifacts')
+        request = self.requests['a']
+        key = archives.identity.build_key(request['identity'])
+        bundle = self.directory / 'bundle'; shutil.copytree(self.built / 'published' / key, bundle)
+        linux.check_expansion(bundle, request)
+        manifest = json.loads((bundle / 'manifest.json').read_text())
+        next(iter(manifest['files'].values()))['size'] = 0
+        (bundle / 'manifest.json').write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'exceeds manifest'):
+            linux.check_expansion(bundle, request)
+        self.assertFalse((self.directory / 'restored').exists())
+
+    def test_alias_scopes_budget_each_retained_extraction_before_variant_download(self):
+        from types import SimpleNamespace
+        linux = load('ci-linux-artifacts')
+        selected_root = self.directory / 'alias'; shutil.copytree(self.built, selected_root)
+        request = self.requests['a']
+        (selected_root / 'requests.json').write_text(json.dumps({'changed-0': request, 'callback': request}))
+        self.store.artifacts.clear(); self.store.publish(selected_root, 1)
+        key = archives.identity.build_key(request['identity'])
+        manifest = archives.verify_bundle(self.built / 'published' / key, request)
+        expanded = sum(item['size'] for item in manifest['files'].values())
+        old_budget = 2 * manifest['archive_bytes'] + expanded + max(8 * 1024**3, expanded // 5)
+        env = dict(GITHUB_REPOSITORY='intent-hq/intentd', GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='1',
+                   GITHUB_WORKFLOW_REF='intent-hq/intentd/.github/workflows/ci.yml@refs/pull/42/merge')
+        with patch.dict(os.environ, env), patch.object(linux.registry, 'GitHub', return_value=self.store), \
+             patch.object(linux.registry, 'context', return_value=self.expected), \
+             patch.object(linux.shutil, 'disk_usage', return_value=SimpleNamespace(free=old_budget + expanded // 2)):
+            with self.assertRaisesRegex(ValueError, 'free bytes'):
+                linux.fetch(self.source, self.directory / 'alias-short', 'changed')
+        self.assertEqual(len(self.store.downloads), 1)
 
     def test_narrow_restore_never_downloads_unrequested_variants(self):
         report = self.restore({'a': self.requests['a']})

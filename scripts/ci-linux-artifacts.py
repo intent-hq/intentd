@@ -15,6 +15,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import tarfile
 import time
 
 
@@ -40,7 +41,8 @@ FULL_PROOF_PATHS = ('.github/workflows/ci.yml', 'scripts/ci-linux-artifacts.py',
                     'scripts/ci-coverage-artifacts.py', 'scripts/ci-test-artifacts.py',
                     'scripts/test-ci-linux-artifacts.py', 'scripts/test-ci-coverage-artifacts.py',
                     'scripts/ci-artifact-reuse.py', 'scripts/ci-publish-variants.cjs',
-                    '.github/actions/publish-variants/action.yml')
+                    '.github/actions/publish-variants/action.yml', 'scripts/ci-artifact-storage.py',
+                    '.github/actions/publish-variants/package.json', '.github/actions/publish-variants/package-lock.json')
 COMPILER_TESTS = ['pool_escape_apis_are_rejected']
 
 
@@ -129,6 +131,7 @@ def produce(source, root, event, base, *, reuse=True):
         (root / 'publication.json').write_text(json.dumps(registry.publication(expected), indent=2) + '\n')
         registry.restore(requests, root, api, expected, 'linux')
     target = Path(os.environ.get('CARGO_TARGET_DIR', root / 'cargo-target')).resolve()
+    (root / 'storage-target.json').write_text(json.dumps({'target': str(target)}))
     initial_state = 'populated' if target.exists() and any(p.is_file() for p in target.rglob('*.rlib')) else 'empty'
     started = time.monotonic()
     records = archives.produce(list(requests.values()), source, target, root / 'published')
@@ -236,7 +239,7 @@ def fetch(source, root, scope):
             # Compressed bundles + all selected fresh extractions + one in-flight
             # ZIP, plus fresh profiles and report headroom. Never use another
             # filesystem's free-space number to approve this root.
-            expanded = sum(entry['expanded_bytes'] for entry in entries)
+            expanded = sum(catalog[archives.identity.build_key(r['identity'])]['expanded_bytes'] for r in selected.values())
             budget = sum(entry['archive_bytes'] for entry in entries) + expanded + max(entry['archive_bytes'] for entry in entries) + max(8 * 1024**3, expanded // 5)
             free = shutil.disk_usage(root).free
             receipt.update(selected_names=list(selected), required_free_bytes=budget, free_bytes_before=free)
@@ -256,6 +259,50 @@ def fetch(source, root, scope):
         (root / 'download.json').write_text(json.dumps(receipt, indent=2) + '\n')
 
 
+def check_expansion(bundle, request):
+    """Inspect real tar headers against the authenticated inventory before writing.
+
+    This Linux-only preflight streams decompression with bounded memory. It does
+    not create another expanded copy or replace nextest's relocation semantics.
+    """
+    manifest = archives.verify_bundle(bundle, request)
+    seen = {}
+
+    def inspect(tar):
+        for member in tar:
+            name = member.name.rstrip('/')
+            archives.safe_join(bundle, name)
+            if member.isdir():
+                continue
+            if not member.isfile() or name in seen:
+                raise ValueError('unsupported or duplicate expanded archive member')
+            expected = manifest['files'].get(name)
+            if expected is None or member.size != expected['size']:
+                raise ValueError('expanded archive member exceeds manifest inventory')
+            seen[name] = member.size
+
+    archive = bundle / manifest['archive']
+    if request['recipe']['kind'] == 'test-archive':
+        with subprocess.Popen(['zstd', '-dq', '-c', str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            try:
+                with tarfile.open(fileobj=process.stdout, mode='r|') as tar:
+                    inspect(tar)
+            finally:
+                # Tar end markers can precede zstd stream padding. No output is
+                # written here; the authenticated compressed bytes were checked.
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate()
+    else:
+        with tarfile.open(archive, 'r:gz') as tar:
+            inspect(tar)
+    if 'report_archive' in manifest:
+        with tarfile.open(bundle / manifest['report_archive']['name'], 'r:gz') as tar:
+            inspect(tar)
+    if seen != {name: item['size'] for name, item in manifest['files'].items()}:
+        raise ValueError('expanded archive inventory is incomplete')
+
+
 def prepare(source, root, names):
     requests = json.loads((root / 'requests.json').read_text())
     prepared = {}
@@ -264,7 +311,11 @@ def prepare(source, root, names):
         request = requests[name]
         key = archives.identity.build_key(request['identity'])
         # No overwrite: a previous run's profraw or binaries must never leak in.
+        started = time.monotonic()
+        check_expansion(root / 'published' / key, request)
+        validation_seconds = time.monotonic() - started
         prepared[name] = archives.prepare(root / 'published' / key, request, source, root / 'restored' / name, env=env)
+        prepared[name]['expansion_validation_seconds'] = validation_seconds
     (root / 'prepared.json').write_text(json.dumps(prepared, indent=2) + '\n')
     return prepared
 

@@ -378,15 +378,9 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
-            slot="/raid/ci-target/intentd/$RUNNER_NAME/check-artifacts"
-            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            mkdir -p "$root"
-            ./scripts/ci-target-slot.sh mark "$slot"
-            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
-            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
-          fi
+          args=(--minimum-gib 60)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -457,15 +451,15 @@ jobs:
       # DPkg::Lock::Timeout makes `install` wait for the dpkg locks, and the
       # retry loop covers `update`, whose lists lock has no wait option
       # (Debian bug #1069167).
-      - name: Install libssl-dev if missing
+      - name: Install OpenSSL headers and archive tools if missing
         run: |
-          if ! pkg-config --exists openssl; then
+          if ! pkg-config --exists openssl || ! command -v zstd >/dev/null; then
             for i in 1 2 3; do
               if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
               if [ "$i" -eq 3 ]; then exit 1; fi
               sleep $((i * 15))
             done
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev zstd
           fi
       # Keep the target dir OUTSIDE the runner work dir: checkout's default
       # clean (git clean -ffdx) wipes ignored files — including target/ — at
@@ -739,6 +733,7 @@ jobs:
         with:
           name: linux-consumer-${{ github.run_attempt }}
           path: |
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-receipt.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: error
@@ -756,14 +751,7 @@ jobs:
       - name: Remove this run's uncached artifact storage
         if: always()
         shell: bash
-        run: |
-          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
-            case "$NATIVE_ARTIFACT_ROOT" in
-              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
-              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
-            esac
-            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
-          fi
+        run: python3 -I -B scripts/ci-artifact-storage.py cleanup
       - name: Release per-slot target dir
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
@@ -950,15 +938,9 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
-            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e-artifacts"
-            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            mkdir -p "$root"
-            ./scripts/ci-target-slot.sh mark "$slot"
-            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
-            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
-          fi
+          args=(--minimum-gib 80)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -996,15 +978,15 @@ jobs:
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
-      - name: Install libssl-dev if missing
+      - name: Install OpenSSL headers and archive tools if missing
         run: |
-          if ! pkg-config --exists openssl; then
+          if ! pkg-config --exists openssl || ! command -v zstd >/dev/null; then
             for i in 1 2 3; do
               if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
               if [ "$i" -eq 3 ]; then exit 1; fi
               sleep $((i * 15))
             done
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev zstd
           fi
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -1130,20 +1112,14 @@ jobs:
           name: coverage-e2e-execution-${{ github.run_attempt }}
           path: |
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
         if: always()
         shell: bash
-        run: |
-          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
-            case "$NATIVE_ARTIFACT_ROOT" in
-              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
-              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
-            esac
-            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
-          fi
+        run: python3 -I -B scripts/ci-artifact-storage.py cleanup
 
 
   coverage-all:
@@ -1178,15 +1154,9 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
-            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all-artifacts"
-            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            mkdir -p "$root"
-            ./scripts/ci-target-slot.sh mark "$slot"
-            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
-            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
-          fi
+          args=(--minimum-gib 80)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -1224,15 +1194,15 @@ jobs:
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
-      - name: Install libssl-dev if missing
+      - name: Install OpenSSL headers and archive tools if missing
         run: |
-          if ! pkg-config --exists openssl; then
+          if ! pkg-config --exists openssl || ! command -v zstd >/dev/null; then
             for i in 1 2 3; do
               if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
               if [ "$i" -eq 3 ]; then exit 1; fi
               sleep $((i * 15))
             done
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev zstd
           fi
       # Raise the per-user inotify instance ceiling. The instrumented full
       # suite starts many real notify watchers in parallel (file, .git
@@ -1331,20 +1301,14 @@ jobs:
           name: coverage-all-execution-${{ github.run_attempt }}
           path: |
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
         if: always()
         shell: bash
-        run: |
-          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
-            case "$NATIVE_ARTIFACT_ROOT" in
-              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
-              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
-            esac
-            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
-          fi
+        run: python3 -I -B scripts/ci-artifact-storage.py cleanup
 
   # pull_request-ONLY counterpart of coverage-e2e / coverage-all
   # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
@@ -1468,15 +1432,9 @@ jobs:
         env:
           ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
         run: |
-          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
-            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-changed-artifacts"
-            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            mkdir -p "$root"
-            ./scripts/ci-target-slot.sh mark "$slot"
-            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
-            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
-          fi
+          args=(--minimum-gib 30)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
         env:
@@ -1514,16 +1472,16 @@ jobs:
             exit 1
           fi
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
-      - name: Install libssl-dev if missing
+      - name: Install OpenSSL headers and archive tools if missing
         if: steps.select.outputs.has_selection == 'true'
         run: |
-          if ! pkg-config --exists openssl; then
+          if ! pkg-config --exists openssl || ! command -v zstd >/dev/null; then
             for i in 1 2 3; do
               if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
               if [ "$i" -eq 3 ]; then exit 1; fi
               sleep $((i * 15))
             done
-            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev zstd
           fi
       - name: Resolve pinned Rust channel
         id: toolchain
@@ -1606,20 +1564,14 @@ jobs:
           name: coverage-changed-execution-${{ github.run_attempt }}
           path: |
             ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/storage*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
         if: always()
         shell: bash
-        run: |
-          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
-            case "$NATIVE_ARTIFACT_ROOT" in
-              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
-              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
-            esac
-            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
-          fi
+        run: python3 -I -B scripts/ci-artifact-storage.py cleanup
 
 
   pr-title:
@@ -1844,6 +1796,7 @@ jobs:
           python3 -I -B scripts/test-ci-build-identity.py
           python3 -I -B scripts/test-ci-test-artifacts.py
           python3 -I -B scripts/test-ci-artifact-reuse.py
+          python3 -I -B scripts/test-ci-artifact-storage.py
           node --test scripts/test-ci-publish-variants.cjs
           python3 -I -B scripts/test-ci-coverage-artifacts.py
           python3 -I -B scripts/test-ci-linux-artifacts.py
