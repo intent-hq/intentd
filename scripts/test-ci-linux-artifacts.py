@@ -145,7 +145,8 @@ class LinuxTests(unittest.TestCase):
                  mock.patch.object(linux.archives, 'run_libtest', side_effect=[0, 0, 41]) as run:
                 for expected in ({'reused': False}, {'reused': True}):
                     self.assertEqual(linux.produce(ROOT, root, 'merge_group', None, reuse=False), [expected])
-                    self.assertEqual(linux.compiler_exclusion(root, 'coverage-all', request, item), 'not binary(=store_pool_api)')
+                    with self.assertRaisesRegex(ValueError, 'authenticated producer prerequisite'):
+                        linux.compiler_exclusion(root, 'coverage-all', request, item)
                 with self.assertRaises(subprocess.CalledProcessError):
                     linux.produce(ROOT, root, 'merge_group', None, reuse=False)
                 self.assertEqual(produce.call_count, 3)
@@ -344,6 +345,36 @@ class LinuxTests(unittest.TestCase):
                             self.assertEqual(json.loads((root / 'receipt-callback.json').read_text())['compiler_calls'], 1)
                         else:
                             run.assert_not_called()
+
+
+class ProducerPrerequisiteTests(unittest.TestCase):
+    def test_only_successful_unsuperseded_job_can_authorize_retained_gate(self):
+        expected = {'source': 's', 'head_sha': 'h'}
+        marker = {'run_id': 42, 'attempt': 1, 'context': expected}
+        job = dict(id=100, name='check', run_id=42, run_attempt=1, head_sha='h',
+                   status='completed', conclusion='success', steps=[dict(
+                       name='Produce Linux variants sequentially in one shared target', status='completed', conclusion='success')])
+        api = mock.Mock()
+        api.pages.side_effect = lambda path, field: [job] if '/attempts/1/' in path else []
+        valid = linux.producer_prerequisite(api, marker, 3)
+        self.assertEqual(valid['job_id'], 100)
+        self.assertEqual(valid['producer_attempt'], 1)
+        self.assertEqual(valid['consumer_attempt'], 3)
+        cases = [[], [dict(job, conclusion='failure')], [dict(job, conclusion='cancelled')],
+                 [dict(job, status='in_progress')], [dict(job, run_attempt=2)],
+                 [dict(job, run_id=99)], [dict(job, head_sha='other')], [dict(job, steps=[])],
+                 [job, job]]
+        for rows in cases:
+            with self.subTest(rows=rows):
+                api.pages.side_effect = lambda path, field: rows if '/attempts/1/' in path else []
+                with self.assertRaisesRegex(ValueError, 'producer prerequisite'):
+                    linux.producer_prerequisite(api, marker, 3)
+        for conclusion in ('success', 'failure', 'cancelled'):
+            with self.subTest(new_producer=conclusion):
+                newer = dict(job, id=200, run_attempt=2, conclusion=conclusion)
+                api.pages.side_effect = lambda path, field: [job] if '/attempts/1/' in path else [newer] if '/attempts/2/' in path else []
+                with self.assertRaisesRegex(ValueError, 'superseded'):
+                    linux.producer_prerequisite(api, marker, 3)
 
 
 class StreamExtractionTests(unittest.TestCase):

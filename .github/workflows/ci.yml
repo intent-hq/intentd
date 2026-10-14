@@ -1117,6 +1117,7 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/producer-prerequisite.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
@@ -1309,6 +1310,7 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/producer-prerequisite.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
@@ -1574,6 +1576,7 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-*.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/producer-prerequisite.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage

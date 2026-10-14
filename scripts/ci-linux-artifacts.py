@@ -187,6 +187,36 @@ def compiler_gates(requests, source, target, root):
         (root / 'compiler-gates.json').write_text(json.dumps(receipt, indent=2) + '\n')
 
 
+def producer_prerequisite(api, marker, consumer_attempt):
+    """Authenticate a successful prerequisite, never an artifact's result claim."""
+    run_id, producer_attempt = marker['run_id'], marker['attempt']
+    if not 1 <= producer_attempt <= consumer_attempt:
+        raise ValueError('invalid producer prerequisite attempt lineage')
+    original = None
+    for attempt in range(producer_attempt, consumer_attempt + 1):
+        jobs = [job for job in api.pages(f'actions/runs/{run_id}/attempts/{attempt}/jobs', 'jobs')
+                if job.get('name') == 'check']
+        if attempt == producer_attempt:
+            if len(jobs) != 1:
+                raise ValueError('missing or ambiguous producer prerequisite job')
+            original = jobs[0]
+            steps = [step for step in original.get('steps', [])
+                     if step.get('name') == 'Produce Linux variants sequentially in one shared target']
+            if (original.get('run_id') != run_id or original.get('run_attempt') != producer_attempt
+                    or original.get('head_sha') != marker['context']['head_sha']
+                    or original.get('status') != 'completed' or original.get('conclusion') != 'success'
+                    or type(original.get('id')) is not int or len(steps) != 1
+                    or steps[0].get('status') != 'completed' or steps[0].get('conclusion') != 'success'):
+                raise ValueError('producer prerequisite was not an exact successful job and build step')
+        elif any(job != original for job in jobs):
+            # A new check (even one failing before publication) supersedes the
+            # retained prerequisite. Only an absent or identical retained job fits.
+            raise ValueError('producer prerequisite was superseded by a later attempt')
+    return {'context': marker['context'], 'run_id': run_id, 'job_id': original['id'],
+            'producer_attempt': producer_attempt, 'consumer_attempt': consumer_attempt,
+            'job_name': 'check', 'conclusion': 'success', 'producer_step': 'success'}
+
+
 def compiler_exclusion(root, name, request, item):
     binary = 'intent-store::store_pool_api'
     if binary not in item['runtime']['tests']:
@@ -195,6 +225,21 @@ def compiler_exclusion(root, name, request, item):
     gate = receipt['gates'].get(name)
     if receipt['source'] != request['identity']['source']['commit'] or not gate or gate['key'] != archives.identity.build_key(request['identity']) or gate['binary'] != binary or gate['exit_code'] != 0 or gate.get('tests') != COMPILER_TESTS:
         raise ValueError('compile-fail test has no successful fresh producer gate')
+    path = root / 'producer-prerequisite.json'
+    if not path.is_file():
+        raise ValueError('compile-fail exclusion requires an authenticated producer prerequisite')
+    prerequisite = archives.identity.read_request(path)
+    publication = archives.identity.read_request(root / 'publication.json')
+    if (prerequisite.get('context') != publication['context']
+            or prerequisite['context']['source'] != receipt['source']
+            or prerequisite.get('run_id') != publication['run_id']
+            or prerequisite.get('run_id') != int(os.environ['GITHUB_RUN_ID'])
+            or prerequisite.get('producer_attempt') != publication['attempt']
+            or prerequisite.get('consumer_attempt') != int(os.environ['GITHUB_RUN_ATTEMPT'])
+            or prerequisite.get('job_name') != 'check' or prerequisite.get('conclusion') != 'success'
+            or prerequisite.get('producer_step') != 'success' or type(prerequisite.get('job_id')) is not int
+            or prerequisite.get('gate_keys', {}).get(name) != gate['key']):
+        raise ValueError('compile-fail exclusion producer prerequisite binding differs')
     return 'not binary(=store_pool_api)'
 
 
@@ -265,6 +310,14 @@ def fetch(source, root, scope):
             wanted = {archives.identity.build_key(r['identity']): r for r in selected.values()}
             if wanted.keys() - catalog.keys():
                 raise ValueError('required consumer variants absent from publication')
+            prerequisite = None
+            gates_path = content / 'compiler-gates.json'
+            if gates_path.is_file():
+                gate_names = set(archives.identity.read_request(gates_path)['gates']) & selected.keys()
+                if gate_names:
+                    prerequisite = producer_prerequisite(api, marker, attempt)
+                    prerequisite['gate_keys'] = {name: archives.identity.build_key(selected[name]['identity']) for name in gate_names}
+                    receipt['producer_prerequisite'] = prerequisite
             entries = [catalog[key] for key in wanted]
             # Compressed bundles + all selected fresh extractions + one in-flight
             # ZIP, plus fresh profiles and report headroom. Never use another
@@ -285,6 +338,8 @@ def fetch(source, root, scope):
             for filename in ('publication.json', 'compiler-gates.json', 'producer.json'):
                 if (content / filename).is_file():
                     shutil.copyfile(content / filename, root / filename)
+            if prerequisite is not None:
+                (root / 'producer-prerequisite.json').write_text(json.dumps(prerequisite, indent=2) + '\n')
             (root / 'requests.json').write_text(json.dumps(selected, indent=2) + '\n')
             receipt.update(complete=True, variant_artifacts=hits, free_bytes_after=shutil.disk_usage(root).free)
     finally:
@@ -416,7 +471,8 @@ def run_coverage(source, root, scope):
     prepared = prepare(source, root, prepare_names)
     download = json.loads((root / 'download.json').read_text()) if (root / 'download.json').is_file() else {}
     receipt = {'scope': scope, 'compiler_calls': 0, 'variants': {},
-               'producer_attempt': download.get('producer_attempt'), 'consumer_attempt': download.get('consumer_attempt')}
+               'producer_attempt': download.get('producer_attempt'), 'consumer_attempt': download.get('consumer_attempt'),
+               'producer_prerequisite': download.get('producer_prerequisite')}
     try:
         for name in names:
             item = prepared[name]

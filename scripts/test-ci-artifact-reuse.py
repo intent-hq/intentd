@@ -176,7 +176,7 @@ class Store:
 
     def __init__(self, root, expected):
         self.root, self.expected = root, expected
-        self.artifacts, self.runs = [], {}
+        self.artifacts, self.runs, self.jobs = [], {}, {}
         self.download_error = None
         self.downloads = []
 
@@ -185,6 +185,12 @@ class Store:
 
     def run(self, run_id):
         return self.runs[run_id]
+
+    def pages(self, path, field):
+        self.assert_jobs_path = (path, field)
+        parts = path.split('/')
+        assert parts[:2] == ['actions', 'runs'] and parts[3] == 'attempts' and parts[5] == field == 'jobs'
+        return copy.deepcopy(self.jobs.get((int(parts[2]), int(parts[4])), []))
 
     def download(self, artifact, destination):
         if self.download_error:
@@ -203,6 +209,9 @@ class Store:
                             'pull_requests': [{'number': expected['pull_request'],
                                                'head': {'sha': expected['head_sha'], 'repo': {'id': 42}},
                                                'base': {'sha': expected['base_sha']}}]}
+        self.jobs[(run_id, attempt)] = [dict(id=run_id * 10000 + attempt, name='check',
+            run_id=run_id, run_attempt=attempt, head_sha=expected['head_sha'], status='completed', conclusion='success',
+            steps=[dict(name='Produce Linux variants sequentially in one shared target', status='completed', conclusion='success')])]
         marker = {'schema': 1, 'context': expected, 'run_id': run_id, 'attempt': attempt, 'workflow': workflow}
         (root / 'publication.json').write_text(json.dumps(marker))
         requests = {}
@@ -279,6 +288,9 @@ class FunctionalReuse(unittest.TestCase):
         linux = load('ci-linux-artifacts')
         self.store.artifacts.clear()
         publication = self.directory / 'retry-publication'; shutil.copytree(self.built, publication)
+        gate_key = archives.identity.build_key(self.requests['a']['identity'])
+        (publication / 'compiler-gates.json').write_text(json.dumps({'source': self.expected['source'], 'gates': {
+            'coverage-all': dict(key=gate_key, binary='intent-store::store_pool_api', tests=linux.COMPILER_TESTS, exit_code=0)}}))
         (publication / 'requests.json').write_text(json.dumps({'coverage-all': self.requests['a']}))
         self.store.publish(publication, 1)
         self.store.runs[1]['run_attempt'] = 2
@@ -291,6 +303,18 @@ class FunctionalReuse(unittest.TestCase):
             receipt = json.loads((root / 'download.json').read_text())
             self.assertEqual((receipt['producer_attempt'], receipt['consumer_attempt']), (1, 2))
             self.assertEqual(receipt['selected_names'], ['coverage-all'])
+            self.assertEqual(receipt['producer_prerequisite']['job_id'], 10001)
+            self.assertEqual(linux.compiler_exclusion(root, 'coverage-all', self.requests['a'],
+                {'runtime': {'tests': {'intent-store::store_pool_api': {}}}}), 'not binary(=store_pool_api)')
+            original_jobs = copy.deepcopy(self.store.jobs[(1, 1)])
+            for index, mutation in enumerate((None, {'conclusion': 'failure'}, {'conclusion': 'cancelled'},
+                                               {'run_id': 999}, {'head_sha': 'wrong'}, {'run_attempt': 2})):
+                self.store.jobs[(1, 1)] = [] if mutation is None else [dict(original_jobs[0], **mutation)]
+                self.store.downloads.clear()
+                with self.assertRaisesRegex(ValueError, 'producer prerequisite'):
+                    linux.fetch(self.source, self.directory / ('invalid-job-' + str(index)), 'coverage-all')
+                self.assertEqual(len(self.store.downloads), 1, 'reject before any large variant transfer')
+            self.store.jobs[(1, 1)] = original_jobs
             self.assertFalse(list(root.glob('receipt-*.json')), 'execution results must never be restored')
             request = self.requests['a']; key = archives.identity.build_key(request['identity'])
             prepared = linux.prepare_streamed(root / 'published' / key, request, self.source, root / 'runtime')
@@ -309,6 +333,7 @@ class FunctionalReuse(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not finalized'):
                 linux.fetch(self.source, self.directory / 'partial-current', 'coverage-all')
             self.store.artifacts = [a for a in self.store.artifacts if a['id'] < 1000000]
+            del self.store.jobs[(1, 2)]
             index = self.store.artifacts[0]
             original = (self.directory / '1.zip').read_bytes()
             (self.directory / '1.zip').write_bytes(b'corrupt')
