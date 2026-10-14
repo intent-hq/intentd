@@ -257,20 +257,19 @@ jobs:
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
             core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
             core.setOutput("linux_burst", String(useBurst));
-            // Windows (intent-hq/intent#5518): 5090pc is a single-slot
-            // runner whose only CI consumer is the build job's Windows
-            // entry, so an online runner is selected outright — no queue
-            // depth to weigh. Offline, invisible, or unreadable → burst.
+            // 5090pc is shared by native builds and lifecycle jobs. Prefer
+            // its free slot only when explicitly idle; a busy or unknown
+            // slot must burst rather than exhaust the merge queue timeout.
             let windowsUseBurst = true;
             let windowsReason = "fail-open default";
             try {
               if (runnerListError) throw runnerListError;
-              const online = onlineWith(windowsSelfHosted);
-              if (online.length === 0) {
-                windowsReason = `no online self-hosted Windows runner (${runnerSource} list)`;
+              const idle = onlineWith(windowsSelfHosted).filter(r => r.busy === false);
+              if (idle.length === 0) {
+                windowsReason = `no idle online self-hosted Windows runner (${runnerSource} list)`;
               } else {
                 windowsUseBurst = false;
-                windowsReason = `online=${online.length} (${runnerSource} list)`;
+                windowsReason = `idle=${idle.length} (${runnerSource} list)`;
               }
             } catch (e) {
               windowsUseBurst = true;

@@ -417,12 +417,17 @@ fn registered_root_keeps_its_own_identity_configuration_and_selection() {
 #[test]
 fn renamed_and_removed_explicit_selection_never_recovers_via_origin() {
     let f = Fixture::new();
-    f.config("remote.origin.url", A);
+    f.git(&f.path, &["remote", "add", "origin", A]);
     let mut input = f.input();
     input.roots[0].saved_selection = SavedReviewSelection::ExplicitRemote {
         remote_name: "origin".into(),
     };
     f.git(&f.path, &["remote", "rename", "origin", "renamed"]);
+    assert_eq!(
+        f.git(&f.path, &["config", "--get", "remote.renamed.fetch"])
+            .trim(),
+        "+refs/heads/*:refs/remotes/renamed/*"
+    );
     let read = f.read(&input);
     assert!(matches!(
         read.context.roots[0].review_selection.outcome,

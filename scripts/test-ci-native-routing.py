@@ -327,8 +327,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(call["args"], {"org": "intent-hq", "per_page": 100} if call["endpoint"] == "org"
                                      else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
 
-    def test_linux_and_windows_keep_existing_queue_and_online_semantics(self):
-        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64", busy=True), runner()]
+    def test_linux_keeps_queue_semantics_and_idle_windows_stays_self_hosted(self):
+        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64"), runner()]
         for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
                                                (0, ["intentd"], True), (0, ["cloudlands-fe", "monorepo"], False)):
             with self.subTest(depth=depth, queue_errors=queue_errors):
@@ -353,6 +353,22 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
+
+    def test_windows_bursts_without_explicit_idle_capacity(self):
+        missing_busy = runner("Windows", "X64")
+        missing_busy.pop("busy")
+        for fleet in ([runner("Windows", "X64", busy=True)], [missing_busy],
+                      [runner("Windows", "X64", busy=None)],
+                      [runner("Windows", "X64", busy="false")],
+                      [runner("Windows", "X64", busy=0)],
+                      [runner("Windows", "X64", status="offline")]):
+            with self.subTest(fleet=fleet):
+                outputs = run_route(self.workflow, org=fleet)["outputs"]
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"])
+                self.assertEqual(outputs["windows_burst"], "true")
+        outputs = run_route(self.workflow, org=[runner("Windows", "X64", busy=True),
+                                               runner("Windows", "X64")])["outputs"]
+        self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
 
     def test_windows_maintenance_override_preserves_other_runner_preferences(self):
         step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
