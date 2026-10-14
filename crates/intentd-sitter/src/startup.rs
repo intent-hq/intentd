@@ -472,112 +472,6 @@ pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     }
 }
 
-#[cfg(test)]
-mod contention_tests {
-    use super::wait_for_start_lock;
-    use crate::readiness::{ProbeStatus, StartupBudget};
-    use std::cell::Cell;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn unix_and_windows_contention_wait_for_lock_despite_fresh_starting() {
-        let attempts = Cell::new(0);
-        let started = Instant::now();
-        let mut budget = StartupBudget::new(Duration::from_secs(1));
-        let lock = wait_for_start_lock(
-            &mut budget,
-            || {
-                attempts.set(attempts.get() + 1);
-                Ok((attempts.get() == 23).then_some(42))
-            },
-            |budget| {
-                budget.observe(&ProbeStatus::Starting {
-                    attempt_id: "unchanged".into(),
-                });
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(lock, 42);
-        assert_eq!(attempts.get(), 23);
-        assert!(started.elapsed() > Duration::from_secs(1));
-    }
-
-    #[test]
-    fn unix_and_windows_contention_bounds_missing_ready_failed_and_cancelled() {
-        for observation in ["missing", "ready", "failed", "cancelled"] {
-            let started = Instant::now();
-            let mut budget = StartupBudget::new(Duration::from_millis(100));
-            let result = wait_for_start_lock::<()>(
-                &mut budget,
-                || Ok(None),
-                |budget| {
-                    match observation {
-                        "failed" | "cancelled" => return Err(std::io::Error::other(observation)),
-                        "ready" => budget.observe(&ProbeStatus::Ready("0.1.0".into())),
-                        _ => budget.observe(&ProbeStatus::Unavailable),
-                    }
-                    Ok(())
-                },
-            );
-            assert!(result.is_err(), "{observation} must not bypass a held lock");
-            assert!(started.elapsed() < Duration::from_secs(2));
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Runs on macOS as well as Linux: retain the dead supervisor with waitid,
-    /// then kill its private group before reaping. The descendant owns a pipe;
-    /// EOF proves cleanup without relying on platform-specific zombie status.
-    #[test]
-    fn dead_supervisor_cleanup_closes_descendant_pipe() {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
-        struct OwnedSession(std::process::Child, std::path::PathBuf);
-        impl Drop for OwnedSession {
-            fn drop(&mut self) {
-                stop_owned_child(&mut self.0, &self.1);
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "sleep 60 & echo ready; wait"])
-            .stdout(Stdio::piped());
-        detach(&mut command);
-        let mut child = OwnedSession(command.spawn().unwrap(), dir.path().join("sitter.pid"));
-        let pid = nix::unistd::Pid::from_raw(child.0.id().cast_signed());
-        let pipe = child.0.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(pipe);
-            let mut line = String::new();
-            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
-            tx.send(line).unwrap();
-            let mut tail = String::new();
-            reader.read_to_string(&mut tail).unwrap();
-            let _ = tx.send("eof".to_string());
-        });
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "ready\n");
-        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !child_exited(&child.0).unwrap() {
-            assert!(Instant::now() < deadline);
-            pause(deadline);
-        }
-        // The PID is still reserved: observing exit a second time must work.
-        assert!(child_exited(&child.0).unwrap());
-        stop_owned_child(&mut child.0, &dir.path().join("sitter.pid"));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "eof");
-        reader.join().unwrap();
-    }
-}
-
 /// Stop the Windows supervisor even during startup/backoff. None means no
 /// supervisor exists, so the CLI should forward stop to the installed daemon.
 #[cfg(windows)]
@@ -694,4 +588,110 @@ pub fn stop(paths: &SitterPaths) -> Option<i32> {
             1
         }
     })
+}
+
+#[cfg(test)]
+mod contention_tests {
+    use super::wait_for_start_lock;
+    use crate::readiness::{ProbeStatus, StartupBudget};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unix_and_windows_contention_wait_for_lock_despite_fresh_starting() {
+        let attempts = Cell::new(0);
+        let started = Instant::now();
+        let mut budget = StartupBudget::new(Duration::from_secs(1));
+        let lock = wait_for_start_lock(
+            &mut budget,
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok((attempts.get() == 23).then_some(42))
+            },
+            |budget| {
+                budget.observe(&ProbeStatus::Starting {
+                    attempt_id: "unchanged".into(),
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(lock, 42);
+        assert_eq!(attempts.get(), 23);
+        assert!(started.elapsed() > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn unix_and_windows_contention_bounds_missing_ready_failed_and_cancelled() {
+        for observation in ["missing", "ready", "failed", "cancelled"] {
+            let started = Instant::now();
+            let mut budget = StartupBudget::new(Duration::from_millis(100));
+            let result = wait_for_start_lock::<()>(
+                &mut budget,
+                || Ok(None),
+                |budget| {
+                    match observation {
+                        "failed" | "cancelled" => return Err(std::io::Error::other(observation)),
+                        "ready" => budget.observe(&ProbeStatus::Ready("0.1.0".into())),
+                        _ => budget.observe(&ProbeStatus::Unavailable),
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{observation} must not bypass a held lock");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Runs on macOS as well as Linux: retain the dead supervisor with waitid,
+    /// then kill its private group before reaping. The descendant owns a pipe;
+    /// EOF proves cleanup without relying on platform-specific zombie status.
+    #[test]
+    fn dead_supervisor_cleanup_closes_descendant_pipe() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        struct OwnedSession(std::process::Child, std::path::PathBuf);
+        impl Drop for OwnedSession {
+            fn drop(&mut self) {
+                stop_owned_child(&mut self.0, &self.1);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo ready; wait"])
+            .stdout(Stdio::piped());
+        detach(&mut command);
+        let mut child = OwnedSession(command.spawn().unwrap(), dir.path().join("sitter.pid"));
+        let pid = nix::unistd::Pid::from_raw(child.0.id().cast_signed());
+        let pipe = child.0.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+            tx.send(line).unwrap();
+            let mut tail = String::new();
+            reader.read_to_string(&mut tail).unwrap();
+            let _ = tx.send("eof".to_string());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "ready\n");
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_exited(&child.0).unwrap() {
+            assert!(Instant::now() < deadline);
+            pause(deadline);
+        }
+        // The PID is still reserved: observing exit a second time must work.
+        assert!(child_exited(&child.0).unwrap());
+        stop_owned_child(&mut child.0, &dir.path().join("sitter.pid"));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "eof");
+        reader.join().unwrap();
+    }
 }
