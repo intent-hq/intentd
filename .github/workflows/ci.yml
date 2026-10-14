@@ -117,6 +117,7 @@ jobs:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
+          LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
         with:
           # tinybox serves several repos on its runner slots, so the probe
           # wants to size the queue across all of them — but the default
@@ -253,6 +254,10 @@ jobs:
             } catch (e) {
               useBurst = true;
               reason = `probe failed (${e.message})`;
+            }
+            if (process.env.LINUX_RUNNER_DISABLED === "true") {
+              useBurst = true;
+              reason = "self-hosted Linux disabled for maintenance";
             }
             core.info(`linux routing: burst=${useBurst} (${reason})`);
             core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));

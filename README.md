@@ -857,8 +857,9 @@ The design docs live in the monorepo under `docs/`:
 Routed jobs prefer the free self-hosted fleet and burst to Depot when the fleet
 is unavailable or busy. Depot Linux checks use 8 CPUs and coverage/release
 compilation uses 16 CPUs. Physical-host pruning remains scheduled.
-To bypass a native runner during maintenance, set the repository variable
-`CI_WINDOWS_RUNNER_DISABLED=true` or `CI_MACOS_RUNNER_DISABLED=true`.
+To bypass self-hosted runners during maintenance, set the repository variable
+`CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
+`CI_MACOS_RUNNER_DISABLED=true`.
 Restore the default self-hosted preference by deleting that variable with
 `gh variable delete <VARIABLE> --repo intent-hq/intentd` after recovery.
 Each override affects only its named platform.
