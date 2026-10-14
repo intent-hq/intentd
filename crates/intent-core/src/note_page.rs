@@ -41,6 +41,8 @@ pub struct NotePageRequest {
 /// Fixed bounded failure classification, never a complete current Note.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotePageError {
+    Preparing,
+    ResourceLimit,
     CursorInvalid,
     Expired,
     Stale,
@@ -50,6 +52,8 @@ impl NotePageError {
     #[must_use]
     pub const fn wire_code(self) -> &'static str {
         match self {
+            Self::Preparing => "note-index-preparing",
+            Self::ResourceLimit => "note-index-resource-limit",
             Self::CursorInvalid => "note-page-cursor-invalid",
             Self::Expired => "note-page-expired",
             Self::Stale => "note-page-stale",
