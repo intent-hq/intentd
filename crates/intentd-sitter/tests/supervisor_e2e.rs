@@ -3885,7 +3885,7 @@ fn stop_during_probe_case(contended: bool) {
         r#"call|status)
     if [ "${BLOCK_START_PROBE:-}" = 1 ]; then
       touch "$INTENTD_DATA_DIR/probe-parked"
-      # timing-guard: deterministic probe barrier released after real stop
+      # // timing-guard: deterministic probe barrier released after real stop
       while [ ! -f "$INTENTD_DATA_DIR/probe-release" ]; do sleep 0.01; done
     fi"#,
     );
