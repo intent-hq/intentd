@@ -19,6 +19,40 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 const WAIT: Duration = Duration::from_secs(15);
+
+fn fixture_request_wait(multiplier: Option<&str>) -> Duration {
+    let multiplier = multiplier
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0);
+    // Coverage exports 3; keep malformed or extreme settings from shortening
+    // the ordinary wait or turning a fixture hang into an unbounded wait.
+    WAIT.mul_f64(multiplier.clamp(1.0, 20.0))
+}
+
+#[test]
+fn fixture_request_wait_honors_coverage_without_shortening_normal_runs() {
+    assert_eq!(fixture_request_wait(Some("3")), WAIT * 3);
+    assert_eq!(
+        fixture_request_wait(Some("1.5")),
+        Duration::from_millis(22_500)
+    );
+    assert_eq!(
+        fixture_request_wait(Some("1e300")),
+        Duration::from_secs(300)
+    );
+    for multiplier in [
+        None,
+        Some("0"),
+        Some("-1"),
+        Some("invalid"),
+        Some("NaN"),
+        Some("inf"),
+    ] {
+        assert_eq!(fixture_request_wait(multiplier), WAIT);
+    }
+}
+
 const METHOD: &str = "_intent/session/register_mcp_callback";
 
 struct ReadObservation {
@@ -396,8 +430,9 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
     }
 
     async fn call(&self, method: &str, params: Value) -> Value {
+        let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER").ok();
         self.connection
-            .request_timeout(method, params, WAIT)
+            .request_timeout(method, params, fixture_request_wait(multiplier.as_deref()))
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
