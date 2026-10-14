@@ -244,7 +244,7 @@ class LinuxTests(unittest.TestCase):
             root = Path(tmp)
             source = root / 'source'
             source.mkdir()
-            (root / 'requests.json').write_text(json.dumps({'changed-0': {'identity': {}}, 'callback': {'identity': {'source': {'commit': 'head'}}}}))
+            (root / 'requests.json').write_text(json.dumps({'changed-0': {'identity': {}}, 'callback': {'identity': {'source': {'commit': 'head'}, 'build': {'inputs': {}}}}}))
             prepared_names = []
             def extract(bundle, request, checkout, destination, **kwargs):
                 self.assertFalse((source / 'default.profraw').exists(), 'preparation must precede runtime outputs')
@@ -270,13 +270,25 @@ class LinuxTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 2)
                 self.assertEqual(json.loads((root / 'receipt-callback.json').read_text())['selected_tests'], names)
 
+    def test_callback_only_demand_prepares_without_running_changed_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'requests.json').write_text(json.dumps({'callback': {}}))
+            with mock.patch.object(linux, 'prepare', return_value={'callback': {}}) as prepare, \
+                 mock.patch.object(linux.archives, 'run_nextest') as run:
+                linux.run_coverage(ROOT, root, 'changed')
+                self.assertEqual(prepare.call_args.args[2], ['callback'])
+                run.assert_not_called()
+                self.assertEqual(json.loads((root / 'receipt-changed.json').read_text())['variants'], {})
+
     def test_callback_inventory_and_failure_prevent_execution(self):
         names = WORKFLOW['jobs']['coverage-changed']['env']['CALLBACK_FIXTURE_TESTS'].split()
-        for mode in ('valid', 'missing', 'extra', 'duplicate', 'empty', 'list-failure', 'run-failure', 'missing-prepared', 'missing-callback', 'wrong-source', 'wrong-key', 'changed-head', 'changed-tracked'):
+        for mode in ('valid', 'missing', 'extra', 'duplicate', 'empty', 'list-failure', 'run-failure', 'missing-prepared', 'missing-callback', 'wrong-source', 'wrong-key', 'changed-head', 'changed-tracked', 'stale-target', 'changed-input', 'swallowed-compiler'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                (root / 'requests.json').write_text(json.dumps({'callback': {'identity': {'source': {'commit': 'head'}}}}))
+                (root / 'requests.json').write_text(json.dumps({'callback': {'identity': {'source': {'commit': 'head'}, 'build': {'inputs': {}}}}}))
                 item = {'source': str(ROOT), 'target': str(root / 'restored/callback/target'), 'runtime': {}, 'request_key': 'key'}
+                if mode == 'stale-target': item['target'] = str(root / 'previous-run/target')
                 if mode == 'wrong-source': item['source'] = str(root / 'elsewhere')
                 if mode == 'wrong-key': item['request_key'] = 'wrong'
                 if mode != 'missing-prepared':
@@ -288,6 +300,16 @@ class LinuxTests(unittest.TestCase):
                 cases = {n: {'filter-match': {'status': 'matches'}} for n in selected}
                 suites = {'one': {'testcases': cases}}
                 if mode == 'duplicate': suites['two'] = {'testcases': {names[0]: cases[names[0]]}}
+                if mode == 'changed-input':
+                    request = json.loads((root / 'requests.json').read_text())
+                    request['callback']['identity']['build']['inputs'] = {'Cargo.lock': '0' * 64}
+                    (root / 'requests.json').write_text(json.dumps(request))
+                real_environment = linux.native.consumer_environment
+                def execute(item, args, *, env):
+                    if mode == 'swallowed-compiler':
+                        attempted = subprocess.run(['rustc', '--version'], env=real_environment(root), capture_output=True)
+                        self.assertEqual(attempted.returncode, 97)
+                    return 44 if mode == 'run-failure' else 0
                 def output(command, *args):
                     if command[:2] == ['git', 'rev-parse']:
                         return 'other-head' if mode == 'changed-head' else 'head'
@@ -301,7 +323,7 @@ class LinuxTests(unittest.TestCase):
                      mock.patch.object(linux.native, 'consumer_environment', return_value={}), \
                      mock.patch.object(linux.archives, 'runtime_env', side_effect=lambda item, env: env), \
                      mock.patch.object(linux.archives, 'output', side_effect=output) as listing, \
-                     mock.patch.object(linux.archives, 'run_nextest', return_value=44 if mode == 'run-failure' else 0) as run:
+                     mock.patch.object(linux.archives, 'run_nextest', side_effect=execute) as run:
                     if mode in ('valid', 'run-failure'):
                         self.assertEqual(linux.run_callback(ROOT, root), 44 if mode == 'run-failure' else 0)
                         args = run.call_args.args[1]
@@ -315,7 +337,11 @@ class LinuxTests(unittest.TestCase):
                     else:
                         with self.assertRaises((ValueError, KeyError, FileNotFoundError, subprocess.CalledProcessError)):
                             linux.run_callback(ROOT, root)
-                        run.assert_not_called()
+                        if mode == 'swallowed-compiler':
+                            run.assert_called_once()
+                            self.assertEqual(json.loads((root / 'receipt-callback.json').read_text())['compiler_calls'], 1)
+                        else:
+                            run.assert_not_called()
 
 
 if __name__ == '__main__':

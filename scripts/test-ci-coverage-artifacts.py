@@ -22,6 +22,7 @@ def load(name):
 archives = load('ci-test-artifacts')
 coverage = load('ci-coverage-artifacts')
 native = load('ci-native-artifacts')
+linux = load('ci-linux-artifacts')
 
 
 class CoverageTests(unittest.TestCase):
@@ -80,6 +81,53 @@ class CoverageTests(unittest.TestCase):
             extra.write_bytes(extra.read_bytes() + b'tampered')
             with self.assertRaisesRegex(ValueError, 'report archive size/digest mismatch'):
                 archives.verify_bundle(bundle, request)
+
+    def test_real_changed_then_callback_prepares_before_runtime_outputs(self):
+        with tempfile.TemporaryDirectory(prefix='intent-callback-archive-') as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            (source / 'src').mkdir(parents=True)
+            (source / 'Cargo.toml').write_text('[package]\nname="callback-fixture"\nversion="0.1.0"\nedition="2021"\n[workspace]\n')
+            names = ['callback_' + str(i) for i in range(6)]
+            rust = '#[test] fn runtime_output() { std::fs::write("runtime-output.txt", "test-owned output").unwrap(); }\n'
+            rust += ''.join('#[test] fn ' + name + '() { assert!(std::env::var("LLVM_PROFILE_FILE").unwrap().contains("restored/")); }\n' for name in names)
+            (source / 'src/lib.rs').write_text(rust)
+            (source / 'tests').mkdir()
+            (source / 'tests/auggie_context_e2e.rs').write_text('#[test] fn excluded() { panic!("must stay excluded"); }\n')
+            subprocess.run(['cargo', 'generate-lockfile', '--offline'], cwd=source, check=True, capture_output=True)
+            for argv in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture']):
+                subprocess.run(['git', *argv], cwd=source, check=True, capture_output=True)
+            facts = native.platform_facts('linux')
+            recipe = dict(kind='test-archive', command=['cargo', 'nextest', 'archive', '--locked', '--offline', '--lib', '--tests', '--target-dir', '{target}', '--cargo-message-format', 'json', '--archive-file', '{archive}'], companions=[])
+            request = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True)
+            record = archives.produce([request], source, root / 'build', root / 'published')[0]
+            (root / 'requests.json').write_text(json.dumps({'changed-0': request, 'callback': request}))
+            self.assertEqual(archives.source_commit(source), request['identity']['source']['commit'])
+            # Genuine dirty input is still rejected before any test runs.
+            (source / 'src/lib.rs').write_text(rust + '// changed source\n')
+            with self.assertRaisesRegex(ValueError, 'clean checkout'):
+                linux.run_coverage(source, root, 'changed')
+            (source / 'src/lib.rs').write_text(rust)
+            with mock.patch.dict(os.environ, {'CALLBACK_FIXTURE_TESTS': '\n'.join(names)}):
+                linux.run_coverage(source, root, 'changed')
+                self.assertEqual((source / 'runtime-output.txt').read_text(), 'test-owned output')
+                # This is the old callback boundary: extracting after tests
+                # fails the real clean-source validator on a runtime output.
+                with self.assertRaisesRegex(ValueError, 'clean checkout'):
+                    archives.prepare(root / 'published' / record['key'], request, source, root / 'late')
+                (source / 'src/lib.rs').write_text(rust + '// later source edit\n')
+                with self.assertRaisesRegex(ValueError, 'tracked source changed'):
+                    linux.run_callback(source, root)
+                (source / 'src/lib.rs').write_text(rust)
+                self.assertFalse(list((root / 'restored/callback').glob('*.profraw')))
+                self.assertEqual(linux.run_callback(source, root), 0)
+            receipt = json.loads((root / 'receipt-callback.json').read_text())
+            self.assertEqual(receipt['selected_tests'], names)
+            self.assertEqual(receipt['test_exit_code'], 0)
+            self.assertEqual(json.loads((root / 'receipt-changed.json').read_text())['compiler_calls'], 0)
+            self.assertTrue(list((root / 'restored/changed-0').glob('*.profraw')))
+            self.assertTrue(list((root / 'restored/callback').glob('*.profraw')))
+            self.assertFalse((root / 'compiler-calls.log').exists())
 
     def test_real_relocated_archives_fresh_profiles_and_floors(self):
         with tempfile.TemporaryDirectory(prefix='intent-coverage-archive-') as tmp:

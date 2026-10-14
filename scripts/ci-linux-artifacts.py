@@ -429,6 +429,8 @@ def run_callback(source, root):
     item = prepared['callback']
     if Path(item['source']).resolve() != Path(source).resolve():
         raise ValueError('callback prepared source differs from current checkout')
+    if Path(item['target']).resolve() != (root / 'restored/callback/target').resolve():
+        raise ValueError('callback prepared target differs from this run')
     request = requests['callback']
     if item.get('request_key') != archives.identity.build_key(request['identity']):
         raise ValueError('callback prepared request differs from current demand')
@@ -436,8 +438,13 @@ def run_callback(source, root):
     # extraction. A different commit or any tracked source change still does.
     if archives.output(['git', 'rev-parse', 'HEAD'], source) != request['identity']['source']['commit']:
         raise ValueError('callback source commit changed after preparation')
-    if archives.output(['git', 'diff', '--name-only', 'HEAD', '--'], source):
-        raise ValueError('callback tracked source changed after preparation')
+    changed_paths = archives.output(['git', 'diff', '--name-only', 'HEAD', '--'], source)
+    if changed_paths:
+        raise ValueError('callback tracked source changed after preparation: ' + changed_paths)
+    for name, digest in request['identity']['build']['inputs'].items():
+        path = archives.safe_join(source, name)
+        if (archives.file_sha(path) if path.is_file() else archives.sha(b'')) != digest:
+            raise ValueError('callback source input changed after preparation: ' + name)
     names = os.environ['CALLBACK_FIXTURE_TESTS'].split()
     if len(names) != 6 or len(set(names)) != 6:
         raise ValueError('expected exactly six callback fixtures')
@@ -449,16 +456,29 @@ def run_callback(source, root):
     command = [*archives.nextest_command(), 'list', '--cargo-metadata', str(target / 'nextest/cargo-metadata.json'),
                '--binaries-metadata', str(target / 'nextest/binaries-metadata.json'), '--workspace-remap', str(source),
                '--target-dir-remap', str(target), '-E', filterset, '--message-format', 'json']
-    listing = json.loads(archives.output(command, source, env))
-    selected = [name for suite in listing['rust-suites'].values() for name, case in suite['testcases'].items()
-                if case['filter-match']['status'] == 'matches']
-    if len(selected) != len(names) or set(selected) != set(names):
-        raise ValueError('callback fixture inventory differs: ' + repr(selected))
+    receipt = {'test_exit_code': None, 'selected_tests': [],
+               'extract_seconds': item.get('extract_seconds', 0),
+               'expansion_validation_seconds': item.get('expansion_validation_seconds', 0)}
     started = time.monotonic()
-    result = archives.run_nextest(item, ['-E', filterset, '--no-fail-fast', '--retries', '0', '--status-level', 'pass', '--final-status-level', 'fail'], env=env)
-    (root / 'receipt-callback.json').write_text(json.dumps({'test_seconds': time.monotonic() - started,
-        'test_exit_code': result, 'selected_tests': selected}, indent=2) + '\n')
-    return result
+    try:
+        listing = json.loads(archives.output(command, source, env))
+        selected = [name for suite in listing['rust-suites'].values() for name, case in suite['testcases'].items()
+                    if case['filter-match']['status'] == 'matches']
+        receipt['selected_tests'] = selected
+        if len(selected) != len(names) or set(selected) != set(names):
+            raise ValueError('callback fixture inventory differs: ' + repr(selected))
+        started = time.monotonic()
+        result = archives.run_nextest(item, ['-E', filterset, '--no-fail-fast', '--retries', '0', '--status-level', 'pass', '--final-status-level', 'fail'], env=env)
+        receipt['test_exit_code'] = result
+        return result
+    finally:
+        logs = [root / 'compiler-calls.log', *(root / 'restored').glob('*/compiler-calls.log')]
+        calls = [line for log in logs if log.exists() for line in log.read_text().splitlines() if line]
+        receipt.update(test_seconds=time.monotonic() - started, compiler_calls=len(calls))
+        (root / 'receipt-callback.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        if calls:
+            raise ValueError('callback consumer attempted compilation: ' + '\n'.join(calls))
+
 
 
 def main():
