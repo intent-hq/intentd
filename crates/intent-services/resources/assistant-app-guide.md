@@ -129,13 +129,14 @@ Read current state and respect the user's requested scope.
 
 ## Start or continue work
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage.svelte,HomeWorkspaceBoard.svelte,home-model.ts}; src/lib/components/workspace/WorkspaceCard.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage.svelte,HomeWorkspaceBoard.svelte,HomeWorkspaceSettings.svelte,home-model.ts,home-workspace-status-groups.ts}; src/lib/components/workspace/WorkspaceCard.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
 
 In **Home → Workspaces**, **PR ready** groups workspaces whose pull requests are
 ready to merge, separately from **Needs you**. Use the **PR ready** status filter
 to find them. Questions, review requests, blockers, and failures take priority over
-a ready PR. In **Board view** with **Group by → Status**, the **PR ready** column
+a ready PR. In **Board view** with **Group by → Activity**, the **PR ready** column
 appears only while matching workspaces remain visible under the current filters.
+In **List view**, **Group by → Status** shows detailed work stages.
 
 Use **Dismiss for now** in a workspace’s Home or sidebar actions menu to hide its current
 **Needs you** reminder for yourself. It stays dismissed across refreshes and
