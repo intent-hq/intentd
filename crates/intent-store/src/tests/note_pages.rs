@@ -17,6 +17,7 @@ mod demand_rebuild;
 mod guarded_metadata;
 mod immediate_delete;
 mod plain_markdown;
+mod profile_reopen;
 mod writer_anchors;
 
 fn request(value: Value) -> NotePageRequest {

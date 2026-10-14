@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 const WAIT: Duration = Duration::from_secs(15);
+
 const METHOD: &str = "_intent/session/register_mcp_callback";
 
 struct ReadObservation {
@@ -397,7 +398,7 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
 
     async fn call(&self, method: &str, params: Value) -> Value {
         self.connection
-            .request_timeout(method, params, WAIT)
+            .request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -5897,7 +5898,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, WAIT)
+            c.request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
                 .await
                 .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }

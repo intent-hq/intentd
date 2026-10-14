@@ -13,24 +13,35 @@ use std::collections::BTreeMap;
 
 pub(crate) const PIECE_BYTES: usize = 4096;
 
-/// Retire derived projections whenever the pinned parser, index implementation,
-/// or recorded canonical schema oracle changes. This is distinct from raw rev.
+/// Index implementation sources hashed into [`profile_revision`]. Tests audit
+/// their external crate references against the fingerprinted dependency roots.
+pub(crate) const INDEX_SOURCES: [&str; 7] = [
+    include_str!("note_page_index.rs"),
+    include_str!("note_page_html.rs"),
+    include_str!("note_page_html/entry.rs"),
+    include_str!("note_page_html/index.rs"),
+    include_str!("note_page_html/markdown.rs"),
+    include_str!("note_page_html/markdown_source.rs"),
+    include_str!("note_page_html/primitive.rs"),
+];
+
+/// Retire derived projections whenever the index implementation, recorded
+/// canonical schema oracle, or an output-relevant dependency changes (see
+/// `build/note_index_dependencies.rs`). This is distinct from raw rev.
 pub(crate) fn profile_revision() -> &'static str {
     static REVISION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let mut digest = Sha256::new();
-        for input in [
-            "canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions",
-            include_str!("note_page_index.rs"),
-            include_str!("note_page_html.rs"),
-            include_str!("note_page_html/entry.rs"),
-            include_str!("note_page_html/index.rs"),
-            include_str!("note_page_html/markdown.rs"),
-            include_str!("note_page_html/markdown_source.rs"),
-            include_str!("note_page_html/primitive.rs"),
+        let marker = ["canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions"];
+        let oracles_and_dependencies = [
             include_str!("tests/fixtures/note_html_native.json"),
             include_str!("tests/fixtures/note_primitive_native.json"),
-            include_str!(concat!(env!("OUT_DIR"), "/profile-Cargo.lock")),
-        ] {
+            include_str!(concat!(env!("OUT_DIR"), "/note-index-dependencies.txt")),
+        ];
+        for input in marker
+            .iter()
+            .chain(&INDEX_SOURCES)
+            .chain(&oracles_and_dependencies)
+        {
             digest.update(input.as_bytes());
             digest.update([0]);
         }
