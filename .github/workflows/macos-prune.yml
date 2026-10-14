@@ -6,8 +6,17 @@ on:
     - cron: "15 11,23 * * *"
   workflow_dispatch:
     inputs:
+      runner:
+        description: Machine to clean (Windows dispatch also works before its workflow lands)
+        type: choice
+        options: [m1mac, 5090pc]
+        default: m1mac
       apply:
         description: Delete inactive CI artifacts (otherwise dry run)
+        type: boolean
+        default: false
+      verify_build:
+        description: Verify a Windows build after applying cleanup (5090pc only)
         type: boolean
         default: false
 permissions:
@@ -17,6 +26,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prune:
+    if: github.event_name != 'workflow_dispatch' || inputs.runner != '5090pc'
     runs-on: [self-hosted, macOS, ARM64, m1mac]
     timeout-minutes: 20
     steps:
@@ -26,3 +36,10 @@ jobs:
       - name: Reclaim disk headroom
         if: github.event_name == 'schedule' || inputs.apply
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply
+  windows:
+    if: github.event_name == 'workflow_dispatch' && inputs.runner == '5090pc'
+    uses: ./.github/workflows/windows-prune.yml
+    with:
+      apply: ${{ inputs.apply }}
+      verify_build: ${{ inputs.verify_build }}
+    secrets: inherit

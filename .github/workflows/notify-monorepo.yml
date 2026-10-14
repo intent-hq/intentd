@@ -11,7 +11,7 @@ permissions: {}
 
 jobs:
   notify:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - name: Send repository_dispatch to intent-hq/intent
         env:
