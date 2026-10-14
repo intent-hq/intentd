@@ -108,6 +108,11 @@ class CoordinationRegression(unittest.TestCase):
             path = Path(directory) / 'publication.zip'
             api.download({'id': 42, 'size_in_bytes': 26_336_283_909}, path)
             self.assertEqual(path.read_bytes(), b'verified separately')
+            # Representative full variant: allow observed slow18MB/s plus120s
+            # setup, while leaving runtime/report time inside the30min job.
+            api.download({'id': 43, 'size_in_bytes': 8_730_870_843}, path)
+        self.assertGreaterEqual(observed[1], 8_730_870_843 / 18_000_000 + 120)
+        self.assertLess(observed[1], 11 * 60)
         # The authenticated old publication took1195.244s at22MB/s.
         self.assertGreater(observed[0], 1195.244)
         self.assertLessEqual(observed[0], 1800)
