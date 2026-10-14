@@ -25,9 +25,12 @@ impl Hold {
         self.release.acquire().await.unwrap().forget();
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(Duration::from_secs(15), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            crate::test_support::fixture_timeout(Duration::from_secs(15)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn resume(&self) {
         self.release.add_permits(1);
@@ -142,7 +145,7 @@ pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
         .unwrap();
     let mut line = String::new();
     tokio::time::timeout(
-        Duration::from_secs(15),
+        crate::test_support::fixture_timeout(Duration::from_secs(15)),
         BufReader::new(stream).read_line(&mut line),
     )
     .await

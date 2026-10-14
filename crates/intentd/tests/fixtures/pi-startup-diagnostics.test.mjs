@@ -4,7 +4,7 @@
 // The adapter still loses child stderr/status. Assert the separate fixture report,
 // keeping the original ACP error honest and successful traffic unchanged.
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -15,6 +15,7 @@ import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
+import { stopWindowsProcessTree } from './pi-windows-shutdown.mjs';
 import diagnostics from './pi-diagnostics.cjs';
 import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 const { Capture, LIMITS, SECRET, safeValue, failureReport, publishEvidence } = diagnostics;
@@ -90,10 +91,7 @@ function startAdapter(cwd, env, records) {
         let witnessError;
         try { record.witnesses = await stopWitnesses(env.PI_TEST_WITNESS_DIR); } catch (error) { witnessError = error; }
         if (windows) {
-          if (child.exitCode === null && child.signalCode === null) {
-            const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 10_000 });
-            assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
-          }
+          await stopWindowsProcessTree(child, closed);
         } else {
           try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
         }

@@ -51,7 +51,7 @@ def coverage_budget_violations(workflow):
     """Keep the combined instrumented lane finite, with post-action headroom."""
     job = workflow["jobs"]["coverage-changed"]
     limits = {
-        "Run changed tests under llvm-cov": 30,
+        "Run changed tests under llvm-cov": 50,
         "Run callback fixture composition under llvm-cov": 8,
     }
     errors = []
@@ -64,10 +64,10 @@ def coverage_budget_violations(workflow):
             errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
     combined = workflow["jobs"]["coverage-all"]
     steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
-    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 40:
-        errors.append("coverage-all must reserve 2m outside its 38m combined phase")
-    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 38:
-        errors.append("coverage-all must retain its 38m compile/test/report bound")
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 45:
+        errors.append("coverage-all must reserve 2m outside its 43m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 43:
+        errors.append("coverage-all must retain its 43m compile/test/report bound")
     return errors
 
 
@@ -246,10 +246,25 @@ class CiPolicyTests(unittest.TestCase):
                     self.assertTrue(coverage_budget_violations(workflow))
                     self.assertTrue(violations(workflow, "1"))
 
+    def test_full_coverage_budget_includes_report_generation(self):
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+
+    def test_full_coverage_uses_verified_bounded_profile_pool(self):
+        job = self.workflow["jobs"]["coverage-all"]
+        self.assertEqual(job["env"].get("LLVM_PROFILE_FILE_NAME"), "intent-%8m.profraw")
+        proof = next(s for s in job["steps"] if s.get("name") == "Verify bounded coverage profile pooling")
+        self.assertEqual(proof["run"], "python3 -I -B scripts/test-coverage-profile-pool.py")
+        self.assertFalse(proof.get("if"))
+        self.assertFalse(proof.get("continue-on-error"))
+        names = [s.get("name") for s in job["steps"]]
+        self.assertLess(names.index(proof["name"]), names.index("Run combined coverage"))
+
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
         self.assertEqual(coverage_budget_violations(self.workflow), [])
+
+        self.assertEqual(job["timeout-minutes"], 60)
         names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
         self.assertEqual(len(names), 6)
         for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):

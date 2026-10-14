@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   stale:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
     steps:
       # SHA-pinned (not tag-pinned): the action holds a write token, and a tag
