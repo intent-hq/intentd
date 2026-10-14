@@ -275,6 +275,22 @@ jobs:
               windowsUseBurst = true;
               windowsReason = `probe failed (${e.message})`;
             }
+            // PR #2419: 5090pc exhausted disk during Rust installation before
+            // any checks ran (actions/runs/38518837615/jobs/115703736371).
+            // Scope hosted recovery to this branch/PR and its main queue ref;
+            // both native build and lifecycle consume this single decision.
+            const startupPr = context.payload?.pull_request;
+            const startupWindowsRecovery =
+              (context.eventName === "pull_request" && startupPr?.number === 2419 &&
+               startupPr.head?.ref === "fix/indexing-startup-progress" &&
+               startupPr.head?.repo?.full_name === "intent-hq/intentd") ||
+              (context.eventName === "push" && context.ref === "refs/heads/fix/indexing-startup-progress") ||
+              (context.eventName === "merge_group" &&
+               /^refs\/heads\/gh-readonly-queue\/main\/pr-2419-[0-9a-f]{40}$/.test(context.payload?.merge_group?.head_ref || ""));
+            if (startupWindowsRecovery) {
+              windowsUseBurst = true;
+              windowsReason = "PR #2419 scoped recovery from self-hosted disk exhaustion";
+            }
             core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
             core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
             core.setOutput("windows_burst", String(windowsUseBurst));
