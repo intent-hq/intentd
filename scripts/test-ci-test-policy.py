@@ -324,8 +324,8 @@ else:
             (root / 'scripts').mkdir()
             for name in ('ci-native-artifacts.py', 'ci-test-artifacts.py', 'ci-build-identity.py'):
                 (root / 'scripts' / name).write_text((ROOT / 'scripts' / name).read_text())
-            artifact_root = root / 'native-artifacts'
-            artifact_root.mkdir()
+            artifact_root = root / 'owned artifacts' / 'run-42-3-native'
+            artifact_root.mkdir(parents=True)
             prepared = {}
             for variant, package, binary_id in (('transport', 'intent-transport', 'intent-transport'),
                                                  ('daemon', 'intentd', 'intentd::e2e_wss_tunnel')):
@@ -346,7 +346,7 @@ else:
             (artifact_root / 'prepared.json').write_text(json.dumps(prepared))
             env = {**os.environ, **self.step["env"], "INTENTD_TUNNEL_TOOLCHAIN": "pinned-channel",
                    "INTENTD_TUNNEL_TARGET": "aarch64-apple-darwin", "TUNNEL_ROOT": tmp,
-                   "RUNNER_TEMP": str(root), "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
+                   "RUNNER_TEMP": str(root), "NATIVE_ARTIFACT_ROOT": str(artifact_root), "TUNNEL_MODE": mode, "TUNNEL_LOG": str(root / "calls.jsonl"),
                    "TUNNEL_PIDS": str(root / "pids.json"), "PATH": tmp + os.pathsep + os.environ["PATH"]}
             env.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
             if inherited_libraries:
