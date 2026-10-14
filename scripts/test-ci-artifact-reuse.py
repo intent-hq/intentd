@@ -61,8 +61,8 @@ class CoordinationRegression(unittest.TestCase):
         self.assertLess(names.index('Production check and Clippy in shared target'), names.index('Restore native executables with compiler tripwires'))
         self.assertEqual(steps[names.index('Publish native variants')]['if'], 'always()')
         upload = steps[names.index('Publish native variants')]['with']
-        self.assertNotIn('overwrite', upload)
-        self.assertIn('github.run_attempt', upload['name'])
+        self.assertEqual(steps[names.index('Publish native variants')]['uses'], './.github/actions/publish-variants')
+        self.assertIn('inputs.platform', upload['platform'])
 
     def test_api_discovery_searches_all_workflows_and_attempts_for_event_head(self):
         api = reuse.GitHub('intent-hq/intentd')
@@ -159,6 +159,7 @@ class Store:
         self.root, self.expected = root, expected
         self.artifacts, self.runs = [], {}
         self.download_error = None
+        self.downloads = []
 
     def candidates(self, name, head_sha):
         return [a for a in reversed(self.artifacts) if a['name'] == name + '-1']
@@ -169,7 +170,11 @@ class Store:
     def download(self, artifact, destination):
         if self.download_error:
             raise self.download_error
+        self.downloads.append(artifact['id'])
         shutil.copyfile(self.root / (str(artifact['id']) + '.zip'), destination)
+
+    def list_artifacts(self, run_id):
+        return [a for a in self.artifacts if a['workflow_run']['id'] == run_id]
 
     def publish(self, root, run_id, *, workflow='.github/workflows/ci.yml', conclusion='success'):
         expected = self.expected
@@ -181,16 +186,27 @@ class Store:
                                                'base': {'sha': expected['base_sha']}}]}
         marker = {'schema': 1, 'context': expected, 'run_id': run_id, 'attempt': 1, 'workflow': workflow}
         (root / 'publication.json').write_text(json.dumps(marker))
-        path = self.root / (str(run_id) + '.zip')
-        with zipfile.ZipFile(path, 'w') as archive:
-            for file in root.rglob('*'):
-                if file.is_file() and ('published' in file.relative_to(root).parts or file.name == 'publication.json'):
-                    archive.write(file, file.relative_to(root))
-        artifact = {'id': run_id, 'name': reuse.artifact_name('linux', expected['source']) + '-1',
-                    'expired': False, 'expires_at': '2099-01-01T00:00:00Z', 'workflow_run': {'id': run_id},
-                    'digest': 'sha256:' + archives.file_sha(path)}
-        self.artifacts.append(artifact)
-        return artifact
+        requests = {}
+        for path in (root / 'published').glob('*/manifest.json'):
+            manifest = json.loads(path.read_text())
+            requests[path.parent.name] = {'identity': manifest['identity'], 'recipe': manifest['recipe']}
+        if not (root / 'requests.json').exists():
+            (root / 'requests.json').write_text(json.dumps(requests))
+        plan = reuse.publication_plan(root, 'linux')
+        index = None
+        for number, upload in enumerate(plan):
+            artifact_id = run_id if number == 0 else run_id*1000 + number
+            path = self.root / (str(artifact_id) + '.zip')
+            with zipfile.ZipFile(path, 'w') as archive:
+                for name in upload['files']:
+                    archive.write(name, Path(name).relative_to(upload['root']))
+            artifact = {'id': artifact_id, 'name': upload['name'],
+                        'expired': False, 'expires_at': '2099-01-01T00:00:00Z', 'workflow_run': {'id': run_id},
+                        'digest': 'sha256:' + archives.file_sha(path), 'size_in_bytes': path.stat().st_size}
+            self.artifacts.append(artifact)
+            if index is None:
+                index = artifact
+        return index
 
 
 def make_fixture(root):
@@ -242,6 +258,82 @@ class FunctionalReuse(unittest.TestCase):
 
     def restore(self, requests=None):
         return reuse.restore(requests or self.requests, self.directory / 'restore', self.store, self.expected, 'linux')
+
+    def test_real_consumer_fetches_only_its_scope_and_checks_actual_disk(self):
+        linux = load('ci-linux-artifacts')
+        selected_root = self.directory / 'scoped'; shutil.copytree(self.built, selected_root)
+        names = {'coverage-e2e': self.requests['a'], 'coverage-all': self.requests['b'],
+                 'changed-0': self.requests['c'], 'callback': self.requests['a']}
+        (selected_root / 'requests.json').write_text(json.dumps(names))
+        self.store.artifacts.clear(); self.store.publish(selected_root, 1)
+        env = dict(GITHUB_REPOSITORY='intent-hq/intentd', GITHUB_RUN_ID='1', GITHUB_RUN_ATTEMPT='1',
+                   GITHUB_WORKFLOW_REF='intent-hq/intentd/.github/workflows/ci.yml@refs/pull/42/merge')
+        with patch.dict(os.environ, env), patch.object(linux.registry, 'GitHub', return_value=self.store), \
+             patch.object(linux.registry, 'context', return_value=self.expected):
+            for scope, count in [('coverage-e2e', 1), ('coverage-all', 1), ('changed', 2)]:
+                root = self.directory / scope
+                self.store.downloads.clear()
+                linux.fetch(self.source, root, scope)
+                receipt = json.loads((root / 'download.json').read_text())
+                self.assertTrue(receipt['complete'])
+                self.assertEqual(len(receipt['variant_artifacts']), count)
+                self.assertEqual(len(self.store.downloads), count + 1)
+                self.assertEqual(len(list((root / 'published').iterdir())), count)
+                self.assertGreater(receipt['required_free_bytes'], 8 * 1024**3)
+                self.assertEqual(len(json.loads((root / 'requests.json').read_text())), count)
+            from types import SimpleNamespace
+            self.store.downloads.clear()
+            root = self.directory / 'out-of-space'
+            with patch.object(linux.shutil, 'disk_usage', return_value=SimpleNamespace(free=0)):
+                with self.assertRaisesRegex(ValueError, 'free bytes'):
+                    linux.fetch(self.source, root, 'coverage-all')
+            self.assertEqual(len(self.store.downloads), 1)  # never download an 8GB bundle before failing
+            self.assertFalse(json.loads((root / 'download.json').read_text())['complete'])
+            self.store.artifacts = self.store.artifacts[:1]  # only index finalized
+            with self.assertRaisesRegex(ValueError, 'no consumer build fallback'):
+                linux.fetch(self.source, self.directory / 'incomplete', 'coverage-all')
+
+    def test_narrow_restore_never_downloads_unrequested_variants(self):
+        report = self.restore({'a': self.requests['a']})
+        self.assertEqual(len(report['hits']), 1)
+        self.assertEqual(len(self.store.downloads), 2)  # small index + exact bundle
+        self.assertEqual(self.store.downloads[0], 1)
+        key = archives.identity.build_key(self.requests['a']['identity'])
+        self.assertEqual(self.store.downloads[1], report['hits'][key]['artifact_id'])
+        self.assertEqual(len(report['transfers']), 2)
+
+    def test_partial_upload_keeps_finalized_variants_and_rebuilds_only_missing(self):
+        self.store.artifacts.pop()  # index already visible; last upload interrupted
+        report = self.restore()
+        self.assertEqual(len(report['hits']), 2)
+        self.assertEqual(len(report['misses']), 1)
+        self.assertEqual(len(self.store.downloads), 3)
+
+    def test_legacy_platform_zip_is_not_a_selective_index(self):
+        self.store.artifacts[0]['name'] = self.store.artifacts[0]['name'].replace('native-v3-index-', 'native-v2-')
+        self.assertEqual(len(self.restore()['misses']), 3)
+        self.assertEqual(self.store.downloads, [])
+
+    def test_variant_from_another_run_cannot_satisfy_index(self):
+        self.store.artifacts[1]['workflow_run']['id'] = 999
+        report = self.restore()
+        self.assertEqual(len(report['hits']), 2)
+        self.assertEqual(len(report['misses']), 1)
+
+    def test_catalog_digest_binds_the_exact_inner_manifest(self):
+        candidate = self.store.artifacts[0]
+        path = self.directory / '1.zip'
+        with zipfile.ZipFile(path) as source:
+            entries = {name: source.read(name) for name in source.namelist()}
+        catalog = json.loads(entries['catalog.json'])
+        next(iter(catalog['variants'].values()))['manifest_sha256'] = '0'*64
+        entries['catalog.json'] = json.dumps(catalog).encode()
+        with zipfile.ZipFile(path, 'w') as archive:
+            for name, value in entries.items():
+                archive.writestr(name, value)
+        candidate['digest'] = 'sha256:' + archives.file_sha(path)
+        with self.assertRaisesRegex(ValueError, 'manifest digest'):
+            self.restore()
 
     def test_reuses_across_workflow_names_and_failed_or_cancelled_runs(self):
         for conclusion in ('success', 'failure', 'cancelled', None):
@@ -310,7 +402,8 @@ class FunctionalReuse(unittest.TestCase):
         path = self.directory / '1.zip'
         for kind in ('marker', 'archive'):
             self.store.artifacts.clear(); self.store.publish(self.built, 1)
-            candidate = self.store.artifacts[0]
+            candidate = self.store.artifacts[0 if kind == 'marker' else 1]
+            path = self.directory / (str(candidate['id']) + '.zip')
             with zipfile.ZipFile(path) as source:
                 entries = {name: source.read(name) for name in source.namelist()}
             if kind == 'marker':

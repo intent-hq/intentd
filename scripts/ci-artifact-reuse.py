@@ -85,6 +85,9 @@ class GitHub:
                 if re.fullmatch(re.escape(name) + r'-[1-9][0-9]*', artifact['name']):
                     yield artifact
 
+    def list_artifacts(self, run_id):
+        return list(self.pages(f'actions/runs/{int(run_id)}/artifacts', 'artifacts'))
+
     def run(self, run_id):
         return self.api(f'actions/runs/{int(run_id)}')
 
@@ -106,7 +109,7 @@ class GitHub:
 def artifact_name(platform, source):
     if platform not in ('linux', 'macos', 'windows') or not re.fullmatch('[0-9a-f]{40}', source):
         raise ValueError('invalid native artifact namespace')
-    return f'native-v2-{platform}-{source}'
+    return f'native-v3-index-{platform}-{source}'
 
 
 def trusted_run(run, expected):
@@ -165,23 +168,142 @@ def extract_download(archive, destination):
         zipped.extractall(destination)
 
 
+def variant_name(platform, source, key, attempt):
+    if not re.fullmatch(r'intentd-build-v1-[0-9a-f]{64}', key):
+        raise ValueError('invalid variant key')
+    return artifact_name(platform, source).replace('-index-', '-variant-') + '-' + key.removeprefix('intentd-build-v1-') + '-' + str(attempt)
+
+
+def publication_plan(root, platform):
+    """Index first: finalized variants survive an interrupted later upload."""
+    root = Path(root).resolve()
+    marker = archives.identity.read_request(root / 'publication.json')
+    requests = archives.identity.read_request(root / 'requests.json')
+    index = root / 'publication-index'
+    index.mkdir(exist_ok=True)
+    for name in ('publication.json', 'requests.json', 'reuse.json', 'compiler-gates.json', 'producer.json', 'compiler-tripwire.exe'):
+        if (root / name).is_file():
+            shutil.copyfile(root / name, index / name)
+    variants, uploads = {}, []
+    for request in requests.values():
+        archives.validate_request(request)
+        key = archives.identity.build_key(request['identity'])
+        if key in variants:
+            continue
+        bundle = root / 'published' / key
+        if not bundle.is_dir():
+            continue  # A failed build still publishes earlier completed variants.
+        manifest = archives.verify_bundle(bundle, request)
+        name = variant_name(platform, marker['context']['source'], key, marker['attempt'])
+        variants[key] = {'name': name, 'manifest_sha256': archives.file_sha(bundle / 'manifest.json'),
+                         'archive_bytes': manifest['archive_bytes'] + manifest.get('report_archive', {}).get('bytes', 0),
+                         'expanded_bytes': sum(item['size'] for item in manifest['files'].values())}
+        files = [root / 'publication.json', *sorted(p for p in bundle.iterdir() if p.is_file())]
+        uploads.append({'name': name, 'root': str(root), 'files': list(map(str, files))})
+    (index / 'catalog.json').write_text(json.dumps({'schema': 3, 'variants': variants}, indent=2) + '\n')
+    plan = [{'name': artifact_name(platform, marker['context']['source']) + '-' + str(marker['attempt']),
+             'root': str(index), 'files': list(map(str, sorted(index.iterdir())))}, *uploads]
+    (root / 'publication-plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+    return plan
+
+
+def live(artifact):
+    expiry = datetime.datetime.fromisoformat(artifact['expires_at'].replace('Z', '+00:00'))
+    return not artifact['expired'] and expiry > datetime.datetime.now(datetime.timezone.utc)
+
+
+def download_verified(api, artifact, destination):
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    zipped = destination / 'download.zip'
+    started = time.monotonic()
+    api.download(artifact, zipped)
+    downloaded = time.monotonic()
+    if artifact.get('digest') != 'sha256:' + archives.file_sha(zipped):
+        raise ValueError('download digest mismatch or missing GitHub artifact digest')
+    checked = time.monotonic()
+    extract_download(zipped, destination / 'content')
+    zipped.unlink()
+    return {'artifact_id': artifact['id'], 'bytes': artifact['size_in_bytes'],
+            'download_seconds': downloaded-started, 'digest_seconds': checked-downloaded,
+            'zip_extract_seconds': time.monotonic()-checked}
+
+
+def validate_marker(content, candidate, run, expected, platform):
+    marker = archives.identity.read_request(content / 'publication.json')
+    if (marker.get('schema') != 1 or marker.get('context') != expected or marker.get('run_id') != run['id']
+            or marker.get('workflow') != run['path'] or type(marker.get('attempt')) is not int
+            or not 1 <= marker['attempt'] <= run['run_attempt']
+            or candidate['name'] != artifact_name(platform, expected['source']) + '-' + str(marker['attempt'])):
+        raise ValueError('publication provenance mismatch')
+    catalog = archives.identity.read_request(content / 'catalog.json')
+    if catalog.get('schema') != 3 or not isinstance(catalog.get('variants'), dict):
+        raise ValueError('unsupported selective publication catalog')
+    for key, entry in catalog['variants'].items():
+        if (entry.get('name') != variant_name(platform, expected['source'], key, marker['attempt'])
+                or not re.fullmatch('[0-9a-f]{64}', entry.get('manifest_sha256', ''))
+                or any(type(entry.get(field)) is not int or entry[field] < 0 for field in ('archive_bytes', 'expanded_bytes'))):
+            raise ValueError('invalid selective variant catalog entry')
+    return marker, catalog['variants']
+
+
+def restore_variants(requests, root, api, expected, platform, candidate, run, content, *, require=False):
+    marker, catalog = validate_marker(content, candidate, run, expected, platform)
+    available = api.list_artifacts(run['id'])
+    hits, transfers = {}, []
+    for key, request in requests.items():
+        entry = catalog.get(key)
+        matches = [item for item in available if entry and item['name'] == entry['name'] and live(item)]
+        if not matches:
+            if require:
+                raise ValueError('required variant not finalized; no consumer build fallback: ' + key)
+            continue
+        if len(matches) != 1 or matches[0]['workflow_run']['id'] != run['id']:
+            raise ValueError('ambiguous or cross-run variant publication')
+        with tempfile.TemporaryDirectory(prefix='variant-download-', dir=root) as tmp:
+            stage = Path(tmp)
+            try:
+                transfer = download_verified(api, matches[0], stage)
+            except Deleted:
+                if require:
+                    raise
+                continue
+            bundle = stage / 'content/published' / key
+            if (archives.identity.read_request(stage / 'content/publication.json') != marker
+                    or archives.file_sha(bundle / 'manifest.json') != entry['manifest_sha256']):
+                raise ValueError('variant provenance or manifest digest mismatch')
+            manifest = archives.verify_bundle(bundle, request)
+            if (entry['archive_bytes'] != manifest['archive_bytes'] + manifest.get('report_archive', {}).get('bytes', 0)
+                    or entry['expanded_bytes'] != sum(item['size'] for item in manifest['files'].values())):
+                raise ValueError('catalog disk budget differs from verified manifest')
+            destination = root / 'published' / key
+            destination.parent.mkdir(exist_ok=True)
+            if destination.exists():
+                archives.verify_bundle(destination, request)
+            else:
+                shutil.move(str(bundle), destination)  # Same filesystem: no third archive copy.
+            hits[key] = {'artifact_id': matches[0]['id'], 'run_id': run['id'], 'workflow': run['path'],
+                         'producer_conclusion': run.get('conclusion'), 'attempt': marker['attempt']}
+            transfers.append(transfer)
+    return hits, transfers
+
+
 def restore(requests, root, api, expected, platform):
-    """Run under the workflow lock; successful downloads only seed exact hits."""
+    """Post-lock index lookup, then only missing exact variant downloads."""
     root = Path(root)
-    published = root / 'published'
-    published.mkdir(parents=True, exist_ok=True)
+    (root / 'published').mkdir(parents=True, exist_ok=True)
     wanted = {archives.identity.build_key(r['identity']): r for r in requests.values()}
     if any(r['identity']['source']['commit'] != expected['source'] for r in wanted.values()):
         raise ValueError('requested source differs from trusted context')
-    report = {'lookup': 'after-lock', 'context': expected, 'hits': {}, 'misses': {}, 'rejected': []}
+    report = {'lookup': 'after-lock', 'context': expected, 'hits': {}, 'misses': {}, 'rejected': [], 'transfers': []}
     started = time.monotonic()
     try:
         for candidate in api.candidates(artifact_name(platform, expected['source']), expected['head_sha']):
-            if not wanted.keys() - report['hits'].keys():
+            missing = {key: request for key, request in wanted.items() if key not in report['hits']}
+            if not missing:
                 break
             origin = {'artifact_id': candidate['id'], 'run_id': candidate['workflow_run']['id']}
-            expiry = datetime.datetime.fromisoformat(candidate['expires_at'].replace('Z', '+00:00'))
-            if candidate['expired'] or expiry <= datetime.datetime.now(datetime.timezone.utc):
+            if not live(candidate):
                 report['rejected'].append({**origin, 'reason': 'expired; rebuild missing variants'})
                 continue
             try:
@@ -192,36 +314,18 @@ def restore(requests, root, api, expected, platform):
             if not trusted_run(run, expected):
                 report['rejected'].append({**origin, 'reason': 'untrusted producer context'})
                 continue
-            with tempfile.TemporaryDirectory(prefix='download-', dir=root) as temporary:
+            if candidate['size_in_bytes'] > 32 * 1024**2:
+                raise ValueError('publication index exceeds metadata size budget')
+            with tempfile.TemporaryDirectory(prefix='index-download-', dir=root) as temporary:
                 stage = Path(temporary)
                 try:
-                    api.download(candidate, stage / 'download.zip')
+                    report['transfers'].append(download_verified(api, candidate, stage))
                 except Deleted:
-                    report['rejected'].append({**origin, 'reason': 'deleted/expired during download; rebuild missing variants'})
+                    report['rejected'].append({**origin, 'reason': 'deleted during download; rebuild missing variants'})
                     continue
-                digest = candidate.get('digest')
-                if not digest or digest != 'sha256:' + archives.file_sha(stage / 'download.zip'):
-                    raise ValueError('download digest mismatch or missing GitHub artifact digest')
-                extract_download(stage / 'download.zip', stage / 'content')
-                content = stage / 'content'
-                marker = archives.identity.read_request(content / 'publication.json')
-                if (marker.get('schema') != 1 or marker.get('context') != expected or marker.get('run_id') != origin['run_id']
-                        or marker.get('workflow') != run['path'] or type(marker.get('attempt')) is not int
-                        or not 1 <= marker['attempt'] <= run['run_attempt']):
-                    raise ValueError('publication provenance mismatch')
-                for key, request in wanted.items():
-                    if key in report['hits']:
-                        continue
-                    bundle = content / 'published' / key
-                    if not bundle.exists():
-                        continue
-                    archives.verify_bundle(bundle, request)
-                    destination = published / key
-                    if destination.exists():
-                        archives.verify_bundle(destination, request)
-                    else:
-                        shutil.copytree(bundle, destination)
-                    report['hits'][key] = {**origin, 'workflow': run['path'], 'producer_conclusion': run.get('conclusion'), 'attempt': marker['attempt']}
+                hits, transfers = restore_variants(missing, root, api, expected, platform, candidate, run, stage / 'content')
+                report['hits'].update(hits)
+                report['transfers'].extend(transfers)
         report['misses'] = {key: 'no retained compatible finalized artifact; build required' for key in wanted if key not in report['hits']}
     except Exception as error:
         report['error'] = str(error)
@@ -231,3 +335,12 @@ def restore(requests, root, api, expected, platform):
         (root / 'reuse.json').write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report), flush=True)
     return report
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--publication-plan', type=Path, required=True)
+    parser.add_argument('--platform', choices=('linux', 'macos', 'windows'), required=True)
+    args = parser.parse_args()
+    publication_plan(args.publication_plan, args.platform)

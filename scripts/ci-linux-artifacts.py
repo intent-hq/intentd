@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -37,7 +38,9 @@ CALLBACK_PATHS = ('scripts/prepare-acp-callback-fixture.py', 'scripts/test-prepa
                   'crates/intent-acp/tests/fixtures/claude-callback-files.json', '.github/workflows/ci.yml')
 FULL_PROOF_PATHS = ('.github/workflows/ci.yml', 'scripts/ci-linux-artifacts.py',
                     'scripts/ci-coverage-artifacts.py', 'scripts/ci-test-artifacts.py',
-                    'scripts/test-ci-linux-artifacts.py', 'scripts/test-ci-coverage-artifacts.py')
+                    'scripts/test-ci-linux-artifacts.py', 'scripts/test-ci-coverage-artifacts.py',
+                    'scripts/ci-artifact-reuse.py', 'scripts/ci-publish-variants.cjs',
+                    '.github/actions/publish-variants/action.yml')
 COMPILER_TESTS = ['pool_escape_apis_are_rejected']
 
 
@@ -190,40 +193,67 @@ def compiler_exclusion(root, name, request, item):
     return 'not binary(=store_pool_api)'
 
 
-def fetch(source, root):
-    """Download this run's immutable publication with authenticated digests.
-
-    These are trusted producer requests, not consumer-supplied configuration.
-    A missing publication fails; consumers have no rebuild fallback.
-    """
+def fetch(source, root, scope):
+    """Validate this run's small catalog, then download only this consumer's keys."""
+    if scope not in ('coverage-e2e', 'coverage-all', 'changed'):
+        raise ValueError('consumer fetch requires an explicit scope')
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     api = registry.GitHub(os.environ['GITHUB_REPOSITORY'])
     expected = registry.context(source, api)
     run_id = int(os.environ['GITHUB_RUN_ID'])
+    run = api.run(run_id)
     name = registry.artifact_name('linux', expected['source']) + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+    receipt = {'scope': scope, 'transfers': [], 'complete': False}
     started = time.monotonic()
-    candidates = [a for a in api.pages(f'actions/runs/{run_id}/artifacts', 'artifacts') if a['name'] == name and not a['expired']]
-    if len(candidates) != 1:
-        raise ValueError('required Linux producer publication missing or ambiguous; no consumer build fallback')
-    artifact = candidates[0]
-    with tempfile.TemporaryDirectory(prefix='verified-download-', dir=root) as tmp:
-        zipped = Path(tmp) / 'publication.zip'
-        api.download(artifact, zipped)
-        if artifact.get('digest') != 'sha256:' + archives.file_sha(zipped):
-            raise ValueError('Linux publication download digest mismatch')
-        registry.extract_download(zipped, root)
-    if archives.identity.read_request(root / 'publication.json') != registry.publication(expected):
-        raise ValueError('Linux publication provenance mismatch')
-    requests = archives.identity.read_request(root / 'requests.json')
-    for request in requests.values():
-        archives.validate_request(request)
-        if request['identity']['source']['commit'] != expected['source'] or request['identity']['platform']['os'] != 'linux':
-            raise ValueError('Linux publication source/platform mismatch')
-        key = archives.identity.build_key(request['identity'])
-        archives.verify_bundle(root / 'published' / key, request)
-    (root / 'download.json').write_text(json.dumps({'artifact_id': artifact['id'], 'bytes': artifact['size_in_bytes'],
-                                                   'download_seconds': time.monotonic() - started}, indent=2) + '\n')
+    try:
+        candidates = [a for a in api.list_artifacts(run_id) if a['name'] == name and registry.live(a)]
+        if len(candidates) != 1:
+            raise ValueError('required Linux producer index missing or ambiguous; no consumer build fallback')
+        candidate = candidates[0]
+        if candidate['size_in_bytes'] > 32 * 1024**2:
+            raise ValueError('publication index exceeds metadata size budget')
+        with tempfile.TemporaryDirectory(prefix='verified-index-', dir=root) as tmp:
+            stage = Path(tmp)
+            receipt['transfers'].append(registry.download_verified(api, candidate, stage))
+            content = stage / 'content'
+            marker, catalog = registry.validate_marker(content, candidate, run, expected, 'linux')
+            if marker != registry.publication(expected):
+                raise ValueError('Linux consumer requires its current run and attempt')
+            requests = archives.identity.read_request(content / 'requests.json')
+            for request in requests.values():
+                archives.validate_request(request)
+                if request['identity']['source']['commit'] != expected['source'] or request['identity']['platform']['os'] != 'linux':
+                    raise ValueError('Linux publication source/platform mismatch')
+            selected = {name: request for name, request in requests.items()
+                        if name == scope or (scope == 'changed' and (name.startswith('changed-') or name == 'callback'))}
+            if not selected:
+                raise ValueError('required consumer scope absent from publication')
+            wanted = {archives.identity.build_key(r['identity']): r for r in selected.values()}
+            if wanted.keys() - catalog.keys():
+                raise ValueError('required consumer variants absent from publication')
+            entries = [catalog[key] for key in wanted]
+            # Compressed bundles + all selected fresh extractions + one in-flight
+            # ZIP, plus fresh profiles and report headroom. Never use another
+            # filesystem's free-space number to approve this root.
+            expanded = sum(entry['expanded_bytes'] for entry in entries)
+            budget = sum(entry['archive_bytes'] for entry in entries) + expanded + max(entry['archive_bytes'] for entry in entries) + max(8 * 1024**3, expanded // 5)
+            free = shutil.disk_usage(root).free
+            receipt.update(selected_names=list(selected), required_free_bytes=budget, free_bytes_before=free)
+            if free < budget:
+                raise ValueError(f'selected coverage artifacts need {budget} free bytes at {root}; only {free} available')
+            hits, transfers = registry.restore_variants(wanted, root, api, expected, 'linux', candidate, run, content, require=True)
+            receipt['transfers'].extend(transfers)
+            for filename in ('publication.json', 'compiler-gates.json', 'producer.json'):
+                if (content / filename).is_file():
+                    shutil.copyfile(content / filename, root / filename)
+            (root / 'requests.json').write_text(json.dumps(selected, indent=2) + '\n')
+            receipt.update(complete=True, variant_artifacts=hits, free_bytes_after=shutil.disk_usage(root).free)
+    finally:
+        receipt['fetch_seconds'] = time.monotonic() - started
+        receipt['bytes'] = sum(item['bytes'] for item in receipt['transfers'])
+        receipt['download_seconds'] = sum(item['download_seconds'] for item in receipt['transfers'])
+        (root / 'download.json').write_text(json.dumps(receipt, indent=2) + '\n')
 
 
 def prepare(source, root, names):
@@ -348,7 +378,7 @@ def run_callback(source, root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('produce', 'fetch', 'prepare-check', 'coverage', 'test', 'callback'))
-    parser.add_argument('--root', type=Path, default=Path(os.environ.get('RUNNER_TEMP', '.')) / 'native-artifacts')
+    parser.add_argument('--root', type=Path, default=Path(os.environ.get('NATIVE_ARTIFACT_ROOT', str(Path(os.environ.get('RUNNER_TEMP', '.')) / 'native-artifacts'))))
     parser.add_argument('--source', type=Path, default=Path.cwd())
     parser.add_argument('--event', choices=('pull_request', 'merge_group'), default=os.environ.get('GITHUB_EVENT_NAME'))
     parser.add_argument('--base')
@@ -359,7 +389,7 @@ def main():
     if args.command == 'produce':
         produce(args.source, args.root, args.event, args.base)
     elif args.command == 'fetch':
-        fetch(args.source, args.root)
+        fetch(args.source, args.root, args.scope)
     elif args.command == 'prepare-check':
         requests = json.loads((args.root / 'requests.json').read_text())
         prepare(args.source, args.root, [name for name, request in requests.items() if request['identity']['build']['instrumentation']['mode'] == 'none'])

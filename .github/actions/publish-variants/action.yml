@@ -1,0 +1,23 @@
+name: Publish exact Rust variants
+description: Publish a small catalog then immutable completed variants independently
+inputs:
+  platform:
+    required: true
+    description: Native platform
+runs:
+  using: composite
+  steps:
+    - name: Prepare completed publication inventory
+      shell: bash
+      env:
+        PUBLICATION_PLATFORM: ${{ inputs.platform }}
+      run: python3 -I -B scripts/ci-artifact-reuse.py --publication-plan "${NATIVE_ARTIFACT_ROOT:-$RUNNER_TEMP/native-artifacts}" --platform "$PUBLICATION_PLATFORM"
+    - name: Install pinned artifact client
+      shell: bash
+      run: npm install --prefix "$RUNNER_TEMP/intent-artifact-client" --no-save --ignore-scripts --no-audit --no-fund @actions/artifact@6.3.1
+    - uses: actions/github-script@v8
+      with:
+        script: |
+          const {DefaultArtifactClient} = require(process.env.RUNNER_TEMP + '/intent-artifact-client/node_modules/@actions/artifact');
+          const {publish} = require(process.env.GITHUB_WORKSPACE + '/scripts/ci-publish-variants.cjs');
+          await publish(new DefaultArtifactClient());

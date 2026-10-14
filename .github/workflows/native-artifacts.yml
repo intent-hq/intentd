@@ -66,6 +66,20 @@ jobs:
           arch: x64
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') }}
+        run: |
+          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
+            slot="/raid/ci-target/intentd/$RUNNER_NAME/native-artifacts"
+            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            mkdir -p "$root"
+            ./scripts/ci-target-slot.sh mark "$slot"
+            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
+            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
+          fi
       - name: Disk-space preflight (tinybox only)
         if: runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted')
         env:
@@ -161,18 +175,9 @@ jobs:
       # Upload before runtime; successful variants survive later failures.
       - name: Publish native variants
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/publish-variants
         with:
-          name: native-v2-${{ inputs.platform }}-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/native-artifacts/requests.json
-            ${{ runner.temp }}/native-artifacts/publication.json
-            ${{ runner.temp }}/native-artifacts/reuse.json
-            ${{ runner.temp }}/native-artifacts/compiler-tripwire.exe
-            ${{ runner.temp }}/native-artifacts/published/
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+          platform: ${{ inputs.platform }}
       - name: Production check and Clippy in shared target
         shell: bash
         env:
@@ -186,7 +191,7 @@ jobs:
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$RUNNER_TEMP/native-artifacts"
+        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$NATIVE_ARTIFACT_ROOT"
       # Exercise the deterministic deadline oracle and real TLS controls on
       # macOS; listen backlog saturation cannot guarantee a pending connect.
       - name: Tunnel deadline and TLS controls (macOS runtime)
@@ -369,9 +374,20 @@ jobs:
         with:
           name: native-consumer-${{ inputs.platform }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-artifacts/consumer-receipt.json
-            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-receipt.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: error
+      - name: Remove this run's uncached artifact storage
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
+            case "$NATIVE_ARTIFACT_ROOT" in
+              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
+              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
+            esac
+            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
+          fi
       - name: Release lifecycle target dir
         if: ${{ always() && runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
         shell: bash

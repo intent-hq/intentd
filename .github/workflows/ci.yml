@@ -373,6 +373,20 @@ jobs:
       # verified downloads together. Exact no-op on burst
       # runners (step skipped). tinybox-prune.yml does the routine
       # scheduled pruning; this is only the emergency backstop.
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
+            slot="/raid/ci-target/intentd/$RUNNER_NAME/check-artifacts"
+            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            mkdir -p "$root"
+            ./scripts/ci-target-slot.sh mark "$slot"
+            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
+            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
+          fi
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -527,19 +541,9 @@ jobs:
         run: python3 -I -B scripts/ci-linux-artifacts.py produce --base "${BASE_SHA:-}"
       - name: Publish Linux variants before checks and tests
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/publish-variants
         with:
-          name: native-v2-linux-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/native-artifacts/requests.json
-            ${{ runner.temp }}/native-artifacts/publication.json
-            ${{ runner.temp }}/native-artifacts/reuse.json
-            ${{ runner.temp }}/native-artifacts/compiler-gates.json
-            ${{ runner.temp }}/native-artifacts/producer.json
-            ${{ runner.temp }}/native-artifacts/published/
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+          platform: linux
       - name: Prepare Linux ordinary test consumers
         run: python3 -I -B scripts/ci-linux-artifacts.py prepare-check
       - name: Linux native Clippy in the shared target
@@ -547,7 +551,7 @@ jobs:
       - name: Linux lifecycle runtime proof
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$RUNNER_TEMP/native-artifacts"
+        run: python3 -I -B scripts/test-daemon-lifecycle.py --archives "$NATIVE_ARTIFACT_ROOT"
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Real import and public session contract
@@ -735,8 +739,8 @@ jobs:
         with:
           name: linux-consumer-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-artifacts/consumer-receipt.json
-            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/consumer-receipt.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: error
       - name: Remove producer profile outputs before caching
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
@@ -749,6 +753,17 @@ jobs:
               for profile in target.rglob(suffix):
                   profile.unlink()
           PY
+      - name: Remove this run's uncached artifact storage
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
+            case "$NATIVE_ARTIFACT_ROOT" in
+              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
+              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
+            esac
+            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
+          fi
       - name: Release per-slot target dir
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
@@ -761,6 +776,8 @@ jobs:
   # empty so the retained native step guards never bypass queue validation
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
+
+
   release-fast-path:
     runs-on: ubuntu-latest
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
@@ -926,12 +943,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the executable publication
-      # and fresh extraction are multi-GiB, followed by new profraw files.
+      # rationale (monorepo#1253). 80 GiB covers the measured full variant, fresh extraction and profiles.
+      # fetch also validates the exact catalog budget on the artifact filesystem.
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
+            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e-artifacts"
+            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            mkdir -p "$root"
+            ./scripts/ci-target-slot.sh mark "$slot"
+            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
+            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
+          fi
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
-          NEED_GIB: 30
+          NEED_GIB: 80
           JOB_TARGET_SUBDIR: coverage-e2e
         run: |
           set -euo pipefail
@@ -1030,7 +1061,7 @@ jobs:
       - name: Download verified Linux executable publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch --scope coverage-e2e
       - name: Run e2e coverage
         # Arm the bound-caller seam for the test processes themselves, not
         # only the daemons they spawn: a direct-call test that evaluates a
@@ -1098,10 +1129,22 @@ jobs:
         with:
           name: coverage-e2e-execution-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-artifacts/download.json
-            ${{ runner.temp }}/native-artifacts/receipt-*.json
-            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
+      - name: Remove this run's uncached artifact storage
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
+            case "$NATIVE_ARTIFACT_ROOT" in
+              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
+              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
+            esac
+            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
+          fi
+
 
   coverage-all:
     # Same full-report demand as coverage-e2e; the gate requires both reports.
@@ -1128,12 +1171,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the executable publication
-      # and fresh extraction are multi-GiB, followed by new profraw files.
+      # rationale (monorepo#1253). 80 GiB covers the measured full variant, fresh extraction and profiles.
+      # fetch also validates the exact catalog budget on the artifact filesystem.
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
+            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all-artifacts"
+            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            mkdir -p "$root"
+            ./scripts/ci-target-slot.sh mark "$slot"
+            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
+            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
+          fi
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
-          NEED_GIB: 30
+          NEED_GIB: 80
           JOB_TARGET_SUBDIR: coverage-all
         run: |
           set -euo pipefail
@@ -1233,7 +1290,7 @@ jobs:
       - name: Download verified Linux executable publication
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch --scope coverage-all
       - name: Run combined coverage
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
@@ -1273,10 +1330,21 @@ jobs:
         with:
           name: coverage-all-execution-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-artifacts/download.json
-            ${{ runner.temp }}/native-artifacts/receipt-*.json
-            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
+      - name: Remove this run's uncached artifact storage
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
+            case "$NATIVE_ARTIFACT_ROOT" in
+              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
+              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
+            esac
+            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
+          fi
 
   # pull_request-ONLY counterpart of coverage-e2e / coverage-all
   # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
@@ -1294,6 +1362,8 @@ jobs:
   # failure fails the gate), accepted as skipped on merge_group / push where
   # it is job-level skipped by design. github.event.pull_request is only
   # read inside the job (absent on merge_group, where the job never runs).
+
+
   coverage-changed:
     needs: [route, check]
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' && needs.check.result == 'success' }}
@@ -1393,6 +1463,20 @@ jobs:
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). Allow room for the publication, fresh
       # extraction and isolated profiles, as in coverage-e2e.
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          echo "NATIVE_ARTIFACT_ROOT=$RUNNER_TEMP/native-artifacts" >> "$GITHUB_ENV"
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then
+            slot="/raid/ci-target/intentd/$RUNNER_NAME/coverage-changed-artifacts"
+            root="$slot/run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            mkdir -p "$root"
+            ./scripts/ci-target-slot.sh mark "$slot"
+            echo "ARTIFACT_SLOT=$slot" >> "$GITHUB_ENV"
+            echo "NATIVE_ARTIFACT_ROOT=$root" >> "$GITHUB_ENV"
+          fi
       - name: Disk-space preflight (tinybox only)
         if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
         env:
@@ -1497,7 +1581,7 @@ jobs:
         if: steps.select.outputs.has_selection == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B scripts/ci-linux-artifacts.py fetch
+        run: python3 -I -B scripts/ci-linux-artifacts.py fetch --scope changed
       - name: Run changed tests under llvm-cov
         if: steps.select.outputs.has_selection == 'true'
         # Armed bound-caller seam — see coverage-e2e's run step. The
@@ -1521,10 +1605,22 @@ jobs:
         with:
           name: coverage-changed-execution-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/native-artifacts/download.json
-            ${{ runner.temp }}/native-artifacts/receipt-*.json
-            ${{ runner.temp }}/native-artifacts/compiler-calls.log
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/download.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/receipt-*.json
+            ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
           if-no-files-found: ignore
+      - name: Remove this run's uncached artifact storage
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${ARTIFACT_SLOT:-}" ]]; then
+            case "$NATIVE_ARTIFACT_ROOT" in
+              "$ARTIFACT_SLOT"/run-*) rm -rf -- "$NATIVE_ARTIFACT_ROOT" ;;
+              *) echo 'Invalid artifact cleanup root' >&2; exit 1 ;;
+            esac
+            ./scripts/ci-target-slot.sh unmark "$ARTIFACT_SLOT"
+          fi
+
 
   pr-title:
     runs-on: ubuntu-latest
@@ -1748,6 +1844,7 @@ jobs:
           python3 -I -B scripts/test-ci-build-identity.py
           python3 -I -B scripts/test-ci-test-artifacts.py
           python3 -I -B scripts/test-ci-artifact-reuse.py
+          node --test scripts/test-ci-publish-variants.cjs
           python3 -I -B scripts/test-ci-coverage-artifacts.py
           python3 -I -B scripts/test-ci-linux-artifacts.py
       - name: Install release cache regression wrapper

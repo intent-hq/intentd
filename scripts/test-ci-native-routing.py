@@ -647,7 +647,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertFalse(job["strategy"]["fail-fast"])
         step = next(step for step in job["steps"] if step.get("name") == "Native lifecycle runtime proof")
         self.assertIn("python3 -I -B scripts/test-daemon-lifecycle.py", step["run"])
-        self.assertIn('--archives "$RUNNER_TEMP/native-artifacts"', step["run"])
+        self.assertIn('--archives "$NATIVE_ARTIFACT_ROOT"', step["run"])
         self.assertNotIn("if", step)
         self.assertFalse(step.get("continue-on-error", False))
         for event in ("pull_request", "merge_group"):

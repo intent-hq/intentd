@@ -23,7 +23,8 @@ _spec = importlib.util.spec_from_file_location('archives', Path(__file__).with_n
 archives = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(archives)
 
-NATIVE_INPUTS = {'.github/workflows/ci.yml', 'scripts/ci-native-artifacts.py',
+NATIVE_INPUTS = {'.github/actions/publish-variants/action.yml', 'scripts/ci-publish-variants.cjs',
+                 '.github/workflows/ci.yml', 'scripts/ci-native-artifacts.py',
                  'scripts/ci-test-artifacts.py', 'scripts/ci-build-identity.py',
                  'scripts/ci-artifact-reuse.py', 'scripts/test-ci-artifact-reuse.py',
                  'scripts/ci-workflow-tests.py',
@@ -266,7 +267,7 @@ def prepare(source, root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('scope', 'produce', 'lint', 'prepare', 'libtest', 'receipt'))
-    parser.add_argument('--root', type=Path, default=Path(os.environ.get('RUNNER_TEMP', '.')) / 'native-artifacts')
+    parser.add_argument('--root', type=Path, default=Path(os.environ.get('NATIVE_ARTIFACT_ROOT', str(Path(os.environ.get('RUNNER_TEMP', '.')) / 'native-artifacts'))))
     parser.add_argument('--source', type=Path, default=Path.cwd())
     parser.add_argument('--platform', choices=('linux', 'macos', 'windows'))
     parser.add_argument('--event', choices=('pull_request', 'merge_group'))
