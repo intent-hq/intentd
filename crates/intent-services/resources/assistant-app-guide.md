@@ -282,8 +282,8 @@ infer a retry from that status alone. Controls depend on the conversation's stat
 and your access.
 
 For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
-header. While editing, **Save** and **Cancel** appear there too. With several
-queued messages, each message has its own controls; the header offers bulk actions.
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
 
 Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
 Expand that label to inspect the saved errors and timestamps and use **Copy
