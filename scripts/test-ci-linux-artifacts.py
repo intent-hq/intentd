@@ -227,13 +227,60 @@ class LinuxTests(unittest.TestCase):
                 self.assertTrue(receipt['compiler_only_selection'])
                 self.assertEqual(receipt['producer_test_inventory'], linux.COMPILER_TESTS)
 
+    def test_disk_budget_covers_measured_full_and_changed_profile_growth(self):
+        # c68 hosted receipts measured st_blocks high-water including fresh
+        # profiles/reports. Keep at least ten percent above those observations.
+        cases = [([8730647500], [51230514375], 123968008192),
+                 ([220328059, 10581410, 210633949, 8157503283, 266215686],
+                  [1171306148, 45542078, 1260479575, 48142893085, 1590533052], 123224186880)]
+        for archives, expansions, measured in cases:
+            with self.subTest(measured=measured):
+                budget = linux.consumer_disk_budget(archives, expansions)
+                self.assertGreaterEqual(budget, measured * 11 // 10)
+
+    def test_callback_is_prepared_before_changed_tests_generate_runtime_files(self):
+        names = WORKFLOW['jobs']['coverage-changed']['env']['CALLBACK_FIXTURE_TESTS'].split()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            source.mkdir()
+            (root / 'requests.json').write_text(json.dumps({'changed-0': {'identity': {}}, 'callback': {'identity': {'source': {'commit': 'head'}}}}))
+            prepared_names = []
+            def extract(bundle, request, checkout, destination, **kwargs):
+                self.assertFalse((source / 'default.profraw').exists(), 'preparation must precede runtime outputs')
+                prepared_names.append(destination.name)
+                return {'source': str(source), 'target': str(destination / 'target'), 'extract_seconds': 0.1, 'runtime': {}}
+            def execute(item, args, **kwargs):
+                self.assertEqual(prepared_names, ['changed-0', 'callback'])
+                (source / 'default.profraw').write_bytes(b'fresh runtime output')
+                return 0
+            with mock.patch.dict(os.environ, {'CALLBACK_FIXTURE_TESTS': '\n'.join(names)}), \
+                 mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \
+                 mock.patch.object(linux, 'check_expansion'), \
+                 mock.patch.object(linux.archives, 'prepare', side_effect=extract) as prepare, \
+                 mock.patch.object(linux.native, 'consumer_environment', return_value={}), \
+                 mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
+                 mock.patch.object(linux, 'compiler_exclusion', return_value=None), \
+                 mock.patch.object(linux.archives, 'runtime_env', side_effect=lambda item, env: env), \
+                 mock.patch.object(linux.archives, 'output', side_effect=lambda cmd, *args: 'head' if cmd[:2] == ['git', 'rev-parse'] else '' if cmd[0] == 'git' else json.dumps({'rust-suites': {'one': {'testcases': {n: {'filter-match': {'status': 'matches'}} for n in names}}}})), \
+                 mock.patch.object(linux.archives, 'run_nextest', side_effect=execute) as run:
+                linux.run_coverage(source, root, 'changed')
+                self.assertEqual(linux.run_callback(source, root), 0)
+                self.assertEqual(prepare.call_count, 2)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(json.loads((root / 'receipt-callback.json').read_text())['selected_tests'], names)
+
     def test_callback_inventory_and_failure_prevent_execution(self):
         names = WORKFLOW['jobs']['coverage-changed']['env']['CALLBACK_FIXTURE_TESTS'].split()
-        for mode in ('valid', 'missing', 'extra', 'duplicate', 'empty', 'list-failure', 'run-failure'):
+        for mode in ('valid', 'missing', 'extra', 'duplicate', 'empty', 'list-failure', 'run-failure', 'missing-prepared', 'missing-callback', 'wrong-source', 'wrong-key', 'changed-head', 'changed-tracked'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                (root / 'requests.json').write_text(json.dumps({'callback': {}}))
-                item = {'source': str(ROOT), 'target': str(root / 'restored/callback/target'), 'runtime': {}}
+                (root / 'requests.json').write_text(json.dumps({'callback': {'identity': {'source': {'commit': 'head'}}}}))
+                item = {'source': str(ROOT), 'target': str(root / 'restored/callback/target'), 'runtime': {}, 'request_key': 'key'}
+                if mode == 'wrong-source': item['source'] = str(root / 'elsewhere')
+                if mode == 'wrong-key': item['request_key'] = 'wrong'
+                if mode != 'missing-prepared':
+                    (root / 'prepared.json').write_text(json.dumps({} if mode == 'missing-callback' else {'callback': item}))
                 selected = list(names)
                 if mode == 'missing': selected.pop()
                 if mode == 'extra': selected.append('wrong')
@@ -241,11 +288,19 @@ class LinuxTests(unittest.TestCase):
                 cases = {n: {'filter-match': {'status': 'matches'}} for n in selected}
                 suites = {'one': {'testcases': cases}}
                 if mode == 'duplicate': suites['two'] = {'testcases': {names[0]: cases[names[0]]}}
+                def output(command, *args):
+                    if command[:2] == ['git', 'rev-parse']:
+                        return 'other-head' if mode == 'changed-head' else 'head'
+                    if command[:2] == ['git', 'diff']:
+                        return 'src/lib.rs' if mode == 'changed-tracked' else ''
+                    if mode == 'list-failure':
+                        raise subprocess.CalledProcessError(43, command)
+                    return json.dumps({'rust-suites': suites})
                 with mock.patch.dict(os.environ, {'CALLBACK_FIXTURE_TESTS': '\n'.join(names), 'INTENTD_ASSERT_BOUND_CALLER': '0'}), \
-                     mock.patch.object(linux, 'prepare', return_value={'callback': item}), \
+                     mock.patch.object(linux.archives.identity, 'build_key', return_value='key'), \
                      mock.patch.object(linux.native, 'consumer_environment', return_value={}), \
                      mock.patch.object(linux.archives, 'runtime_env', side_effect=lambda item, env: env), \
-                     mock.patch.object(linux.archives, 'output', side_effect=subprocess.CalledProcessError(43, []) if mode == 'list-failure' else None, return_value=json.dumps({'rust-suites': suites})) as listing, \
+                     mock.patch.object(linux.archives, 'output', side_effect=output) as listing, \
                      mock.patch.object(linux.archives, 'run_nextest', return_value=44 if mode == 'run-failure' else 0) as run:
                     if mode in ('valid', 'run-failure'):
                         self.assertEqual(linux.run_callback(ROOT, root), 44 if mode == 'run-failure' else 0)
@@ -258,7 +313,7 @@ class LinuxTests(unittest.TestCase):
                         self.assertIn('/restored/callback/', env['LLVM_PROFILE_FILE'])
                         self.assertEqual(listing.call_args.args[0][-3], args[1])
                     else:
-                        with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                        with self.assertRaises((ValueError, KeyError, FileNotFoundError, subprocess.CalledProcessError)):
                             linux.run_callback(ROOT, root)
                         run.assert_not_called()
 

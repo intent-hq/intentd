@@ -197,6 +197,15 @@ def compiler_exclusion(root, name, request, item):
     return 'not binary(=store_pool_api)'
 
 
+def consumer_disk_budget(archive_sizes, expansion_sizes):
+    # Hosted full/changed runs reached 124 GB from roughly 51 GB of
+    # extracted objects: profiles/reports need far more than twenty percent.
+    # Reserve another 150% (plus the in-flight ZIP) above fresh extractions.
+    # This is conservative measured headroom, not a bound on arbitrary tests.
+    expanded = sum(expansion_sizes)
+    return sum(archive_sizes) + expanded + max(archive_sizes) + max(8 * 1024**3, 3 * expanded // 2)
+
+
 def fetch(source, root, scope):
     """Validate this run's small catalog, then download only this consumer's keys."""
     if scope not in ('coverage-e2e', 'coverage-all', 'changed'):
@@ -241,8 +250,9 @@ def fetch(source, root, scope):
             # Compressed bundles + all selected fresh extractions + one in-flight
             # ZIP, plus fresh profiles and report headroom. Never use another
             # filesystem's free-space number to approve this root.
-            expanded = sum(catalog[archives.identity.build_key(r['identity'])]['expanded_bytes'] for r in selected.values())
-            budget = sum(entry['archive_bytes'] for entry in entries) + expanded + max(entry['archive_bytes'] for entry in entries) + max(8 * 1024**3, expanded // 5)
+            budget = consumer_disk_budget(
+                [entry['archive_bytes'] for entry in entries],
+                [catalog[archives.identity.build_key(r['identity'])]['expanded_bytes'] for r in selected.values()])
             free = shutil.disk_usage(root).free
             receipt.update(selected_names=list(selected), required_free_bytes=budget, free_bytes_before=free)
             if free < budget and (root / 'storage.json').is_file():
@@ -324,6 +334,7 @@ def prepare(source, root, names):
         validation_seconds = time.monotonic() - started
         prepared[name] = archives.prepare(root / 'published' / key, request, source, root / 'restored' / name, env=env)
         prepared[name]['expansion_validation_seconds'] = validation_seconds
+        prepared[name]['request_key'] = key
     (root / 'prepared.json').write_text(json.dumps(prepared, indent=2) + '\n')
     return prepared
 
@@ -331,10 +342,14 @@ def prepare(source, root, names):
 def run_coverage(source, root, scope):
     requests = json.loads((root / 'requests.json').read_text())
     names = [scope] if scope != 'changed' else [name for name in requests if name.startswith('changed-')]
-    prepared = prepare(source, root, names)
+    # Validate every requested archive against the clean checkout before tests
+    # can create runtime files. Callback execution remains a separate step.
+    prepare_names = names + (['callback'] if scope == 'changed' and 'callback' in requests else [])
+    prepared = prepare(source, root, prepare_names)
     receipt = {'scope': scope, 'compiler_calls': 0, 'variants': {}}
     try:
-        for name, item in prepared.items():
+        for name in names:
+            item = prepared[name]
             run = Path(item['target']).parent
             # Source-scanning tests legitimately query Cargo metadata. The same
             # strict report guards permit those read-only probes, never builds.
@@ -410,7 +425,19 @@ def run_callback(source, root):
     requests = json.loads((root / 'requests.json').read_text())
     if 'callback' not in requests:
         raise ValueError('required callback archive missing')
-    item = prepare(source, root, ['callback'])['callback']
+    prepared = json.loads((root / 'prepared.json').read_text())
+    item = prepared['callback']
+    if Path(item['source']).resolve() != Path(source).resolve():
+        raise ValueError('callback prepared source differs from current checkout')
+    request = requests['callback']
+    if item.get('request_key') != archives.identity.build_key(request['identity']):
+        raise ValueError('callback prepared request differs from current demand')
+    # Runtime-created untracked files do not invalidate an already validated
+    # extraction. A different commit or any tracked source change still does.
+    if archives.output(['git', 'rev-parse', 'HEAD'], source) != request['identity']['source']['commit']:
+        raise ValueError('callback source commit changed after preparation')
+    if archives.output(['git', 'diff', '--name-only', 'HEAD', '--'], source):
+        raise ValueError('callback tracked source changed after preparation')
     names = os.environ['CALLBACK_FIXTURE_TESTS'].split()
     if len(names) != 6 or len(set(names)) != 6:
         raise ValueError('expected exactly six callback fixtures')
