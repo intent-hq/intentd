@@ -7,11 +7,16 @@ contract="$GITHUB_WORKSPACE/contract"
 evidence="$GITHUB_WORKSPACE/evidence"
 test "$(git -C "$diagnostic" rev-parse HEAD)" = "$DIAGNOSTIC_SHA"
 test "$(git -C "$component" rev-parse HEAD)" = "$SOURCE_SHA"
-test "$(git -C "$component" rev-parse HEAD^)" = "$PRODUCT_SHA"
+git -C "$component" merge-base --is-ancestor "$PRODUCT_SHA" HEAD
 test "$(git -C "$contract" rev-parse HEAD)" = "$ROOT_SHA"
 test -z "$(git -C "$component" status --porcelain)"
-test "$(git -C "$component" diff --name-only "$PRODUCT_SHA" HEAD)" = crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs
-git -C "$component" diff "$PRODUCT_SHA" HEAD > "$evidence/diagnostic-source.patch"
+# The diagnostic history contains its four harness files. Exclude exactly those
+# from the product comparison; all compiled-source changes must be the trace edit.
+product_paths=(. ':(exclude).github/workflows/startup-callback-diagnostic.yml'
+  ':(exclude)scripts/startup-callback-guard.py' ':(exclude)scripts/startup-callback-run.sh'
+  ':(exclude)scripts/test-startup-callback-guard.py')
+test "$(git -C "$component" diff --name-only "$PRODUCT_SHA" HEAD -- "${product_paths[@]}")" = crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs
+git -C "$component" diff "$PRODUCT_SHA" HEAD -- "${product_paths[@]}" > "$evidence/diagnostic-source.patch"
 printf 'diagnostic=%s\nproduct=%s\nsource=%s\ncontract=%s\n' \
   "$DIAGNOSTIC_SHA" "$PRODUCT_SHA" "$SOURCE_SHA" "$ROOT_SHA" > "$evidence/source-shas.txt"
 uname -a

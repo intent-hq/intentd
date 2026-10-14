@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 135
     env:
       PRODUCT_SHA: 84fe4a8e9325f9f37b86c1ef1636b2f458aa8d98
-      SOURCE_SHA: 1923c052a642610caad1a85db85c0c753d0f24a2
+      SOURCE_SHA: 19beae7af6558615c82be73e640d43a51a402f86
       ROOT_SHA: b4686a6c1573d83cf2d24003fbf7d8ce4d96f417
       DIAGNOSTIC_SHA: ${{ github.sha }}
       CARGO_BUILD_JOBS: '1'
@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.SOURCE_SHA }}
-          fetch-depth: 2
+          fetch-depth: 8
           path: subject
           persist-credentials: false
       - uses: actions/checkout@v7

@@ -2,6 +2,7 @@
 """Lightweight functional tests for the temporary diagnostic resource guard."""
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import shlex
@@ -90,6 +91,8 @@ class GuardTests(unittest.TestCase):
         self.write_selection(["expected"])
         (self.root / "test-exit-code.txt").write_text("0")
         def save(cases):
+            if cases == '<testcase name="expected"/>':
+                cases = '<testcase name="expected"><system-err>' + self.stage_lines() + '</system-err></testcase>'
             (self.root / "junit.xml").write_text("<testsuites><testsuite>" + cases + "</testsuite></testsuites>")
         save('<testcase name="expected"/>')
         guard.verify_result(self.root)
@@ -105,6 +108,63 @@ class GuardTests(unittest.TestCase):
         (self.root / "test-exit-code.txt").write_text("101")
         with self.assertRaises(RuntimeError):
             guard.verify_result(self.root)
+
+    def test_result_rejects_missing_admission_stage_evidence(self):
+        self.write_selection(["expected"])
+        (self.root / "test-exit-code.txt").write_text("0")
+        (self.root / "junit.xml").write_text(
+            '<testsuites><testsuite><testcase name="expected"/></testsuite></testsuites>')
+        with self.assertRaisesRegex(RuntimeError, "stage evidence"):
+            guard.verify_result(self.root)
+
+    def stage_traces(self, path="admit_optional"):
+        stages = [{"path": path, "stage": stage, "records": 64, "elapsed_ms": elapsed}
+                  for stage, elapsed in zip(
+                      ["retain-start", "retain-complete", "original-start", "original-complete"],
+                      [0, 120, 121, 450])]
+        return [{"subcase": "mixed-alias-budget", "iterations": count,
+                 "returned": True, "unwinding": False, "stages": stages if count == 63 else []}
+                for count in [63, 64]]
+
+    def stage_lines(self, traces=None):
+        return "\n".join("budget-admission-trace " + json.dumps(t)
+                         for t in (self.stage_traces() if traces is None else traces))
+
+    def test_both_paths_report_actual_path_and_separate_stage_costs(self):
+        for path in ("admit", "admit_optional"):
+            result = guard.verify_stages(self.stage_lines(self.stage_traces(path)))
+            self.assertEqual(result["path"], path)
+            self.assertEqual(result["fixture_validation_ms"], 120)
+            self.assertEqual(result["original_admission_ms"], 329)
+
+    def test_rejects_partial_duplicate_wrong_path_or_malformed_stage_evidence(self):
+        valid = self.stage_traces()
+        bad = [[], valid[:1], valid + valid, list(reversed(valid))]
+        for field, value in [("path", "unknown"), ("records", 63),
+                             ("stage", "original-start"), ("elapsed_ms", -1),
+                             ("elapsed_ms", True), ("elapsed_ms", 500)]:
+            traces = copy.deepcopy(valid)
+            traces[0]["stages"][1][field] = value
+            bad.append(traces)
+        for path in ("admit", "admit_optional"):
+            traces = copy.deepcopy(valid)
+            traces[0]["stages"][0]["path"] = path
+            traces[0]["stages"][1]["path"] = "admit" if path == "admit_optional" else "admit_optional"
+            bad.append(traces)
+        for kind in ("partial", "unexpected-quota-admission", "unwinding", "not-returned"):
+            traces = copy.deepcopy(valid)
+            if kind == "partial":
+                traces[0]["stages"].pop()
+            elif kind == "unexpected-quota-admission":
+                traces[1]["stages"] = traces[0]["stages"]
+            elif kind == "unwinding":
+                traces[0]["unwinding"] = True
+            else:
+                traces[0]["returned"] = False
+            bad.append(traces)
+        for traces in bad:
+            with self.subTest(traces=traces), self.assertRaises(RuntimeError):
+                guard.verify_stages(self.stage_lines(traces))
 
 
 if __name__ == "__main__":

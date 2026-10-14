@@ -103,9 +103,38 @@ def verify_result(evidence):
             raise RuntimeError(f"Diagnostic result contains {tag}")
     if (evidence / "test-exit-code.txt").read_text().strip() != "0":
         raise RuntimeError("Diagnostic process did not succeed")
+    stages = verify_stages(cases[0].findtext("system-err", ""))
     (evidence / "verified-result.json").write_text(json.dumps({
         "test": expected, "fresh_passes": 1, "retries": 0, "exit_code": 0,
+        "admission": stages,
     }, indent=2) + "\n")
+
+
+def verify_stages(stderr):
+    prefix = "budget-admission-trace "
+    traces = [json.loads(line[len(prefix):]) for line in stderr.splitlines()
+              if line.startswith(prefix)]
+    if len(traces) != 2 or [t.get("iterations") for t in traces] != [63, 64]:
+        raise RuntimeError("Missing or duplicate admission stage evidence for both quota cases")
+    if any(t.get("subcase") != "mixed-alias-budget" or t.get("returned") is not True
+           or t.get("unwinding") is not False for t in traces):
+        raise RuntimeError("Admission stage evidence does not describe completed quota cases")
+    stages = traces[0].get("stages", [])
+    if (len(stages) != 4 or [s.get("stage") for s in stages] != [
+            "retain-start", "retain-complete", "original-start", "original-complete"]
+            or traces[1].get("stages") != []):
+        raise RuntimeError("Admission stage evidence is incomplete or contradicts the quota boundary")
+    path = stages[0].get("path")
+    if path not in ("admit", "admit_optional") or any(
+            s.get("path") != path or s.get("records") != 64 for s in stages):
+        raise RuntimeError("Admission stage evidence has inconsistent path or record count")
+    times = [s.get("elapsed_ms") for s in stages]
+    if any(type(t) is not int or t < 0 for t in times) or times != sorted(times):
+        raise RuntimeError("Admission stage evidence has invalid or decreasing times")
+    return {"path": path, "records": 64, "stages": stages,
+            "fixture_validation_ms": times[1] - times[0],
+            "between_validation_and_admission_ms": times[2] - times[1],
+            "original_admission_ms": times[3] - times[2]}
 
 
 def main():
