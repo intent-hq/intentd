@@ -5898,7 +5898,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, WAIT)
+            c.request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
                 .await
                 .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }

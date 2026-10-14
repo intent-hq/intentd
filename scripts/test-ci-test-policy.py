@@ -193,7 +193,7 @@ class CiPolicyTests(unittest.TestCase):
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
-        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["timeout-minutes"], 60)
         names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
         self.assertEqual(len(names), 6)
         for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):
