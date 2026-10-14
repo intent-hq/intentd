@@ -2066,7 +2066,10 @@ impl Drop for BudgetRequestTrace<'_> {
         let hosts = self.control.budget_hosts.as_ref().unwrap();
         let (event_count, tail) = {
             let events = self.control.events.lock().unwrap();
-            (events.len(), events[events.len().saturating_sub(6)..].to_vec())
+            (
+                events.len(),
+                events[events.len().saturating_sub(6)..].to_vec(),
+            )
         };
         let admission = *hosts.admission.lock().unwrap();
         let stages = hosts.diagnostic_stages.lock().unwrap().clone();
