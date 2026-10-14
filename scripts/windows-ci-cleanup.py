@@ -103,6 +103,7 @@ class Native:
             (self.a.GetSecurityInfo, W.DWORD, [W.HANDLE, ctypes.c_int, W.DWORD, ctypes.POINTER(W.LPVOID),
                                            W.LPVOID, W.LPVOID, W.LPVOID, ctypes.POINTER(W.LPVOID)]),
             (self.a.EqualSid, W.BOOL, [W.LPVOID, W.LPVOID]),
+            (self.a.IsWellKnownSid, W.BOOL, [W.LPVOID, ctypes.c_int]),
             (self.u.GetUserProfileDirectoryW, W.BOOL, [W.HANDLE, W.LPWSTR, ctypes.POINTER(W.DWORD)]),
         ]
         for function, result, args in signatures:
@@ -142,20 +143,25 @@ class Native:
         self.check(self.k.GetFileInformationByHandle(handle, ctypes.byref(info)))
         return info
 
-    def owned(self, handle, path):
+    def owned(self, handle, path, *, allow_system_owner=False):
         owner, descriptor = W.LPVOID(), W.LPVOID()
         error = self.a.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner), None, None, None, ctypes.byref(descriptor))
         if error:
             raise ctypes.WinError(error)
         try:
-            if not owner or not any(self.a.EqualSid(owner, allowed) for allowed in self.owners):
+            account_owner = owner and any(self.a.EqualSid(owner, allowed) for allowed in self.owners)
+            system_profile = owner and allow_system_owner and self.a.IsWellKnownSid(owner, 22)
+            if not account_owner and not system_profile:
                 raise Refusal('Path has an unrelated owner: ' + str(path))
         finally:
             if descriptor:
                 self.k.LocalFree(descriptor)
 
     @contextmanager
-    def open(self, path, *, directory=False, create=False, delete=False, owned=True, writable=False):
+    def open(self, path, *, directory=False, create=False, delete=False, owned=True, writable=False,
+             allow_system_owner=False):
+        if allow_system_owner and (not directory or delete or create or writable):
+            raise Refusal('SYSTEM ownership is only allowed for a read-only profile anchor')
         # No FILE_SHARE_DELETE: an opened object cannot be renamed or replaced.
         access = 0x20000 | 0x80  # READ_CONTROL, FILE_READ_ATTRIBUTES
         if directory:
@@ -179,7 +185,7 @@ class Native:
             if not directory and info.links != 1:
                 raise Refusal('Multiply-linked file refused: ' + str(path))
             if owned:
-                self.owned(handle, path)
+                self.owned(handle, path, allow_system_owner=allow_system_owner)
             yield handle
         finally:
             self.k.CloseHandle(handle)
@@ -214,7 +220,10 @@ def open_home(api, home, stack):
     stack.enter_context(api.open(current, directory=True, owned=False))
     for component in home.parts[1:]:
         current /= component
-        stack.enter_context(api.open(current, directory=True, owned=current == home))
+        # Windows may provision the account profile as SYSTEM. This is only
+        # an anchor: all CI descendants and deletion handles require the account.
+        stack.enter_context(api.open(current, directory=True, owned=current == home,
+                                     allow_system_owner=current == home))
 
 
 def missing(path):

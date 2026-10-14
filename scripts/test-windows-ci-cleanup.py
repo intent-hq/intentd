@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SPEC = importlib.util.spec_from_file_location('cleanup', Path(__file__).with_name('windows-ci-cleanup.py'))
 cleanup = importlib.util.module_from_spec(SPEC)
@@ -23,6 +23,24 @@ def process(pid, parent, name):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_system_owner_is_allowed_only_for_the_profile_anchor(self):
+        api = cleanup.Native.__new__(cleanup.Native)
+        api.a, api.k, api.owners = Mock(), Mock(), [7]
+        def security_info(handle, kind, fields, owner, *rest):
+            owner._obj.value = 42
+            return 0
+        api.a.GetSecurityInfo.side_effect = security_info
+        api.a.EqualSid.return_value = False
+        api.a.IsWellKnownSid.return_value = True
+        api.owned(1, Path('profile'), allow_system_owner=True)
+        api.a.IsWellKnownSid.assert_called_once()
+        self.assertEqual(api.a.IsWellKnownSid.call_args.args[1], 22)
+        with self.assertRaises(cleanup.Refusal):
+            api.owned(1, Path('artifact'))
+        api.a.IsWellKnownSid.return_value = False
+        with self.assertRaises(cleanup.Refusal):
+            api.owned(1, Path('profile'), allow_system_owner=True)
+
     def test_only_own_worker_and_no_compilers(self):
         valid = [process(1, 0, 'Runner.Listener.exe'), process(2, 1, 'Runner.Worker.exe'),
                  process(3, 2, 'python.exe')]
@@ -106,6 +124,21 @@ class NativeTests(unittest.TestCase):
             with self.assertRaisesRegex(cleanup.Refusal, 'owner'):
                 self.clean(True)
         self.assertTrue(self.file.exists())
+
+    def test_system_profile_exception_does_not_extend_to_ci_descendants(self):
+        with patch.object(self.api.a, 'EqualSid', return_value=False), patch.object(
+                self.api.a, 'IsWellKnownSid', return_value=True):
+            with ExitStack() as stack:
+                cleanup.open_home(self.api, self.home, stack)
+            with self.assertRaisesRegex(cleanup.Refusal, 'owner'):
+                self.clean(True)
+        self.assertTrue(self.file.exists())
+
+    def test_system_profile_exception_cannot_authorize_mutation(self):
+        for options in ({'delete': True}, {'create': True}, {'writable': True}, {'directory': False}):
+            with self.subTest(options=options), self.assertRaisesRegex(cleanup.Refusal, 'read-only profile'):
+                with self.api.open(self.home, **({'directory': True, 'allow_system_owner': True} | options)):
+                    self.fail('Mutation must not receive a handle')
 
     def test_dry_run_reports_and_preserves_content(self):
         result = self.clean()
