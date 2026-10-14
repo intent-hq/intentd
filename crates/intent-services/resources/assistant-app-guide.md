@@ -228,7 +228,7 @@ In **Home → Workspaces**, choose **Dashboard view** beside **List view** and
 progress. Cards also show agent activity, reasons for attention, waiting and unread
 indicators, and workspace token totals when available. Open the workspace's
 conversation to read the full response or address a question or blocker. Cards adapt
-to the available width and follow **View options → Group by**: status, repository,
+to the available width and follow **View options → Group by**: activity, repository,
 or none. Search and filters continue to apply when you switch views.
 
 On desktop, recent conversation messages appear progressively, newest first, while
