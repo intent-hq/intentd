@@ -48,6 +48,19 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+      - name: Report account and profile ownership
+        shell: powershell
+        run: |
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $profile = [Environment]::GetFolderPath('UserProfile')
+          $paths = @($profile, (Join-Path $profile 'ci-target'), (Join-Path $profile 'ci-target\intentd'))
+          [pscustomobject]@{ Account = $identity.Name; UserSid = $identity.User.Value; OwnerSid = $identity.Owner.Value; Profile = $profile } | ConvertTo-Json -Compress
+          foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              $acl = Get-Acl -LiteralPath $path
+              [pscustomobject]@{ Path = $path; Owner = $acl.Owner; OwnerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } | ConvertTo-Json -Compress
+            }
+          }
       - name: Report eligible profiles
         shell: powershell
         run: python -I -B scripts/windows-ci-cleanup.py
