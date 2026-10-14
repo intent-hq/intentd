@@ -39,11 +39,12 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RETIREMENT_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
         # Preview-only pending the read-only credential probe in this draft PR.
         # Do not merge an always-skipping integration as completed automation.
         run: |
           python3 -I -B scripts/retire-obsolete-merge-runs-caller.py \
-            --repository intent-hq/intentd --dry-run \
+            --repository intent-hq/intentd --workflow-credentials --dry-run \
             --state .retirement/cursor.json | tee retirement-report.json
       - uses: actions/cache/save@v4
         if: always() && steps.sweep.outcome != 'skipped' && hashFiles('.retirement/cursor.json') != ''

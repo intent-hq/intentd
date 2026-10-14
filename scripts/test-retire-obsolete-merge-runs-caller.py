@@ -132,6 +132,35 @@ class CallerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 C.read_cursor(path, REPO, 'dry-run')
 
+    def test_workflow_transport_selects_read_and_cancel_credentials(self):
+        api = C.WorkflowApi(REPO, 'offline-read-token', 'offline-write-token')
+        response = mock.Mock(stdout='HTTP/2.0 200 OK' + chr(10) * 2 + '{}', returncode=0)
+        with mock.patch.object(C.subprocess, 'run', return_value=response) as run:
+            api.request('GET', '/repos/' + REPO + '/rulesets/1')
+            self.assertEqual(run.call_args.kwargs['env']['GH_TOKEN'], 'offline-read-token')
+            api.request('POST', '/graphql', {'query': C.P.QUEUE_QUERY, 'variables': {}})
+            self.assertEqual(run.call_args.kwargs['env']['GH_TOKEN'], 'offline-read-token')
+            api.request('POST', '/repos/' + REPO + '/actions/runs/10/cancel')
+            self.assertEqual(run.call_args.kwargs['env']['GH_TOKEN'], 'offline-write-token')
+            self.assertNotIn('RETIREMENT_READ_TOKEN', run.call_args.kwargs['env'])
+            self.assertNotIn('offline-write-token', str(run.call_args.args))
+
+    def test_workflow_transport_refuses_other_mutations_or_missing_credentials(self):
+        api = C.WorkflowApi(REPO, 'offline-read-token', 'offline-write-token')
+        with mock.patch.object(C.subprocess, 'run') as run:
+            for method, path, body in (
+                ('POST', '/repos/other/repo/actions/runs/10/cancel', None),
+                ('POST', '/repos/' + REPO + '/actions/runs/10/force-cancel', None),
+                ('DELETE', '/repos/' + REPO + '/git/refs/heads/main', None),
+                ('POST', '/graphql', {'query': 'mutation { nope }'}),
+            ):
+                with self.subTest(path=path), self.assertRaises(C.P.SafetyError):
+                    api.request(method, path, body)
+            run.assert_not_called()
+        for read, write in (('', 'write'), ('read', '')):
+            with self.assertRaises(C.P.SafetyError):
+                C.WorkflowApi(REPO, read, write)
+
     def test_probe_transport_refuses_mutation(self):
         with self.assertRaises(T.P.SafetyError):
             C.ReadOnlyApi(self.api).request('POST', self.api.root + '/actions/runs/10/cancel')

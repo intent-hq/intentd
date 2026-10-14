@@ -9,6 +9,9 @@ only the next scheduled invocation retries. Cursors are progress, not authority.
 import argparse
 import importlib.util
 import json
+import os
+import re
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -16,6 +19,43 @@ import time
 SPEC = importlib.util.spec_from_file_location('retirement', Path(__file__).with_name('retire-obsolete-merge-runs.py'))
 P = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(P)
+
+
+class WorkflowApi:
+    """Read evidence with the proven read credential; cancel with the job token.
+
+    Credentials go only in the child process environment, never argv/logs.
+    No fallback: losing either credential must be visible, not silently skipped.
+    """
+    def __init__(self, repository, read_token, write_token):
+        P.require(repository in P.WORKFLOWS, 'repository not allowlisted')
+        P.require(bool(read_token) and bool(write_token), 'workflow credentials unavailable')
+        self.root = '/repos/' + repository
+        self.read_token, self.write_token = read_token, write_token
+
+    def request(self, method, path, body=None):
+        cancel = (method == 'POST' and body is None and re.fullmatch(
+            re.escape(self.root) + r'/actions/runs/[1-9][0-9]*/cancel', path))
+        read = ((method == 'GET' and (path == self.root or path.startswith(self.root + '/')))
+                or (method == 'POST' and path == '/graphql' and isinstance(body, dict)
+                    and body.get('query') == P.QUEUE_QUERY))
+        P.require(cancel or read, 'workflow transport refuses non-local or unexpected request')
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('RETIREMENT_READ_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')}
+        env['GH_TOKEN'] = self.write_token if cancel else self.read_token
+        command = ['gh', 'api', '--hostname', 'github.com', '--include', '--method', method,
+                   '-H', 'Accept: application/vnd.github+json',
+                   '-H', 'X-GitHub-Api-Version: 2022-11-28', path]
+        if body is not None:
+            command += ['--input', '-']
+        try:
+            result = subprocess.run(command, input=None if body is None else json.dumps(body),
+                                    env=env, text=True, capture_output=True, timeout=30)
+            response = P.parse_response(result.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            raise P.SafetyError('GitHub request failed; no retry') from error
+        P.require(result.returncode == 0 or response.status >= 400, 'gh failed without HTTP error')
+        return response
 
 
 class BudgetApi:
@@ -124,18 +164,22 @@ def main():
     modes.add_argument('--dry-run', action='store_true')
     modes.add_argument('--probe-only', action='store_true')
     parser.add_argument('--state', type=Path)
+    parser.add_argument('--workflow-credentials', action='store_true',
+                        help='Use RETIREMENT_READ_TOKEN for evidence and GH_TOKEN only for cancellation')
     args = parser.parse_args()
     mode = 'apply' if args.apply else 'dry-run'
     try:
+        api = (WorkflowApi(args.repository, os.environ.get('RETIREMENT_READ_TOKEN'), os.environ.get('GH_TOKEN'))
+               if args.workflow_credentials else P.GhApi())
         if args.probe_only:
-            result = probe(BudgetApi(P.GhApi(), 200, 180), args.repository)
+            result = probe(BudgetApi(api, 200, 180), args.repository)
             success = result['ok']
         else:
             cursor = read_cursor(args.state, args.repository, mode) if args.state else 0
             def checkpoint(value):
                 if args.state:
                     write_cursor(args.state, args.repository, mode, value)
-            result = sweep(P.GhApi(), args.repository, apply=args.apply,
+            result = sweep(api, args.repository, apply=args.apply,
                            after_run_id=cursor, checkpoint=checkpoint)
             # A clean work bound is resumable success, not uncertain API evidence.
             success = 'error' not in result

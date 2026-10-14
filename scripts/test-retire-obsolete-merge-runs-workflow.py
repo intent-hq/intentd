@@ -29,6 +29,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(checkout['with'], {'ref': 'main', 'persist-credentials': False})
         run = next(s for s in job['steps'] if s.get('id') == 'sweep')
         self.assertEqual(run['env']['GH_TOKEN'], '${{ github.token }}')
+        self.assertEqual(run['env']['RETIREMENT_READ_TOKEN'], '${{ secrets.CI_QUEUE_READ_TOKEN }}')
+        self.assertIn('--workflow-credentials', run['run'])
         self.assertIn('--repository intent-hq/intentd', run['run'])
         self.assertIn('--state .retirement/cursor.json', run['run'])
         self.assertIn('python3 -I -B', run['run'])
