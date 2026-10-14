@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Cleanup trust boundary and existing CI contract regressions (offline)."""
 from pathlib import Path
+import importlib.util
 import unittest
 import os
 import json
 import subprocess
 import tempfile
+
+ISOLATION_SPEC = importlib.util.spec_from_file_location(
+    'retirement_test_isolation', Path(__file__).with_name('retirement-test-isolation.py'))
+ISOLATION = importlib.util.module_from_spec(ISOLATION_SPEC)
+ISOLATION_SPEC.loader.exec_module(ISOLATION)
+ISOLATION.install()
+
 
 import yaml
 
@@ -96,6 +104,7 @@ class WorkflowTests(unittest.TestCase):
                 driver.write_text("#!/usr/bin/env -S python3 -I -S -B\n" + r"""
 import importlib.util, json, os, sys
 from pathlib import Path
+import importlib.util
 fixture_path = FIXTURE_PATH
 spec = importlib.util.spec_from_file_location('fixture', fixture_path)
 t = importlib.util.module_from_spec(spec)

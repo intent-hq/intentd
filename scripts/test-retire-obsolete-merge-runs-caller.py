@@ -2,10 +2,21 @@
 """Permanent caller regressions; all transport and mutations are offline."""
 import importlib.util
 import json
+import os
+import socket
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+
+ISOLATION_SPEC = importlib.util.spec_from_file_location(
+    'retirement_test_isolation', Path(__file__).with_name('retirement-test-isolation.py'))
+ISOLATION = importlib.util.module_from_spec(ISOLATION_SPEC)
+ISOLATION_SPEC.loader.exec_module(ISOLATION)
+ISOLATION.install()
+
 
 
 def load(name, path):
@@ -19,6 +30,44 @@ T = load('fixtures', 'test-retire-obsolete-merge-runs.py')
 C = load('caller', 'retire-obsolete-merge-runs-caller.py')
 C.P = T.P
 REPO = 'intent-hq/intentd'
+
+
+class IsolationTests(unittest.TestCase):
+    def test_os_network_denial_is_inherited_by_isolated_python_children(self):
+        self.assertTrue(sys._retirement_tests_isolated)
+        with self.assertRaises(PermissionError):
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        code = ("import socket; "
+                "socket.socket(socket.AF_INET, socket.SOCK_STREAM)")
+        child = subprocess.run([sys.executable, '-I', '-S', '-c', code],
+                               capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn('PermissionError', child.stderr)
+
+    def test_real_gh_calls_and_child_gh_are_denied_without_credentials(self):
+        for name in ('GH_TOKEN', 'GITHUB_TOKEN', 'RETIREMENT_READ_TOKEN'):
+            self.assertNotIn(name, os.environ)
+        with self.assertRaisesRegex(RuntimeError, 'deny real network CLI'):
+            C.P.GhApi().request('GET', '/repos/intent-hq/intentd')
+        child = subprocess.run(['bash', '-c', 'gh api /user'],
+                               capture_output=True, text=True, timeout=5)
+        self.assertEqual(child.returncode, 97)
+        self.assertIn('RETIREMENT_TEST_GH_DENIED', child.stderr)
+
+    def test_unmocked_cli_apply_cannot_escape_default_denial(self):
+        # Seccomp is already installed and inherited before this intentional
+        # failing-first CLI case: even an absolute gh cannot reach the network.
+        self.assertTrue(sys._retirement_tests_isolated)
+        child = subprocess.run([sys.executable, '-I', '-B',
+                                str(Path(__file__).with_name('retire-obsolete-merge-runs-caller.py')),
+                                '--repository', REPO, '--apply'],
+                               capture_output=True, text=True, timeout=5)
+        self.assertEqual(child.returncode, 2, child.stdout)
+        result = json.loads(child.stdout)
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['batches'], [])
+        self.assertFalse(result['probe']['protection']['ok'])
+        self.assertFalse(result['probe']['activity']['ok'])
 
 
 class CallerTests(unittest.TestCase):

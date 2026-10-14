@@ -10,6 +10,13 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+ISOLATION_SPEC = importlib.util.spec_from_file_location(
+    'retirement_test_isolation', Path(__file__).with_name('retirement-test-isolation.py'))
+ISOLATION = importlib.util.module_from_spec(ISOLATION_SPEC)
+ISOLATION_SPEC.loader.exec_module(ISOLATION)
+ISOLATION.install()
+
+
 SCRIPT = Path(__file__).with_name('retire-obsolete-merge-runs.py')
 SPEC = importlib.util.spec_from_file_location('retirement', SCRIPT)
 P = importlib.util.module_from_spec(SPEC)
