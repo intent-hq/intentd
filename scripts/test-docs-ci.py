@@ -115,6 +115,37 @@ class RoutingTests(unittest.TestCase):
             self.assertNotIn("paths-ignore", events[event] or {})
             self.assertNotIn("paths", events[event] or {})
 
+    def test_compiled_fixture_setup_exports_verified_path_and_propagates_failure(self):
+        steps = self.workflow["jobs"]["docs-compiled"]["steps"]
+        provision = next(s for s in steps if s.get("name") == "Build the pinned callback fixture from verified source")
+        transfer = next(s for s in steps if s.get("uses") == "./.github/actions/transfer-selection-fixtures")
+        node = next(s for s in steps if s.get("uses", "").startswith("actions/setup-node@"))
+        descriptor = json.loads((ROOT / "crates/intent-acp/tests/fixtures/claude-callback-adapter.json").read_text())
+        self.assertEqual(str(node["with"]["node-version"]), descriptor["tools"]["node"].removeprefix("v"))
+        self.assertLess(steps.index(transfer), steps.index(node))
+        self.assertLess(steps.index(node), steps.index(provision))
+        self.assertLess(steps.index(provision), len(steps) - 1)
+        for failure in (False, True):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory(prefix="docs-fixture-") as tmp:
+                root = Path(tmp)
+                shim = root / "python3"
+                shim.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGV_LOG"\n' +
+                                ('exit 29\n' if failure else 'printf "%s\\n" "$RUNNER_TEMP/verified fixture"\n'))
+                shim.chmod(0o755)
+                output = root / "env"
+                result = subprocess.run(["/bin/bash", "-e", "-o", "pipefail", "-c", provision["run"]],
+                                        env={**os.environ, "PATH": tmp, "ARGV_LOG": str(root / "args"),
+                                             "RUNNER_TEMP": tmp, "GITHUB_ENV": str(output)},
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 29 if failure else 0, result.stderr)
+                if failure:
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(output.read_text(), f"INTENT_ACP_CALLBACK_ADAPTER_FIXTURE={tmp}/verified fixture\n")
+                self.assertEqual((root / "args").read_text().splitlines(),
+                                 ["-I", "-B", "-S", "scripts/prepare-acp-callback-fixture.py",
+                                  "--cache-dir", tmp + "/acp-callback-fixture", "--build-from-source"])
+
 
 class RunnerTests(unittest.TestCase):
     def test_classifier_errors_degrade_to_full(self):

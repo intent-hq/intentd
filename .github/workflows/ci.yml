@@ -118,14 +118,19 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --component clippy --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docs-compiled
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+      - name: Build the pinned callback fixture from verified source
+        run: |
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
       - name: Check, lint and test compiled documentation consumers
         run: python3 -I -B scripts/docs-ci.py compiled
 
