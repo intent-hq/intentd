@@ -275,6 +275,22 @@ jobs:
               windowsUseBurst = true;
               windowsReason = `probe failed (${e.message})`;
             }
+            // PR #2415: 5090pc exhausted disk before native checks could run
+            // (actions/runs/38530825092/jobs/115742177653 and 115742177834).
+            // Scope hosted recovery to this branch/PR and its main queue ref;
+            // both native build and lifecycle consume this single decision.
+            const fingerprintPr = context.payload?.pull_request;
+            const fingerprintWindowsRecovery =
+              (context.eventName === "pull_request" && fingerprintPr?.number === 2415 &&
+               fingerprintPr.head?.ref === "fix/note-index-profile-invalidation" &&
+               fingerprintPr.head?.repo?.full_name === "intent-hq/intentd") ||
+              (context.eventName === "push" && context.ref === "refs/heads/fix/note-index-profile-invalidation") ||
+              (context.eventName === "merge_group" &&
+               /^refs\/heads\/gh-readonly-queue\/main\/pr-2415-[0-9a-f]{40}$/.test(context.payload?.merge_group?.head_ref || ""));
+            if (fingerprintWindowsRecovery) {
+              windowsUseBurst = true;
+              windowsReason = "PR #2415 scoped recovery from self-hosted disk exhaustion";
+            }
             core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
             core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
             core.setOutput("windows_burst", String(windowsUseBurst));

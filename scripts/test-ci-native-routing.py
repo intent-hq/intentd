@@ -233,7 +233,7 @@ const github = {
   },
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
-const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, ...fixture.context };
 process.env.THRESHOLD = '8';
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
@@ -352,6 +352,41 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
+
+    def test_fingerprint_branch_uses_hosted_windows_for_both_consumers(self):
+        branch = "fix/note-index-profile-invalidation"
+        queue_ref = "refs/heads/gh-readonly-queue/main/pr-2415-" + "a" * 40
+        pr = {"number": 2415, "head": {"ref": branch, "repo": {"full_name": "intent-hq/intentd"}}}
+        cases = [
+            ({"eventName": "pull_request", "payload": {"pull_request": pr}}, True),
+            ({"eventName": "push", "ref": "refs/heads/" + branch}, True),
+            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref}}}, True),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "number": 24150}}}, False),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "ref": "other"}}}}, False),
+            ({"eventName": "pull_request", "payload": {"pull_request": {**pr, "head": {**pr["head"], "repo": {"full_name": "outside/intentd"}}}}}, False),
+            ({"eventName": "push", "ref": "refs/heads/main"}, False),
+            ({"eventName": "push", "ref": "refs/heads/" + branch + "-other"}, False),
+            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref.replace("2415-", "24150-")}}}, False),
+            ({"eventName": "merge_group", "payload": {"merge_group": {"head_ref": queue_ref.replace("/main/", "/other/")}}}, False),
+            ({"eventName": "merge_group", "payload": {}}, False),
+            ({}, False),
+        ]
+        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        baseline = run_route(self.workflow, org=fleet)["outputs"]
+        for event_context, hosted in cases:
+            with self.subTest(context=event_context):
+                outputs = route_outputs(self.workflow, run_route(self.workflow, org=fleet, context=event_context)["outputs"])
+                expected = ["gh-windows-16x"] if hosted else ["self-hosted", "Windows", "X64"]
+                self.assertEqual(json.loads(outputs["windows_labels"]), expected)
+                self.assertEqual(outputs["windows_burst"], str(hosted).lower())
+                for key in ("linux_labels", "check_labels", "linux_burst", "macos_labels", "macos_burst"):
+                    self.assertEqual(outputs[key], baseline[key])
+                for job_id, field, value in (("build", "target", "x86_64-pc-windows-msvc"),
+                                             ("daemon-lifecycle", "platform", "windows")):
+                    job = self.workflow["jobs"][job_id]
+                    self.assertEqual(job["runs-on"], "${{ matrix.os }}")
+                    row = next(r for r in job["strategy"]["matrix"]["include"] if r[field] == value)
+                    self.assertEqual(matrix_labels(row["os"], outputs), expected)
 
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
