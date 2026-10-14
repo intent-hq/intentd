@@ -851,3 +851,19 @@ The design docs live in the monorepo under `docs/`:
 
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
+
+### Depot CI and compiler cache
+
+CI and release builds run on Depot GitHub Actions runners. Linux checks use
+8 CPUs and coverage/release compilation uses 16 CPUs; native platform jobs keep
+their target triples. Local runner availability no longer affects CI routing.
+Machine inventory/provisioning/pruning workflows remain manual host operations.
+
+The shared release-rust-cache action requires the Depot-managed WebDAV endpoint,
+installs pinned sccache, and preserves the runner's short-lived authentication.
+Enable automatic Depot Cache access for this repository in Depot. Rust builds
+set RUSTC_WRAPPER=sccache and CARGO_INCREMENTAL=0; compiler entries are stored
+remotely, without Actions sccache archives or local size/retention policies.
+The build-only release-cache workflow warms the same release inputs. The Depot
+managed cache smoke workflow proves reuse across separate jobs and invalidation
+when source changes; summaries report compiler hits rather than archive hits.

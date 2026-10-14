@@ -46,7 +46,7 @@ jobs:
   cleanup:
     # Skip noncanonical/manual feature or tag runs before exposing credentials.
     if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}

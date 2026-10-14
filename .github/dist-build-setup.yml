@@ -10,7 +10,7 @@
 # stub) shadows Git Bash in PATH, and WSL bash can't execute the runner's
 # Windows-path step scripts. Prepend Git's bin dir so every later
 # `shell: bash` step resolves Git Bash instead (same workaround as ci.yml's
-# build job). No-op on the GitHub-hosted windows-2022 image.
+# build job). No-op on the GitHub-hosted depot-windows-2022 image.
 - name: Put Git Bash first on PATH (Windows)
   if: runner.os == 'Windows'
   shell: cmd
@@ -91,7 +91,7 @@
     # later steps. Without this, the first `cargo` invocation inside
     # `dist build` re-enters rustup's rust-toolchain.toml sync to add the
     # declared rustfmt/clippy components, which on the GitHub-hosted
-    # gh-linux-16x images collides with the preinstalled Rust ("failed to
+    # depot-ubuntu-24.04-16 images collides with the preinstalled Rust ("failed to
     # install component: 'rustfmt-preview-...', detected conflict:
     # 'bin/cargo-fmt'"), rolls back, and leaves the shim reporting cargo
     # as missing (v0.2.16 Release run 30706345522, aarch64-musl leg).
@@ -124,7 +124,7 @@
     tmp=$(mktemp -d)
     fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
       curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
-      # Git Bash on the hosted windows-2022 runner ships coreutils'
+      # Git Bash on the hosted depot-windows-2022 runner ships coreutils'
       # sha256sum but not the perl shasum; Linux runners have both.
       if command -v sha256sum >/dev/null 2>&1; then
         echo "$2  $tmp/$1" | sha256sum -c -
@@ -133,7 +133,7 @@
       fi
       case "$1" in
         *.zip)
-          # unzip is absent from Git Bash and the windows-2022 image;
+          # unzip is absent from Git Bash and the depot-windows-2022 image;
           # the image ships 7-Zip (7z on PATH) instead.
           if command -v unzip >/dev/null 2>&1; then
             unzip -q "$tmp/$1" -d "$tmp/x"
@@ -170,11 +170,6 @@
       *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
     esac
     ls -l "$dest"
-# Main builds populate these bounded compiler entries. Tags only restore;
-# an evicted or incompatible archive leaves the normal cold build intact.
-- name: Restore release compiler cache
+# Main and release builds share compiler entries through Depot managed sccache.
+- name: Configure Depot managed compiler cache
   uses: ./.github/actions/release-rust-cache
-  with:
-    flavor: daemon-dist
-    target: ${{ join(matrix.targets, ' ') }}
-    runner: ${{ matrix.runner }}

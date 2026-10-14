@@ -38,14 +38,14 @@ class WorkflowTests(unittest.TestCase):
         data = workflow('macos-prune.yml')
         events = data.get('on', data.get(True))
         self.assertFalse(events['workflow_dispatch']['inputs']['apply']['default'])
-        self.assertTrue(events['schedule'])
+        self.assertNotIn('schedule', events)
         self.assertEqual(data['permissions'], {'contents': 'read'})
         self.assertEqual(data['concurrency'], {'group': 'macos-ci-disk-maintenance', 'cancel-in-progress': False})
         job = data['jobs']['prune']
         self.assertEqual(job['runs-on'], ['self-hosted', 'macOS', 'ARM64', 'm1mac'])
         steps = job['steps']
         self.assertEqual(steps[1]['run'], 'python3 -I -B scripts/macos-ci-cleanup.py')
-        self.assertEqual(steps[2]['if'], "github.event_name == 'schedule' || inputs.apply")
+        self.assertEqual(steps[2]['if'], 'inputs.apply')
         self.assertEqual(steps[2]['run'], 'python3 -I -B scripts/macos-ci-cleanup.py --apply')
 
     def test_safety_tests_are_enforced_in_ci(self):

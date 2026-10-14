@@ -1,186 +1,139 @@
 #!/usr/bin/env python3
-"""Offline compiler-cache smoke test; requires PyYAML, cargo, rustc and sccache.
+"""Compile through a WebDAV sccache backend and prove reuse and invalidation.
 
-Uses an isolated cache/server and no downloaded dependencies. This proves cache
-reuse, profile/flag separation and eviction fallback, NOT release speedups.
+By default a local HTTP fixture exercises real sccache without Depot credentials.
+--managed uses the runner's Depot backend. --phase populate/verify splits reuse
+across two independent CI jobs, with a unique source per workflow run.
 """
+import argparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
-import random
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
-import time
-
-import yaml
-
-
-def pressure_regression(sccache):
-    """Replay a graph larger than the cache using the action's consumer policy.
-
-    Three deterministic, incompressible Rust libraries exceed the scaled-down
-    cache. A writable consumer evicts the restored last library before reaching
-    it, even though every compiler key is identical. No network is needed.
-    """
-    action = yaml.safe_load((Path(__file__).resolve().parents[1] /
-                             '.github/actions/release-rust-cache/action.yml').read_text())
-    with tempfile.TemporaryDirectory(prefix='release-cache-pressure-') as temp:
-        root = Path(temp)
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', 0))
-            port = str(sock.getsockname()[1])
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(('SCCACHE_', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS',
-                                    'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'))}
-        env.update(CACHE_FLAVOR='daemon-dist', CACHE_TARGET='x86_64-unknown-linux-musl',
-                   CACHE_RUNNER='gh-linux-16x', CACHE_GENERATION='', TOOLCHAIN='test',
-                   BUILD_INPUTS='test', RUNNER_TEMP=temp,
-                   GITHUB_OUTPUT=str(root / 'output'), GITHUB_ENV=str(root / 'environment'))
-        def settings(generation):
-            (root / 'environment').write_text('')
-            subprocess.run(['bash', '-eu', '-c', action['runs']['steps'][0]['run']],
-                           env={**env, 'CACHE_GENERATION': generation}, check=True)
-            return dict(line.split('=', 1) for line in (root / 'environment').read_text().splitlines())
-
-        consumer = settings('')
-        producer = settings('100-1')
-        env.update(consumer)
-        consumer_mode = consumer.get('SCCACHE_LOCAL_RW_MODE', 'READ_WRITE')
-        env.update(SCCACHE_SERVER_PORT=port, SCCACHE_CONF=str(root / 'config'),
-                   SCCACHE_CACHE_SIZE='1M')
-        (root / 'config').write_text('')
-        rng = random.Random(0)
-        for i in range(3):
-            data = ','.join(str(rng.getrandbits(64)) for _ in range(32768))
-            (root / f'entry{i}.rs').write_text(f'pub static DATA: [u64; 32768] = [{data}];')
-
-        def run(*args):
-            return subprocess.check_output(args, cwd=root, env=env, text=True,
-                                           stderr=subprocess.PIPE)
-
-        def build(mode):
-            env['SCCACHE_LOCAL_RW_MODE'] = mode
-            run(sccache, '--start-server')
-            for i in range(3):
-                run(sccache, shutil.which('rustc'), '--crate-name', f'entry{i}',
-                    '--crate-type', 'rlib', '--emit=link', '--out-dir', str(root),
-                    str(root / f'entry{i}.rs'))
-            stats = json.loads(run(sccache, '--show-stats', '--stats-format=json'))['stats']
-            run(sccache, '--stop-server')
-            return stats
-
-        cache = Path(env['SCCACHE_DIR'])
-        try:
-            cold = build('READ_WRITE')
-            assert cold['cache_writes'] == 3 and cold['cache_write_errors'] == 0, cold
-            seed = {p.relative_to(cache): p.read_bytes() for p in cache.rglob('*') if p.is_file()}
-            assert seed, 'cold build must retain a real compiler entry'
-            warm = build(consumer_mode)
-            assert warm['cache_hits']['counts'].get('Rust', 0) > 0, (
-                'daemon consumer evicted the restored entries before they could be reused', warm)
-            assert {p.relative_to(cache): p.read_bytes() for p in cache.rglob('*') if p.is_file()} == seed
-            # Cold/missing archives still compile successfully in consumer mode.
-            shutil.rmtree(cache)
-            empty = build(consumer_mode)
-            assert empty['cache_misses']['counts'].get('Rust') == 3, empty
-            # Producers get bounded working room, but upload the original cap.
-            # Scale both production limits by the same factor for this fixture.
-            for name, data in seed.items():
-                (cache / name).parent.mkdir(parents=True, exist_ok=True)
-                (cache / name).write_bytes(data)
-            size = producer['SCCACHE_CACHE_SIZE']
-            env['SCCACHE_CACHE_SIZE'] = str(int(size[:-1]) * {'M': 2**20, 'G': 2**30}[size[-1]] // 256)
-            refresh = build(producer.get('SCCACHE_LOCAL_RW_MODE', 'READ_WRITE'))
-            assert refresh['cache_hits']['counts'].get('Rust', 0) > 0, refresh
-            assert refresh['cache_writes'] == 2 and refresh['cache_write_errors'] == 0, refresh
-            # A changed compiler input must still refresh; never freeze producers.
-            with (root / 'entry2.rs').open('a') as source:
-                source.write('\npub fn generation() -> u8 { 2 }\n')
-            changed = build(producer.get('SCCACHE_LOCAL_RW_MODE', 'READ_WRITE'))
-            assert changed['cache_writes'] == 1 and changed['cache_write_errors'] == 0, changed
-            controls = Path(__file__).with_name('release-cache-controls.py')
-            bound = json.loads(run(sys.executable, '-B', str(controls), 'bound', str(cache),
-                                   '--limit', str(2**20)))
-            assert bound['after_bytes'] <= 2**20, bound
-            env['SCCACHE_CACHE_SIZE'] = '1M'
-            refreshed = build(consumer_mode)
-            assert refreshed['cache_hits']['counts'].get('Rust', 0) > 0, refreshed
-            return {'warm_rust_hits': warm['cache_hits']['counts']['Rust'],
-                    'warm_rust_misses': warm['cache_misses']['counts']['Rust'],
-                    'producer_rust_hits': refresh['cache_hits']['counts']['Rust']}
-        finally:
-            subprocess.run([sccache, '--stop-server'], env=env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+import threading
 
 
 def main():
-    sccache = shutil.which('sccache')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--managed', action='store_true')
+    parser.add_argument('--phase', choices=['all', 'populate', 'verify'], default='all')
+    args = parser.parse_args()
+    env = dict(os.environ)
+    if args.managed and not env.get('SCCACHE_WEBDAV_ENDPOINT'):
+        raise SystemExit('Depot managed cache endpoint is required')
+    server = None
+    entries = {}
+    if not args.managed:
+        for key in list(env):
+            if key.startswith('SCCACHE_'):
+                del env[key]
+
+        class WebDAV(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = entries.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.send_header('Content-Length', str(len(body or b'')))
+                self.end_headers()
+                self.wfile.write(body or b'')
+
+            def do_PUT(self):
+                entries[self.path] = self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(201)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def do_PROPFIND(self):
+                body = (f'<D:multistatus xmlns:D="DAV:"><D:response><D:href>{self.path}</D:href>'
+                        '<D:propstat><D:prop><D:getlastmodified>Wed, 14 Oct 2026 00:00:00 GMT</D:getlastmodified><D:getcontentlength>0</D:getcontentlength><D:resourcetype><D:collection/></D:resourcetype>'
+                        '</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>'
+                        '</D:response></D:multistatus>').encode()
+                self.send_response(207)
+                self.send_header('Content-Type', 'application/xml')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_MKCOL(self):
+                self.send_response(201)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), WebDAV)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env['SCCACHE_WEBDAV_ENDPOINT'] = f'http://127.0.0.1:{server.server_port}'
+    sccache = os.environ.get('SCCACHE_BIN') or shutil.which('sccache')
     if not sccache:
         raise SystemExit('sccache is required')
-    print(json.dumps({'pressure_regression': pressure_regression(sccache)}), flush=True)
-    with tempfile.TemporaryDirectory(prefix='release-cache-smoke-') as temp:
-        root = Path(temp)
-        (root / 'src').mkdir()
-        (root / 'src/lib.rs').write_text('pub fn answer() -> u64 { (1..=6).product() }\n')
-        (root / 'Cargo.toml').write_text('''[package]
-name = "release_cache_smoke"
-version = "0.1.0"
-edition = "2021"
-[profile.dist]
-inherits = "release"
-lto = "thin"
-''')
-        with socket.socket() as port:
-            port.bind(('127.0.0.1', 0))
-            server_port = str(port.getsockname()[1])
-        env = {**os.environ, 'RUSTC_WRAPPER': sccache, 'CARGO_INCREMENTAL': '0',
-               'SCCACHE_DIR': str(root / 'cache'), 'SCCACHE_CACHE_SIZE': '256M',
-               'SCCACHE_SERVER_PORT': server_port, 'CARGO_TARGET_DIR': str(root / 'target')}
-        # Never use an inherited remote backend or compiler flags for this test.
-        for key in list(env):
-            if key.startswith(('SCCACHE_BUCKET', 'SCCACHE_GHA_', 'SCCACHE_REDIS', 'SCCACHE_MEMCACHED', 'SCCACHE_AZURE', 'SCCACHE_GCS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS')):
-                env.pop(key)
-        env['SCCACHE_GHA_ENABLED'] = 'false'
+    with socket.socket() as port:
+        port.bind(('127.0.0.1', 0))
+        env['SCCACHE_SERVER_PORT'] = str(port.getsockname()[1])
+    env.update(CARGO_INCREMENTAL='0', SCCACHE_GHA_ENABLED='false')
+    for key in ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']:
+        env.pop(key, None)
+    # Stable cwd across the two hosted jobs; source identity is run-specific.
+    identity = os.environ.get('GITHUB_RUN_ID', 'local')
+    directory = tempfile.TemporaryDirectory(prefix='managed-cache-smoke-') if args.phase == 'all' else None
+    root = Path(directory.name if directory else Path(tempfile.gettempdir()) / ('intent-depot-smoke-' + identity))
+    root.mkdir(exist_ok=True)
+    env['SCCACHE_DIR'] = str(root / 'unused-local-cache')
 
-        def run(*args):
-            return subprocess.check_output(args, cwd=root, env=env, text=True, stderr=subprocess.STDOUT)
+    def run(*command):
+        return subprocess.check_output(command, cwd=root, env=env, text=True, stderr=subprocess.STDOUT)
 
-        def hits():
-            return sum(json.loads(run(sccache, '--show-stats', '--stats-format=json'))['stats']['cache_hits']['counts'].values())
+    def stats():
+        return json.loads(run(sccache, '--show-stats', '--stats-format=json'))['stats']
 
-        def build(profile):
-            shutil.rmtree(root / 'target', ignore_errors=True)
-            start = time.monotonic()
-            run('cargo', 'build', '--offline', '--profile', profile)
-            return round(time.monotonic() - start, 3)
+    def build(value):
+        # A fresh output directory rules out Cargo/incremental/local artifact reuse.
+        shutil.rmtree(root / 'target', ignore_errors=True)
+        (root / 'target').mkdir()
+        (root / 'fixture.rs').write_text(f'// {identity}\npub fn answer() -> u32 {{ {value} }}\n')
+        run(sccache, '--zero-stats')
+        run(sccache, 'rustc', '--crate-name', 'cache_fixture', '--crate-type', 'rlib',
+            '--emit=link', '-C', 'opt-level=2', 'fixture.rs', '--out-dir', 'target')
+        measured = stats()
+        (root / 'main.rs').write_text(f'fn main() {{ assert_eq!(cache_fixture::answer(), {value}); }}\n')
+        binary = 'check.exe' if os.name == 'nt' else 'check'
+        run('rustc', 'main.rs', '--extern', 'cache_fixture=target/libcache_fixture.rlib', '-o', 'target/' + binary)
+        run(str(root / 'target' / binary))
+        return measured
 
-        results = {}
-        try:
-            run(sccache, '--start-server')
-            for profile in ('dist', 'release'):
-                before = hits()
-                cold = build(profile)
-                after_cold = hits()
-                assert after_cold == before, f'{profile} incorrectly reused another profile'
-                warm = build(profile)
-                assert hits() > after_cold, f'{profile} produced no compiler cache hit'
-                results[profile] = {'cold_seconds': cold, 'warm_seconds': warm}
-            env['RUSTFLAGS'] = '-C opt-level=1'
-            before = hits()
-            build('release')
-            assert hits() == before, 'changed flags incorrectly hit cached compilation'
+    try:
+        run(sccache, '--start-server')
+        if args.phase != 'verify':
+            cold = build(42)
+            assert cold['cache_write_errors'] == 0, cold
+            if not args.managed:
+                assert entries, 'WebDAV must receive compiled objects'
+        if args.phase != 'populate':
+            # Kill process-local state as well as build outputs before reuse.
             run(sccache, '--stop-server')
-            results['cache_bytes'] = sum(p.stat().st_size for p in (root / 'cache').rglob('*') if p.is_file())
-            shutil.rmtree(root / 'cache')
             run(sccache, '--start-server')
-            build('release')
-            assert hits() == 0, 'evicted cache should rebuild cold'
-            print(json.dumps(results, indent=2))
-        finally:
-            subprocess.run([sccache, '--stop-server'], cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            warm = build(42)
+            assert warm['cache_hits']['counts'].get('Rust', 0) > 0, warm
+            changed = build(43 + int(os.environ.get('GITHUB_RUN_ATTEMPT', '1')))
+            assert changed['cache_misses']['counts'].get('Rust', 0) > 0, changed
+            assert changed['cache_write_errors'] == 0, changed
+            print(json.dumps({'managed': args.managed, 'rust_hits': warm['cache_hits']['counts']['Rust'],
+                              'changed_source_misses': changed['cache_misses']['counts']['Rust']}))
+        else:
+            print('Populated Depot managed cache for verification in a separate job.')
+        assert not (root / 'unused-local-cache').exists(), 'remote test must not use a disk cache'
+    finally:
+        subprocess.run([sccache, '--stop-server'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if server:
+            server.shutdown()
+        if directory:
+            directory.cleanup()
+        else:
+            shutil.rmtree(root)
 
 
 if __name__ == '__main__':

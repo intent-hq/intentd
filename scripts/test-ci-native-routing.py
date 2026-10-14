@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real runner probe, native event routing and CI Gate offline.
+"""Exercise Depot runner selection, native event routing and CI Gate offline.
 
 The small expression interpreter supports only the boolean/context subset used
 by these job and native-step conditions; unknown syntax fails closed. This is
@@ -281,7 +281,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         result = run_route(self.workflow, **fixture)
         outputs = route_outputs(self.workflow, result["outputs"])
         self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
-        self.assertEqual(outputs.get("macos_burst"), str(expected == ["macos-15"]).lower())
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["depot-macos-15"]).lower())
         for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
                                      ("daemon-lifecycle", "platform", "macos")):
             job = self.workflow["jobs"][job_id]
@@ -291,73 +291,24 @@ class RunnerAvailabilityTests(unittest.TestCase):
             self.assertEqual(matrix_labels(row["os"], outputs), expected)
         return result
 
-    def test_macos_requires_positive_idle_matching_availability(self):
-        missing_busy = runner()
-        missing_busy.pop("busy")
-        for fleet in ([], [runner(status="offline")], [runner(busy=True)], [missing_busy],
-                      [runner(busy=None)], [runner(busy="false")], [runner(busy=0)],
-                      [runner(arch="X64")], [runner(platform="Linux")],
-                      [{**runner(), "labels": []}], [{**runner(), "labels": None}],
-                      [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
-                      [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
-            with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["macos-15"])
-        for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
-                      [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
-                      [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
-            with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
-
-    def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
-        cases = [({}, ["macos-15"], ["org"]),
-                 ({"orgError": "403 missing permission", "repo": [runner()]},
-                  ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["macos-15"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": []}, ["macos-15"], ["org", "repo"]),
-                 ({"orgError": "403", "repoError": "403 missing permission"}, ["macos-15"], ["org", "repo"]),
-                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["macos-15"], ["org", "repo"]),
-                 ({"org": {"unexpected": "response"}}, ["macos-15"], ["org"]),
-                 ({"org": [], "repo": [runner()]}, ["macos-15"], ["org"])]
-        for fixture, expected, endpoints in cases:
+    def test_depot_selection_ignores_local_fleet_and_queue_failures(self):
+        for fixture in [{}, {'org': [runner()]}, {'orgError': '403', 'repoError': '503'},
+                        {'org': [runner('Linux', 'X64')], 'queueErrors': ['intentd']}]:
             with self.subTest(fixture=fixture):
-                result = self.assert_mac_route(fixture, expected)
-                self.assertEqual([call["endpoint"] for call in result["calls"]], endpoints)
-                for call in result["calls"]:
-                    self.assertEqual(call["args"], {"org": "intent-hq", "per_page": 100} if call["endpoint"] == "org"
-                                     else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
-
-    def test_linux_and_windows_keep_existing_queue_and_online_semantics(self):
-        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64", busy=True), runner()]
-        for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
-                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "monorepo"], False)):
-            with self.subTest(depth=depth, queue_errors=queue_errors):
-                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux"]}
-                        for i in range(depth)]
-                jobs += [{"status": "in_progress", "labels": ["gh-linux-16x"]}] * 20
-                result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["self-hosted", "macOS", "ARM64"])
-                outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"] if linux_burst else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"] if linux_burst else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
-                self.assertEqual(outputs["windows_burst"], "false")
-        for fixture in ({}, {"orgError": "403", "repoError": "403"},
-                        {"org": [runner("Linux", "X64", status="offline"), runner("Windows", "X64", status="offline")]},
-                        {"org": [runner("linux", "x64"), runner("windows", "x64")]}):
-            with self.subTest(fixture=fixture):
-                outputs = run_route(self.workflow, **fixture)["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
-                self.assertEqual(outputs["linux_burst"], "true")
-                self.assertEqual(outputs["windows_burst"], "true")
+                result = self.assert_mac_route(fixture, ['depot-macos-15'])
+                self.assertEqual(result['calls'], [])
+                for key, label in [('linux', 'depot-ubuntu-24.04-16'),
+                                   ('check', 'depot-ubuntu-24.04-8'),
+                                   ('windows', 'depot-windows-2022-16')]:
+                    self.assertEqual(json.loads(result['outputs'][key + '_labels']), [label])
+                self.assertEqual(result['outputs']['linux_burst'], 'true')
+                self.assertEqual(result['outputs']['windows_burst'], 'true')
 
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "daemon-lifecycle"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
-                expected = ["macos-15"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
-                    ["gh-linux-16x"] if row.get("platform") == "linux" else ["gh-windows-16x"])
+                expected = ["depot-macos-15"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                    ["depot-ubuntu-24.04-16"] if row.get("platform") == "linux" else ["depot-windows-2022-16"])
                 for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
@@ -367,7 +318,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
         steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
-        for labels in (["macos-15"], ["self-hosted", "macOS", "ARM64"]):
+        for labels in (["depot-macos-15"], ["self-hosted", "macOS", "ARM64"]):
             for fast_path in ("", "true"):
                 values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
                 for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):

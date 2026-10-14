@@ -1,0 +1,38 @@
+name: Depot managed cache smoke
+on:
+  pull_request:
+    paths:
+      - '.github/actions/release-rust-cache/**'
+      - '.github/workflows/depot-cache-smoke.yml'
+      - 'scripts/test-release-cache-smoke.py'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  populate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/release-rust-cache
+      - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase populate
+  verify:
+    needs: populate
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/release-rust-cache
+      - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase verify
