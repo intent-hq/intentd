@@ -16,10 +16,9 @@ async fn operation_observation_keeps_exact_transports_head_ref_and_staging_witho
     let owned = Fixture::new().await;
     let f = &owned;
     f.git(&f.path, &["tag", "main"]);
-    f.git(
-        &f.path,
-        &["config", "remote.origin.url", "short:team/a.git"],
-    );
+    // Include the normal fetch refspec: Git 2.34 cannot rename a remote
+    // constructed only from remote.origin.url with no fetch mapping.
+    f.git(&f.path, &["remote", "add", "origin", "short:team/a.git"]);
     f.git(
         &f.path,
         &["config", "url.https://github.com/.insteadOf", "short:"],
@@ -125,6 +124,11 @@ async fn operation_observation_keeps_exact_transports_head_ref_and_staging_witho
                 .unwrap();
             assert_eq!(moved.source_ref, "refs/heads/next");
             f.git(&f.path, &["remote", "rename", "origin", "renamed"]);
+            assert_eq!(
+                f.git(&f.path, &["config", "--get", "remote.renamed.fetch"])
+                    .trim(),
+                "+refs/heads/*:refs/remotes/renamed/*"
+            );
             assert_eq!(
                 source
                     .observe_operation(
