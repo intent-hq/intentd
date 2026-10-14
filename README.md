@@ -869,3 +869,25 @@ Without credentials, compilation proceeds uncached with a notice. Rust caches
 use the managed service, without Rust cache actions or Actions cache archives.
 The build-only release-cache workflow warms release inputs; the managed smoke
 workflow verifies compiler hits across jobs and invalidation after source changes.
+
+### Windows CI disk cleanup
+
+`windows-prune.yml` maintains 40 GiB of free space on 5090pc twice daily. Manual
+runs default to dry-run; `apply=true` deletes only inactive debug artifacts in
+the two intentd CI target directories. It preserves Cargo lock files, release
+profiles, toolchains, registry, credentials and sources. Native Windows safety
+tests run first. A busy runner, compiler, held lock, in-use marker, reparse point,
+unknown owner or insufficient eligible space fails visibly.
+
+Before the new workflow lands, the existing Mac maintenance dispatcher can run
+it from this branch without merging:
+
+```sh
+gh workflow run macos-prune.yml --repo intent-hq/intentd --ref ci/depot-managed-cache -f runner=5090pc -f apply=false
+# Inspect the dry-run, then use the same command with -f apply=true.
+```
+
+Once available on main, invoke `windows-prune.yml` directly. After cleanup,
+verify a self-hosted Windows build before removing the maintenance routing
+variable documented above. The cleanup log reports actual free bytes before
+and after deletion; a rebuild repopulates any evicted debug cache.

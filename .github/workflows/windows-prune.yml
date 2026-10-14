@@ -1,0 +1,50 @@
+name: Windows CI disk cleanup
+on:
+  schedule:
+    - cron: "45 11,23 * * *"
+  pull_request:
+    paths:
+      - .github/workflows/windows-prune.yml
+      - .github/workflows/macos-prune.yml
+      - scripts/windows-ci-cleanup.py
+      - scripts/test-windows-ci-cleanup.py
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Delete inactive CI artifacts (otherwise dry run)
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      apply:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: windows-ci-disk-maintenance-${{ github.event_name == 'pull_request' && github.ref || '5090pc' }}
+  cancel-in-progress: false
+jobs:
+  safety-tests:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: depot-windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test native Windows locks and deletion boundaries
+        shell: pwsh
+        run: python -I -B scripts/test-windows-ci-cleanup.py --require-windows
+  prune:
+    if: github.event_name != 'pull_request'
+    needs: safety-tests
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Report eligible profiles
+        shell: powershell
+        run: python -I -B scripts/windows-ci-cleanup.py
+      - name: Reclaim disk headroom
+        if: github.event_name == 'schedule' || inputs.apply
+        shell: powershell
+        run: python -I -B scripts/windows-ci-cleanup.py --apply

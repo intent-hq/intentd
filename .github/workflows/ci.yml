@@ -1941,6 +1941,8 @@ jobs:
         run: ./scripts/test-ci-lld-retry.sh
       - name: Test ci-target-slot.sh
         run: ./scripts/test-ci-target-slot.sh
+      - name: Test Windows cleanup policy
+        run: python3 -I -B scripts/test-windows-ci-cleanup.py
       - name: Test macOS cleanup safety and Cargo lock ownership
         run: |
           python3 -I -B scripts/test-macos-ci-cleanup.py
