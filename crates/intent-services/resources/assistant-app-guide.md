@@ -251,10 +251,13 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 In **Home → Workspaces**, open **View options → Group by** in either list or board
 view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
-groups. **Status** uses the daemon's detailed workspace status: **Failed**,
+groups. In list view, **Status** shows detailed workspace status: **Failed**,
 **Blocked**, **Needs attention**, **Not started**, **In progress**, **Idle**,
 **Complete**, **PR open**, **PR Mergeable**, **PR Queued**, and **PR merged**.
 **Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
