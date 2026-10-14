@@ -110,6 +110,10 @@ impl StartupLocalListener {
         }
         bootstrap.abort_all();
         while bootstrap.join_next().await.is_some() {}
+        #[cfg(unix)]
+        tracing::info!("intentd UDS listener stopped");
+        #[cfg(windows)]
+        tracing::info!("intentd named-pipe listener stopped");
         Ok(())
     }
 

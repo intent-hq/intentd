@@ -9,6 +9,8 @@ use std::sync::{
 pub struct Bootstrap {
     pub dispatch: StartupDispatch,
     pub cancellation: Cancellation,
+    #[cfg(unix)]
+    pub staged_restart_signal: Option<tokio::signal::unix::Signal>,
     pub ws: Option<WsApiServer>,
     pub port: Option<u16>,
     pub local: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
@@ -23,6 +25,8 @@ impl Bootstrap {
                 "CARGO_PKG_VERSION"
             ))),
             cancellation: Cancellation::new(),
+            #[cfg(unix)]
+            staged_restart_signal: None,
             ws: None,
             port: None,
             local: None,

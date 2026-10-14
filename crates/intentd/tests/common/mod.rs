@@ -367,7 +367,7 @@ pub fn registry_with_default_provider(
     registry
 }
 
-/// Wait until a freshly spawned `intentd serve` child accepts connections on
+/// Wait until a freshly spawned `intentd serve` child serves application RPCs on
 /// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
 /// panicking with the daemon log — if the child exits before listening, so
 /// tests don't keep polling a dead daemon for the full window. Unix-only
@@ -378,7 +378,7 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        if daemon_is_ready(socket).await {
             return;
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -397,6 +397,15 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// A listening startup socket is not application readiness. Probe only a read;
+/// never retry a test's writes or open its store while migrations are running.
+#[cfg(unix)]
+pub async fn daemon_is_ready(socket: &Path) -> bool {
+    try_status_rpc(socket, Duration::from_secs(1))
+        .await
+        .is_ok_and(|reply| reply["result"].is_object())
 }
 
 /// One `system.status` round-trip over the daemon's UDS control socket. The

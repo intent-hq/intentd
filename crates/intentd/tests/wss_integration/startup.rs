@@ -91,6 +91,10 @@ async fn seed(dir: &Path) -> usize {
 }
 
 fn launch(dir: &Path, gate: &Path) -> (GuardedChild, u16) {
+    launch_with_handshake(dir, gate, false)
+}
+
+fn launch_with_handshake(dir: &Path, gate: &Path, advertised: bool) -> (GuardedChild, u16) {
     common::enable_ws_api(dir);
     let registry = intent_services::SettingsRegistry::load(dir.join("config.toml")).unwrap();
     let port = registry.snapshot().effective.server.ws_api.port;
@@ -103,6 +107,10 @@ fn launch(dir: &Path, gate: &Path) -> (GuardedChild, u16) {
         .env("TOKIO_WORKER_THREADS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(dir.join("startup.log")).unwrap());
+    command.env_remove("INTENTD_SITTER_IDLE_RESTART");
+    if advertised {
+        command.env("INTENTD_SITTER_IDLE_RESTART", "1");
+    }
     if let Ok(proxy_port) = std::fs::read_to_string(dir.join("proxy-port")) {
         command
             .env("INTENTD_TAILCAT_BIN", dir.join("tailcat-fixture"))
@@ -169,6 +177,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
     let listener = UnixListener::bind(&gate_path).unwrap();
     let (mut child, port) = launch(dir.path(), &gate_path);
     let mut inventory = barrier(&listener, b'i').await;
+    assert!(!common::daemon_is_ready(&dir.path().join("intentd.sock")).await);
     let cfg = startup_client_config(dir.path());
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
         .arg("status")
@@ -360,6 +369,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
         "saved-test-key"
     );
     assert_eq!(status["result"]["phase"], "ready");
+    assert!(common::daemon_is_ready(&dir.path().join("intentd.sock")).await);
     assert_eq!(status["result"]["attemptId"], attempt);
     assert!(status["result"].get("retryAfterMs").is_none());
     let hello = call(
@@ -825,6 +835,76 @@ async fn cli_startup_liveness_uses_server_identity_and_rejects_invalid_probes() 
                 "never use this CLI's build version"
             );
             assert_eq!(actual["ready"], false);
+        }
+    }
+}
+
+#[tokio::test]
+async fn sigusr2_during_indexing_is_retained_until_ready_and_stop_wins() {
+    for advertised in [false, true] {
+        for stop_early in [false, true] {
+            let dir = common::test_tempdir_in("/tmp", "startup-usr2-");
+            seed(dir.path()).await;
+            let gate_path = dir.path().join("gate");
+            let listener = UnixListener::bind(&gate_path).unwrap();
+            let (mut child, _) = launch_with_handshake(dir.path(), &gate_path, advertised);
+            let mut inventory = barrier(&listener, b'i').await;
+            child.signal(nix::sys::signal::Signal::SIGUSR2).unwrap();
+            let socket = dir.path().join("intentd.sock");
+            assert_eq!(
+                uds_call(&socket, "system.startupStatus").await["result"]["phase"],
+                "indexing"
+            );
+            assert_eq!(
+                uds_call(&socket, "system.status").await["error"]["code"],
+                -32012
+            );
+            if stop_early {
+                child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+            } else {
+                inventory.write_u8(b'c').await.unwrap();
+                for stage in [b'n', b'c'] {
+                    barrier(&listener, stage)
+                        .await
+                        .write_u8(b'c')
+                        .await
+                        .unwrap();
+                }
+                if !advertised {
+                    timeout(common::daemon_startup_timeout(), async {
+                        while !common::daemon_is_ready(&socket).await {
+                            // timing-guard: poll application readiness after the commit barrier.
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    })
+                    .await
+                    .expect("unsupervised signal must not stop startup");
+                    child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+                }
+            }
+            let exit = child
+                .wait_with_timeout(Duration::from_secs(20))
+                .unwrap()
+                .expect("bounded exit");
+            assert_eq!(
+                exit.code(),
+                Some(if advertised && !stop_early { 75 } else { 0 })
+            );
+            assert!(!socket.exists());
+            let db = database(dir.path()).await;
+            let indexed: i64 = sqlx::query_scalar("SELECT indexed_rev FROM note_page_head")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            assert_eq!(indexed, if stop_early { -1 } else { 17 });
+            db.close().await;
+            if !stop_early {
+                let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();
+                assert!(
+                    log.contains("phase=\"store_close\" state=\"completed\""),
+                    "{log}"
+                );
+            }
         }
     }
 }

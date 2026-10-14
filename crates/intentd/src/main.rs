@@ -1695,6 +1695,15 @@ async fn cmd_serve(
     let prepared =
         Store::prepare_for_daemon(&config.db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let mut bootstrap = startup::Bootstrap::new(&config);
+    // A frozen sitter can send a staged-update signal as soon as our protected
+    // liveness endpoint appears. Reserve its receiver before exposing that
+    // endpoint, retaining pending signals until normal startup completes.
+    #[cfg(unix)]
+    {
+        bootstrap.staged_restart_signal = Some(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::user_defined2(),
+        )?);
+    }
     let dispatch = bootstrap.dispatch.clone();
     let cancellation = bootstrap.cancellation.clone();
     let result = {
@@ -1865,7 +1874,7 @@ async fn cmd_serve_owned(
     let (stop, stopped) = tokio::sync::oneshot::channel();
     bootstrap.stop_local = Some(stop);
     let dispatch = bootstrap.dispatch.clone();
-    bootstrap.local = Some(tokio::spawn(local.serve(dispatch, async {
+    bootstrap.local = Some(intent_core::spawn_daemon(local.serve(dispatch, async {
         let _ = stopped.await;
     })));
     if boot_listener != BootWsListener::None {
@@ -2730,6 +2739,12 @@ async fn cmd_serve_owned(
         manager.clone(),
         idle_update_state.clone(),
         shutdown_notify.clone(),
+        bootstrap
+            .staged_restart_signal
+            .take()
+            .expect("SIGUSR2 receiver reserved before listeners"),
+        bootstrap.dispatch.clone(),
+        bootstrap.cancellation.clone(),
     );
     #[cfg(unix)]
     let idle_update_requester = spawn_idle_update_requester(
@@ -2782,7 +2797,7 @@ async fn cmd_serve_owned(
         let dispatch = bootstrap.dispatch.clone();
         let registry = settings_registry.clone();
         let services = services.clone();
-        tokio::spawn(async move {
+        intent_core::spawn_daemon(async move {
             let mut config_shutdown = config_shutdown;
             tokio::select! {
                 () = dispatch.retired() => {},
@@ -5773,7 +5788,7 @@ fn spawn_idle_update_requester(
     })
 }
 
-/// Spawn the staged-restart watcher: installs the SIGUSR2 handler (the
+/// Spawn the staged-restart watcher using the reserved SIGUSR2 receiver (the
 /// sitter's "a newer version is staged; exit when idle"), and on receipt
 /// marks the restart pending and triggers the graceful shutdown as soon as
 /// `list_busy()` is empty — immediately if already idle, otherwise polled
@@ -5781,7 +5796,8 @@ fn spawn_idle_update_requester(
 /// the forced fallback). The serve loop then exits with
 /// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
 /// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
-/// disposition; it is then logged and ignored.
+/// disposition; it is then logged and ignored. Signals received before readiness
+/// remain pending until startup commits and all required services are ready.
 ///
 /// The exit-when-idle competes for the write-once
 /// [`IdleUpdateState::shutdown_cause`] latch: once a requested stop has
@@ -5794,16 +5810,18 @@ fn spawn_staged_restart_watcher(
     manager: Arc<AgentManager>,
     state: Arc<IdleUpdateState>,
     shutdown: Arc<tokio::sync::Notify>,
+    mut usr2: tokio::signal::unix::Signal,
+    dispatch: intent_transport::startup::StartupDispatch,
+    cancellation: startup::Cancellation,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut usr2 = match signal(SignalKind::user_defined2()) {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to install the SIGUSR2 handler; staged update restarts disabled");
-                return;
-            }
-        };
+        // A staged update may wait through indexing, but must never interrupt
+        // initialization or outrank a stop already latched during startup.
+        tokio::select! {
+            biased;
+            () = cancellation.stopped() => return,
+            () = dispatch.retired() => {},
+        }
         loop {
             if usr2.recv().await.is_none() {
                 return;
@@ -5814,7 +5832,7 @@ fn spawn_staged_restart_watcher(
                 );
                 continue;
             }
-            if state.shutdown_cause() != ShutdownCause::Undecided {
+            if cancellation.stopping() || state.shutdown_cause() != ShutdownCause::Undecided {
                 tracing::info!("SIGUSR2 received after shutdown was already decided; ignored");
                 continue;
             }
@@ -5829,7 +5847,7 @@ fn spawn_staged_restart_watcher(
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("staged update restart accepted; exiting once no turn is in flight");
             loop {
-                if state.shutdown_cause() != ShutdownCause::Undecided {
+                if cancellation.stopping() || state.shutdown_cause() != ShutdownCause::Undecided {
                     tracing::info!(
                         "shutdown already in progress; staged update restart not applied"
                     );
