@@ -2990,8 +2990,17 @@ async fn cmd_serve_owned(
             }
         }
         let services = services.clone();
+        let dispatch = bootstrap.dispatch.clone();
+        let cancellation = bootstrap.cancellation.clone();
         intent_core::spawn_daemon(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // This fixture models an admitted application request. Starting it
+            // before handoff can change admission settings during bootstrap.
+            tokio::select! {
+                biased;
+                () = cancellation.stopped() => return,
+                () = dispatch.retired() => {},
+            }
             let mut gate = tokio::net::UnixStream::connect(path)
                 .await
                 .expect("settings response test gate");
