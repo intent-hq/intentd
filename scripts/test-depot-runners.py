@@ -79,11 +79,13 @@ class DepotRunners(unittest.TestCase):
 
     def test_compiling_jobs_configure_managed_cache(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-        for name in ['check', 'build', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
+        for name in ['docs-compiled', 'check', 'build', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
             with self.subTest(job=name):
                 steps = doc['jobs'][name]['steps']
                 configure = next(i for i, step in enumerate(steps) if step.get('run') == 'python3 scripts/setup-depot-sccache.py')
-                builds = [i for i, s in enumerate(steps) if re.search(r'\bcargo (?:check|clippy|build|test|nextest|llvm-cov)\b', s.get('run', ''))]
+                builds = [i for i, s in enumerate(steps)
+                          if re.search(r'\bcargo (?:check|clippy|build|test|nextest|llvm-cov)\b', s.get('run', ''))
+                          or s.get('run') == 'python3 -I -B scripts/docs-ci.py compiled']
                 self.assertTrue(builds)
                 self.assertLess(configure, min(builds))
 
