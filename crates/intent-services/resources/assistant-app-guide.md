@@ -153,7 +153,8 @@ In **Home → Workspaces**, list rows and board cards show organization/reposito
 labels in views that include multiple repositories. When an organization is selected,
 labels show only the repository name. Narrow lists hide the row label; the selected
 workspace's preview header shows its repository. Local repositories show their name
-or path. Repository-specific views identify the repository in the page heading.
+or path. Long labels truncate; hover to read the full name. Repository-specific
+views identify the repository in the page heading.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
