@@ -101,9 +101,9 @@ jobs:
   auto-merge-release-pr:
     name: Auto-merge green Release PR
     # Lightweight job (seconds on cron/dispatch runs; up to ~15 min of polling
-    # on push-triggered runs): pinned to ubuntu-latest (same rationale as
+    # on push-triggered runs): pinned to depot-ubuntu-24.04 (same rationale as
     # ci.yml's pr-title/gate jobs — a tinybox slot would be wasted on it).
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     if: ${{ github.repository_owner == 'intent-hq' }}
     # Covers the 15-min push-run polling budget plus headroom; cron and
     # dispatch runs still finish in seconds.
