@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Real LLVM archive relocation, fresh profiles, compiler guards and floors."""
 import importlib.util
+import io
+import copy
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,79 @@ linux = load('ci-linux-artifacts')
 
 
 class CoverageTests(unittest.TestCase):
+    def test_report_index_authenticates_metadata_version_and_owned_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'run/target'
+            metadata = target / 'nextest/binaries-metadata.json'
+            metadata.parent.mkdir(parents=True)
+            (target / 'debug').mkdir()
+            document = {'rust-build-meta': {'base-output-directories': ['debug']}}
+            def write(value):
+                data = json.dumps(value).encode()
+                metadata.write_bytes(data)
+                return {'size': len(data), 'sha256': archives.sha(data)}
+            expected = write(document)
+            prepared = {'target': str(target), 'report_metadata': expected}
+            request = {'recipe': {'coverage': {'tools': {'cargo-llvm-cov': 'cargo-llvm-cov 0.9.0'}}}}
+            index = coverage.report_index(prepared, request)
+            raw = subprocess.check_output(['zstd', '-dq', '-c', str(index)])
+            with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+                self.assertEqual(tar.getnames(), ['target/nextest/binaries-metadata.json'])
+                self.assertEqual(tar.extractfile(tar.getmembers()[0]).read(), metadata.read_bytes())
+            metadata.unlink()
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                coverage.report_index(prepared, request)
+            write(document)
+            metadata.write_bytes(metadata.read_bytes() + b' ')
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                coverage.report_index(prepared, request)
+            write(document)
+            for version in ('cargo-llvm-cov 0.8.0', 'cargo-llvm-cov 0.9.1', ''):
+                wrong = copy.deepcopy(request)
+                wrong['recipe']['coverage']['tools']['cargo-llvm-cov'] = version
+                with self.assertRaisesRegex(ValueError, 'version'):
+                    coverage.report_index(prepared, wrong)
+            for output in ('../outside', '/tmp', 'C:\\temp', '.', '', 'missing'):
+                changed = {'rust-build-meta': {'base-output-directories': [output]}}
+                prepared['report_metadata'] = write(changed)
+                with self.subTest(output=output), self.assertRaisesRegex(ValueError, 'output'):
+                    coverage.report_index(prepared, request)
+            for malformed in ({}, {'rust-build-meta': {}}, {'rust-build-meta': {'base-output-directories': []}}, {'rust-build-meta': {'base-output-directories': ['debug', 'debug']}}):
+                prepared['report_metadata'] = write(malformed)
+                with self.assertRaisesRegex(ValueError, 'output'):
+                    coverage.report_index(prepared, request)
+            outside = root / 'outside'; outside.mkdir()
+            (target / 'escape').symlink_to(outside, target_is_directory=True)
+            prepared['report_metadata'] = write({'rust-build-meta': {'base-output-directories': ['escape']}})
+            with self.assertRaisesRegex(ValueError, 'output'):
+                coverage.report_index(prepared, request)
+
+    def test_lossless_transport_identity_and_failed_recompression(self):
+        recipe = coverage.compression_recipe()
+        self.assertEqual(recipe['level'], 3)
+        self.assertEqual(recipe['window_log'], 30)
+        self.assertEqual(recipe['threads'], 4)
+        self.assertEqual(recipe['decoder_memory_mib'], 2048)
+        coverage.validate_compression(recipe)
+        for key in ('level', 'window_log', 'threads', 'decoder_memory_mib'):
+            wrong = dict(recipe, **{key: recipe[key] + 1})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                coverage.validate_compression(wrong)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / 'original.tar'; raw.write_bytes(b'fixture tar bytes' * 1000)
+            archive = root / 'tests.tar.zst'
+            subprocess.run(['zstd', '-q', str(raw), '-o', str(archive)], check=True)
+            result = coverage.compress_archive(archive, recipe)
+            self.assertGreaterEqual(result['compression_seconds'], 0)
+            self.assertEqual(subprocess.check_output(['zstd', '-dq', '-M2048MB', '-c', str(archive)]), raw.read_bytes())
+            archive.write_bytes(b'invalid archive')
+            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                coverage.compress_archive(archive, recipe)
+            self.assertEqual(archive.read_bytes(), b'invalid archive')
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['original.tar', 'tests.tar.zst'])
+
     def test_wrapper_flags_and_tools_isolate_cargo_cache_without_source_or_feature_partition(self):
         captured = {'environment': {'wrapper-flags': 'coverage remap'}, 'tools': {'llvm': 'v1'}}
         same = {'tools': {'llvm': 'v1'}, 'environment': {'wrapper-flags': 'coverage remap'}}
@@ -61,7 +136,15 @@ class CoverageTests(unittest.TestCase):
             bundle = root / 'published' / record['key']
             run = root / 'run'
             prepared = linux.prepare_streamed(bundle, request, source, run)
+            original_bundle, original_request = bundle, request
             baseline_prepared = archives.prepare(bundle, request, source, root / 'nextest-baseline')
+            request = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True, compressed=True)
+            compressed_record = archives.produce([request], source, root / 'archive-target', root / 'published')[0]
+            bundle = root / 'published' / compressed_record['key']
+            shutil.rmtree(run)
+            prepared = linux.prepare_streamed(bundle, request, source, run)
+            self.assertGreaterEqual(compressed_record['compression_seconds'], 0)
+
             self.assertEqual(prepared['runtime'], baseline_prepared['runtime'])
             self.assertEqual(archives.inventory_files(run), archives.inventory_files(root / 'nextest-baseline'))
             for path in run.rglob('*'):
@@ -71,6 +154,11 @@ class CoverageTests(unittest.TestCase):
             runtime = dict(native.consumer_environment(root / 'guard'), LLVM_PROFILE_FILE=str(run / 'coverage-%p-%m.profraw'))
             self.assertEqual(archives.run_nextest(prepared, [], env=runtime), 0)
             self.assertEqual(coverage.report(bundle, prepared, request, 0)['exit_code'], 0)
+            compressed_lcov = (source / 'lcov.info').read_bytes()
+            compressed_summary = (source / 'coverage-summary.txt').read_bytes()
+            self.assertEqual(coverage.report(original_bundle, prepared, original_request, 0)['exit_code'], 0)
+            self.assertEqual((source / 'lcov.info').read_bytes(), compressed_lcov)
+            self.assertEqual((source / 'coverage-summary.txt').read_bytes(), compressed_summary)
             def source_lines(path):
                 result, current = {}, None
                 for line in path.read_text().splitlines():
@@ -106,7 +194,7 @@ class CoverageTests(unittest.TestCase):
                 subprocess.run(['git', *argv], cwd=source, check=True, capture_output=True)
             facts = native.platform_facts('linux')
             recipe = dict(kind='test-archive', command=['cargo', 'nextest', 'archive', '--locked', '--offline', '--lib', '--tests', '--target-dir', '{target}', '--cargo-message-format', 'json', '--archive-file', '{archive}'], companions=[])
-            request = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True)
+            request = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True, compressed=True)
             record = archives.produce([request], source, root / 'build', root / 'published')[0]
             (root / 'requests.json').write_text(json.dumps({'changed-0': request, 'callback': request}))
             self.assertEqual(archives.source_commit(source), request['identity']['source']['commit'])
@@ -164,7 +252,26 @@ pub fn uncalled() -> u8 {
                 subprocess.run(['git', *argv], cwd=source, check=True, capture_output=True)
             facts = native.platform_facts('linux')
             recipe = dict(kind='test-archive', command=['cargo', 'nextest', 'archive', '--locked', '--offline', '--lib', '--target', facts['platform']['target'], '--target-dir', '{target}', '--cargo-message-format', 'json', '--archive-file', '{archive}'], companions=[])
-            requests = [archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=mode) for mode in (False, True)]
+            requests = [archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=mode, compressed=mode) for mode in (False, True)]
+            self.assertNotIn('compression', requests[0]['recipe'])
+            self.assertIn('compression', requests[1]['recipe'])
+            uncompressed = archives.capture_request(source, facts['platform'], recipe, config_sha256='0'*64, instrumented=True)
+            self.assertNotEqual(archives.identity.build_key(uncompressed['identity']), archives.identity.build_key(requests[1]['identity']))
+            for field in requests[1]['recipe']['compression']:
+                changed = copy.deepcopy(requests[1])
+                value = changed['recipe']['compression'][field]
+                changed['recipe']['compression'][field] = value + 1 if isinstance(value, int) else value + '-changed'
+                changed['identity']['build']['recipe_sha256'] = archives.recipe_digest(changed['recipe'])
+                self.assertNotEqual(archives.identity.build_key(changed['identity']), archives.identity.build_key(requests[1]['identity']))
+                if field != 'version':
+                    with self.assertRaises(ValueError):
+                        archives.validate_request(changed)
+            wrong = copy.deepcopy(requests[0])
+            wrong['recipe']['compression'] = requests[1]['recipe']['compression']
+            wrong['identity']['build']['recipe_sha256'] = archives.recipe_digest(wrong['recipe'])
+            with self.assertRaisesRegex(ValueError, 'instrumented Linux'):
+                archives.validate_request(wrong)
+
             self.assertNotEqual(archives.identity.build_key(requests[0]['identity']), archives.identity.build_key(requests[1]['identity']))
             self.assertEqual(archives.identity.producer_group_key(requests[0]['identity']), archives.identity.producer_group_key(requests[1]['identity']))
             records = archives.produce(requests, source, root / 'shared-target', root / 'published')

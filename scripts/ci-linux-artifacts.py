@@ -124,7 +124,7 @@ def produce(source, root, event, base, *, reuse=True):
     facts = native.platform_facts('linux')
     demand = recipes(facts['platform']['target'], event, plan, callback_changed=changed, full_proof=proof)
     requests = {name: archives.capture_request(source, facts['platform'], recipe,
-                 config_sha256=native.config_digest(source), native_tools=facts['native_tools'], instrumented=instrumented)
+                 config_sha256=native.config_digest(source), native_tools=facts['native_tools'], instrumented=instrumented, compressed=instrumented)
                 for name, (recipe, instrumented) in demand.items()}
     (root / 'requests.json').write_text(json.dumps(requests, indent=2) + '\n')
     if reuse:
@@ -170,7 +170,7 @@ def compiler_gates(requests, source, target, root):
             if binary not in manifest['runtime']['tests']:
                 continue
             with tempfile.TemporaryDirectory(prefix='compiler-gate-', dir=root) as tmp:
-                item = archives.prepare(bundle, request, source, Path(tmp) / 'archive')
+                item = prepare_streamed(bundle, request, source, Path(tmp) / 'archive')
                 diagnostic_target = coverage.target_directory(target, coverage.capture(source, remap=False))
                 env = coverage.build_environment(request['recipe']['coverage'], source, diagnostic_target, remap=False)
                 env.update(INTENTD_ASSERT_BOUND_CALLER='1', INTENTD_TEST_TIMEOUT_MULTIPLIER='3',
@@ -398,7 +398,7 @@ def extract_stream(bundle, manifest, destination, zstd_archive):
             path.chmod(mode)
     archive = bundle / manifest['archive']
     if zstd_archive:
-        with subprocess.Popen(['zstd', '-dq', '-c', str(archive)], stdout=subprocess.PIPE) as process:
+        with subprocess.Popen(['zstd', '-dq', '-M2048MB', '-c', str(archive)], stdout=subprocess.PIPE) as process:
             try:
                 with tarfile.open(fileobj=process.stdout, mode='r|', bufsize=1024 * 1024) as tar:
                     extract(tar)
@@ -438,6 +438,7 @@ def prepare_streamed(bundle, request, source, destination, *, env=None):
     if set(request['recipe']['companions']) - runtime['companions'].keys():
         raise ValueError('archive missing required companions')
     return {'source': str(source), 'target': str(destination / 'target'),
+            'report_metadata': manifest['files'].get('target/nextest/binaries-metadata.json'),
             'producer_group': archives.identity.producer_group_key(manifest['identity']),
             'runtime': runtime, 'extract_seconds': time.monotonic() - started,
             'expansion_validation_seconds': validation_seconds}

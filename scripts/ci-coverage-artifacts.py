@@ -2,14 +2,114 @@
 """LLVM archive build identity and isolated, compile-free coverage reporting."""
 import json
 import hashlib
+import io
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import time
+
+
+REPORT_VERSION = 'cargo-llvm-cov 0.9.0'
+DECODER_MEMORY_MIB = 2048
+
+
+def compression_recipe():
+    return {'codec': 'zstd', 'version': output(['zstd', '--version'], None),
+            'level': 3, 'window_log': 30, 'threads': 4,
+            'decoder_memory_mib': DECODER_MEMORY_MIB}
+
+
+def validate_compression(recipe):
+    expected = {'codec': 'zstd', 'level': 3, 'window_log': 30, 'threads': 4,
+                'decoder_memory_mib': DECODER_MEMORY_MIB}
+    if set(recipe) != set(expected) | {'version'} or any(recipe.get(k) != v for k, v in expected.items()):
+        raise ValueError('unsupported coverage transport compression')
+    if not isinstance(recipe['version'], str) or not recipe['version'].strip():
+        raise ValueError('missing compression tool version')
+
+
+def compress_archive(archive, recipe):
+    """Repack one validated Linux variant before its immediate publication.
+
+    Long windows are transport-only: nextest and llvm-cov cannot decode them.
+    Keep the original until both processes succeed; never materialize raw tar.
+    """
+    validate_compression(recipe)
+    if output(['zstd', '--version'], None) != recipe['version']:
+        raise ValueError('compression tool version differs from recipe')
+    temporary = archive.with_name('transport.tmp')
+    started = time.monotonic()
+    original_bytes = archive.stat().st_size
+    try:
+        with subprocess.Popen(['zstd', '-dq', '-M2048MB', '-c', str(archive)], stdout=subprocess.PIPE) as decoder:
+            try:
+                with temporary.open('xb') as stream:
+                    subprocess.run(['zstd', '-q', '-3', '--long=30', '-T4', '-c'],
+                                   stdin=decoder.stdout, stdout=stream, check=True)
+                decoder.stdout.close()
+                if decoder.wait():
+                    raise ValueError('source archive decompression failed')
+            finally:
+                if decoder.poll() is None:
+                    decoder.kill()
+                decoder.wait()
+        temporary.replace(archive)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {'compression_seconds': time.monotonic() - started,
+            'before_compression_bytes': original_bytes}
+
+
+def report_index(prepared, request):
+    """Give pinned llvm-cov its exact authenticated metadata in a small frame.
+
+    Version 0.9.0 reads only base-output-directories from this archive, then
+    scans the restored objects (including workspace procedural macros).
+    Do not generalize this contract to another report version without proof.
+    """
+    if request['recipe']['coverage']['tools']['cargo-llvm-cov'] != REPORT_VERSION:
+        raise ValueError('unsupported metadata-index report version')
+    target = Path(prepared['target']).resolve()
+    metadata = target / 'nextest/binaries-metadata.json'
+    expected = prepared.get('report_metadata')
+    if not metadata.is_file() or metadata.is_symlink() or not metadata.resolve().is_relative_to(target) or not expected:
+        raise ValueError('missing or unowned report metadata')
+    data = metadata.read_bytes()
+    if len(data) != expected['size'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+        raise ValueError('report metadata size/digest mismatch')
+    try:
+        directories = json.loads(data)['rust-build-meta']['base-output-directories']
+    except (ValueError, KeyError, TypeError) as error:
+        raise ValueError('invalid report output metadata') from error
+    if not isinstance(directories, list) or len(directories) != 1 or not isinstance(directories[0], str):
+        raise ValueError('unsupported report output directories')
+    relative = PurePosixPath(directories[0])
+    destination = target / relative
+    if (not directories[0] or directories[0] == '.' or relative.is_absolute() or
+            '..' in relative.parts or '\\' in directories[0] or ':' in directories[0] or
+            not destination.resolve().is_relative_to(target) or not destination.is_dir()):
+        raise ValueError('report output directory escapes or is missing from extraction')
+    index = target.parent / 'report-index.tar.zst'
+    with index.open('wb') as stream:
+        with subprocess.Popen(['zstd', '-q', '-3', '--zstd=wlog=23', '-c'], stdin=subprocess.PIPE, stdout=stream) as encoder:
+            try:
+                with tarfile.open(fileobj=encoder.stdin, mode='w|') as tar:
+                    member = tarfile.TarInfo('target/nextest/binaries-metadata.json')
+                    member.size = len(data)
+                    member.mode = 0o644
+                    tar.addfile(member, io.BytesIO(data))
+                encoder.stdin.close()
+                if encoder.wait():
+                    raise ValueError('report index compression failed')
+            finally:
+                if encoder.poll() is None:
+                    encoder.kill()
+                encoder.wait()
+    return index
 
 
 def output(argv, source, env=None):
@@ -149,9 +249,10 @@ def report(bundle, prepared, request, floor, *, lcov=True):
     if tool_versions(source, env) != request['recipe']['coverage']['tools']:
         raise ValueError('report LLVM tools differ from instrumented archive')
     env['CARGO_LLVM_COV_TARGET_DIR'] = str(root)
-    command = [shutil.which('cargo-llvm-cov'), 'llvm-cov', 'report', '--remap-path-prefix',
-               '--nextest-archive-file', str(Path(bundle) / 'tests.tar.zst')]
     started = time.monotonic()
+    archive = report_index(prepared, request) if 'compression' in request['recipe'] else Path(bundle) / 'tests.tar.zst'
+    command = [shutil.which('cargo-llvm-cov'), 'llvm-cov', 'report', '--remap-path-prefix',
+               '--nextest-archive-file', str(archive)]
     if lcov:
         subprocess.run([*command, '--lcov', '--output-path', str(source / 'lcov.info')], cwd=source, env=env, check=True)
     result = subprocess.run([*command, '--summary-only', '--fail-under-lines', str(floor)],

@@ -117,7 +117,7 @@ def validate_request(request):
     identity.fields(request, "identity recipe", "request")
     identity.validate(request["identity"])
     recipe, build = request["recipe"], request["identity"]["build"]
-    identity.fields(recipe, "kind command companions" + (" coverage" if "coverage" in recipe else ""), "recipe")
+    identity.fields(recipe, "kind command companions" + (" coverage" if "coverage" in recipe else "") + (" compression" if "compression" in recipe else ""), "recipe")
     identity.string_list(recipe["command"], "recipe.command")
     identity.string_list(recipe["companions"], "recipe.companions")
     if build["commands"] != [recipe["command"]] or build["kind"] != recipe["kind"] or build["recipe_sha256"] != recipe_digest(recipe):
@@ -128,6 +128,12 @@ def validate_request(request):
     if "{target}" not in recipe["command"] or (recipe["kind"] == "test-archive" and "{archive}" not in recipe["command"]):
         raise ValueError("recipe must use logical target/archive placeholders")
     coverage = recipe.get("coverage")
+    if "compression" in recipe:
+        if coverage is None or request["identity"]["platform"]["os"] != "linux" or recipe["kind"] != "test-archive":
+            raise ValueError("compressed transport requires instrumented Linux test archive")
+        coverage_module().validate_compression(recipe["compression"])
+        if coverage["tools"]["cargo-llvm-cov"] != coverage_module().REPORT_VERSION:
+            raise ValueError("unsupported compressed report version")
     if coverage is not None:
         identity.fields(coverage, "environment tools", "recipe.coverage")
         identity.string_map(coverage["environment"], ("CARGO_LLVM_COV", "LLVM_PROFILE_FILE"), "recipe.coverage.environment")
@@ -144,11 +150,13 @@ def coverage_module():
     return module
 
 
-def capture_request(source, platform, recipe, *, config_sha256, native_tools=None, instrumented=False):
+def capture_request(source, platform, recipe, *, config_sha256, native_tools=None, instrumented=False, compressed=False):
     source = Path(source).resolve()
     commit = source_commit(source)
     if instrumented:
         recipe = dict(recipe, coverage=coverage_module().capture(source))
+    if compressed:
+        recipe = dict(recipe, compression=coverage_module().compression_recipe())
     command = recipe["command"]
     graph = output(["cargo", "tree", *graph_args(command), "--prefix", "none", "-e", "normal,build,dev", "-f", "{p} features=[{f}]"], source).replace(str(source), "{workspace}")
     files = output(["git", "ls-files"], source).splitlines()
@@ -440,9 +448,10 @@ def produce(requests, source, target, published):
                 report_archive = {"name": extra.name, "sha256": file_sha(extra), "bytes": extra.stat().st_size}
             files = inventory_files(extraction)
             shutil.rmtree(extraction)
+            compression_timings = coverage_module().compress_archive(archive, recipe["compression"]) if "compression" in recipe else {}
             manifest = {"schema": 1, "key": key, "identity": expected, "recipe": recipe,
                 "archive": archive.name, "archive_sha256": file_sha(archive), "archive_bytes": archive.stat().st_size,
-                "files": files, "runtime": runtime, "timings": {"build_command_seconds": built-started, "compile_seconds": compile_seconds, "archive_seconds": archive_seconds, "validation_and_staging_seconds": time.monotonic()-built}}
+                "files": files, "runtime": runtime, "timings": {"build_command_seconds": built-started, "compile_seconds": compile_seconds, "archive_seconds": archive_seconds, "validation_and_staging_seconds": time.monotonic()-built-compression_timings.get("compression_seconds", 0), **compression_timings}}
             if report_archive is not None:
                 manifest["report_archive"] = report_archive
             (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True)+"\n")
