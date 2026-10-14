@@ -20,6 +20,17 @@ class StorageTests(unittest.TestCase):
                               GITHUB_RUN_ID='42', GITHUB_RUN_ATTEMPT='1', GITHUB_JOB='coverage-all', RUNNER_NAME='slot')
         self.env.start(); self.addCleanup(self.env.stop)
 
+    def test_existing_disk_preflight_remains_reachable_before_storage_selection(self):
+        import yaml
+        root = Path(__file__).resolve().parents[1]
+        for filename, names in [('ci.yml', ['check', 'coverage-e2e', 'coverage-all', 'coverage-changed']),
+                                ('native-artifacts.yml', ['native'])]:
+            workflow = yaml.safe_load((root / '.github/workflows' / filename).read_text())
+            for name in names:
+                steps = [step.get('name') for step in workflow['jobs'][name]['steps']]
+                self.assertLess(steps.index('Disk-space preflight (tinybox only)'),
+                                steps.index('Initialize fresh artifact storage'), name)
+
     def test_temp_preferred_and_cleanup_preserves_neighbours(self):
         neighbour = self.root / 'other-run'; neighbour.mkdir()
         with patch.object(storage, 'alternate') as alt:

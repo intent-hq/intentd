@@ -373,14 +373,6 @@ jobs:
       # verified downloads together. Exact no-op on burst
       # runners (step skipped). tinybox-prune.yml does the routine
       # scheduled pruning; this is only the emergency backstop.
-      - name: Initialize fresh artifact storage
-        shell: bash
-        env:
-          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
-        run: |
-          args=(--minimum-gib 60)
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
-          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -444,6 +436,14 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          args=(--minimum-gib 60)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       # openssl-sys needs the OpenSSL headers; ubuntu-latest images preinstall
       # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
       # relies on the runner user's passwordless sudo. Co-tenant jobs on the
@@ -934,14 +934,6 @@ jobs:
       # rationale (monorepo#1253). Keep the existing cache preflight below.
       # Only the small index is needed initially; fetch selects storage using
       # its authenticated exact expansion/profile budget before large transfer.
-      - name: Initialize fresh artifact storage
-        shell: bash
-        env:
-          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
-        run: |
-          args=(--minimum-gib 1)
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
-          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -978,6 +970,14 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          args=(--minimum-gib 1)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install OpenSSL headers and archive tools if missing
         run: |
@@ -1151,14 +1151,6 @@ jobs:
       # rationale (monorepo#1253). Keep the existing cache preflight below.
       # Only the small index is needed initially; fetch selects storage using
       # its authenticated exact expansion/profile budget before large transfer.
-      - name: Initialize fresh artifact storage
-        shell: bash
-        env:
-          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
-        run: |
-          args=(--minimum-gib 1)
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
-          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: needs.route.outputs.linux_burst != 'true'
         env:
@@ -1195,6 +1187,14 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          args=(--minimum-gib 1)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install OpenSSL headers and archive tools if missing
         run: |
@@ -1429,14 +1429,6 @@ jobs:
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). Allow room for the publication, fresh
       # extraction and isolated profiles, as in coverage-e2e.
-      - name: Initialize fresh artifact storage
-        shell: bash
-        env:
-          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
-        run: |
-          args=(--minimum-gib 1)
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
-          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
         env:
@@ -1473,6 +1465,14 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ needs.route.outputs.linux_burst != 'true' }}
+        run: |
+          args=(--minimum-gib 1)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       # See the `check` job's comment: tinybox lacks the OpenSSL headers.
       - name: Install OpenSSL headers and archive tools if missing
         if: steps.select.outputs.has_selection == 'true'

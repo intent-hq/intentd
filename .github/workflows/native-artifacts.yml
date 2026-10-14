@@ -66,14 +66,6 @@ jobs:
           arch: x64
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
-      - name: Initialize fresh artifact storage
-        shell: bash
-        env:
-          ARTIFACTS_ON_RAID: ${{ runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') }}
-        run: |
-          args=(--minimum-gib 1)
-          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
-          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Disk-space preflight (tinybox only)
         if: runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted')
         env:
@@ -110,6 +102,14 @@ jobs:
             echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
             exit 1
           fi
+      - name: Initialize fresh artifact storage
+        shell: bash
+        env:
+          ARTIFACTS_ON_RAID: ${{ runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted') }}
+        run: |
+          args=(--minimum-gib 1)
+          if [[ "$ARTIFACTS_ON_RAID" == true ]]; then args+=(--allow-alternate); fi
+          python3 -I -B scripts/ci-artifact-storage.py init "${args[@]}"
       - name: Point lifecycle target outside checkout (Linux)
         if: runner.os == 'Linux' && contains(fromJSON(inputs.runner_labels), 'self-hosted')
         shell: bash
