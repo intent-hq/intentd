@@ -1962,6 +1962,57 @@ struct BudgetHosts {
     started: AtomicUsize,
     returned: AtomicUsize,
     admission: Mutex<Option<(Boundary, &'static str)>>,
+    diagnostic_stages: Mutex<Vec<BudgetAdmissionStage>>,
+}
+
+// Temporary diagnostic: retain both TCP paths for the request owner's final trace.
+#[derive(serde::Serialize)]
+struct BudgetAdmissionStage {
+    path: &'static str,
+    stage: &'static str,
+    records: usize,
+    elapsed_ms: u128,
+}
+
+struct BudgetAdmissionTrace<'a> {
+    hosts: &'a BudgetHosts,
+    path: &'static str,
+    records: usize,
+    started: std::time::Instant,
+}
+
+impl<'a> BudgetAdmissionTrace<'a> {
+    fn start(
+        control: &'a NativeControl,
+        boundary: &McpPrivateBoundary,
+        path: &'static str,
+        records: usize,
+    ) -> Option<Self> {
+        if boundary.kind() != Boundary::TcpResponse {
+            return None;
+        }
+        let trace = Self {
+            hosts: control.budget_hosts.as_deref()?,
+            path,
+            records,
+            started: std::time::Instant::now(),
+        };
+        trace.record("retain-start");
+        Some(trace)
+    }
+
+    fn record(&self, stage: &'static str) {
+        self.hosts
+            .diagnostic_stages
+            .lock()
+            .unwrap()
+            .push(BudgetAdmissionStage {
+                path: self.path,
+                stage,
+                records: self.records,
+                elapsed_ms: self.started.elapsed().as_millis(),
+            });
+    }
 }
 
 struct BudgetHostScope {
@@ -2016,6 +2067,16 @@ impl Drop for BudgetRequestTrace<'_> {
         let events = self.control.events.lock().unwrap();
         let tail = &events[events.len().saturating_sub(6)..];
         eprintln!("budget-request end subcase={} iterations={} elapsed_ms={} returned={} unwinding={} host_scopes_started={} host_scopes_returned={} boundary_count={} last_boundaries={tail:?} last_admission={:?}", self.subcase, self.count, self.started.elapsed().as_millis(), self.returned, std::thread::panicking(), hosts.started.load(Ordering::SeqCst), hosts.returned.load(Ordering::SeqCst), events.len(), *hosts.admission.lock().unwrap());
+        eprintln!(
+            "budget-admission-trace {}",
+            json!({
+                "subcase": self.subcase,
+                "iterations": self.count,
+                "returned": self.returned,
+                "unwinding": std::thread::panicking(),
+                "stages": &*hosts.diagnostic_stages.lock().unwrap(),
+            })
+        );
     }
 }
 
@@ -2131,9 +2192,18 @@ impl McpPrivatePolicy for NativePolicy {
                 .lock()
                 .unwrap()
                 .push((boundary.kind(), sealed.records().len()));
+            let diagnostic = BudgetAdmissionTrace::start(
+                &self.control,
+                boundary,
+                "admit_optional",
+                sealed.records().len(),
+            );
             let retained =
                 crate::repository_read_source::tests::retain_and_check_records(sealed.records())
                     .await;
+            if let Some(trace) = &diagnostic {
+                trace.record("retain-complete");
+            }
             *self.control.records.lock().unwrap() = retained;
             let hold = {
                 let mut held = self.control.hold.lock().unwrap();
@@ -2151,10 +2221,16 @@ impl McpPrivatePolicy for NativePolicy {
             }
             // Delegate the same successful seal, optional evidence, boundary,
             // one-use packet and resulting receipt. No fixture authority.
+            if let Some(trace) = &diagnostic {
+                trace.record("original-start");
+            }
             let actual = self
                 .original
                 .admit_optional(boundary, sealed, evidence, packet)
                 .await;
+            if let Some(trace) = &diagnostic {
+                trace.record("original-complete");
+            }
             if let Some(observed) = &self.control.budget_hosts {
                 let result = match &actual {
                     McpPrivateAdmission::Transferred(_) => "transferred",
@@ -2189,29 +2265,17 @@ impl McpPrivatePolicy for NativePolicy {
         packet: PreparedMcpTransfer<'a>,
     ) -> BoxFuture<'a, McpPrivateAdmission> {
         Box::pin(async move {
-            // Temporary diagnostic: passive timings only for acquisition-budget controls.
-            let diagnostic_start = (self.control.budget_hosts.is_some()
-                && boundary.kind() == Boundary::TcpResponse)
-                .then(std::time::Instant::now);
-            if diagnostic_start.is_some() {
-                eprintln!(
-                    "budget-admission stage=retain-start records={}",
-                    records.len()
-                );
-            }
             self.control
                 .events
                 .lock()
                 .unwrap()
                 .push((boundary.kind(), records.len()));
+            let diagnostic =
+                BudgetAdmissionTrace::start(&self.control, boundary, "admit", records.len());
             let retained =
                 crate::repository_read_source::tests::retain_and_check_records(records).await;
-            if let Some(started) = diagnostic_start {
-                eprintln!(
-                    "budget-admission stage=retain-complete records={} elapsed_ms={}",
-                    records.len(),
-                    started.elapsed().as_millis()
-                );
+            if let Some(trace) = &diagnostic {
+                trace.record("retain-complete");
             }
             let foreign = self.control.foreign.lock().unwrap().clone();
             if !foreign.is_empty() {
@@ -2235,20 +2299,12 @@ impl McpPrivatePolicy for NativePolicy {
             if let Some((_, false, gate)) = &hold {
                 gate.wait().await;
             }
-            if let Some(started) = diagnostic_start {
-                eprintln!(
-                    "budget-admission stage=original-start records={} elapsed_ms={}",
-                    records.len(),
-                    started.elapsed().as_millis()
-                );
+            if let Some(trace) = &diagnostic {
+                trace.record("original-start");
             }
             let actual = self.original.admit(boundary, records, packet).await;
-            if let Some(started) = diagnostic_start {
-                eprintln!(
-                    "budget-admission stage=original-complete records={} elapsed_ms={}",
-                    records.len(),
-                    started.elapsed().as_millis()
-                );
+            if let Some(trace) = &diagnostic {
+                trace.record("original-complete");
             }
             if let Some(observed) = &self.control.budget_hosts {
                 let result = match &actual {
