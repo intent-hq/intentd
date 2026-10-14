@@ -251,9 +251,10 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 In **Home → Workspaces**, open **View options → Group by** in either list or board
 view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
-groups. In list view, **Status** shows detailed workspace status: **Failed**,
-**Blocked**, **Needs attention**, **Not started**, **In progress**, **Idle**,
-**Complete**, **PR open**, **PR Mergeable**, **PR Queued**, and **PR merged**.
+groups. In list view, **Status** groups workspace statuses in this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR Mergeable**, **PR Queued**, **PR merged**, then
+**Done & idle** (idle or complete).
 **Repository** groups by repository; **None** removes grouping.
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
