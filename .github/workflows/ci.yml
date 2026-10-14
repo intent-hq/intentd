@@ -1255,7 +1255,8 @@ jobs:
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    # Include LLVM report generation after the full suite on shared runners.
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0

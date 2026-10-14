@@ -190,6 +190,9 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn("has_selection=" + expected, output)
                 self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
 
+    def test_full_coverage_budget_includes_report_generation(self):
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
