@@ -2189,6 +2189,16 @@ impl McpPrivatePolicy for NativePolicy {
         packet: PreparedMcpTransfer<'a>,
     ) -> BoxFuture<'a, McpPrivateAdmission> {
         Box::pin(async move {
+            // Temporary diagnostic: passive timings only for acquisition-budget controls.
+            let diagnostic_start = (self.control.budget_hosts.is_some()
+                && boundary.kind() == Boundary::TcpResponse)
+                .then(std::time::Instant::now);
+            if diagnostic_start.is_some() {
+                eprintln!(
+                    "budget-admission stage=retain-start records={}",
+                    records.len()
+                );
+            }
             self.control
                 .events
                 .lock()
@@ -2196,6 +2206,13 @@ impl McpPrivatePolicy for NativePolicy {
                 .push((boundary.kind(), records.len()));
             let retained =
                 crate::repository_read_source::tests::retain_and_check_records(records).await;
+            if let Some(started) = diagnostic_start {
+                eprintln!(
+                    "budget-admission stage=retain-complete records={} elapsed_ms={}",
+                    records.len(),
+                    started.elapsed().as_millis()
+                );
+            }
             let foreign = self.control.foreign.lock().unwrap().clone();
             if !foreign.is_empty() {
                 crate::repository_read_source::tests::refuse_foreign_record_set(
@@ -2218,7 +2235,21 @@ impl McpPrivatePolicy for NativePolicy {
             if let Some((_, false, gate)) = &hold {
                 gate.wait().await;
             }
+            if let Some(started) = diagnostic_start {
+                eprintln!(
+                    "budget-admission stage=original-start records={} elapsed_ms={}",
+                    records.len(),
+                    started.elapsed().as_millis()
+                );
+            }
             let actual = self.original.admit(boundary, records, packet).await;
+            if let Some(started) = diagnostic_start {
+                eprintln!(
+                    "budget-admission stage=original-complete records={} elapsed_ms={}",
+                    records.len(),
+                    started.elapsed().as_millis()
+                );
+            }
             if let Some(observed) = &self.control.budget_hosts {
                 let result = match &actual {
                     McpPrivateAdmission::Transferred(_) => "transferred",
