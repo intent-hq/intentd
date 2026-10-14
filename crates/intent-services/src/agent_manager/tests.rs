@@ -16476,9 +16476,33 @@ async fn pre_output_transport_failure_redrives_silently_once() {
 /// not re-emit).
 #[tokio::test]
 async fn auth_required_prompt_failure_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": 401, "message": "Unauthorized"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn claude_expired_oauth_prompt_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": -32603,
+        "message": "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "data": {"errorKind": "authentication_failed"},
+    }))
+    .await;
+}
+
+async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json::Value) {
+    struct ClearMockAuth;
+    impl Drop for ClearMockAuth {
+        fn drop(&mut self) {
+            crate::provider_auth::seed_auth_verdict_for_tests("mock", None);
+        }
+    }
+    let _cleanup = ClearMockAuth;
     let script = mock_agent_script();
     let behavior = json!({
-        "promptRpcError": { "code": 401, "message": "Unauthorized" },
+        "promptRpcError": rpc_error,
         "response": "unreached",
     })
     .to_string();
