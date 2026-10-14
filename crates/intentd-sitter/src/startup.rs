@@ -60,24 +60,32 @@ fn start(args: &SitterArgs, paths: &SitterPaths) -> std::io::Result<()> {
 
     let mut budget = readiness::StartupBudget::new(readiness::timeout_from_env());
     std::fs::create_dir_all(&paths.sitter_dir)?;
-    let _lock = lock_start(paths, &mut budget)?;
-    if probe(paths, &mut budget)? {
+    let lock = lock_start(paths, &mut budget)?;
+    let existing_supervisor = lock.owner.or_else(|| start_owner(paths));
+    ensure_start_owner(paths, existing_supervisor)?;
+    let ready = probe(paths, &mut budget)?;
+    ensure_start_owner(paths, existing_supervisor)?;
+    if ready {
         println!("intentd is already running; launch options apply on the next start");
         return Ok(());
     }
     // An existing serve may still be booting or restarting. Never stop it and
     // never launch a second supervisor merely because readiness is delayed.
-    let existing_supervisor = supervisor::read_live_pid(&paths.pid_path);
+    if lock.contended && existing_supervisor.is_none() && !budget.has_started() {
+        return Err(io::Error::other(
+            "contended startup owner did not remain live",
+        ));
+    }
     if existing_supervisor.is_some() || budget.has_started() {
         loop {
-            if probe(paths, &mut budget)? {
+            ensure_start_owner(paths, existing_supervisor)?;
+            let ready = probe(paths, &mut budget)?;
+            ensure_start_owner(paths, existing_supervisor)?;
+            if ready {
                 println!("intentd is running");
                 return Ok(());
             }
-            if Instant::now() >= budget.deadline
-                || (existing_supervisor.is_some()
-                    && supervisor::read_live_pid(&paths.pid_path) != existing_supervisor)
-            {
+            if Instant::now() >= budget.deadline {
                 return Err(io::Error::other("existing supervisor did not become ready"));
             }
             pause(budget.deadline);
@@ -166,21 +174,46 @@ fn wait_for_start_lock<T>(
     }
 }
 
+/// Keep contention history with the lock through the caller's readiness decision.
+pub(crate) struct StartLock<T> {
+    _guard: T,
+    owner: Option<i32>,
+    contended: bool,
+}
+
+fn start_owner(paths: &SitterPaths) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        crate::supervisor::read_live_pid(&paths.pid_path).map(nix::unistd::Pid::as_raw)
+    }
+    #[cfg(windows)]
+    {
+        crate::supervisor::read_live_pid(&paths.pid_path)
+            .as_ref()
+            .map(crate::supervisor::WindowsPid::as_raw)
+    }
+}
+
+fn ensure_start_owner(paths: &SitterPaths, owner: Option<i32>) -> std::io::Result<()> {
+    if owner.is_some() && start_owner(paths) != owner {
+        return Err(std::io::Error::other(
+            "startup lock owner exited or changed",
+        ));
+    }
+    Ok(())
+}
+
 fn observe_start_lock_owner(
     paths: &SitterPaths,
     budget: &mut crate::readiness::StartupBudget,
     owner: &mut Option<i32>,
 ) -> std::io::Result<()> {
-    let current = crate::supervisor::read_live_pid(&paths.pid_path).map(|pid| pid.as_raw());
-    if owner.is_some() && current != *owner {
-        return Err(std::io::Error::other(
-            "startup lock owner exited or changed",
-        ));
-    }
-    *owner = owner.or(current);
-    // Ready alone never grants the lock, and starting never grants readiness.
+    ensure_start_owner(paths, *owner)?;
+    *owner = owner.or_else(|| start_owner(paths));
+    // A CLI probe may block while stop releases the owner's lock. Revalidate
+    // after it returns; unavailable must never become permission to relaunch.
     let _ = probe(paths, budget)?;
-    Ok(())
+    ensure_start_owner(paths, *owner)
 }
 
 fn probe(
@@ -283,7 +316,7 @@ fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path)
 fn lock_start(
     paths: &SitterPaths,
     budget: &mut crate::readiness::StartupBudget,
-) -> std::io::Result<nix::fcntl::Flock<std::fs::File>> {
+) -> std::io::Result<StartLock<nix::fcntl::Flock<std::fs::File>>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -293,7 +326,8 @@ fn lock_start(
         .open(paths.sitter_dir.join("start.lock"))?;
     let mut file = Some(file);
     let mut owner = None;
-    wait_for_start_lock(
+    let mut contended = false;
+    let guard = wait_for_start_lock(
         budget,
         || {
             let file_to_lock = file
@@ -311,19 +345,29 @@ fn lock_start(
                 ))),
             }
         },
-        |budget| observe_start_lock_owner(paths, budget, &mut owner),
-    )
+        |budget| {
+            contended = true;
+            observe_start_lock_owner(paths, budget, &mut owner)
+        },
+    )?;
+    ensure_start_owner(paths, owner)?;
+    Ok(StartLock {
+        _guard: guard,
+        owner,
+        contended,
+    })
 }
 
 #[cfg(windows)]
 pub(crate) fn lock_start(
     paths: &SitterPaths,
     budget: &mut crate::readiness::StartupBudget,
-) -> std::io::Result<std::fs::File> {
+) -> std::io::Result<StartLock<std::fs::File>> {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::create_dir_all(&paths.sitter_dir)?;
     let mut owner = None;
-    wait_for_start_lock(
+    let mut contended = false;
+    let guard = wait_for_start_lock(
         budget,
         || match std::fs::OpenOptions::new()
             .create(true)
@@ -336,8 +380,17 @@ pub(crate) fn lock_start(
             Err(error) if error.raw_os_error() == Some(32) => Ok(None),
             Err(error) => Err(error),
         },
-        |budget| observe_start_lock_owner(paths, budget, &mut owner),
-    )
+        |budget| {
+            contended = true;
+            observe_start_lock_owner(paths, budget, &mut owner)
+        },
+    )?;
+    ensure_start_owner(paths, owner)?;
+    Ok(StartLock {
+        _guard: guard,
+        owner,
+        contended,
+    })
 }
 #[cfg(windows)]
 fn detach(command: &mut std::process::Command) {
@@ -376,10 +429,14 @@ fn stop_owned_child(child: &mut std::process::Child, pid_path: &std::path::Path)
 pub fn restart(args: &SitterArgs, paths: &SitterPaths) -> i32 {
     let result = (|| -> std::io::Result<bool> {
         let mut budget = crate::readiness::StartupBudget::new(crate::readiness::timeout_from_env());
-        let _lock = lock_start(paths, &mut budget)?;
+        let lock = lock_start(paths, &mut budget)?;
         let Some(pid) = crate::supervisor::read_live_pid(&paths.pid_path) else {
+            if lock.contended {
+                return Err(std::io::Error::other("contended restart owner exited"));
+            }
             return Ok(false);
         };
+        ensure_start_owner(paths, lock.owner)?;
         let process = crate::windows::Process::open(pid.as_raw().cast_unsigned(), false)?;
         let control = crate::windows::RestartControl::open(
             pid.as_raw().cast_unsigned(),

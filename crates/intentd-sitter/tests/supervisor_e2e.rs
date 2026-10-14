@@ -3870,6 +3870,87 @@ fn live_indexing_deadline_case(detached: bool, terminal: &str) {
 }
 
 #[test]
+fn live_indexing_concurrent_stop_during_first_probe_never_relaunches() {
+    for contended in [true, false] {
+        stop_during_probe_case(contended);
+    }
+}
+
+fn stop_during_probe_case(contended: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let binary = fixture.paths.daemon_binary("0.1.0");
+    let source = fs::read_to_string(&binary).unwrap().replace(
+        "call|status)",
+        r#"call|status)
+    if [ "${BLOCK_START_PROBE:-}" = 1 ]; then
+      touch "$INTENTD_DATA_DIR/probe-parked"
+      # timing-guard: deterministic probe barrier released after real stop
+      while [ ! -f "$INTENTD_DATA_DIR/probe-release" ]; do sleep 0.01; done
+    fi"#,
+    );
+    fs::write(binary, source).unwrap();
+    let base = dead_url();
+    let command = || {
+        let mut command = sitter_command(dir.path(), &base);
+        command
+            .arg("start")
+            .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+            .env(KILL_TIMEOUT_ENV, "100");
+        command
+    };
+    let mut first = spawn_guarded(&mut command());
+    wait_until("owned indexing", Duration::from_secs(5), || {
+        dir.path().join("probes").exists()
+    });
+    if !contended {
+        fs::write(
+            dir.path().join("release-indexing"),
+            "ready before second start",
+        )
+        .unwrap();
+        assert!(first
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    let mut second_command = command();
+    second_command.env("BLOCK_START_PROBE", "1");
+    let mut second = spawn_guarded(&mut second_command);
+    wait_until(
+        "contender first probe barrier",
+        Duration::from_secs(5),
+        || dir.path().join("probe-parked").exists(),
+    );
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    if contended {
+        assert!(!first
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    fs::write(dir.path().join("probe-release"), "resume after stop").unwrap();
+    assert!(!second
+        .wait_with_timeout(Duration::from_secs(7))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        read_or_empty(&daemon_log_path(dir.path()))
+            .lines()
+            .filter(|line| line.starts_with("spawn "))
+            .count(),
+        1,
+        "stop must not be undone by contender"
+    );
+    assert!(!fixture.paths.pid_path.exists());
+}
+
+#[test]
 fn live_indexing_concurrent_start_without_status_is_bounded() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = indexing_fixture(dir.path());
