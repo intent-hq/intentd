@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 135
     env:
       PRODUCT_SHA: 84fe4a8e9325f9f37b86c1ef1636b2f458aa8d98
-      SOURCE_SHA: 19beae7af6558615c82be73e640d43a51a402f86
+      SOURCE_SHA: a339d28cf15de9b86eb4846e274497e75f52651c
       ROOT_SHA: b4686a6c1573d83cf2d24003fbf7d8ce4d96f417
       DIAGNOSTIC_SHA: ${{ github.sha }}
       CARGO_BUILD_JOBS: '1'
