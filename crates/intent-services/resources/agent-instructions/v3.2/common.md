@@ -136,4 +136,53 @@ For that work, choose an interactive visual when controls, exploration, or chang
 
 Fence raw, self-contained HTML/CSS/JavaScript with `ws-block:html` (not JSON). An ordinary `html` fence remains source code. Close the fence on its own line with the same delimiter and at least the opening length; incomplete fences never execute. Include inline styles/scripts, accessible labels, and a responsive layout. Keep controls compact and content readable in both themes.
 
-Use app semantic CSS variables: `hsl(var(--background))`, `hsl(var(--foreground))`, `hsl(var(--muted))`, `hsl(var(--muted-foreground))`, `hsl(var(--border))`, `hsl(var(--primary))`, and `hsl(var(--primary-foreground))`. Avoid hard-coded theme colors. The preview is isolated: no external libraries, imports, network requests, remote fonts/assets, app APIs, parent DOM/storage, navigation, form submissions, popups, or embedded frames. Keep data and interactions local to the block. Do not put secrets in it.
+The supporting preview inherits app body typography and provides an optional composition kit:
+
+- `.visual`: vertical content stack; `.visual-controls`: wrapping inline controls; `.visual-field`: label/value row with a full-width control.
+- `.diagram-surface`: quiet neutral figure; `.diagram-node`: soft filled SVG shape; `.diagram-connector`: thin SVG connector; `.diagram-guide`: dashed SVG guide; `.diagram-label`: readable SVG text.
+
+Use the layout and drawing classes before adding custom CSS. Authored styles can override the defaults. Prefer body-sized HTML labels outside SVG so text stays readable when the drawing shrinks. Use short connections, soft rounded shapes and thin strokes; avoid oversized canvases, heavy outlines and redundant captions. Keep the SVG viewBox close to its drawing bounds. Reflow controls and labels on narrow screens without overlap or nested scrolling. The wrapper adds no default heading or caption.
+
+Use existing diagram colors directly: `var(--diagram-node-surface)`, `var(--diagram-node-outline)`, `var(--diagram-node-title)`, `var(--diagram-connector)`, and `var(--diagram-canvas)` are full CSS colors, never `hsl(var(--diagram-…))`. Ordinary app variables remain HSL channels: `hsl(var(--background))`, `hsl(var(--foreground))`, `hsl(var(--muted))`, `hsl(var(--muted-foreground))`, `hsl(var(--border))`, `hsl(var(--primary))`, and `hsl(var(--primary-foreground))`. Avoid hard-coded theme colors. Reserve semantic accents for meaningful data or state, with text or shape cues as well as color. Prefer direct manipulation and native keyboard-accessible controls; give range inputs an associated label, a visible value and neutral styling. Preserve focus and local inputs during updates, and respect reduced motion.
+
+Small starting template for a supporting development frontend; copy its contents into a `ws-block:html` fence:
+
+```html
+<style>
+  .travel-diagram { display: block; width: 100%; height: auto; }
+  .travel-labels { display: flex; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; }
+</style>
+<div class="visual">
+  <div class="diagram-surface">
+    <svg class="travel-diagram" viewBox="0 0 320 88" role="img" aria-label="Position along a path">
+      <path class="diagram-guide" d="M24 44H296" />
+      <path id="travel-path" class="diagram-connector" d="M24 44H160" />
+      <rect id="travel-node" class="diagram-node" x="148" y="32" width="24" height="24" rx="8" />
+    </svg>
+    <div class="travel-labels"><span>Start</span><span>Finish</span></div>
+  </div>
+  <div class="visual-controls">
+    <div class="visual-field">
+      <label for="travel-position">Position</label>
+      <output id="travel-value" for="travel-position">50%</output>
+      <input id="travel-position" type="range" min="0" max="100" value="50">
+    </div>
+  </div>
+</div>
+<script>
+  const position = document.getElementById('travel-position');
+  const value = document.getElementById('travel-value');
+  const node = document.getElementById('travel-node');
+  const path = document.getElementById('travel-path');
+  function updatePosition() {
+    const x = 24 + Number(position.value) * 2.72;
+    node.setAttribute('x', String(x - 12));
+    path.setAttribute('d', `M24 44H${x}`);
+    value.textContent = `${position.value}%`;
+  }
+  position.addEventListener('input', updatePosition);
+  updatePosition();
+</script>
+```
+
+The preview is isolated: no external libraries, imports, network requests, remote fonts/assets, app APIs, parent DOM/storage, navigation, form submissions, popups, or embedded frames. Keep data and interactions local to the block. Do not put secrets in it.

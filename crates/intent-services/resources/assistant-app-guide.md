@@ -54,7 +54,12 @@ for both themes and cannot use external libraries, network access, app APIs,
 navigation, forms, popups, or embedded frames. **Source** shows the code;
 **Reload** starts the visual again and resets its local inputs.
 
-<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts}; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
+The development preview supplies app typography, compact controls and optional
+drawing styles from the diagrams: neutral surfaces and thin lines that stay thin
+as the drawing resizes. Use HTML labels for readable text in narrow chat columns.
+Authored styles can override the defaults.
+
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
 
 ## Finding things
 
