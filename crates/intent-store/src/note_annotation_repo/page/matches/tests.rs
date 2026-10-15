@@ -26,6 +26,10 @@ async fn fixture(count: i64) -> (tempfile::TempDir, Store, Lease, AnnotationEpoc
     let epochs = store.note_annotation_epochs(&ws, &note).await.unwrap();
     let state = store.read_note_page_state(&ws, &note, None).await.unwrap();
     let lease = Lease {
+        content_generation: store
+            .ready_note_content_generation("ws", "spec")
+            .await
+            .unwrap(),
         scope: serde_json::from_value(state["scope"].clone()).unwrap(),
         principal: "alice".into(),
         source_revision: state["sourceRevision"].as_str().unwrap().into(),

@@ -165,6 +165,15 @@ anything. A dismissed reminder shows **Running** if work is running, otherwise
 
 <!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+
+In **Home → Workspaces**, list rows and board cards show organization/repository
+labels in views that include multiple repositories. When an organization is selected,
+labels show only the repository name. Narrow lists hide the row label; the selected
+workspace's preview header shows its repository. Local repositories show their name
+or path. Long labels truncate; hover to read the full name. Repository-specific
+views identify the repository in the page heading.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
@@ -263,6 +272,53 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Home Workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
+
+In **Home → Workspaces**, open **View options → Group by** in either list or board
+view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
+**Done & idle** groups. The **PR ready** board column appears only when matching
+workspaces remain visible. In list view, **Status** groups workspace statuses in
+this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
+**Done & idle** (waiting, idle, or complete).
+**Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
+
+The grouping choice is remembered with Home's settings for the current signed-in
+user and connected backend. **Activity** remains the default; existing saved
+grouping choices keep their behavior.
+
+## Home workspace status icons
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+
+In **Home → Workspaces**, the status icon in list and board views describes the
+workspace's current status. Hover over it for an explanation:
+
+- **PR Open** (pull request icon): a pull request is open.
+- **PR Mergeable** (pull request icon): a pull request is reported ready to merge.
+- **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Colors follow the current theme: Open and Queued use its informational color;
+Mergeable uses its success color. Use the label and tooltip to identify the state.
+
+Questions, review requests, failures, and blockers can take precedence over PR
+icons. **PR Mergeable** does not grant permission to merge: agents still need the
+user's explicit authorization and must check the current merge requirements.
+
+A muted hourglass indicates waiting on external events, delegated work, or a
+reminder you dismissed for now; it does not mean every agent is waiting. It
+replaces an otherwise idle dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+hourglass, with additional waiting explained in its tooltip. Waiting is also
+included in accessible status text. The waiting indicator is hidden when the main
+status shows active work, unread updates, a question, a review request, a failure,
+or a blocker.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
@@ -288,7 +344,7 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
 In the existing conversation, **Couldn't complete this response** summarizes a
 stopped response. Open **Details** to inspect the technical error, then **Copy
@@ -298,6 +354,10 @@ scheduled. Inspect that message and use its available controls before sending
 another copy. Active work keeps its normal **Thinking** or activity status; do not
 infer a retry from that status alone. Controls depend on the conversation's state
 and your access.
+
+For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
 
 Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
 Expand that label to inspect the saved errors and timestamps and use **Copy

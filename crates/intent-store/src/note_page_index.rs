@@ -6,44 +6,48 @@ use pulldown_cmark::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqliteConnection};
+#[cfg(test)]
+use sqlx::Row;
+use sqlx::SqliteConnection;
 use std::collections::BTreeMap;
 
 pub(crate) const PIECE_BYTES: usize = 4096;
 
-/// Retire derived projections whenever the pinned parser, index implementation,
-/// or recorded canonical schema oracle changes. This is distinct from raw rev.
+/// Index implementation sources hashed into [`profile_revision`]. Tests audit
+/// their external crate references against the fingerprinted dependency roots.
+pub(crate) const INDEX_SOURCES: [&str; 7] = [
+    include_str!("note_page_index.rs"),
+    include_str!("note_page_html.rs"),
+    include_str!("note_page_html/entry.rs"),
+    include_str!("note_page_html/index.rs"),
+    include_str!("note_page_html/markdown.rs"),
+    include_str!("note_page_html/markdown_source.rs"),
+    include_str!("note_page_html/primitive.rs"),
+];
+
+/// Retire derived projections whenever the index implementation, recorded
+/// canonical schema oracle, or an output-relevant dependency changes (see
+/// `build/note_index_dependencies.rs`). This is distinct from raw rev.
 pub(crate) fn profile_revision() -> &'static str {
     static REVISION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let mut digest = Sha256::new();
-        for input in [
-            "canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions",
-            include_str!("note_page_index.rs"),
-            include_str!("note_page_html.rs"),
-            include_str!("note_page_html/entry.rs"),
-            include_str!("note_page_html/index.rs"),
-            include_str!("note_page_html/markdown.rs"),
-            include_str!("note_page_html/markdown_source.rs"),
-            include_str!("note_page_html/primitive.rs"),
+        let marker = ["canonicalNote:1:preserveAnchors:workspace:notePrimitives:mentions"];
+        let oracles_and_dependencies = [
             include_str!("tests/fixtures/note_html_native.json"),
             include_str!("tests/fixtures/note_primitive_native.json"),
-            include_str!(concat!(env!("OUT_DIR"), "/profile-Cargo.lock")),
-        ] {
+            include_str!(concat!(env!("OUT_DIR"), "/note-index-dependencies.txt")),
+        ];
+        for input in marker
+            .iter()
+            .chain(&INDEX_SOURCES)
+            .chain(&oracles_and_dependencies)
+        {
             digest.update(input.as_bytes());
             digest.update([0]);
         }
         format!("{:x}", digest.finalize())
     });
     &REVISION
-}
-
-pub(crate) async fn retire_changed_profiles(conn: &mut SqliteConnection) -> Result<()> {
-    sqlx::query("UPDATE note_page_head SET indexed_rev=-1 WHERE profile_revision<>?")
-        .bind(profile_revision())
-        .execute(conn)
-        .await
-        .map_err(db_error)?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -93,6 +97,11 @@ pub(super) struct Entries {
     serial: usize,
 }
 impl Entries {
+    pub(super) fn push(&mut self, row: (String, usize, Value)) {
+        crate::note_index_budget::charge(row.0.capacity() + 64);
+        crate::note_index_budget::value(&row.2);
+        self.rows.push(row);
+    }
     pub(super) fn id(&mut self) -> String {
         self.serial += 1;
         format!("{:016x}", self.serial)
@@ -102,14 +111,14 @@ impl Entries {
         let collection = format!("f:{id}");
         let parts = pieces(text);
         for (i, part) in parts.iter().enumerate() {
-            self.rows.push((collection.clone(), part.start, json!({"kind":"fragment","id":id,"field":field,"offset":part.start,"text":part.text,"nextRef": parts.get(i+1).map(|p| format!("{collection}@{}",p.start))})));
+            self.push((collection.clone(), part.start, json!({"kind":"fragment","id":id,"field":field,"offset":part.start,"text":part.text,"nextRef": parts.get(i+1).map(|p| format!("{collection}@{}",p.start))})));
         }
         collection
     }
     pub(super) fn context_attributes(&mut self, value: &Value) -> String {
         let entry = self.metadata(value, "a", None, None, None);
         let collection = format!("a:{}:root", entry["id"].as_str().expect("metadata id"));
-        self.rows.push((collection.clone(), 0, entry));
+        self.push((collection.clone(), 0, entry));
         collection
     }
 
@@ -121,6 +130,7 @@ impl Entries {
         key: Option<&str>,
         index: Option<usize>,
     ) -> Value {
+        let _depth = crate::note_index_budget::enter();
         let id = self.id();
         let mut entry = json!({"id":id,"parentId":parent});
         if let Some(key) = key {
@@ -141,7 +151,7 @@ impl Entries {
                 let sorted: BTreeMap<_, _> = map.iter().collect();
                 for (position, (key, value)) in sorted.into_iter().enumerate() {
                     let child = self.metadata(value, namespace, Some(&id), Some(key), None);
-                    self.rows.push((collection.clone(), position, child));
+                    self.push((collection.clone(), position, child));
                 }
             }
             Value::Array(array) => {
@@ -150,7 +160,7 @@ impl Entries {
                 entry["childrenRef"] = json!(collection);
                 for (position, value) in array.iter().enumerate() {
                     let child = self.metadata(value, namespace, Some(&id), None, Some(position));
-                    self.rows.push((collection.clone(), position, child));
+                    self.push((collection.clone(), position, child));
                 }
             }
             Value::String(text) => {
@@ -330,6 +340,7 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
     } else {
         "markdown"
     };
+    crate::note_index_budget::charge((text.len() + 1).saturating_mul(8));
     let mut units = vec![0; text.len() + 1];
     let mut count = 0;
     for (byte, ch) in text.char_indices() {
@@ -341,6 +352,7 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
     let mut descriptors: Vec<(usize, usize, String, Value)> = Vec::new();
     let mut parents: Vec<Parent> = Vec::new();
     for (event, range) in Parser::new_ext(text, Options::all()).into_offset_iter() {
+        crate::note_index_budget::charge(1024);
         if matches!(event, Event::End(_)) {
             if let Some(Parent {
                 index,
@@ -359,7 +371,7 @@ fn context_entries(text: &str, parts: &[Piece], entries: &mut Entries) {
                 fields.insert(0, ("openingSource".into(), opening.into()));
                 for (position, (field, value)) in fields.into_iter().enumerate() {
                     let reference = entries.fragment(&field, &value);
-                    entries.rows.push((details.clone(),position,json!({"kind":"fragment","id":format!("{id}:{position}"),"field":field,"offset":0,"text":"","nextRef":reference})));
+                    entries.push((details.clone(),position,json!({"kind":"fragment","id":format!("{id}:{position}"),"field":field,"offset":0,"text":"","nextRef":reference})));
                 }
                 descriptor["detailRef"] = json!(details);
                 entries
@@ -536,7 +548,7 @@ fn task_entries(text: &str, entries: &mut Entries) -> usize {
         } else {
             item["taskNoteIdRef"] = json!(entries.fragment("taskNoteId", id));
         }
-        entries.rows.push(("t:root".into(), index, item));
+        entries.push(("t:root".into(), index, item));
     }
     seen.len()
 }
@@ -546,9 +558,66 @@ fn db_error(e: sqlx::Error) -> Error {
     Error::Internal(format!("note page index: {e}"))
 }
 
-fn sql_offset(value: usize) -> Result<i64> {
+pub(crate) fn sql_offset(value: usize) -> Result<i64> {
     i64::try_from(value)
         .map_err(|_| Error::Internal("note index exceeds SQLite offset range".into()))
+}
+
+type PreparedEntry = (String, i64, String, Option<i64>, Option<i64>);
+
+pub(crate) struct Prepared {
+    pub pieces: Vec<Piece>,
+    pub entries: Vec<PreparedEntry>,
+    pub artifacts: Vec<(String, String, &'static str)>,
+    pub task_count: i64,
+    pub source_length: i64,
+    pub source_bytes: i64,
+    pub scalar_count: i64,
+    pub lf_count: i64,
+}
+
+/// Database-free conversion, also using the canonical writer's exact parsers.
+pub(crate) fn prepare(note: &Note) -> Result<Prepared> {
+    let mut entries = Entries {
+        rows: Vec::new(),
+        artifact_sources: Vec::new(),
+        serial: 1_usize << 40,
+    };
+    let metadata = json!({"title":note.title,"tags":note.tags,"parentId":note.parent_id,"metadata":note.metadata,"contentType":note.content_type,"isPinned":note.is_pinned,"isArchived":note.is_archived,"isDefault":note.is_default,"visibility":note.visibility,"createdAt":note.created_at,"updatedAt":note.updated_at});
+    let root = entries.metadata(&metadata, "m", None, None, None);
+    entries.push(("m:root".into(), 0, root));
+    let parts = pieces(&note.content);
+    crate::note_index_budget::charge(note.content.len());
+    entries.serial = 0;
+    context_entries(&note.content, &parts, &mut entries);
+    let task_count = task_entries(&note.content, &mut entries);
+    let mut rows = Vec::with_capacity(entries.rows.len());
+    for (collection, position, mut value) in entries.rows {
+        let range = value
+            .as_object_mut()
+            .expect("index object")
+            .remove("_admissionRange")
+            .unwrap_or_else(|| value["sourceRange"].clone());
+        let json = value.to_string();
+        crate::note_index_budget::charge(json.len());
+        rows.push((
+            collection,
+            sql_offset(position)?,
+            json,
+            range["start"].as_i64(),
+            range["end"].as_i64(),
+        ));
+    }
+    Ok(Prepared {
+        pieces: parts,
+        entries: rows,
+        artifacts: entries.artifact_sources,
+        task_count: sql_offset(task_count)?,
+        source_length: sql_offset(note.content.encode_utf16().count())?,
+        source_bytes: sql_offset(note.content.len())?,
+        scalar_count: sql_offset(note.content.chars().count())?,
+        lf_count: sql_offset(note.content.bytes().filter(|b| *b == b'\n').count())?,
+    })
 }
 
 // Keep write-time parser and SQL state from inflating every enclosing legacy
@@ -571,7 +640,7 @@ pub(crate) fn rebuild<'a>(
         entries.serial = 1_usize << 40;
         let metadata = json!({"title":note.title,"tags":note.tags,"parentId":note.parent_id,"metadata":note.metadata,"contentType":note.content_type,"isPinned":note.is_pinned,"isArchived":note.is_archived,"isDefault":note.is_default,"visibility":note.visibility,"createdAt":note.created_at,"updatedAt":note.updated_at});
         let root = entries.metadata(&metadata, "m", None, None, None);
-        entries.rows.push(("m:root".into(), 0, root));
+        entries.push(("m:root".into(), 0, root));
         // Metadata fragments occupy the high serial namespace. The classification
         // column avoids inspecting or hydrating any old JSON during invalidation.
         sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'm:%' OR collection >= 'f:0000010000000000' AND collection < 'g:')")
@@ -590,6 +659,7 @@ pub(crate) fn rebuild<'a>(
             sqlx::query("DELETE FROM note_page_entry WHERE workspace_id=? AND note_id=? AND (collection LIKE 'c:%' OR collection LIKE 'd:%' OR collection LIKE 't:%' OR collection LIKE 'h:%' OR collection < 'f:0000010000000000')").bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
             let parts = pieces(&note.content);
             for part in &parts {
+                crate::note_index_budget::charge(part.text.len());
                 sqlx::query("INSERT INTO note_page_piece(workspace_id,note_id,start,end,text,byte_start,scalar_start,lf_start,content_generation) VALUES (?,?,?,?,?,?,?,?,?)")
                     .bind(ws)
                     .bind(id)
@@ -645,8 +715,8 @@ pub(crate) fn rebuild<'a>(
     })
 }
 
-/// Used only during open/import/adoption, never from a read RPC. One legacy row
-/// at a time bounds migration memory independently of workspace note count.
+/// Legacy fixture helper. Production repairs only explicitly requested notes.
+#[cfg(test)]
 pub(crate) async fn rebuild_pending(conn: &mut SqliteConnection) -> Result<()> {
     loop {
         let row = sqlx::query("SELECT n.* FROM note n JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE h.indexed_rev = -1 LIMIT 1").fetch_optional(&mut *conn).await.map_err(db_error)?;
@@ -655,6 +725,25 @@ pub(crate) async fn rebuild_pending(conn: &mut SqliteConnection) -> Result<()> {
         };
         let note = crate::note_repo::map_note_row(&row)?;
         rebuild(conn, &note, row.try_get("rev").map_err(db_error)?, true).await?;
+    }
+    Ok(())
+}
+
+/// Canonical writers repair only identities they directly changed.
+pub(crate) async fn rebuild_one(
+    conn: &mut SqliteConnection,
+    workspace: &str,
+    id: &str,
+) -> Result<()> {
+    let row = sqlx::query("SELECT * FROM note WHERE workspace_id=? AND id=?")
+        .bind(workspace)
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    if let Some(row) = row {
+        let note = crate::note_repo::map_note_row(&row)?;
+        rebuild(conn, &note, note.rev, true).await?;
     }
     Ok(())
 }

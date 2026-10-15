@@ -103,15 +103,17 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Note deletion unavailable".into(),
             data: Some(json!({"code":kind.wire_code()})),
         },
-        Error::NotePage(kind) => RpcErr {
-            code: if kind == intent_core::note_page::NotePageError::Stale {
-                -32005
-            } else {
-                -32602
-            },
-            message: "Note page unavailable".into(),
-            data: Some(json!({"code":kind.wire_code()})),
-        },
+        Error::NotePage(kind) => {
+            let mut data = json!({"code":kind.wire_code()});
+            if kind == intent_core::note_page::NotePageError::Preparing {
+                data["retryAfterMs"] = json!(1000);
+            }
+            RpcErr {
+                code: Error::NotePage(kind).code(),
+                message: "Note page unavailable".into(),
+                data: Some(data),
+            }
+        }
         Error::ExecutionAuthorization {
             source,
             authorization,

@@ -229,7 +229,7 @@ struct ReadBoundary {
 static READ_BOUNDARIES: std::sync::Mutex<Vec<(WorkspaceId, std::sync::Arc<ReadBoundary>)>> =
     std::sync::Mutex::new(Vec::new());
 
-pub(super) fn read_outcome(result: &Result<Value>) -> u8 {
+pub(crate) fn read_outcome(result: &Result<Value>) -> u8 {
     match result {
         Ok(_) => 1,
         Err(Error::NotePage(NotePageError::Stale)) => 2,
@@ -237,7 +237,7 @@ pub(super) fn read_outcome(result: &Result<Value>) -> u8 {
     }
 }
 
-pub(super) async fn pause_after_read(workspace: &WorkspaceId, outcome: u8) {
+pub(crate) async fn pause_after_read(workspace: &WorkspaceId, outcome: u8) {
     let boundary = {
         let mut boundaries = READ_BOUNDARIES.lock().unwrap();
         boundaries
@@ -317,6 +317,72 @@ async fn annotation_service_revocation_after_store_result_withholds_success_and_
         assert!(
             matches!(result, Err(Error::NotFound(_))),
             "post-read revocation must override stored success/stale result: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn demand_note_service_revocation_withholds_ready_and_preparing_results() {
+    use intent_core::WorkspaceApi;
+    for pending in [false, true] {
+        let (_tmp, service, workspace, note) = setup("source").await;
+        let caller = guest(&service, &workspace).await;
+        let Caller::Wire { principal_id, .. } = &caller else {
+            panic!("wire fixture")
+        };
+        let boundary = std::sync::Arc::new(ReadBoundary {
+            outcome: std::sync::atomic::AtomicU8::new(0),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let writer = if pending {
+            sqlx::query(
+                "UPDATE note_page_head SET indexed_rev=-1 WHERE workspace_id=? AND note_id=?",
+            )
+            .bind(workspace.as_str())
+            .bind(note.as_str())
+            .execute(service.store.write_pool())
+            .await
+            .unwrap();
+            Some(service.store.write_pool().acquire().await.unwrap())
+        } else {
+            None
+        };
+        READ_BOUNDARIES
+            .lock()
+            .unwrap()
+            .push((workspace.clone(), boundary.clone()));
+        let read = with_caller(
+            caller.clone(),
+            service.get_note_page(
+                workspace.clone(),
+                note.clone(),
+                serde_json::from_value(json!({"kind":"source"})).unwrap(),
+                json!(1),
+            ),
+        );
+        let revoke = async {
+            boundary.reached.notified().await;
+            assert_eq!(
+                boundary.outcome.load(std::sync::atomic::Ordering::SeqCst),
+                if pending { 3 } else { 1 }
+            );
+            drop(writer);
+            service
+                .store
+                .remove_workspace_member(&workspace, principal_id)
+                .await
+                .unwrap();
+            boundary.release.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(read, revoke)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(Error::NotFound(_))),
+            "revoked caller received {result:?}"
         );
     }
 }
