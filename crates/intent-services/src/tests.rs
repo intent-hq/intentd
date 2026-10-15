@@ -1048,8 +1048,8 @@ async fn workspace_list_row_stays_within_row_budget() {
         .as_ref()
         .expect("active row keeps agentSummary");
     assert_eq!(summary.count, 10, "worst case carries ten agents");
-    // The eight-entry pool is capped to the five most recently updated with
-    // the linked PR (the oldest, `pr(0)`) retained and moved to the front.
+    // Keep the draft and both open PRs ahead of terminal PRs. The linked
+    // open PR (the oldest, `pr(0)`) wins only within its lifecycle state.
     assert_eq!(
         row.pull_requests
             .as_ref()
@@ -1057,7 +1057,7 @@ async fn workspace_list_row_stays_within_row_budget() {
             .iter()
             .map(|pr| pr.number)
             .collect::<Vec<_>>(),
-        vec![1_000, 1_007, 1_006, 1_005, 1_004]
+        vec![1_003, 1_000, 1_006, 1_007, 1_004]
     );
     assert_eq!(row.pull_requests_total, Some(8));
     assert!(row.active_pull_request.is_some());
@@ -1369,6 +1369,89 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
             );
         }
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_list_keeps_unfinished_root_prs_ahead_of_merged_active() {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceGitRoot, WorkspaceGitRootId,
+        WorkspaceGitRootSource, WORKSPACE_LIST_PR_CAP,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = WorkspaceId::new();
+    let mut row = workspace(&id);
+    let pr = |n: u64, repo: &str, status| PullRequestInfo {
+        id: n.to_string(),
+        number: n,
+        url: format!("https://github.com/intent-hq/{repo}/pull/{n}"),
+        title: format!("PR {n}"),
+        status,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+        is_in_merge_queue: None,
+    };
+    let merged = pr(7, "intent", PullRequestStatus::Merged);
+    row.active_pull_request = Some(merged.clone());
+    row.pr_url = Some(merged.url);
+    row.pr_number = Some(7);
+    row.pr_status = Some(PullRequestStatus::Merged);
+    row.pull_requests = Some(
+        (1..8)
+            .map(|n| pr(n, "intent", PullRequestStatus::Merged))
+            .collect(),
+    );
+    store.insert_workspace(&row).await.expect("workspace");
+    let mut draft = pr(1, "cloudlands-fe", PullRequestStatus::Open);
+    draft.is_draft = Some(true);
+    let open = pr(2, "cloudlands-fe", PullRequestStatus::Open);
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: id.clone(),
+            path: "/tmp/unfinished-pr-root".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("intent-hq".into()),
+            repo_name: Some("cloudlands-fe".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![draft.clone(), open.clone()]),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("git root");
+
+    let root = tempfile::tempdir().expect("workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    for rows in [
+        svc.list_workspaces(true).await.unwrap(),
+        svc.list_workspaces_lite(true).await.unwrap(),
+    ] {
+        let listed = rows.iter().find(|ws| ws.id == id).unwrap();
+        let pool = listed.pull_requests.as_ref().unwrap();
+        assert_eq!(pool.len(), WORKSPACE_LIST_PR_CAP);
+        assert_eq!(listed.pull_requests_total, Some(9));
+        assert_eq!(pool[0].url, draft.url);
+        assert_eq!(pool[1].url, open.url);
+        assert_eq!(listed.active_pull_request.as_ref().unwrap().number, 7);
+    }
+    let detail = svc.get_workspace(id).await.unwrap();
+    let pool = detail.pull_requests.as_ref().unwrap();
+    assert_eq!(pool.len(), 9);
+    assert_eq!(detail.pull_requests_total, None);
+    assert_eq!(pool.iter().filter(|pr| pr.number == 1).count(), 2);
 }
 
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
