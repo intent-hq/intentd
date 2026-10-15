@@ -4,8 +4,8 @@
 # daemon's dist pipeline (release.yml) never picks it up. Triggered by pushing
 # a `sitter-vX.Y.Z` tag, it:
 #
-# * builds `intentd-sitter` in release mode for the same 5 targets as the
-#   daemon (musl targets cross-built with cargo-zigbuild, mirroring dist)
+# * attempts `intentd-sitter` for the same 5 targets as the
+#   daemon (Intel Mac is optional; the other four targets are required)
 # * renames the binary to `intentd` (`intentd.exe` on Windows) and packages it
 #   as `intentd-<triple>.tar.xz` (unix, nested `intentd-<triple>/` dir like
 #   dist tarballs) / `intentd-<triple>.zip` (Windows, flat like dist zips),
@@ -43,7 +43,7 @@ on:
 
 jobs:
   plan:
-    runs-on: gh-linux-16x
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -86,6 +86,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
+    continue-on-error: ${{ matrix.target == 'x86_64-apple-darwin' }}
     needs: plan
     strategy:
       fail-fast: false
@@ -95,24 +96,24 @@ jobs:
           # self-hosted m1mac went offline and releases queued forever
           # behind it); the x86_64 target is a cross build, smoke-tested
           # under Rosetta 2. Linux musl targets build on the org-hosted
-          # gh-linux-16x runner (cross-built with cargo-zigbuild as before)
+          # depot-ubuntu-24.04-16 runner (cross-built with cargo-zigbuild as before)
           # so the release path never queues behind — or deadlocks on — the
           # self-hosted tinybox fleet.
-          # Windows uses the org-hosted gh-windows-16x runner (16-core/64GB,
+          # Windows uses the org-hosted depot-windows-2022-16 runner (16-core/64GB,
           # Windows Server 2022 image) for faster release builds
           # (intent-hq/monorepo#1803).
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: depot-macos-latest
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: depot-macos-latest
           - target: x86_64-unknown-linux-musl
-            os: gh-linux-16x
+            os: depot-ubuntu-24.04-16
             zigbuild: true
           - target: aarch64-unknown-linux-musl
-            os: gh-linux-16x
+            os: depot-ubuntu-24.04-16
             zigbuild: true
           - target: x86_64-pc-windows-msvc
-            os: gh-windows-16x
+            os: depot-windows-2022-16
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -124,7 +125,7 @@ jobs:
       # Provision the toolchain with bare rustup instead of a toolchain
       # action, mirroring v-release.yml's "Provision Rust toolchain and
       # matrix targets" step (green on the same runner pool). On the
-      # GitHub-hosted gh-linux-16x images the preinstalled Rust collides
+      # GitHub-hosted depot-ubuntu-24.04-16 images the preinstalled Rust collides
       # with the channel sync that rust-toolchain.toml triggers to add its
       # declared rustfmt/clippy components ("failed to install component:
       # 'rustfmt-preview-...', detected conflict: 'bin/cargo-fmt'" —
@@ -151,14 +152,12 @@ jobs:
           pip3 install cargo-zigbuild
           mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      # Main producers use this same release profile, target and runner.
-      # Tags never save archives; cache misses keep the ordinary build path.
-      - name: Restore release compiler cache
-        uses: ./.github/actions/release-rust-cache
-        with:
-          flavor: sitter-release
-          target: ${{ matrix.target }}
-          runner: ${{ matrix.os }}
+      # Main and release builds share Depot managed compiler entries.
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Build (cargo)
         if: ${{ !matrix.zigbuild }}
         shell: bash
@@ -239,7 +238,7 @@ jobs:
     needs:
       - plan
       - build
-    runs-on: gh-linux-16x
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 10
     # Serialize sitter-latest updates so two tags pushed close together cannot
     # interleave and leave the fixed release with mixed assets.
@@ -261,6 +260,8 @@ jobs:
           pattern: sitter-*
           path: artifacts
           merge-multiple: true
+      - name: Validate complete platform archives
+        run: python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Create GitHub Release on the tag
         env:
           RELEASE_COMMIT: ${{ github.sha }}
@@ -279,11 +280,14 @@ jobs:
               --title "intentd sitter $VERSION" \
               --notes "Self-updating supervisor shim for intentd, installed as \`intentd\`. Archives contain the sitter binary renamed to \`intentd\` (\`intentd.exe\` on Windows)."
           fi
+          python3 -I scripts/reconcile-sitter-intel.py "$TAG" artifacts --repo "$GITHUB_REPOSITORY"
           gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
       # Fixed release so install instructions have a stable URL
       # (releases/download/sitter-latest/intentd-<triple>.tar.xz). Asset names
-      # are constant, so --clobber replaces the full set. Prereleases are not
-      # promoted here, mirroring channel-stable semantics.
+      # are constant. Omitted Intel leaves its previous valid archive/checksum
+      # pair intact after downloading and verifying it; invalid remote pairs are
+      # removed before upload. Only this run's successful pairs are replaced.
+      # Prereleases are not promoted here, mirroring channel-stable semantics.
       - name: Refresh sitter-latest release
         if: ${{ needs.plan.outputs.prerelease == 'false' }}
         env:
@@ -304,6 +308,7 @@ jobs:
               fi
             fi
           fi
+          python3 -I scripts/reconcile-sitter-intel.py sitter-latest artifacts --repo "$GITHUB_REPOSITORY" --retain-valid
           gh release upload sitter-latest artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
           # One-line installer scripts, refreshed alongside the archives so
           # `curl … install.sh | sh` / `irm … install.ps1 | iex` URLs stay
@@ -325,7 +330,7 @@ jobs:
       - plan
       - publish
       - deb
-    runs-on: gh-linux-16x
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 10
     outputs:
       enabled: ${{ steps.mirror.outputs.enabled }}
@@ -370,6 +375,7 @@ jobs:
           DEST_REPO: ${{ env.MIRROR_REPO }}
           DEST_GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
           ASSET_REGEX: ${{ env.SITTER_ASSET_REGEX }}
+          PRUNE_STALE: "true"
           RELEASE_TITLE: intentd sitter ${{ needs.plan.outputs.version }}
           RELEASE_NOTES: "Mirror of the ${{ needs.plan.outputs.tag }} intentd sitter release: platform archives, Debian packages, and .sha256 sidecars. Archives contain the sitter binary renamed to `intentd` (`intentd.exe` on Windows)."
         run: |
@@ -408,7 +414,7 @@ jobs:
       - publish
       - mirror
     if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
-    runs-on: gh-linux-16x
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
     # non-fast-forward push.
@@ -427,8 +433,16 @@ jobs:
           pattern: sitter-*
           path: artifacts
           merge-multiple: true
+      - uses: actions/checkout@v7
+        with:
+          repository: intent-hq/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          persist-credentials: true
+          path: tap
+      - name: Validate complete platform archives
+        run: python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Render formula
-        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb
+        run: ./scripts/render-sitter-homebrew-formula.sh "$VERSION" artifacts intentd.rb tap/Formula/intentd.rb
       - name: Style-check rendered formula (advisory)
         run: |
           export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
@@ -445,12 +459,6 @@ jobs:
           cp intentd.rb "$(brew --repository scratch/sitter)/Formula/intentd.rb"
           brew style --formula scratch/sitter/intentd \
             || echo "::warning::brew style reported offenses on intentd.rb (non-blocking)"
-      - uses: actions/checkout@v7
-        with:
-          repository: intent-hq/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          persist-credentials: true
-          path: tap
       - name: Commit and push formula
         run: |
           install -m 0644 intentd.rb tap/Formula/intentd.rb
@@ -473,7 +481,7 @@ jobs:
     needs:
       - plan
       - publish
-    runs-on: gh-linux-16x
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 10
     # Own group (not the publish one): asset names are disjoint from the
     # archives, so deb refreshes only need to serialize against themselves.

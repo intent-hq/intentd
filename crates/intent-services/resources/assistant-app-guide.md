@@ -78,6 +78,17 @@ Check the provider's official setup instructions before choosing a URL or local 
 
 A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
 
+## Mac update availability
+
+Mac update availability can differ by architecture. Intel Macs stay on their last
+compatible available release in the selected update channel when a newer release
+has no Intel build. Older Apple Silicon apps may also remain on an earlier
+compatible release; manually installing a current Apple Silicon build lets them
+receive newer releases. Do not
+suggest an Apple Silicon build for an Intel Mac.
+
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
+
 ## Manage Assistant chats
 
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
@@ -146,6 +157,15 @@ and configuring a tunnel are separate choices from displaying pairing informatio
 Read current state and respect the user's requested scope.
 
 ## Start or continue work
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+
+In **Home → Workspaces**, list rows and board cards show organization/repository
+labels in views that include multiple repositories. When an organization is selected,
+labels show only the repository name. Narrow lists hide the row label; the selected
+workspace's preview header shows its repository. Local repositories show their name
+or path. Long labels truncate; hover to read the full name. Repository-specific
+views identify the repository in the page heading.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
@@ -245,6 +265,51 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Home Workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+
+In **Home → Workspaces**, open **View options → Group by** in either list or board
+view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
+groups. In list view, **Status** groups workspace statuses in this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
+**Done & idle** (idle or complete).
+**Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
+
+The grouping choice is remembered with Home's settings for the current signed-in
+user and connected backend. **Activity** remains the default; existing saved
+grouping choices keep their behavior.
+
+## Home workspace status icons
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+
+In **Home → Workspaces**, the status icon in list and board views describes the
+workspace's current status. Hover over it for an explanation:
+
+- **PR Open** (pull request icon): a pull request is open.
+- **PR Mergeable** (pull request icon): a pull request is reported ready to merge.
+- **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Colors follow the current theme: Open and Queued use its informational color;
+Mergeable uses its success color. Use the label and tooltip to identify the state.
+
+Questions, review requests, failures, and blockers can take precedence over PR
+icons. **PR Mergeable** does not grant permission to merge: agents still need the
+user's explicit authorization and must check the current merge requirements.
+
+A muted hourglass indicates waiting on external events or delegated work in the
+workspace; it does not mean every agent is waiting. It replaces an otherwise idle
+dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+hourglass, with additional waiting explained in its tooltip. Waiting is also
+included in accessible status text. The waiting indicator is hidden when the main
+status shows active work, unread updates, a question, a review request, a failure,
+or a blocker.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
@@ -270,7 +335,7 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
 In the existing conversation, **Couldn't complete this response** summarizes a
 stopped response. Open **Details** to inspect the technical error, then **Copy
@@ -280,6 +345,10 @@ scheduled. Inspect that message and use its available controls before sending
 another copy. Active work keeps its normal **Thinking** or activity status; do not
 infer a retry from that status alone. Controls depend on the conversation's state
 and your access.
+
+For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
 
 Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
 Expand that label to inspect the saved errors and timestamps and use **Copy
@@ -327,7 +396,7 @@ where available or reconnect, and check the app and daemon versions.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar warns when its primary browser client is offline, even if
 the workspace has no browser tabs yet. Hover over the warning for recovery help:
@@ -338,11 +407,14 @@ To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. The action depends on the
-current client's browser capability and your access. After reconnecting, wait
-for the current client and workspace browser state to refresh. A checked action
-means this client is already explicitly primary; an unavailable action can also
-mean the connection, browser capability, or access is not ready. Do not promise
-automatic failover or change the primary client without the user's instruction.
+current client's connection, browser capability and your access. A checkmark
+means the saved primary selection matches the confirmed current client; it does
+not guarantee browser availability. The selection updates when the primary
+changes; after reconnecting, wait for the current client and workspace browser
+state to refresh. When the saved selection is known and this client is not
+selected, the action is available once its connection, browser capability and
+your access are ready. Do not promise automatic failover or change the primary
+client without the user's instruction.
 
 ## Add context, run a task, and find results
 
@@ -370,7 +442,10 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
-Workspace file links open a file panel. Excel workbooks and other binary files
+Workspace file links open a file panel. Markdown files open in a read-only preview
+that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
 Binary files are not editable in the file panel or Files view. Delete is unavailable
@@ -378,7 +453,7 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
 
 ## Daemon lifecycle from the terminal
 

@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   pin:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     # Manual runs must use trusted main too; never execute a branch's script
     # with the publication token. The checkout resolves main afresh.

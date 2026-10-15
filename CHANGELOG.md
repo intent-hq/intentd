@@ -2,6 +2,42 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.46] - 2026-10-13
+
+### 📚 Documentation
+
+- Describe Mermaid diagrams in Markdown file previews ([#2402](https://github.com/intent-hq/intentd/pull/2402))
+
+
+## [0.10.45] - 2026-10-13
+
+### 📚 Documentation
+
+- Clarify browser primary selection and switching ([#2391](https://github.com/intent-hq/intentd/pull/2391))
+
+
+## [0.10.44] - 2026-10-13
+
+### 🚀 Features
+
+- *(scripts)* Add compact active lists and durable monitor cleanup ([#2393](https://github.com/intent-hq/intentd/pull/2393))
+- Let Assistant manage MCP servers and chats ([#2384](https://github.com/intent-hq/intentd/pull/2384))
+
+### 🐛 Bug Fixes
+
+- Preserve note index lockfile inputs during packaging ([#2399](https://github.com/intent-hq/intentd/pull/2399))
+- Publish sufficient state for push-driven client updates ([#2392](https://github.com/intent-hq/intentd/pull/2392))
+
+### 📚 Documentation
+
+- Explain workspace cycling from Home ([#2390](https://github.com/intent-hq/intentd/pull/2390))
+- Explain composer prompt recall ([#7068](https://github.com/intent-hq/intentd/pull/7068)) ([#2388](https://github.com/intent-hq/intentd/pull/2388))
+
+### 🧪 Testing
+
+- Preserve final Pi child evidence during fixture cleanup ([#2398](https://github.com/intent-hq/intentd/pull/2398))
+
+
 ## [0.10.43] - 2026-10-11
 
 ### 🚀 Features

@@ -25264,9 +25264,18 @@ impl WorkspaceApi for Services {
                 Some(intent_core::Caller::Daemon) => "daemon".into(),
                 None => return Err(Error::Forbidden("Caller required".into())),
             };
-            self.store
+            let result = self
+                .store
                 .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
-                .await
+                .await;
+            #[cfg(test)]
+            note_annotation::tests::pause_after_read(
+                &workspace_id,
+                note_annotation::tests::read_outcome(&result),
+            )
+            .await;
+            self.require_member(&workspace_id).await?;
+            result
         })
     }
 
