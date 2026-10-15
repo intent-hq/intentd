@@ -23,6 +23,7 @@ name: Warm release Rust caches
     - .github/workflows/release-cache.yml
     - .github/workflows/release-sitter.yml
     - scripts/*release*cache*.py
+    - scripts/optional-intel-release.py
   workflow_dispatch: {}
 permissions:
   contents: read
@@ -49,6 +50,7 @@ jobs:
       shell: bash
       run: |
         dist plan --output-format=json > cache-plan.json
+        python3 scripts/optional-intel-release.py matrix cache-plan.json --event cache --ref refs/heads/main
         echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB_OUTPUT"
   daemon:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -209,8 +211,6 @@ jobs:
       matrix:
         include:
         - target: aarch64-apple-darwin
-          os: depot-macos-latest
-        - target: x86_64-apple-darwin
           os: depot-macos-latest
         - target: x86_64-unknown-linux-musl
           os: depot-ubuntu-24.04-16

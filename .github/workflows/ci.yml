@@ -1927,9 +1927,16 @@ jobs:
           python3 -m pip install PyYAML==6.0.2
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
+          python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-setup-depot-sccache.py
           python3 -B scripts/test-depot-runners.py
           python3 -I -B scripts/test-native-review-artifact.py
+      - name: Test optional Intel cargo-dist publication
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("dist-workspace.toml", "rb"))["dist"]["cargo-dist-version"])')
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" | sh
+          python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py

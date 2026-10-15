@@ -62,6 +62,9 @@ def generate():
     source_steps = sitter_source['steps']
     build_start = next(i for i, step in enumerate(source_steps) if step.get('name') == 'Build (cargo)')
     sitter_setup = [step for step in source_steps[:build_start] if step.get('run') != CACHE_RUN]
+    sitter_strategy = deepcopy(sitter_source['strategy'])
+    sitter_strategy['matrix']['include'] = [row for row in sitter_strategy['matrix']['include']
+                                            if row['target'] != 'x86_64-apple-darwin']
     sitter_builds = source_steps[build_start:build_start + 2]
     if [step.get('name') for step in sitter_builds] != ['Build (cargo)', 'Build (cargo-zigbuild)']:
         raise ValueError('expected adjacent sitter cargo/zigbuild steps; review the producer boundary')
@@ -73,7 +76,7 @@ def generate():
                 'dist-workspace.toml', '**/build.rs', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h',
                 '.github/dist-build-setup.yml',
                 'scripts/setup-depot-sccache.py', '.github/workflows/release-cache.yml',
-                '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py',
+                '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py', 'scripts/optional-intel-release.py',
             ]},
             'workflow_dispatch': {},
         },
@@ -88,6 +91,7 @@ def generate():
                           {'name': 'Install dist', 'shell': 'bash', 'run': install},
                           {'id': 'plan', 'name': 'Plan build-only matrix', 'shell': 'bash',
                            'run': '''dist plan --output-format=json > cache-plan.json
+python3 scripts/optional-intel-release.py matrix cache-plan.json --event cache --ref refs/heads/main
 echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB_OUTPUT"
 '''}],
             },
@@ -104,7 +108,7 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
                                          'run': 'dist build --output-format=json ${{ matrix.dist_args }} > cache-build-manifest.json'}])],
             },
             'sitter': {
-                'if': MAIN_ONLY, 'strategy': deepcopy(sitter_source['strategy']),
+                'if': MAIN_ONLY, 'strategy': sitter_strategy,
                 'runs-on': '${{ matrix.os }}', 'timeout-minutes': 30,
                 'env': deepcopy(sitter_source.get('env', {})),
                 'steps': [*sitter_setup,
