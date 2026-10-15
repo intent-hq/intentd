@@ -17,6 +17,23 @@ ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "crates/intent-store"
 WRAPPER = ROOT / "scripts/release-plz-cargo.py"
 BROKEN = 'include_str!("../../../Cargo.lock")'
+# The real build helper parses manifests with the `toml` crate, which this
+# offline fixture cannot resolve. Its logic is unit-tested in intent-store
+# (src/tests/note_index_profile.rs); this std-only stand-in keeps the helper's
+# interface so the real build.rs and the Cargo package layout are exercised.
+HELPER = "build/note_index_dependencies.rs"
+HELPER_STAND_IN = """use std::path::{Path, PathBuf};
+pub struct Inputs { pub lock: String, pub manifests: Vec<String>, pub watched: Vec<PathBuf> }
+pub fn collect(manifest_dir: &Path) -> Result<Inputs, String> {
+    let lock = manifest_dir.ancestors().map(|dir| dir.join("Cargo.lock"))
+        .find(|path| path.is_file()).ok_or("Cargo.lock is required")?;
+    let text = std::fs::read_to_string(&lock).map_err(|error| error.to_string())?;
+    Ok(Inputs { lock: text, manifests: Vec::new(), watched: vec![lock] })
+}
+pub fn dependency_profile(lock: &str, _manifests: &[&str]) -> Result<String, String> {
+    Ok(lock.to_owned())
+}
+"""
 
 
 class PackagingTests(unittest.TestCase):
@@ -53,10 +70,14 @@ class PackagingTests(unittest.TestCase):
 
     def current_source(self):
         source = (STORE / "src/note_page_index.rs").read_text()
-        expression, = re.findall(r'include_str!\([^\n]*Cargo\.lock[^\n]*\)', source)
+        expression, = re.findall(
+            r'include_str!\(concat!\(env!\("OUT_DIR"\), "/note-index-dependencies\.txt"\)\)', source)
         self.source(expression)
-        if (STORE / "build.rs").exists():
-            shutil.copyfile(STORE / "build.rs", self.crate / "build.rs")
+        shutil.copyfile(STORE / "build.rs", self.crate / "build.rs")
+        self.assertIn(f'#[path = "{HELPER}"]', (STORE / "build.rs").read_text())
+        self.assertTrue((STORE / HELPER).is_file())
+        (self.crate / HELPER).parent.mkdir(exist_ok=True)
+        (self.crate / HELPER).write_text(HELPER_STAND_IN)
 
     def add_dependent(self):
         dependent = self.repo / "crates/dependent"
@@ -71,6 +92,7 @@ class PackagingTests(unittest.TestCase):
         self.current_source()
         self.run_ok("cargo", "package", "--allow-dirty", "--workspace")
         packaged = self.repo / "target/package/intent-store-0.1.0"
+        self.assertTrue((packaged / HELPER).is_file())
         self.assertEqual(self.run_ok("cargo", "run", "--quiet", "--manifest-path",
                                     str(packaged / "Cargo.toml")),
                          (packaged / "Cargo.lock").read_text())
