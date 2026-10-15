@@ -179,6 +179,12 @@ checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
+Legacy workspace import has been retired. Settings no longer offers the Data import
+section, and a fresh daemon does not discover or import old Electron workspace
+directories. Workspaces already stored in the daemon remain available.
+
+<!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository

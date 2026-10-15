@@ -494,7 +494,6 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "server.pairingInfo",
     "server.rotateToken",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",

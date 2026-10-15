@@ -37,8 +37,6 @@ mod command_evidence;
 mod doctor_codex;
 mod exact_update;
 mod git_credential;
-mod import;
-mod legacy_import;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -192,35 +190,6 @@ enum Command {
         /// The per-agent MCP listener address to connect to (`host:port`).
         #[arg(long)]
         connect: String,
-    },
-    /// Migrate an existing Intent (Electron) install into intentd's `SQLite` store
-    /// (§9.7): read `<dir>/workspaces.json` and each workspace's `.workspace/`
-    /// entities and idempotently upsert them. Read-only toward the source.
-    Import {
-        /// Path to the Intent `userData` directory to import from.
-        #[arg(long)]
-        from: PathBuf,
-    },
-    /// Import legacy per-directory Intent workspaces
-    /// (`<root>/<id>/.workspace/workspace.json`) into the `SQLite` store. Scans
-    /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
-    /// idempotent (ids already in the DB are skipped) and read-only toward the
-    /// source. The same module backs the automatic first-boot import in `serve`.
-    ImportLegacy {
-        /// Scan only these directories instead of the default legacy roots
-        /// (repeatable: `--root a --root b`; each must exist).
-        #[arg(long)]
-        root: Vec<PathBuf>,
-        /// Legacy Electron app-level dir holding `config.json` /
-        /// `repo-registry.json`; defaults to the platform userData dir.
-        #[arg(long)]
-        app_dir: Option<PathBuf>,
-        /// Print the per-workspace plan without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Update rows whose workspace id already exists instead of skipping.
-        #[arg(long)]
-        force: bool,
     },
     /// Print everything a client needs to pair with this daemon: the LAN
     /// pairing QR code, then labeled URL (`intent://pair?…` payload URI),
@@ -447,13 +416,6 @@ async fn async_main(cli: Cli) -> ExitCode {
                     }
                 }
             }
-            Command::Import { from } => to_exit(cmd_import(&from).await),
-            Command::ImportLegacy {
-                root,
-                app_dir,
-                dry_run,
-                force,
-            } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
             Command::Pair {
                 png,
                 svg,
@@ -1280,121 +1242,6 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     intent_core::write_private(path, bytes)
 }
 
-/// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
-/// Opens (creating + migrating) the configured DB, runs the idempotent import,
-/// and prints the per-domain summary. Exits non-zero on a hard source failure.
-async fn cmd_import(from: &Path) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let store = Store::open(&config.db_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let summary = import::run(&store, from).await?;
-    println!("{summary}");
-    Ok(())
-}
-
-/// Import legacy per-directory Intent workspaces into the configured `SQLite`
-/// store. `--root` (repeatable) narrows the scan to explicit directories
-/// (each must exist); otherwise the default legacy roots are scanned. The
-/// first-boot completion marker does not gate explicit CLI runs. A
-/// non-dry-run run without manifest compatibility failures rewrites the marker;
-/// `--force` only controls whether existing workspace rows are updated.
-/// Per-workspace problems are soft (reported, exit 0); only an unusable
-/// explicit `--root` or a store-open failure exits non-zero. A dry-run
-/// against a not-yet-created DB removes the freshly created DB file
-/// afterwards, so a later `serve` still sees a fresh DB and the first-boot
-/// auto-import still fires. Empty resolved roots (legacy import disabled)
-/// exit early without opening the store or writing the marker.
-async fn cmd_import_legacy(
-    roots: Vec<PathBuf>,
-    app_dir: Option<PathBuf>,
-    dry_run: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let roots = if roots.is_empty() {
-        legacy_import::default_roots()
-    } else {
-        for dir in &roots {
-            if !dir.is_dir() {
-                anyhow::bail!("--root is not a directory: {}", dir.display());
-            }
-        }
-        roots
-    };
-    // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
-    // hermetic test harness) mean "legacy import disabled": return before
-    // touching the store so no app-level blobs land and no completion marker
-    // is written — consistent with `decide_first_boot_import`.
-    if roots.is_empty() {
-        println!("legacy import disabled: no legacy roots to scan");
-        return Ok(());
-    }
-    let app_dir = app_dir.or_else(legacy_import::default_app_dir);
-    let db_existed = config.db_path.exists();
-    let store = Store::open(&config.db_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let report = legacy_import::run(
-        &store,
-        &legacy_import::Options {
-            roots,
-            dry_run,
-            force,
-            assets_root: Some(config.data_dir.join("assets")),
-            app_dir,
-            // Offline CLI: no daemon, no live subscribers — no events. A
-            // running daemon learns about the rows via `system.importLegacy`
-            // or its next boot, both of which publish.
-            event_bus: None,
-            setup_states: None,
-            stopping: None,
-        },
-    )
-    .await?;
-    println!("{report}");
-    if !dry_run {
-        // Keep the persisted failure summary in sync: a clean run (e.g. the
-        // documented `--force` retry) clears any stale row from a prior run.
-        legacy_import::persist_failure_summary(&store, &report).await;
-        if !report.has_compatibility_failures() {
-            // Marker write failure is a warning, not a command failure — the
-            // import itself completed (mirrors the first-boot hook in `serve`).
-            // Without the marker a later run/first-boot may re-import, which is
-            // safe: the import is idempotent.
-            if let Err(e) = legacy_import::write_completion_marker(&store).await {
-                eprintln!(
-                    "warning: import completed but the completion marker could not \
-                     be written ({e}); a later run or first boot may re-import \
-                     (idempotent, existing rows are skipped)"
-                );
-            }
-        }
-    } else if !db_existed {
-        // Dry-run on a fresh install: don't leave behind the DB file that
-        // `Store::open` just created, or the first-boot auto-import in
-        // `serve` (gated on DB-file existence) would silently never fire.
-        store.close().await;
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = config.db_path.as_os_str().to_owned();
-            path.push(suffix);
-            let path = PathBuf::from(path);
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "warning: could not remove {} ({e}); delete it manually or the \
-                         first-boot auto-import in `serve` will not fire",
-                        path.display()
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn cmd_mcp_bridge(connect: &str) -> anyhow::Result<()> {
     intent_acp::run_stdio_bridge(connect)
         .await
@@ -1925,9 +1772,6 @@ async fn cmd_serve_owned(
             }
         }
     }
-    // Snapshot DB-file existence before `Store::open` creates it: the one-time
-    // legacy workspace import below fires only on a truly fresh database.
-    let db_existed = config.db_path.exists();
     #[cfg(all(unix, debug_assertions))]
     startup::preparing_test_gate().await?;
     let store = prepared
@@ -1985,58 +1829,7 @@ async fn cmd_serve_owned(
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
-    // Serializes import runs: shared between the first-boot background task
-    // below and the `system.importLegacy` RPC (via DaemonControl), so the two
-    // can never interleave workspace inserts — without the lock both could
-    // observe a missing row before either inserts it, turning the loser's
-    // idempotent skip into a spurious `insert failed` failure-summary entry.
-    let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
-    let legacy_import_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Per-workspace setup-stage map shared by the services surface and the
-    // legacy importer (both the first-boot task and `system.importLegacy`),
-    // so an imported row reads `skipped` from `ws.workspace.details()`.
     let workspace_setup_states = WorkspaceSetupStates::default();
-    // First-boot legacy workspace import: the eligibility decision (fresh DB
-    // / marker state) is made synchronously here, but the import itself runs
-    // in a spawned background task concurrently with the transports coming up
-    // — `serve` never awaits it, so a large legacy tree no longer delays
-    // first boot. `decide_first_boot_import` persists a pending marker before
-    // the run starts; a daemon killed mid-import resumes on the next boot
-    // (the importer is idempotent). A concurrent `system.importLegacy` RPC —
-    // a concurrency window the inline pre-transport import never had — is
-    // serialized behind `legacy_import_lock`. Shutdown stops admission between
-    // workspaces and joins the admitted unit before closing the store. A partial
-    // run keeps its pending marker so the next boot resumes idempotently.
-    let legacy_import_handle = {
-        let roots = legacy_import::default_roots();
-        match legacy_import::decide_first_boot_import(&store, db_existed, &roots).await {
-            legacy_import::FirstBootDecision::Skip => None,
-            decision => {
-                let store = store.clone();
-                let assets_root = Some(config.data_dir.join("assets"));
-                let app_dir = legacy_import::default_app_dir();
-                let event_bus = Some(bus.clone());
-                let setup_states = Some(workspace_setup_states.clone());
-                let lock = legacy_import_lock.clone();
-                let stopping = legacy_import_stopping.clone();
-                let resumed = decision == legacy_import::FirstBootDecision::Resume;
-                Some(intent_core::spawn_daemon(async move {
-                    let _guard = lock.lock().await;
-                    legacy_import::run_first_boot_import(
-                        &store,
-                        roots,
-                        assets_root,
-                        app_dir,
-                        event_bus,
-                        setup_states,
-                        resumed,
-                        Some(stopping),
-                    )
-                    .await;
-                }))
-            }
-        }
-    };
     // Hold a store handle for the §10.2 retention sweep before the store is
     // moved into the services surface below.
     let retention_store = store.clone();
@@ -2109,7 +1902,6 @@ async fn cmd_serve_owned(
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
-    let legacy_import_store = store.clone();
     let assets_root = config.data_dir.join("assets");
 
     // Suspend/wake detector (clock-skew): infers host sleep/resume with no OS
@@ -2127,7 +1919,7 @@ async fn cmd_serve_owned(
         });
 
     let services = Services::new(store)
-        .with_assets_root(assets_root.clone())
+        .with_assets_root(assets_root)
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
         .with_event_bus(bus.clone())
@@ -2712,12 +2504,6 @@ async fn cmd_serve_owned(
         route_info: route_info.clone(),
         workspaces_disk,
         watch_health,
-        legacy_import_store,
-        legacy_import_assets_root: assets_root,
-        legacy_import_lock: legacy_import_lock.clone(),
-        legacy_import_stopping: legacy_import_stopping.clone(),
-        legacy_import_bus: bus.clone(),
-        legacy_import_setup_states: workspace_setup_states.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         exact_update: exact_update::ExactUpdate::default(),
@@ -2838,7 +2624,6 @@ async fn cmd_serve_owned(
     let (startup_stop, startup_stopping) =
         tokio::sync::watch::channel(boot_error.is_some() || bootstrap.cancellation.stopping());
     let shutdown = {
-        let legacy_import_stopping = legacy_import_stopping.clone();
         let manager = manager.clone();
         let rpc_limiter = rpc_limiter.clone();
         let host_exec_runtime = host_exec_runtime.clone();
@@ -2855,7 +2640,6 @@ async fn cmd_serve_owned(
                 () = cancellation.stopped() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
-            legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
             rpc_limiter.begin_shutdown();
             manager.begin_shutdown();
             host_exec_runtime.begin_shutdown();
@@ -3088,7 +2872,6 @@ async fn cmd_serve_owned(
     bootstrap.stop_local_listener().await;
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
-    legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     rpc_limiter.begin_shutdown();
     services.begin_settings_shutdown();
     manager.begin_shutdown();
@@ -3222,12 +3005,6 @@ async fn cmd_serve_owned(
         }
     }
 
-    // Stop the background first-boot legacy import (if still running) before
-    // closing the store; the pending marker makes the next boot resume it.
-    if let Some(handle) = legacy_import_handle {
-        let _ = handle.await;
-    }
-
     // Stop the periodic WAL checkpoint task before closing the store.
     checkpoint_handle.abort();
     let _ = checkpoint_handle.await;
@@ -3265,8 +3042,8 @@ async fn cmd_serve_owned(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Live daemon control surface backing `system.status`, `system.shutdown`, and
-/// `system.importLegacy` (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
+/// Live daemon control surface backing `system.status` and `system.shutdown`
+/// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
 /// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
@@ -3296,20 +3073,6 @@ struct DaemonControl {
     /// Watch-coverage handle for `system.status` (intent-hq/intent#3708);
     /// snapshots `None` until the backgrounded watcher registry attaches.
     watch_health: intent_services::WatchHealth,
-    /// Live store and asset destination shared with Services for legacy import.
-    legacy_import_store: Store,
-    legacy_import_assets_root: PathBuf,
-    /// Prevent overlapping import runs from racing workspace inserts/copies.
-    /// Shared with the first-boot background import task, which acquires it
-    /// for its whole run, so the RPC and the boot import never interleave.
-    legacy_import_lock: Arc<tokio::sync::Mutex<()>>,
-    legacy_import_stopping: Arc<std::sync::atomic::AtomicBool>,
-    /// Event bus for `workspace:created` publishes on imported rows, so live
-    /// subscribers learn about workspaces the importer writes through `Store`.
-    legacy_import_bus: EventBus,
-    /// Setup-state map shared with `Services`, so imported rows record
-    /// `skipped` alongside their `workspace:setup:completed` publish.
-    legacy_import_setup_states: WorkspaceSetupStates,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -4582,70 +4345,6 @@ impl SystemControl for DaemonControl {
 
     fn request_exact_update(&self, target: &str) -> Result<(), String> {
         self.exact_update.start(&self.sitter_pid_path, target)
-    }
-
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let _guard = self.legacy_import_lock.lock().await;
-            let report = legacy_import::run(
-                &self.legacy_import_store,
-                &legacy_import::Options {
-                    roots: legacy_import::default_roots(),
-                    dry_run: false,
-                    force,
-                    assets_root: Some(self.legacy_import_assets_root.clone()),
-                    app_dir: legacy_import::default_app_dir(),
-                    event_bus: Some(self.legacy_import_bus.clone()),
-                    setup_states: Some(self.legacy_import_setup_states.clone()),
-                    stopping: Some(self.legacy_import_stopping.clone()),
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-            // Keep the persisted failure summary in sync: a clean run (e.g.
-            // the documented `--force` retry) clears any stale row.
-            legacy_import::persist_failure_summary(&self.legacy_import_store, &report).await;
-            let compatibility_failures = report.has_compatibility_failures();
-            let marker_written = if compatibility_failures {
-                false
-            } else {
-                match legacy_import::write_completion_marker(&self.legacy_import_store).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "legacy import RPC marker write failed");
-                        false
-                    }
-                }
-            };
-            let skip_summary: Vec<Value> = report
-                .entries
-                .iter()
-                .filter_map(|entry| match &entry.outcome {
-                    legacy_import::Outcome::Skipped(reason) => {
-                        Some(json!({ "id": &entry.id, "reason": reason }))
-                    }
-                    _ => None,
-                })
-                .take(20)
-                .collect();
-            Ok(json!({
-                "imported": report.imported(),
-                "updated": report.updated(),
-                "skipped": report.skipped(),
-                "notes": report.notes_imported(),
-                "comments": report.comments_imported(),
-                "agents": report.agent_sessions_imported(),
-                "assets": report.assets_imported(),
-                "skipSummary": skip_summary,
-                "compatibilityFailures": compatibility_failures,
-                "markerWritten": marker_written,
-            }))
-        })
     }
 
     fn git_credential(

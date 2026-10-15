@@ -201,7 +201,7 @@ const EXPECTED_TOTAL_METHODS: usize = 435;
 const EXPECTED_ROUTER_METHODS: usize = 378;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -856,7 +856,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "stats.getUsage",
     "system.capabilities",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -1388,7 +1387,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "specialist.delete",
     "specialist.edit",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -2579,7 +2577,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "specialist.delete",
         "specialist.edit",
         "system.gitCredential",
-        "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
         "system.startupStatus",
