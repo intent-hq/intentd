@@ -601,6 +601,11 @@ class LifecycleCacheTests(unittest.TestCase):
 
 
 class NativeRoutingTests(unittest.TestCase):
+    def test_consumer_workflow_allows_nested_runner_probe_reads(self):
+        caller = self.workflow["jobs"]["monorepo-consumer-checks"]
+        self.assertEqual(caller["permissions"].get("contents"), "read")
+        self.assertEqual(caller["permissions"].get("actions"), "read")
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
