@@ -78,7 +78,9 @@ fn apply_diff(original: &str, diff: &str) -> String {
 }
 
 fn real_inputs() -> deps::Inputs {
-    deps::collect(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("collect workspace inputs")
+    let manifest_dir =
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"));
+    deps::collect(&manifest_dir).expect("collect workspace inputs")
 }
 
 fn try_profile(lock: &str, manifests: &[String]) -> Result<String, String> {

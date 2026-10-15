@@ -89,6 +89,50 @@ class LinuxTests(unittest.TestCase):
                 result = subprocess.run([str(executable)], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_note_index_inputs_choose_runtime_checkout_before_collecting(self):
+        # Compile the real_inputs call site and the actual runtime-path helper.
+        # A filesystem-reading collector isolates this boundary; the Rust
+        # note_index_profile suite separately verifies the real fingerprint.
+        text = (ROOT / 'crates/intent-store/src/tests/note_index_profile.rs').read_text()
+        function = text.split('fn real_inputs() -> deps::Inputs {', 1)[1].split('\n}', 1)[0]
+        with tempfile.TemporaryDirectory(prefix='intent-index-relocation-') as tmp:
+            root = Path(tmp)
+            producer = root / 'producer/crates/intent-store'
+            consumer = root / 'consumer/crates/intent-store'
+            for directory, marker in ((producer, 'producer-decoy'), (consumer, 'consumer-lock')):
+                directory.mkdir(parents=True)
+                (directory.parent.parent / 'Cargo.lock').write_text(marker)
+                (directory / 'Cargo.toml').write_text('[package]\nname="intent-store"\nversion="0.0.0"\n')
+            source = root / 'main.rs'
+            source.write_text('#![allow(dead_code, unused_imports)]\nextern crate self as intentd_test_support;\n' +
+                '#[path=' + json.dumps(str(ROOT / 'crates/intentd-test-support/src/runtime_paths.rs')) + '] pub mod runtime_paths;\n' +
+                'use std::path::Path;\nmod deps { pub type Inputs = String; pub fn collect(path: &std::path::Path) -> Result<Inputs, String> {\n' +
+                'assert!(path.join("Cargo.toml").is_file());\n' +
+                'let lock = path.ancestors().map(|p| p.join("Cargo.lock")).find(|p| p.is_file()).ok_or("missing lock")?;\n' +
+                'std::fs::read_to_string(lock).map_err(|e| e.to_string()) } }\n' +
+                'fn real_inputs() -> deps::Inputs {' + function + '\n}\n' +
+                'fn main() { assert_eq!(real_inputs(), std::env::var("EXPECTED_LOCK").unwrap()); }\n')
+            binary = root / 'inputs-proof'
+            subprocess.run(['rustc', '--edition=2021', str(source), '-o', str(binary)],
+                           env=dict(os.environ, CARGO_MANIFEST_DIR=str(producer)), check=True, capture_output=True)
+            env = dict(os.environ, CARGO_MANIFEST_DIR=str(consumer), EXPECTED_LOCK='consumer-lock')
+            for exists in (True, False):
+                with self.subTest(producer_exists=exists):
+                    if not exists:
+                        shutil.rmtree(root / 'producer')
+                    result = subprocess.run([str(binary)], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            invalid = subprocess.run([str(binary)], env={**env, 'CARGO_MANIFEST_DIR': str(root / 'missing')},
+                                     capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
+            producer.mkdir(parents=True)
+            (producer / 'Cargo.toml').write_text('[package]\nname="intent-store"\nversion="0.0.0"\n')
+            (producer.parent.parent / 'Cargo.lock').write_text('normal-cargo')
+            fallback_env = dict(os.environ, EXPECTED_LOCK='normal-cargo')
+            fallback_env.pop('CARGO_MANIFEST_DIR', None)
+            fallback = subprocess.run([str(binary)], env=fallback_env, capture_output=True, text=True)
+            self.assertEqual(fallback.returncode, 0, fallback.stderr)
+
     def plan(self, args):
         return {'version': 1, 'head': 'a'*40, 'mergeBase': 'b'*40, 'plans': args}
 
