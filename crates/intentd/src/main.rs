@@ -1700,9 +1700,19 @@ async fn cmd_serve(
     // endpoint, retaining pending signals until normal startup completes.
     #[cfg(unix)]
     {
-        bootstrap.staged_restart_signal = Some(tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::user_defined2(),
-        )?);
+        use tokio::signal::unix::{signal, SignalKind};
+        let kind = SignalKind::user_defined2();
+        // Exercise the real registration error before protected startup endpoints exist.
+        #[cfg(debug_assertions)]
+        let kind = if std::env::var_os("INTENTD_TEST_STAGED_RESTART_SIGNAL_ERROR").is_some() {
+            SignalKind::from_raw(-1)
+        } else {
+            kind
+        };
+        bootstrap.staged_restart_signal = Some(
+            signal(kind)
+                .map_err(|e| anyhow::anyhow!("failed to install the SIGUSR2 handler: {e}"))?,
+        );
     }
     let dispatch = bootstrap.dispatch.clone();
     let cancellation = bootstrap.cancellation.clone();
@@ -5837,6 +5847,16 @@ fn spawn_staged_restart_watcher(
     cancellation: startup::Cancellation,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
+        // Hold consumption of the bootstrap receiver while the regression proves
+        // operational readiness and queues a signal before this task proceeds.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("INTENTD_TEST_STAGED_RESTART_WATCHER_GATE") {
+            use tokio::io::AsyncReadExt;
+            let mut gate = tokio::net::UnixStream::connect(path)
+                .await
+                .expect("staged restart watcher test gate");
+            gate.read_u8().await.expect("release restart watcher");
+        }
         // A staged update may wait through indexing, but must never interrupt
         // initialization or outrank a stop already latched during startup.
         tokio::select! {
