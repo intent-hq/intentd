@@ -2341,8 +2341,7 @@ async fn chat_subscription_loop(
                         continue;
                     }
                     Delivery::Batch(batch) => batch,
-                    Delivery::Fence(_) => continue,
-                    Delivery::Monitor(_) => continue,
+                    Delivery::Fence(_) | Delivery::Monitor(_) => continue,
                     Delivery::HistoryChanged => {
                         // No private row crosses the bus. Re-read using this
                         // original chat recipient and bind the replacement
