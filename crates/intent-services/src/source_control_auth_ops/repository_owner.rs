@@ -46,7 +46,7 @@ pub(crate) struct GitlabCredentialGuard {
 }
 
 impl GitlabCredentialGuard {
-    pub(super) fn lease(&self) -> PersistenceLease {
+    pub(crate) fn lease(&self) -> PersistenceLease {
         self.lease.clone()
     }
 }
@@ -199,6 +199,14 @@ pub(crate) struct RepositoryWrite {
     write_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<WriteState>,
 }
+/// Equality evidence for one completed operation, never account authority.
+pub(crate) struct CompletedRepositorySource {
+    owner: Arc<RepositoryOwner>,
+    fingerprint: secret_reader::SourceFingerprint,
+    config: Option<intent_core::settings_file::GitlabSettings>,
+    descriptor: Option<GitlabDescriptor>,
+}
+
 struct WriteState {
     reservation: Option<RepositoryWriterReservation>,
     mutation: Option<RepositoryWriterMutation>,
@@ -272,6 +280,105 @@ impl RepositoryWrite {
     pub(super) fn confirm_publication(&self, confirmed: bool) {
         if let Ok(mut state) = self.state.lock() {
             state.publication_confirmed = confirmed;
+            self.settle(&mut state);
+        }
+    }
+
+    pub(crate) fn native_retirement_pending(&self) -> bool {
+        !self.owner.directory.native_contexts.settled()
+            || !self.owner.evidence.native_contexts.settled()
+    }
+
+    /// Only call after the persistence worker releases its physical leases.
+    /// The original supervisor retains this write across waiter cancellation.
+    pub(crate) async fn join_native_retirement(&self) -> intent_core::Result<()> {
+        let unavailable =
+            |_| intent_core::Error::Internal("original native retirement unconfirmed".into());
+        self.owner
+            .directory
+            .native_contexts
+            .join()
+            .await
+            .map_err(unavailable)?;
+        self.owner
+            .evidence
+            .native_contexts
+            .join()
+            .await
+            .map_err(unavailable)
+    }
+
+    pub(crate) async fn completed_source(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: PersistenceLease,
+    ) -> intent_core::Result<CompletedRepositorySource> {
+        let unavailable = || {
+            intent_core::Error::Internal("original completed credential source unavailable".into())
+        };
+        let config = self
+            .owner
+            .settings
+            .get()
+            .map(|settings| {
+                settings
+                    .config
+                    .lock()
+                    .map(|config| config.clone())
+                    .map_err(|_| unavailable())
+            })
+            .transpose()?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| unavailable())?
+            .clone();
+        let material = secret_reader::load_material(store, lease)
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(CompletedRepositorySource {
+            owner: self.owner.clone(),
+            fingerprint: material.fingerprint(&self.owner.evidence),
+            config,
+            descriptor,
+        })
+    }
+
+    pub(crate) async fn check_completed_source(
+        &self,
+        original: intent_core::Result<CompletedRepositorySource>,
+        store: intent_core::FileSecretStore,
+        lease: PersistenceLease,
+    ) -> intent_core::Result<()> {
+        let checked = async {
+            let original = original?;
+            let current = self.completed_source(store, lease).await?;
+            if !Arc::ptr_eq(&original.owner, &self.owner)
+                || original.fingerprint != current.fingerprint
+                || original.config != current.config
+                || original.descriptor != current.descriptor
+            {
+                return Err(intent_core::Error::Internal(
+                    "original completed credential source changed".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if checked.is_err() {
+            if let Ok(state) = self.state.lock() {
+                if let Some(mutation) = &state.mutation {
+                    let _ = mutation.completion().indeterminate();
+                }
+            }
+            let _ = self.owner.evidence.invalidate();
+        }
+        checked
+    }
+
+    pub(crate) fn retry_native_settlement(&self) {
+        if let Ok(mut state) = self.state.lock() {
             self.settle(&mut state);
         }
     }

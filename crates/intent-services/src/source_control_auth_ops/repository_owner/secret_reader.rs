@@ -34,6 +34,8 @@ struct AttestedSource {
 pub(super) struct SourceEvidence {
     nonce: uuid::Uuid,
     published: Mutex<Option<Arc<AttestedSource>>>,
+    pub(super) native_contexts:
+        crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements,
     checkout_denials: Mutex<std::collections::HashMap<String, RepositorySecretRequest>>,
     #[cfg(test)]
     read_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -44,6 +46,7 @@ impl SourceEvidence {
         Self {
             nonce: uuid::Uuid::new_v4(),
             published: Mutex::new(None),
+            native_contexts: crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements::default(),
             checkout_denials: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             read_probe: Mutex::new(None),
@@ -73,7 +76,9 @@ impl SourceEvidence {
     }
 
     pub(super) fn invalidate(&self) -> Result<()> {
-        *self.published.lock().map_err(|_| Error::Indeterminate)? = None;
+        let mut current = self.published.lock().map_err(|_| Error::Indeterminate)?;
+        self.native_contexts.retire();
+        *current = None;
         Ok(())
     }
 
@@ -83,6 +88,7 @@ impl SourceEvidence {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, original))
         {
+            self.native_contexts.retire();
             *current = None;
         }
         Ok(())
@@ -406,11 +412,15 @@ impl RepositoryOwner {
         if request.source != RepositoryCredentialSource::GitlabSecretSlot {
             return Err(Error::Unverified);
         }
-        *self
+        let mut published = self
             .evidence
             .published
             .lock()
-            .map_err(|_| Error::Indeterminate)? = Some(Arc::new(AttestedSource {
+            .map_err(|_| Error::Indeterminate)?;
+        if !self.evidence.native_contexts.settled() {
+            return Err(Error::Indeterminate);
+        }
+        *published = Some(Arc::new(AttestedSource {
             request,
             descriptor: descriptor.clone(),
             fingerprint,
@@ -975,14 +985,104 @@ pub(crate) struct RepositoryReadEligibility {
     scope: RepositoryReadScope,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "qualified cache consumption remains separately owned"
-    )
-)]
+impl crate::repository_admission::read_request::MonitorCommitAuthority
+    for RepositoryReadEligibility
+{
+    fn commit_prepared(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> crate::repository_admission::AdmissionResult<intent_core::Result<bool>> {
+        self.commit_monitor_write(write)
+            .map_err(|_| crate::repository_admission::AdmissionError::Retired)
+    }
+
+    fn commit_message(
+        &self,
+        write: intent_store::PreparedMonitorMessage,
+    ) -> crate::repository_admission::AdmissionResult<
+        intent_core::Result<Option<intent_core::AgentMessage>>,
+    > {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })
+        .map_err(|_| crate::repository_admission::AdmissionError::Retired)?;
+        outcome.ok_or(crate::repository_admission::AdmissionError::Retired)
+    }
+}
+
 impl RepositoryReadEligibility {
+    /// Dedicated database-effect boundary. The Store token already owns an
+    /// IMMEDIATE transaction, so this cannot wait for pool/writer acquisition or
+    /// call provider/lifecycle code while metadata fences are held. Only the
+    /// `SQLite` worker executes the prebuilt statement and commit under these
+    /// fences; account retirement cannot finish until that commit finishes.
+    pub(crate) fn commit_monitor_write(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> Result<intent_core::Result<bool>> {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })?;
+        outcome.ok_or(Error::Indeterminate)
+    }
+
+    /// Called under the original request/recipient fence; all credential and
+    /// source proofs remain held until the exact allocation has been retained.
+    pub(crate) fn retain_native_context(
+        originals: &[&Self],
+        native: &Arc<crate::repository_admission::lifecycle::native_allocation::NativeAllocation>,
+    ) -> Result<()> {
+        Self::with_all_current_and_facts(originals, None, |_| {
+            for original in originals {
+                original
+                    .owner
+                    .directory
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+                original
+                    .owner
+                    .evidence
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Retain the new prompt's source obligation before its final transfer,
+    /// while the exact source/configuration/proof fences are still held.
+    pub(crate) fn with_native_context(
+        &self,
+        native: Option<
+            &Arc<crate::repository_admission::lifecycle::native_allocation::NativeAllocation>,
+        >,
+        transfer: &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        self.with_current(&mut || {
+            if let Some(native) = native {
+                self.owner
+                    .directory
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+                self.owner
+                    .evidence
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+            }
+            transfer()
+        })
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         self.with_current(&mut || Ok(()))
     }
@@ -1155,6 +1255,8 @@ impl RepositoryReadEligibility {
 
     /// Lock order: settings config -> descriptor -> directory -> source proof.
     /// Only a prebuilt, synchronous metadata/ownership action may run here.
+    /// The typed `commit_monitor_write` entry is the sole database exception: it
+    /// reserves its writer before this fence, never acquires one inside it.
     pub(crate) fn with_current(
         &self,
         action: &mut (dyn FnMut() -> Result<()> + Send),

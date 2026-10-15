@@ -26,6 +26,7 @@ struct Snapshot {
     scope: NoteScope,
     revision: String,
     generation: String,
+    content_generation: String,
     principal: String,
     born: Instant,
     expires: String,
@@ -376,11 +377,67 @@ impl Store {
         {
             return Err(invalid());
         }
+        // Reject stale references before they can enqueue conversion. Repeat
+        // these checks below inside the actual page snapshot after preparation.
+        if snapshot.is_some()
+            || request.source_revision.is_some()
+            || request.note_instance_id.is_some()
+        {
+            let head = sqlx::query("SELECT instance_id,current_rev,generation,indexed_rev,profile_revision,content_generation FROM note_page_head WHERE workspace_id=? AND note_id=?")
+                .bind(ws).bind(note).fetch_optional(self.read_pool()).await.map_err(db_error)?
+                .ok_or_else(|| Error::NotFound("Note not found".into()))?;
+            // Profile retirement takes precedence over revision staleness,
+            // matching the page snapshot checks below.
+            if snapshot.is_some()
+                && head
+                    .try_get::<String, _>("profile_revision")
+                    .map_err(db_error)?
+                    != crate::note_page_index::profile_revision()
+            {
+                return Err(failure(NotePageError::Expired));
+            }
+            let instance: String = head.try_get("instance_id").map_err(db_error)?;
+            let revision = format!(
+                "r:{}:{}",
+                head.try_get::<i64, _>("current_rev").map_err(db_error)?,
+                head.try_get::<String, _>("generation").map_err(db_error)?
+            );
+            if request
+                .source_revision
+                .as_ref()
+                .is_some_and(|r| r != &revision)
+                || request
+                    .note_instance_id
+                    .as_ref()
+                    .is_some_and(|i| i != &instance)
+                || snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.revision != revision || s.scope.note_instance_id != instance)
+            {
+                return Err(failure(NotePageError::Stale));
+            }
+            if let Some(snapshot) = &snapshot {
+                if head
+                    .try_get::<String, _>("profile_revision")
+                    .map_err(db_error)?
+                    != crate::note_page_index::profile_revision()
+                    || head.try_get::<i64, _>("indexed_rev").map_err(db_error)?
+                        != head.try_get::<i64, _>("current_rev").map_err(db_error)?
+                    || head
+                        .try_get::<String, _>("content_generation")
+                        .map_err(db_error)?
+                        != snapshot.content_generation
+                {
+                    return Err(failure(NotePageError::Expired));
+                }
+            }
+        }
+        self.ensure_note_index(ws, note, false).await?;
         let mut connection = self.read_pool().acquire().await.map_err(db_error)?;
         let outcome = async {
         let mut tx = connection.begin().await.map_err(db_error)?;
         let outcome = async {
-        let head = sqlx::query("SELECT instance_id,indexed_rev,profile_revision,source_length,task_count,current_rev AS rev,generation FROM note_page_head WHERE workspace_id=? AND note_id=?")
+        let head = sqlx::query("SELECT instance_id,indexed_rev,profile_revision,source_length,task_count,current_rev AS rev,generation,content_generation FROM note_page_head WHERE workspace_id=? AND note_id=?")
             .bind(ws).bind(note).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or_else(||Error::NotFound("Note not found".into()))?;
         if head
             .try_get::<String, _>("profile_revision")
@@ -413,6 +470,10 @@ impl Store {
         if head.try_get::<i64, _>("indexed_rev").map_err(db_error)? != rev {
             return Err(failure(NotePageError::Expired));
         }
+        let content_generation: String = head.try_get("content_generation").map_err(db_error)?;
+        if snapshot.as_ref().is_some_and(|s| s.content_generation != content_generation) {
+            return Err(failure(NotePageError::Expired));
+        }
         let snapshot = snapshot.unwrap_or_else(|| Snapshot {
             scope: NoteScope {
                 backend_id: self.note_pages.backend.clone(),
@@ -422,6 +483,7 @@ impl Store {
             },
             revision,
             generation,
+            content_generation,
             principal: principal.into(),
             born: Instant::now(),
             expires: intent_core::iso_ms_from_now(300_000),
@@ -937,6 +999,7 @@ mod lifetime_tests {
             },
             revision: "r:0".into(),
             generation: "g".into(),
+            content_generation: "cg".into(),
             principal: "alice".into(),
             born: Instant::now(),
             expires: "fixed".into(),

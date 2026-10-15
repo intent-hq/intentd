@@ -322,6 +322,7 @@ impl Default for Inner {
 }
 
 struct Entry {
+    monitor_hello: monitor::ConnectionHello,
     /// Monotonic registration sequence — the arrival order.
     id: u64,
     channel: ReverseChannel,
@@ -379,6 +380,8 @@ impl Inner {
                     .send(ClientTransition::Disconnected(identity));
             }
         }
+        drop(state);
+        entry.monitor_hello.retire();
         Some(entry.channel)
     }
 }
@@ -447,6 +450,7 @@ impl PrimaryReverseRegistry {
             return PrimaryReverseGuard { registry: None, id };
         }
         state.entries.push_back(Entry {
+            monitor_hello: monitor::ConnectionHello::default(),
             id,
             channel,
             transport,
@@ -919,3 +923,4 @@ impl Drop for PrimaryReverseGuard {
 mod tests;
 
 mod devices;
+pub(crate) mod monitor;

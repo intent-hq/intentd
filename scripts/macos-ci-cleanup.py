@@ -27,7 +27,8 @@ import subprocess
 
 GIB = 1024 ** 3
 CARGO_LOCKS = ('.cargo-lock', '.cargo-artifact-lock', '.cargo-build-lock')
-TARGETS = ('build-aarch64-apple-darwin', 'daemon-lifecycle-macos')
+TARGETS = ('build-aarch64-apple-darwin', 'daemon-lifecycle-macos',
+           'macos-services-runtime-aarch64-apple-darwin')
 PROFILES = ('debug', 'aarch64-apple-darwin/debug')
 
 

@@ -752,7 +752,7 @@ mod read_owner {
             read(&blocked, caller(&f)).await,
             Err(AdmissionError::Unavailable)
         ));
-        known.settle_confirmed();
+        known.settle_confirmed().await.unwrap();
         assert!(matches!(
             read(&blocked, caller(&f)).await,
             Err(AdmissionError::Unavailable)
@@ -776,7 +776,9 @@ mod read_owner {
             .begin_repository_pending_delete(&[key])
             .await
             .unwrap()
-            .settle_confirmed();
+            .settle_confirmed()
+            .await
+            .unwrap();
         assert!(
             RepositoryReadOwner::capture(Arc::new(f.services.clone())).is_ok(),
             "retention alone is not a usable request"

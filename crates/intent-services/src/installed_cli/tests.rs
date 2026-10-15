@@ -540,6 +540,15 @@ impl DetachedCleanup {
         root: &Path,
         read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
     ) -> Result<Self, String> {
+        Self::capture_with_poll(pid, root, read_identity, Self::poll_pidfd)
+    }
+
+    fn capture_with_poll(
+        pid: i32,
+        root: &Path,
+        read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
+        mut poll: impl FnMut(&std::os::fd::OwnedFd, i32) -> Result<bool, String>,
+    ) -> Result<Self, String> {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
         if pid <= 1 {
@@ -566,7 +575,14 @@ impl DetachedCleanup {
         // EACCES, ENOENT and an empty environment alone prove nothing. Check
         // after reading so an exit/PID reuse during that read cannot grant
         // signal authority from another process's environment.
-        let retired = Self::pidfd_retired(&fd)?;
+        let retired = poll(&fd, 0)?
+            || (identity
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                // Exit can deny environ access before the pidfd becomes readable.
+                // Bound that observation on this same handle; a timeout grants
+                // no identity or signal authority. Other read errors do not wait.
+                && poll(&fd, 100)?);
         match identity {
             Err(error)
                 if !matches!(
@@ -594,14 +610,18 @@ impl DetachedCleanup {
     }
 
     fn pidfd_retired(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
+        Self::poll_pidfd(fd, 0)
+    }
+
+    fn poll_pidfd(fd: &std::os::fd::OwnedFd, timeout_ms: i32) -> Result<bool, String> {
         use std::os::fd::AsRawFd;
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: poll points to one initialized descriptor and never blocks.
-        let result = if unsafe { libc::poll(&raw mut poll, 1, 0) } < 0 {
+        // SAFETY: poll points to one initialized descriptor; the caller bounds its wait.
+        let result = if unsafe { libc::poll(&raw mut poll, 1, timeout_ms) } < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(poll.revents)
@@ -800,6 +820,154 @@ fn installed_cli_detached_identity_observes_exit_during_inspection() {
     });
     child.wait().unwrap();
     assert!(retired.unwrap().0.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observes_exit_after_nonterminal_poll() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            if timeout > 0 {
+                // Deterministically complete the owned child's exit only after
+                // the initial nonterminal observation, without reusing its PID.
+                detached_identity_zombie(&mut child);
+            }
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        captured.unwrap().0.is_none(),
+        "retired child became a signal target"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(
+        polls[0].0, polls[1].0,
+        "exit observation must pin the same process"
+    );
+    assert_eq!(polls[0].1, 0);
+    assert_eq!(polls[1].1, 100);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_bounds_denied_exit_observation() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut unrelated = detached_identity_child(other.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    let rejected = captured.is_err();
+    drop(captured);
+    let child_alive = child.try_wait().unwrap().is_none();
+    let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(rejected, "unverified live child acquired signal authority");
+    assert!(
+        child_alive && unrelated_alive,
+        "observation signaled a live child"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0].0, polls[1].0);
+    assert_eq!([polls[0].1, polls[1].1], [0, 100]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_propagates_exit_observation_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for result in [
+        Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok(libc::POLLERR),
+        Ok(libc::POLLNVAL),
+        Ok(libc::POLLIN | libc::POLLERR),
+    ] {
+        let mut result = Some(result);
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            |_, timeout| {
+                timeouts.push(timeout);
+                if timeout == 0 {
+                    Ok(false)
+                } else {
+                    DetachedCleanup::polled_retirement(result.take().unwrap())
+                }
+            },
+        );
+        outcomes.push((captured.is_err(), timeouts));
+        drop(captured);
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive, "poll errors must not grant signal authority");
+    for (rejected, timeouts) in outcomes {
+        assert!(rejected, "terminal observation hid a poll error");
+        assert_eq!(timeouts, [0, 100]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_does_not_wait_on_other_read_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for errno in [libc::EIO, libc::ENOENT] {
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(errno)),
+            |fd, timeout| {
+                timeouts.push(timeout);
+                DetachedCleanup::poll_pidfd(fd, timeout)
+            },
+        );
+        outcomes.push((captured.err(), timeouts));
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive);
+    for (error, timeouts) in outcomes {
+        assert!(error
+            .unwrap()
+            .starts_with("inspect detached child identity:"));
+        assert_eq!(timeouts, [0]);
+    }
 }
 
 #[cfg(target_os = "linux")]

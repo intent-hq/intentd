@@ -53,7 +53,7 @@ env:
 
 jobs:
   mirror:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     outputs:
       kind: ${{ steps.validate.outputs.kind }}
@@ -144,7 +144,7 @@ jobs:
   republish-beta:
     needs: mirror
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'beta' || inputs.republish == 'both') }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -194,7 +194,7 @@ jobs:
   republish-stable:
     needs: mirror
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'stable' || inputs.republish == 'both') }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

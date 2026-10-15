@@ -109,6 +109,17 @@ fn spawn_serve_fixed_port(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
+fn copy_stand_in_sitter(destination: &Path) {
+    // macOS /bin/sh re-execs /bin/bash, losing the copied executable's name.
+    // Copy bash itself there so the real parent/name supervision check applies.
+    let shell = if cfg!(target_os = "macos") {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    std::fs::copy(shell, destination).expect("copy stand-in sitter shell");
+}
+
 /// Spawn `intentd serve` as the CHILD of a stand-in sitter: `sitter_bin` (a
 /// shell COPIED as `intentd-sitter` — the kernel-visible process name comes
 /// from the executed image itself, so a copy carries the name on every
@@ -219,7 +230,7 @@ impl Drop for KillPidOnDrop {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -972,7 +983,7 @@ async fn wss_system_request_update_signals_the_sitter() {
     // (intent-hq/monorepo#4220). Caveat: the copy executes out of the /tmp
     // data dir, so this assumes /tmp is not mounted noexec (true on CI
     // runners and macOS); if that ever bites, move the copy destination.
-    std::fs::copy("/bin/sh", &sitter_bin).expect("copy stand-in sitter shell");
+    copy_stand_in_sitter(&sitter_bin);
     let daemon_pid_path = sitter_dir.join("daemon.pid");
 
     // The wrapper shell, not the `intentd` bin, is the spawned program, so
@@ -1857,7 +1868,7 @@ async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel
     let sitter_dir = data_dir.join("sitter");
     std::fs::create_dir_all(&sitter_dir).unwrap();
     let sitter_bin = sitter_dir.join("intentd-sitter");
-    std::fs::copy("/bin/sh", &sitter_bin).unwrap();
+    copy_stand_in_sitter(&sitter_bin);
     let daemon_pid_path = sitter_dir.join("daemon.pid");
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -2043,8 +2054,8 @@ fn occupied_fixed_wss_port_fails_daemon_boot() {
         "actionable bind error: {log}"
     );
     assert!(
-        log.contains("phase=\"store_close\" state=\"completed\""),
-        "store cleanup completes: {log}"
+        !log.contains("agent manager ready"),
+        "early bind failure must not create service owners: {log}"
     );
     assert!(
         !dir.path().join("intentd.pid").exists(),

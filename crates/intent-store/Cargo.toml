@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.10.46"
+version = "0.10.48"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ description = "SQLite + file-tree persistence (repositories, migrations, locking
 ignored-paths = ["tests/ui/store_pool_*.rs"]
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.10.46" }
+intent-core = { path = "../intent-core", version = "0.10.48" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,11 +35,16 @@ html5ever = "=0.29.1"
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["fs"] }
 
+[build-dependencies]
+# Parses Cargo.lock and manifests for the note index dependency profile.
+toml = { workspace = true }
+
 [dev-dependencies]
 regex = "1"
 trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }
+toml = { workspace = true }
 uuid = { workspace = true }
 
 [lints]
