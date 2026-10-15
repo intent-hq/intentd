@@ -15,6 +15,7 @@ fails the job explicitly. Cancellation retains only fully uploaded artifacts;
 queue:max overflow (>100 pending) and runner loss may cancel a request and
 require a rerun. These are disposable archives, not permanent exactly-once work.
 """
+import concurrent.futures
 import datetime
 import importlib.util
 import json
@@ -24,6 +25,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import zipfile
@@ -33,6 +35,7 @@ archives = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(archives)
 
 WORKFLOWS = {'.github/workflows/ci.yml', '.github/workflows/native-reuse-proof.yml'}
+RANGE_DOWNLOAD_THRESHOLD = 512 * 1024**2
 
 
 class Unavailable(RuntimeError):
@@ -100,10 +103,125 @@ class GitHub:
             raise ValueError('invalid GitHub artifact size')
         timeout = min(1800, 120 + (size + 16 * 1024**2 - 1) // (16 * 1024**2))
         try:
-            self.api(f'actions/artifacts/{int(artifact["id"])}/zip', destination, timeout=timeout)
+            if size >= RANGE_DOWNLOAD_THRESHOLD:
+                self.download_ranges(artifact, destination, timeout)
+            else:
+                self.api(f'actions/artifacts/{int(artifact["id"])}/zip', destination, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             Path(destination).unlink(missing_ok=True)
             raise Unavailable(f'GitHub artifact download timed out after {timeout}s ({size} bytes)') from error
+
+    def download_ranges(self, artifact, destination, timeout, *, chunk_bytes=64 * 1024**2):
+        """Four bounded transfers under one deadline; whole-ZIP SHA is still mandatory.
+
+        Each worker retains at most one 64MiB part alongside the output ZIP.
+        This fits inside the existing download storage reserve. No retry, new
+        deadline, alternate provenance or range-only integrity claim is added.
+        """
+        destination = Path(destination)
+        size = artifact['size_in_bytes']
+        deadline = time.monotonic() + timeout
+        stopped = threading.Event()
+        try:
+            with tempfile.TemporaryDirectory(prefix='artifact-ranges-', dir=destination.parent) as temporary:
+                destination.write_bytes(b'')
+
+                def worker(number):
+                    part = Path(temporary) / str(number)
+                    try:
+                        with destination.open('r+b') as output:
+                            for start in range(number * chunk_bytes, size, 4 * chunk_bytes):
+                                if stopped.is_set():
+                                    return
+                                end = min(start + chunk_bytes, size) - 1
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    raise subprocess.TimeoutExpired('artifact ranges', timeout)
+                                command = ['gh', 'api', f'repos/{self.repository}/actions/artifacts/{int(artifact["id"])}/zip',
+                                           '--include', '-H', f'Range: bytes={start}-{end}']
+                                result = self.range_part(command, part, min(120, remaining), end - start + 1 + 65536)
+                                if result.returncode:
+                                    if re.search(rb'HTTP (404|410)\b', result.stderr):
+                                        raise Deleted('artifact range was deleted/unavailable (HTTP 404/410)')
+                                    raise Unavailable('GitHub artifact range download failed')
+                                with part.open('rb') as stream:
+                                    status = stream.readline(8193)
+                                    if not re.fullmatch(rb'HTTP/\S+ 206[^\r\n]*\r?\n', status):
+                                        raise Unavailable('artifact range response must be HTTP 206')
+                                    fields, header_bytes = {}, len(status)
+                                    while True:
+                                        line = stream.readline(8193)
+                                        header_bytes += len(line)
+                                        if not line or len(line) > 8192 or header_bytes > 65536:
+                                            raise Unavailable('invalid artifact range headers')
+                                        if line in (b'\r\n', b'\n'):
+                                            break
+                                        name, separator, value = line.partition(b':')
+                                        name = name.lower()
+                                        if not separator or name in fields:
+                                            raise Unavailable('invalid or duplicate artifact range headers')
+                                        fields[name] = value.strip()
+                                    if fields.get(b'content-range') != f'bytes {start}-{end}/{size}'.encode():
+                                        raise Unavailable('artifact range bounds mismatch')
+                                    length = end - start + 1
+                                    if (part.stat().st_size - stream.tell() != length
+                                            or fields.get(b'content-length', str(length).encode()) != str(length).encode()):
+                                        raise Unavailable('artifact range length mismatch')
+                                    output.seek(start)
+                                    shutil.copyfileobj(stream, output, 1024**2)
+                                part.unlink()
+                    except BaseException:
+                        stopped.set()
+                        raise
+
+                # The context joins active transfers before any partial file is
+                # removed. Every subprocess is bounded by the shared deadline.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(worker, number) for number in range(4)]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+                if destination.stat().st_size != size:
+                    raise Unavailable('assembled artifact size mismatch')
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def range_part(command, destination, timeout, max_bytes):
+        """Bound bytes while receiving, even when a server ignores Range."""
+        expired = threading.Event()
+        with tempfile.TemporaryFile() as errors, Path(destination).open('wb') as output:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors)
+
+            def expire():
+                if process.poll() is None:
+                    expired.set()
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+
+            timer = threading.Timer(timeout, expire)
+            timer.start()
+            try:
+                count = 0
+                while block := process.stdout.read(min(1024**2, max_bytes + 1 - count)):
+                    count += len(block)
+                    if count > max_bytes:
+                        raise Unavailable('artifact range response exceeds bounded part size')
+                    output.write(block)
+                process.wait()
+                if expired.is_set():
+                    raise subprocess.TimeoutExpired(command, timeout)
+                errors.seek(0)
+                return subprocess.CompletedProcess(command, process.returncode, stderr=errors.read(65536))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                timer.cancel()
+                timer.join()
+                process.stdout.close()
 
 
 def artifact_name(platform, source):

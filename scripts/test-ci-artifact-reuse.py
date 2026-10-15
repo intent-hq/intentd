@@ -95,7 +95,121 @@ class CoordinationRegression(unittest.TestCase):
         self.assertIn('head_sha=' + 'a'*40, calls[0])
         self.assertFalse(any('/3/artifacts' in call for call in calls))
 
+    @staticmethod
+    def part_adapter(response):
+        def part(command, destination, timeout, max_bytes):
+            with Path(destination).open('wb') as stream:
+                return response(command, stdout=stream, timeout=timeout)
+        return part
+
+    def test_range_subprocess_bounds_bytes_timeout_and_reaps_its_process(self):
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'part'
+            with self.assertRaisesRegex(reuse.Unavailable, 'bounded part'):
+                reuse.GitHub.range_part([sys.executable, '-c', 'import sys; sys.stdout.buffer.write(b"x" * 1000000)'], path, 5, 100)
+            self.assertLessEqual(path.stat().st_size, 100)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                reuse.GitHub.range_part([sys.executable, '-c', 'import time; time.sleep(30)'], path, .05, 100)
+            result = reuse.GitHub.range_part([sys.executable, '-c', 'print("valid")'], path, 5, 100)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(path.read_bytes(), b'valid\n')
+
+    def range_response(self, payload, *, fault=None):
+        def transfer(command, **kwargs):
+            header = command[command.index('-H') + 1]
+            start, end = map(int, header.removeprefix('Range: bytes=').split('-'))
+            body = payload[start:end + 1]
+            status = 200 if fault == 'status' else 206
+            total = len(payload) + (1 if fault == 'range' else 0)
+            headers = f'HTTP/1.1 {status} response\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len(body)}\r\n'
+            if fault == 'duplicate':
+                headers += f'Content-Range: bytes {start}-{end}/{total}\r\n'
+            if fault == 'short': body = body[:-1]
+            if fault == 'extra': body += b'x'
+            if fault == 'corrupt': body = bytes(b ^ 1 for b in body)
+            kwargs['stdout'].write(headers.encode() + b'\r\n' + body)
+            if fault == 'timeout':
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            return subprocess.CompletedProcess(command, 1 if fault == 'exit' else 0, stderr=b'failure')
+        return transfer
+
+    def test_large_download_selects_ranges_without_extending_the_deadline(self):
+        api = reuse.GitHub('intent-hq/intentd')
+        with patch.object(api, 'download_ranges') as ranges, patch.object(api, 'api') as serial:
+            api.download({'id': 42, 'size_in_bytes': 5_240_449_301}, Path('large.zip'))
+            self.assertEqual(ranges.call_args.args[2], 433)
+            serial.assert_not_called()
+            api.download({'id': 43, 'size_in_bytes': 1024}, Path('small.zip'))
+            self.assertEqual(serial.call_args.kwargs['timeout'], 121)
+
+    def test_parallel_ranges_stop_scheduling_at_the_shared_deadline(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(reuse.time, 'monotonic', side_effect=[0, 31, 31, 31, 31]), patch.object(reuse.GitHub, 'range_part') as transfer:
+            path = Path(directory) / 'archive.zip'
+            with self.assertRaises(subprocess.TimeoutExpired):
+                reuse.GitHub('intent-hq/intentd').download_ranges({'id': 42, 'size_in_bytes': 513}, path, 30, chunk_bytes=128)
+            transfer.assert_not_called()
+            self.assertFalse(path.exists())
+
+    def test_parallel_ranges_assemble_exact_bytes_and_bound_active_parts(self):
+        payload = bytes(range(251)) * 7
+        response = self.range_response(payload)
+        barrier = threading.Barrier(4)
+        lock = threading.Lock()
+        active = peak = 0
+        budgets = []
+        def concurrent_transfer(command, **kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1; peak = max(peak, active)
+                budgets.append(kwargs['timeout'])
+            start = int(command[-1].split('=')[1].split('-')[0])
+            if start < 4 * 128:
+                barrier.wait(timeout=5)
+            try: return response(command, **kwargs)
+            finally:
+                with lock: active -= 1
+        with tempfile.TemporaryDirectory() as directory, patch.object(reuse.GitHub, 'range_part', side_effect=self.part_adapter(concurrent_transfer)):
+            root = Path(directory); path = root / 'archive.zip'
+            reuse.GitHub('intent-hq/intentd').download_ranges({'id': 42, 'size_in_bytes': len(payload)}, path, 30, chunk_bytes=128)
+            self.assertEqual(path.read_bytes(), payload)
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['archive.zip'])
+        self.assertEqual(peak, 4)
+        self.assertTrue(all(0 < budget <= 30 for budget in budgets))
+
+    def test_parallel_ranges_reject_bad_responses_and_remove_owned_partial_files(self):
+        for fault in ('status', 'range', 'duplicate', 'short', 'extra', 'exit', 'timeout'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); path = root / 'archive.zip'
+                neighbour = root / 'keep'; neighbour.write_bytes(b'untouched')
+                with patch.object(reuse.GitHub, 'range_part', side_effect=self.part_adapter(self.range_response(b'a' * 513, fault=fault))):
+                    with self.assertRaises((reuse.Unavailable, subprocess.TimeoutExpired)):
+                        reuse.GitHub('intent-hq/intentd').download_ranges({'id': 42, 'size_in_bytes': 513}, path, 2, chunk_bytes=128)
+                self.assertEqual(neighbour.read_bytes(), b'untouched')
+                self.assertEqual(sorted(p.name for p in root.iterdir()), ['keep'])
+
+    def test_parallel_ranges_still_require_whole_archive_digest_before_extraction(self):
+        import io
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, 'w') as archive: archive.writestr('metadata.json', '{}')
+        payload = output.getvalue()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); original = root / 'original'; original.write_bytes(payload)
+            artifact = {'id': 42, 'size_in_bytes': len(payload), 'digest': 'sha256:' + archives.file_sha(original)}
+            api = reuse.GitHub('intent-hq/intentd')
+            for fault in (None, 'corrupt'):
+                destination = root / ('good' if fault is None else 'bad')
+                with patch.object(api, 'download', side_effect=lambda a, p: api.download_ranges(a, p, 30, chunk_bytes=32)), patch.object(reuse.GitHub, 'range_part', side_effect=self.part_adapter(self.range_response(payload, fault=fault))):
+                    if fault:
+                        with self.assertRaisesRegex(ValueError, 'digest'): reuse.download_verified(api, artifact, destination)
+                        self.assertFalse((destination / 'content').exists())
+                    else:
+                        reuse.download_verified(api, artifact, destination)
+                        self.assertEqual((destination / 'content/metadata.json').read_text(), '{}')
+
     def test_large_publication_download_has_a_bounded_size_aware_budget(self):
+        serial = patch.object(reuse, 'RANGE_DOWNLOAD_THRESHOLD', 10**20)
+        serial.start(); self.addCleanup(serial.stop)
         api = reuse.GitHub('intent-hq/intentd')
         observed = []
         def transfer(command, **kwargs):
@@ -118,6 +232,8 @@ class CoordinationRegression(unittest.TestCase):
         self.assertLessEqual(observed[0], 1800)
 
     def test_download_timeout_removes_partial_archive_and_fails_explicitly(self):
+        serial = patch.object(reuse, 'RANGE_DOWNLOAD_THRESHOLD', 10**20)
+        serial.start(); self.addCleanup(serial.stop)
         api = reuse.GitHub('intent-hq/intentd')
         def timeout(command, **kwargs):
             kwargs['stdout'].write(b'partial')
@@ -129,6 +245,8 @@ class CoordinationRegression(unittest.TestCase):
             self.assertFalse(path.exists())
 
     def test_metadata_keeps_short_budget_and_download_budget_is_capped(self):
+        serial = patch.object(reuse, 'RANGE_DOWNLOAD_THRESHOLD', 10**20)
+        serial.start(); self.addCleanup(serial.stop)
         api = reuse.GitHub('intent-hq/intentd')
         def response(command, **kwargs):
             return subprocess.CompletedProcess(command, 0, stdout=b'{}', stderr=b'')
