@@ -221,6 +221,7 @@ fn sample_ws() -> Workspace {
         browser_client_id: None,
         pull_requests_total: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,

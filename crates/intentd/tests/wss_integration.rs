@@ -15,6 +15,8 @@ mod annotation_pages;
 mod annotation_reads;
 #[path = "wss_integration/annotation_writer_anchors.rs"]
 mod annotation_writer_anchors;
+#[path = "wss_integration/attention_reminders.rs"]
+mod attention_reminders;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
@@ -13941,6 +13943,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         browser_client_id: None,
         pull_requests_total: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         checkout_mode: None,
         disk_usage: None,

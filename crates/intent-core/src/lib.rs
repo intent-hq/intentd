@@ -155,6 +155,7 @@ pub use model::{
     WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{AttentionReminderReason, WorkspaceAttentionReminder};
 pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,

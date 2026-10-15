@@ -186,6 +186,7 @@ fn seed_workspace(idx: usize) -> Workspace {
         agent_summary: None,
         diff_summary: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         token_usage: None,
         cow_supported: None,

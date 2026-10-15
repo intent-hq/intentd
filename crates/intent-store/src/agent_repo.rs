@@ -3720,6 +3720,11 @@ impl Store {
         reason: &str,
         timestamp: &str,
     ) -> Result<()> {
+        let mut tx = self
+            .write_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         let rows = sqlx::query(
             "UPDATE agent_session SET attention_request_kind=?, \
              attention_request_reason=?, attention_request_timestamp=?, updated_at=? \
@@ -3731,13 +3736,22 @@ impl Store {
         .bind(timestamp)
         .bind(&id.0)
         .bind(&workspace_id.0)
-        .execute(self.write_pool())
+        .execute(&mut *tx)
         .await
         .map_err(|e| Error::Internal(format!("set attention request failed: {e}")))?
         .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
+        crate::attention_reminder_repo::write_reminder_generation(
+            &mut tx,
+            workspace_id,
+            &format!("discussion:{}", id.as_str()),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?;
         Ok(())
     }
 
@@ -8213,6 +8227,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -8339,6 +8354,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -9114,6 +9130,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -12939,6 +12956,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -13074,6 +13092,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -13161,6 +13180,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -13362,6 +13382,7 @@ mod tests {
                 browser_client_id: None,
                 pull_requests_total: None,
                 display_status: None,
+                attention_reminder: None,
                 waiting: false,
                 checkout_mode: None,
                 disk_usage: None,
@@ -13907,6 +13928,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,
@@ -18490,6 +18512,7 @@ mod tests {
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,

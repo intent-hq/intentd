@@ -358,6 +358,7 @@ async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) ->
             browser_client_id: None,
             pull_requests_total: None,
             display_status: None,
+            attention_reminder: None,
             waiting: false,
             checkout_mode: None,
             disk_usage: None,

@@ -158,6 +158,24 @@ Read current state and respect the user's requested scope.
 
 ## Start or continue work
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage.svelte,HomeWorkspaceBoard.svelte,HomeWorkspaceSettings.svelte,home-model.ts,home-workspace-status-groups.ts}; src/lib/components/workspace/WorkspaceCard.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
+
+In **Home → Workspaces**, **PR ready** groups workspaces whose pull requests are
+ready to merge, separately from **Needs you**. Use the **PR ready** status filter
+to find them. Questions, review requests, blockers, and failures take priority over
+a ready PR. In **Board view** with **Group by → Activity**, the **PR ready** column
+appears only while matching workspaces remain visible under the current filters.
+In **List view**, **Group by → Status** shows detailed work stages.
+
+Use **Dismiss for now** in a workspace’s Home or sidebar actions menu to hide its current
+**Needs you** reminder for yourself. It stays dismissed across refreshes and
+restarts, while a new question or request brings it back. Pending questions and
+paused work stay available; dismissal does not answer, resume, complete, or merge
+anything. A dismissed reminder shows **Running** if work is running, otherwise
+**Waiting**. Blocked and failed work keeps its status.
+
+<!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
@@ -267,14 +285,17 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
 
 In **Home → Workspaces**, open **View options → Group by** in either list or board
-view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
-groups. In list view, **Status** groups workspace statuses in this order:
+view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
+**Done & idle** groups. The **PR ready** board column appears only when matching
+workspaces remain visible. In list view, **Status** groups workspace statuses in
+this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
-**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
-**Done & idle** (idle or complete).
+**In progress**, **Waiting** (when a reminder is personally dismissed),
+**PR open**, **PR mergeable**, **PR queued**, **PR merged**, then **Done & idle**
+(idle or complete).
 **Repository** groups by repository; **None** removes grouping.
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
@@ -286,7 +307,7 @@ grouping choices keep their behavior.
 
 ## Home workspace status icons
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
 
 In **Home → Workspaces**, the status icon in list and board views describes the
 workspace's current status. Hover over it for an explanation:
@@ -302,9 +323,9 @@ Questions, review requests, failures, and blockers can take precedence over PR
 icons. **PR Mergeable** does not grant permission to merge: agents still need the
 user's explicit authorization and must check the current merge requirements.
 
-A muted hourglass indicates waiting on external events or delegated work in the
-workspace; it does not mean every agent is waiting. It replaces an otherwise idle
-dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+A muted hourglass indicates waiting on external events, delegated work, or a
+reminder you dismissed for now; it does not mean every agent is waiting. It
+replaces an otherwise idle dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
 hourglass, with additional waiting explained in its tooltip. Waiting is also
 included in accessible status text. The waiting indicator is hidden when the main
 status shows active work, unread updates, a question, a review request, a failure,
