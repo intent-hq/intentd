@@ -79,6 +79,13 @@ def main():
         generated = (root / '.github/workflows/v-release.yml').read_text()
         subprocess.run(customize, cwd=root, check=True)
         assert generated == (root / '.github/workflows/v-release.yml').read_text()
+        shutil.copy(ROOT / 'scripts/configure-runner-routing.py', root / 'scripts/configure-runner-routing.py')
+        route_command = ['python3', '-I', '-B', 'scripts/configure-runner-routing.py']
+        subprocess.run(route_command, cwd=root, check=True)
+        routed = (root / '.github/workflows/v-release.yml').read_text()
+        subprocess.run(route_command, cwd=root, check=True)
+        assert routed == (root / '.github/workflows/v-release.yml').read_text()
+        assert "needs.runner-route.outputs.runners" in routed
         print('PASS: pinned cargo-dist includes successful Intel and removes partial Intel assets, checksums and release links')
 
 

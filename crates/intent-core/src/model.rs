@@ -478,13 +478,15 @@ pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
 /// folded git-root PRs) — unlike the active row's `agentSummary`, which is
 /// deliberately left uncapped, it is cheap to bound here — and
 /// [`WORKSPACE_LIST_ROW_BUDGET_BYTES`] was sized from a five-entry pool
-/// (≈ 390 B per slimmed entry). Survivors are the most recently updated
-/// entries (`updatedAt` descending, `number` descending on ties), with the
+/// (≈ 390 B per slimmed entry). Survivors prioritize draft, open, merged,
+/// then closed PRs. Within each lifecycle state, the
 /// entry matching `activePullRequest` — by repository-qualified `url`
 /// ([`PullRequestInfo::same_pull_request`]; PR numbers collide across the
 /// repositories the merged pool spans, and a blank-URL entry never stands
-/// in for an active PR that has a URL) — always retained and moved to the
-/// front; a truncated row reports the pre-cap length as
+/// in for an active PR that has a URL) — comes first, followed by recency
+/// (`updatedAt` descending, `number` descending on ties). A terminal active
+/// PR cannot displace unfinished PRs; `activePullRequest` itself remains
+/// available separately. A truncated row reports the pre-cap length as
 /// `pullRequestsTotal`. `workspace.get` serves the full pool.
 pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 
@@ -606,10 +608,9 @@ impl Workspace {
     /// - `activePullRequest` / `pullRequests[]` entries: per-PR detail
     ///   fields via [`PullRequestInfo::slim_for_list`].
     /// - `pullRequests[]` length: capped at [`WORKSPACE_LIST_PR_CAP`]
-    ///   entries — the most recently updated (`updatedAt` desc, `number`
-    ///   desc on ties), the `activePullRequest` match (by
-    ///   repository-qualified `url`, [`PullRequestInfo::same_pull_request`])
-    ///   always kept and moved to the front — with the pre-cap length
+    ///   entries — draft, open, merged, then closed; within each state the
+    ///   `activePullRequest` match leads, then `updatedAt` desc and `number`
+    ///   desc break ties (see [`WORKSPACE_LIST_PR_CAP`]) — with the pre-cap length
     ///   reported as `pullRequestsTotal`. A pool within the cap is left
     ///   untouched (no reorder, `pullRequestsTotal` absent).
     ///   `activePullRequest` itself is never removed (only slimmed, above).
@@ -643,17 +644,25 @@ impl Workspace {
             }
             if prs.len() > WORKSPACE_LIST_PR_CAP {
                 self.pull_requests_total = Some(u32::try_from(prs.len()).unwrap_or(u32::MAX));
+                let priority = |pr: &PullRequestInfo| match pr.status {
+                    PullRequestStatus::Draft => 0,
+                    PullRequestStatus::Open if pr.is_draft == Some(true) => 0,
+                    PullRequestStatus::Open => 1,
+                    PullRequestStatus::Merged => 2,
+                    PullRequestStatus::Closed => 3,
+                };
+                let is_active = |pr: &PullRequestInfo| {
+                    self.active_pull_request
+                        .as_ref()
+                        .is_some_and(|active| pr.same_pull_request(active))
+                };
                 prs.sort_by(|a, b| {
-                    b.updated_at
-                        .cmp(&a.updated_at)
+                    priority(a)
+                        .cmp(&priority(b))
+                        .then_with(|| is_active(b).cmp(&is_active(a)))
+                        .then_with(|| b.updated_at.cmp(&a.updated_at))
                         .then_with(|| b.number.cmp(&a.number))
                 });
-                if let Some(active) = self.active_pull_request.as_ref() {
-                    if let Some(pos) = prs.iter().position(|pr| pr.same_pull_request(active)) {
-                        let active = prs.remove(pos);
-                        prs.insert(0, active);
-                    }
-                }
                 prs.truncate(WORKSPACE_LIST_PR_CAP);
             }
         }
@@ -6418,6 +6427,41 @@ mod tests {
         let mut row = list_cap_workspace(8, Some(42));
         row.slim_for_list();
         assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+    }
+
+    #[test]
+    fn workspace_list_cap_keeps_unfinished_before_merged_active() {
+        let mut row = list_cap_workspace(8, None);
+        let pool = row.pull_requests.as_mut().unwrap();
+        for pr in pool.iter_mut().skip(2) {
+            pr.status = PullRequestStatus::Merged;
+            // A stale draft bit must not revive a terminal PR.
+            pr.is_draft = Some(true);
+        }
+        pool[0].is_draft = Some(true);
+        pool[0].url = "https://github.com/intent-hq/cloudlands-fe/pull/100".into();
+        row.active_pull_request = Some(pool[7].clone());
+        let full = row.clone();
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![100, 101, 107, 106, 105]);
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(row.active_pull_request.as_ref().unwrap().number, 107);
+        assert_eq!(pr_numbers(&full), (100..108).collect::<Vec<_>>());
+        assert_eq!(full.pull_requests_total, None);
+    }
+
+    #[test]
+    fn workspace_list_cap_does_not_reserve_a_slot_for_terminal_active() {
+        let mut row = list_cap_workspace(8, None);
+        let pool = row.pull_requests.as_mut().unwrap();
+        pool[7].status = PullRequestStatus::Merged;
+        row.active_pull_request = Some(pool[7].clone());
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![106, 105, 104, 103, 102]);
+        assert_eq!(row.active_pull_request.as_ref().unwrap().number, 107);
+        assert_eq!(row.pull_requests_total, Some(8));
     }
 
     /// The active-PR match is by repository-qualified `url`, not `id` /
