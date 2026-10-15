@@ -54,6 +54,13 @@ class RunnerPolicy(unittest.TestCase):
             self.assertEqual(violations(f'jobs:\n  unexpected:\n    runs-on: ubuntu-latest\n', filename), ['unexpected'])
             self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: ubuntu-latest\n', 'copy.yml'), [job])
 
+    def test_native_runner_delegation_is_exact(self):
+        runner = '${{ fromJSON(inputs.runner_labels) }}'
+        self.assertEqual(violations(f'jobs:\n  native:\n    runs-on: {runner}\n', 'native-artifacts.yml'), [])
+        self.assertEqual(violations(f'jobs:\n  native:\n    runs-on: {runner}\n', 'copy.yml'), ['native'])
+        self.assertEqual(violations(f'jobs:\n  other:\n    runs-on: {runner}\n', 'native-artifacts.yml'), ['other'])
+        self.assertEqual(violations('jobs:\n  native:\n    runs-on: ubuntu-latest\n', 'native-artifacts.yml'), ['native'])
+
     def test_routing_behavior(self):
         subprocess.run(['node', '--test', str(ROOT / 'scripts/runner-policy.test.cjs')], check=True)
 
