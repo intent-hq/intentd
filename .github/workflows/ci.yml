@@ -1615,7 +1615,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-      actions: read # Required by the nested runner-route probe.
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
