@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { assertWindowsTaskkillComplete } from './pi-session-cleanup.mjs';
 import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 
 const helper = new URL('./pi-session-cleanup.mjs', import.meta.url).href;
@@ -183,3 +184,41 @@ for (const bodyFails of [false, true]) {
     });
   }
 }
+
+test('Windows taskkill missing-process race waits for this child close event', async () => {
+  const child = { exitCode: null, signalCode: null };
+  let release;
+  const closed = new Promise(resolve => { release = resolve; });
+  let settled = false;
+  const result = assertWindowsTaskkillComplete(
+    { status: 128, signal: null, stderr: 'process not found' }, child, () => closed,
+  ).finally(() => { settled = true; });
+  result.catch(() => {});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'exit128 alone must not prove cleanup');
+  child.exitCode = 0;
+  release();
+  await result;
+});
+
+test('Windows taskkill still rejects kill errors and unproven closure', async () => {
+  for (const killed of [
+    { status: 1, stderr: 'access denied' },
+    { status: null, error: new Error('spawn failed') },
+    { status: 128, error: new Error('timed out'), stderr: 'process not found' },
+    { status: 128, signal: 'SIGTERM', stderr: 'process not found' },
+  ]) {
+    await assert.rejects(assertWindowsTaskkillComplete(killed, { exitCode: 0, signalCode: null }, async () => {}));
+  }
+  await assert.rejects(assertWindowsTaskkillComplete(
+    { status: 128 }, { exitCode: null, signalCode: null }, async () => { throw new Error('close deadline'); },
+  ), /close deadline/);
+  await assert.rejects(assertWindowsTaskkillComplete(
+    { status: 128 }, { exitCode: null, signalCode: null }, async () => {},
+  ), /exit not observed/);
+});
+
+test('Windows successful taskkill preserves the caller close and witness checks', async () => {
+  await assertWindowsTaskkillComplete({ status: 0 }, { exitCode: null, signalCode: null },
+    () => assert.fail('normal success retains caller close handling'));
+});

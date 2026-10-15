@@ -401,6 +401,29 @@ pub struct Store {
     >,
 }
 
+/// Exclusive database ownership prepared without opening `SQLite`.
+/// Dropping this before open releases the lock; after open every pool retains it.
+pub struct PreparedDaemonStore {
+    physical: std::path::PathBuf,
+    owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
+}
+
+impl PreparedDaemonStore {
+    /// Open/migrate without converting unopened notes.
+    ///
+    /// # Errors
+    /// Returns initialization errors, preserving the database ownership guard.
+    pub async fn open(self) -> Result<Store> {
+        // SQLite initialization callbacks retain ownership even if this caller
+        // disappears, matching open_for_daemon's existing cancellation guarantee.
+        tokio::spawn(Store::finish_owned_startup(self.physical, self.owner))
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("daemon database initialization task failed: {e}"))
+            })?
+    }
+}
+
 impl Store {
     /// Open (creating if needed) the database at `db_path` and run migrations.
     /// Builds two pools: a single-connection write pool and a 32-connection read pool.
@@ -472,6 +495,14 @@ impl Store {
     /// Returns an error if another daemon owns this database, locking is unsupported,
     /// or opening/migrating/sweeping the database fails.
     pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
+        Self::prepare_for_daemon(db_path)?.open().await
+    }
+
+    /// Acquire database ownership before exposing startup listeners.
+    ///
+    /// # Errors
+    /// Refuses aliases, unsupported locking, and a competing daemon owner.
+    pub fn prepare_for_daemon(db_path: &Path) -> Result<PreparedDaemonStore> {
         // Resolve symlinks (including parent aliases for a new DB) before deriving
         // the lock path, so different config paths cannot acquire different locks.
         // exists() follows symlinks: a dangling final alias would otherwise get
@@ -497,17 +528,10 @@ impl Store {
         let mut lock_path = physical.as_os_str().to_os_string();
         lock_path.push(".daemon.lock");
         let owner = daemon_ownership::DaemonOwnership::acquire(Path::new(&lock_path))?;
-        // SQLx installs connection callbacks after its initial PRAGMAs. Keep
-        // initialization owned even if the caller cancels while those run.
-        // Dropping a JoinHandle detaches this startup task; no Store escapes
-        // until migrations and cleanup finish. Its result is dropped if the
-        // caller has gone away.
-        tokio::spawn(Self::finish_owned_startup(
+        Ok(PreparedDaemonStore {
             physical,
-            std::sync::Arc::new(owner),
-        ))
-        .await
-        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+            owner: std::sync::Arc::new(owner),
+        })
     }
 
     async fn finish_owned_startup(
