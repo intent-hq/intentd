@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.48] - 2026-10-15
+
+### 📚 Documentation
+
+- Explain current workspace toast suppression ([#2374](https://github.com/intent-hq/intentd/pull/2374))
+
+
 ## [0.10.47] - 2026-10-15
 
 ### 🚀 Features

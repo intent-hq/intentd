@@ -74,6 +74,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("browser.rs", "browser."),
         ("host.rs", "host."),
         ("control.rs", "system."),
+        ("startup.rs", "system."),
         ("pairing.rs", "pairing."),
         ("server.rs", "server."),
         ("provider_setup.rs", "providers.setup."),
@@ -190,7 +191,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 435;
+const EXPECTED_TOTAL_METHODS: usize = 436;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -200,7 +201,7 @@ const EXPECTED_TOTAL_METHODS: usize = 435;
 const EXPECTED_ROUTER_METHODS: usize = 378;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -859,6 +860,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "system.status",
     "task.assignAgent",
     "task.convertBlocks",
@@ -1390,6 +1392,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "terminal.create",
     "terminal.getBuffer",
     "terminal.kill",
@@ -2581,6 +2584,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
+        "system.startupStatus",
         "unsloth.status",
         "unsloth.stop",
     ];

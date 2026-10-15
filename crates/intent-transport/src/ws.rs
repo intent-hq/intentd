@@ -15,6 +15,8 @@
 //! serves plain `ws://` with no TLS acceptor and no bearer-token enforcement;
 //! it is the only path in this module that ever bypasses those checks.
 
+mod startup;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -374,8 +376,7 @@ pub(crate) struct ClientHandle {
 /// Shared listener state (the TS server instance). Lifecycle methods are in
 /// [`crate::lifecycle`]; transport mechanics are below.
 pub(crate) struct WsInner {
-    pub api: Arc<dyn WorkspaceApi>,
-    pub bus: EventBus,
+    pub dispatch: crate::startup::StartupDispatch,
     /// TLS acceptor for secure listeners; `None` puts the listener in the
     /// insecure dev-mode plain-`ws://` accept path.
     pub acceptor: Option<TlsAcceptor>,
@@ -401,26 +402,6 @@ pub(crate) struct WsInner {
     pub external_stop_generation: AtomicU64,
     pub state: tokio::sync::Mutex<StartState>,
     pub stop_gate: tokio::sync::Mutex<()>,
-    /// REV-1 first-client-sticky reverse-dispatch target set. Every accepted
-    /// connection registers its per-connection [`ReverseChannel`] here so
-    /// agent-initiated reverse RPCs (`browser.exec`) can be routed to the
-    /// first-connected live client. Defaults to a fresh (empty) registry, so
-    /// standalone / test wiring keeps the pre-REV-1 behavior (agent-initiated
-    /// reverse RPCs still surface `NoClient` when the composition root did not
-    /// share a registry across listeners).
-    pub reverse_registry: Arc<PrimaryReverseRegistry>,
-    /// Server pairing info provider for `server.pairingInfo` / `server.rotateToken`
-    /// fast-path (§5.2). `None` means the methods are unavailable on this listener.
-    pub server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
-    /// System control surface (§5.7) for `system.status`/`system.shutdown`. When
-    /// present, fast-path `system.*` RPCs are handled inline on the connection
-    /// loop. Shared with the UDS listener; `None` in test harnesses that don't
-    /// wire a daemon control surface.
-    pub control: Option<Arc<dyn crate::control::SystemControl>>,
-    /// Daemon-wide outstanding-slow-path-RPC cap shared with the UDS listener
-    /// (`server.maxOutstandingRpcs`); unlimited unless the composition root
-    /// wires one through [`WsOptions::rpc_limiter`].
-    pub rpc_limiter: RpcLimiter,
     /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
     pub tunnel_limits: crate::tunnel::TunnelLimits,
     /// Test-only post-deregistration gate (from [`WsOptions::cleanup_gate`]).
@@ -469,8 +450,14 @@ impl WsApiServer {
     ) -> Result<Self> {
         let acceptor = build_acceptor(tls)?;
         let inner = WsInner {
-            api,
-            bus,
+            dispatch: crate::startup::StartupDispatch::normal(crate::startup::ReadyServices {
+                api,
+                bus,
+                rpc_limiter: options.rpc_limiter.clone(),
+                reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+                server_pairing_info: None,
+                control,
+            }),
             acceptor: Some(acceptor),
             token_store: Some((**token_store).clone()),
             enabled: options.enabled,
@@ -488,10 +475,6 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             stop_gate: tokio::sync::Mutex::new(()),
-            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
-            server_pairing_info: None,
-            control,
-            rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
@@ -516,8 +499,14 @@ impl WsApiServer {
         control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Self {
         let inner = WsInner {
-            api,
-            bus,
+            dispatch: crate::startup::StartupDispatch::normal(crate::startup::ReadyServices {
+                api,
+                bus,
+                rpc_limiter: options.rpc_limiter.clone(),
+                reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+                server_pairing_info: None,
+                control,
+            }),
             acceptor: None,
             token_store: None,
             enabled: options.enabled,
@@ -533,10 +522,6 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             stop_gate: tokio::sync::Mutex::new(()),
-            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
-            server_pairing_info: None,
-            control,
-            rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
@@ -548,6 +533,47 @@ impl WsApiServer {
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Build the same listener with restricted startup dispatch and no Store.
+    ///
+    /// # Errors
+    /// Returns TLS configuration errors without exposing a listener.
+    pub fn new_startup(
+        dispatch: crate::startup::StartupDispatch,
+        tls: Option<&TlsCertificate>,
+        token_store: Option<&Arc<AsyncTokenStore>>,
+        options: WsOptions,
+    ) -> Result<Self> {
+        let acceptor = tls.map(build_acceptor).transpose()?;
+        let inner = WsInner {
+            dispatch,
+            acceptor,
+            token_store: token_store.map(|s| (**s).clone()),
+            enabled: options.enabled,
+            auth_enabled: tls.is_some() && options.auth_enabled,
+            locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
+            bind_addresses: options.bind_addresses.clone(),
+            base_port: options.base_port,
+            fingerprint: tls.map(|t| t.fingerprint256.clone()),
+            heartbeat_interval: options.heartbeat_interval,
+            heartbeat_timeout: options.heartbeat_timeout,
+            clients: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(0),
+            external_stop_generation: AtomicU64::new(0),
+            state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
+            tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
+            heartbeat_gate: options.heartbeat_gate,
+            recovery_bulk_gate: options.recovery_bulk_gate,
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
+            guests: GuestRegistry::new(options.guest_limits),
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// [`new`](Self::new) variant that shares an existing REV-1 primary
@@ -596,7 +622,7 @@ impl WsApiServer {
     fn install_registry(server: &mut Self, reverse_registry: Arc<PrimaryReverseRegistry>) {
         let inner = Arc::get_mut(&mut server.inner)
             .expect("WsApiServer inner not yet shared before install_registry");
-        inner.reverse_registry = reverse_registry;
+        inner.dispatch.services_mut().reverse_registry = reverse_registry;
     }
 
     /// Install server pairing info provider on the inner state. Uses the same
@@ -611,7 +637,7 @@ impl WsApiServer {
     ) {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("WsApiServer inner not yet shared before install_pairing_info");
-        inner.server_pairing_info = Some(server_pairing_info);
+        inner.dispatch.services_mut().server_pairing_info = Some(server_pairing_info);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -694,6 +720,15 @@ impl WsApiServer {
     #[must_use]
     pub fn is_insecure(&self) -> bool {
         self.inner.acceptor.is_none()
+    }
+}
+
+impl std::ops::Deref for WsInner {
+    type Target = crate::startup::ReadyServices;
+    fn deref(&self) -> &Self::Target {
+        self.dispatch
+            .ready()
+            .expect("ordinary dispatch requires readiness")
     }
 }
 
@@ -842,6 +877,11 @@ impl WsInner {
         }
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
+        }
+        if self.dispatch.ready().is_none() {
+            return self
+                .bootstrap_upgrade(stream, path, target, authorization.as_deref(), ws_key)
+                .await;
         }
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
@@ -1008,6 +1048,17 @@ impl WsInner {
     where
         W: AsyncWrite + Unpin,
     {
+        if self.dispatch.ready().is_none() {
+            let phase = self.dispatch.status().snapshot().phase;
+            let body = if phase == intent_core::startup::StartupPhase::Failed {
+                "{\"status\":\"failed\"}"
+            } else {
+                "{\"status\":\"starting\"}"
+            };
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await?;
+            return stream.shutdown().await;
+        }
         let count = self.clients.lock().expect("ws clients poisoned").len();
         let guests = self.guests.connections();
         let body =

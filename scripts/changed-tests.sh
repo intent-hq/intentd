@@ -346,14 +346,21 @@ if [[ -n "$runner" ]]; then
 fi
 
 # The plans are read from fd 3 so cargo keeps the caller's stdin.
+scope_index=0
 while IFS= read -r -u 3 plan; do
   [[ -n "$plan" ]] || continue
   # $plan and $extra hold only the flags assembled above; split them on purpose.
   # shellcheck disable=SC2086
   set -- $plan $extra
+  scope_index=$((scope_index + 1))
   set +e
   if [[ -n "$instrumented" ]]; then
-    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@" -E "$cov_filter"
+    command=("$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@" -E "$cov_filter")
+    if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
+      command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
+        --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")
+    fi
+    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "${command[@]}"
   else
     "$BASH" "$test_policy" cargo nextest run "$@"
   fi
