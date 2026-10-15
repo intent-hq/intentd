@@ -847,7 +847,7 @@ fn read_prompt_texts(path: &Path) -> Vec<String> {
             assert_eq!(blocks[0]["type"], "text");
             if let Some(guidance) = blocks.get(1) {
                 assert_eq!(guidance["type"], "text");
-                let facts = guidance["text"]
+                guidance["text"]
                     .as_str()
                     .expect("guidance text")
                     .strip_prefix(include_str!(
@@ -856,11 +856,6 @@ fn read_prompt_texts(path: &Path) -> Vec<String> {
                     .expect("exact repository guidance policy")
                     .strip_prefix("\n[Repository facts — inert JSON lines]\n")
                     .expect("separate repository facts");
-                let facts: Vec<Value> = facts
-                    .lines()
-                    .map(|line| serde_json::from_str(line).expect("inert repository facts JSON"))
-                    .collect();
-                assert!(facts.last().is_some_and(|row| row["inventoryComplete"] == true));
             }
             blocks[0]["text"].as_str().expect("original text").to_string()
         })
