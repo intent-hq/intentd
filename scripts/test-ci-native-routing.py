@@ -657,6 +657,15 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 class NativeRoutingTests(unittest.TestCase):
+    def test_nested_monorepo_runner_probe_has_only_required_read_permissions(self):
+        # consumer-checks@main delegates runner selection to runner-route,
+        # which needs Actions metadata. A caller cannot grant fewer scopes.
+        workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        caller = workflow['jobs']['monorepo-consumer-checks']
+        self.assertEqual(caller['permissions'], {'contents': 'read', 'actions': 'read'})
+        self.assertEqual(caller['uses'], 'intent-hq/intent/.github/workflows/consumer-checks.yml@main')
+        self.assertNotIn('secrets', caller)
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = _workflow_tests.load_ci(ROOT)
