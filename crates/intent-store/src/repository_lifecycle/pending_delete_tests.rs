@@ -255,7 +255,7 @@ async fn unobserved_original_guard_blocks_first_install_until_confirmed() {
         .install_repository_lifecycle_observer(observer.clone())
         .await
         .is_err());
-    guard.settle_confirmed();
+    guard.settle_confirmed().await.unwrap();
     f.store
         .install_repository_lifecycle_observer(observer.clone())
         .await
@@ -314,13 +314,13 @@ async fn own_confirmation_does_not_settle_predecessor_or_unrelated_ticket() {
         .begin_repository_pending_delete(std::slice::from_ref(&other))
         .await
         .unwrap();
-    second.settle_confirmed();
+    second.settle_confirmed().await.unwrap();
     assert!(probe.blocked(&key));
     assert!(probe.blocked(&other));
-    first.settle_confirmed();
+    first.settle_confirmed().await.unwrap();
     assert!(!probe.blocked(&key));
     assert!(probe.blocked(&other));
-    unrelated.settle_confirmed();
+    unrelated.settle_confirmed().await.unwrap();
     assert!(!probe.blocked(&other));
 }
 
@@ -353,7 +353,9 @@ async fn actual_observer_and_unknown_ticket_survive_last_store_reopen() {
         .begin_repository_pending_delete(std::slice::from_ref(&key))
         .await
         .unwrap()
-        .settle_confirmed();
+        .settle_confirmed()
+        .await
+        .unwrap();
     assert!(
         probe.blocked(&key),
         "neither reinstall nor later success settles the original"
@@ -393,7 +395,7 @@ async fn retained_original_can_confirm_after_independent_managed_open() {
         .install_repository_lifecycle_observer(observer.clone())
         .await
         .is_err());
-    guard.settle_confirmed();
+    guard.settle_confirmed().await.unwrap();
     reopened
         .install_repository_lifecycle_observer(observer)
         .await
@@ -459,12 +461,12 @@ async fn begin_and_first_install_have_both_serialized_orders() {
             install.await.unwrap();
             let guard = begin.await.unwrap();
             assert!(probe.blocked(&keys[0]));
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
             assert!(!probe.blocked(&keys[0]));
         } else {
             let guard = begin.await.unwrap();
             assert!(install.await.is_err());
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
             f.store
                 .install_repository_lifecycle_observer(observer)
                 .await
@@ -500,7 +502,12 @@ async fn held_observer_callback_does_not_hold_store_writer_or_install_lock() {
     .unwrap();
     assert!(probe.blocked(&f.key()));
     release.send(()).unwrap();
-    task.await.unwrap().unwrap().settle_confirmed();
+    task.await
+        .unwrap()
+        .unwrap()
+        .settle_confirmed()
+        .await
+        .unwrap();
     assert!(!probe.blocked(&f.key()));
 }
 
@@ -538,7 +545,7 @@ async fn aborted_unpolled_and_panicked_guard_owners_never_confirm() {
         let task = tokio::spawn(async move {
             assert!(!panic, "fixture worker panic");
             std::future::pending::<()>().await;
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
         });
         if !panic {
             task.abort();
@@ -600,7 +607,9 @@ async fn replaced_original_database_cannot_begin_or_borrow_another_domain() {
         .begin_repository_pending_delete(&[other.key()])
         .await
         .unwrap()
-        .settle_confirmed();
+        .settle_confirmed()
+        .await
+        .unwrap();
     assert!(f
         .store
         .begin_repository_pending_delete(&[f.key()])
@@ -646,7 +655,7 @@ async fn factual_commit_removes_rows_tombstones_id_and_evicts_display_cache() {
         probe.blocked(&f.key()),
         "Store completion is not pending-owner settlement"
     );
-    guard.settle_confirmed();
+    guard.settle_confirmed().await.unwrap();
     assert!(!probe.blocked(&f.key()));
 }
 
@@ -800,7 +809,7 @@ async fn cancelled_batch(installed: bool) {
     let task = tokio::spawn(async move {
         let outcome = store.delete_workspace_with_outcome(&id).await;
         if outcome.disposition == Committed {
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
         }
         outcome
     });
@@ -831,7 +840,9 @@ async fn cancelled_batch(installed: bool) {
             .begin_repository_pending_delete(std::slice::from_ref(&key))
             .await
             .unwrap()
-            .settle_confirmed();
+            .settle_confirmed()
+            .await
+            .unwrap();
         assert!(probe.blocked(&key));
     } else {
         assert!(reopened
@@ -892,7 +903,7 @@ async fn cancelled_caller_does_not_cancel_original_final_commit_or_settle_pendin
     let task = tokio::spawn(async move {
         let outcome = store.delete_workspace_with_outcome(&id).await;
         if outcome.disposition == Committed {
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
         }
         outcome
     });
@@ -941,7 +952,7 @@ async fn domain_identity_matches_clones_and_managed_opens_without_granting_insta
         .await
         .is_err());
 
-    guard.settle_confirmed();
+    guard.settle_confirmed().await.unwrap();
     reopened
         .install_repository_lifecycle_observer(observer.clone())
         .await
@@ -1036,7 +1047,9 @@ async fn domain_identity_preserves_installed_unknown_ticket_after_last_store_reo
         .begin_repository_pending_delete(std::slice::from_ref(&key))
         .await
         .unwrap()
-        .settle_confirmed();
+        .settle_confirmed()
+        .await
+        .unwrap();
     assert!(reopened.shares_repository_lifecycle_domain(&independent));
     assert!(
         probe.blocked(&key),

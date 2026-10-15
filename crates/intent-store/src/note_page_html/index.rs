@@ -62,7 +62,7 @@ fn source_pieces(
         .enumerate()
     {
         let piece_id = entries.id();
-        entries.rows.push((reference.clone(), position, json!({"kind":"sourcePiece","id":piece_id,"nodeRef":format!("d:{id}"),"sourceRange":wire_range(range,units),"role":role})));
+        entries.push((reference.clone(), position, json!({"kind":"sourcePiece","id":piece_id,"nodeRef":format!("d:{id}"),"sourceRange":wire_range(range,units),"role":role})));
     }
     reference
 }
@@ -207,7 +207,7 @@ pub(crate) fn append(
                 value.clone(),
             ));
         }
-        entries.rows.push((format!("d:{native_id}"), 0, value));
+        entries.push((format!("d:{native_id}"), 0, value));
     }
     for (&id, (boundary_id, envelope)) in &boundaries {
         let node = &tree.nodes[id];
@@ -278,7 +278,7 @@ pub(crate) fn append(
         {
             let fragment =
                 entries.fragment(field, range.as_ref().map_or("", |r| &source[r.clone()]));
-            entries.rows.push((detail.clone(),index,json!({"kind":"fragment","id":format!("{boundary_id}:{index}"),"field":field,"offset":0,"text":"","nextRef":fragment})));
+            entries.push((detail.clone(),index,json!({"kind":"fragment","id":format!("{boundary_id}:{index}"),"field":field,"offset":0,"text":"","nextRef":fragment})));
         }
         let literal_range = if provenance == "implicit" {
             envelope.start..envelope.start
@@ -418,7 +418,7 @@ pub(crate) fn append(
             let id = entries.id();
             let map = json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":wire_range(&raw,units),"renderedRange":{"start":rendered.start,"end":rendered.end},"mapping":mapping,"textRef":text_ref});
             let position = positions.entry(owner.clone()).or_default();
-            entries.rows.push((format!("h:{owner}"), *position, map));
+            entries.push((format!("h:{owner}"), *position, map));
             *position += 1;
         }
     }

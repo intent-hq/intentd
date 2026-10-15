@@ -145,7 +145,7 @@ async fn imported_ready(store: &Store, note: &Note) {
 }
 
 #[tokio::test]
-async fn transfer_finalizes_after_comments_and_assigns_fresh_incarnation() {
+async fn demand_transfer_prepares_after_comments_and_assigns_fresh_incarnation() {
     let (_source_db, source, note) = legacy_source().await;
     let original = source_page(&source, &note).await;
     let rows = source
@@ -159,6 +159,17 @@ async fn transfer_finalizes_after_comments_and_assigns_fresh_incarnation() {
     let target_db = TempDb::new();
     let target = Store::open(&target_db.path).await.unwrap();
     target.transfer_import_rows(&rows).await.unwrap();
+    assert!(
+        !target
+            .note_annotation_epochs(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .anchors_ready
+    );
+    target
+        .ensure_note_index(note.workspace_id.as_str(), note.id.as_str(), true)
+        .await
+        .unwrap();
     imported_ready(&target, &note).await;
     let imported = source_page(&target, &note).await;
     assert_eq!(imported["text"], original["text"]);
@@ -174,7 +185,7 @@ async fn transfer_finalizes_after_comments_and_assigns_fresh_incarnation() {
 }
 
 #[tokio::test]
-async fn final_anchor_failure_rolls_back_import_then_same_rows_retry() {
+async fn demand_anchor_failure_preserves_import_and_retries_after_restart() {
     let (_source_db, source, note) = legacy_source().await;
     let rows = source
         .transfer_export_rows(&note.workspace_id)
@@ -182,40 +193,46 @@ async fn final_anchor_failure_rolls_back_import_then_same_rows_retry() {
         .unwrap();
     let target_db = TempDb::new();
     let target = Store::open(&target_db.path).await.unwrap();
-    sqlx::query("CREATE TRIGGER reject_import_anchor BEFORE INSERT ON note_comment_anchor WHEN new.comment_id='healthy' BEGIN SELECT RAISE(ABORT,'import final anchor rejected'); END")
+    sqlx::query("CREATE TRIGGER reject_import_anchor BEFORE INSERT ON note_comment_anchor BEGIN SELECT RAISE(ABORT,'import final anchor rejected'); END")
         .execute(target.write_pool()).await.unwrap();
-    let result = target.transfer_import_rows(&rows).await;
+    target.transfer_import_rows(&rows).await.unwrap();
+    let result = target
+        .ensure_note_index(note.workspace_id.as_str(), note.id.as_str(), true)
+        .await;
     assert!(
         matches!(result, Err(Error::Internal(message)) if message.contains("import final anchor rejected"))
     );
-    assert!(target
-        .transfer_table_stats(&note.workspace_id)
-        .await
-        .unwrap()
-        .iter()
-        .all(|table| table.row_count == 0));
-    for table in [
-        "note_annotation_head",
-        "note_comment_projection",
-        "note_comment_anchor",
-        "note_comment_anchor_cover",
-    ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(target.read_pool())
+    assert_eq!(
+        target
+            .get_note(&note.workspace_id, &note.id)
             .await
-            .unwrap();
-        assert_eq!(count, 0, "{table}");
-    }
+            .unwrap()
+            .content,
+        SOURCE
+    );
+    assert!(
+        !target
+            .note_annotation_epochs(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .anchors_ready
+    );
     sqlx::query("DROP TRIGGER reject_import_anchor")
         .execute(target.write_pool())
         .await
         .unwrap();
-    target.transfer_import_rows(&rows).await.unwrap();
+    target.close().await;
+    drop(target);
+    let target = Store::open(&target_db.path).await.unwrap();
+    target
+        .ensure_note_index(note.workspace_id.as_str(), note.id.as_str(), true)
+        .await
+        .unwrap();
     imported_ready(&target, &note).await;
 }
 
 #[tokio::test]
-async fn reopening_repairs_legacy_pending_anchors_without_reviving_retirement() {
+async fn demand_reopening_leaves_legacy_anchors_pending_without_reviving_retirement() {
     let (db, store, note) = legacy_source().await;
     let retired_ws = WorkspaceId("retired".into());
     store
@@ -250,6 +267,17 @@ async fn reopening_repairs_legacy_pending_anchors_without_reviving_retirement() 
     store.close().await;
     drop(store);
     let reopened = Store::open(&db.path).await.unwrap();
+    assert!(
+        !reopened
+            .note_annotation_epochs(&note.workspace_id, &note.id)
+            .await
+            .unwrap()
+            .anchors_ready
+    );
+    reopened
+        .ensure_note_index(note.workspace_id.as_str(), note.id.as_str(), true)
+        .await
+        .unwrap();
     imported_ready(&reopened, &note).await;
     assert_eq!(
         source_page(&reopened, &note).await["scope"],

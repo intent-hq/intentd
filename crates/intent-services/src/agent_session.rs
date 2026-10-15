@@ -1919,6 +1919,7 @@ fn build_session_meta(
 pub(crate) struct LocalPromptInput<'a> {
     pub(crate) connection: &'a Connection,
     pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    pub(crate) required: Option<Box<crate::repository_read_source::MonitorPromptAdmission>>,
 }
 
 impl Services {
@@ -2808,6 +2809,31 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_review_context(
+            conn,
+            callbacks,
+            agent_id,
+            cwd,
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_acp_session_with_review_context(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        native: Option<
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        >,
+    ) -> Result<PreparedAcpSession> {
+        let context = native.map(
+            crate::repository_admission::lifecycle::native_allocation::NativeAllocation::context,
+        );
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2827,12 +2853,20 @@ impl Services {
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
             is_orchestrator,
         );
+        if let Some(context) = context {
+            if !callbacks.is_some_and(CallbackClient::supports_review_monitoring) {
+                return Err(Error::Unsupported(
+                    "Private native startup unavailable".into(),
+                ));
+            }
+            context.insert_into(meta.get_or_insert_with(Default::default));
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2854,6 +2888,37 @@ impl Services {
                 )
         }
         .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        if let Some(native) = native {
+            native
+                .bind_response(&opened.response.session_id.0)
+                .map_err(|_| Error::Forbidden("Private native startup unavailable".into()))?;
+        }
+        if let Some(context) = context {
+            let exact = opened
+                .query
+                .as_ref()
+                .and_then(
+                    intent_acp::callback_registration::CallbackQuery::pending_review_monitoring,
+                )
+                .is_some_and(|pending| pending.matches_context(context));
+            if !exact {
+                // A response is not permission to persist or use a mismatched
+                // allocation. Join only the original requested startup attempt.
+                if let Some(callbacks) = callbacks {
+                    callbacks
+                        .retire_review_context(&opened.response.session_id.0, context)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("Private native retirement unconfirmed".into())
+                        })?;
+                }
+                return Err(if native.is_some_and(crate::repository_admission::lifecycle::native_allocation::NativeAllocation::is_retired) {
+                    Error::Forbidden("Private native startup unavailable".into())
+                } else {
+                    Error::Unsupported("Private native startup unavailable".into())
+                });
+            }
+        }
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -2976,6 +3041,20 @@ impl Services {
         replacing: bool,
     ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
         let (conn, callbacks) = conn;
+        if let Some(callbacks) =
+            callbacks.filter(|callbacks| callbacks.supports_review_monitoring())
+        {
+            return self
+                .create_owned_review_session(
+                    callbacks.clone(),
+                    agent_id.clone(),
+                    cwd.into(),
+                    mcp_servers,
+                    creation,
+                    replacing,
+                )
+                .await;
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -3073,6 +3152,34 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
+        let stored = self.store.get_agent_session(agent_id).await?;
+        if let Some(session_id) = &stored.acp_session_id {
+            if self
+                .store
+                .get_review_context_enrollment(&stored.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+            {
+                let callbacks = callbacks
+                    .filter(|client| client.supports_review_monitoring())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "Private native history requires original admission".into(),
+                        )
+                    })?;
+                return self
+                    .load_owned_review_session(
+                        callbacks.clone(),
+                        init.clone(),
+                        agent_id.clone(),
+                        cwd.into(),
+                        mcp_servers,
+                        creation,
+                    )
+                    .await
+                    .map(Some);
+            }
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -3108,11 +3215,51 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<PreparedAcpLoad>> {
+        self.prepare_acp_load_with_review(
+            conn,
+            callbacks,
+            init,
+            agent_id,
+            cwd.into(),
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original startup owners and admission inputs remain explicit"
+    )]
+    async fn prepare_acp_load_with_review(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        review: Option<(
+            &crate::repository_admission::lifecycle::physical_owner::RepositoryReviewBootstrap,
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        )>,
+    ) -> Result<Option<PreparedAcpLoad>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
+        if review.is_none()
+            && self
+                .store
+                .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
+                .await?
+                .is_some()
+        {
+            return Err(Error::Unsupported(
+                "Private native history requires original admission".into(),
+            ));
+        }
         if !session::supports_load_session(init) {
             return Ok(None);
         }
@@ -3182,7 +3329,61 @@ impl Services {
             "info",
         )
         .await;
-        let opened = if let Some(callbacks) = callbacks {
+        let opened = if let Some((bootstrap, native)) = review {
+            let unavailable =
+                || Error::Forbidden("Private native history requires original admission".into());
+            let callbacks = callbacks.ok_or_else(unavailable)?;
+            if bootstrap.loaded_session().map_err(|_| unavailable())? != acp_session_id
+                || native.is_retired()
+            {
+                return Err(unavailable());
+            }
+            bootstrap
+                .with_current(|| Ok(()))
+                .map_err(|_| unavailable())?;
+            let prepared = callbacks
+                .prepare_review_history(&acp_session_id, native.context().clone())
+                .await
+                .map_err(|_| unavailable())?;
+            let target = prepared
+                .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
+                .map_err(|_| unavailable())?;
+            let verified = bootstrap
+                .verify_history(prepared.messages())
+                .await
+                .map_err(|_| unavailable())?;
+            let admitted = verified
+                .admit(Arc::new(self.clone()))
+                .await
+                .map_err(|_| unavailable())?;
+            admitted
+                .retain_native_context()
+                .map_err(|_| unavailable())?;
+            let opened = prepared
+                .load(
+                    callbacks,
+                    cwd,
+                    mcp_servers,
+                    meta,
+                    admitted.bind_load(target),
+                )
+                .await;
+            if let Ok(opened) = &opened {
+                if native.is_retired()
+                    || !opened
+                        .query
+                        .as_ref()
+                        .and_then(intent_acp::callback_registration::CallbackQuery::pending_review_monitoring)
+                        .is_some_and(|receipt| receipt.matches_context(native.context()))
+                {
+                    native.join().await.map_err(|_| {
+                        Error::Internal("Private native retirement unconfirmed".into())
+                    })?;
+                    return Err(unavailable());
+                }
+            }
+            opened
+        } else if let Some(callbacks) = callbacks {
             callbacks
                 .load_session(&acp_session_id, cwd, mcp_servers, meta)
                 .await
@@ -3354,6 +3555,7 @@ impl Services {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
         let prompt = prompt.into_blocks();
+        let required = local.as_ref().is_some_and(|input| input.required.is_some());
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3507,6 +3709,21 @@ impl Services {
             let attempt_result = {
                 let prompt_fut = async {
                     if let Some(input) = local.as_mut() {
+                        if required {
+                            let admission = input.required.take().ok_or_else(|| {
+                                AcpError::Transport(
+                                    "required monitor prompt already consumed".into(),
+                                )
+                            })?;
+                            return Box::pin(session::prompt_with_required_admission(
+                                input.connection,
+                                acp_session_id,
+                                prompt.clone(),
+                                &activity,
+                                admission,
+                            ))
+                            .await;
+                        }
                         let guidance = match input.captured.as_mut() {
                             Some(original) => original.prepare().await,
                             None => None,
@@ -3604,7 +3821,8 @@ impl Services {
             // Only a recognized pre-start policy rejection may change modes and
             // replay the untouched prompt. Reuse the output/client-work guards
             // above, and recheck after the asynchronous mode change.
-            if !closed
+            if !required
+                && !closed
                 && !any_update_received
                 && conn.client_request_seq() == client_request_watermark
             {
@@ -3660,7 +3878,8 @@ impl Services {
             }
             match &attempt_result {
                 Err(e)
-                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                    if !required
+                        && fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
                         && conn.client_request_seq() == client_request_watermark
@@ -6221,3 +6440,6 @@ impl Services {
         .await
     }
 }
+
+#[path = "agent_session/review_startup.rs"]
+mod review_startup;

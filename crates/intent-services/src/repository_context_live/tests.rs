@@ -26,10 +26,16 @@ impl LiveFixture {
     pub(crate) async fn new(http: &ReadServer) -> Self {
         Self::from_base(ActualRead::new(http).await).await
     }
+    pub(crate) async fn with_version(http: &ReadServer, version: &str) -> Self {
+        Self::from_base_with_version(ActualRead::new(http).await, version).await
+    }
     async fn from_base(base: ActualRead) -> Self {
+        Self::from_base_with_version(base, "3.0").await
+    }
+    async fn from_base_with_version(base: ActualRead, version: &str) -> Self {
         let session: AgentSession = serde_json::from_value(json!({
             "id":AgentId::new(),"workspaceId":base.git.workspace.id,"name":"real-context",
-            "status":"active","harnessVersion":"3.0", "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
+            "status":"active","harnessVersion":version, "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
         })).unwrap();
         base.auth
             .service
@@ -58,7 +64,8 @@ impl LiveFixture {
         .unwrap();
         let owner = RepositoryContextOwner::bind(
             base.auth.service.clone(),
-            RepositoryReadOwner::capture(base.auth.service.clone()),
+            RepositoryReadOwner::capture(base.auth.service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
             &physical,
         )
         .unwrap();
@@ -247,7 +254,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     let foreign = Arc::new(f.base.auth.service.as_ref().clone());
     assert!(RepositoryContextOwner::bind(
         foreign,
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());
@@ -268,7 +276,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     );
     let separate = RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical,
     )
     .unwrap();
@@ -526,7 +535,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
     let other = LiveFixture::new(&other_http).await;
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &other.physical
     )
     .is_err());
@@ -557,7 +567,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
         .unwrap();
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());

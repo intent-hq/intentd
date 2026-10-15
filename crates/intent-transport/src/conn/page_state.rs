@@ -234,7 +234,7 @@ async fn forward(
             }
         }
         let deleted = state["deleted"] == true;
-        permit.send(frame);
+        permit.send(frame.into());
         if let Some(timer) = timer.take() {
             timer.snapshot_emitted();
         }

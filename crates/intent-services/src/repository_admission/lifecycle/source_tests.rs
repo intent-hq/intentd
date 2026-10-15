@@ -1183,7 +1183,9 @@ mod precise_registered_tests {
                                 ])
                                 .await
                                 .unwrap()
-                                .settle_confirmed();
+                                .settle_confirmed()
+                                .await
+                                .unwrap();
                         }
                         _ => {
                             let _independent =

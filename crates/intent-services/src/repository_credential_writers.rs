@@ -73,3 +73,7 @@ impl RepositoryCredentialWriters {
         policy::reserve(self.directory.clone(), self.policy.clone(), binding)
     }
 }
+
+#[cfg(test)]
+#[path = "repository_credential_writers/tests.rs"]
+mod tests;

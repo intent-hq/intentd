@@ -9,7 +9,6 @@ use std::fmt::Write as _;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
-use intent_sourcecontrol::PrAncestry;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
 use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
@@ -966,95 +965,10 @@ impl Harness for V1 {
     }
 
     fn pr_checklist(&self, s: &PrMonitorSnapshot) -> String {
-        let r = &s.requirements;
-        let mut lines = vec![format!("state: {}", r.state)];
-        let approvals = match r.approvals.needed {
-            Some(needed) => format!(
-                "approvals: {} ({}/{} required)",
-                r.approvals.decision, r.approvals.have, needed
-            ),
-            None => format!(
-                "approvals: {} ({} approving)",
-                r.approvals.decision, r.approvals.have
-            ),
-        };
-        lines.push(approvals);
-        if r.approvals.changes_requested > 0 {
-            lines.push(format!(
-                "changes requested by {} reviewer{}",
-                r.approvals.changes_requested,
-                plural(r.approvals.changes_requested)
-            ));
-        }
-        let mut checks = format!(
-            "checks: {} passed, {} failed, {} pending (of {})",
-            r.checks.passed, r.checks.failed, r.checks.pending, r.checks.total
-        );
-        if !r.checks.failing_required.is_empty() {
-            let _ = write!(
-                checks,
-                "; failing required: {}",
-                r.checks.failing_required.join(", ")
-            );
-        }
-        if !r.checks.pending_required.is_empty() {
-            let _ = write!(
-                checks,
-                "; pending required: {}",
-                r.checks.pending_required.join(", ")
-            );
-        }
-        if !r.checks.required_known {
-            checks.push_str(" (required-check flags unavailable)");
-        }
-        lines.push(checks);
-        let count = match r.threads.unresolved {
-            Some(n) => n.to_string(),
-            None => "unknown (thread resolution state unreadable)".to_string(),
-        };
-        let threads = match r.threads.resolution_required {
-            Some(true) => format!("unresolved threads: {count} (resolution required to merge)"),
-            _ => format!("unresolved threads: {count}"),
-        };
-        lines.push(threads);
-        if r.has_conflicts {
-            lines.push("merge conflicts present".to_string());
-        }
-        lines.push(match &r.ancestry {
-            PrAncestry::Unknown => "branch ancestry: unknown".to_string(),
-            PrAncestry::Known { behind_by, .. } => {
-                let suffix = if *behind_by == 1 { "" } else { "s" };
-                let mut line = format!("branch ancestry: {behind_by} commit{suffix} behind base");
-                if *behind_by > 0 && crate::pr_monitor::requirements_ready(r) {
-                    line.push_str(" (behind but mergeable)");
-                }
-                line
-            }
-        });
-        lines.push(
-            match r.branch_update_required {
-                Some(true) => "forge requires a branch update before merging",
-                Some(false) => "forge branch-update requirement: not required",
-                None => "forge branch-update requirement: unknown",
-            }
-            .to_string(),
-        );
-        if r.is_in_merge_queue == Some(true) {
-            lines.push("in merge queue".to_string());
-        }
-        if let Some(reason) = &r.merge_blocked_reason {
-            lines.push(format!("blocked: {reason}"));
-        }
-        if !r.rules_known {
-            lines.push(
-                "(branch rules unreadable — approval/thread requirements unknown)".to_string(),
-            );
-        }
-        lines
-            .into_iter()
-            .map(|l| format!("- {l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        super::review_wake::checklist(
+            &serde_json::to_value(&s.requirements).expect("serialize requirements"),
+            crate::pr_monitor::requirements_ready(&s.requirements),
+        )
     }
 
     fn pr_diff_lines(&self, old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
@@ -1266,19 +1180,13 @@ impl Harness for V1 {
         changes: &[String],
         snapshot: &PrMonitorSnapshot,
     ) -> String {
-        let bullets = changes
-            .iter()
-            .map(|c| format!("- {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "[PR monitor {label}] {} change{} detected on \"{}\" ({}):\n{bullets}\n\nWhere the PR \
-             stands now:\n{}",
-            changes.len(),
-            plural(i64::try_from(changes.len()).expect("value fits in i64")),
-            snapshot.title,
-            snapshot.url,
-            self.pr_checklist(snapshot)
+        super::review_wake::changed(
+            "PR",
+            label,
+            changes,
+            &snapshot.title,
+            &snapshot.url,
+            &self.pr_checklist(snapshot),
         )
     }
 
@@ -1288,25 +1196,14 @@ impl Harness for V1 {
         changes: &[String],
         snapshot: &PrMonitorSnapshot,
     ) -> String {
-        let outcome = if snapshot.requirements.state == "merged" {
-            "was MERGED"
-        } else {
-            "was CLOSED without merging"
-        };
-        let mut body = format!(
-            "[PR monitor {label}] \"{}\" {outcome} ({}).\n\nMonitoring has STOPPED — this monitor \
-             is retired and will not report again.",
-            snapshot.title, snapshot.url
-        );
-        if !changes.is_empty() {
-            let bullets = changes
-                .iter()
-                .map(|c| format!("- {c}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = write!(body, "\n\nChanges since the last report:\n{bullets}");
-        }
-        body
+        super::review_wake::terminal(
+            "PR",
+            label,
+            changes,
+            &snapshot.title,
+            &snapshot.url,
+            snapshot.requirements.state == "merged",
+        )
     }
 
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String {

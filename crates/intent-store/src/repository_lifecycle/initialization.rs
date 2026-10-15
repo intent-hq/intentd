@@ -135,7 +135,17 @@ pub enum RepositoryAcpInitialization {
 }
 
 /// One original observer owner. Drop MUST leave its barrier unsettled.
-pub trait RepositoryInitializationTicket: Send {
+pub trait RepositoryInitializationTicket: Send + 'static {
+    /// Wait outside Store/SQL locks for the exact retired native allocations.
+    /// With no confirmation, retire the original attempt as well. Failure must
+    /// leave this ticket's barrier unsettled and grants no completion proof.
+    fn join_retirement(
+        &self,
+        _confirm_original: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Consume after confirmed original commit/load. A concurrent retirement
     /// may reject completion even though the database effect already happened.
     /// Settle the original known-completed barrier even on that rejection;
@@ -307,7 +317,31 @@ impl Store {
     ) -> RepositoryInitializationOutcome {
         let mut persistence = RepositoryInitializationPersistence::NotAttempted;
         let confirmation = self
-            .initialize_repository_acp_session_inner(claim, binding, &mut persistence)
+            .initialize_repository_acp_session_inner(claim, binding, None, &mut persistence)
+            .await;
+        RepositoryInitializationOutcome {
+            persistence,
+            confirmation,
+        }
+    }
+
+    /// Atomically bind an original private native family to the winning session
+    /// write, or verify an exact loaded association without inserting one.
+    /// Persistence remains distinct from later physical-owner confirmation.
+    pub async fn initialize_repository_review_session_outcome(
+        &self,
+        claim: RepositoryInitializationClaim,
+        binding: RepositoryInitializationBinding,
+        enrollment: crate::ReviewContextEnrollmentIntent,
+    ) -> RepositoryInitializationOutcome {
+        let mut persistence = RepositoryInitializationPersistence::NotAttempted;
+        let confirmation = self
+            .initialize_repository_acp_session_inner(
+                claim,
+                binding,
+                Some(enrollment),
+                &mut persistence,
+            )
             .await;
         RepositoryInitializationOutcome {
             persistence,
@@ -319,6 +353,7 @@ impl Store {
         &self,
         claim: RepositoryInitializationClaim,
         binding: RepositoryInitializationBinding,
+        enrollment: Option<crate::ReviewContextEnrollmentIntent>,
         persistence: &mut RepositoryInitializationPersistence,
     ) -> Result<RepositoryInitializationConfirmation> {
         if !Arc::ptr_eq(&claim.domain, &self.repository_lifecycle)
@@ -438,6 +473,9 @@ impl Store {
             if actual.as_ref().and_then(Option::as_ref) != Some(session_id) {
                 return Err(lifecycle_error("initialization winner changed inside transaction"));
             }
+            if let Some(enrollment) = enrollment.as_ref() {
+                Self::apply_review_context_enrollment(&mut conn, &binding, enrollment).await?;
+            }
             Ok(())
         }
         .await;
@@ -448,14 +486,28 @@ impl Store {
             };
         }
         let ticket = ticket.ok_or_else(|| lifecycle_error("initialization was not observed"))?;
-        let completion = ticket.finish_confirmed();
-        lifecycle.settle();
-        let completion = completion?;
-        Ok(RepositoryInitializationConfirmation {
-            domain: claim.domain,
-            observer: claim.observer,
-            binding,
-            completion,
+        lifecycle.release_serialization();
+        // Retain the original ticket and SQL receipt independently of the API
+        // waiter. Joining must not hold Store serialization or a SQL connection.
+        intent_core::caller::spawn_with_current_caller(async move {
+            ticket.join_retirement(true).await?;
+            let completion = ticket.finish_confirmed();
+            lifecycle.settle_after_retirement().await?;
+            Ok(RepositoryInitializationConfirmation {
+                domain: claim.domain,
+                observer: claim.observer,
+                binding,
+                completion: completion?,
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            Err(lifecycle_error(
+                "original initialization completion unavailable",
+            ))
         })
     }
 
@@ -669,39 +721,62 @@ impl Store {
                 affected_rows: committed.rows,
             };
         }
-        if let Some(ticket) = ticket {
-            if committed.strict_winner {
-                let completion = ticket.finish_confirmed();
-                lifecycle.settle();
-                *confirmation = completion.and_then(|completion| {
-                    let (domain, observer) = original.ok_or_else(|| {
-                        lifecycle_error("original initialization envelope is absent")
-                    })?;
-                    Ok(RepositoryInitializationConfirmation {
-                        domain,
-                        observer,
-                        binding,
-                        completion,
-                    })
-                });
-            } else if committed.dispatched {
-                let settled = ticket.settle_committed_without_confirmation();
-                if settled.is_ok() {
-                    lifecycle.settle();
+        lifecycle.release_serialization();
+        let original_confirmation = std::mem::replace(
+            confirmation,
+            Err(lifecycle_error(
+                "original initialization completion unavailable",
+            )),
+        );
+        let completion = intent_core::caller::spawn_with_current_caller(async move {
+            let mut confirmation = original_confirmation;
+            if let Some(ticket) = ticket {
+                ticket.join_retirement(committed.strict_winner).await?;
+                if committed.strict_winner {
+                    let completion = ticket.finish_confirmed();
+                    lifecycle.settle_after_retirement().await?;
+                    confirmation = completion.and_then(|completion| {
+                        let (domain, observer) = original.ok_or_else(|| {
+                            lifecycle_error("original initialization envelope is absent")
+                        })?;
+                        Ok(RepositoryInitializationConfirmation {
+                            domain,
+                            observer,
+                            binding,
+                            completion,
+                        })
+                    });
+                } else if committed.dispatched {
+                    let settled = ticket.settle_committed_without_confirmation();
+                    if settled.is_ok() {
+                        lifecycle.settle_after_retirement().await?;
+                    }
+                    confirmation = settled.and_then(|()| {
+                        Err(lifecycle_error(
+                            "legacy commit has no strict original winner",
+                        ))
+                    });
+                } else {
+                    ticket.settle_no_effect();
+                    lifecycle.settle_after_retirement().await?;
                 }
-                *confirmation = settled.and_then(|()| {
-                    Err(lifecycle_error(
-                        "legacy commit has no strict original winner",
-                    ))
-                });
             } else {
-                ticket.settle_no_effect();
-                lifecycle.settle();
+                lifecycle.settle_after_retirement().await?;
             }
-        } else {
-            lifecycle.settle();
-        }
-        Ok(committed.into_result())
+            Ok((committed.into_result(), confirmation))
+        })
+        .await
+        .unwrap_or_else(|error| {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
+            }
+            Err(lifecycle_error(
+                "original initialization completion unavailable",
+            ))
+        });
+        let (result, completed_confirmation) = completion?;
+        *confirmation = completed_confirmation;
+        Ok(result)
     }
 
     /// Consume a receipt only in its original managed domain/observer.

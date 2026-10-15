@@ -1206,10 +1206,8 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
             .await
             .is_pending()
     );
-    assert!(
-        h.svc.workspace_mutations.enter(&ws).is_err(),
-        "delete closes new admission"
-    );
+    // The original pending-delete claim may still be waiting for the held
+    // Store lifecycle writer. A single pending poll is not admission closure.
     let finished = AtomicBool::new(false);
     release.send(()).unwrap();
     let write = async {
@@ -1225,6 +1223,10 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
             () = snapshot.notified() => {},
             result = &mut deleting => panic!("deletion missed snapshot gate: {result:?}"),
         }
+        assert!(
+            h.svc.workspace_mutations.enter(&ws).is_err(),
+            "delete closes new admission before its snapshot"
+        );
         assert!(
             finished.load(Ordering::SeqCst),
             "delete swept runtime before {mutation:?} finished"

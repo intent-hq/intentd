@@ -24,13 +24,13 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
 INDIRECT_TEST_STEPS = {
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"),
+    ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"),
 }
 COMMAND = re.compile(
     r"^(?:[A-Z_]+=\S+\s+)*(?:(?:rustup\s+run\s+\S+\s+)?cargo\s+(?:test\b|nextest\s+run\b|llvm-cov\b[^\n]*\bnextest\b)"
@@ -47,8 +47,58 @@ def test_steps(workflow):
                 yield name, job, step
 
 
-def violations(workflow, policy):
+def coverage_budget_violations(workflow):
+    """Keep the combined instrumented lane finite, with post-action headroom."""
+    job = workflow["jobs"]["coverage-changed"]
+    limits = {
+        "Run changed tests under llvm-cov": 50,
+        "Run callback fixture composition under llvm-cov": 8,
+    }
     errors = []
+    total = job.get("timeout-minutes")
+    if type(total) is not int or total != sum(limits.values()) + 2:
+        errors.append("coverage-changed must reserve 2m outside its bounded test phases")
+    for name, limit in limits.items():
+        steps = [step for step in job["steps"] if step.get("name") == name]
+        if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != limit:
+            errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
+    combined = workflow["jobs"]["coverage-all"]
+    steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 45:
+        errors.append("coverage-all must reserve 2m outside its 43m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 43:
+        errors.append("coverage-all must retain its 43m compile/test/report bound")
+    return errors
+
+
+def profile_pool_violations(workflow):
+    errors = []
+    for job_id, first_test, condition in (
+        ("coverage-all", "Run combined coverage", None),
+        ("coverage-changed", "Run changed tests under llvm-cov", "steps.select.outputs.has_selection == 'true'"),
+    ):
+        job = workflow["jobs"][job_id]
+        steps = job["steps"]
+        proofs = [s for s in steps if s.get("name") == "Verify bounded coverage profile pooling"]
+        if (job.get("env", {}).get("LLVM_PROFILE_FILE_NAME") != "intent-%8m.profraw"
+                or "LLVM_PROFILE_FILE" in job.get("env", {})):
+            errors.append(f"{job_id}: retain the bounded profile pool")
+        if len(proofs) != 1:
+            errors.append(f"{job_id}: require exactly one profile pooling proof")
+            continue
+        proof = proofs[0]
+        if (proof.get("run") != "python3 -I -B scripts/test-coverage-profile-pool.py"
+                or proof.get("if") != condition or proof.get("continue-on-error")
+                or steps.index(proof) >= next(i for i, s in enumerate(steps) if s.get("name") == first_test)):
+            errors.append(f"{job_id}: require the profile proof before instrumented tests")
+        for step in steps:
+            if any(key in step.get("env", {}) for key in ("LLVM_PROFILE_FILE_NAME", "LLVM_PROFILE_FILE")):
+                errors.append(f"{job_id}: do not override the job profile pool in a step")
+    return errors
+
+
+def violations(workflow, policy):
+    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -96,10 +146,10 @@ REQUIRED_TEST_STEPS = {
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
+    ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"): None,
     ("build", "Headless workspace setup (Windows runtime)"): 1,
     ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
-    ("build", "Codex focused diagnostics (macOS runtime)"): 2,
+    ("macos-services-runtime", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,
     ("coverage-changed", "Run changed tests under llvm-cov"): 1,
@@ -151,9 +201,10 @@ class CiPolicyTests(unittest.TestCase):
                           "Retained workspace CoW fixtures (macOS runtime)"):
             with self.subTest(step=step_name):
                 workflow = copy.deepcopy(self.workflow)
-                step = next(s for s in workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                owner = "macos-services-runtime" if step_name.startswith("Retained workspace") else "build"
+                step = next(s for s in workflow['jobs'][owner]['steps'] if s.get('name') == step_name)
                 step['run'] = 'unset INTENTD_ASSERT_BOUND_CALLER\n' + step['run']
-                self.assertIn(f"build: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
+                self.assertIn(f"{owner}: {step_name} must arm INTENTD_ASSERT_BOUND_CALLER=1", violations(workflow, "1"))
 
     def test_callback_scope_changes_select_validation_without_rust_changes(self):
         job = self.workflow["jobs"]["coverage-changed"]
@@ -190,10 +241,76 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn("has_selection=" + expected, output)
                 self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
 
+    def test_coverage_budget_rejects_lost_bounds_and_cleanup_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for name in (None, "Run changed tests under llvm-cov",
+                     "Run callback fixture composition under llvm-cov"):
+            for limit in (None, 0, True, 30 if name is None else 60):
+                with self.subTest(phase=name, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-changed"]
+                    target = job if name is None else next(s for s in job["steps"] if s.get("name") == name)
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_combined_coverage_budget_rejects_lost_bounds_and_report_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for phase in (False, True):
+            for limit in (None, 0, True, 30, 60):
+                with self.subTest(phase=phase, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-all"]
+                    target = next(s for s in job["steps"] if s.get("name") == "Run combined coverage") if phase else job
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_full_coverage_budget_includes_report_generation(self):
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+
+    def test_coverage_profile_pool_rejects_unbounded_or_unverified_collection(self):
+        self.assertEqual(profile_pool_violations(self.workflow), [])
+        for job_id in ("coverage-all", "coverage-changed"):
+            for mutation in ("missing-env", "per-process", "direct-profile", "missing-proof", "skipped-proof",
+                             "ignored-proof", "late-proof", "step-override"):
+                with self.subTest(job=job_id, mutation=mutation):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"][job_id]
+                    steps = job["steps"]
+                    proof = next(s for s in steps if s.get("name") == "Verify bounded coverage profile pooling")
+                    if mutation == "missing-env":
+                        job["env"].pop("LLVM_PROFILE_FILE_NAME")
+                    elif mutation == "per-process":
+                        job["env"]["LLVM_PROFILE_FILE_NAME"] = "intent-%p-%32m.profraw"
+                    elif mutation == "direct-profile":
+                        job["env"]["LLVM_PROFILE_FILE"] = "intent-%p.profraw"
+                    elif mutation == "missing-proof":
+                        steps.remove(proof)
+                    elif mutation == "skipped-proof":
+                        proof["if"] = False
+                    elif mutation == "ignored-proof":
+                        proof["continue-on-error"] = True
+                    elif mutation == "late-proof":
+                        steps.remove(proof)
+                        steps.append(proof)
+                    else:
+                        proof["env"] = {"LLVM_PROFILE_FILE_NAME": "intent-%p.profraw"}
+                    self.assertTrue(profile_pool_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
-        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+
+        self.assertEqual(job["timeout-minutes"], 60)
         names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
         self.assertEqual(len(names), 6)
         for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):
@@ -303,7 +420,7 @@ else:
                     "print('CoW fixture assertions passed: '+test.split('::')[-1])\n"
                 )
                 stub.chmod(0o755)
-                step = next(s for s in self.workflow['jobs']['build']['steps'] if s.get('name') == step_name)
+                step = next(s for s in self.workflow['jobs']['macos-services-runtime']['steps'] if s.get('name') == step_name)
                 env = {**os.environ, 'INTENTD_ASSERT_BOUND_CALLER': '0', **step.get('env', {})}
                 env = {k: re.sub(r'\$\{\{.*?\}\}', 'fixture', str(v)) for k, v in env.items()}
                 env.update(PATH=str(root)+os.pathsep+os.environ['PATH'], RUNNER_TEMP=str(root), POLICY_CHILD_LOG=str(root/'children.jsonl'))
@@ -658,7 +775,7 @@ else:
         self.assertEqual(self.job["env"]["CALLBACK_FIXTURE_TESTS"].split(), [
             "callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result",
             "callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers",
-            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_1_reaches_original_guidance_boundary",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_2_reaches_original_guidance_boundary",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate",

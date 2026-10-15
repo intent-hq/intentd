@@ -1955,10 +1955,10 @@ mod mixed_lifecycle {
         assert_eq!(f.id().await.as_deref(), Some("A"));
         assert_eq!(probe.pending(&key), 2);
         assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
-        second.settle_confirmed();
+        second.settle_confirmed().await.unwrap();
         assert_eq!(probe.pending(&key), 1);
         assert!(outcome(&f, loaded("A")).await.confirmation.is_err());
-        pending.settle_confirmed();
+        pending.settle_confirmed().await.unwrap();
         assert_eq!(probe.pending(&key), 0);
         assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
         let fresh = compatible(&f, replace(Some("A"), "B"), true).await;
@@ -1995,7 +1995,7 @@ mod mixed_lifecycle {
         ));
         assert!(result.confirmation.is_err());
         assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
-        pending.settle_confirmed();
+        pending.settle_confirmed().await.unwrap();
         f.store
             .insert_principal_credential(&principal.id, "known-successor")
             .await
@@ -2069,7 +2069,7 @@ mod mixed_lifecycle {
                 assert_eq!(probe.pending(&key), 1);
                 assert_eq!(f.owner.state.lock().unwrap().blocked, 1);
             }
-            pending.settle_confirmed();
+            pending.settle_confirmed().await.unwrap();
             assert_eq!(f.owner.state.lock().unwrap().blocked, 0);
         }
     }
@@ -2119,7 +2119,7 @@ mod mixed_lifecycle {
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         assert_eq!(probe.pending(&agent_key), 1);
         assert_eq!(probe.pending(&RepositoryLifecycleKey::WireAuthority), 1);
-        pending.settle_confirmed();
+        pending.settle_confirmed().await.unwrap();
         assert_eq!(probe.pending(&workspace_key), 0);
         assert_eq!(f.owner.state.lock().unwrap().blocked, 2);
         release.send(()).unwrap();
@@ -2151,3 +2151,6 @@ mod mixed_lifecycle {
             .is_err());
     }
 }
+
+#[path = "enrollment_tests.rs"]
+mod enrollment_tests;

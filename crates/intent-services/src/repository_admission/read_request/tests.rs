@@ -53,7 +53,7 @@ async fn read_child_cleanup_and_last_scope_drop_preserve_only_original_siblings(
             let read = current_read_request().unwrap();
             assert!(read.retains(retained.as_ref()));
             assert!(!read.retains(&17_u8));
-            let mut child = read.child().unwrap();
+            let child = read.child().unwrap();
             child
                 .subscribe(&[
                     RepositoryLifecycleKey::Database,
@@ -171,7 +171,7 @@ async fn optional_local_key_retires_only_its_prepared_owner_and_required_coverag
         f.caller.clone(),
         scope.scope(Box::pin(async {
             let read = current_read_request().unwrap();
-            let mut required = read.child().unwrap();
+            let required = read.child().unwrap();
             let key = RepositoryLifecycleKey::GitRoot(intent_core::WorkspaceGitRootId::new());
             let optional = read.capture_optional().unwrap();
             let metadata = optional.metadata();
@@ -251,7 +251,7 @@ async fn optional_execution_restores_original_identity_and_cannot_grow_required_
         scope.scope(Box::pin(async {
             let read = current_read_request().unwrap();
             let source = current_source_lifetime().unwrap();
-            let mut child = read.child().unwrap();
+            let child = read.child().unwrap();
             let optional = read.capture_optional().unwrap();
             let escaped = optional.metadata();
             let original = read.clone();
@@ -1191,4 +1191,221 @@ async fn manager_prompt_drop_joins_original_consuming_fence_and_retires_escaped_
         assert_eq!(escaped.check_current(), Err(AdmissionError::Retired));
     })
     .await;
+}
+
+#[tokio::test]
+async fn negotiated_monitor_support_is_original_session_and_capture_time_scoped() {
+    negotiated_monitor_allocation_case("receipt-only").await;
+}
+
+#[tokio::test]
+async fn monitor_native_allocation_requires_original_physical_and_acknowledged_context() {
+    negotiated_monitor_allocation_case("native").await;
+    negotiated_monitor_allocation_case("foreign-context").await;
+}
+
+async fn negotiated_monitor_allocation_case(mode: &str) {
+    use intent_acp::callback_registration::{
+        CallbackDeliveryOutcome, CallbackOffer, CallbackStdioServer, CallbackTool,
+    };
+    use intent_acp::review_monitoring::{ReviewMonitoringContext, ReviewMonitoringOffer};
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut f = OptionalFixture::new().await;
+    let (socket, peer) = tokio::io::duplex(8192);
+    let (read, write) = tokio::io::split(socket);
+    let connection = Arc::new(intent_acp::Connection::new(
+        write,
+        read,
+        None,
+        intent_acp::ConnectionHooks::default(),
+    ));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let permit = release.clone();
+    let previous_session = f.physical.confirmed_session_id().to_owned();
+    let session = if mode == "receipt-only" {
+        previous_session.clone()
+    } else {
+        "native-original-session".to_owned()
+    };
+    let original_session = session.clone();
+    let peer_task = tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(peer);
+        let mut read = BufReader::new(read);
+        for step in 0..3 {
+            let mut line = String::new();
+            read.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match step {
+                0 => json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"_meta":{
+                    "reviewMonitoring":1,"intentCallbackRegistration":{"version":1,"method":"_intent/session/register_mcp_callback"}}}),
+                1 => json!({"sessionId":original_session,"_meta":{"reviewMonitoring":1,
+                    "reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"],
+                    "intentCallbackRegistration":{"version":1,"queryReceipt":"11111111-1111-4111-8111-111111111111"}}}),
+                _ => {
+                    permit.notified().await;
+                    json!({"version":1,"sessionId":request["params"]["sessionId"],
+                        "queryReceipt":request["params"]["queryReceipt"],"registrationId":request["params"]["registrationId"],
+                        "serverName":"intent-callback-22222222-2222-4222-8222-222222222222","status":"acknowledged",
+                        "result":{"added":["intent-callback-22222222-2222-4222-8222-222222222222"],"removed":[],"errors":{}}})
+                }
+            };
+            let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let client = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap()
+    .callbacks
+    .unwrap();
+    let creation = if mode == "receipt-only" {
+        None
+    } else {
+        let Caller::Agent { agent_id } = &f.caller else {
+            panic!("original agent")
+        };
+        let row = f.store.get_agent_session(agent_id).await.unwrap();
+        Some(
+            RepositoryCreationOwner::allocate(
+                &f.registry,
+                &f.store,
+                row.workspace_id,
+                agent_id.clone(),
+                RepositoryCreationIntent::Replace {
+                    expected: Some(previous_session),
+                },
+            )
+            .unwrap()
+            .prepare_review()
+            .await
+            .unwrap(),
+        )
+    };
+    let native = creation.as_ref().map(|creation| {
+        let native = super::super::lifecycle::native_allocation::NativeAllocation::new(
+            client.clone(),
+            creation.context().clone(),
+        );
+        creation.attach_native(native.clone()).unwrap();
+        native
+    });
+    let context = if mode == "native" {
+        native.as_ref().unwrap().context().clone()
+    } else {
+        ReviewMonitoringContext::new("original-services-owner".into()).unwrap()
+    };
+    let mut meta = serde_json::Map::default();
+    context.insert_into(&mut meta);
+    let query = client
+        .new_session("/fixture", vec![], Some(meta))
+        .await
+        .unwrap()
+        .query
+        .unwrap();
+    if let Some(creation) = creation {
+        let outcome = creation
+            .initialize_with_outcome(&f.store, || async { Ok::<_, ()>((session.clone(), ())) })
+            .await
+            .unwrap();
+        f.physical = outcome.owner.unwrap();
+        native.as_ref().unwrap().bind_response(&session).unwrap();
+        native.as_ref().unwrap().producer_finished();
+    }
+    let pending = query.pending_review_monitoring().unwrap();
+    let shared =
+        RepositoryReadOwner::retain_original(Arc::new(23_u8), f.store.clone(), f.registry.clone())
+            .unwrap();
+    let bound = shared.with_monitor_recipient(Some(pending.clone()), &connection, &session);
+    assert!(shared.monitor_recipient.is_none());
+    assert!(shared
+        .with_monitor_recipient(Some(pending.clone()), &connection, "foreign")
+        .monitor_recipient
+        .is_none());
+    let callback = f.physical.callback().with_read_owner(Ok(bound));
+    let before_ack = McpRequestContext::capture(&callback);
+    let ordinary = McpRequestContext::capture(&f.physical.callback().with_read_owner(Ok(shared)));
+    let registration = query.registration(
+        CallbackStdioServer::new(
+            "fixture-mcp".into(),
+            vec![],
+            None,
+            [CallbackTool::WorkspaceApi],
+        )
+        .unwrap(),
+    );
+    let registered = tokio::spawn(async move { registration.run(std::future::pending()).await });
+    release.notify_one();
+    assert!(matches!(
+        registered.await.unwrap(),
+        CallbackDeliveryOutcome::Remote(_)
+    ));
+    let receipt = pending.acknowledged().unwrap();
+    with_caller(
+        f.caller.clone(),
+        before_ack.scope(Box::pin(async {
+            let read = current_read_request().unwrap();
+            assert!(!read.supports_review_monitoring());
+            assert!(read.monitor_native_allocation().is_err());
+            assert!(!read.retain_monitor().unwrap().supports_review_monitoring());
+            assert_eq!(
+                read.with_monitor_recipient(|| Ok(1)),
+                Err(AdmissionError::Denied)
+            );
+        })),
+    )
+    .await;
+    with_caller(
+        f.caller.clone(),
+        ordinary.scope(Box::pin(async {
+            assert!(!current_read_request().unwrap().supports_review_monitoring());
+        })),
+    )
+    .await;
+    let after_ack = McpRequestContext::capture(&callback);
+    with_caller(
+        f.caller.clone(),
+        after_ack.scope(Box::pin(async {
+            let read = current_read_request().unwrap();
+            assert!(read.supports_review_monitoring());
+            let retained = read.retain_monitor().unwrap();
+            assert!(retained.supports_review_monitoring());
+            assert_eq!(retained.with_monitor_recipient(|| Ok(7)), Ok(7));
+            if mode == "native" {
+                let actual = retained.monitor_native_allocation().unwrap().unwrap();
+                assert!(Arc::ptr_eq(&actual, native.as_ref().unwrap()));
+                assert!(Arc::ptr_eq(
+                    &read.monitor_native_allocation().unwrap().unwrap(),
+                    &actual
+                ));
+            } else {
+                assert!(
+                    retained.monitor_native_allocation().is_err(),
+                    "receipt cannot borrow a missing or foreign native allocation"
+                );
+            }
+            receipt.retire();
+            assert!(retained.monitor_native_allocation().is_err());
+            assert!(!read.supports_review_monitoring());
+            assert!(!retained.supports_review_monitoring());
+            assert_eq!(
+                retained.with_monitor_recipient(|| Ok(9)),
+                Err(AdmissionError::Retired)
+            );
+        })),
+    )
+    .await;
+    peer_task.abort();
+    let _ = peer_task.await;
 }

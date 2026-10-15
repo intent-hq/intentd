@@ -428,6 +428,85 @@ pub(crate) struct RepositoryCapturedRequest {
 }
 
 impl RepositoryCapturedRequest {
+    pub(super) fn native_allocation(
+        &self,
+    ) -> AdmissionResult<Arc<super::lifecycle::native_allocation::NativeAllocation>> {
+        self.check_read_caller()?;
+        let captured = self.captured.as_ref().map_err(|error| *error)?;
+        captured
+            .registry
+            .native_allocation(&captured.origin, &captured.caller)
+    }
+
+    pub(super) fn same_physical_session(&self, other: &Self) -> AdmissionResult<()> {
+        self.retirement.check_current()?;
+        other.retirement.check_current()?;
+        let original = self.captured.as_ref().map_err(|error| *error)?;
+        let destination = other.captured.as_ref().map_err(|error| *error)?;
+        if original.caller != destination.caller
+            || !original.origin.same_allocation(&destination.origin)
+        {
+            return Err(AdmissionError::BindingChanged);
+        }
+        Ok(())
+    }
+
+    /// Resume only a retained monitor from the daemon scheduler, under its
+    /// captured physical caller. Neither a stored binding nor an ambient agent
+    /// ID can construct this scope. Recheck the entry and original lifetime on
+    /// every poll, including a future moved after an earlier Pending.
+    pub(super) fn run_monitor<'a, T: Send + 'a>(
+        &'a self,
+        body: intent_core::BoxFuture<'a, AdmissionResult<T>>,
+    ) -> intent_core::BoxFuture<'a, AdmissionResult<T>> {
+        Box::pin(async move {
+            manager_prompt_entry()?;
+            let captured = self.captured.as_ref().map_err(|error| *error)?;
+            self.retirement.check_current()?;
+            let mut scoped = Box::pin(with_caller(captured.caller.clone(), async move {
+                let mut body = body;
+                std::future::poll_fn(|context| {
+                    if let Err(error) = self.check_read_caller() {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    body.as_mut().poll(context)
+                })
+                .await
+            }));
+            std::future::poll_fn(|context| {
+                if let Err(error) = manager_prompt_entry() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::future::Future::poll(scoped.as_mut(), context)
+            })
+            .await
+        })
+    }
+
+    /// A monitor owns a separate leaf of the SAME physical session. Ending the
+    /// MCP invocation must not retire the registration; replacing/retiring the
+    /// physical session still does. No lookup by public agent ID is involved.
+    pub(super) fn retain_monitor(&self) -> AdmissionResult<Arc<Self>> {
+        require_mandatory_execution()?;
+        self.check_read_caller()?;
+        let original = self.captured.as_ref().map_err(|error| *error)?;
+        let retirement = RepositoryRetirement::default();
+        let (caller, subscription) = original
+            .registry
+            .capture_request(&original.origin, retirement.clone())?;
+        self.check_read_caller()?;
+        Ok(Arc::new(Self {
+            captured: Ok(Captured {
+                registry: original.registry.clone(),
+                origin: original.origin.clone(),
+                caller,
+                store: original.store.clone(),
+                subscriptions: Arc::new(Mutex::new(vec![subscription])),
+            }),
+            retirement,
+        }))
+    }
+
     pub(super) fn check_read_owner(
         &self,
         store: &Store,
