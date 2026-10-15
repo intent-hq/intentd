@@ -235,7 +235,11 @@ async fn transfer_human_trust_migration_cleans_legacy_keys_once_and_fences_downg
     let write_pool = crate::connect_write(&tmp.path).await.unwrap();
     previous_migrator().run(&write_pool).await.unwrap();
     let store = Store {
+        task_event_baselines: std::sync::Arc::default(),
+        task_events_enabled: std::sync::Arc::default(),
         note_pages: std::sync::Arc::default(),
+        note_index_jobs: std::sync::Arc::default(),
+        note_index_owner: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),

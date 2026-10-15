@@ -539,7 +539,7 @@ mod pending_delete {
                 .origins
                 .values()
                 .all(|o| !o.retired));
-            guard.settle_confirmed();
+            guard.settle_confirmed().await.unwrap();
             assert!(current(&callback.capture(), &f.first).await);
             assert!(!current(&request, &f.first).await);
             assert!(!current(&denied_capture, &f.first).await);
@@ -561,7 +561,7 @@ mod pending_delete {
             .unwrap();
         assert!(!current(&old, &f.first).await);
         assert!(!current(&owner.callback().capture(), &f.first).await);
-        guard.settle_confirmed();
+        guard.settle_confirmed().await.unwrap();
         assert!(current(&owner.callback().capture(), &f.first).await);
         let other_owner = creator
             .initialize(&f.store, || async { Ok("original other".into()) })
@@ -622,11 +622,11 @@ mod pending_delete {
             )])
             .await
             .unwrap();
-        known.settle_confirmed();
+        known.settle_confirmed().await.unwrap();
         drop(unknown);
         assert!(!current(&first.callback().capture(), &f.first).await);
         assert!(!current(&other.callback().capture(), &f.other).await);
-        unrelated.settle_confirmed();
+        unrelated.settle_confirmed().await.unwrap();
         assert_eq!(
             f.registry
                 .state
@@ -657,7 +657,9 @@ mod pending_delete {
             .begin_repository_pending_delete(&first_keys)
             .await
             .unwrap()
-            .settle_confirmed();
+            .settle_confirmed()
+            .await
+            .unwrap();
         assert_eq!(
             f.registry
                 .state
@@ -705,7 +707,7 @@ mod pending_delete {
             Err(AdmissionError::Unavailable)
         ));
         assert!(current(&other.callback().capture(), &f.other).await);
-        guard.settle_confirmed();
+        guard.settle_confirmed().await.unwrap();
         let owner = creator
             .initialize(&f.store, || async { Ok("original".into()) })
             .await
@@ -747,7 +749,9 @@ mod pending_delete {
                 )])
                 .await
                 .unwrap()
-                .settle_confirmed();
+                .settle_confirmed()
+                .await
+                .unwrap();
         })
         .await
         .unwrap();
@@ -757,9 +761,9 @@ mod pending_delete {
         let first = first.await.unwrap().unwrap();
         let second = second.await.unwrap().unwrap();
         assert!(!current(&request, &f.first).await);
-        first.settle_confirmed();
+        first.settle_confirmed().await.unwrap();
         assert!(!current(&owner.callback().capture(), &f.first).await);
-        second.settle_confirmed();
+        second.settle_confirmed().await.unwrap();
         assert!(current(&owner.callback().capture(), &f.first).await);
         assert!(!current(&unavailable, &f.first).await);
         assert_eq!(
@@ -797,7 +801,7 @@ mod pending_delete {
         let pending = pending.await.unwrap().unwrap();
         assert!(delete.await.unwrap().unwrap());
         assert_eq!(f.registry.state.lock().unwrap().pending.len(), 1);
-        pending.settle_confirmed();
+        pending.settle_confirmed().await.unwrap();
         assert!(f.registry.state.lock().unwrap().pending.is_empty());
         assert!(!current(&request, &f.first).await);
         assert!(!current(&owner.callback().capture(), &f.first).await);

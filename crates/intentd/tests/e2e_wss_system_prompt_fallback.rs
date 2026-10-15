@@ -848,7 +848,7 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     assert!(!system.contains("WORKSPACE_ONLY_MARKER"));
     assert!(!system.contains("## Commit Policy"));
     assert!(!system.contains("## Delegating Tasks"));
-    assert_eq!(before["session"]["harnessVersion"], "3.1");
+    assert_eq!(before["session"]["harnessVersion"], "3.2");
     wss_rpc(&mut rpc, 5, "agent.stop", json!({"agentId": agent})).await;
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();

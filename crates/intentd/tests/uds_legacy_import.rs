@@ -100,7 +100,7 @@ fn spawn_daemon(data_dir: &Path, legacy_root: &Path, hold_file: Option<&Path>) -
 async fn await_socket(socket: &Path) {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

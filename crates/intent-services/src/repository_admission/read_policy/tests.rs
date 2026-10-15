@@ -406,7 +406,7 @@ async fn source_changes_after_host_disclosure_reject_constant_output_without_reb
             _ => f.owner.retirement().retire(),
         }
         if let Some(pending) = pending {
-            pending.settle_confirmed();
+            pending.settle_confirmed().await.unwrap();
         }
         gate.release.add_permits(1);
         let reply = task.await.unwrap();

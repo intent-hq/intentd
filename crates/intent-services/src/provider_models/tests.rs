@@ -2469,6 +2469,30 @@ fn auth_required_detection() {
 }
 
 #[test]
+fn auth_required_detection_recognizes_claude_expired_oauth() {
+    for message in [
+        "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "FAILED TO AUTHENTICATE: OAUTH SESSION EXPIRED AND COULD NOT BE REFRESHED",
+    ] {
+        assert!(is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
+fn auth_required_detection_rejects_unrelated_expiry() {
+    for message in [
+        "Internal error",
+        "session expired",
+        "tool execution deadline expired",
+        "Failed to refresh model catalog",
+        "OAuth callback listener failed to start",
+    ] {
+        assert!(!is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
 fn installed_cli_probe_copies_routing_credentials_but_not_tools_or_hooks() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("config.toml");

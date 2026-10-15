@@ -157,7 +157,19 @@ impl Store {
             if epoch.is_some_and(|epoch| epoch != current) {
                 return Err(failure(NotePageError::Stale));
             }
+            self.ensure_note_index(&scope.workspace_id, &scope.note_id, true)
+                .await
+                .map_err(|error| match error {
+                    intent_core::Error::NotFound(_) => {
+                        intent_core::Error::NotFound("note annotations".into())
+                    }
+                    other => other,
+                })?;
+            let content_generation = self
+                .ready_note_content_generation(&scope.workspace_id, &scope.note_id)
+                .await?;
             let lease = Lease {
+                content_generation,
                 scope: scope.clone(),
                 principal: principal.to_owned(),
                 source_revision: source_revision.to_owned(),

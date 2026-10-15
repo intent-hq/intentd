@@ -37,7 +37,7 @@ pub(crate) struct RepositorySettingsWrite {
     original: GitlabSettings,
     desired: GitlabSettings,
     original_source: Option<GitlabDescriptor>,
-    lease: PersistenceLease,
+    lease: Mutex<Option<PersistenceLease>>,
     secret_changed: std::sync::atomic::AtomicBool,
 }
 
@@ -287,7 +287,7 @@ impl GitlabCredentialGate {
             original,
             desired,
             original_source,
-            lease: guard.lease(),
+            lease: Mutex::new(Some(guard.lease())),
             secret_changed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -423,7 +423,39 @@ impl GitlabCredentialGate {
 
 impl RepositorySettingsWrite {
     pub(crate) fn lease(&self) -> PersistenceLease {
-        self.lease.clone()
+        self.lease
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("settings persistence requires its original credential lease")
+            .clone()
+    }
+    pub(crate) fn native_retirement_pending(&self) -> bool {
+        self.began() && self.write.native_retirement_pending()
+    }
+    pub(crate) async fn completed_source(
+        &self,
+        store: FileSecretStore,
+    ) -> Result<super::CompletedRepositorySource> {
+        self.write.completed_source(store, self.lease()).await
+    }
+    pub(crate) async fn check_completed_source(
+        &self,
+        original: Result<super::CompletedRepositorySource>,
+        store: FileSecretStore,
+    ) -> Result<()> {
+        self.write
+            .check_completed_source(original, store, self.lease())
+            .await
+    }
+    pub(crate) fn release_native_wait_lease(&self) {
+        self.lease.lock().unwrap().take();
+    }
+    pub(crate) fn restore_native_wait_lease(&self, guard: &GitlabCredentialGuard) {
+        *self.lease.lock().unwrap() = Some(guard.lease());
+    }
+    pub(crate) async fn join_native_retirement(&self) -> Result<()> {
+        self.write.join_native_retirement().await
     }
     pub(crate) fn began(&self) -> bool {
         self.write.state.lock().is_ok_and(|s| s.mutation.is_some())
@@ -538,8 +570,7 @@ impl crate::Services {
             &self.gitlab_secret_store,
             None,
         )?;
-        self.reconcile_gitlab_repository_binding_locked(&guard)
-            .await
+        self.owned_gitlab_repository_reconciliation(guard).await
     }
 
     /// Explicit cold test composition on the original paired settings and store.
@@ -586,20 +617,44 @@ impl crate::Services {
             &self.gitlab_secret_store,
             fixtures,
         )?;
-        self.reconcile_gitlab_repository_binding_locked(&guard)
-            .await
+        self.owned_gitlab_repository_reconciliation(guard).await
     }
 
     #[cfg(test)]
     pub(crate) async fn reconcile_gitlab_repository_binding(&self) -> Result<()> {
         let guard = self.gitlab_credential_gate.lock().await;
-        self.reconcile_gitlab_repository_binding_locked(&guard)
+        self.owned_gitlab_repository_reconciliation(guard).await
+    }
+
+    /// Retain the original reconciliation before its first provider or storage
+    /// await. Dropping the boot/request waiter cannot abandon native retirement.
+    async fn owned_gitlab_repository_reconciliation(
+        &self,
+        guard: GitlabCredentialGuard,
+    ) -> Result<()> {
+        let mut operation = self.clone();
+        operation.secrets = Arc::new(
+            self.secrets
+                .settled_operation(Arc::new(tokio::sync::Notify::new())),
+        );
+        let handle = self
+            .settings_tasks
+            .spawn_draining_with_current_caller(async move {
+                let result = operation
+                    .reconcile_gitlab_repository_binding_locked(guard)
+                    .await;
+                operation.secrets.finish_operation().await;
+                result
+            })
+            .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
+        handle
             .await
+            .map_err(|_| Error::Internal("repository reconciliation completion failed".into()))?
     }
 
     async fn reconcile_gitlab_repository_binding_locked(
         &self,
-        guard: &GitlabCredentialGuard,
+        guard: GitlabCredentialGuard,
     ) -> Result<()> {
         let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
         let host = self.gitlab_credential_gate.stored_source_host(
@@ -628,26 +683,71 @@ impl crate::Services {
                     .oauth_client_id,
                 &host,
             );
-            return match super::super::try_refresh(
+            let original_settings = registry.snapshot().effective.source_control.gitlab.clone();
+            let result = super::super::try_refresh(
                 &host,
                 client_id.as_deref(),
                 self.gitlab_secret_store.clone(),
                 &self.secrets,
-                guard,
+                &guard,
                 write.clone(),
             )
-            .await
-            {
+            .await;
+            // Persistence timeout is distinct from completion: join its exact
+            // worker before releasing the last physical credential lease.
+            self.secrets.finish_operation().await;
+            let persisted = load_material(self.gitlab_secret_store.clone(), guard.lease()).await;
+            let completion = if let Some(write) = &write {
+                if write.native_retirement_pending() {
+                    drop(guard);
+                    let joined = write.join_native_retirement().await;
+                    let guard = self.gitlab_credential_gate.lock().await;
+                    (joined, guard)
+                } else {
+                    (Ok(()), guard)
+                }
+            } else {
+                (Ok(()), guard)
+            };
+            let (joined, guard) = completion;
+            return match result {
                 Ok(()) => {
+                    joined?;
                     if let Some(write) = write {
+                        let persisted = persisted.map_err(|_| unavailable())?;
+                        let after = load_material(self.gitlab_secret_store.clone(), guard.lease())
+                            .await
+                            .map_err(|_| unavailable())?;
+                        if registry.snapshot().effective.source_control.gitlab != original_settings
+                            || persisted.fingerprint(&write.owner.evidence)
+                                != after.fingerprint(&write.owner.evidence)
+                        {
+                            return Err(unavailable());
+                        }
                         write.confirm_publication(true);
+                        if !self
+                            .gitlab_credential_gate
+                            .original_source_current(
+                                &host,
+                                &self.gitlab_secret_store,
+                                &guard,
+                                after.access().ok(),
+                            )
+                            .await?
+                        {
+                            return Err(unavailable());
+                        }
                     }
                     Ok(())
                 }
                 Err(super::super::RefreshFailure::Local(error)) => {
                     Err(crate::pr_ops::map_sc_err(error))
                 }
-                Err(_) => Err(unavailable()),
+                Err(super::super::RefreshFailure::Persistence(error)) => Err(error),
+                Err(_) => {
+                    joined?;
+                    Err(unavailable())
+                }
             };
         }
         let write = self
@@ -655,7 +755,8 @@ impl crate::Services {
             .reserve(&host, RepositoryMutationKind::Replace)
             .map_err(crate::pr_ops::map_sc_err)?
             .ok_or_else(unavailable)?;
-        self.verify_stored_repository_account(&host, &write, None, guard.lease())
+        let lease = guard.lease();
+        self.verify_stored_repository_account(&host, &write, None, lease, Some(guard))
             .await
     }
 
@@ -746,8 +847,14 @@ impl crate::Services {
             &self.gitlab_secret_store,
             allow_new,
         )?;
-        self.verify_stored_repository_account(&host, &write.write, Some(compensated), write.lease())
-            .await
+        self.verify_stored_repository_account(
+            &host,
+            &write.write,
+            Some(compensated),
+            write.lease(),
+            None,
+        )
+        .await
     }
 
     async fn verify_stored_repository_account(
@@ -756,6 +863,7 @@ impl crate::Services {
         write: &RepositoryWrite,
         compensated: Option<bool>,
         lease: PersistenceLease,
+        reconciliation_guard: Option<GitlabCredentialGuard>,
     ) -> Result<()> {
         let registry = self.settings_registry.as_deref().ok_or_else(unavailable)?;
         let snapshot = registry.snapshot();
@@ -779,7 +887,7 @@ impl crate::Services {
         let user = intent_sourcecontrol::gitlab_auth::validate_pat(host, token)
             .await
             .map_err(crate::pr_ops::map_sc_err)?;
-        let after = load_material(store, lease)
+        let after = load_material(store.clone(), lease)
             .await
             .map_err(|_| unavailable())?;
         if snapshot.effective.source_control.gitlab
@@ -801,6 +909,30 @@ impl crate::Services {
         )
         .map_err(|_| unavailable())?;
         write.begin().map_err(crate::pr_ops::map_sc_err)?;
+        // Verification failure above still cancels an unstarted reservation.
+        // After beginning, retain the exact evidence across the native join and
+        // refuse any changed source before publishing its original completion.
+        let _reconciliation_guard = if let Some(guard) = reconciliation_guard {
+            if write.native_retirement_pending() {
+                drop(guard);
+                write.join_native_retirement().await?;
+                let guard = self.gitlab_credential_gate.lock().await;
+                let current = load_material(store, guard.lease())
+                    .await
+                    .map_err(|_| unavailable())?;
+                if registry.snapshot().effective.source_control.gitlab
+                    != snapshot.effective.source_control.gitlab
+                    || current.fingerprint(&write.owner.evidence) != fingerprint
+                {
+                    return Err(unavailable());
+                }
+                Some(guard)
+            } else {
+                Some(guard)
+            }
+        } else {
+            None
+        };
         let binding = write
             .complete_settings(if compensated == Some(true) {
                 SettledCredentialState::Compensated(account)

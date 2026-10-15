@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.48] - 2026-10-15
+
+### 📚 Documentation
+
+- Explain current workspace toast suppression ([#2374](https://github.com/intent-hq/intentd/pull/2374))
+
+
+## [0.10.47] - 2026-10-15
+
+### 🚀 Features
+
+- Rebuild stale note indexes on demand ([#2417](https://github.com/intent-hq/intentd/pull/2417))
+- Push complete task and workspace statistics updates ([#2409](https://github.com/intent-hq/intentd/pull/2409))
+
+### 🐛 Bug Fixes
+
+- *(store)* Avoid note index rebuilds on release-only changes ([#2415](https://github.com/intent-hq/intentd/pull/2415))
+- Make Intel Mac artifacts optional and release-only ([#2411](https://github.com/intent-hq/intentd/pull/2411))
+
+### 📚 Documentation
+
+- Describe queued message controls in the assistant guide ([#2428](https://github.com/intent-hq/intentd/pull/2428))
+- Describe Home workspace list status groups ([#2423](https://github.com/intent-hq/intentd/pull/2423))
+- Explain repository labels on Home ([#2424](https://github.com/intent-hq/intentd/pull/2424))
+- Explain Home PR and waiting indicators ([#2406](https://github.com/intent-hq/intentd/pull/2406))
+
+### ⚙️ Miscellaneous Tasks
+
+- Migrate hosted builds and compiler caching to Depot ([#2421](https://github.com/intent-hq/intentd/pull/2421))
+
+
+## [0.10.46] - 2026-10-13
+
+### 📚 Documentation
+
+- Describe Mermaid diagrams in Markdown file previews ([#2402](https://github.com/intent-hq/intentd/pull/2402))
+
+
 ## [0.10.45] - 2026-10-13
 
 ### 📚 Documentation

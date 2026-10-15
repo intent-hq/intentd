@@ -552,8 +552,9 @@ async fn idle_daemon_exits_with_restart_code_on_sigusr2() {
 }
 
 /// Readiness must imply installed signal handling even when the spawned
-/// watcher has not run. The socket gate holds that task at its first poll;
-/// a successful status RPC is the production sitter's readiness criterion.
+/// watcher has consumed its bootstrap receiver. The gate holds that task at
+/// its first poll while startup reaches the ready phase and serves normal RPCs;
+/// protected startup liveness alone must not satisfy this regression.
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
@@ -581,12 +582,16 @@ async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
         .expect("restart watcher reached gate")
         .expect("accept watcher gate");
 
-    let status = Client::connect(&socket)
-        .await
-        .rpc(1, "system.status", json!({}))
-        .await;
+    let mut client = Client::connect(&socket).await;
+    let startup = client.rpc(1, "system.startupStatus", json!({})).await;
+    assert_eq!(startup["phase"], "ready", "{startup}");
+    let status = client.rpc(2, "system.status", json!({})).await;
     assert!(status["version"].is_string(), "{status}");
-    eprintln!("production readiness passed while restart watcher held: {status}");
+    let workspaces = client.rpc(3, "workspace.list", json!({})).await;
+    assert!(workspaces["workspaces"].is_array(), "{workspaces}");
+    eprintln!(
+        "operational readiness passed while restart watcher held: startup={startup}, status={status}"
+    );
 
     // Queue the signal while the process is stopped, then release the gate
     // before resuming. Pending signals are delivered before userspace runs:
@@ -622,7 +627,7 @@ async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
     assert!(daemon.log().contains("staged update restart accepted"));
 }
 
-/// Registration errors must stop startup before readiness, whether or not
+/// Registration errors must stop bootstrap before even protected liveness, whether or not
 /// the sitter advertised the handshake. Use an invalid signal to exercise
 /// Tokio's real error path rather than bypassing registration.
 #[cfg(debug_assertions)]

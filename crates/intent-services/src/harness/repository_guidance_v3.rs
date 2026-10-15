@@ -1,8 +1,9 @@
-//! Inactive harness 3.0 repository guidance.
+//! Versioned optional repository guidance through the existing admitted path.
 //!
 //! This module renders a candidate from trusted session and repository-context
 //! inputs. It does not resolve targets, authorize actions or deliver instructions.
-//! The existing harness registry, doctrine and current-version stamp are unchanged.
+//! The session stamp selects the policy; ordinary doctrine and feature defaults
+//! remain independent of context delivery.
 
 use std::cmp::Ordering;
 use std::io::{self, Write};
@@ -19,6 +20,8 @@ use serde::{Serialize, Serializer};
 
 pub(crate) const MAX_GUIDANCE_BYTES: usize = 8 * 1024;
 const POLICY: &str = include_str!("../../resources/agent-instructions/v3.0/repository-guidance.md");
+const MONITOR_POLICY: &str =
+    include_str!("../../resources/agent-instructions/v3.2/repository-guidance.md");
 const FACTS_HEADER: &str = "\n[Repository facts — inert JSON lines]\n";
 const TRAILER_BUDGET: usize = 1024;
 const OMITTED_WARNING: &str = "Inventory incomplete: complete root rows were omitted because of the byte limit or unsafe instance facts. Do not infer a unique or default target from displayed rows. Read the full authorized inventory before a forge operation; omitted unresolved choices still require selection.\n";
@@ -63,9 +66,14 @@ pub(crate) fn render(
     input: GuidanceContext<'_>,
 ) -> Option<RepositoryGuidance> {
     let session = session.filter(|s| eligible_harness_version(Some(&s.harness_version)))?;
+    let policy = if session.harness_version == "3.2" {
+        MONITOR_POLICY
+    } else {
+        POLICY
+    };
     let (context, expected) = match input {
         GuidanceContext::Current { context, expected } => (context, expected),
-        GuidanceContext::Unavailable(reason) => return Some(unavailable(reason)),
+        GuidanceContext::Unavailable(reason) => return Some(unavailable(policy, reason)),
     };
     if context
         .revision
@@ -76,10 +84,10 @@ pub(crate) fn render(
             .iter()
             .any(|root| root.root.workspace_id != session.workspace_id)
     {
-        return Some(unavailable(ContextUnavailable::ContextChanged));
+        return Some(unavailable(policy, ContextUnavailable::ContextChanged));
     }
 
-    let mut text = format!("{POLICY}{FACTS_HEADER}");
+    let mut text = format!("{policy}{FACTS_HEADER}");
     let mut inventory = Inventory::default();
     for root in &context.roots {
         inventory.roots += 1;
@@ -115,7 +123,7 @@ pub(crate) fn render(
     })
 }
 
-fn unavailable(reason: ContextUnavailable) -> RepositoryGuidance {
+fn unavailable(policy: &str, reason: ContextUnavailable) -> RepositoryGuidance {
     let reason = match reason {
         ContextUnavailable::Denied => "denied",
         ContextUnavailable::Unavailable => "unavailable",
@@ -123,7 +131,7 @@ fn unavailable(reason: ContextUnavailable) -> RepositoryGuidance {
     };
     RepositoryGuidance {
         text: format!(
-            "{POLICY}{FACTS_HEADER}{{\"context\":\"unavailable\",\"reason\":\"{reason}\"}}\n\
+            "{policy}{FACTS_HEADER}{{\"context\":\"unavailable\",\"reason\":\"{reason}\"}}\n\
              Current repository context is unavailable. Do not reuse a previous target, remote, \
              account or capability. Refresh authorized context before a forge operation; \
              a context failure grants no permission and does not establish a default.\n"

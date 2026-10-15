@@ -851,3 +851,50 @@ The design docs live in the monorepo under `docs/`:
 
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
+
+### Depot CI and compiler cache
+
+Routed jobs prefer the free self-hosted fleet and burst to Depot when the fleet
+is unavailable or busy. Depot Linux checks use 8 CPUs and coverage/release
+compilation uses 16 CPUs. Physical-host pruning remains scheduled.
+To bypass self-hosted runners during maintenance, set the repository variable
+`CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
+`CI_MACOS_RUNNER_DISABLED=true`.
+Restore the default self-hosted preference by deleting that variable with
+`gh variable delete <VARIABLE> --repo intent-hq/intentd` after recovery.
+Each override affects only its named platform.
+
+`scripts/setup-depot-sccache.py` installs pinned, checksum-verified sccache directly.
+Depot supplies its job-scoped WebDAV endpoint. Self-hosted runners use the
+`DEPOT_TOKEN` Actions secret, or existing `SCCACHE_WEBDAV_*` environment settings.
+Without credentials, compilation proceeds uncached with a notice. Rust caches
+use the managed service, without Rust cache actions or Actions cache archives.
+The build-only release-cache workflow warms release inputs; the managed smoke
+workflow verifies compiler hits across jobs and invalidation after source changes.
+
+### Windows CI disk cleanup
+
+`windows-prune.yml` maintains 40 GiB of free space on 5090pc twice daily. Manual
+runs default to dry-run; `apply=true` deletes only inactive debug artifacts in
+the two intentd CI target directories. It preserves Cargo lock files, release
+profiles, hardlinked artifacts, toolchains, registry, credentials and sources. Native Windows safety
+tests run first. A busy runner, compiler, held lock, in-use marker, reparse point,
+unknown owner or insufficient eligible space fails visibly.
+Cleanup locks existing Cargo lock files without allocating new ones, so a full
+disk can still be recovered. The legacy Cargo lock is required for each profile.
+
+Before the new workflow lands, the existing Mac maintenance dispatcher can run
+it from this branch without merging:
+
+```sh
+gh workflow run macos-prune.yml --repo intent-hq/intentd --ref ci/depot-managed-cache -f runner=5090pc -f apply=false
+# Inspect the dry-run, then use -f apply=true -f verify_build=true.
+```
+
+Once available on main, invoke `windows-prune.yml` directly. After cleanup,
+verify a self-hosted Windows build before removing the maintenance routing
+variable documented above. The optional `verify_build=true` input compiles the
+real daemon with the pinned Rust toolchain after a successful apply; it has no
+effect on dry runs. It uses Depot managed sccache when `DEPOT_TOKEN` is configured.
+The cleanup log reports actual free bytes before
+and after deletion; a rebuild repopulates any evicted debug cache.

@@ -1799,7 +1799,7 @@ async fn assert_member_pr_authorization_entry(flush: bool) {
             let agent = AgentId::from(agent["agent"]["id"].as_str().unwrap());
             let value = with_caller(
                 owner_caller.clone(),
-                svc.pr_monitor_start(ws.clone(), agent, 42, None),
+                svc.pr_monitor_start(ws.clone(), agent, 42, Some("o/r".into())),
             )
             .await
             .unwrap();

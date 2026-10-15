@@ -29,6 +29,8 @@ struct Original {
 #[derive(Default)]
 struct State {
     retired: bool,
+    #[cfg(feature = "repository-test-fixtures")]
+    review_runtime_fixture: bool,
     blueprint: Option<Arc<EndpointBlueprint>>,
     endpoint: Option<Arc<Endpoint>>,
     callback_offer: CallbackOffer,
@@ -194,6 +196,27 @@ impl RepositoryOrigin {
         }
     }
 
+    #[cfg(feature = "repository-test-fixtures")]
+    pub(super) fn capture_review_runtime_fixture(
+        &self,
+        opts: &intent_acp::spawn::SpawnOptions<'_>,
+    ) {
+        let selected =
+            std::env::var_os("INTENTD_TEST_REVIEW_LAUNCHER").map(std::path::PathBuf::from);
+        let mut state = self.state.lock().unwrap();
+        if !state.retired && opts.provider.id == "claude-code" {
+            state.review_runtime_fixture = selected
+                .as_deref()
+                .is_some_and(|path| path.is_absolute() && Some(path) == opts.provider_binary);
+        }
+    }
+
+    #[cfg(feature = "repository-test-fixtures")]
+    pub(super) fn review_runtime_fixture(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.retired && state.review_runtime_fixture
+    }
+
     pub(super) fn callback_offer(
         &self,
         session: &AgentSession,
@@ -281,13 +304,14 @@ impl RepositoryOrigin {
                 let blueprint = self.state.lock().unwrap().blueprint.clone();
                 // Bind once, synchronously, outside the state lock while the
                 // consumed original physical owner is still directly available.
-                let live = outcome.query.as_ref().and_then(|_| {
+                let live = outcome.query.as_ref().and_then(|query| {
                     let original = self.original.as_ref()?;
                     blueprint.as_ref()?.bind_context(
                         connection,
                         &owner,
                         &original.workspace,
                         &original.agent,
+                        query.pending_review_monitoring(),
                     )
                 });
                 if self.install(attempt, owner) {

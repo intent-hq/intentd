@@ -64,7 +64,7 @@ jobs:
     # never runs any of this workflow's jobs. Tag pushes and same-repo PRs
     # are unaffected. Re-apply this after any `dist generate`.
     if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: "ubuntu-latest"
+    runs-on: "depot-ubuntu-24.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -101,6 +101,7 @@ jobs:
       - id: plan
         run: |
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          python3 scripts/optional-intel-release.py matrix plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -137,6 +138,8 @@ jobs:
       # - 1 "global" task that builds universal installers
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    # LOCAL CUSTOMIZATION: only the isolated Intel Mac leg may fail.
+    continue-on-error: ${{ matrix.optional }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
@@ -210,7 +213,7 @@ jobs:
           # later steps. Without this, the first `cargo` invocation inside
           # `dist build` re-enters rustup's rust-toolchain.toml sync to add the
           # declared rustfmt/clippy components, which on the GitHub-hosted
-          # gh-linux-16x images collides with the preinstalled Rust ("failed to
+          # depot-ubuntu-24.04-16 images collides with the preinstalled Rust ("failed to
           # install component: 'rustfmt-preview-...', detected conflict:
           # 'bin/cargo-fmt'"), rolls back, and leaves the shim reporting cargo
           # as missing (v0.2.16 Release run 30706345522, aarch64-musl leg).
@@ -234,7 +237,7 @@ jobs:
           tmp=$(mktemp -d)
           fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
             curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
-            # Git Bash on the hosted windows-2022 runner ships coreutils'
+            # Git Bash on the hosted depot-windows-2022 runner ships coreutils'
             # sha256sum but not the perl shasum; Linux runners have both.
             if command -v sha256sum >/dev/null 2>&1; then
               echo "$2  $tmp/$1" | sha256sum -c -
@@ -243,7 +246,7 @@ jobs:
             fi
             case "$1" in
               *.zip)
-                # unzip is absent from Git Bash and the windows-2022 image;
+                # unzip is absent from Git Bash and the depot-windows-2022 image;
                 # the image ships 7-Zip (7z on PATH) instead.
                 if command -v unzip >/dev/null 2>&1; then
                   unzip -q "$tmp/$1" -d "$tmp/x"
@@ -281,12 +284,11 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
-      - name: "Restore release compiler cache"
-        uses: "./.github/actions/release-rust-cache"
-        with:
-          "flavor": "daemon-dist"
-          "runner": "${{ matrix.runner }}"
-          "target": "${{ join(matrix.targets, ' ') }}"
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -330,7 +332,7 @@ jobs:
     needs:
       - plan
       - build-local-artifacts
-    runs-on: "ubuntu-latest"
+    runs-on: "depot-ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
@@ -355,7 +357,8 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
+          dist build ${{ needs.plan.outputs.tag-flag }} $targets --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -381,7 +384,7 @@ jobs:
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "ubuntu-latest"
+    runs-on: "depot-ubuntu-24.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
@@ -405,7 +408,8 @@ jobs:
       - id: host
         shell: bash
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
+          dist host ${{ needs.plan.outputs.tag-flag }} $targets --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -426,6 +430,7 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+          python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Create GitHub Release
         env:
           # LOCAL CUSTOMIZATION of this cargo-dist-generated file: always
@@ -455,7 +460,7 @@ jobs:
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-latest"
+    runs-on: "depot-ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:

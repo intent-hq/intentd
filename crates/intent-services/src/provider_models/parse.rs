@@ -795,6 +795,11 @@ pub(crate) fn is_auth_required_error(code: i64, message: &str) -> bool {
         .collect();
     normalized.contains("auth required")
         || normalized.contains("authentication required")
+        // Claude ACP wraps expired OAuth credentials in JSON-RPC -32603,
+        // not 401. Match its explicit failure, not unrelated expired sessions.
+        || normalized.contains(
+            "failed to authenticate: oauth session expired and could not be refreshed",
+        )
         || normalized.contains("not logged in")
         || normalized.contains("not authenticated")
         || normalized.contains("unauthorized")
