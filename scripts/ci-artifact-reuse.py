@@ -143,8 +143,21 @@ def context(source, api):
         # A checkout head and GitHub's PR head are not interchangeable. Git can
         # read the commit header even in a depth-one checkout.
         parents = [line[7:] for line in archives.output(['git', 'cat-file', '-p', actual], source).splitlines() if line.startswith('parent ')]
-        if parents != [expected['base_sha'], expected['head_sha']]:
+        if len(parents) != 2 or parents[1] != expected['head_sha'] or not all(
+                re.fullmatch('[0-9a-f]{40}', value) for value in [*parents, expected['base_sha']]):
             raise ValueError('PR source is not the expected base/head merge commit')
+        if parents[0] != expected['base_sha']:
+            # GitHub can generate GITHUB_SHA against newer main than the base
+            # recorded in its synchronize event/run metadata. Keep that event
+            # base binding and independently authenticate the immutable tested
+            # merge and a forward-only base advance; never substitute a live ref.
+            commit = api.api('git/commits/' + actual)
+            if commit.get('sha') != actual or [p.get('sha') for p in commit.get('parents', [])] != parents:
+                raise ValueError('PR source is not the authenticated base/head merge commit')
+            comparison = api.api('compare/' + expected['base_sha'] + '...' + parents[0])
+            if comparison.get('status') != 'ahead' or comparison.get('merge_base_commit', {}).get('sha') != expected['base_sha']:
+                raise ValueError('PR merge base is not an authenticated advance of the event base')
+            expected['actual_base_sha'] = parents[0]
     run = api.run(int(os.environ['GITHUB_RUN_ID']))
     if not trusted_run(run, expected):
         raise ValueError('current workflow is outside the permitted producer trust context')

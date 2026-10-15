@@ -138,6 +138,60 @@ class CoordinationRegression(unittest.TestCase):
             api.download({'id': 42, 'size_in_bytes': 10**15}, Path(directory) / 'large.zip')
             self.assertEqual(run.call_args.kwargs['timeout'], 1800)
 
+    def test_advanced_merge_base_requires_immutable_github_provenance(self):
+        # A synchronize event can retain the old PR base while GITHUB_SHA is
+        # GitHub's newly generated merge with a later main commit.
+        expected = {'repository': 'intent-hq/intentd', 'source': 'c'*40,
+                    'head_sha': 'a'*40, 'base_sha': 'b'*40,
+                    'pull_request': 42, 'event': 'pull_request'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root, expected)
+            bundle = root / 'bundle'; bundle.mkdir()
+            store.publish(bundle, 1)
+            event = root / 'event.json'
+            event.write_text(json.dumps({'number': 42, 'pull_request': {
+                'head': {'sha': 'a'*40, 'repo': {'full_name': 'intent-hq/intentd'}},
+                'base': {'sha': 'b'*40}}}))
+            env = dict(GITHUB_EVENT_PATH=str(event), GITHUB_SHA='c'*40,
+                       GITHUB_EVENT_NAME='pull_request', GITHUB_REPOSITORY='intent-hq/intentd',
+                       GITHUB_RUN_ID='1')
+            commit = {'sha': 'c'*40, 'parents': [{'sha': 'd'*40}, {'sha': 'a'*40}]}
+            comparison = {'status': 'ahead', 'merge_base_commit': {'sha': 'b'*40}}
+            def response(path):
+                return {'git/commits/' + 'c'*40: commit,
+                        'compare/' + 'b'*40 + '...' + 'd'*40: comparison}[path]
+            with patch.dict(os.environ, env), patch.object(archives, 'source_commit', return_value='c'*40), \
+                 patch.object(archives, 'output', return_value='parent ' + 'd'*40 + '\nparent ' + 'a'*40), \
+                 patch.object(store, 'api', side_effect=response, create=True) as api:
+                actual = reuse.context(root, store)
+                self.assertEqual(actual, dict(expected, actual_base_sha='d'*40))
+                self.assertEqual(api.call_count, 2)
+                # Original event/run base stays bound; actual source stays bound
+                # separately and cannot be exchanged for the PR head.
+                self.assertTrue(reuse.trusted_run(store.run(1), actual))
+                for bad in [dict(commit, sha='e'*40),
+                            dict(commit, parents=[{'sha': 'e'*40}, {'sha': 'a'*40}]),
+                            dict(commit, parents=[{'sha': 'd'*40}, {'sha': 'e'*40}]),
+                            dict(commit, parents=[]), {}]:
+                    with self.subTest(commit=bad), patch.object(store, 'api', return_value=bad):
+                        with self.assertRaises(ValueError):
+                            reuse.context(root, store)
+                for bad in [{'status': 'behind', 'merge_base_commit': {'sha': 'b'*40}},
+                            {'status': 'diverged', 'merge_base_commit': {'sha': 'b'*40}},
+                            {'status': 'ahead', 'merge_base_commit': {'sha': 'e'*40}}, {}]:
+                    with self.subTest(comparison=bad), patch.object(store, 'api', side_effect=[commit, bad]):
+                        with self.assertRaises(ValueError):
+                            reuse.context(root, store)
+                with patch.object(store, 'api', side_effect=reuse.Unavailable('denied')):
+                    with self.assertRaises(reuse.Unavailable):
+                        reuse.context(root, store)
+                for parents in ['parent ' + 'd'*40, 'parent ' + 'd'*40 + '\nparent ' + 'e'*40,
+                                'parent ' + 'd'*40 + '\nparent ' + 'a'*40 + '\nparent ' + 'f'*40]:
+                    with self.subTest(parents=parents), patch.object(archives, 'output', return_value=parents):
+                        with self.assertRaises(ValueError):
+                            reuse.context(root, store)
+
     def test_actual_pr_merge_source_is_distinct_from_event_head(self):
         expected = {'repository': 'intent-hq/intentd', 'source': 'c'*40, 'head_sha': 'a'*40,
                     'base_sha': 'b'*40, 'pull_request': 42, 'event': 'pull_request'}
@@ -156,7 +210,8 @@ class CoordinationRegression(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'source/merge SHA'):
                     reuse.context(root, store)
             with patch.dict(os.environ, env), patch.object(archives, 'source_commit', return_value='c'*40), \
-                 patch.object(archives, 'output', return_value='parent ' + 'd'*40 + '\nparent ' + 'a'*40):
+                 patch.object(archives, 'output', return_value='parent ' + 'd'*40 + '\nparent ' + 'a'*40), \
+                 patch.object(store, 'api', return_value={}, create=True):
                 with self.assertRaisesRegex(ValueError, 'base/head merge'):
                     reuse.context(root, store)
 
