@@ -273,6 +273,32 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
+## Home workspace status icons
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+
+In **Home → Workspaces**, the status icon in list and board views describes the
+workspace's current status. Hover over it for an explanation:
+
+- **PR Open** (pull request icon): a pull request is open.
+- **PR Mergeable** (pull request icon): a pull request is reported ready to merge.
+- **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Colors follow the current theme: Open and Queued use its informational color;
+Mergeable uses its success color. Use the label and tooltip to identify the state.
+
+Questions, review requests, failures, and blockers can take precedence over PR
+icons. **PR Mergeable** does not grant permission to merge: agents still need the
+user's explicit authorization and must check the current merge requirements.
+
+A muted hourglass indicates waiting on external events or delegated work in the
+workspace; it does not mean every agent is waiting. It replaces an otherwise idle
+dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+hourglass, with additional waiting explained in its tooltip. Waiting is also
+included in accessible status text. The waiting indicator is hidden when the main
+status shows active work, unread updates, a question, a review request, a failure,
+or a blocker.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
