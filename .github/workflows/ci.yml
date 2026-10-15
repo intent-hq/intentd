@@ -139,11 +139,13 @@ jobs:
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
             const tinybox = ["self-hosted", "Linux", "X64"];
-            // The coverage jobs run the whole instrumented suite, so they
-            // burst to the 16-core runner. Check now produces their archives
-            // sequentially, so it needs the same compilation capacity.
+            // Keep small Linux/native work on Depot. The shared producer and
+            // full/changed consumers retain large targets, staged variants and
+            // fresh profiles: Depot's 16-core disk exhausted on this graph.
+            // Use the larger-disk pool for these jobs only; their aggregate
+            // storage guards still verify actual capacity before expensive work.
             const burst = ["depot-ubuntu-24.04-16"];
-            const checkBurst = ["depot-ubuntu-24.04-16"];
+            const checkBurst = ["gh-linux-16x"];
             // The Windows build entry: the self-hosted 5090pc runner, or
             // the org-hosted 16-core Windows runner (the one
             // release-sitter.yml builds on) — cold workspace Clippy
@@ -830,10 +832,10 @@ jobs:
           #   os: depot-ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
           # use the latest hosted ARM64 image. Empty route output also falls back to
-          # hosted. Retain the historical macos-14 check name for continuity.
+          # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
-            name: build (aarch64-apple-darwin, macos-14)
+            name: build (aarch64-apple-darwin)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
           # depot-windows-2022-16 runner otherwise (fail-open to burst, like the
@@ -1145,7 +1147,7 @@ jobs:
     # Same full-report demand as coverage-e2e; the gate requires both reports.
     needs: [route, check]
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || needs.check.outputs.full_coverage == 'true') && needs.route.result == 'success' && needs.check.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1163,7 +1165,7 @@ jobs:
       # failed: concurrent_writes_no_sqlite_busy hit "database is locked" on
       # both tries, bridge/auto-commit timing tests timed out), but up to 8
       # co-tenant jobs now share the box, so halve to 16 to avoid the lock
-      # storms under co-tenancy. This also matches the 16-core depot-ubuntu-24.04-16
+      # storms under co-tenancy. This also matches the 16-core gh-linux-16x
       # burst runner, so the value no longer varies by route.
       NEXTEST_TEST_THREADS: 16
     steps:
@@ -1361,7 +1363,7 @@ jobs:
   coverage-changed:
     needs: [route, check]
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' && needs.check.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1608,6 +1610,8 @@ jobs:
             ${{ env.NATIVE_ARTIFACT_ROOT }}/preparation-progress.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/producer-prerequisite.json
             ${{ env.NATIVE_ARTIFACT_ROOT }}/compiler-calls.log
+            ${{ runner.temp }}/coverage-changed-plan.txt
+            ${{ runner.temp }}/coverage-changed-plan.json
           if-no-files-found: ignore
       - name: Remove this run's uncached artifact storage
         if: always()
@@ -1816,6 +1820,7 @@ jobs:
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-setup-depot-sccache.py
+          python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-depot-runners.py
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test optional Intel cargo-dist publication
@@ -1829,6 +1834,11 @@ jobs:
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+      - name: Test obsolete merge-run policy and workflow integration (offline)
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
         run: |
           python3 -I -B scripts/test-ci-native-routing.py

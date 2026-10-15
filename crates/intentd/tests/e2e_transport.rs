@@ -20,7 +20,7 @@
 mod common;
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,10 +112,10 @@ fn run_cli_with_env(
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
 /// daemon-startup budget (see `common::daemon_startup_timeout`).
-async fn await_uds(socket: &PathBuf) -> bool {
+async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

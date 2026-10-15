@@ -21,7 +21,6 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 /// A deterministic fake token; never a real credential.
@@ -69,7 +68,7 @@ fn spawn_serve(data_dir: &Path) -> Child {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

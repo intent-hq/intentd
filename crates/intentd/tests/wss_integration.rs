@@ -50,6 +50,9 @@ mod script_lifecycle;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[cfg(all(unix, debug_assertions))]
+#[path = "wss_integration/startup.rs"]
+mod startup;
 #[path = "wss_integration/task_list_latency.rs"]
 mod task_list_latency;
 #[cfg(unix)]

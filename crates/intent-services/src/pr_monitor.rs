@@ -1190,6 +1190,14 @@ async fn poll_pr(
                 entry.record_started_at = record_started_at;
                 entry.authorization.clone_from(&authorization);
                 entry.pr = pr.clone();
+                // Queue movement need not change updatedAt or mergeability.
+                // Keep the signal already returned by the folded observation
+                // even when the remaining checklist reuses the full fetch.
+                if let Some(observation) = &observation {
+                    let queue = observation.signals.is_in_merge_queue;
+                    entry.snapshot.merge_queue_reported = queue;
+                    entry.snapshot.requirements.is_in_merge_queue = queue.filter(|&q| q);
+                }
                 Some(entry.clone())
             }
             _ => None,
@@ -1680,7 +1688,9 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         mergeable: m.snapshot_mergeable,
         mergeable_state: None,
         is_draft: m.snapshot_is_draft,
-        is_in_merge_queue: None,
+        is_in_merge_queue: m
+            .snapshot_is_in_merge_queue
+            .filter(|&queued| queued && status == PullRequestStatus::Open),
     }
 }
 
@@ -1988,6 +1998,29 @@ impl Services {
             );
         }
         Ok((entry, fetched))
+    }
+
+    /// Project a monitor observation into existing same-head workspace/root
+    /// copies without replacing newer REST fields or making another forge call.
+    /// Monitor-only PRs are projected separately from the persisted snapshot.
+    async fn project_monitor_queue(&self, repo_ref: &RepoRef, entry: &PrCacheEntry) {
+        if let Err(error) = self
+            .fold_served_pr(
+                repo_ref,
+                &entry.pr,
+                entry.snapshot.merge_queue_reported,
+                false,
+            )
+            .await
+        {
+            tracing::warn!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = entry.pr.number,
+                error = %error,
+                "pr monitor: projecting queue state into workspace PRs failed"
+            );
+        }
     }
 
     /// The PRs under an active monitor, for the cache's retention pass
@@ -2521,7 +2554,10 @@ impl Services {
             .read_pr(repo_ref, pr_number, PrReadPolicy::REFRESH)
             .await
         {
-            Ok(entry) => Ok(Some(entry.snapshot.materialize(None))),
+            Ok(entry) => {
+                self.project_monitor_queue(repo_ref, &entry).await;
+                Ok(Some(entry.snapshot.materialize(None)))
+            }
             Err(Error::RateLimited(detail)) => {
                 self.pause_sweeps_for_rate_limit(sc, &detail).await;
                 Ok(None)
@@ -3142,7 +3178,10 @@ impl Services {
         )
         .await
         {
-            Ok(entry) => entry.snapshot,
+            Ok(entry) => {
+                self.project_monitor_queue(&repo_ref, &entry).await;
+                entry.snapshot
+            }
             Err(e) => {
                 self.record_pr_monitor_error(&monitor, &e.to_string()).await;
                 return Err(e);
@@ -3425,9 +3464,11 @@ impl Services {
                             rate_limited = true;
                             Err(self.rate_limit_pause_error())
                         }
-                        Ok(result) => result
-                            .map(|entry| entry.snapshot)
-                            .map_err(|e| e.to_string()),
+                        Ok(Ok(observed)) => {
+                            self.project_monitor_queue(&repo_ref, &observed).await;
+                            Ok(observed.snapshot)
+                        }
+                        Ok(Err(error)) => Err(error.to_string()),
                         Err(_) => Err(format!(
                             "PR fetch timed out after {:?}",
                             self.pr_monitor_fetch_timeout
@@ -4690,6 +4731,7 @@ mod tests {
     mod ancestry_messages;
     mod ancestry_regression;
     mod compact_required_checks;
+    mod home_queue_regression;
     mod qualified_isolation;
     mod qualified_recovery;
     mod quota_regression;

@@ -87,7 +87,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             // timing-guard: poll interval

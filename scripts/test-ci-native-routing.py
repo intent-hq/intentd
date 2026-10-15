@@ -341,7 +341,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                               ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-16x"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], "false")
@@ -351,7 +351,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(fixture=fixture):
                 outputs = run_route(self.workflow, **fixture)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-16"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-16x"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
@@ -393,7 +393,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["linux_labels"]),
                                  ["depot-ubuntu-24.04-16"] if disabled == "true" else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(json.loads(outputs["check_labels"]),
-                                 ["depot-ubuntu-24.04-16"] if disabled == "true" else ["self-hosted", "Linux", "X64"])
+                                 ["gh-linux-16x"] if disabled == "true" else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(outputs["linux_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -422,7 +422,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
         mac = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"][0]
-        self.assertEqual(mac["name"], "build (aarch64-apple-darwin, macos-14)")
+        self.assertEqual(mac["name"], "build (aarch64-apple-darwin)")
         self.assertEqual(self.workflow["jobs"]["daemon-lifecycle"]["name"], "Daemon lifecycle (${{ matrix.platform }})")
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):

@@ -325,6 +325,24 @@ class CiPolicyTests(unittest.TestCase):
                     proof['run'] = 'python3 scripts/ci-linux-artifacts.py produce\n' + proof['run']
                 self.assertTrue(profile_pool_violations(workflow))
 
+    def test_changed_storage_and_selection_evidence_survives_failure(self):
+        job = self.workflow['jobs']['coverage-changed']
+        steps = job['steps']
+        initialize = next(s for s in steps if 'ci-artifact-storage.py init' in s.get('run', ''))
+        execute = next(s for s in steps if s.get('name') == 'Run changed tests under llvm-cov')
+        callback = next(s for s in steps if s.get('name') == 'Run callback fixture composition under llvm-cov')
+        upload = next(s for s in steps if s.get('name') == 'Upload coverage execution evidence')
+        cleanup = next(s for s in steps if 'ci-artifact-storage.py cleanup' in s.get('run', ''))
+        self.assertLess(steps.index(initialize), steps.index(execute))
+        self.assertLess(steps.index(callback), steps.index(upload))
+        self.assertLess(steps.index(upload), steps.index(cleanup))
+        self.assertEqual(upload['if'], 'always()')
+        for evidence in ('storage*.json', 'receipt-*.json', 'consumer-*.json', 'coverage-changed-plan.json'):
+            self.assertIn(evidence, upload['with']['path'])
+        self.assertFalse(execute.get('continue-on-error'))
+        self.assertFalse(callback.get('continue-on-error'))
+        self.assertIn('ci-consumer-process.py --', callback['run'])
+
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
             ("Retained workspace CoW fixtures (macOS runtime)", 6),

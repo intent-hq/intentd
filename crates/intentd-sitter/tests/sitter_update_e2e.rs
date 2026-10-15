@@ -1078,3 +1078,46 @@ fn double_dash_forwards_update_to_the_daemon() {
         "the forwarded form must not update anything"
     );
 }
+
+#[test]
+fn update_waits_for_cli_starting_before_target_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0");
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, _) = serve_recording(Arc::clone(&routes));
+    publish_stable(
+        &routes,
+        &base_url,
+        "0.2.0",
+        br#"#!/bin/sh
+count=0
+if [ -f "$INTENTD_DATA_DIR/probes" ]; then count=$(cat "$INTENTD_DATA_DIR/probes"); fi
+count=$((count + 1))
+echo "$count" > "$INTENTD_DATA_DIR/probes"
+if [ "$count" -lt 7 ]; then
+  echo '{"version":"0.2.0","ready":false,"startup":{"startupStatus":1,"attemptId":"boot-update","phase":"indexing","elapsedMs":10,"phaseElapsedMs":10,"progressAgeMs":10,"retryAfterMs":1000}}'
+else
+  echo '{"version":"0.2.0"}'
+fi
+"#,
+    );
+    let hup_log = dir.path().join("hup.log");
+    let mut sitter = spawn_fake_sitter(&paths, &hup_log);
+    let output = run_sitter_with_readiness_timeout(dir.path(), &base_url, 2000, &["update"]);
+    let _ = sitter.kill();
+    let _ = sitter.wait();
+    assert!(
+        output.status.success(),
+        "{}; count={:?}",
+        stderr_of(&output),
+        fs::read_to_string(dir.path().join("probes"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("probes"))
+            .unwrap()
+            .trim(),
+        "7",
+        "ready:false with a matching version must renew the budget without reporting ready"
+    );
+}
