@@ -41,6 +41,8 @@ mod metrics_repo;
 mod node_repo;
 pub mod note_annotation_repo;
 pub mod note_delete_repo;
+mod note_index_budget;
+mod note_index_job;
 mod note_line_attribution_repo;
 mod note_page_html;
 mod note_page_index;
@@ -347,9 +349,6 @@ pub(crate) async fn commit_with_rollback_guard<T>(
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(unix, debug_assertions))]
-mod startup_test_gate;
-
 /// Embedded schema migrations (§9.4).
 ///
 /// **Adding workspace state? Transfer checklist.** A migration that adds a
@@ -383,6 +382,8 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
+    note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -397,20 +398,18 @@ pub struct PreparedDaemonStore {
 }
 
 impl PreparedDaemonStore {
-    /// Open/migrate/rebuild while publishing only aggregate startup observations.
+    /// Open/migrate without converting unopened notes.
     ///
     /// # Errors
     /// Returns initialization errors, preserving the database ownership guard.
-    pub async fn open(self, startup: Option<intent_core::startup::StartupStatus>) -> Result<Store> {
+    pub async fn open(self) -> Result<Store> {
         // SQLite initialization callbacks retain ownership even if this caller
         // disappears, matching open_for_daemon's existing cancellation guarantee.
-        tokio::spawn(Store::finish_owned_startup(
-            self.physical,
-            self.owner,
-            startup,
-        ))
-        .await
-        .map_err(|e| Error::Internal(format!("daemon database initialization task failed: {e}")))?
+        tokio::spawn(Store::finish_owned_startup(self.physical, self.owner))
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("daemon database initialization task failed: {e}"))
+            })?
     }
 }
 
@@ -422,13 +421,12 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database cannot be opened or created, a migration fails, or the migration ledger records a version newer than this build (downgrade).
     pub async fn open(db_path: &Path) -> Result<Self> {
-        Self::open_with_owner(db_path, None, None).await
+        Self::open_with_owner(db_path, None).await
     }
 
     async fn open_with_owner(
         db_path: &Path,
         owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
-        startup: Option<intent_core::startup::StartupStatus>,
     ) -> Result<Self> {
         let write_pool = match &owner {
             Some(_) => connect_write_owned(db_path, WRITE_ACQUIRE_TIMEOUT, owner.clone()).await?,
@@ -452,57 +450,16 @@ impl Store {
         })?;
         let write_pool = StorePool::new(write_pool, owner.is_some());
         let read_pool = StorePool::new(read_pool, owner.is_some());
-        // Keep the derived-index startup future off enclosing callers' stacks,
-        // and leave the read pool cold until the first actual read.
-        let note_pages = std::sync::Arc::new(
-            Box::pin(async {
-                let initialize: futures_util::future::BoxFuture<'_, Result<_>> = Box::pin(async {
-                    let mut index_conn =
-                        note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
-                    let indexed = async {
-                        note_page_index::retire_changed_profiles(&mut index_conn).await?;
-                        note_page_index::rebuild_pending_with_progress(
-                            &mut index_conn,
-                            startup.as_ref(),
-                        )
-                        .await?;
-                        if let Some(status) = &startup {
-                            status.finalizing(intent_core::startup::FinalizingStep::Anchors);
-                        }
-                        note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
-                    }
-                    .await;
-                    if indexed.is_ok() {
-                        if let Some(status) = &startup {
-                            status.finalizing(intent_core::startup::FinalizingStep::Committing);
-                            #[cfg(all(unix, debug_assertions))]
-                            startup_test_gate::reach(b'c', &mut index_conn).await?;
-                        }
-                    }
-                    index_conn
-                        .finish(indexed, "note index backfill commit")
-                        .await?;
-                    note_page_repo::Runtime::open(&write_pool).await
-                });
-                if let Some(status) = &startup {
-                    tokio::select! {
-                        biased;
-                        () = status.cancelled() => Err(Error::Internal("startup cancelled".into())),
-                        result = initialize => result,
-                    }
-                } else {
-                    initialize.await
-                }
-            })
-            .await?,
-        );
-        if let Some(status) = &startup {
-            status.finalizing(intent_core::startup::FinalizingStep::Services);
-        }
+        // Profiles/readiness are checked only for a demanded note. Opening the
+        // database must never hydrate or convert the stale note backlog.
+        let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
+        let note_index_jobs = note_index_job::domain_for(db_path)?;
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            note_index_jobs,
+            note_index_owner: std::sync::Arc::default(),
             write_pool,
             read_pool,
             _daemon_owner: owner,
@@ -522,7 +479,7 @@ impl Store {
     /// Returns an error if another daemon owns this database, locking is unsupported,
     /// or opening/migrating/sweeping the database fails.
     pub async fn open_for_daemon(db_path: &Path) -> Result<Self> {
-        Self::prepare_for_daemon(db_path)?.open(None).await
+        Self::prepare_for_daemon(db_path)?.open().await
     }
 
     /// Acquire database ownership before exposing startup listeners.
@@ -564,9 +521,8 @@ impl Store {
     async fn finish_owned_startup(
         physical: std::path::PathBuf,
         owner: std::sync::Arc<daemon_ownership::DaemonOwnership>,
-        startup: Option<intent_core::startup::StartupStatus>,
     ) -> Result<Self> {
-        let store = Self::open_with_owner(&physical, Some(owner), startup).await?;
+        let store = Self::open_with_owner(&physical, Some(owner)).await?;
         // No Store has escaped this constructor yet, and the OS lock excludes
         // competing daemon startups. The delete trigger rebalances byte counts.
         let reaped = sqlx::query(
@@ -749,6 +705,7 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        self.note_index_jobs.close(&self.note_index_owner).await;
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).

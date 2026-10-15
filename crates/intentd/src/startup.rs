@@ -59,6 +59,23 @@ impl Bootstrap {
     }
 }
 
+/// Debug-only subprocess seam at real preparation, before Store initialization.
+/// It exercises restricted listeners and cancellation without converting notes.
+#[cfg(all(unix, debug_assertions))]
+pub async fn preparing_test_gate() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(path) = std::env::var_os("INTENTD_TEST_PREPARING_STARTUP_GATE") else {
+        return Ok(());
+    };
+    let mut gate = tokio::net::UnixStream::connect(path).await?;
+    gate.write_u8(b'p').await?;
+    anyhow::ensure!(
+        gate.read_u8().await? == b'c',
+        "preparation barrier rejected"
+    );
+    Ok(())
+}
+
 /// A latched stop request shared with the initialization owner. Only the
 /// pre-Store future may be dropped; service initialization owns its teardown.
 #[derive(Clone)]

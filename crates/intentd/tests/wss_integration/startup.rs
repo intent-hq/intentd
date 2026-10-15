@@ -1,4 +1,4 @@
-//! Full daemon startup against a temporary database, with transaction barriers.
+//! Protected preparation and lazy note demand against a temporary database.
 use super::*;
 use intentd_test_support::GuardedChild;
 use serde_json::json;
@@ -36,7 +36,7 @@ async fn call(ws: &mut Ws, method: &str, params: Value) -> Value {
         }
     })
     .await
-    .expect("startup RPC responds while transaction is blocked")
+    .expect("startup RPC responds while preparation is blocked")
 }
 
 async fn uds_call(path: &Path, method: &str) -> Value {
@@ -51,7 +51,7 @@ async fn uds_call(path: &Path, method: &str) -> Value {
         serde_json::from_str(&line).unwrap()
     })
     .await
-    .expect("UDS status responds during indexing")
+    .expect("UDS status responds during preparation")
 }
 
 async fn seed(dir: &Path) -> usize {
@@ -59,6 +59,7 @@ async fn seed(dir: &Path) -> usize {
     sqlx::query("INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES ('startup','private title','main','now','now')").execute(store.write_pool()).await.unwrap();
     let content = "A😀\r\n旧".repeat(3000);
     sqlx::query("INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at) VALUES ('spec','startup','secret note title',?,17,'now','now')").bind(&content).execute(store.write_pool()).await.unwrap();
+    sqlx::query("INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at) VALUES ('unopened','startup','unopened fixture',?,17,'now','now')").bind(&content).execute(store.write_pool()).await.unwrap();
     let principal = intent_core::Principal {
         id: intent_core::PrincipalId::from("startup-guest"),
         identity: None,
@@ -86,6 +87,18 @@ async fn seed(dir: &Path) -> usize {
         )
         .await
         .unwrap();
+    let denied = intent_core::Principal {
+        id: intent_core::PrincipalId::from("startup-denied"),
+        ..principal
+    };
+    store.upsert_principal(&denied).await.unwrap();
+    store
+        .insert_principal_credential(
+            &denied.id,
+            &intent_transport::hash_token("valid-denied-token"),
+        )
+        .await
+        .unwrap();
     store.close().await;
     content.len()
 }
@@ -103,7 +116,7 @@ fn launch_with_handshake(dir: &Path, gate: &Path, advertised: bool) -> (GuardedC
         .env("INTENTD_TCP_PORT", port.to_string())
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("INTENTD_WORKSPACES_DIR", dir.join("workspaces"))
-        .env("INTENTD_TEST_INDEX_STARTUP_GATE", gate)
+        .env("INTENTD_TEST_PREPARING_STARTUP_GATE", gate)
         .env("TOKIO_WORKER_THREADS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(dir.join("startup.log")).unwrap());
@@ -126,7 +139,7 @@ fn launch_with_handshake(dir: &Path, gate: &Path, advertised: bool) -> (GuardedC
 fn startup_client_config(dir: &Path) -> Arc<ClientConfig> {
     let intent_transport::CertStatus::Valid { fingerprint } = intent_transport::inspect_cert(dir)
     else {
-        panic!("child daemon must persist its TLS certificate before indexing");
+        panic!("child daemon must persist its TLS certificate before preparation");
     };
     client_config(&fingerprint)
 }
@@ -144,11 +157,11 @@ async fn database(dir: &Path) -> sqlx::SqlitePool {
 }
 
 #[tokio::test]
-async fn protected_startup_transaction_progress_and_fresh_handoff() {
+async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let dir = common::test_tempdir_in("/tmp", "startup-e2e-");
-    let bytes = seed(dir.path()).await;
+    seed(dir.path()).await;
     // A real local byte-forwarding sidecar verifies the saved route carries
-    // the same TLS/owner-token endpoint during indexing and after handoff.
+    // the same TLS/owner-token endpoint during preparation and after handoff.
     let proxy_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -176,7 +189,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
     let gate_path = dir.path().join("gate");
     let listener = UnixListener::bind(&gate_path).unwrap();
     let (mut child, port) = launch(dir.path(), &gate_path);
-    let mut inventory = barrier(&listener, b'i').await;
+    let mut preparation = barrier(&listener, b'p').await;
     assert!(!common::daemon_is_ready(&dir.path().join("intentd.sock")).await);
     let cfg = startup_client_config(dir.path());
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -185,7 +198,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("not ready (indexing)"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("not ready (preparing)"));
     // Old installed sitters execute this NEW binary for their liveness probe.
     // The CLI may confirm liveness, but the protected wire stays not-ready.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
@@ -201,7 +214,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
     let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(cli["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(cli["ready"], false);
-    assert_eq!(cli["startup"]["phase"], "indexing");
+    assert_eq!(cli["startup"]["phase"], "preparing");
     let socket = dir.path().join("intentd.sock");
     assert_eq!(
         uds_call(&socket, "system.status").await["error"]["code"],
@@ -221,11 +234,8 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
     assert_eq!(hello["error"]["data"]["code"], "daemon-not-ready");
     let attempt = hello["error"]["data"]["startup"]["attemptId"].clone();
     let status = call(&mut ws, "system.startupStatus", json!({})).await;
-    assert_eq!(status["result"]["phase"], "indexing");
-    assert_eq!(
-        status["result"]["progress"],
-        json!({"completedNotes":0,"totalNotes":1,"processedSourceBytes":0,"totalSourceBytes":bytes})
-    );
+    assert_eq!(status["result"]["phase"], "preparing");
+    assert!(status["result"].get("progress").is_none());
     assert!(status["result"].get("estimatedRemainingMs").is_none());
     assert!(!status.to_string().contains("secret note title"));
     assert_eq!(
@@ -297,33 +307,13 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
             .unwrap(),
         17
     );
-    inventory.write_u8(b'c').await.unwrap();
-    // The actual projection worker is blocked, while the sole async runtime
-    // worker must continue serving both protected transports.
-    let mut note = barrier(&listener, b'n').await;
     assert_eq!(
-        uds_call(&socket, "system.startupStatus").await["result"]["phase"],
-        "indexing"
-    );
-    assert_eq!(
-        call(&mut ws, "system.startupStatus", json!({})).await["result"]["progress"]
-            ["completedNotes"],
-        0
-    );
-    note.write_u8(b'c').await.unwrap();
-    let mut committing = barrier(&listener, b'c').await;
-    let status = call(&mut ws, "system.startupStatus", json!({})).await;
-    assert_eq!(status["result"]["phase"], "finalizing");
-    assert_eq!(status["result"]["finalizingStep"], "committing");
-    assert_eq!(status["result"]["progress"]["completedNotes"], 1);
-    assert_eq!(status["result"]["progress"]["processedSourceBytes"], bytes);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT indexed_rev FROM note_page_head")
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
             .fetch_one(&db)
             .await
             .unwrap(),
-        -1,
-        "rebuild is still uncommitted"
+        0,
+        "preparation must not convert unopened notes"
     );
     let mut old_uds = UnixStream::connect(&socket).await.unwrap();
     // Force admission before handoff, rather than merely connecting into backlog.
@@ -333,7 +323,7 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
         .unwrap();
     let mut old_uds = BufReader::new(old_uds);
     old_uds.read_line(&mut String::new()).await.unwrap();
-    committing.write_u8(b'c').await.unwrap();
+    preparation.write_u8(b'c').await.unwrap();
     timeout(common::daemon_startup_timeout(), async {
         loop {
             match ws.next().await {
@@ -372,6 +362,16 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
     assert!(common::daemon_is_ready(&dir.path().join("intentd.sock")).await);
     assert_eq!(status["result"]["attemptId"], attempt);
     assert!(status["result"].get("retryAfterMs").is_none());
+    assert!(status["result"].get("progress").is_none());
+    assert!(status["result"].get("estimatedRemainingMs").is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "ready must not convert the stale backlog"
+    );
     let hello = call(
         &mut ready,
         "client.hello",
@@ -400,6 +400,120 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
             .unwrap(),
         17
     );
+    // A ready daemon must retain lazy demand semantics. Authentication without
+    // workspace authorization and legacy full reads cannot activate conversion.
+    let cfg = startup_client_config(dir.path());
+    let mut denied = common::wss_connect_with_retry(
+        port,
+        cfg.clone(),
+        &format!("wss://localhost:{port}/ws?token=valid-denied-token"),
+    )
+    .await;
+    let page = json!({"workspaceId":"startup","noteId":"spec","page":{"kind":"source"}});
+    let refused = call(&mut denied, "note.get", page.clone()).await;
+    assert_eq!(refused["error"]["data"]["code"], "not-found", "{refused}");
+    let mut guest = common::wss_connect_with_retry(
+        port,
+        cfg,
+        &format!("wss://localhost:{port}/ws?token=valid-guest-token"),
+    )
+    .await;
+    let legacy = call(
+        &mut guest,
+        "note.get",
+        json!({"workspaceId":"startup","noteId":"spec"}),
+    )
+    .await;
+    assert!(legacy.get("error").is_none(), "{legacy}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Hold the real database writer, forcing the owned demand job to remain
+    // pending while ordinary authenticated status stays ready and responsive.
+    let writer = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("intentd.db")),
+        )
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&writer)
+        .await
+        .unwrap();
+    let pending = call(&mut guest, "note.get", page.clone()).await;
+    assert_eq!(pending["error"]["code"], -32006, "{pending}");
+    assert_eq!(
+        pending["error"]["data"],
+        json!({"code":"note-index-preparing","retryAfterMs":1000})
+    );
+    let during = call(&mut ready, "system.startupStatus", json!({})).await;
+    assert_eq!(during["result"]["phase"], "ready");
+    assert_eq!(during["result"]["attemptId"], attempt);
+    assert!(during["result"].get("progress").is_none());
+    assert!(during["result"].get("estimatedRemainingMs").is_none());
+    assert!(common::daemon_is_ready(&socket).await);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
+    guest.close(None).await.unwrap();
+    sqlx::query("ROLLBACK").execute(&writer).await.unwrap();
+    writer.close().await;
+    let mut guest = common::wss_connect_with_retry(
+        port,
+        startup_client_config(dir.path()),
+        &format!("wss://localhost:{port}/ws?token=valid-guest-token"),
+    )
+    .await;
+    let prepared = timeout(Duration::from_secs(15), async {
+        loop {
+            let response = call(&mut guest, "note.get", page.clone()).await;
+            if response["error"]["data"]["code"] != "note-index-preparing" {
+                break response;
+            }
+            // timing-guard: retry only the explicit read-preparation response.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(prepared["result"]["kind"], "noteSourcePage", "{prepared}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM note_page_head WHERE indexed_rev=current_rev"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT indexed_rev FROM note_page_head WHERE note_id='unopened'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        -1
+    );
+    let canonical: Vec<(String, i64)> = sqlx::query_as("SELECT content,rev FROM note ORDER BY id")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    assert_eq!(canonical, vec![("A😀\r\n旧".repeat(3000), 17); 2]);
+    assert_eq!(
+        call(&mut ready, "system.startupStatus", json!({})).await["result"]["phase"],
+        "ready"
+    );
     db.close().await;
     child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(child
@@ -411,27 +525,24 @@ async fn protected_startup_transaction_progress_and_fresh_handoff() {
 }
 
 #[tokio::test]
-async fn failed_commit_and_shutdown_roll_back_and_restart_resets_attempt() {
+async fn failed_preparation_and_shutdown_preserve_backlog_and_reset_attempt() {
     let dir = common::test_tempdir_in("/tmp", "startup-rollback-");
     seed(dir.path()).await;
     let gate_path = dir.path().join("gate");
     let listener = UnixListener::bind(&gate_path).unwrap();
     let mut previous = Value::Null;
-    for fail_commit in [true, false] {
+    for fail_preparation in [true, false] {
         let (mut child, port) = launch(dir.path(), &gate_path);
-        let mut inventory = barrier(&listener, b'i').await;
+        let mut preparation = barrier(&listener, b'p').await;
         let cfg = startup_client_config(dir.path());
         let mut ws = connect_ws(port, cfg).await;
         let status = call(&mut ws, "system.startupStatus", json!({})).await;
         let attempt = status["result"]["attemptId"].clone();
         assert_ne!(attempt, previous);
         previous = attempt;
-        assert_eq!(status["result"]["progress"]["completedNotes"], 0);
-        inventory.write_u8(b'c').await.unwrap();
-        let mut projection = barrier(&listener, b'n').await;
-        if fail_commit {
-            projection.write_u8(b'c').await.unwrap();
-            barrier(&listener, b'c').await.write_u8(b'f').await.unwrap();
+        assert!(status["result"].get("progress").is_none());
+        if fail_preparation {
+            preparation.write_u8(b'f').await.unwrap();
         } else {
             child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
         }
@@ -441,7 +552,7 @@ async fn failed_commit_and_shutdown_roll_back_and_restart_resets_attempt() {
                 .unwrap()
                 .unwrap()
                 .success(),
-            !fail_commit
+            !fail_preparation
         );
         assert!(!dir.path().join("intentd.sock").exists());
         let db = database(dir.path()).await;
@@ -511,13 +622,7 @@ async fn queue_restore_failure_never_activates_operational_work() {
     let gate_path = dir.path().join("gate");
     let indexing = UnixListener::bind(&gate_path).unwrap();
     let (mut child, _) = launch(dir.path(), &gate_path);
-    for stage in [b'i', b'n', b'c'] {
-        barrier(&indexing, stage)
-            .await
-            .write_u8(b'c')
-            .await
-            .unwrap();
-    }
+    barrier(&indexing, b'p').await.write_u8(b'c').await.unwrap();
     assert!(!child
         .wait_with_timeout(Duration::from_secs(20))
         .unwrap()
@@ -576,13 +681,7 @@ async fn service_startup_exit(invalidate_policy: bool) {
     let indexing = UnixListener::bind(&gate_path).unwrap();
     let services = UnixListener::bind(dir.path().join("service-gate")).unwrap();
     let (mut child, _) = launch(dir.path(), &gate_path);
-    for stage in [b'i', b'n', b'c'] {
-        barrier(&indexing, stage)
-            .await
-            .write_u8(b'c')
-            .await
-            .unwrap();
-    }
+    barrier(&indexing, b'p').await.write_u8(b'c').await.unwrap();
     let (mut service_gate, _) = timeout(common::daemon_startup_timeout(), services.accept())
         .await
         .unwrap()
@@ -591,6 +690,8 @@ async fn service_startup_exit(invalidate_policy: bool) {
     let status = uds_call(&socket, "system.startupStatus").await;
     assert_eq!(status["result"]["phase"], "finalizing");
     assert_eq!(status["result"]["finalizingStep"], "services");
+    assert!(status["result"].get("progress").is_none());
+    assert!(status["result"].get("estimatedRemainingMs").is_none());
     if invalidate_policy {
         std::fs::write(dir.path().join("config.toml"), "invalid = [").unwrap();
         service_gate.write_u8(1).await.unwrap();
@@ -642,7 +743,7 @@ async fn service_startup_exit(invalidate_policy: bool) {
             .fetch_one(&db)
             .await
             .unwrap(),
-        17
+        -1
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM client")
@@ -840,7 +941,7 @@ async fn cli_startup_liveness_uses_server_identity_and_rejects_invalid_probes() 
 }
 
 #[tokio::test]
-async fn sigusr2_during_indexing_is_retained_until_ready_and_stop_wins() {
+async fn sigusr2_during_preparation_is_retained_until_ready_and_stop_wins() {
     for advertised in [false, true] {
         for stop_early in [false, true] {
             let dir = common::test_tempdir_in("/tmp", "startup-usr2-");
@@ -848,12 +949,12 @@ async fn sigusr2_during_indexing_is_retained_until_ready_and_stop_wins() {
             let gate_path = dir.path().join("gate");
             let listener = UnixListener::bind(&gate_path).unwrap();
             let (mut child, _) = launch_with_handshake(dir.path(), &gate_path, advertised);
-            let mut inventory = barrier(&listener, b'i').await;
+            let mut preparation = barrier(&listener, b'p').await;
             child.signal(nix::sys::signal::Signal::SIGUSR2).unwrap();
             let socket = dir.path().join("intentd.sock");
             assert_eq!(
                 uds_call(&socket, "system.startupStatus").await["result"]["phase"],
-                "indexing"
+                "preparing"
             );
             assert_eq!(
                 uds_call(&socket, "system.status").await["error"]["code"],
@@ -862,18 +963,11 @@ async fn sigusr2_during_indexing_is_retained_until_ready_and_stop_wins() {
             if stop_early {
                 child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
             } else {
-                inventory.write_u8(b'c').await.unwrap();
-                for stage in [b'n', b'c'] {
-                    barrier(&listener, stage)
-                        .await
-                        .write_u8(b'c')
-                        .await
-                        .unwrap();
-                }
+                preparation.write_u8(b'c').await.unwrap();
                 if !advertised {
                     timeout(common::daemon_startup_timeout(), async {
                         while !common::daemon_is_ready(&socket).await {
-                            // timing-guard: poll application readiness after the commit barrier.
+                            // timing-guard: poll application readiness after the preparation barrier.
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
                     })
@@ -896,7 +990,7 @@ async fn sigusr2_during_indexing_is_retained_until_ready_and_stop_wins() {
                 .fetch_one(&db)
                 .await
                 .unwrap();
-            assert_eq!(indexed, if stop_early { -1 } else { 17 });
+            assert_eq!(indexed, -1);
             db.close().await;
             if !stop_early {
                 let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();

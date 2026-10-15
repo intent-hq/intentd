@@ -109,8 +109,8 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
     ("note_artifact_source", "derived canonical source grants rebuilt in the destination; artifact arena never transfers"),
     ("note_page_backend", "database-local namespace and authentication secret never transfer"),
     ("note_page_head", "fresh note incarnations created by import insert triggers"),
-    ("note_page_piece", "derived source index rebuilt inside import transaction"),
-    ("note_page_entry", "derived context and metadata rebuilt inside import transaction"),
+    ("note_page_piece", "derived source index prepared on first access"),
+    ("note_page_entry", "derived context and metadata prepared on first access"),
     ("note_stage_root", "backend-local staged operations, ownership and immutable source never transfer"),
     ("note_stage_root_pin", "backend-local retained operation source ownership never transfers"),
     ("note_stage_root_reclaim", "backend-local durable reclamation progress never transfers"),
@@ -733,9 +733,6 @@ impl Store {
                         anchor_notes.insert((workspace, note));
                     }
                 }
-                if *table == "note" {
-                    crate::note_page_index::rebuild_pending(&mut tx).await?;
-                }
                 if let Some(metadata) = history_metadata {
                     sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
                         .bind(metadata)
@@ -865,7 +862,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
         }
         // Comments arrive after notes. Publish only after the last imported
-        // root/reply, hydrating one affected note at a time inside this writer.
+        // root/reply. Stale source indexes stay pending until explicit demand.
         for (workspace, note) in anchor_notes {
             crate::note_annotation_repo::rebuild_note_anchors(
                 &mut tx,

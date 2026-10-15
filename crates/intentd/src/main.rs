@@ -1726,8 +1726,8 @@ async fn cmd_serve(
                     // cooperative stop reaches the canonical teardown below.
                     serve.await
                 } else {
-                    // Index cancellation owns no service work. The status
-                    // signal cancels/rolls back the separately owned Store open.
+                    // Preparation owns no service work. SQLite callbacks
+                    // retain physical ownership until their work settles.
                     Ok(ExitCode::SUCCESS)
                 }
             },
@@ -1928,11 +1928,17 @@ async fn cmd_serve_owned(
     // Snapshot DB-file existence before `Store::open` creates it: the one-time
     // legacy workspace import below fires only on a truly fresh database.
     let db_existed = config.db_path.exists();
+    #[cfg(all(unix, debug_assertions))]
+    startup::preparing_test_gate().await?;
     let store = prepared
-        .open(Some(bootstrap.dispatch.status().clone()))
+        .open()
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     bootstrap.cancellation.own_services();
+    bootstrap
+        .dispatch
+        .status()
+        .finalizing(intent_core::startup::FinalizingStep::Services);
     // One-time auto_vacuum activation (monorepo#720 finding 1): a legacy
     // database created before the `auto_vacuum = INCREMENTAL` pragma stays in
     // NONE mode until a full VACUUM rebuilds the file, leaving the retention

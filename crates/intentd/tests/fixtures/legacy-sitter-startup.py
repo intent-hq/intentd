@@ -14,7 +14,6 @@ import shlex
 import shutil
 import signal
 import socket
-import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -56,7 +55,7 @@ for mode in ("start", "serve", "update"):
         env.update(INTENTD_DATA_DIR=temp, INTENTD_WORKSPACES_DIR=str(root / "workspaces"),
                    GH_CONFIG_DIR=str(root / "gh-config"), INTENTD_SECRETS_FILE=str(root / "secrets.json"),
                    INTENTD_CONFIG=str(root / "config.toml"), INTENTD_TCP_PORT="0",
-                   INTENTD_TEST_INDEX_STARTUP_GATE=str(root / "gate"),
+                   INTENTD_TEST_PREPARING_STARTUP_GATE=str(root / "gate"),
                    INTENTD_SITTER_READINESS_TIMEOUT_MS=budget_ms,
                    INTENTD_SITTER_KILL_TIMEOUT_MS="500", TOKIO_WORKER_THREADS="1")
         if budget_ms == "60000":
@@ -120,45 +119,34 @@ for mode in ("start", "serve", "update"):
         update = None
         peers = []
 
-        def finish_indexing(peer):
+        def finish_preparing(peer):
             peer.sendall(b"c")
-            next_peer, _ = gate.accept()
-            peers.append(next_peer)
-            stage = next_peer.recv(1)
-            if stage == b"n":
-                next_peer.sendall(b"c")
-                next_peer, _ = gate.accept()
-                peers.append(next_peer)
-                stage = next_peer.recv(1)
-            assert stage == b"c"
-            next_peer.sendall(b"c")
 
         try:
             peer, _ = gate.accept()
             peers.append(peer)
-            assert peer.recv(1) == b"i"
+            assert peer.recv(1) == b"p"
             path = root / "intentd.sock"
             if mode == "update":
-                finish_indexing(peer)
+                finish_preparing(peer)
                 wait_for(lambda: "result" in rpc(path, "system.status"))
-                # Fixture-owned derived state forces real rebuild work after restart.
-                with sqlite3.connect(root / "intentd.db") as db:
-                    db.execute("UPDATE note_page_head SET indexed_rev=-1")
                 published[0] = version
                 update = subprocess.Popen([sitter, "update"], env=env, stdout=log, stderr=log, start_new_session=True)
                 peer, _ = gate.accept()
                 peers.append(peer)
-                assert peer.recv(1) == b"i"
+                assert peer.recv(1) == b"p"
             snapshot = rpc(path, "system.startupStatus")["result"]
-            assert snapshot["progress"]["totalNotes"] == 1
-            assert snapshot["progress"]["completedNotes"] == 0
+            assert snapshot["phase"] == "preparing"
+            assert "progress" not in snapshot
+            assert "estimatedRemainingMs" not in snapshot
             start = time.monotonic()
             while time.monotonic() - start < budget + 0.4:
                 # The old sitter may call this liveness ready, but every wire
                 # request still sees actual startup and cannot enter services.
                 current = rpc(path, "system.startupStatus")["result"]
                 assert current["attemptId"] == snapshot["attemptId"]
-                assert current["progress"] == snapshot["progress"]
+                assert current["phase"] == "preparing"
+                assert "progress" not in current
                 for method in ("system.status", "client.hello", "note.add"):
                     assert rpc(path, method)["error"]["code"] == -32012
                 if mode != "start":
@@ -170,7 +158,7 @@ for mode in ("start", "serve", "update"):
                 assert caller.wait(timeout=5) == 0
             if update:
                 assert update.wait(timeout=5) == 0, "old update consumer must accept actual server version"
-            finish_indexing(peer)
+            finish_preparing(peer)
             wait_for(lambda: "result" in rpc(path, "system.status"))
             # A new connection now performs a genuine normal hello.
             assert "result" in rpc(path, "client.hello")
