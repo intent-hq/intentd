@@ -814,3 +814,102 @@ async fn admitted_selection_commit_survives_settlement_failure_and_abort_stays_u
     assert!(outcome.result.is_err());
     assert!(before.matches(&f.read().await));
 }
+
+struct AsyncSelectionSettlement {
+    entered: Arc<tokio::sync::Notify>,
+    released: Arc<tokio::sync::Notify>,
+    settled: Arc<std::sync::atomic::AtomicBool>,
+}
+impl crate::RepositoryLifecycleObserver for AsyncSelectionSettlement {
+    fn begin_mutation(
+        &self,
+        _: &[crate::RepositoryLifecycleKey],
+    ) -> Result<Box<dyn crate::RepositoryLifecycleMutationTicket>> {
+        Ok(Box::new(Self {
+            entered: self.entered.clone(),
+            released: self.released.clone(),
+            settled: self.settled.clone(),
+        }))
+    }
+}
+impl crate::RepositoryLifecycleMutationTicket for AsyncSelectionSettlement {
+    fn settle_confirmed(self: Box<Self>) {
+        self.settled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn settle_after_retirement(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.released.notified().await;
+            self.settle_confirmed();
+            Ok(())
+        })
+    }
+}
+
+async fn selection_waits_for_original_completion(cancel: bool) {
+    let f = Fixture::new().await;
+    let original = f.read().await;
+    let observer = Arc::new(AsyncSelectionSettlement {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        released: Arc::new(tokio::sync::Notify::new()),
+        settled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    f.store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    let mut write = Box::pin(
+        f.store
+            .write_repository_selection(&original, remote("selected")),
+    );
+    tokio::select! {
+        () = observer.entered.notified() => {},
+        _ = &mut write => panic!("selection completed before original retirement"),
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("selection did not start original retirement"),
+    }
+    assert!(!observer.settled.load(std::sync::atomic::Ordering::SeqCst));
+    let stored = tokio::time::timeout(std::time::Duration::from_secs(5), f.read())
+        .await
+        .expect("selection join retained Store serialization");
+    assert_eq!(
+        saved(&stored),
+        &SavedReviewSelection::ExplicitRemote {
+            remote_name: "selected".into()
+        }
+    );
+    if cancel {
+        drop(write);
+        observer.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !observer.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled selection waiter abandoned completion");
+    } else {
+        observer.released.notify_one();
+        let outcome = write.await;
+        assert!(matches!(
+            outcome.persistence,
+            RepositorySelectionPersistence::Committed { .. }
+        ));
+        assert!(matches!(
+            outcome.result,
+            Ok(RepositorySelectionWriteResult::Applied(_))
+        ));
+        assert!(observer.settled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn selection_commit_waits_outside_locks_for_original_completion() {
+    selection_waits_for_original_completion(false).await;
+}
+#[tokio::test]
+async fn selection_commit_completion_survives_cancelled_waiter() {
+    selection_waits_for_original_completion(true).await;
+}

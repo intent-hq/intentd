@@ -113,6 +113,108 @@ fn gl() -> ReviewTarget {
     )
 }
 
+#[tokio::test]
+async fn qualified_scope_lists_preserve_history_targets_and_unresolved_bytes_after_restart() {
+    let (dir, store) = store().await;
+    let mut completed = monitor("completed-github");
+    completed.state = PrMonitorState::Completed;
+    assert!(store
+        .insert_qualified_pr_monitor(&completed, &gh(), LegacyGithubWriter)
+        .await
+        .unwrap());
+    let gitlab = monitor("gitlab");
+    assert!(store
+        .insert_qualified_pr_monitor(&gitlab, &gl(), CapturedRequest)
+        .await
+        .unwrap());
+    let mut other = monitor("other-instance");
+    other.agent_id = AgentId("b".into());
+    let second = target(
+        Gitlab,
+        "https://other.example/forge",
+        "o/r",
+        MergeRequest,
+        42,
+    );
+    assert!(store
+        .insert_qualified_pr_monitor(&other, &second, CapturedRequest)
+        .await
+        .unwrap());
+    let mut unknown = monitor("unresolved");
+    unknown.agent_id = other.agent_id.clone();
+    assert!(store.insert_pr_monitor(&unknown).await.unwrap());
+    sqlx::query(
+        "UPDATE pr_monitor SET target_provider=NULL,target_instance_base_url=NULL,
+        target_project_path=NULL,target_kind=NULL,target_provenance='unresolved',
+        target_unresolved_reason='missing-provenance',pending_changes='[ \"keep\" ]'
+        WHERE monitor_id='unresolved'",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO workspace(id,title,branch,created_at,updated_at)
+        VALUES ('foreign','Foreign','main','created','updated');
+        INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at)
+        VALUES ('foreign-agent','foreign','Foreign','idle','created','updated');",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    let mut foreign = monitor("foreign");
+    foreign.agent_id = AgentId("foreign-agent".into());
+    foreign.workspace_id = WorkspaceId("foreign".into());
+    assert!(store.insert_pr_monitor(&foreign).await.unwrap());
+    let before = original_bytes(store.read_pool(), "unresolved").await;
+    drop(store);
+
+    let reopened = Store::open(&dir.path().join("monitors.db")).await.unwrap();
+    let rows = reopened
+        .list_qualified_pr_monitors_by_workspace(&WorkspaceId("w".into()))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].monitor(), &completed);
+    assert!(
+        matches!(rows[0].target(), PersistedMonitorTarget::Resolved {target,provenance:LegacyGithubWriter} if target == &gh())
+    );
+    assert!(
+        matches!(rows[1].target(), PersistedMonitorTarget::Resolved {target,provenance:CapturedRequest} if target == &gl())
+    );
+    assert!(
+        matches!(rows[2].target(), PersistedMonitorTarget::Resolved {target,provenance:CapturedRequest} if target == &second)
+    );
+    assert!(matches!(
+        rows[3].target(),
+        PersistedMonitorTarget::Unresolved { .. }
+    ));
+    assert_eq!(
+        reopened
+            .list_qualified_pr_monitors_by_agent(&AgentId("a".into()))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        reopened
+            .list_qualified_pr_monitors_by_agent(&AgentId("b".into()))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(reopened
+        .list_qualified_pr_monitors_by_agent(&AgentId("missing".into()))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        original_bytes(reopened.read_pool(), "unresolved").await,
+        before
+    );
+}
+
 async fn original_bytes(pool: &crate::StorePool, id: &str) -> Vec<serde_json::Value> {
     let row = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id=?"
@@ -746,3 +848,113 @@ INSERT INTO pr_monitor (
     '2026-09-20T12:00:01Z', '2026-09-20T12:00:00Z', '2026-09-20T12:00:02Z'
 );
 "#;
+
+#[tokio::test]
+async fn routing_cancellation_cannot_cancel_a_transferred_captured_row() {
+    let (_dir, store) = store().await;
+    let original = monitor("captured-cancel");
+    let resource = target(Gitlab, "https://gitlab.test/forge", "o/r", MergeRequest, 42);
+    assert!(store
+        .insert_qualified_pr_monitor(&original, &resource, CapturedRequest)
+        .await
+        .unwrap());
+    let captured = store
+        .get_qualified_pr_monitor(&original.monitor_id)
+        .await
+        .unwrap();
+    assert!(store
+        .adopt_pr_monitor(
+            &original.monitor_id,
+            &original.agent_id,
+            &AgentId("b".into()),
+            PrMonitorPollUpdate {
+                last_snapshot: original.last_snapshot.as_deref(),
+                baseline_snapshot: original.baseline_snapshot.as_deref(),
+                pending_changes: &[],
+                updated_at: "transferred",
+                expected_updated_at: &original.updated_at,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap());
+    // The old caller must lose after adoption, even with the same row ID.
+    let cancelled = store
+        .cancel_qualified_pr_monitor(&captured, "cancel-attempt")
+        .await
+        .unwrap();
+    assert!(
+        !cancelled,
+        "old owner cancelled the new owner's captured target"
+    );
+    let current = store.get_pr_monitor(&original.monitor_id).await.unwrap();
+    assert_eq!(current.agent_id, AgentId("b".into()));
+    assert_eq!(current.state, PrMonitorState::Active);
+    let current = store
+        .get_qualified_pr_monitor(&original.monitor_id)
+        .await
+        .unwrap();
+    assert!(store
+        .cancel_qualified_pr_monitor(&current, "current-owner-cancel")
+        .await
+        .unwrap());
+    assert!(!store
+        .cancel_qualified_pr_monitor(&current, "duplicate-cancel")
+        .await
+        .unwrap());
+    assert_eq!(
+        store
+            .get_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap()
+            .state,
+        PrMonitorState::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn routing_cancellation_compares_binding_target_and_poll_without_timestamp_assumptions() {
+    for changed_column in ["last_snapshot", "target_project_path", "pending_changes"] {
+        let (_dir, store) = store().await;
+        let original = monitor("captured-change");
+        let resource = target(Gitlab, "https://gitlab.test/forge", "o/r", MergeRequest, 42);
+        assert!(store
+            .insert_qualified_pr_monitor(&original, &resource, CapturedRequest)
+            .await
+            .unwrap());
+        let captured = store
+            .get_qualified_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap();
+        // Simulate an independently committed replacement with the exact same
+        // updated_at. A timestamp alone cannot fence identity or private evidence.
+        sqlx::query(&format!(
+            "UPDATE pr_monitor SET {changed_column} = ? WHERE monitor_id = ?"
+        ))
+        .bind("replacement")
+        .bind(original.monitor_id.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        assert!(
+            !store
+                .cancel_qualified_pr_monitor(&captured, "stale-cancel")
+                .await
+                .unwrap(),
+            "{changed_column}"
+        );
+        let current = store
+            .get_qualified_pr_monitor(&original.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(current.monitor().state, PrMonitorState::Active);
+        assert_eq!(current.monitor().updated_at, original.updated_at);
+        assert!(
+            store
+                .cancel_qualified_pr_monitor(&current, "fresh-cancel")
+                .await
+                .unwrap(),
+            "{changed_column}"
+        );
+    }
+}

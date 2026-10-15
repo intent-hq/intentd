@@ -114,6 +114,10 @@ pub(crate) fn qualified_review_snapshot(
                 "unknown"
             },
         )
+        .map(|reason| match reason.as_str() {
+            "draft PRs cannot be merged" => "draft MRs cannot be merged".into(),
+            _ => reason,
+        })
     } else {
         None
     };

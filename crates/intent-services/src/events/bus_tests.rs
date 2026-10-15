@@ -1231,7 +1231,9 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             n, OVERFLOW as u64,
             "marker carries the ring's exact skipped count"
         ),
-        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+        Delivery::Batch(_) | Delivery::Monitor(_) | Delivery::HistoryChanged => {
+            panic!("expected the lag marker before any surviving event")
+        }
     }
     let second = timeout(Duration::from_secs(5), sub.recv_delivery())
         .await
@@ -1264,4 +1266,64 @@ async fn recv_skips_lag_markers_transparently() {
         !batch.is_empty(),
         "recv yields the surviving events, never a marker"
     );
+}
+
+#[tokio::test]
+async fn private_history_change_only_notifies_matching_opted_in_chat() {
+    use intent_core::repository_request::{
+        RepositoryMonitorHistoryRecipient, RepositoryPrivateOutput,
+    };
+    use std::sync::Arc;
+    struct History;
+    impl RepositoryMonitorHistoryRecipient for History {
+        fn scope<'a>(
+            &'a self,
+            body: intent_core::BoxFuture<'a, ()>,
+        ) -> intent_core::BoxFuture<'a, ()> {
+            body
+        }
+        fn bind_output(&self, _: String) -> Arc<dyn RepositoryPrivateOutput> {
+            panic!("a history invalidation must not bind or expose any private output")
+        }
+        fn begin_generation(&self) {
+            panic!("the bus does not read history")
+        }
+        fn retire(&self) {}
+    }
+    let (_tmp, bus) = bus().await;
+    let mut ordinary = bus.subscribe(SubscriptionFilter::default());
+    let mut matching = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    let mut other = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-other".into(),
+        Arc::new(History),
+    );
+    let mut generic = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    bus.notify_monitor_history("agent-original");
+    let barrier = bus.publish_transient(&new_event("workspace:updated", None, ActorType::System));
+    assert!(matches!(
+        matching.recv_delivery().await,
+        Some(Delivery::HistoryChanged)
+    ));
+    for sub in [&mut ordinary, &mut matching, &mut other] {
+        let Some(Delivery::Batch(events)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("only the matching opted-in subscriber may receive the private notification")
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, barrier.id);
+        assert!(sub.try_recv_delivery().is_none());
+    }
+    // Generic consumers cannot accidentally flatten a private notification.
+    assert_eq!(generic.recv().await.unwrap()[0].id, barrier.id);
 }
