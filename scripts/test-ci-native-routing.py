@@ -23,7 +23,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ("success", "skipped", "failure", "cancelled")
-ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
+ALWAYS_REQUIRED = {"route", "deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
     "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
     "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
@@ -116,7 +116,7 @@ def gate_errors(workflow):
     if gate.get("continue-on-error") or step.get("continue-on-error") or step.get("if"):
         errors.append("gate result check must be unconditional and fatal")
     needs = set(workflow["jobs"]["gate"]["needs"])
-    expected = set.union(*REQUIRED.values(), PR_METADATA)
+    expected = set.union(*REQUIRED.values(), PR_METADATA) | {"route"}
     if needs != expected:
         errors.append("gate dependencies changed")
     for event, required in REQUIRED.items():
@@ -231,21 +231,23 @@ const outputs = {}, calls = [], logs = [];
 const github = {
   rest: { actions: {
     listSelfHostedRunnersForOrg: 'org', listSelfHostedRunnersForRepo: 'repo',
-    async listWorkflowRunsForRepo(args) {
-      if ((fixture.queueErrors || []).includes(args.repo)) throw new Error('queue unavailable');
-      return { data: { workflow_runs: args.repo === 'intentd' && args.status === 'queued' ? [{ id: 1 }] : [] } };
-    },
-    async listJobsForWorkflowRun() { return { data: { jobs: fixture.jobs || [] } }; },
+    listWorkflowRunsForRepo: 'runs', listJobsForWorkflowRun: 'jobs',
   } },
   async paginate(endpoint, args) {
+    if (endpoint === 'runs') {
+      if ((fixture.queueErrors || []).includes(args.repo)) throw new Error('queue unavailable');
+      return args.repo === 'intentd' && args.status === 'queued' ? [{id: 1}] : [];
+    }
+    if (endpoint === 'jobs') return fixture.jobs || [];
     calls.push({ endpoint, args });
     if (fixture[endpoint + 'Error']) throw new Error(fixture[endpoint + 'Error']);
     return fixture[endpoint] ?? [];
   },
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
-const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: 'push', payload: {} };
 process.env.THRESHOLD = '8';
+process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
@@ -341,21 +343,21 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                      else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
 
     def test_linux_keeps_queue_semantics_and_idle_windows_stays_self_hosted(self):
-        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64"), runner()]
+        fleet = [runner("Linux", "X64", busy=True)] * 8 + [runner("Windows", "X64"), runner()]
         for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
-                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "monorepo"], False)):
+                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "intent"], True)):
             with self.subTest(depth=depth, queue_errors=queue_errors):
-                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux"]}
+                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux", "X64"], "created_at": "2099-01-01T00:00:00Z"}
                         for i in range(depth)]
                 jobs += [{"status": "in_progress", "labels": ["depot-ubuntu-24.04-16"]}] * 20
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["self-hosted", "macOS", "ARM64"])
+                                              ["depot-macos-latest"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-8"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
-                self.assertEqual(outputs["windows_burst"], "false")
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"] if queue_errors else ["self-hosted", "Windows", "X64"])
+                self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
                         {"org": [runner("Linux", "X64", status="offline"), runner("Windows", "X64", status="offline")]},
                         {"org": [runner("linux", "x64"), runner("windows", "x64")]}):

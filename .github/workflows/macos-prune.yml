@@ -38,6 +38,9 @@ jobs:
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply
   windows:
     if: github.event_name == 'workflow_dispatch' && inputs.runner == '5090pc'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/windows-prune.yml
     with:
       apply: ${{ inputs.apply }}
