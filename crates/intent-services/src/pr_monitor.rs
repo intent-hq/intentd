@@ -97,7 +97,11 @@ use crate::{publish_event, system_actor, Services};
     reason = "qualified reads await admitted caller-directory wiring"
 )]
 pub(crate) mod qualified_cache;
+mod qualified_events;
+mod qualified_poll;
+mod routing;
 use qualified_cache::{CacheKey, CacheSlot};
+pub(crate) use routing::wire as qualified_pr_monitor_wire;
 
 use intent_core::config::{
     MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -1711,6 +1715,38 @@ fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str, paused_until: Option<&s
     metadata
 }
 
+/// An unresolved imported row is inspectable under native workspace admission,
+/// without treating its stored observation or pending text as authorized output.
+pub(crate) fn unresolved_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_store::MonitorTargetUnresolvedReason,
+) -> Value {
+    use intent_core::review_monitor::ReviewMonitorUnresolvedReason as Reason;
+    let reason = match reason {
+        intent_store::MonitorTargetUnresolvedReason::MissingProvenance => Reason::MissingProvenance,
+        intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => Reason::UnverifiedImport,
+        intent_store::MonitorTargetUnresolvedReason::InvalidTarget => Reason::InvalidTarget,
+    };
+    recovery_pr_monitor_wire(m, reason)
+}
+
+/// Safe recovery controls for an original row whose private observation cannot
+/// presently be admitted. This does not change its persisted qualification.
+pub(crate) fn recovery_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_core::review_monitor::ReviewMonitorUnresolvedReason,
+) -> Value {
+    let mut safe = m.clone();
+    safe.pending_changes.clear();
+    safe.last_snapshot = None;
+    safe.last_error = None;
+    let mut value = pr_monitor_wire(&safe, None);
+    value["hasPendingChanges"] = json!(!m.pending_changes.is_empty());
+    value["monitorAvailability"] =
+        json!(intent_core::review_monitor::ReviewMonitorAvailability::Unresolved { reason });
+    value
+}
+
 /// The list-surface projection of one monitor: identity + lifecycle plus the
 /// hover/click fields the FE needs — PR title/URL and a compact summary of
 /// the last-refresh snapshot, whether changes are accumulated awaiting the
@@ -2361,7 +2397,22 @@ impl Services {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                self.store.insert_pr_monitor(&m).await?.then_some(m)
+                self.store
+                    .insert_qualified_pr_monitor(
+                        &m,
+                        &intent_core::ReviewTarget {
+                            repository: intent_core::RepositoryTarget {
+                                provider: intent_core::RepositoryProvider::Github,
+                                instance_base_url: "https://github.com".into(),
+                                project_path: format!("{repo_owner}/{repo_name}"),
+                            },
+                            kind: intent_core::RepositoryResourceKind::PullRequest,
+                            number: pr_number,
+                        },
+                        intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    )
+                    .await?
+                    .then_some(m)
             };
             if let Some(m) = inserted {
                 monitor = Some(m);
@@ -2511,6 +2562,14 @@ impl Services {
         else {
             return Ok(None);
         };
+        self.classify_pr_monitor_holder(owner, agent_id).await
+    }
+
+    async fn classify_pr_monitor_holder(
+        &self,
+        owner: PrMonitor,
+        agent_id: &AgentId,
+    ) -> Result<Option<PrMonitorHolder>> {
         if owner.agent_id == *agent_id {
             return Ok(None);
         }
@@ -3108,16 +3167,37 @@ impl Services {
     /// docs). Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
+    /// # Panics
+    /// Panics if the monitor control mutex is poisoned.
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
+        let (sender, mut controls) = tokio::sync::mpsc::channel::<
+            crate::repository_native_wire::monitor::flush::Command,
+        >(32);
+        let installed = {
+            let mut current = self.review_monitor_controls.lock().unwrap();
+            if current.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                false
+            } else {
+                *current = Some(sender);
+                true
+            }
+        };
         intent_core::spawn_daemon(async move {
+            if !installed {
+                return;
+            }
+            let mut next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
             loop {
                 tokio::select! {
                     biased;
                     () = services.settings_tasks.closed() => break,
-                    () = tokio::time::sleep(services.pr_monitor_poll_interval()) => {}
+                    () = tokio::time::sleep_until(next) => {
+                        services.poll_due_pr_monitors().await;
+                        next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
+                    }
+                    Some(command) = controls.recv() => command.run().await,
                 }
-                services.poll_due_pr_monitors().await;
             }
         })
     }
@@ -3227,6 +3307,23 @@ impl Services {
     }
 
     async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
+        // Each configured connection owns its own in-flight lane. The periodic
+        // loop never waits for GitLab before allowing another GitHub tick.
+        let services = self.clone();
+        let qualified = self.store_tasks.spawn_draining(async move {
+            services.sweep_qualified_pr_monitors(skip_fresh).await;
+        });
+        self.sweep_legacy_pr_monitors_accounted(skip_fresh).await;
+        // Explicit deterministic sweeps await both lanes; the recurring loop
+        // leaves its bounded qualified fetch with the finite-task supervisor.
+        if !skip_fresh {
+            if let Some(qualified) = qualified {
+                let _ = qualified.await;
+            }
+        }
+    }
+
+    async fn sweep_legacy_pr_monitors_accounted(&self, skip_fresh: bool) {
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3239,8 +3336,20 @@ impl Services {
             }
             probed = lifted;
         }
-        let monitors = match self.store.load_active_pr_monitors().await {
-            Ok(monitors) => monitors,
+        let monitors = match self.store.load_active_qualified_pr_monitors().await {
+            Ok(monitors) => monitors
+                .into_iter()
+                .filter(|row| {
+                    matches!(
+                        row.target(),
+                        intent_store::PersistedMonitorTarget::Resolved {
+                            provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                            ..
+                        }
+                    )
+                })
+                .map(|row| row.monitor().clone())
+                .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(error = %e, "pr monitor sweep: load failed; skipping tick");
                 return;
@@ -3732,8 +3841,15 @@ impl Services {
     /// An unparseable/absent anchor emits immediately rather than stranding
     /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
+        self.pr_monitor_debounce_elapsed_at(monitor, time::OffsetDateTime::now_utc())
+    }
+
+    pub(crate) fn pr_monitor_debounce_elapsed_at(
+        &self,
+        monitor: &PrMonitor,
+        now: time::OffsetDateTime,
+    ) -> bool {
         let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs().cast_signed());
-        let now = time::OffsetDateTime::now_utc();
         if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
             if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
                 return true;
@@ -4017,9 +4133,17 @@ impl Services {
                 self.clear_pr_monitor_pause_annotations(None).await;
             }
         }
-        let monitors = self.store.load_active_pr_monitors().await?;
+        let monitors = self.store.load_active_qualified_pr_monitors().await?;
         let mut resumed = 0;
-        for mut monitor in monitors {
+        for record in monitors {
+            let legacy = matches!(
+                record.target(),
+                intent_store::PersistedMonitorTarget::Resolved {
+                    provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    ..
+                }
+            );
+            let mut monitor = record.monitor().clone();
             // Owner deleted, session row gone, or soft-retired — the
             // retire-time sweep ([`Services::cancel_agent_pr_monitors`])
             // could have been missed by a crash window.
@@ -4057,16 +4181,35 @@ impl Services {
             // Coalesced-era rows are a fixed point of the recompute and stay
             // on the normal catch-up poll, which folds downtime changes into
             // one consolidated wake.
-            if !monitor.pending_changes.is_empty() && !pending_survives_recompute(&monitor) {
+            // A legacy-shaped snapshot does not establish its writer. Imports
+            // and captured targets keep their exact pending bytes until their
+            // own recovery path has independently admitted the original target.
+            if legacy
+                && !monitor.pending_changes.is_empty()
+                && !pending_survives_recompute(&monitor)
+            {
                 self.emit_pending_changes(&monitor).await?;
             }
-            self.pr_monitor_catch_up
-                .lock()
-                .unwrap()
-                .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            if legacy {
+                self.pr_monitor_catch_up
+                    .lock()
+                    .unwrap()
+                    .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            }
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    pub(crate) async fn settle_unresolved_monitor_cancel(&self, monitor: &PrMonitor) {
+        self.pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .remove(&monitor.monitor_id);
+        self.resettle_owner_after_pr_monitor_terminal(monitor).await;
+        self.maybe_emit_display_status_changed(&monitor.workspace_id)
+            .await;
+        self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
     }
 
     /// Idle-visibility deferral backstop (mirrors
@@ -4264,12 +4407,16 @@ impl Services {
             Some(a) => self.pr_monitors_for_agent(a).await?,
             None => self.pr_monitors_for_workspace(workspace_id).await?,
         };
-        let paused_until = self.sweep_rate_limit_paused_until();
-        let monitors: Vec<Value> = monitors
+        let mut projected = Vec::new();
+        for monitor in monitors
             .into_iter()
             .filter(|m| &m.workspace_id == workspace_id)
-            .map(|m| pr_monitor_wire(&m, paused_until.as_deref()))
-            .collect();
+        {
+            if let Some(value) = self.review_monitor_list_entry(&monitor).await? {
+                projected.push(value);
+            }
+        }
+        let monitors = projected;
         Ok(json!({ "monitors": monitors }))
     }
 
@@ -4280,6 +4427,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
     ) -> Result<Value> {
+        self.require_legacy_monitor_control(monitor_id).await?;
         let monitor = self
             .pr_monitor_cancel(workspace_id, monitor_id, None)
             .await?;
@@ -4297,6 +4445,17 @@ impl Services {
         monitor_id: &PrMonitorId,
         check: bool,
     ) -> Result<Value> {
+        if let Some(result) = crate::repository_native_wire::monitor::flush::flush(
+            self,
+            workspace_id,
+            monitor_id,
+            check,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        self.require_legacy_monitor_control(monitor_id).await?;
         let flushed = if check {
             self.pr_monitor_check_and_flush(workspace_id, monitor_id)
                 .await?
@@ -4326,6 +4485,21 @@ impl Services {
         }
     }
 
+    /// Generic agent summaries can disclose only proven legacy producer rows.
+    /// Keep internal waiting/adoption checks on the unfiltered method above.
+    pub(crate) async fn legacy_pr_monitor_wait_entries(&self, agent_id: &AgentId) -> Vec<Value> {
+        self.store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .map(intent_store::QualifiedPrMonitor::monitor)
+            .filter(|m| m.state == PrMonitorState::Active)
+            .map(waiting_on_pr_monitors_entry)
+            .collect()
+    }
+
     /// Workspace-batched variant of
     /// [`active_pr_monitors_for_agent`](Self::active_pr_monitors_for_agent)
     /// for `agent.list`: one store query for the whole workspace, grouped by
@@ -4339,7 +4513,7 @@ impl Services {
     ) -> HashMap<String, Vec<Value>> {
         let monitors = match self
             .store
-            .list_active_pr_monitors_by_workspace(workspace_id)
+            .list_qualified_pr_monitors_by_workspace(workspace_id)
             .await
         {
             Ok(monitors) => monitors,
@@ -4353,12 +4527,17 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for m in monitors {
+        for record in monitors {
+            if !routing::legacy_output(&record) || record.monitor().state != PrMonitorState::Active
+            {
+                continue;
+            }
+            let m = record.monitor();
             let agent = m.agent_id.0.clone();
             by_agent
                 .entry(agent)
                 .or_default()
-                .push(waiting_on_pr_monitors_entry(&m));
+                .push(waiting_on_pr_monitors_entry(m));
         }
         by_agent
     }
@@ -4376,11 +4555,40 @@ impl Services {
     ) -> Vec<Value> {
         self.annotate_waiting_on_script_monitors(agent_id, data)
             .await;
-        if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
-            return existing.clone();
+        let records = self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default();
+        let legacy: Vec<_> = records
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .collect();
+        let entries: Vec<Value> =
+            if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
+                existing
+                    .iter()
+                    .filter(|entry| {
+                        legacy.iter().any(|row| {
+                            entry.get("monitorId").and_then(Value::as_str)
+                                == Some(row.monitor().monitor_id.0.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                legacy
+                    .iter()
+                    .map(|row| row.monitor())
+                    .filter(|m| m.state == PrMonitorState::Active)
+                    .map(waiting_on_pr_monitors_entry)
+                    .collect()
+            };
+        if entries.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.remove("waitingOnPrMonitors");
+            }
         }
-        let monitors = self.active_pr_monitors_for_agent(agent_id).await;
-        let entries: Vec<Value> = monitors.iter().map(waiting_on_pr_monitors_entry).collect();
         if !entries.is_empty() {
             if let Some(obj) = data.as_object_mut() {
                 obj.insert(
@@ -4399,7 +4607,11 @@ impl Services {
     /// no snapshot parsing. Best-effort: a store failure reads as empty so a
     /// snapshot build never fails on it.
     pub(crate) async fn active_pr_monitor_labels(&self, agent_id: &AgentId) -> Vec<String> {
-        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+        let monitors = match self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+        {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -4412,9 +4624,11 @@ impl Services {
         };
         monitors
             .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-            .map(|m| {
-                let label = monitor_label(&m);
+            .filter(routing::legacy_output)
+            .filter(|row| row.monitor().state == PrMonitorState::Active)
+            .map(|row| {
+                let m = row.monitor();
+                let label = monitor_label(m);
                 if m.pending_changes.is_empty() {
                     label
                 } else {
@@ -4433,6 +4647,18 @@ impl Services {
         monitor: &PrMonitor,
         extra: Option<Value>,
     ) {
+        // The global bus has consumers with no qualified recipient receipt.
+        // Qualified lifecycle output must use its scoped native route instead.
+        let Ok(record) = self
+            .store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+        else {
+            return;
+        };
+        if !routing::legacy_output(&record) {
+            return;
+        }
         let mut data = json!({
             "workspaceId": monitor.workspace_id,
             "agentId": monitor.agent_id,
@@ -4464,6 +4690,8 @@ mod tests {
     mod ancestry_messages;
     mod ancestry_regression;
     mod compact_required_checks;
+    mod qualified_isolation;
+    mod qualified_recovery;
     mod quota_regression;
     mod qwen_regression;
     use std::path::PathBuf;
@@ -14364,6 +14592,68 @@ mod tests {
                 .with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET)
                 .pr_monitor_hourly_request_budget(),
             MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        );
+    }
+    #[intent_test_macros::daemon_test]
+    async fn qualified_and_legacy_identical_names_numbers_keep_independent_records() {
+        use crate::repository_read_source::tests::{run, ActualRead, ReadServer};
+        fn body(reply: &Value) -> Value {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+        let provider = ReadServer::new().await;
+        let mut f = ActualRead::new(&provider).await;
+        let forge = StubForge::new();
+        f.auth.service = Arc::new(
+            f.auth
+                .service
+                .as_ref()
+                .clone()
+                .with_source_control(Arc::new(forge.clone())),
+        );
+        f.auth
+            .registry
+            .apply(&[
+                ("workspaceApi.toonOutput".into(), json!(false)),
+                ("workspaceApi.maxOutputChars".into(), json!(0)),
+            ])
+            .unwrap();
+        let gl = body(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+        let gh = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.monitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_ne!(gl["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        assert_eq!(gl["monitor"]["repo"], gh["monitor"]["repo"]);
+        assert_eq!(gl["monitor"]["prNumber"], gh["monitor"]["prNumber"]);
+        assert_eq!(
+            gl["monitor"]["resource"]["repository"]["provider"],
+            "gitlab"
+        );
+        assert!(
+            gh["monitor"].get("resource").is_none(),
+            "legacy shape remains unchanged"
+        );
+        let all = body(&run(&f.server(), "return await ws.pr.monitors();").await);
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        let before = forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let stopped = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.unmonitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_eq!(stopped["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        let left = body(&run(&f.server(), "return await ws.mr.monitors();").await);
+        assert_eq!(left.as_array().unwrap().len(), 1);
+        assert_eq!(left[0]["monitorId"], gl["monitor"]["monitorId"]);
+        assert_eq!(
+            forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before
         );
     }
 }

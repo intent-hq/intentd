@@ -3213,8 +3213,14 @@ async fn cmd_serve_owned(
     mcp_hub.shutdown().await;
     phase.complete();
     let phase = shutdown::Phase::start("agent_shutdown");
-    manager.shutdown().await;
-    phase.complete();
+    let native_shutdown = manager.shutdown_with_native_outcome().await;
+    match &native_shutdown {
+        Ok(()) => phase.complete(),
+        Err(error) => {
+            phase.failed();
+            tracing::error!(%error, "native retirement failed during shutdown");
+        }
+    }
 
     // Stop the background first-boot legacy import (if still running) before
     // closing the store; the pending marker makes the next boot resume it.
@@ -3245,6 +3251,7 @@ async fn cmd_serve_owned(
     shutdown_store.close().await;
     phase.complete();
     cleanup.complete();
+    native_shutdown?;
     serve_result?;
 
     #[cfg(unix)]

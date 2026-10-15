@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Depot managed compiler-cache and release warming contracts."""
-import os
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import tempfile
@@ -46,7 +46,12 @@ class ManagedCache(unittest.TestCase):
         self.assertEqual(daemon[start:start + len(source)], source)
         sitter = workflow('release-sitter.yml')['jobs']['build']
         warm = workflow('release-cache.yml')['jobs']
-        self.assertEqual(sitter['strategy'], warm['sitter']['strategy'])
+        expected = deepcopy(sitter['strategy'])
+        expected['matrix']['include'] = [row for row in expected['matrix']['include']
+                                        if row['target'] != 'x86_64-apple-darwin']
+        self.assertEqual(expected, warm['sitter']['strategy'])
+        self.assertIn('optional-intel-release.py matrix cache-plan.json --event cache --ref refs/heads/main',
+                      warm['plan']['steps'][-1]['run'])
         targets = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']['targets']
         self.assertEqual({row['target'] for row in sitter['strategy']['matrix']['include']}, set(targets))
         for steps in [source, sitter['steps'], warm['daemon']['steps'], warm['sitter']['steps']]:

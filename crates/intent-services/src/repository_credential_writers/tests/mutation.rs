@@ -6,9 +6,9 @@ use intent_sourcecontrol::{
     gitlab::GitlabCredentialRequest, GitlabDescriptor, GitlabInstance, GitlabRequestCredentials,
 };
 
+use super::support::*;
 use crate::repository_credential_writers::*;
 use crate::repository_credentials::*;
-use crate::support::*;
 
 #[tokio::test]
 async fn invalid_noop_placeholder_and_abandoned_preflight_preserve_access() {

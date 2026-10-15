@@ -47,6 +47,20 @@ pub(crate) fn refused() -> intent_core::Error {
     intent_core::Error::Forbidden(REFUSAL.into())
 }
 
+pub(crate) fn unsupported() -> intent_core::Error {
+    intent_core::Error::Unsupported("Addressed review monitoring unavailable".into())
+}
+
+pub(crate) fn capture_monitor_owner(
+    services: &Services,
+) -> AdmissionResult<Arc<RepositoryReadRequest>> {
+    let host = crate::repository_read_policy::capture(services)?;
+    if !host.request().supports_review_monitoring() {
+        return Err(AdmissionError::Unavailable);
+    }
+    host.request().retain_monitor()
+}
+
 fn local(error: &intent_core::Error) -> AdmissionError {
     match error {
         intent_core::Error::Forbidden(_) | intent_core::Error::NotFound(_) => {
@@ -157,17 +171,20 @@ pub(crate) async fn context_member(
     Ok((before, agent))
 }
 
-fn subscribe(child: &mut RepositoryReadChild, workspace: &WorkspaceId) -> AdmissionResult<()> {
+fn subscribe(child: &mut RepositoryReadChild, root: &RepositoryRootId) -> AdmissionResult<()> {
     let Some(Caller::Agent { agent_id }) = current_caller() else {
         return Err(AdmissionError::Denied);
     };
     child.subscribe(&[
         RepositoryLifecycleKey::Database,
-        RepositoryLifecycleKey::Workspace(workspace.clone()),
+        RepositoryLifecycleKey::Workspace(root.workspace_id.clone()),
         RepositoryLifecycleKey::Agent(agent_id),
         RepositoryLifecycleKey::Selection {
-            workspace_id: workspace.clone(),
-            git_root_id: None,
+            workspace_id: root.workspace_id.clone(),
+            git_root_id: match &root.kind {
+                RepositoryRootKind::Primary => None,
+                RepositoryRootKind::Registered { git_root_id } => Some(git_root_id.clone()),
+            },
         },
     ])
 }
@@ -194,6 +211,35 @@ fn target(
         ReviewSelectionOutcome::Resolved { target, .. } => Ok(target),
         _ => Err(AdmissionError::Unavailable),
     }
+}
+
+fn selected_target(
+    observed: &RepositoryObservedRoot,
+    selection: &SelectionFacts,
+    explicit: Option<&intent_core::RepositoryTarget>,
+    settled: Option<&RepositorySettledConnection>,
+) -> AdmissionResult<intent_core::RepositoryTarget> {
+    let Some(explicit) = explicit else {
+        return target(observed, &selection.saved()?);
+    };
+    let resolved = resolver(settled)?
+        .resolve(&format!(
+            "{}/{}",
+            explicit.instance_base_url.trim_end_matches('/'),
+            explicit.project_path
+        ))
+        .map_err(|_| AdmissionError::Denied)?;
+    let provider = match resolved.provider {
+        intent_sourcecontrol::remote_project::RemoteProvider::Github => RepositoryProvider::Github,
+        intent_sourcecontrol::remote_project::RemoteProvider::Gitlab => RepositoryProvider::Gitlab,
+    };
+    if provider != explicit.provider
+        || resolved.instance_base_url != explicit.instance_base_url
+        || resolved.project_path != explicit.project_path
+    {
+        return Err(AdmissionError::Denied);
+    }
+    Ok(explicit.clone())
 }
 
 /// Kept private, without Debug/Serde. Equality checks every original local fact.
@@ -226,6 +272,7 @@ impl GitFacts {
 }
 
 pub(crate) enum ReadOutcome {
+    Unsupported,
     Github(RepoRef),
     Managed {
         target: ReviewTarget,
@@ -241,14 +288,32 @@ pub(crate) struct CapturedReview {
     settled: credentials::Result<RepositorySettledConnection>,
     workspace: WorkspaceId,
     number: u64,
+    root_kind: RepositoryRootKind,
+    explicit: Option<intent_core::RepositoryTarget>,
+    addressed: bool,
 }
 
 impl CapturedReview {
     pub(crate) fn capture(services: &Services, workspace: WorkspaceId, number: u64) -> Self {
+        Self::capture_root(services, workspace, number, RepositoryRootKind::Primary)
+    }
+
+    fn capture_root(
+        services: &Services,
+        workspace: WorkspaceId,
+        number: u64,
+        root_kind: RepositoryRootKind,
+    ) -> Self {
         let host = crate::repository_read_policy::capture(services);
         let child = host.as_ref().map_err(|e| *e).and_then(|host| {
             let mut child = host.request().child()?;
-            subscribe(&mut child, &workspace)?;
+            subscribe(
+                &mut child,
+                &RepositoryRootId {
+                    workspace_id: workspace.clone(),
+                    kind: root_kind.clone(),
+                },
+            )?;
             Ok(child)
         });
         Self {
@@ -257,17 +322,61 @@ impl CapturedReview {
             settled: services.gitlab_repository_settled_connection(),
             workspace,
             number,
+            root_kind,
+            explicit: None,
+            addressed: false,
         }
     }
 
-    pub(crate) async fn read(mut self, services: &Services) -> AdmissionResult<ReadOutcome> {
+    pub(crate) fn capture_addressed(
+        services: &Services,
+        workspace: WorkspaceId,
+        request: &intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> intent_core::Result<Self> {
+        use intent_core::review_monitor::ReviewMonitorAddress;
+        let address = request
+            .address()
+            .map_err(|e| intent_core::Error::InvalidParams(e.into()))?;
+        let root_kind = match &address {
+            ReviewMonitorAddress::SelectedRoot {
+                git_root_id: Some(git_root_id),
+            } => RepositoryRootKind::Registered {
+                git_root_id: git_root_id.clone(),
+            },
+            _ => RepositoryRootKind::Primary,
+        };
+        let mut captured = Self::capture_root(services, workspace, request.pr_number, root_kind);
+        captured.addressed = true;
+        match address {
+            ReviewMonitorAddress::SelectedRoot { .. } => {}
+            ReviewMonitorAddress::Explicit { target } => {
+                captured.explicit = Some(target.repository);
+            }
+            ReviewMonitorAddress::LegacyGithub { .. } => {
+                return Err(intent_core::Error::InvalidParams(
+                    "legacy repo uses the legacy observation seam".into(),
+                ))
+            }
+        }
+        Ok(captured)
+    }
+
+    pub(crate) async fn resolve(mut self, services: &Services) -> AdmissionResult<ResolvedReview> {
+        if self.addressed
+            && !self
+                .host
+                .as_ref()
+                .is_ok_and(|host| host.request().supports_review_monitoring())
+        {
+            return Ok(ResolvedReview::Unsupported);
+        }
         services
             .require_member(&self.workspace)
             .await
             .map_err(|e| local(&e))?;
         let root_id = RepositoryRootId {
             workspace_id: self.workspace.clone(),
-            kind: RepositoryRootKind::Primary,
+            kind: self.root_kind.clone(),
         };
         let root = RootRecord::read(&services.store, &root_id).await?;
         if let Ok(child) = self.child.as_mut() {
@@ -292,26 +401,385 @@ impl CapturedReview {
         if SelectionFacts::read(services, &root_id).await? != selection {
             return Err(AdmissionError::BindingChanged);
         }
-        let selected = target(&observed, &selection.saved()?)?;
+        let selected = selected_target(
+            &observed,
+            &selection,
+            self.explicit.as_ref(),
+            self.settled.as_ref().ok(),
+        )?;
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
                 .project_path
                 .rsplit_once('/')
                 .ok_or(AdmissionError::Unavailable)?;
-            return Ok(ReadOutcome::Github(RepoRef::new(owner, name)));
+            return Ok(ResolvedReview::Github(RepoRef::new(owner, name)));
+        }
+        if !self
+            .host
+            .as_ref()
+            .is_ok_and(|host| host.request().supports_review_monitoring())
+        {
+            return Ok(ResolvedReview::Unsupported);
         }
         let host = self.host?;
         host.check_current()?;
-        read_review(
-            &host,
-            self.workspace,
-            self.number,
-            self.child?,
-            self.settled,
-            (root, GitFacts::from(observed), selection),
+        Ok(ResolvedReview::Managed(Box::new(PreparedReview {
+            host,
+            workspace: self.workspace,
+            target: ReviewTarget {
+                repository: selected,
+                kind: RepositoryResourceKind::MergeRequest,
+                number: self.number,
+            },
+            child: self.child?,
+            settled: self.settled,
+            original: (root, GitFacts::from(observed), selection, self.explicit),
+        })))
+    }
+
+    pub(crate) async fn read(self, services: &Services) -> AdmissionResult<ReadOutcome> {
+        match self.resolve(services).await? {
+            ResolvedReview::Unsupported => Ok(ReadOutcome::Unsupported),
+            ResolvedReview::Github(repo) => Ok(ReadOutcome::Github(repo)),
+            ResolvedReview::Managed(prepared) => prepared.read().await,
+        }
+    }
+}
+
+pub(crate) enum ResolvedReview {
+    Unsupported,
+    Github(RepoRef),
+    Managed(Box<PreparedReview>),
+}
+
+pub(crate) struct PreparedReview {
+    host: ReadHost,
+    workspace: WorkspaceId,
+    pub(crate) target: ReviewTarget,
+    child: RepositoryReadChild,
+    settled: credentials::Result<RepositorySettledConnection>,
+    original: (
+        RootRecord,
+        GitFacts,
+        SelectionFacts,
+        Option<intent_core::RepositoryTarget>,
+    ),
+}
+
+impl PreparedReview {
+    pub(crate) async fn monitor_authority(
+        &self,
+        retained: Arc<RepositoryReadRequest>,
+    ) -> AdmissionResult<Arc<MonitorAuthority>> {
+        self.host.check_current()?;
+        let original = self
+            .settled
+            .as_ref()
+            .map_err(|_| AdmissionError::Unavailable)?;
+        let settled = original
+            .reobserve()
+            .map_err(|_| AdmissionError::Unavailable)?;
+        if settled.selected() != original.selected()
+            || settled.descriptor() != original.descriptor()
+        {
+            return Err(AdmissionError::BindingChanged);
+        }
+        MonitorAuthority::admit_original(
+            self.host.services(),
+            retained,
+            &self.workspace,
+            self.target.clone(),
+            settled,
+            None,
         )
         .await
     }
+
+    pub(crate) async fn read(self) -> AdmissionResult<ReadOutcome> {
+        read_review(
+            &self.host,
+            self.workspace,
+            self.target.number,
+            self.child,
+            self.settled,
+            self.original,
+        )
+        .await
+    }
+}
+
+/// Original session/account lifetime retained independently from the MCP reply.
+/// Root/selection subscriptions are deliberately short-lived: the resource in
+/// this binding never changes after registration. The binding alone is evidence.
+pub(crate) struct MonitorAuthority {
+    pub(crate) binding: intent_core::review_monitor::ReviewMonitorBinding,
+    request: Arc<RepositoryReadRequest>,
+    member: MemberFacts,
+    settled: RepositorySettledConnection,
+    lifetime: RepositoryReadChild,
+    eligibility: OnceLock<RepositoryReadEligibility>,
+    source: OnceLock<Arc<dyn RepositoryAuthority>>,
+    services: std::sync::Weak<Services>,
+    observations: crate::observation_adapter::ConnectionObservations,
+    restored_from: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+    explicit_recovery: std::sync::atomic::AtomicBool,
+}
+
+#[path = "read_source/monitor_poll.rs"]
+mod monitor_poll;
+pub(crate) use monitor_poll::{
+    MonitorDeliveries, MonitorDeliveryCompletion, MonitorPromptAdmission,
+};
+
+impl MonitorAuthority {
+    async fn admit_original(
+        services: &Arc<Services>,
+        retained: Arc<RepositoryReadRequest>,
+        workspace: &WorkspaceId,
+        target: ReviewTarget,
+        settled: RepositorySettledConnection,
+        restored_from: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+    ) -> AdmissionResult<Arc<Self>> {
+        if !retained.retains(services.as_ref()) || !retained.supports_review_monitoring() {
+            return Err(AdmissionError::Denied);
+        }
+        retained.check_current()?;
+        let member = member(services, &retained, workspace).await?;
+        let binding = intent_core::review_monitor::ReviewMonitorBinding {
+            scope: ExecutionScope {
+                daemon_id: services.daemon_boot_id.clone(),
+                authority_scope_id: retained.correlation().into(),
+                authority_generation: member
+                    .workspace
+                    .workspace
+                    .revision
+                    .ok_or(AdmissionError::Unavailable)?
+                    .get(),
+            },
+            connection: settled.selected().binding.scope.clone(),
+            resource: target,
+        };
+        let lifetime = retained.child()?;
+        lifetime.subscribe(&[
+            RepositoryLifecycleKey::Database,
+            RepositoryLifecycleKey::Workspace(workspace.clone()),
+            RepositoryLifecycleKey::Agent(member.agent.id.clone()),
+        ])?;
+        let authority = Arc::new(MonitorAuthority {
+            observations: crate::observation_adapter::ConnectionObservations::new(
+                binding.scope.clone(),
+                binding.connection.clone(),
+            ),
+            binding,
+            request: retained,
+            member,
+            settled,
+            lifetime,
+            eligibility: OnceLock::new(),
+            source: OnceLock::new(),
+            services: Arc::downgrade(services),
+            explicit_recovery: std::sync::atomic::AtomicBool::new(restored_from.is_some()),
+            restored_from,
+        });
+        let source: Arc<dyn RepositoryAuthority> =
+            Arc::new(MonitorAuthoritySource(Arc::downgrade(&authority)));
+        authority
+            .source
+            .set(source.clone())
+            .map_err(|_| AdmissionError::Unavailable)?;
+        let admission = services
+            .repository_connection_directory()
+            .admit(
+                &authority.settled.selected().binding,
+                authority.credential_request(),
+                source,
+            )
+            .map_err(|_| AdmissionError::Unavailable)?;
+        let eligibility = services
+            .gitlab_repository_read_eligibility(&admission)
+            .map_err(|_| AdmissionError::Unavailable)?;
+        authority
+            .eligibility
+            .set(eligibility)
+            .map_err(|_| AdmissionError::Unavailable)?;
+        Ok(authority)
+    }
+
+    /// A real manager prompt capture, not an ID lookup, supplies this request.
+    /// The saved row constrains fresh admission and never supplies a credential.
+    pub(crate) async fn recover(
+        services: &Arc<Services>,
+        retained: Arc<RepositoryReadRequest>,
+        row: &intent_store::QualifiedPrMonitor,
+        admitted_connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<Self>> {
+        let intent_store::PersistedMonitorTarget::Resolved {
+            target,
+            provenance: intent_store::MonitorTargetProvenance::CapturedRequest,
+        } = row.target()
+        else {
+            return Err(AdmissionError::Denied);
+        };
+        let envelope: serde_json::Value = serde_json::from_str(
+            row.monitor()
+                .last_snapshot
+                .as_deref()
+                .ok_or(AdmissionError::Unavailable)?,
+        )
+        .map_err(|_| AdmissionError::Unavailable)?;
+        let original: intent_core::review_monitor::ReviewMonitorBinding =
+            serde_json::from_value(envelope["monitorBinding"].clone())
+                .map_err(|_| AdmissionError::Unavailable)?;
+        if original.resource != *target
+            || original.connection.account_id != admitted_connection.account_id
+            || row.monitor().state != intent_core::PrMonitorState::Active
+        {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let settled = services
+            .gitlab_repository_settled_connection()
+            .map_err(|_| AdmissionError::Unavailable)?;
+        if &settled.selected().binding.scope != admitted_connection {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let authority = Self::admit_original(
+            services,
+            retained,
+            &row.monitor().workspace_id,
+            target.clone(),
+            settled,
+            Some(original),
+        )
+        .await?;
+        if authority.owner() != &row.monitor().agent_id {
+            return Err(AdmissionError::Denied);
+        }
+        authority.validate(services).await?;
+        Ok(authority)
+    }
+
+    pub(crate) fn requires_explicit_recovery(&self) -> bool {
+        self.explicit_recovery
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn matches_saved_binding(
+        &self,
+        saved: &intent_core::review_monitor::ReviewMonitorBinding,
+    ) -> bool {
+        (saved.resource == self.binding.resource
+            && saved.connection == self.binding.connection
+            && saved.scope.daemon_id == self.binding.scope.daemon_id)
+            || self.restored_from.as_ref() == Some(saved)
+    }
+    fn credential_request(&self) -> RepositoryAuthorityRequest {
+        RepositoryAuthorityRequest {
+            execution: self.binding.scope.clone(),
+            target: self.binding.resource.repository.clone(),
+            connection: self.binding.connection.clone(),
+            use_kind: RepositoryCredentialUse::NativeRead,
+            allowed_transport: RepositoryCredentialTransport::GitlabApi(
+                self.settled.descriptor().clone(),
+            ),
+        }
+    }
+
+    pub(crate) fn reserve_output(self: &Arc<Self>, services: &Services) -> AdmissionResult<()> {
+        let host = crate::repository_read_policy::capture(services)?;
+        if !host.request().supports_review_monitoring() {
+            return Err(AdmissionError::Denied);
+        }
+        host.reserve()?
+            .bind(Arc::new(MonitorRecord {
+                request: host.request().clone(),
+                authority: self.clone(),
+            }))
+            .map_err(|_| AdmissionError::Retired)
+    }
+
+    pub(crate) async fn validate(&self, services: &Services) -> AdmissionResult<()> {
+        if !self.request.retains(services) || !self.request.supports_review_monitoring() {
+            return Err(AdmissionError::Denied);
+        }
+        self.lifetime.retirement().check_current()?;
+        if member(services, &self.request, &self.member.agent.workspace_id).await? != self.member {
+            return Err(AdmissionError::BindingChanged);
+        }
+        let fresh = self
+            .settled
+            .reobserve()
+            .map_err(|_| AdmissionError::Unavailable)?;
+        if fresh.selected() != self.settled.selected()
+            || fresh.descriptor() != self.settled.descriptor()
+        {
+            return Err(AdmissionError::BindingChanged);
+        }
+        self.request.check_current()
+    }
+
+    /// Reserve the database writer before entering this boundary. A blocking
+    /// worker retains both original physical lifetime and credential/source
+    /// fences through the actual SQL statement and COMMIT. Cancellation of the
+    /// awaiting caller drops only its `JoinHandle`, not an admitted SQL worker.
+    pub(crate) async fn commit(
+        self: &Arc<Self>,
+        services: &Services,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> intent_core::Result<bool> {
+        self.validate(services).await.map_err(|_| refused())?;
+        let authority = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Context/caller checks ran in the original async call. This worker
+            // can use only its retained original leaf, never ambient authority.
+            authority
+                .lifetime
+                .commit_monitor_write(authority.eligibility.get().ok_or_else(refused)?, write)
+                .map_err(|_| refused())?
+        })
+        .await
+        .map_err(|_| refused())?
+    }
+
+    pub(crate) fn owner(&self) -> &intent_core::AgentId {
+        &self.member.agent.id
+    }
+}
+
+struct MonitorFence(Arc<MonitorAuthority>);
+impl RepositoryAuthorityFence for MonitorFence {
+    fn dispatch(
+        self: Box<Self>,
+        action: &mut (dyn FnMut() -> credentials::Result<()> + Send),
+    ) -> credentials::Result<()> {
+        self.0
+            .lifetime
+            .transfer(|| Ok(action()))
+            .map_err(credential)?
+    }
+}
+struct MonitorAuthoritySource(std::sync::Weak<MonitorAuthority>);
+impl RepositoryAuthority for MonitorAuthoritySource {
+    fn revalidate<'a>(
+        &'a self,
+        request: &'a RepositoryAuthorityRequest,
+    ) -> CredentialFuture<'a, Box<dyn RepositoryAuthorityFence>> {
+        Box::pin(async move {
+            let authority = self.0.upgrade().ok_or(RepositoryCredentialError::Retired)?;
+            if request != &authority.credential_request() {
+                return Err(RepositoryCredentialError::BoundaryMismatch);
+            }
+            let services = authority
+                .services
+                .upgrade()
+                .ok_or(RepositoryCredentialError::Retired)?;
+            authority.validate(&services).await.map_err(credential)?;
+            Ok(Box::new(MonitorFence(authority)) as Box<dyn RepositoryAuthorityFence>)
+        })
+    }
+}
+
+pub(crate) struct MonitorRecord {
+    pub(crate) request: Arc<RepositoryReadRequest>,
+    pub(crate) authority: Arc<MonitorAuthority>,
 }
 
 /// A persistent obligation, never a reusable acquisition fence.
@@ -338,6 +806,7 @@ struct ReadFacts {
     member: MemberFacts,
     git: GitFacts,
     selection: SelectionFacts,
+    explicit: Option<intent_core::RepositoryTarget>,
     settled: RepositorySettledConnection,
     request: RepositoryAuthorityRequest,
 }
@@ -372,7 +841,12 @@ impl ReadFacts {
         let observed = git.observe_root(resolver(Some(&self.settled))?).await?;
         if authority != self.member
             || SelectionFacts::read(&self.services, &self.git.root).await? != self.selection
-            || target(&observed, &self.selection.saved()?)? != self.request.target
+            || selected_target(
+                &observed,
+                &self.selection,
+                self.explicit.as_ref(),
+                Some(&self.settled),
+            )? != self.request.target
             || GitFacts::from(observed) != self.git
         {
             return Err(AdmissionError::BindingChanged);
@@ -510,20 +984,22 @@ async fn read_review(
     host: &ReadHost,
     workspace: WorkspaceId,
     number: u64,
-    mut child: RepositoryReadChild,
+    child: RepositoryReadChild,
     settled: credentials::Result<RepositorySettledConnection>,
-    original: (RootRecord, GitFacts, SelectionFacts),
+    original: (
+        RootRecord,
+        GitFacts,
+        SelectionFacts,
+        Option<intent_core::RepositoryTarget>,
+    ),
 ) -> AdmissionResult<ReadOutcome> {
-    let (original_root, original_git, selection) = original;
+    let (original_root, original_git, selection, explicit) = original;
     host.check_current()?;
     if number == 0 {
         return Err(AdmissionError::Denied);
     }
     let member_facts = member(host.services(), host.request(), &workspace).await?;
-    let root_id = RepositoryRootId {
-        workspace_id: workspace,
-        kind: RepositoryRootKind::Primary,
-    };
+    let root_id = original_git.root.clone();
     let root = RootRecord::read(&host.services().store, &root_id).await?;
     if root != original_root {
         return Err(AdmissionError::BindingChanged);
@@ -542,7 +1018,12 @@ async fn read_review(
             if SelectionFacts::read(host.services(), &root_id).await? != selection {
                 return Err(AdmissionError::BindingChanged);
             }
-            let selected_target = target(&observed, &selection.saved()?)?;
+            let selected_target = selected_target(
+                &observed,
+                &selection,
+                explicit.as_ref(),
+                settled.as_ref().ok(),
+            )?;
             let git_facts = GitFacts::from(observed);
             if git_facts != original_git || selected_target.provider != RepositoryProvider::Gitlab {
                 return Err(AdmissionError::BindingChanged);
@@ -586,6 +1067,7 @@ async fn read_review(
                 member: member_facts,
                 git: git_facts,
                 selection,
+                explicit,
                 settled,
                 request,
             });
@@ -761,22 +1243,38 @@ pub(crate) async fn with_records<T: Send>(
     records: &[&ReadRecord],
     transfer: impl FnOnce() -> T + Send,
 ) -> AdmissionResult<T> {
+    with_records_and_monitors(request, services, records, &[], transfer).await
+}
+
+pub(crate) async fn with_records_and_monitors<T: Send>(
+    request: &Arc<RepositoryReadRequest>,
+    services: &Arc<Services>,
+    records: &[&ReadRecord],
+    monitors: &[&MonitorRecord],
+    transfer: impl FnOnce() -> T + Send,
+) -> AdmissionResult<T> {
     request.check_current()?;
     let current = crate::repository_admission::request_context::current_read_request()?;
     if !Arc::ptr_eq(request, &current) {
         return Err(AdmissionError::Denied);
     }
-    if records.is_empty()
+    if (records.is_empty() && monitors.is_empty())
         || records
             .iter()
             .any(|r| !Arc::ptr_eq(&r.request, request) || !Arc::ptr_eq(&r.facts.services, services))
     {
         return Err(AdmissionError::Denied);
     }
+    for record in monitors {
+        if !Arc::ptr_eq(&record.request, request) || !request.supports_review_monitoring() {
+            return Err(AdmissionError::Denied);
+        }
+        record.authority.validate(services).await?;
+    }
     let mut child = request.child()?;
     let mut roots = Vec::with_capacity(records.len());
     for record in records {
-        subscribe(&mut child, &record.facts.git.root.workspace_id)?;
+        subscribe(&mut child, &record.facts.git.root)?;
         child.subscribe(&[
             RepositoryLifecycleKey::Database,
             record.facts.root.lifecycle_key(),
@@ -811,31 +1309,58 @@ pub(crate) async fn with_records<T: Send>(
                 .collect::<Vec<_>>();
             operations.sort_unstable_by_key(Arc::as_ptr);
             operations.dedup_by(|a, b| Arc::ptr_eq(a, b));
-            let eligibility = records
+            let mut eligibility = records
                 .iter()
                 .map(|r| r.eligibility.as_ref())
                 .collect::<Vec<_>>();
-            with_deliveries(records, || {
-                child.transfer(|| {
-                    let states = operations
-                        .iter()
-                        .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
-                        .collect::<AdmissionResult<Vec<_>>>()?;
-                    if states.iter().any(|state| **state != ReadState::Finished) {
-                        return Err(AdmissionError::Retired);
-                    }
-                    let mut output = None;
-                    RepositoryReadEligibility::with_all_current(&eligibility, || {
-                        output = Some(transfer());
-                        Ok(())
+            for record in monitors {
+                eligibility.push(
+                    record
+                        .authority
+                        .eligibility
+                        .get()
+                        .ok_or(AdmissionError::Unavailable)?,
+                );
+            }
+            let mut authorities = monitors.iter().map(|r| &r.authority).collect::<Vec<_>>();
+            authorities.sort_unstable_by_key(|a| Arc::as_ptr(a));
+            authorities.dedup_by(|a, b| Arc::ptr_eq(a, b));
+            with_monitor_fences(&authorities, || {
+                with_deliveries(records, || {
+                    child.transfer(|| {
+                        let states = operations
+                            .iter()
+                            .map(|op| op.lock().map_err(|_| AdmissionError::Retired))
+                            .collect::<AdmissionResult<Vec<_>>>()?;
+                        if states.iter().any(|state| **state != ReadState::Finished) {
+                            return Err(AdmissionError::Retired);
+                        }
+                        let mut output = None;
+                        RepositoryReadEligibility::with_all_current(&eligibility, || {
+                            output = Some(transfer());
+                            Ok(())
+                        })
+                        .map_err(|_| AdmissionError::Unavailable)?;
+                        output.ok_or(AdmissionError::Retired)
                     })
-                    .map_err(|_| AdmissionError::Unavailable)?;
-                    output.ok_or(AdmissionError::Retired)
                 })
             })
         },
     )
     .await
+}
+
+fn with_monitor_fences<T>(
+    authorities: &[&Arc<MonitorAuthority>],
+    action: impl FnOnce() -> AdmissionResult<T>,
+) -> AdmissionResult<T> {
+    if let Some((first, rest)) = authorities.split_first() {
+        first
+            .lifetime
+            .transfer(|| with_monitor_fences(rest, action))
+    } else {
+        action()
+    }
 }
 
 /// INACTIVE: checks optional LOCAL lifetime only, never optional Git/settings/P
@@ -869,7 +1394,7 @@ pub(crate) async fn with_joint_local_records<T: Send>(
     let mut child = request.child()?;
     let mut roots = Vec::with_capacity(records.len());
     for record in records {
-        subscribe(&mut child, &record.facts.git.root.workspace_id)?;
+        subscribe(&mut child, &record.facts.git.root)?;
         child.subscribe(&[
             RepositoryLifecycleKey::Database,
             record.facts.root.lifecycle_key(),
@@ -981,7 +1506,7 @@ pub(crate) async fn with_context_records<T: Send>(
     let mut child = request.child()?;
     let mut roots = Vec::new();
     for record in records {
-        subscribe(&mut child, &record.facts.git.root.workspace_id)?;
+        subscribe(&mut child, &record.facts.git.root)?;
         child.subscribe(&[
             RepositoryLifecycleKey::Database,
             record.facts.root.lifecycle_key(),
@@ -1147,3 +1672,11 @@ pub(crate) async fn with_context_only<T: Send>(
 #[cfg(test)]
 #[path = "read_source/tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "read_source/monitor_native_tests.rs"]
+mod monitor_native_tests;
+
+#[cfg(test)]
+#[path = "read_source/native_runtime_tests.rs"]
+mod native_runtime_tests;

@@ -231,7 +231,7 @@ impl Store {
             Ok((merged, inserted))
         })
         .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Fetch a single git root by id, or `NotFound`.
@@ -390,7 +390,7 @@ impl Store {
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace git root {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 

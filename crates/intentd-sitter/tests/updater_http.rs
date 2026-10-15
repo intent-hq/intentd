@@ -408,6 +408,48 @@ fn missing_platform_entry_is_a_soft_failure() {
 }
 
 #[test]
+fn omitted_platform_keeps_installed_daemon_and_state_without_architecture_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "0.1.0", Channel::Stable);
+    let previous_state = fs::read(&paths.state_path).unwrap();
+    let previous_binary = fs::read(paths.daemon_binary("0.1.0")).unwrap();
+    // A release for another architecture must never be installed for this one.
+    // This runs on every CI host, including Intel Mac when available.
+    let other_target = if TARGET_TRIPLE == "aarch64-apple-darwin" {
+        "x86_64-apple-darwin"
+    } else {
+        "aarch64-apple-darwin"
+    };
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "version": "0.2.0",
+        "platforms": {
+            other_target: {
+                "asset": format!("intentd-{other_target}.tar.xz"),
+                "url": "http://127.0.0.1:1/must-not-download",
+                "sha256": "0".repeat(64),
+            }
+        }
+    });
+    let base_url = serve(HashMap::from([(
+        "/channel-stable/stable.json".to_string(),
+        manifest.to_string().into_bytes(),
+    )]));
+    let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
+    assert!(matches!(
+        updater.check_and_install(Channel::Stable),
+        Err(UpdateError::NoPlatformEntry { .. })
+    ));
+    assert_eq!(fs::read(&paths.state_path).unwrap(), previous_state);
+    assert_eq!(
+        fs::read(paths.daemon_binary("0.1.0")).unwrap(),
+        previous_binary
+    );
+    assert!(!paths.daemon_binary("0.2.0").exists());
+}
+
+#[test]
 fn prune_keeps_current_and_one_previous_version() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths_in(dir.path());

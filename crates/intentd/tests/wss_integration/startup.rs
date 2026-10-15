@@ -233,6 +233,12 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     .await;
     assert_eq!(hello["error"]["data"]["code"], "daemon-not-ready");
     let attempt = hello["error"]["data"]["startup"]["attemptId"].clone();
+    // The private monitor handshake is application admission too. A bootstrap
+    // seat cannot acquire or remember monitor authority before the fresh hello.
+    let monitor_params = json!({"clientId":"must-not-persist-monitor", "connectionRole":"review-monitor", "capabilities":{"reviewMonitoring":1}});
+    let monitor = call(&mut ws, "client.hello", monitor_params.clone()).await;
+    assert_eq!(monitor["error"]["code"], -32012);
+    assert_eq!(monitor["error"]["data"]["code"], "daemon-not-ready");
     let status = call(&mut ws, "system.startupStatus", json!({})).await;
     assert_eq!(status["result"]["phase"], "preparing");
     assert!(status["result"].get("progress").is_none());
@@ -371,6 +377,18 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
             .unwrap(),
         0,
         "ready must not convert the stale backlog"
+    );
+    let monitor = call(&mut ready, "client.hello", monitor_params).await;
+    assert_eq!(monitor["error"]["code"], -32602, "{monitor}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM client WHERE id='must-not-persist-monitor'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        0,
+        "fresh handoff must not turn a bootstrap claim into private authority"
     );
     let hello = call(
         &mut ready,
