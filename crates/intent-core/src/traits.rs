@@ -134,6 +134,28 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Owner-only policy on the original native application connection.
+    fn gitlab_child_git_policy_get(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    /// Transport-private helper branch. Implementations require actual local
+    /// owner admission and retain credential proof through final socket output.
+    fn gitlab_child_git_credential(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git credential unavailable".into())) })
+    }
+
     /// Acquire read-only repository context under the original native connection.
     /// Explicit original-socket resource reads; older implementations refuse.
     fn repository_resource_capture(
@@ -162,6 +184,68 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
         Box::pin(async {
             Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryKnownSelection>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource read unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedCapture>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedDetail>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_list(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryResourceList>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_discussions(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryDiscussions>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
                 "Repository resource reads unavailable".into(),
             ))
         })

@@ -19,8 +19,10 @@ use crate::repository_credentials::{
     RepositorySecretRequest, RepositorySecretSnapshot,
 };
 
-/// Implemented only by the original pre-workspace caller/host owner. The action
-/// transfers prepared data once; no await, disk/network IO or spawn under it.
+/// Implemented only by the original caller/host owner. Ordinary actions transfer
+/// prepared data once. A child guard bound to one immutable output frame may
+/// admit one nonblocking transport phase per dispatch. Never await, perform
+/// blocking I/O, spawn, or recursively enter the same owner locks here.
 pub(crate) trait CheckoutAuthority: Send + Sync {
     fn dispatch(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
 }

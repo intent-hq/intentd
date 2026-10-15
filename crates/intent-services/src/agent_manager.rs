@@ -3401,6 +3401,9 @@ impl AgentManager {
             })
             .with_original_services(original_services, session.clone())
         };
+        // Prompt envelopes use the original physical confirmation even when a
+        // provider has no callback-registration or session-MCP capability.
+        repository_origin.configure_prompt_source(server_blueprint.clone());
         let mut server = server_blueprint.server();
         if let Some(context) = repository_origin.pending_callback() {
             server = server.with_request_context(Arc::new(context));

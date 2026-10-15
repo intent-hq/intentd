@@ -745,7 +745,8 @@ use std::time::{Duration, Instant};
 // 13.10 adds capability-gated cancellable note deletion controls.
 // 14.0 removes archived script lists and terminal monitor history; active pages and lazy details.
 // 14.1 adds owner-only startup readiness and indexing observations.
-pub const PROTOCOL_VERSION: &str = "14.1";
+// 14.2 adds scoped repository pages and owner-bound GitLab child Git policy methods.
+pub const PROTOCOL_VERSION: &str = "14.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

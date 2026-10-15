@@ -908,6 +908,7 @@ impl crate::Services {
             RepositoryCredentialSource::GitlabSecretSlot,
         )
         .map_err(|_| unavailable())?;
+        write.verified_user(Some(user));
         write.begin().map_err(crate::pr_ops::map_sc_err)?;
         // Verification failure above still cancels an unstarted reservation.
         // After beginning, retain the exact evidence across the native join and
@@ -944,6 +945,15 @@ impl crate::Services {
             .owner
             .publish_source(&binding, &descriptor, fingerprint)
             .map_err(|_| unavailable())?;
+        if let super::ChildChoice::Known(enabled) =
+            write.state.lock().map_err(|_| unavailable())?.child_choice
+        {
+            write
+                .owner
+                .directory
+                .restore_child_policy(&binding, enabled)
+                .map_err(|_| unavailable())?;
+        }
         *settings
             .source_descriptor
             .lock()

@@ -191,14 +191,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 435;
+// Startup status (14.1): +1 fast-path method.
+// Scoped repository pages and child Git policy (14.2): +8 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 443;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+const EXPECTED_ROUTER_METHODS: usize = 386;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -207,7 +209,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 57;
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 5;
+const EXPECTED_NOTIFICATIONS: usize = 6;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -841,11 +843,19 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1381,8 +1391,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -2047,6 +2060,13 @@ mod unbound_owner_only_methods {
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
             ("sourceControl.getUser", json!({ "provider": "github" })),
+            ("sourceControl.gitlab.childGit.get", json!({})),
+            (
+                "sourceControl.gitlab.childGit.set",
+                json!({"binding":{"instanceBaseUrl":"https://forge.test/install",
+                    "connection":{"connectionId":"original","accountId":"account",
+                        "connectionGeneration":"1"},"revision":"1"},"enabled":false}),
+            ),
             (
                 "sourceControl.identityProof.create",
                 json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
@@ -2054,6 +2074,10 @@ mod unbound_owner_only_methods {
             (
                 "sourceControl.identityProof.delete",
                 json!({ "provider": "github", "proofId": "g" }),
+            ),
+            (
+                "sourceControl.read.resolveKnownRepository",
+                json!({ "context": { "kind": "host" }, "readLifetimeId": "original", "path": dir }),
             ),
             ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
@@ -2572,8 +2596,11 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.cancelAuth",
         "sourceControl.connect",
         "sourceControl.getUser",
+        "sourceControl.gitlab.childGit.get",
+        "sourceControl.gitlab.childGit.set",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
+        "sourceControl.read.resolveKnownRepository",
         "sourceControl.revoke",
         "specialist.create",
         "specialist.delete",

@@ -47,6 +47,8 @@ pub(crate) mod review;
 
 #[path = "native_checkout.rs"]
 pub(crate) mod checkout;
+#[path = "native_child_git.rs"]
+pub(crate) mod child_git;
 #[path = "native_resource_read.rs"]
 pub(crate) mod resource;
 
@@ -128,6 +130,7 @@ pub(crate) fn connection(
         parent: RepositoryRetirement::default(),
         review: review::ConnectionState::default(),
         resource: resource::ConnectionState::default(),
+        child_git: child_git::ConnectionState::default(),
         checkout: checkout::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
         monitor: monitor::ConnectionState::default(),
@@ -150,6 +153,7 @@ struct Connection {
     parent: RepositoryRetirement,
     review: review::ConnectionState,
     resource: resource::ConnectionState,
+    child_git: child_git::ConnectionState,
     checkout: checkout::ConnectionState,
     selection: selection::ConnectionState,
     monitor: monitor::ConnectionState,
@@ -370,6 +374,12 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_child_git(
+        &self,
+        frame: &intent_core::gitlab_child_git::GitlabChildGitFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(child_git::capture_frame(self, frame.clone()))
+    }
     fn capture_monitor_events(
         &self,
     ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {

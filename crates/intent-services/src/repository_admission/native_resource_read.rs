@@ -1,5 +1,5 @@
-//! Explicit GitLab detail reads on one original native socket. A scope is
-//! independent of Git remotes/selection and never grants a write or list read.
+//! Explicit GitLab reads on one original native socket. A scope is independent
+//! of Git remotes/selection and never grants a repository write.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,6 +15,8 @@ use intent_core::repository_request::{
     RepositoryResourceQuota as Quota, RepositoryResourceResult as ReadResult,
     RepositoryResourceRetired as Retired, RepositoryResourceRetirements,
 };
+use intent_core::repository_resource_pages::RepositoryReadContext;
+use intent_core::repository_resource_pages::RepositoryResourceEvent;
 use intent_core::{
     BoxFuture, Error, ExecutionScope, RepositoryAvailability, RepositoryContextRevision,
     RepositoryProvider, RepositoryResourceKind, Result, ReviewTarget,
@@ -36,7 +38,8 @@ use crate::repository_credentials::authority::{
     RepositoryCredentialTransport,
 };
 use crate::repository_credentials::read::{
-    RepositoryReadOperation, RepositoryResponseAttribution, RepositoryResponseDisposition,
+    RepositoryCollectionTarget, RepositoryReadOperation, RepositoryResponseAttribution,
+    RepositoryResponseDisposition,
 };
 use crate::repository_credentials::{
     self as credentials, RepositoryCredentialError, RepositoryCredentialUse,
@@ -46,6 +49,19 @@ use crate::source_control_auth_ops::repository_owner::{
     RepositoryConnectionFacts, RepositoryReadEligibility, RepositorySettledConnection,
 };
 use crate::SettingsRegistry;
+
+#[path = "native_resource_read/cursors.rs"]
+mod cursors;
+#[path = "native_resource_read/known.rs"]
+pub(crate) mod known;
+#[path = "native_resource_read/observations.rs"]
+mod observations;
+#[path = "native_resource_read/output.rs"]
+mod output;
+#[path = "native_resource_read/pages.rs"]
+pub(crate) mod pages;
+#[path = "native_resource_read/scoped.rs"]
+pub(crate) mod scoped;
 
 const LIMIT: usize = 64;
 const TTL: Duration = Duration::from_secs(300);
@@ -81,11 +97,12 @@ struct Feed {
     closed: bool,
     sequence: u64,
     terminal: Option<Retired>,
-    notices: VecDeque<Retired>,
+    notices: VecDeque<RepositoryResourceEvent>,
     leases: HashMap<String, Arc<Lease>>,
 }
 pub(super) struct ConnectionState {
     feed: Mutex<Feed>,
+    groups: Mutex<Vec<Weak<observations::Group>>>,
     notify: Notify,
     leases: Arc<Semaphore>,
     frames: Arc<Semaphore>,
@@ -94,6 +111,7 @@ impl Default for ConnectionState {
     fn default() -> Self {
         Self {
             feed: Mutex::default(),
+            groups: Mutex::default(),
             notify: Notify::new(),
             leases: Arc::new(Semaphore::new(LIMIT)),
             frames: Arc::new(Semaphore::new(LIMIT)),
@@ -148,12 +166,13 @@ impl ConnectionState {
                     .filter(|_| f.notices.len() < LIMIT)
                 {
                     f.sequence = seq;
-                    f.notices.push_back(Retired {
-                        read_lifetime_ids: vec![id.into()],
-                        sequence: seq.to_string(),
-                        all_retired: false,
-                        terminal: false,
-                    });
+                    f.notices
+                        .push_back(RepositoryResourceEvent::Retired(Retired {
+                            read_lifetime_ids: vec![id.into()],
+                            sequence: seq.to_string(),
+                            all_retired: false,
+                            terminal: false,
+                        }));
                     false
                 } else {
                     true
@@ -200,6 +219,16 @@ impl Drop for Receiver {
 impl RepositoryResourceRetirements for Receiver {
     fn next(&mut self) -> BoxFuture<'_, Option<Retired>> {
         Box::pin(async move {
+            loop {
+                match self.next_event().await? {
+                    RepositoryResourceEvent::Retired(notice) => return Some(notice),
+                    RepositoryResourceEvent::Invalidated(_) => {}
+                }
+            }
+        })
+    }
+    fn next_event(&mut self) -> BoxFuture<'_, Option<RepositoryResourceEvent>> {
+        Box::pin(async move {
             let c = self.connection.upgrade()?;
             loop {
                 let wake = c.resource.notify.notified();
@@ -212,7 +241,7 @@ impl RepositoryResourceRetirements for Receiver {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(t) = f.terminal.take() {
-                        return Some(t);
+                        return Some(RepositoryResourceEvent::Retired(t));
                     }
                     if f.closed {
                         return None;
@@ -254,10 +283,10 @@ pub(super) fn take_retirements(c: &Connection) -> Option<Box<dyn RepositoryResou
 
 struct Lease {
     id: String,
-    workspace: intent_core::WorkspaceId,
+    context: RepositoryReadContext,
     scope: ExecutionScope,
     deadline: Instant,
-    authority: RepositoryAuthoritySnapshot,
+    authority: scoped::Authority,
     lifetime: RepositorySourceLifetime,
     _registration: RepositorySubscription,
     _subscription: RepositorySubscription,
@@ -267,7 +296,9 @@ struct Lease {
     facts: RepositoryConnectionFacts,
     settled: RepositorySettledConnection,
     observations: ConnectionObservations,
+    group: Arc<observations::Group>,
     reads: AtomicUsize,
+    cursors: Mutex<cursors::Cursors>,
     published: AtomicBool,
 }
 impl Lease {
@@ -279,7 +310,6 @@ impl Lease {
     }
     fn end(&self) {
         self.lifetime.retirement().end_scope();
-        self.observations.retire();
     }
     fn revision(&self) -> RepositoryContextRevision {
         RepositoryContextRevision::new(&self.id, 1)
@@ -297,10 +327,12 @@ struct Request {
     weak: Weak<Self>,
     used: AtomicBool,
     consumed: AtomicBool,
+    output_admitted: Arc<AtomicBool>,
     state: Mutex<State>,
     permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     deadline: Instant,
 }
+#[derive(Clone)]
 enum State {
     Empty,
     Public,
@@ -312,6 +344,7 @@ enum State {
         Option<Arc<RepositoryResponseAttribution>>,
         bool,
         Option<CacheDelivery>,
+        Option<Arc<RepositoryCollectionTarget>>,
     ),
 }
 tokio::task_local! { static RESOURCE_REQUEST: Arc<Request>; }
@@ -338,7 +371,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             .subscribe(
                 &c.services.store,
                 c.caller.caller(),
-                &keys(frame.workspace_id()),
+                &keys(&frame.context()),
             )
             .map_err(denied)?;
         Ok::<_, Error>((lifetime, registration, subscription, local, global))
@@ -374,6 +407,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         used: AtomicBool::new(false),
         consumed: AtomicBool::new(false),
         state: Mutex::new(State::Empty),
+        output_admitted: Arc::new(AtomicBool::new(false)),
         permits,
         deadline: Instant::now() + FRAME_TTL,
     });
@@ -391,12 +425,15 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
     }
     request
 }
-fn keys(workspace: &intent_core::WorkspaceId) -> [RepositoryLifecycleKey; 3] {
-    [
+fn keys(context: &RepositoryReadContext) -> Vec<RepositoryLifecycleKey> {
+    let mut keys = vec![
         RepositoryLifecycleKey::Database,
         RepositoryLifecycleKey::WireAuthority,
-        RepositoryLifecycleKey::Workspace(workspace.clone()),
-    ]
+    ];
+    if let Some(workspace) = context.workspace_id() {
+        keys.push(RepositoryLifecycleKey::Workspace(workspace.clone()));
+    }
+    keys
 }
 impl Request {
     fn current(services: &Services, frame: &Frame) -> Result<Arc<Self>> {
@@ -429,7 +466,7 @@ impl Request {
         );
         let retire = match state {
             State::Capture(l) if !l.published.load(Ordering::Acquire) => Some(l),
-            State::Reading(l) | State::Read(l, _, _, _, _)
+            State::Reading(l) | State::Read(l, _, _, _, _, _)
                 if !self.consumed.load(Ordering::Acquire) =>
             {
                 Some(l)
@@ -440,17 +477,8 @@ impl Request {
             self.base.connection.resource.retire(&l.id);
         }
     }
-    async fn authority(&self) -> Result<RepositoryAuthoritySnapshot> {
-        self.check()?;
-        self.base
-            .connection
-            .services
-            .require_host_execution("Repository resource read")
-            .await
-            .map_err(denied)?;
-        super::authority(&self.base, self.frame.workspace_id())
-            .await
-            .map_err(denied)
+    async fn authority(&self) -> Result<scoped::Authority> {
+        scoped::authority(self).await
     }
     async fn validate(&self, lease: &Lease) -> Result<()> {
         self.check()?;
@@ -509,8 +537,7 @@ impl Request {
             .get(id)
             .cloned()
             .ok_or_else(unavailable)?;
-        if lease.workspace != *self.frame.workspace_id() || !lease.published.load(Ordering::Acquire)
-        {
+        if lease.context != self.frame.context() || !lease.published.load(Ordering::Acquire) {
             return Err(unavailable());
         }
         lease.check()?;
@@ -523,6 +550,13 @@ impl Drop for Request {
     }
 }
 impl RepositoryReadRequestScope for Request {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> Result<Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>> {
+        output::bind(self, frame)
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         Box::pin(RESOURCE_REQUEST.scope(self.weak.upgrade().expect("owned original frame"), body))
     }
@@ -544,6 +578,7 @@ impl RepositoryReadRequestScope for Request {
                     Option<Arc<RepositoryResponseAttribution>>,
                     bool,
                     Option<CacheDelivery>,
+                    Option<Arc<RepositoryCollectionTarget>>,
                 ),
             }
             let state = {
@@ -551,13 +586,14 @@ impl RepositoryReadRequestScope for Request {
                 match &*s {
                     State::Public => Delivery::Public,
                     State::Capture(l) => Delivery::Capture(l.clone()),
-                    State::Read(lease, eligibility, attribution, failed, delivery) => {
+                    State::Read(lease, eligibility, attribution, failed, delivery, collection) => {
                         Delivery::Read(
                             lease.clone(),
                             eligibility.clone(),
                             attribution.clone(),
                             *failed,
                             delivery.clone(),
+                            collection.clone(),
                         )
                     }
                     _ => return Err(unavailable()),
@@ -566,7 +602,7 @@ impl RepositoryReadRequestScope for Request {
             if matches!(state, Delivery::Public) {
                 // Only a sanitized service error or explicit release is public.
                 if kind == RepositoryReadReplyKind::Result
-                    && !matches!(self.frame, Frame::Release(_))
+                    && !matches!(self.frame, Frame::Release(_) | Frame::ReleaseScoped(_))
                 {
                     return Err(unavailable());
                 }
@@ -579,20 +615,24 @@ impl RepositoryReadRequestScope for Request {
                 return Err(unavailable());
             }
             let lease = match &state {
-                Delivery::Capture(l) | Delivery::Read(l, _, _, _, _) => l.clone(),
+                Delivery::Capture(l) | Delivery::Read(l, _, _, _, _, _) => l.clone(),
                 Delivery::Public => unreachable!(),
             };
             let result = tokio::time::timeout(ACQUIRE, async {
                 let _legacy = self.base.connection.caller.legacy_lease().await.map_err(denied)?;
                 self.validate(&lease).await?;
                 // Snapshot all private records before taking consuming fences.
-                let response = if let Delivery::Read(_,_,a,_,_) = &state { a.clone() } else { None };
+                let response = if let Delivery::Read(_,_,a,_,_,_) = &state { a.clone() } else { None };
                 let mut transferred = None;
-                let mut guarded = || self.with_scope(&lease, || {
+                let mut guarded = |check: &crate::pr_monitor::qualified_cache::CacheRevalidationCheck<'_>| self.with_scope(&lease, || {
                     let mut action = || {
+                        check()?;
                         if self.consumed.swap(true,Ordering::AcqRel) { return Err(RepositoryCredentialError::Retired); }
                         let actual = transfer();
-                        if actual.is_ok() { lease.published.store(true,Ordering::Release); }
+                        if actual.is_ok() {
+                            lease.published.store(true,Ordering::Release);
+                            self.output_admitted.store(true,Ordering::Release);
+                        }
                         transferred = Some(actual);
                         Ok(())
                     };
@@ -600,11 +640,11 @@ impl RepositoryReadRequestScope for Request {
                         Delivery::Capture(_) => RepositoryConnectionFacts::with_native_context_current(Some(&lease.facts), |current| {
                             if current { action() } else { Err(RepositoryCredentialError::Retired) }
                         }),
-                        Delivery::Read(_,eligibility,_,failure,_) => {
+                        Delivery::Read(_,eligibility,_,failure,_,collection) => {
                             if *failure {
                                 if let Some(response) = &response {
                                     let mut accepted_rejection = false;
-                                    eligibility.with_response(response, match &self.frame { Frame::Detail(q) => &q.target, _ => return Err(RepositoryCredentialError::BoundaryMismatch) }, &mut |disposition| {
+                                    with_response(eligibility, response, self.frame.resource_target(), collection.as_deref(), &mut |disposition| {
                                         accepted_rejection = disposition == RepositoryResponseDisposition::AcceptedCredentialRejection;
                                         if matches!(disposition, RepositoryResponseDisposition::NotApplied | RepositoryResponseDisposition::Unattributed | RepositoryResponseDisposition::Indeterminate) { return Err(RepositoryCredentialError::Retired); }
                                         if accepted_rejection { action()?; }
@@ -620,9 +660,9 @@ impl RepositoryReadRequestScope for Request {
                         Delivery::Public => unreachable!(),
                     }
                 }).map_err(credential);
-                if let Delivery::Read(_,_,_,false,Some(delivery)) = &state {
-                    delivery.with_current(&mut guarded).map_err(denied)?;
-                } else { guarded().map_err(denied)?; }
+                if let Delivery::Read(_,_,_,false,Some(delivery),_) = &state {
+                    delivery.with_revalidation(&mut guarded).map_err(denied)?;
+                } else { guarded(&|| Ok(())).map_err(denied)?; }
                 transferred.ok_or_else(unavailable)?
             }).await.map_err(denied).and_then(|r|r);
             if result.is_err() {
@@ -644,7 +684,8 @@ fn entry<'a, T: Send + 'a>(
         let result = body(r.clone()).await;
         if result.is_err() {
             let previous = std::mem::replace(&mut *r.state.lock().map_err(denied)?, State::Public);
-            if let State::Capture(l) | State::Reading(l) | State::Read(l, _, _, _, _) = previous {
+            if let State::Capture(l) | State::Reading(l) | State::Read(l, _, _, _, _, _) = previous
+            {
                 r.base.connection.resource.retire(&l.id);
             }
         }
@@ -681,7 +722,7 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
         .subscribe(
             &c.services.store,
             c.caller.caller(),
-            &keys(r.frame.workspace_id()),
+            &keys(&r.frame.context()),
         )
         .map_err(denied)?;
     let authority = r.authority().await?;
@@ -710,14 +751,23 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
     let scope = ExecutionScope {
         daemon_id: c.services.daemon_boot_id.clone(),
         authority_scope_id: id.clone(),
-        authority_generation: authority.workspace.revision.ok_or_else(unavailable)?.get(),
+        authority_generation: authority.generation()?,
     };
-    let observations =
-        ConnectionObservations::new(scope.clone(), settled.selected().binding.scope.clone());
+    let group = observations::group(
+        c,
+        &r.frame.context(),
+        &authority,
+        &settings,
+        &scope,
+        &settled,
+        matches!(r.frame, Frame::CaptureScoped(_)),
+    )?;
+    let observations = group.observations.clone();
+    let scope = group.scope.clone();
     let instance_base_url = settled.descriptor().instance().as_str().to_owned();
     let lease = Arc::new(Lease {
         id: id.clone(),
-        workspace: r.frame.workspace_id().clone(),
+        context: r.frame.context(),
         scope: scope.clone(),
         deadline: Instant::now() + TTL,
         authority,
@@ -730,7 +780,9 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
         facts,
         settled,
         observations,
+        group,
         reads: AtomicUsize::new(0),
+        cursors: Mutex::default(),
         published: AtomicBool::new(false),
     });
     r.with_scope(&lease, || {
@@ -777,31 +829,31 @@ async fn capture_inner(r: &Arc<Request>) -> Result<Capture> {
 }
 pub(crate) fn release(services: &Services, q: Bound) -> BoxFuture<'_, Result<Released>> {
     entry(services, &Frame::Release(q.clone()), move |r| {
-        Box::pin(async move {
-            // Store admission for a release has the same fixed acquisition
-            // budget as capture. A timeout is a refusal, never a released reply.
-            tokio::time::timeout(ACQUIRE, r.authority())
-                .await
-                .map_err(denied)??;
-            if let Some(l) = r
-                .base
-                .connection
-                .resource
-                .feed
-                .lock()
-                .map_err(denied)?
-                .leases
-                .get(&q.read_lifetime_id)
-            {
-                if l.workspace != q.workspace_id {
-                    return Err(unavailable());
-                }
-            }
-            r.base.connection.resource.retire(&q.read_lifetime_id);
-            *r.state.lock().map_err(denied)? = State::Public;
-            Ok(Released { released: true })
-        })
+        Box::pin(async move { release_inner(&r, &q.read_lifetime_id).await })
     })
+}
+async fn release_inner(r: &Request, id: &str) -> Result<Released> {
+    // Release retains the same fixed original authority acquisition budget.
+    tokio::time::timeout(ACQUIRE, r.authority())
+        .await
+        .map_err(denied)??;
+    if let Some(l) = r
+        .base
+        .connection
+        .resource
+        .feed
+        .lock()
+        .map_err(denied)?
+        .leases
+        .get(id)
+    {
+        if l.context != r.frame.context() {
+            return Err(unavailable());
+        }
+    }
+    r.base.connection.resource.retire(id);
+    *r.state.lock().map_err(denied)? = State::Public;
+    Ok(Released { released: true })
 }
 
 struct ReadAuthority {
@@ -855,18 +907,13 @@ impl RepositoryAuthority for Arc<ReadAuthority> {
         })
     }
 }
-fn valid_target(target: &ReviewTarget) -> Result<()> {
-    let instance = GitlabInstance::parse(&target.repository.instance_base_url)
+fn valid_repository(repository: &intent_core::RepositoryTarget) -> Result<()> {
+    let instance = GitlabInstance::parse(&repository.instance_base_url)
         .map_err(|_| Error::InvalidParams("Invalid resource instance".into()))?;
-    let path = &target.repository.project_path;
-    if target.repository.provider != RepositoryProvider::Gitlab
-        || instance.as_str() != target.repository.instance_base_url
+    let path = &repository.project_path;
+    if repository.provider != RepositoryProvider::Gitlab
+        || instance.as_str() != repository.instance_base_url
         || !instance.as_str().starts_with("https://")
-        || !(1..=9_007_199_254_740_991).contains(&target.number)
-        || !matches!(
-            target.kind,
-            RepositoryResourceKind::MergeRequest | RepositoryResourceKind::Issue
-        )
         || path.len() > 1024
         || path.split('/').count() < 2
         || path.split('/').any(|p| {
@@ -882,6 +929,37 @@ fn valid_target(target: &ReviewTarget) -> Result<()> {
         ));
     }
     Ok(())
+}
+fn valid_target(target: &ReviewTarget) -> Result<()> {
+    valid_repository(&target.repository)?;
+    if !(1..=9_007_199_254_740_991).contains(&target.number)
+        || !matches!(
+            target.kind,
+            RepositoryResourceKind::MergeRequest | RepositoryResourceKind::Issue
+        )
+    {
+        return Err(Error::InvalidParams(
+            "Invalid explicit GitLab target".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn with_response(
+    eligibility: &RepositoryReadEligibility,
+    response: &RepositoryResponseAttribution,
+    target: Option<&ReviewTarget>,
+    collection: Option<&RepositoryCollectionTarget>,
+    action: &mut (dyn FnMut(RepositoryResponseDisposition) -> credentials::Result<()> + Send),
+) -> credentials::Result<()> {
+    match collection {
+        Some(collection) => eligibility.with_collection_response(response, collection, action),
+        None => eligibility.with_response(
+            response,
+            target.ok_or(RepositoryCredentialError::BoundaryMismatch)?,
+            action,
+        ),
+    }
 }
 fn validate_resource_url(target: &ReviewTarget, url: &str) -> Result<()> {
     let kind = match target.kind {
@@ -901,44 +979,54 @@ fn validate_resource_url(target: &ReviewTarget, url: &str) -> Result<()> {
 }
 pub(crate) fn detail(services: &Services, q: Detail) -> BoxFuture<'_, Result<ReadResult>> {
     entry(services, &Frame::Detail(q.clone()), move |r| {
-        Box::pin(async move {
-            valid_target(&q.target)?;
-            let lease = r.lease(&q.read_lifetime_id)?;
-            *r.state.lock().map_err(denied)? = State::Reading(lease.clone());
-            if q.target.repository.instance_base_url
-                != lease.settled.descriptor().instance().as_str()
-            {
-                return Err(unavailable());
-            }
-            lease
-                .reads
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    n.checked_add(1).filter(|n| *n <= LIMIT)
-                })
-                .map_err(denied)?;
-            let stop = r
-                .base
-                .lifetime
-                .as_ref()
-                .ok_or_else(unavailable)?
-                .retirement();
-            let lease_stop = lease.lifetime.retirement();
-            tokio::select! {
-                biased;
-                ()=stop.native_cancelled()=>Err(unavailable()),
-                ()=lease_stop.native_cancelled()=>Err(unavailable()),
-                result=tokio::time::timeout(READ,read_inner(&r,&lease,&q))=>result.map_err(denied)?,
-            }
-        })
+        Box::pin(async move { detail_inner(&r, &q.read_lifetime_id, &q.target, q.refresh).await })
     })
 }
-async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<ReadResult> {
+async fn detail_inner(
+    r: &Arc<Request>,
+    id: &str,
+    target: &ReviewTarget,
+    refresh: bool,
+) -> Result<ReadResult> {
+    valid_target(target)?;
+    let lease = r.lease(id)?;
+    *r.state.lock().map_err(denied)? = State::Reading(lease.clone());
+    if target.repository.instance_base_url != lease.settled.descriptor().instance().as_str() {
+        return Err(unavailable());
+    }
+    lease
+        .reads
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_add(1).filter(|n| *n <= LIMIT)
+        })
+        .map_err(denied)?;
+    let stop = r
+        .base
+        .lifetime
+        .as_ref()
+        .ok_or_else(unavailable)?
+        .retirement();
+    let lease_stop = lease.lifetime.retirement();
+    tokio::select! {
+        biased;
+        ()=stop.native_cancelled()=>Err(unavailable()),
+        ()=lease_stop.native_cancelled()=>Err(unavailable()),
+        result=tokio::time::timeout(READ,read_inner(r,&lease,target,refresh))=>result.map_err(denied)?,
+    }
+}
+
+async fn read_inner(
+    r: &Arc<Request>,
+    lease: &Arc<Lease>,
+    target: &ReviewTarget,
+    refresh: bool,
+) -> Result<ReadResult> {
     let c = &r.base.connection;
     let _legacy = c.caller.legacy_lease().await.map_err(denied)?;
     r.validate(lease).await?;
     let expected = RepositoryAuthorityRequest {
         execution: lease.scope.clone(),
-        target: q.target.repository.clone(),
+        target: target.repository.clone(),
         connection: lease.settled.selected().binding.scope.clone(),
         use_kind: RepositoryCredentialUse::NativeRead,
         allowed_transport: RepositoryCredentialTransport::GitlabApi(
@@ -974,7 +1062,7 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
         first,
         reader.clone(),
         READ,
-        q.target.clone(),
+        target.clone(),
     )
     .map_err(denied)?;
     let full = RepositoryReadOperation::new(
@@ -982,21 +1070,24 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
         admit().map_err(denied)?,
         reader,
         READ,
-        q.target.clone(),
+        target.clone(),
     )
     .map_err(denied)?;
     let revalidate = || r.check().and_then(|()| lease.check());
-    let guard: &CacheAdmissionGuard<'_> = &|action| authority.with_current(action);
+    let denials = observations::Denials::new(r, lease);
+    let guard: &CacheAdmissionGuard<'_> = &|action| denials.with_current(action);
+    let observer: &crate::pr_monitor::qualified_cache::CacheDenialObserver<'_> =
+        &|notice| denials.observe(notice);
     let cache = ManagedCacheRequest {
         request: CacheRequest {
             connection: &lease.observations,
-            target: &q.target,
+            target,
             revalidate: &revalidate,
         },
         eligibility: &eligibility,
         with_authority: guard,
     };
-    let age = if q.refresh {
+    let age = if refresh {
         Duration::ZERO
     } else {
         c.services.pr_cache_max_age()
@@ -1004,17 +1095,18 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
     let response = Mutex::new(None);
     let invalid_identity = AtomicBool::new(false);
     let identity_matches = |number, url: &str| {
-        let matched = number == q.target.number && validate_resource_url(&q.target, url).is_ok();
+        let matched = number == target.number && validate_resource_url(target, url).is_ok();
         if !matched {
             invalid_identity.store(true, Ordering::Release);
         }
         matched
     };
-    let result = match q.target.kind {
+    let result = match target.kind {
         RepositoryResourceKind::MergeRequest => {
-            let read = crate::pr_monitor::qualified_cache::read_managed_review(
+            let read = crate::pr_monitor::qualified_cache::read_managed_review_observed(
                 &c.services.pr_cache,
                 &cache,
+                observer,
                 crate::pr_monitor::PrReadPolicy::Serve { max_age: age },
                 &HashSet::new(),
                 || async {
@@ -1040,10 +1132,8 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
             .await;
             read.map(|v| {
                 (
-                    validate_resource_url(&q.target, &v.value.details.review.url)
-                        .and_then(|()| {
-                            crate::pr_ops::qualified_review_snapshot(&q.target, &v.value)
-                        })
+                    validate_resource_url(target, &v.value.details.review.url)
+                        .and_then(|()| crate::pr_ops::qualified_review_snapshot(target, &v.value))
                         .map(|snapshot| Outcome::MergeRequest { snapshot }),
                     v.quota,
                     v.delivery,
@@ -1051,9 +1141,10 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
             })
         }
         RepositoryResourceKind::Issue => {
-            let read = crate::issue_cache::read_managed_issue(
+            let read = crate::issue_cache::read_managed_issue_observed(
                 &c.services.issue_cache,
                 &cache,
+                observer,
                 age,
                 || async {
                     let v = primary
@@ -1067,8 +1158,8 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
             )
             .await;
             read.map(|v| {
-                let value = if v.value.number != q.target.number
-                    || validate_resource_url(&q.target, &v.value.url).is_err()
+                let value = if v.value.number != target.number
+                    || validate_resource_url(target, &v.value.url).is_err()
                 {
                     Err(unavailable())
                 } else {
@@ -1104,12 +1195,13 @@ async fn read_inner(r: &Arc<Request>, lease: &Arc<Lease>, q: &Detail) -> Result<
         response.into_inner().map_err(denied)?,
         failure,
         delivery,
+        None,
     );
     Ok(ReadResult {
         read_lifetime_id: lease.id.clone(),
         scope: lease.scope.clone(),
         revision: lease.revision(),
-        target: q.target.clone(),
+        target: target.clone(),
         outcome,
         quota: Quota {
             reset_at: rate.reset_at.map(|n| n.to_string()),
