@@ -191,14 +191,14 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 435;
+const EXPECTED_TOTAL_METHODS: usize = 437;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+const EXPECTED_ROUTER_METHODS: usize = 380;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -513,6 +513,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   the author projection), never a human row; `agent.respondPermission`
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
+/// - `discussion.*` uses its own human-only store, never the agent transcript.
 /// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
 ///   forge objects — never the agent transcript; `accept-changes.*` and
 ///   `file-tracking.*` drive the worktree / PR flow the same way.
@@ -582,6 +583,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "discussion.list",
+    "discussion.send",
     "drafts.clear",
     "drafts.get",
     "drafts.set",

@@ -82,6 +82,7 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_ops;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -33974,6 +33975,30 @@ impl WorkspaceApi for Services {
     }
 
     // `workspace.members.*` (multiplayer w3) — see `capability`.
+
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        before_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionPage>> {
+        Box::pin(async move {
+            self.discussion_list_op(&workspace_id, before_sequence, limit)
+                .await
+        })
+    }
+
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionMessage>> {
+        Box::pin(async move {
+            self.discussion_send_op(&workspace_id, &message_id, &body)
+                .await
+        })
+    }
 
     fn workspace_members_list(
         &self,

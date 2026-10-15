@@ -11088,3 +11088,6 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         store.write_pool().close().await;
     }
 }
+
+#[path = "discussion_tests.rs"]
+mod discussion;

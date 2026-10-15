@@ -1079,6 +1079,42 @@ async fn dispatch_other(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "discussion.list" => {
+            let id = require_workspace_id(params)?;
+            let before = params
+                .get("beforeSequence")
+                .map(|v| {
+                    v.as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("beforeSequence must be a positive integer"))
+                })
+                .transpose()?;
+            let limit = params
+                .get("limit")
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|n| (1..=100).contains(n))
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+                })
+                .transpose()?
+                .unwrap_or(intent_core::discussion::DISCUSSION_PAGE_DEFAULT);
+            let page = api
+                .discussion_list(id, before, limit)
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&page)
+        }
+        "discussion.send" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let body = require_str_param(params, "body")?;
+            let message = api
+                .discussion_send(id, message_id, body)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(serde_json::json!({"message":message}))
+        }
         // `workspace.members.*` (multiplayer w3): membership roster of one
         // workspace. Member+ may list; add / removal are Owner-only in the
         // service layer (`-32003` for a collaborator, `-32602` for a

@@ -22,6 +22,8 @@ mod common;
 mod demand_note_indexes;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
+#[path = "wss_integration/discussion.rs"]
+mod discussion;
 #[path = "wss_integration/git_commit_removal.rs"]
 mod git_commit_removal;
 #[path = "wss_integration/host_roles.rs"]

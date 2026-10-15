@@ -1328,6 +1328,9 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
+/// - **`workspace_discussion_message`**: keep the immutable author snapshot;
+///   clear the private retry principal so a destination identity collision
+///   cannot consume an imported message as a new send's retry.
 /// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
@@ -1344,6 +1347,12 @@ fn transform_rows(
     for (table, mut objects) in rows {
         match table.as_str() {
             "draft" => continue,
+            "workspace_discussion_message" => {
+                for object in &mut objects {
+                    expect_object(&table, object)?
+                        .insert("principal_id".into(), serde_json::Value::Null);
+                }
+            }
             "interrupted_agent" => {
                 existing_interrupted = objects;
                 continue;
@@ -1679,6 +1688,72 @@ mod tests {
         let row = &find(&outcome, "workspace")[0];
         assert!(row.get("owner_principal_id").is_none());
         assert!(row.get("legacy_author_principal_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn discussion_transfer_does_not_rebind_colliding_human_or_retry_identity() {
+        use crate::tests::{workspace, TempDb};
+        use intent_core::discussion::DiscussionAuthor;
+        use intent_core::{with_caller, Caller, HostRole};
+
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let target_db = TempDb::new();
+        let target = Store::open(&target_db.path).await.unwrap();
+        let mut local = target.get_primary_principal().await.unwrap();
+        local.login = Some("destination-human".into());
+        local.display_name = Some("Destination Human".into());
+        local.avatar_url = Some("https://example.test/destination.png".into());
+        target.upsert_principal(&local).await.unwrap();
+        source.insert_workspace(&workspace(&ws())).await.unwrap();
+        // The source author deliberately collides with a different destination
+        // profile; historic labels must remain a snapshot, never a live lookup.
+        let author = DiscussionAuthor {
+            principal_id: local.id.clone(),
+            login: Some("source-human".into()),
+            display_name: Some("Source Human".into()),
+            avatar_url: Some("https://example.test/source.png".into()),
+        };
+        let (original, _) = source
+            .insert_discussion_message(&ws(), "same-key", "source history", &author)
+            .await
+            .unwrap();
+        let rows = source.transfer_export_rows(&ws()).await.unwrap();
+        validate_row_scope(&rows, &ws()).unwrap();
+        let transformed = transform_rows(rows, &ws(), &root(), "now").unwrap();
+        target
+            .transfer_import_rows(&transformed.rows)
+            .await
+            .unwrap();
+        let service = Services::new(target);
+        let caller = Caller::Wire {
+            principal_id: local.id.clone(),
+            host_role: HostRole::Owner,
+        };
+        let history = with_caller(caller.clone(), service.discussion_list_op(&ws(), None, 50))
+            .await
+            .unwrap();
+        assert_eq!(history.messages, vec![original.clone()]);
+        let next = with_caller(
+            caller.clone(),
+            service.discussion_send_op(&ws(), "same-key", "destination message"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(next.id, original.id);
+        assert_eq!(next.sequence, 2);
+        assert_eq!(next.body, "destination message");
+        assert_eq!(next.author.principal_id, local.id);
+        assert_eq!(next.author.login, local.login);
+        assert_eq!(next.author.display_name, local.display_name);
+        assert_eq!(next.author.avatar_url, local.avatar_url);
+        let retry = with_caller(
+            caller,
+            service.discussion_send_op(&ws(), "same-key", "different retry body"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry, next);
     }
 
     /// Relative / null path values are left untouched by the rewrite.

@@ -5241,6 +5241,36 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Read a bounded human discussion page. Human connections only; member-gated.
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        before_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionPage>> {
+        let _ = (workspace_id, before_sequence, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::discussion_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// Send as the authenticated human. The retry key is scoped to workspace and principal.
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionMessage>> {
+        let _ = (workspace_id, message_id, body);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::discussion_send not implemented".into(),
+            ))
+        })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
