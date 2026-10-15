@@ -337,3 +337,174 @@ hourglass, with additional waiting explained in its tooltip. Waiting is also
 included in accessible status text. The waiting indicator is hidden when the main
 status shows active work, unread updates, a question, a review request, a failure,
 or a blocker.
+
+## Workspace numbers for Micro keys
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
+
+With a supported **Creator Micro 2** or **Codex Micro** connected to Intent,
+**Home → Workspaces** shows colored numbered squares on assigned workspaces in
+both list and board views. Matching smaller squares appear at the left of top
+workspace tabs, including pinned tabs. Numbers **1–6** identify the workspace's
+Micro key assignment. An unassigned workspace has no number.
+
+Right-click a workspace's list row, board card, or top tab and choose **Assign to
+Micro Key**, then a key number. This also works for workspaces without a number;
+the workspace does not need to be selected. Archived, deleted, and Assistant
+workspaces cannot receive Micro assignments.
+An occupied key's menu label names the workspace it will replace. Choose
+**Unassign** to remove the current assignment. Changes are shared across these
+views and saved.
+
+The numbers and assignment actions appear only while Intent's Micro integration
+is connected; a device merely being plugged in or detected is not enough.
+Disconnecting hides them without deleting saved assignments. If they are missing,
+check the device's connection to Intent before trying to change assignments.
+
+## Inspect a failed response and recover
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
+
+In the existing conversation, **Couldn't complete this response** summarizes a
+stopped response. Open **Details** to inspect the technical error, then **Copy
+details** to copy it. **Needs attention** means action is needed; choose **Retry**
+when offered. **Queued** means a message is in the queue, not that a retry is
+scheduled. Inspect that message and use its available controls before sending
+another copy. Active work keeps its normal **Thinking** or activity status; do not
+infer a retry from that status alone. Controls depend on the conversation's state
+and your access.
+
+For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
+
+Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
+Expand that label to inspect the saved errors and timestamps and use **Copy
+details**. These are counts of recorded notices, not total attempts or proof that
+all failures belong to the same request. A historical notice alone does not mean
+the agent is still failing; check the current status and latest response.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
+
+A current blocker warning means an agent reported a problem that prevents work.
+After confirming recovery, the agent can clear its warning while a release or
+scheduled check is still pending. A recorded blocker notice can remain in the
+conversation after the current warning clears.
+
+Follow specific recovery guidance when shown: **Retry with [model]** uses the
+offered available model; **Retry on [provider]** switches away from a provider
+whose usage limit was reached. For sign-in errors, run the displayed CLI login
+command; signing in to the Claude desktop app does not sign in its CLI. For
+**Agent session corrupted**, retry starts a fresh session and carries over the
+conversation history. Do not promise a model or provider switch unless the UI
+offers it; inspect **Settings → Providers** for setup problems.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
+Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies
+its workspace tools automatically and keeps user-installed Pi extensions enabled.
+If Pi works in a terminal but fails in Intent, copy the conversation's failure
+details and check the CLI found by **Providers**. A Windows error saying Pi MCP
+delivery requires a Unix host comes from an older Intent build; changing the
+workspace setup script does not resolve it.
+
+## Restore workspace browser use
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+
+The workspace sidebar warns when its primary browser client is offline, even if
+the workspace has no browser tabs yet. Hover over the warning for recovery help:
+agent browser tabs and tunnels fail until that client reconnects or another
+connected, browser-capable client is set as primary.
+
+To switch, open the workspace in the client you want to use, open the workspace
+sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
+Primary**. This moves agent-owned tabs to that client without preserving page
+state; tabs you opened yourself stay where they are. The action depends on the
+current client's connection, browser capability and your access. A checkmark
+means the saved primary selection matches the confirmed current client; it does
+not guarantee browser availability. The selection updates when the primary
+changes; after reconnecting, wait for the current client and workspace browser
+state to refresh. When the saved selection is known and this client is not
+selected, the action is available once its connection, browser capability and
+your access are ready. Do not promise automatic failover or change the primary
+client without the user's instruction.
+
+## Add context, run a task, and find results
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; sidebar/{AddContextSection,ContextPanel,NotesPanel}.svelte; NoteMetadataBar.svelte (sidebar/ and NoteMetadataBar paths relative to the same workspace component directory); messages/en.json. -->
+
+In the workspace sidebar, open **Context** to find the **Spec** and other notes.
+Use its **Add context** action to create a note. In layouts showing the Notes-panel
+button, its visible label is **Attach more context**; **New note** is the tooltip.
+Notes hold shared context, decisions, and deliverables for that workspace.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
+
+When testing experimental GitLab context suggestions, choose **GL Issues** or
+**GL MRs** in workspace creation or the workspace context picker. Search the
+selected projects; **Use link** accepts an explicit project URL where offered.
+**Refresh** and **Load more** operate on that selection. Unsupported filters and
+partial results remain explicit. Selecting an item attaches its qualified context;
+it does not automatically check out the MR's source branch. Availability depends
+on the current connection, repository access and supported daemon.
+
+When a supported note deletion offers **Undo**, it cancels a pending deletion during
+the displayed grace period (normally 15 seconds). It does not restore an already
+deleted note. If the result is uncertain, check the note’s current status before trying again. If the
+connected backend does not support cancellable deletion, the note is kept.
+
+Open a task note and inspect its status and assigned agent first. Select the
+assigned agent to continue existing work. To start an agent for the task, use the
+play button labeled **Run agent** when available. This creates an agent and sends
+the task's initial message; do not use it to duplicate work already underway.
+It is a task-note action, not an action on the Spec or every ordinary note. Access
+can hide it; explain the observed limitation instead of promising it is always there.
+
+Find results in the agent's conversation and relevant task note; follow the file
+or artifact links the agent supplied. A status label alone is not proof that work
+succeeded. Use live workspace, note, and agent tools for actual IDs, progress, and
+available actions. Never construct links from guessed IDs or claim completion from
+this static guide.
+
+Workspace file links open a file panel. Markdown files open in a read-only preview
+that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+Excel workbooks and other binary files
+without a preview show a binary-file notice; use **Download file** in that panel
+to save the original file on your computer, including from a remote workspace.
+Binary files are not editable in the file panel or Files view. Delete is unavailable
+when Undo cannot preserve the file's contents; the file stays unchanged.
+A missing-file or access error is different: check the path and access rather than
+assuming the file cannot be previewed.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+
+## Daemon lifecycle from the terminal
+
+For a separately installed `intentd` launcher on Windows, macOS, or Linux, use
+`intentd start` to run in the background, `intentd status` to inspect live status,
+`intentd stop` to confirm shutdown (including a supervisor still starting or recovering;
+already stopped succeeds), and `intentd restart` to replace the supervised daemon
+or start it if stopped. These commands act on the
+host where they run; stopping the daemon disconnects its clients.
+
+`start` waits for readiness (60-second default budget); starting a healthy daemon
+again succeeds without restarting it. Startup errors return nonzero and point to
+`<data-dir>/sitter/start.log`. `restart` from stopped uses that same startup path.
+For a running supervisor, restart retains its launch options; Windows waits for
+replacement readiness, while macOS/Linux return after signaling, so check `status`.
+This also works with supervisors launched by services or Windows Scheduled Tasks.
+Background start/restart does not install or enable boot/login services or tasks;
+stop does not disable an existing one.
+
+Use the same `INTENTD_DATA_DIR` and configuration environment for each command.
+`start` accepts serve options (`--mode`, `--insecure` for development only,
+`--resume-all`, `--specialists-dir`); restart takes no launch options. Stop then
+start to change options. `intentd --help` and `intentd start --help` are safe even
+before daemon installation. `serve` stays in the foreground. Direct bare daemon
+builds and the desktop-bundled daemon are distinct from this installed launcher;
+start/restart are launcher commands. Check the installed launcher's help when its
+version differs from this guide; do not infer launcher support from daemon version.
+
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop). -->
