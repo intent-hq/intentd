@@ -281,9 +281,13 @@ test('harness reaps a known child after its launcher has already exited', async 
       if (scenario === 'observer close failure') {
         assert.ok(primaryError, 'The missing close must fail the original cleanup');
         assert.ok(failures.length, 'Repeated cleanup must not waive missing close evidence');
-        assert.match(report, /primaryError/);
-        assert.match(report, /Missing child close|Fixture child force-stop failed/);
-        assert.match(report, /cleanupErrors/);
+        const parsed = JSON.parse(report);
+        // The canonical harness rejects a published observer error before
+        // waiting for missing close evidence or attempting a force-stop.
+        assert.equal(parsed.primaryError.method.text, 'Fixture observer failed');
+        assert.equal(parsed.cleanupErrors[0].method.text, 'Fixture observer failed');
+        assert.equal(parsed.independentChild.close, null);
+        assert.match(parsed.independentChild.observerError.text, /injected observer close publication failure/);
         assert.match(report, /observer close publication failed/);
         assert.ok(!report.includes(value));
         auditText(report);

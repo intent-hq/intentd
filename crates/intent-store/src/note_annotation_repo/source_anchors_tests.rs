@@ -197,7 +197,7 @@ async fn current_writer_selects_only_scoped_non_orphan_roots_and_preserves_ready
 }
 
 #[tokio::test]
-async fn empty_roots_require_current_source_index_and_retirement_blocks_ready_noop() {
+async fn pending_source_defers_empty_anchor_repair_and_retirement_blocks_ready_noop() {
     let (_dir, store, ws, note) = fixture("large source with no roots").await;
     let mut tx = store
         .write_pool()
@@ -213,10 +213,14 @@ async fn empty_roots_require_current_source_index_and_retirement_blocks_ready_no
         .execute(&mut *tx)
         .await
         .unwrap();
-    assert!(matches!(
-        rebuild_note_anchors(&mut tx, &ws, &note, None).await,
-        Err(Error::NotePage(_))
-    ));
+    sqlx::query("UPDATE note_annotation_head SET anchors_rev=-1 WHERE workspace_id='owner'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    rebuild_note_anchors(&mut tx, &ws, &note, None)
+        .await
+        .unwrap();
+    assert!(!head(&mut tx, &ws, &note).await.unwrap().1.anchors_ready);
     tx.rollback().await.unwrap();
     let mut tx = store
         .write_pool()

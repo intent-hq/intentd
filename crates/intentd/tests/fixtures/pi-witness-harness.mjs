@@ -31,16 +31,41 @@ function processState(pid) {
   try { process.kill(pid, 0); return 'alive'; }
   catch (error) { return error.code === 'ESRCH' ? 'exited' : error.code ?? error.message; }
 }
+function assertObserverHealthy(record) {
+  assert.ok(!record.observerError, failureReport('Fixture observer failed', record.observerError, [record]));
+}
+export function assertWitnessesClosed(records) {
+  for (const record of records) {
+    assertObserverHealthy(record);
+    assert.ok(record.close, failureReport('Missing child close after harness cleanup', null, [record]));
+  }
+  return records;
+}
 export async function stopWitnesses(directory) {
   const records = readWitnesses(directory);
-  for (const record of records) {
-    if (record.close || !record.pid) continue;
+  for (let record of records) {
     const file = join(directory, record.invocationId + '.json');
+    const refresh = () => {
+      const current = readWitnesses(directory).find(child => child.invocationId === record.invocationId);
+      assert.ok(current, 'Missing registered child evidence');
+      assertObserverHealthy(current);
+      return current;
+    };
+    // Registration precedes spawn. Never skip an owned invocation while its
+    // child PID is still being published, or when its observer failed to write.
+    assertObserverHealthy(record);
+    const startupDeadline = Date.now() + 3000;
+    while (!record.pid && !record.close && Date.now() < startupDeadline) {
+      await delay(20);
+      record = refresh();
+    }
+    if (record.close) continue;
+    assert.ok(record.pid, failureReport('Missing child pid after observer registration', null, [record]));
     writeFileSync(file + '.stop', 'harness cleanup');
     try { process.kill(record.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
     const deadline = Date.now() + 3000;
-    while (Date.now() < deadline && !JSON.parse(readFileSync(file, 'utf8')).close) await delay(20);
-    if (!JSON.parse(readFileSync(file, 'utf8')).close) {
+    while (Date.now() < deadline && !refresh().close) await delay(20);
+    if (!refresh().close) {
       if (process.platform === 'win32') {
         const run = spawnSync('taskkill.exe', ['/PID', String(record.pid), '/T', '/F'], { timeout: 3000 });
         assert.equal(run.status, 0, failureReport('Fixture child force-stop failed', {
@@ -53,9 +78,9 @@ export async function stopWitnesses(directory) {
         try { process.kill(record.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
       }
       const forcedDeadline = Date.now() + 3000;
-      while (Date.now() < forcedDeadline && !JSON.parse(readFileSync(file, 'utf8')).close) await delay(20);
+      while (Date.now() < forcedDeadline && !refresh().close) await delay(20);
     }
-    assert.ok(JSON.parse(readFileSync(file, 'utf8')).close, 'Missing child close after harness cleanup');
+    assertWitnessesClosed([refresh()]);
   }
-  return readWitnesses(directory);
+  return assertWitnessesClosed(readWitnesses(directory));
 }

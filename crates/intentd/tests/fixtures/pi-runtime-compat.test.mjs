@@ -18,8 +18,9 @@ import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertCleanupComplete, assertNoUnexpectedStreamErrors, finishCleanup } from './pi-session-cleanup.mjs';
+import { stopWindowsProcessTree } from './pi-windows-shutdown.mjs';
 import diagnostics from './pi-diagnostics.cjs';
-import { readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
+import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 const { Capture, failureReport, publishEvidence, summarizeStreamErrors } = diagnostics;
 const observer = fileURLToPath(new URL('./pi-startup-witness.cjs', import.meta.url));
 
@@ -243,10 +244,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
             let witnessError;
             try { record.witnesses = await stopWitnesses(directory); } catch (error) { witnessError = error; }
             if (windows) {
-              if (child.exitCode === null) {
-                const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 20_000 });
-                assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
-              }
+              await stopWindowsProcessTree(child, closed, { timeoutMs: 20_000 });
             } else {
               try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
             }
@@ -254,6 +252,7 @@ runtimes.push(test(`published adapter with real minimum Pi: lifecycle, models, t
             record.shutdown = { exitCode: child.exitCode, signalCode: child.signalCode };
             record.witnesses = readWitnesses(directory);
             if (witnessError) throw witnessError;
+            assertWitnessesClosed(record.witnesses);
           })();
         },
       };

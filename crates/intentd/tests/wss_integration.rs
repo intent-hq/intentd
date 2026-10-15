@@ -18,6 +18,8 @@ mod annotation_writer_anchors;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/demand_note_indexes.rs"]
+mod demand_note_indexes;
 #[path = "wss_integration/desktop_control.rs"]
 mod desktop_control;
 #[path = "wss_integration/discovery_context.rs"]

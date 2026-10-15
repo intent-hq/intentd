@@ -28,6 +28,9 @@ process.on('uncaughtExceptionMonitor', error => {
     startedAt: record.startedAt, observerPid: process.pid, pid: record.pid, observerError });
   try { writeFileSync(file + '.observer-error', failure, { flag: 'wx' }); } catch {}
 });
+// Register ownership before the child can respond over inherited stdout. A
+// successful ACP reply may otherwise let cleanup overtake our first publication.
+publish(false);
 const child = spawn(process.execPath, [process.env.PI_TEST_CHILD_ENTRY, ...process.argv.slice(2)], {
   stdio: ['inherit', 'inherit', 'pipe'],
 });

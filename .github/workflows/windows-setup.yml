@@ -25,7 +25,7 @@ concurrency:
 jobs:
   headless-setup:
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: gh-windows-16x
+    runs-on: depot-windows-2022-16
     timeout-minutes: 45
     defaults:
       run:
@@ -53,9 +53,11 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: gh-build-x86_64-pc-windows-msvc
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
       - name: Test cursor parser
         run: |
           mkdir -p setup-headless-evidence

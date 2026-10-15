@@ -70,9 +70,27 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
-<!-- Source: packages/intentd/crates/intent-services/src/mcp_servers.rs. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
-For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. When MCP is enabled, saving edits to an enabled server reconnects the daemon using the saved settings, including a changed URL. Disabled servers stay disabled; an unreachable URL shows a connection error.
+For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. Users can also ask the Assistant to set up or update a server. Use `ws.app.mcp` to read existing configurations, avoid duplicates, and apply the requested change app-wide. These configuration tools are available only in Assistant chat; ordinary workspace agents retain access to enabled servers' tools.
+
+Check the provider's official setup instructions before choosing a URL or local command. Creation connects by default; `enabled: false` saves a disabled server. For edits, read the full configuration first and preserve redacted credential placeholders; omitted keys are removed. When MCP is enabled, saving edits to an enabled server reconnects with the saved settings. Preserve its enabled value unless asked to change it. Check the returned status: saved does not mean connected. For `auth_required`, direct the user to the existing sign-in flow in **Connections → MCP servers**; keep tokens out of chat. Disabled MCP and connection errors must be reported as such.
+
+A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
+
+## Manage Assistant chats
+
+Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
+Use `ws.app.chats.list` to identify it and read only the relevant conversation slice.
+Ask which chat they mean if several match. Apply a rename or deletion only when
+requested. These tools are exclusive to Assistant chat and cannot target workspace
+agents. A chat cannot delete itself through these tools.
+
+Deletion uses the app's 15-second undo window. Report the deletion as scheduled;
+`ws.app.chats.cancelDelete` can undo it before the returned deadline. It cannot
+recover a chat after deletion has completed.
+
+<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/chats.rs; packages/cloudlands-fe/src/lib/components/chat/assistant-thread-rename.svelte.ts; packages/cloudlands-fe/src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; packages/cloudlands-fe/src/features/agent/utils/pending-agent-deletions.ts. -->
 
 ## Choose a model or change agent behavior
 
@@ -137,6 +155,15 @@ agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+
+Use **Next Workspace Tab** (default **Ctrl+Tab**) or **Previous Workspace Tab**
+(default **Ctrl+Shift+Tab**) to cycle through open workspace tabs in displayed
+order. From **Home**, next opens the first workspace tab and previous opens the
+last, regardless of which workspace was selected before Home. With no open
+workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
+and shortcuts → Keyboard shortcuts**.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
 When an agent monitors a GitHub pull request, its conversation shows the monitored
@@ -186,6 +213,14 @@ an agent is a particular conversation doing work.
 
 When answering agent questions above the composer, paste images into **Or type your own answer…** to attach removable previews and send them with your answers, with or without text.
 
+In an empty composer, press **Up Arrow** to recall a previous prompt. Recalled
+prompts use the visible message text, without hidden sender or delivery metadata.
+At the start of the text, **Up Arrow** moves to an older prompt; at the end,
+**Down Arrow** moves forward and restores your draft. If an editable queued
+message is present, **Up Arrow** in an empty composer edits that message first.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/ChatPanel.svelte; src/lib/components/chat/input/TipTapEditor.svelte; src/lib/utils/user-message-presentation.ts. -->
+
 On desktop, recent conversation messages appear progressively, newest first, while
 older messages in the initial window load. The conversation stays bottom-aligned
 unless you scroll away; older-history loading becomes available when that initial
@@ -209,6 +244,25 @@ files with their directory paths. Search by filename or path, then click a file 
 expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
+
+## Home Workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+
+In **Home → Workspaces**, open **View options → Group by** in either list or board
+view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
+groups. In list view, **Status** groups workspace statuses in this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
+**Done & idle** (idle or complete).
+**Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
+
+The grouping choice is remembered with Home's settings for the current signed-in
+user and connected backend. **Activity** remains the default; existing saved
+grouping choices keep their behavior.
 
 ## Workspace numbers for Micro keys
 
@@ -235,7 +289,7 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
 In the existing conversation, **Couldn't complete this response** summarizes a
 stopped response. Open **Details** to inspect the technical error, then **Copy
@@ -245,6 +299,10 @@ scheduled. Inspect that message and use its available controls before sending
 another copy. Active work keeps its normal **Thinking** or activity status; do not
 infer a retry from that status alone. Controls depend on the conversation's state
 and your access.
+
+For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
 
 Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
 Expand that label to inspect the saved errors and timestamps and use **Copy
@@ -278,7 +336,7 @@ workspace setup script does not resolve it.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/store/renderer/slices/browser-clients/browser-clients-selectors.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar warns when its primary browser client is offline, even if
 the workspace has no browser tabs yet. Hover over the warning for recovery help:
@@ -289,11 +347,14 @@ To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. The action depends on the
-current client's browser capability and your access. After reconnecting, wait
-for the current client and workspace browser state to refresh. A checked action
-means this client is already explicitly primary; an unavailable action can also
-mean the connection, browser capability, or access is not ready. Do not promise
-automatic failover or change the primary client without the user's instruction.
+current client's connection, browser capability and your access. A checkmark
+means the saved primary selection matches the confirmed current client; it does
+not guarantee browser availability. The selection updates when the primary
+changes; after reconnecting, wait for the current client and workspace browser
+state to refresh. When the saved selection is known and this client is not
+selected, the action is available once its connection, browser capability and
+your access are ready. Do not promise automatic failover or change the primary
+client without the user's instruction.
 
 ## Add context, run a task, and find results
 
@@ -321,7 +382,10 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
-Workspace file links open a file panel. Excel workbooks and other binary files
+Workspace file links open a file panel. Markdown files open in a read-only preview
+that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
 Binary files are not editable in the file panel or Files view. Delete is unavailable
@@ -329,7 +393,7 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
 
 ## Daemon lifecycle from the terminal
 
