@@ -754,6 +754,26 @@ class NativeRoutingTests(unittest.TestCase):
             ])
             self.assertEqual(len(native.check_commands(platform, 'pull_request', 'native-triple', '/target')), 1)
 
+    def test_services_proofs_share_the_required_single_native_producer(self):
+        # Upstream isolated service compilation to avoid cold native timeouts.
+        # Our archive producer stages that distinct graph once; these required
+        # runtime proofs consume it without a second compiling job.
+        self.assertNotIn('macos-services-runtime', self.workflow['jobs'])
+        job = self.workflow['jobs']['daemon-lifecycle']
+        self.assertEqual(job['timeout-minutes'], 60)
+        for name in ('Codex focused diagnostics (macOS runtime)',
+                     'Retained workspace CoW fixtures (macOS runtime)'):
+            step = next(s for s in job['steps'] if s.get('name') == name)
+            self.assertNotIn('cargo test', step['run'])
+            self.assertIn('ci-native-artifacts.py libtest', step['run'])
+            self.assertFalse(step.get('continue-on-error'))
+            self.assertFalse(any(s.get('name') == name for s in self.workflow['jobs']['build']['steps']))
+        for result in ('skipped', 'failure', 'cancelled'):
+            workflow = copy.deepcopy(self.workflow)
+            gate = next(s for s in workflow['jobs']['gate']['steps'] if s.get('name') == 'Check results')
+            gate['run'] = gate['run'].replace('${{ needs.daemon-lifecycle.result }}', 'success')
+            self.assertIn('merge_group: daemon-lifecycle=' + result, gate_errors(workflow))
+
     def test_mutation_cannot_accept_skipped_queue_build(self):
         workflow = copy.deepcopy(self.workflow)
         step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")

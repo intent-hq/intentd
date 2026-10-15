@@ -422,13 +422,58 @@ fn observation_reply(r: &Request) -> Reply {
     }
     if r.path.ends_with("/merge_requests/7") {
         let mut v = mr();
-        v["head_pipeline"] = json!({"id":19,"project_id":91,"sha":"synthetic","status":"running"});
+        v["head_pipeline"] = json!({"id":19,"project_id":91,"sha":"remote-A","status":"running"});
         return reply(200, v);
     }
     let mut p = project();
     p["only_allow_merge_if_pipeline_succeeds"] = json!(true);
     p["only_allow_merge_if_all_discussions_are_resolved"] = json!(true);
     reply(200, p)
+}
+
+#[tokio::test]
+async fn observation_never_attributes_an_old_pipeline_to_the_current_mr_head() {
+    for pipeline_sha in [Some("old-head"), Some("merged-result"), None, Some("")] {
+        let fixture = Fixture::new(move |request| {
+            if request.path.ends_with("/merge_requests/7") {
+                let mut body = mr();
+                body["head_pipeline"] =
+                    json!({"id":19,"project_id":73,"sha":pipeline_sha,"status":"success"});
+                return reply(200, body);
+            }
+            if request.path.contains("/pipelines/") {
+                return reply(200, json!([]));
+            }
+            observation_reply(request)
+        })
+        .await;
+        let observed = fixture.provider().observe_review(&repo(), 7).await.unwrap();
+        assert!(
+            !observed.signals.checks_known,
+            "pipeline {pipeline_sha:?} cannot establish current-head success"
+        );
+        assert_eq!(observed.availability.checks, ProviderAvailability::Unknown);
+        assert_ne!(
+            observed.signals.checks_head_sha.as_deref(),
+            Some("remote-A")
+        );
+        assert_eq!(
+            observed.signals.checks_head_sha.as_deref(),
+            pipeline_sha.filter(|sha| !sha.is_empty())
+        );
+        assert!(
+            !fixture
+                .provider()
+                .mergeability(&repo(), 7)
+                .await
+                .unwrap()
+                .required_checks_passed
+        );
+        assert!(fixture
+            .requests()
+            .iter()
+            .all(|request| !request.path.contains("/pipelines/")));
+    }
 }
 
 #[tokio::test]
@@ -863,7 +908,7 @@ async fn ci_policy_distinguishes_skipped_optional_and_missing_pipelines() {
             if r.path.ends_with("/merge_requests/7") {
                 let mut v = mr();
                 if let Some(status) = pipeline_status {
-                    v["head_pipeline"] = json!({"id":19,"status":status});
+                    v["head_pipeline"] = json!({"id":19,"sha":"remote-A","status":status});
                 }
                 return reply(200, v);
             }

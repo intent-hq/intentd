@@ -534,6 +534,7 @@ impl Error {
                 _ => -32603,
             },
 
+            Error::NotePage(crate::note_page::NotePageError::Preparing | crate::note_page::NotePageError::ResourceLimit) => -32006,
             Error::NotePage(crate::note_page::NotePageError::Stale)
             | Error::Conflict { .. } => -32005,
             Error::IdentityMismatch

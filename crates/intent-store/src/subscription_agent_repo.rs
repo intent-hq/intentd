@@ -20,7 +20,7 @@ pub struct SubscriptionAgentProjection {
     pub messages: SessionMessageProjection,
     /// Active hook identity and timing only.
     pub waiting_on_hooks: Vec<Value>,
-    /// Active PR monitor identity and title only.
+    /// Proven legacy PR monitor identity and title only.
     pub waiting_on_pr_monitors: Vec<Value>,
 }
 
@@ -45,8 +45,9 @@ fn hooks_sql(placeholders: &str) -> String {
 }
 
 fn monitors_sql(placeholders: &str) -> String {
+    let targets = crate::pr_monitor_repo::TARGET_COLUMNS;
     format!(
-        "SELECT agent_id, monitor_id, repo_owner, repo_name, pr_number, \
+        "SELECT agent_id, monitor_id, repo_owner, repo_name, pr_number, {targets}, \
          CASE WHEN json_valid(last_snapshot) THEN \
          CASE WHEN json_type(last_snapshot, '$.title') = 'text' \
          THEN json_extract(last_snapshot, '$.title') END END AS title \
@@ -139,6 +140,9 @@ impl Store {
             for row in query.fetch_all(self.read_pool()).await.map_err(|e| {
                 Error::Internal(format!("subscription PR monitor projection failed: {e}"))
             })? {
+                if !crate::pr_monitor_repo::legacy_monitor_summary(&row)? {
+                    continue;
+                }
                 if let Some(agent) = batch.get_mut(&row.get::<String, _>("agent_id")) {
                     let mut value = json!({
                         "monitorId": row.get::<String, _>("monitor_id"),

@@ -54,8 +54,58 @@ def test_steps(workflow):
                 yield name, job, step
 
 
-def violations(workflow, policy):
+def coverage_budget_violations(workflow):
+    """Keep the combined instrumented lane finite, with post-action headroom."""
+    job = workflow["jobs"]["coverage-changed"]
+    limits = {
+        "Run changed tests under llvm-cov": 20,
+        "Run callback fixture composition under llvm-cov": 8,
+    }
     errors = []
+    total = job.get("timeout-minutes")
+    if type(total) is not int or total != sum(limits.values()) + 2:
+        errors.append("coverage-changed must reserve 2m outside its bounded test phases")
+    for name, limit in limits.items():
+        steps = [step for step in job["steps"] if step.get("name") == name]
+        if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != limit:
+            errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
+    combined = workflow["jobs"]["coverage-all"]
+    steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 30:
+        errors.append("coverage-all must reserve 2m outside its 28m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 28:
+        errors.append("coverage-all must retain its 28m compile/test/report bound")
+    return errors
+
+
+def profile_pool_violations(workflow):
+    errors = []
+    producer = workflow['jobs']['check']
+    proofs = [s for s in producer['steps'] if 'scripts/test-coverage-profile-pool.py' in s.get('run', '')]
+    if len(proofs) != 1:
+        errors.append('check: require exactly one profile pooling proof')
+    else:
+        proof = proofs[0]
+        body = proof['run']
+        if (proof.get('if') is not None or proof.get('continue-on-error')
+                or 'LLVM_PROFILE_FILE_NAME="intent-%8m.profraw"' not in body
+                or 'ci-linux-artifacts.py produce' not in body
+                or body.index('test-coverage-profile-pool.py') > body.index('ci-linux-artifacts.py produce')):
+            errors.append('check: require fresh profile proof before producing instrumented archives')
+    for job_id in ('coverage-all', 'coverage-changed'):
+        job = workflow['jobs'][job_id]
+        if (job.get('env', {}).get('LLVM_PROFILE_FILE_NAME') != 'intent-%8m.profraw'
+                or 'LLVM_PROFILE_FILE' in job.get('env', {})):
+            errors.append(f'{job_id}: retain the bounded profile pool')
+        for step in job['steps']:
+            if ('test-coverage-profile-pool.py' in step.get('run', '')
+                    or any(key in step.get('env', {}) for key in ('LLVM_PROFILE_FILE_NAME', 'LLVM_PROFILE_FILE'))):
+                errors.append(f'{job_id}: no consumer compiler proof or profile override')
+    return errors
+
+
+def violations(workflow, policy):
+    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -212,6 +262,68 @@ class CiPolicyTests(unittest.TestCase):
             self.assertEqual(consumer['timeout-minutes'], 30)
             self.assertFalse(any('test-coverage-profile-pool.py' in s.get('run', '') for s in consumer['steps']))
         self.assertEqual(self.workflow['jobs']['coverage-all']['env']['LLVM_PROFILE_FILE_NAME'], 'intent-%8m.profraw')
+
+    def test_coverage_budget_rejects_lost_bounds_and_cleanup_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for name in (None, "Run changed tests under llvm-cov",
+                     "Run callback fixture composition under llvm-cov"):
+            for limit in (None, 0, True, 60):
+                with self.subTest(phase=name, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-changed"]
+                    target = job if name is None else next(s for s in job["steps"] if s.get("name") == name)
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_combined_coverage_budget_rejects_lost_bounds_and_report_margin(self):
+        self.assertEqual(coverage_budget_violations(self.workflow), [])
+        for phase in (False, True):
+            for limit in (None, 0, True, 45, 60):
+                with self.subTest(phase=phase, limit=limit):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"]["coverage-all"]
+                    target = next(s for s in job["steps"] if s.get("name") == "Run combined coverage") if phase else job
+                    if limit is None:
+                        target.pop("timeout-minutes")
+                    else:
+                        target["timeout-minutes"] = limit
+                    self.assertTrue(coverage_budget_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_profile_pool_mutations_fail_closed(self):
+        self.assertEqual(profile_pool_violations(self.workflow), [])
+        for name in ('coverage-all', 'coverage-changed'):
+            for mutation in ('missing', 'per-process', 'direct', 'step-override'):
+                with self.subTest(job=name, mutation=mutation):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow['jobs'][name]
+                    if mutation == 'missing':
+                        job['env'].pop('LLVM_PROFILE_FILE_NAME')
+                    elif mutation == 'per-process':
+                        job['env']['LLVM_PROFILE_FILE_NAME'] = 'intent-%p-%32m.profraw'
+                    elif mutation == 'direct':
+                        job['env']['LLVM_PROFILE_FILE'] = 'intent-%p.profraw'
+                    else:
+                        job['steps'][-1]['env'] = {'LLVM_PROFILE_FILE_NAME': 'intent-%p.profraw'}
+                    self.assertTrue(profile_pool_violations(workflow))
+        for mutation in ('missing', 'skipped', 'ignored', 'late'):
+            with self.subTest(producer=mutation):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow['jobs']['check']['steps']
+                proof = next(s for s in steps if 'scripts/test-coverage-profile-pool.py' in s.get('run', ''))
+                if mutation == 'missing':
+                    steps.remove(proof)
+                elif mutation == 'skipped':
+                    proof['if'] = False
+                elif mutation == 'ignored':
+                    proof['continue-on-error'] = True
+                else:
+                    proof['run'] = 'python3 scripts/ci-linux-artifacts.py produce\n' + proof['run']
+                self.assertTrue(profile_pool_violations(workflow))
 
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
@@ -456,7 +568,7 @@ class CallbackDiscoveryTests(unittest.TestCase):
         self.assertEqual(self.job["env"]["CALLBACK_FIXTURE_TESTS"].split(), [
             "callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result",
             "callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers",
-            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_1_reaches_original_guidance_boundary",
+            "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_actual_created_3_2_reaches_original_guidance_boundary",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture",
             "agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate",

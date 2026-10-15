@@ -50,19 +50,20 @@ class LinuxTests(unittest.TestCase):
                 capacity.assert_called_once()
                 api.assert_not_called(); restore.assert_not_called(); build.assert_not_called()
 
-    def test_full_scope_uses_upstream_bounded_profile_pool_in_fresh_extraction(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'requests.json').write_text(json.dumps({'coverage-all': {}}))
-            item = {'target': str(root / 'restored/coverage-all/target'), 'extract_seconds': 0}
-            with mock.patch.object(linux, 'prepare', return_value={'coverage-all': item}), \
-                 mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
-                 mock.patch.object(linux, 'compiler_exclusion', return_value=None), \
-                 mock.patch.object(linux.archives, 'run_nextest', return_value=100) as run:
-                with self.assertRaises(subprocess.CalledProcessError):
-                    linux.run_coverage(ROOT, root, 'coverage-all')
-                pattern = run.call_args.kwargs['env']['LLVM_PROFILE_FILE']
-                self.assertEqual(pattern, str(root / 'restored/coverage-all/intent-%8m.profraw'))
+    def test_full_and_changed_scopes_use_bounded_profile_pool_in_fresh_extractions(self):
+        for scope, name in (('coverage-all', 'coverage-all'), ('changed', 'changed-0')):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'requests.json').write_text(json.dumps({name: {}}))
+                item = {'target': str(root / 'restored' / name / 'target'), 'extract_seconds': 0}
+                with mock.patch.object(linux, 'prepare', return_value={name: item}), \
+                     mock.patch.object(linux.coverage, 'report_environment', return_value={}), \
+                     mock.patch.object(linux, 'compiler_exclusion', return_value=None), \
+                     mock.patch.object(linux.archives, 'run_nextest', return_value=100) as run:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        linux.run_coverage(ROOT, root, scope)
+                    pattern = run.call_args.kwargs['env']['LLVM_PROFILE_FILE']
+                    self.assertEqual(pattern, str(root / 'restored' / name / 'intent-%8m.profraw'))
 
     def test_real_source_lint_root_uses_relocated_checkout_not_producer_decoy(self):
         with tempfile.TemporaryDirectory(prefix='intent-lint-relocation-') as tmp:

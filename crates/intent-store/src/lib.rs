@@ -41,6 +41,8 @@ mod metrics_repo;
 mod node_repo;
 pub mod note_annotation_repo;
 pub mod note_delete_repo;
+mod note_index_budget;
+mod note_index_job;
 mod note_line_attribution_repo;
 mod note_page_html;
 mod note_page_index;
@@ -65,6 +67,8 @@ mod sharing_projection;
 mod stop_redelivery_repo;
 mod subscription_agent_repo;
 mod task_agent_link_repo;
+mod task_event_repo;
+pub use task_event_repo::TaskEventBaselines;
 mod tracked_changes_repo;
 mod transfer_authorship;
 mod transfer_repo;
@@ -92,8 +96,10 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage, SessionMessageProjection,
-    UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
+    PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
+    ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -114,7 +120,7 @@ pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
     pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
     MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
-    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
+    PreparedMonitorWrite, QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
@@ -380,6 +386,10 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    task_event_baselines: std::sync::Arc<TaskEventBaselines>,
+    task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
+    note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -423,29 +433,18 @@ impl Store {
         })?;
         let write_pool = StorePool::new(write_pool, owner.is_some());
         let read_pool = StorePool::new(read_pool, owner.is_some());
-        // Keep the derived-index startup future off enclosing callers' stacks,
-        // and leave the read pool cold until the first actual read.
-        let note_pages = std::sync::Arc::new(
-            Box::pin(async {
-                let mut index_conn =
-                    note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
-                let indexed = async {
-                    note_page_index::retire_changed_profiles(&mut index_conn).await?;
-                    note_page_index::rebuild_pending(&mut index_conn).await?;
-                    note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
-                }
-                .await;
-                index_conn
-                    .finish(indexed, "note index backfill commit")
-                    .await?;
-                note_page_repo::Runtime::open(&write_pool).await
-            })
-            .await?,
-        );
-        lifecycle.settle();
+        // Profiles/readiness are checked only for a demanded note. Opening the
+        // database must never hydrate or convert the stale note backlog.
+        let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
+        let note_index_jobs = note_index_job::domain_for(db_path)?;
+        lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            task_event_baselines: std::sync::Arc::default(),
+            task_events_enabled: std::sync::Arc::default(),
+            note_index_jobs,
+            note_index_owner: std::sync::Arc::default(),
             write_pool,
             read_pool,
             _daemon_owner: owner,
@@ -690,6 +689,7 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        self.note_index_jobs.close(&self.note_index_owner).await;
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).

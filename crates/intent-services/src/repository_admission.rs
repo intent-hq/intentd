@@ -580,6 +580,12 @@ impl RepositoryRetirement {
         self.link_optional(child)
     }
 
+    /// Atomic retirement marker for a linked optional leaf. Callers must hold
+    /// that leaf's fence; every listed parent must join it before mutation.
+    pub(crate) fn native_closed(&self) -> bool {
+        self.is_closed()
+    }
+
     pub(crate) fn native_dispatch<T>(
         &self,
         action: impl FnOnce() -> AdmissionResult<T>,

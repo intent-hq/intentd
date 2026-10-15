@@ -1594,3 +1594,416 @@ async fn replaced_handle_late_metadata_completion_preserves_new_physical_owner()
 async fn same_handle_obsolete_metadata_completion_cannot_install_before_new_owner() {
     metadata_completion_ordering(false, false).await;
 }
+
+#[tokio::test]
+async fn manager_shutdown_waits_for_original_native_retirement_response() {
+    manager_native_shutdown_case(true, false, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_preserves_negative_original_native_outcome() {
+    manager_native_shutdown_case(false, false, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_cancelled_waiter_preserves_original_native_join() {
+    manager_native_shutdown_case(true, true, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_preserves_lost_original_native_response() {
+    manager_native_shutdown_case(false, false, true).await;
+}
+
+async fn manager_native_shutdown_case(positive: bool, cancel: bool, lost: bool) {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (handle, mut reader, mut writer) = handle(origin.clone());
+    let connection = handle.execution.connection().unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut resume = Some(resume);
+        let mut context = Value::Null;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"_meta":{"reviewMonitoring":1,"intentCallbackRegistration":{"version":1,"method":"_intent/session/register_mcp_callback"}}})
+                }
+                "session/new" => {
+                    context = request["params"]["_meta"]["reviewMonitoringContext"].clone();
+                    json!({"sessionId":"shutdown-native-original","_meta":{"reviewMonitoring":1,"reviewMonitoringContext":context,"intentCallbackRegistration":{"version":1,"queryReceipt":"11111111-1111-4111-8111-111111111111"}}})
+                }
+                "_intent/session/retire_review_context" => {
+                    assert_eq!(request["params"]["sessionId"], "shutdown-native-original");
+                    assert_eq!(request["params"]["loadAttemptId"], context["loadAttemptId"]);
+                    entered.take().unwrap().send(()).unwrap();
+                    resume.take().unwrap().await.unwrap();
+                    if lost {
+                        break;
+                    }
+                    json!({"retired":positive})
+                }
+                other => panic!("unexpected shutdown request {other}"),
+            };
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let handshake = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap();
+    let callbacks = handshake.callbacks.unwrap();
+    let (creation, attempt) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    let opened = f
+        .manager
+        .services
+        .create_repository_acp_session(
+            (&connection, Some(&callbacks)),
+            &f.row.id,
+            f.dir.path().to_str().unwrap(),
+            vec![],
+            creation,
+            false,
+        )
+        .await
+        .unwrap();
+    let physical = opened.owner.unwrap();
+    let native = physical.native_allocation_for_test();
+    assert!(origin.install(attempt, physical));
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let manager = f.manager.clone();
+    let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(native.is_retired());
+    assert!(!native.is_joined());
+    if cancel {
+        shutdown.abort();
+        assert!(shutdown.await.unwrap_err().is_cancelled());
+        assert!(f.manager.handles.lock().unwrap().contains_key(&f.row.id));
+        let manager = f.manager.clone();
+        shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    }
+    // A bounded held-peer window observes the actual shutdown future, not just
+    // the allocation's independently driven retirement task.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
+    let returned_early = early.is_ok();
+    release.send(()).unwrap();
+    let result = match early {
+        Ok(result) => result.unwrap(),
+        Err(_) => shutdown.await.unwrap(),
+    };
+    assert_eq!(result.is_ok(), positive);
+    f.manager.services.store_tasks.drain_finite().await;
+    assert_eq!(native.is_joined(), positive);
+    assert_eq!(
+        f.manager.handles.lock().unwrap().contains_key(&f.row.id),
+        !positive,
+        "negative native completion must not destroy the still-owned transport"
+    );
+    server.abort();
+    assert!(
+        !returned_early,
+        "manager reported shutdown before original native retirement joined"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn manager_shutdown_keeps_real_stdio_child_until_original_native_join() {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (mut handle, _, _) = handle(origin.clone());
+    let entered = f.dir.path().join("retire-entered");
+    let release = f.dir.path().join("retire-release");
+    // Controlled real stdio process: this establishes transport/child lifetime,
+    // not the separately pinned native consumer's containment or model semantics.
+    let script = r"
+import json,sys,time,pathlib
+entered,release=map(pathlib.Path,sys.argv[1:])
+context=None
+for line in sys.stdin:
+ r=json.loads(line);m=r['method'];p=r.get('params',{})
+ if m=='initialize':
+  result={'protocolVersion':1,'agentCapabilities':{},'authMethods':[],'_meta':{'reviewMonitoring':1,'intentCallbackRegistration':{'version':1,'method':'_intent/session/register_mcp_callback'}}}
+ elif m=='session/new':
+  context=p['_meta']['reviewMonitoringContext']
+  result={'sessionId':'real-shutdown-native','_meta':{'reviewMonitoring':1,'reviewMonitoringContext':context,'intentCallbackRegistration':{'version':1,'queryReceipt':'11111111-1111-4111-8111-111111111111'}}}
+ elif m=='_intent/session/retire_review_context':
+  assert p=={'sessionId':'real-shutdown-native','loadAttemptId':context['loadAttemptId']}
+  entered.write_text('original retirement entered')
+  while not release.exists(): time.sleep(0.005)
+  result={'retired':True}
+ else: raise AssertionError(m)
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+";
+    let mut child = tokio::process::Command::new("python3")
+        .args(["-u", "-c", script])
+        .arg(&entered)
+        .arg(&release)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let connection = Arc::new(Connection::new(
+        child.stdin.take().unwrap(),
+        child.stdout.take().unwrap(),
+        None,
+        ConnectionHooks::default(),
+    ));
+    let (_, receiver) = mpsc::unbounded_channel::<IncomingNotification>();
+    handle.execution =
+        crate::agent_manager::RuntimeHandle::local(crate::agent_manager::runtime::LocalResources {
+            connection: connection.clone(),
+            notifications: Arc::new(TokioMutex::new(receiver)),
+            serve_task: tokio::spawn(std::future::pending()),
+            child: Some(child),
+            child_pid: Some(pid),
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            npx_launch_dir: None,
+            preparation_guard: None,
+            cleanup_lease: None,
+            cleanup_services: None,
+        });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let handshake = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap();
+    let callbacks = handshake.callbacks.unwrap();
+    let (creation, attempt) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    let opened = f
+        .manager
+        .services
+        .create_repository_acp_session(
+            (&connection, Some(&callbacks)),
+            &f.row.id,
+            f.dir.path().to_str().unwrap(),
+            vec![],
+            creation,
+            false,
+        )
+        .await
+        .unwrap();
+    let physical = opened.owner.unwrap();
+    let native = physical.native_allocation_for_test();
+    assert!(origin.install(attempt, physical));
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let manager = f.manager.clone();
+    let shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(native.is_retired());
+    assert!(!native.is_joined());
+    assert!(!shutdown.is_finished());
+    assert!(connection.is_alive());
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "original child was killed before retirement response"
+    );
+    std::fs::write(release, "allow original response").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(native.is_joined());
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "original child was not joined after positive retirement"
+    );
+    f.manager.services.store_tasks.drain_finite().await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_retains_pending_native_startup_until_original_response_and_join() {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (handle, mut reader, mut writer) = handle(origin.clone());
+    let connection = handle.execution.connection().unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let (retiring, retirement) = tokio::sync::oneshot::channel();
+    let (join, allow_join) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut resume = Some(resume);
+        let mut retiring = Some(retiring);
+        let mut allow_join = Some(allow_join);
+        let mut context = Value::Null;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"_meta":{"reviewMonitoring":1,"intentCallbackRegistration":{"version":1,"method":"_intent/session/register_mcp_callback"}}})
+                }
+                "session/new" => {
+                    context = request["params"]["_meta"]["reviewMonitoringContext"].clone();
+                    entered.take().unwrap().send(()).unwrap();
+                    resume.take().unwrap().await.unwrap();
+                    json!({"sessionId":"pending-shutdown-native","_meta":{"reviewMonitoring":1,"reviewMonitoringContext":context,"intentCallbackRegistration":{"version":1,"queryReceipt":"11111111-1111-4111-8111-111111111111"}}})
+                }
+                "_intent/session/retire_review_context" => {
+                    assert_eq!(request["params"]["sessionId"], "pending-shutdown-native");
+                    assert_eq!(request["params"]["loadAttemptId"], context["loadAttemptId"]);
+                    retiring.take().unwrap().send(()).unwrap();
+                    allow_join.take().unwrap().await.unwrap();
+                    json!({"retired":true})
+                }
+                other => panic!("unexpected pending shutdown request {other}"),
+            };
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let callbacks = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap()
+    .callbacks
+    .unwrap();
+    let (creation, _) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let services = f.manager.services.clone();
+    let agent = f.row.id.clone();
+    let original = connection.clone();
+    let cwd = f.dir.path().to_string_lossy().into_owned();
+    let startup = tokio::spawn(async move {
+        services
+            .create_repository_acp_session(
+                (&original, Some(&callbacks)),
+                &agent,
+                &cwd,
+                vec![],
+                creation,
+                false,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    f.manager.begin_shutdown();
+    startup.abort();
+    assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+    let manager = f.manager.clone();
+    let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown lost pending producer"
+    );
+    assert!(connection.is_alive());
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown lost original retirement outcome"
+    );
+    join.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!f.manager.handles.lock().unwrap().contains_key(&f.row.id));
+    assert!(f
+        .manager
+        .services
+        .store
+        .get_agent_session(&f.row.id)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    f.manager.services.store_tasks.drain_finite().await;
+    server.abort();
+}

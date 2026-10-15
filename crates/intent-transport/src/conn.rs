@@ -75,8 +75,8 @@ pub(crate) const BULK_CAPACITY: usize = 256;
 /// the forwarder is spawned.
 #[derive(Clone)]
 pub(crate) struct OutboundSender {
-    priority: mpsc::Sender<String>,
-    bulk: mpsc::Sender<String>,
+    priority: mpsc::Sender<crate::OutboundFrame>,
+    bulk: mpsc::Sender<crate::OutboundFrame>,
     shutdown: Option<RpcLimiter>,
 }
 
@@ -84,7 +84,7 @@ impl OutboundSender {
     /// Queue a latency-critical frame (RPC response / error / reverse
     /// request). `Err` means the connection's writer is gone.
     pub(crate) async fn send_priority(&self, frame: String) -> Result<(), ()> {
-        match self.priority.try_send(frame) {
+        match self.priority.try_send(frame.into()) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
             Err(mpsc::error::TrySendError::Full(frame)) => tokio::select! {
@@ -104,7 +104,7 @@ impl OutboundSender {
     /// Queue a bulk frame (event notification / subscription push). `Err`
     /// means the connection's writer is gone.
     pub(crate) async fn send_bulk(&self, frame: String) -> Result<(), ()> {
-        self.bulk.send(frame).await.map_err(|_| ())
+        self.bulk.send(frame.into()).await.map_err(|_| ())
     }
 
     /// Reserve one slot on the priority lane, waiting for space when the
@@ -114,7 +114,9 @@ impl OutboundSender {
     /// backpressure point, applied on the read loop BEFORE a limiter slot is
     /// claimed (see [`finish_slow_path_rpc`]). `Err` means the connection's
     /// writer is gone.
-    pub(crate) async fn reserve_priority(&self) -> Result<mpsc::OwnedPermit<String>, ()> {
+    pub(crate) async fn reserve_priority(
+        &self,
+    ) -> Result<mpsc::OwnedPermit<crate::OutboundFrame>, ()> {
         tokio::select! {
             () = self.shutdown_requested() => Err(()),
             result = self.priority.clone().reserve_owned() => result.map_err(|_| ()),
@@ -137,14 +139,14 @@ impl OutboundSender {
 
     /// The priority-lane sender for collaborators that only ever send
     /// latency-critical frames (the reverse-RPC channel).
-    pub(crate) fn priority_sender(&self) -> mpsc::Sender<String> {
+    pub(crate) fn priority_sender(&self) -> mpsc::Sender<crate::OutboundFrame> {
         self.priority.clone()
     }
 
     /// The bulk-lane sender for the subscription forwarders, which only ever
     /// send bulk frames and need `reserve` / `try_reserve` on the lane for
     /// backpressure conflation (see [`crate::conflate`]).
-    pub(crate) fn bulk_sender(&self) -> mpsc::Sender<String> {
+    pub(crate) fn bulk_sender(&self) -> mpsc::Sender<crate::OutboundFrame> {
         self.bulk.clone()
     }
 }
@@ -152,14 +154,14 @@ impl OutboundSender {
 /// Receiving half of the two-lane outbound queue; owned by the transport
 /// writer.
 pub(crate) struct OutboundReceiver {
-    pub(crate) priority: mpsc::Receiver<String>,
-    pub(crate) bulk: mpsc::Receiver<String>,
+    pub(crate) priority: mpsc::Receiver<crate::OutboundFrame>,
+    pub(crate) bulk: mpsc::Receiver<crate::OutboundFrame>,
     priority_open: bool,
     bulk_open: bool,
 }
 
 impl OutboundReceiver {
-    pub(crate) async fn recv_priority(&mut self) -> Option<String> {
+    pub(crate) async fn recv_priority(&mut self) -> Option<crate::OutboundFrame> {
         self.priority.recv().await
     }
     /// Next frame to write, priority lane first. Empties the priority lane
@@ -167,7 +169,7 @@ impl OutboundReceiver {
     /// (biased toward priority). Returns `None` once every sender is dropped
     /// and both lanes are drained. Cancel-safe: no frame is lost when the
     /// caller races this against other select arms.
-    pub(crate) async fn recv(&mut self) -> Option<String> {
+    pub(crate) async fn recv(&mut self) -> Option<crate::OutboundFrame> {
         loop {
             // Drain whatever is already queued on the priority lane first.
             if self.priority_open {
@@ -208,8 +210,8 @@ impl OutboundReceiver {
 /// Build one connection's two-lane outbound queue ([`PRIORITY_CAPACITY`] /
 /// [`BULK_CAPACITY`] frames).
 pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
-    let (priority_tx, priority_rx) = mpsc::channel::<String>(PRIORITY_CAPACITY);
-    let (bulk_tx, bulk_rx) = mpsc::channel::<String>(BULK_CAPACITY);
+    let (priority_tx, priority_rx) = mpsc::channel::<crate::OutboundFrame>(PRIORITY_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<crate::OutboundFrame>(BULK_CAPACITY);
     (
         OutboundSender {
             priority: priority_tx,
@@ -241,6 +243,10 @@ struct ChatLifecycle {
 /// layer by [`ConnSubs::remove`] before the removal is acknowledged).
 struct ConnSub {
     handle: JoinHandle<()>,
+    monitor_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>>,
+    history_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>>,
     replace_group: Option<String>,
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
@@ -249,6 +255,14 @@ struct ConnSub {
 
 impl Drop for ConnSub {
     fn drop(&mut self) {
+        // Aborting the forwarder alone defers its Drop until a scheduler turn.
+        // Join the original queued-output fence before removal is acknowledged.
+        if let Some(recipient) = &self.monitor_recipient {
+            recipient.retire();
+        }
+        if let Some(recipient) = &self.history_recipient {
+            recipient.retire();
+        }
         if let Some(lifecycle) = &self.lifecycle {
             subscriptions::trace_chat_teardown(&lifecycle.scope, &lifecycle.subscription_id);
         }
@@ -294,6 +308,8 @@ impl ConnSubs {
             id,
             ConnSub {
                 handle,
+                monitor_recipient: None,
+                history_recipient: None,
                 replace_group,
                 lifecycle,
                 note_lease: false,
@@ -314,6 +330,8 @@ impl ConnSubs {
             id,
             ConnSub {
                 handle,
+                monitor_recipient: None,
+                history_recipient: None,
                 replace_group,
                 lifecycle: None,
                 note_lease: true,
@@ -762,6 +780,67 @@ async fn process_captured_frame(
             return true;
         }
         if let Some(req) = client::classify(value) {
+            reverse_guard.retire_monitor_hello();
+            let monitor_hello = crate::context::review_monitoring_hello(
+                intent_core::review_monitor::ReviewMonitorRecipientSupport::from_capabilities(
+                    if req.connection_role == client::ConnectionRole::ReviewMonitor {
+                        req.capabilities.as_ref().unwrap_or(&Value::Null)
+                    } else {
+                        &Value::Null
+                    },
+                ),
+            );
+            if req.connection_role != client::ConnectionRole::Ordinary
+                || reverse_guard.is_monitor_attachment()
+            {
+                let admitted = (|| {
+                    if req.connection_role != client::ConnectionRole::ReviewMonitor
+                        || req.client_id_invalid
+                        || !req.id_present
+                        || req
+                            .capabilities
+                            .as_ref()
+                            .and_then(|v| v.get("reviewMonitoring"))
+                            .and_then(Value::as_u64)
+                            .is_none_or(|v| v < 1)
+                    {
+                        return None;
+                    }
+                    let canonical = ClientId::from_string(req.client_id.as_ref()?.clone());
+                    // Attachments must present the actual acknowledged id, not
+                    // a raw id that the handler silently namespaces for them.
+                    if client::scope_to_caller(canonical.clone()) != canonical {
+                        return None;
+                    }
+                    let principal = crate::context::current_caller()?.principal_id()?.clone();
+                    let attachment = reverse_guard.prepare_monitor_attachment(
+                        &canonical,
+                        &principal,
+                        monitor_hello.clone()?,
+                    )?;
+                    Some((canonical, attachment))
+                })();
+                if let Some((canonical, attachment)) = admitted {
+                    let sent = out_tx
+                        .send_priority(client::attachment_result(&req, &canonical, is_local))
+                        .await
+                        .is_ok();
+                    if sent {
+                        *client_id = Some(canonical);
+                        attachment.acknowledge();
+                    } else {
+                        reverse_guard.retire_monitor_hello();
+                    }
+                    return sent;
+                }
+                if let Some(receipt) = monitor_hello {
+                    receipt.retire();
+                }
+                return match client::reject_role(&req) {
+                    Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                    None => true,
+                };
+            }
             let setup_requested = req.id_present
                 && req
                     .capabilities
@@ -781,6 +860,10 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
+            let ordinary_source = bound.as_ref().and_then(|identity| {
+                let principal = crate::context::current_caller()?.principal_id()?.clone();
+                reverse_guard.prepare_ordinary_monitor_source(identity.client_id.clone(), principal)
+            });
             if let Some(identity) = bound {
                 reverse
                     .set_browser_member(crate::context::may_manage_workspaces(api.as_ref()).await);
@@ -808,7 +891,21 @@ async fn process_captured_frame(
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                     .is_some_and(|v| v.get("result").is_some());
             return match frame {
-                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                Some(frame) => {
+                    let acknowledged = hello_ok
+                        && serde_json::from_str::<Value>(&frame)
+                            .is_ok_and(|value| value.get("result").is_some());
+                    let sent = out_tx.send_priority(frame).await.is_ok();
+                    if sent && acknowledged {
+                        if let Some(source) = ordinary_source {
+                            source.acknowledge();
+                        }
+                        if let Some(receipt) = monitor_hello {
+                            receipt.acknowledge();
+                        }
+                    }
+                    sent
+                }
                 None => true,
             };
         }
@@ -951,12 +1048,12 @@ async fn process_captured_frame(
 async fn finish_slow_path_rpc(
     permit: Option<OwnedSemaphorePermit>,
     handler: impl Future<Output = Option<String>>,
-    slot: mpsc::OwnedPermit<String>,
+    slot: mpsc::OwnedPermit<crate::OutboundFrame>,
 ) {
     let frame = handler.await;
     drop(permit);
     if let Some(frame) = frame {
-        slot.send(frame);
+        slot.send(frame.into());
     }
 }
 
@@ -966,22 +1063,50 @@ async fn finish_prepared_rpc(
     context: &crate::context::CapturedFrame,
     permit: Option<OwnedSemaphorePermit>,
     handler: impl Future<Output = Option<crate::router::PreparedReply>>,
-    slot: mpsc::OwnedPermit<String>,
+    slot: mpsc::OwnedPermit<crate::OutboundFrame>,
 ) {
     use futures::FutureExt as _;
 
     let Some(reply) = handler.await else { return };
     let Some((kind, id)) = reply.service else {
         drop(permit);
-        slot.send(reply.frame);
+        slot.send(reply.frame.into());
         return;
     };
     let Some(scope) = context.read_scope() else {
         drop(permit);
-        slot.send(reply.frame);
+        slot.send(reply.frame.into());
         return;
     };
-    let mut packet = Some((slot, reply.frame));
+    // Attach the original service's final-egress owner before admission. A
+    // failed binding is a refusal, never a downgrade to an ordinary frame.
+    let bound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scope
+            .bind_private_output(&reply.frame)
+            .and_then(|owner| match owner {
+                Some(owner) if owner.frame() == reply.frame => {
+                    Ok(crate::OutboundFrame::private(owner))
+                }
+                Some(_) => Err(intent_core::Error::Internal(
+                    "private output binding mismatch".into(),
+                )),
+                None => Ok(reply.frame.into()),
+            })
+    }));
+    let frame = match bound {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            drop(permit);
+            slot.send(crate::router::delivery_error(&id, error).into());
+            return;
+        }
+        Err(_) => {
+            drop(permit);
+            slot.send(panic_guard::internal_error_frame(&id).into());
+            return;
+        }
+    };
+    let mut packet = Some((slot, frame));
     let mut permit = permit;
     let mut transfer = || {
         let (slot, frame) = packet.take().ok_or_else(|| {
@@ -1002,7 +1127,7 @@ async fn finish_prepared_rpc(
             Ok(Ok(())) | Err(_) => panic_guard::internal_error_frame(&id),
         };
         drop(permit);
-        slot.send(frame);
+        slot.send(frame.into());
     }
 }
 
@@ -1136,7 +1261,8 @@ pub(crate) async fn handle_fast_path(
                             pattern,
                         )
                     });
-                let subscription = bus.subscribe(SubscriptionFilter {
+                let subscription_id = events::next_subscription_id();
+                let filter = SubscriptionFilter {
                     event_types,
                     workspace_id,
                     batch_window: None,
@@ -1144,8 +1270,14 @@ pub(crate) async fn handle_fast_path(
                     member_execution_events: true,
                     exclude_channel_only: true,
                     ..Default::default()
-                });
-                let subscription_id = events::next_subscription_id();
+                };
+                let monitor_recipient = crate::context::capture_monitor_events();
+                let subscription = match &monitor_recipient {
+                    Some(recipient) => {
+                        bus.subscribe_monitor(filter, recipient.clone(), subscription_id.clone())
+                    }
+                    None => bus.subscribe(filter),
+                };
                 // Enqueue the response (priority lane) before spawning the
                 // forwarder (bulk lane); the writer drains priority first, so
                 // it can never be preceded by an `events.event` notification.
@@ -1169,10 +1301,9 @@ pub(crate) async fn handle_fast_path(
                     host_removal_control,
                 ));
                 subs.insert(subscription_id.clone(), handle, replace_group, None);
-                subs.subs
-                    .get_mut(&subscription_id)
-                    .expect("just inserted")
-                    .host_removal_control = host_removal_control;
+                let sub = subs.subs.get_mut(&subscription_id).expect("just inserted");
+                sub.host_removal_control = host_removal_control;
+                sub.monitor_recipient = monitor_recipient;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1243,7 +1374,7 @@ async fn forward_subscription(
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
                     if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id));
+                        permit.send(item.into_frame(&subscription_id).into());
                     }
                 }
                 Err(_) => return,
@@ -1267,13 +1398,22 @@ async fn forward_subscription(
                     _ => membership_events = None,
                 }
             },
-            maybe = subscription.recv() => {
-                let Some(batch) = maybe else {
+            maybe = subscription.recv_delivery() => {
+                let Some(delivery) = maybe else {
                     // Bus closed: flush anything still pending, then stop.
                     let _ = buffer
                         .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
                         .await;
                     return;
+                };
+                let batch = match delivery {
+                    Delivery::Batch(batch) => batch,
+                    Delivery::Lagged(_) | Delivery::HistoryChanged => continue,
+                    Delivery::Monitor(output) => {
+                        if !buffer.drain_all(&out_tx, |item| item.into_frame(&subscription_id)).await { return; }
+                        if out_tx.send(crate::OutboundFrame::private(output.into_output())).await.is_err() { return; }
+                        continue;
+                    }
                 };
                 for mut event in batch {
                     // The revocation branch sends this exact durable event once,
@@ -1311,7 +1451,7 @@ async fn forward_subscription(
                                 {
                                     return;
                                 }
-                                if out_tx.send(item.into_frame(&subscription_id)).await.is_err() {
+                                if out_tx.send(item.into_frame(&subscription_id).into()).await.is_err() {
                                     return;
                                 }
                             }
@@ -1326,7 +1466,7 @@ async fn forward_subscription(
                         }
                         let frame =
                             events::build_event_notification(&subscription_id, &event);
-                        if out_tx.send(frame).await.is_err() {
+                        if out_tx.send(frame.into()).await.is_err() {
                             return;
                         }
                     }
@@ -1552,6 +1692,7 @@ pub(crate) async fn handle_sub_fast_path(
                     projection,
                     replace_group,
                 } = p;
+                let history_recipient = crate::context::capture_monitor_history();
                 // Time the request-to-snapshot interval (intent-hq/intent#3707),
                 // started before the replace-group cleanup so a costly removal
                 // scan is included in the measured interval.
@@ -1578,14 +1719,18 @@ pub(crate) async fn handle_sub_fast_path(
                         ..Default::default()
                     })
                 });
-                let subscription = bus.subscribe(SubscriptionFilter {
+                let filter = SubscriptionFilter {
                     event_types: subscriptions::channel_event_types(Channel::Chat),
                     workspace_id: None,
                     batch_window: None,
                     collaborator_only: gate.is_some(),
                     member_execution_events: true,
                     ..Default::default()
-                });
+                };
+                let subscription = match history_recipient.clone() {
+                    Some(owner) => bus.subscribe_history(filter, agent_id.clone(), owner),
+                    None => bus.subscribe(filter),
+                };
                 let subscription_id = events::next_subscription_id();
                 // Logged before the response enqueue so a client that vanishes
                 // mid-reply still leaves the subscribe record behind. The
@@ -1611,21 +1756,33 @@ pub(crate) async fn handle_sub_fast_path(
                     scope: agent_id.clone(),
                     subscription_id: subscription_id.clone(),
                 };
-                let handle = spawn_forwarder(forward_chat_subscription(
-                    api.clone(),
-                    AgentId::from(agent_id),
-                    since_message_id,
-                    delta_encoding,
-                    projection,
-                    subscription,
-                    gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
-                    subscription_id.clone(),
-                    out_tx.clone(),
-                    timer,
-                    limit,
-                    progressive_history,
+                let handle = spawn_forwarder(crate::context::with_monitor_history(
+                    history_recipient.clone(),
+                    forward_chat_subscription(
+                        api.clone(),
+                        AgentId::from(agent_id),
+                        since_message_id,
+                        delta_encoding,
+                        projection,
+                        subscription,
+                        gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
+                        subscription_id.clone(),
+                        out_tx.clone(),
+                        timer,
+                        limit,
+                        progressive_history,
+                    ),
                 ));
-                subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
+                subs.insert(
+                    subscription_id.clone(),
+                    handle,
+                    replace_group,
+                    Some(lifecycle),
+                );
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("just inserted")
+                    .history_recipient = history_recipient;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1968,7 +2125,7 @@ async fn forward_chat_subscription(
 /// when the read or outbound reservation is ready on the same poll.
 async fn wait_for_chat_initial<T>(
     work: impl std::future::Future<Output = T>,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
     gate: &mut Option<events::MembershipGate>,
     membership_events: &mut Option<Subscription>,
     agent_workspace: Option<&str>,
@@ -2120,7 +2277,7 @@ async fn chat_subscription_loop(
     )
     .await
     {
-        Ok(Ok(permit)) => permit.send(frame),
+        Ok(Ok(permit)) => permit.send(crate::context::chat_frame(frame)),
         Ok(Err(_)) => return "client_closed",
         Err(reason) => return reason,
     }
@@ -2180,7 +2337,7 @@ async fn chat_subscription_loop(
             permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
                 Ok(permit) => {
                     if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id, seq));
+                        permit.send(crate::context::chat_frame(item.into_frame(&subscription_id, seq)));
                         seq += 1;
                     }
                 }
@@ -2210,7 +2367,7 @@ async fn chat_subscription_loop(
                 let Ok(permit) = permit else { return "client_closed"; };
                 let history = history_frame.take().expect("guarded");
                 if let Some(message) = history.get("message") { state.seed_history_message(message); }
-                permit.send(subscriptions::build_history_push(&subscription_id, seq, &history));
+                permit.send(crate::context::chat_frame(subscriptions::build_history_push(&subscription_id, seq, &history)));
                 seq += 1;
                 if history["complete"] == true { initial_history = None; }
             }
@@ -2244,7 +2401,7 @@ async fn chat_subscription_loop(
                         .drain_all(&out_tx, |item| {
                             let frame = item.into_frame(&subscription_id, seq);
                             seq += 1;
-                            frame
+                            crate::context::chat_frame(frame)
                         })
                         .await;
                     return "bus_closed";
@@ -2263,6 +2420,28 @@ async fn chat_subscription_loop(
                         continue;
                     }
                     Delivery::Batch(batch) => batch,
+                    Delivery::Monitor(_) => continue,
+                    Delivery::HistoryChanged => {
+                        // No private row crosses the bus. Re-read using this
+                        // original chat recipient and bind the replacement
+                        // snapshot to its freshly retained source fences.
+                        // Earlier queued deltas/history are superseded by the
+                        // same bounded recovery used for transcript replacement.
+                        while subscription.try_recv_delivery().is_some() {}
+                        initial_history = None;
+                        history_frame = None;
+                        history_read = None;
+                        held_events.clear();
+                        buffer = ConflationBuffer::new();
+                        pending_recovery = Some(0);
+                        if !attempt_chat_recovery(
+                            api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
+                            &mut seq, &out_tx, &mut state, &mut pending_recovery, limit, progressive_history,
+                        ).await {
+                            return "client_closed";
+                        }
+                        continue;
+                    }
                     // Upstream loss: the ring dropped events before delivery,
                     // possibly this agent's turn tail. Self-heal by re-emitting
                     // a fresh bounded snapshot at the next seq (see the doc
@@ -2371,7 +2550,7 @@ async fn chat_subscription_loop(
                             match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
                                 let frame = item.into_frame(sid, *s);
                                 *s += 1;
-                                frame
+                                crate::context::chat_frame(frame)
                             }) {
                                 Enqueue::Closed => return "client_closed",
                                 Enqueue::Sent | Enqueue::Buffered => continue,
@@ -2383,7 +2562,7 @@ async fn chat_subscription_loop(
                                         .drain_all(&out_tx, |item| {
                                             let frame = item.into_frame(&subscription_id, seq);
                                             seq += 1;
-                                            frame
+                                            crate::context::chat_frame(frame)
                                         })
                                         .await;
                                     if !drained {
@@ -2391,7 +2570,7 @@ async fn chat_subscription_loop(
                                     }
                                     let frame = item.into_frame(&subscription_id, seq);
                                     seq += 1;
-                                    if out_tx.send(frame).await.is_err() {
+                                    if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
                                         return "client_closed";
                                     }
                                     continue;
@@ -2404,7 +2583,7 @@ async fn chat_subscription_loop(
                         .drain_all(&out_tx, |item| {
                             let frame = item.into_frame(&subscription_id, seq);
                             seq += 1;
-                            frame
+                            crate::context::chat_frame(frame)
                         })
                         .await;
                     if !drained {
@@ -2412,7 +2591,7 @@ async fn chat_subscription_loop(
                     }
                     let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                     seq += 1;
-                    if out_tx.send(frame).await.is_err() {
+                    if out_tx.send(crate::context::chat_frame(frame)).await.is_err() {
                         return "client_closed";
                     }
                 }
@@ -2442,12 +2621,13 @@ async fn attempt_chat_recovery(
     delta_encoding: subscriptions::DeltaEncoding,
     projection: Option<intent_core::ConversationProjection>,
     seq: &mut u64,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
     state: &mut subscriptions::ChatDeltaState,
     pending_recovery: &mut Option<u64>,
     limit: usize,
     progressive_history: bool,
 ) -> bool {
+    crate::context::begin_chat_history_generation();
     let Some(mut snapshot) =
         subscriptions::chat_recovery_snapshot(api, agent_id, projection, limit).await
     else {
@@ -2467,7 +2647,11 @@ async fn attempt_chat_recovery(
     snapshot["resumed"] = Value::Bool(false);
     let frame = subscriptions::build_snapshot_push(subscription_id, *seq, &snapshot);
     *seq += 1;
-    if out_tx.send(frame).await.is_err() {
+    if out_tx
+        .send(crate::context::chat_frame(frame))
+        .await
+        .is_err()
+    {
         return false;
     }
     *state = subscriptions::ChatDeltaState::new(agent_id, delta_encoding, projection);
@@ -2697,6 +2881,9 @@ async fn forward_channel_subscription(
 pub(crate) mod read_delivery_tests;
 
 #[cfg(test)]
+mod monitor_event_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2897,7 +3084,7 @@ mod tests {
             rx.recv().await.expect("first response"),
             rx.recv().await.expect("second response"),
         ];
-        got.sort();
+        got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(got, ["resp-0", "resp-1"]);
         for task in tasks {
             task.await.unwrap();
@@ -2921,7 +3108,7 @@ mod tests {
         // no permit while it waits.
         let parked = tokio::spawn(async move {
             let slot = tx.reserve_priority().await.expect("slot after drain");
-            slot.send("late-resp".to_string());
+            slot.send("late-resp".into());
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -3103,8 +3290,8 @@ mod tests {
         drop(tx);
         assert_eq!(rx.recv().await.as_deref(), Some("p1"));
         assert_eq!(rx.recv().await.as_deref(), Some("b1"));
-        assert_eq!(rx.recv().await, None);
-        assert_eq!(rx.recv().await, None, "recv stays terminal after None");
+        assert!(rx.recv().await.is_none());
+        assert!(rx.recv().await.is_none(), "recv stays terminal after None");
     }
 
     /// `recv` wakes for a frame that arrives while it is parked (both lanes
@@ -3124,7 +3311,7 @@ mod tests {
         // Both frames are delivered; the parked recv takes whichever lane
         // wakes it first, then the follow-up recv drains the other.
         let mut got = vec![first.unwrap(), second.unwrap()];
-        got.sort();
+        got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(got, ["b1", "p1"]);
     }
 
@@ -3139,7 +3326,7 @@ mod tests {
         assert!(tx.send_priority("p".to_string()).await.is_err());
         assert!(tx.send_bulk("b".to_string()).await.is_err());
         assert!(
-            tx.priority_sender().send("p".to_string()).await.is_err(),
+            tx.priority_sender().send("p".into()).await.is_err(),
             "the raw priority sender observes the close too"
         );
     }

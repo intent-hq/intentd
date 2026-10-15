@@ -41,6 +41,9 @@ pub enum RepositoryLifecycleKey {
     Workspace(WorkspaceId),
     /// The originally captured agent row.
     Agent(AgentId),
+    /// Saved private monitor envelopes for this agent, independently of its
+    /// live ACP owner. Transcript mutation must retire queued history first.
+    MonitorHistory(AgentId),
     /// The originally captured registered root.
     GitRoot(WorkspaceGitRootId),
     /// A path already qualified by the physical-root owner, not by Store.
@@ -48,9 +51,21 @@ pub enum RepositoryLifecycleKey {
 }
 
 /// One original mutation owner. Dropping this ticket MUST NOT settle a barrier.
-pub trait RepositoryLifecycleMutationTicket: Send {
+pub trait RepositoryLifecycleMutationTicket: Send + 'static {
     /// Consume only after the original owner confirmed commit or no effect.
     fn settle_confirmed(self: Box<Self>);
+
+    /// Join the original invalidated native allocations after SQL and Store
+    /// serialization are released. An unknown join must retain the barrier.
+    #[must_use]
+    fn settle_after_retirement(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            self.settle_confirmed();
+            Ok(())
+        })
+    }
 }
 
 /// Invalidation only. No database, network or asynchronous work may run here.
@@ -342,6 +357,7 @@ impl LifecycleWrite {
         self.serial.take();
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn settle(mut self) {
         if let Some(ticket) = self.ticket.take() {
             ticket.settle_confirmed();
@@ -349,11 +365,41 @@ impl LifecycleWrite {
         self.confirmed = true;
     }
 
-    pub(crate) fn finish<T>(self, result: Result<T>) -> Result<T> {
-        if result.is_ok() {
-            self.settle();
+    fn mark_confirmed(&mut self) {
+        self.confirmed = true;
+    }
+
+    pub(crate) async fn settle_after_retirement(mut self) -> Result<()> {
+        self.release_serialization();
+        // SQL is already terminal. Retain this exact completion independently
+        // of a cancelled API waiter, preserving its original caller scope.
+        let completion = intent_core::caller::spawn_with_current_caller(async move {
+            if let Some(ticket) = self.ticket.take() {
+                ticket.settle_after_retirement().await?;
+            }
+            self.mark_confirmed();
+            Ok(())
+        })
+        .await;
+        match completion {
+            Ok(result) => result,
+            // Preserve the caller's existing panic boundary, including its
+            // independent record of an already acknowledged SQL commit.
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(lifecycle_error(
+                "original retirement completion unavailable",
+            )),
         }
-        result
+    }
+
+    pub(crate) async fn finish<T>(self, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => {
+                self.settle_after_retirement().await?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -389,8 +435,11 @@ impl RepositoryPendingDeleteGuard {
     /// Confirm only this operation's positively established terminal work or
     /// no effect. A public success response, current row or another operation's
     /// completion cannot establish this fact. Consumes the sole original guard.
-    pub fn settle_confirmed(self) {
-        self.lifecycle.settle();
+    ///
+    /// # Errors
+    /// Returns an error if the original native retirement cannot be confirmed.
+    pub async fn settle_confirmed(self) -> Result<()> {
+        self.lifecycle.settle_after_retirement().await
     }
 }
 
