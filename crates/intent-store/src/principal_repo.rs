@@ -509,7 +509,8 @@ impl Store {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -867,7 +868,7 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member commit failed: {e}")))?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -974,7 +975,7 @@ impl Store {
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
                 .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
@@ -1024,7 +1025,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role commit failed: {e}"))
             })?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(())
         })
         .await
@@ -1067,7 +1068,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member commit failed: {e}"))
             })?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -1124,7 +1125,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(deleted.rows_affected() > 0)
     }
 
@@ -1153,7 +1154,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("insert principal credential failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(PrincipalCredential {
             token_hash: token_hash.to_string(),
             principal_id: principal_id.clone(),
@@ -1277,7 +1278,8 @@ impl Store {
         .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credential failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1310,7 +1312,8 @@ impl Store {
         .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credentials failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(res.rows_affected())
     }
 
@@ -1664,7 +1667,7 @@ impl Store {
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
                 .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Record a redemption of an **open** invite by `principal_id`: stamps
@@ -1920,7 +1923,7 @@ impl Store {
 
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 }
 

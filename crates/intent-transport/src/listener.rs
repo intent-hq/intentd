@@ -39,7 +39,7 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::net::UnixListener;
 
 #[cfg(any(unix, windows))]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[cfg(any(unix, windows))]
 use crate::conn::{outbound_channel, process_frame, ConnSubs};
@@ -298,13 +298,12 @@ where
                 continue;
             }
             if !writer_recovery
-                .write(&frame, async {
-                    write_half.write_all(frame.as_bytes()).await.is_ok()
-                        && write_half.write_all(b"\n").await.is_ok()
-                        && write_half.flush().await.is_ok()
-                })
+                .prepare_frame(&frame)
+                .finish(async { frame.write_uds(&mut write_half).await.is_ok() })
                 .await
             {
+                #[cfg(feature = "repository-test-fixtures")]
+                crate::private_output::fixture_discarded_queue(&mut out_rx);
                 break;
             }
         }

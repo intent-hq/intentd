@@ -1236,7 +1236,10 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             n, OVERFLOW as u64,
             "marker carries the ring's exact skipped count"
         ),
-        Delivery::Batch(_) | Delivery::Fence(_) => {
+        Delivery::Batch(_)
+        | Delivery::Fence(_)
+        | Delivery::Monitor(_)
+        | Delivery::HistoryChanged => {
             panic!("expected the lag marker before any surviving event")
         }
     }
@@ -1319,4 +1322,132 @@ async fn recovery_fence_cannot_skip_lost_filtered_tail() {
     };
     ack.send(()).unwrap();
     receipt.await.unwrap();
+}
+
+#[tokio::test]
+async fn private_history_change_only_notifies_matching_opted_in_chat() {
+    use intent_core::repository_request::{
+        RepositoryMonitorHistoryRecipient, RepositoryPrivateOutput,
+    };
+    use std::sync::Arc;
+    struct History;
+    impl RepositoryMonitorHistoryRecipient for History {
+        fn scope<'a>(
+            &'a self,
+            body: intent_core::BoxFuture<'a, ()>,
+        ) -> intent_core::BoxFuture<'a, ()> {
+            body
+        }
+        fn bind_output(&self, _: String) -> Arc<dyn RepositoryPrivateOutput> {
+            panic!("a history invalidation must not bind or expose any private output")
+        }
+        fn begin_generation(&self) {
+            panic!("the bus does not read history")
+        }
+        fn retire(&self) {}
+    }
+    let (_tmp, bus) = bus().await;
+    let mut ordinary = bus.subscribe(SubscriptionFilter::default());
+    let mut matching = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    let mut other = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-other".into(),
+        Arc::new(History),
+    );
+    let mut generic = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    bus.notify_monitor_history("agent-original");
+    let barrier = bus.publish_transient(&new_event("workspace:updated", None, ActorType::System));
+    assert!(matches!(
+        matching.recv_delivery().await,
+        Some(Delivery::HistoryChanged)
+    ));
+    for sub in [&mut ordinary, &mut matching, &mut other] {
+        let Some(Delivery::Batch(events)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("only the matching opted-in subscriber may receive the private notification")
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, barrier.id);
+        assert!(sub.try_recv_delivery().is_none());
+    }
+    // Generic consumers cannot accidentally flatten a private notification.
+    assert_eq!(generic.recv().await.unwrap()[0].id, barrier.id);
+}
+
+/// A quiet raw tail includes private envelopes, but gives a generic subscriber
+/// neither their payload nor a public marker carrying their routing identity.
+#[tokio::test]
+async fn recovery_fence_covers_private_quiet_tail_without_projection() {
+    use intent_core::repository_request::RepositoryMonitorEventSource;
+    use std::sync::Arc;
+    struct Source;
+    impl RepositoryMonitorEventSource for Source {
+        fn with_current(
+            &self,
+            action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+        ) -> intent_core::Result<()> {
+            action()
+        }
+    }
+    let (_tmp, bus) = bus().await;
+    let mut ordinary = bus.subscribe(SubscriptionFilter::default());
+    let mut filtered = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        batch_window: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let public = bus.publish_transient(&new_event("file:changed", None, ActorType::System));
+    let mut private = stored_event(
+        "private-id",
+        &new_event("note:updated", None, ActorType::System),
+    );
+    private.workspace_id = WorkspaceId::from("private-workspace");
+    private.data = json!({"secret":"withheld"});
+    bus.publish_monitor(private, None, Arc::new(Source))
+        .unwrap();
+    bus.notify_monitor_history("private-agent");
+    for sub in [&mut ordinary, &mut filtered] {
+        let receipt = sub.fence_handle().request().unwrap();
+        let delivery = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap();
+        assert!(
+            matches!(delivery, Some(Delivery::Batch(ref batch)) if batch.len() == 1 && batch[0].id == public.id)
+        );
+        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("private quiet tail must reach its fence without a public projection");
+        };
+        ack.send(()).unwrap();
+        receipt.await.unwrap();
+        assert!(sub.try_recv_delivery().is_none());
+    }
+    // Registration after a nonzero tail starts at that cursor. A following
+    // private-only tail must not need a public event to release any receipt.
+    let mut late = bus.subscribe(SubscriptionFilter::default());
+    bus.notify_monitor_history("private-agent-only");
+    for sub in [&mut ordinary, &mut filtered, &mut late] {
+        let receipt = sub.fence_handle().request().unwrap();
+        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("private-only tail has no public marker");
+        };
+        ack.send(()).unwrap();
+        receipt.await.unwrap();
+        assert!(sub.try_recv_delivery().is_none());
+    }
 }

@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::filter::{event_matches, SubscriptionFilter};
+use super::monitor_delivery::{BroadcastEvent, MonitorEvent, PrivateEventDelivery, Recipient};
 
 mod fence;
 pub use fence::FenceHandle;
@@ -362,7 +363,8 @@ impl EventBus {
         };
         // Broadcast on the same channel so transient/persisted events interleave
         // correctly for subscribers (ordering preserved from a single publisher).
-        self.tx.send(Arc::new(event.clone()));
+        self.tx
+            .send(Arc::new(BroadcastEvent::Public(event.clone())));
         event
     }
 
@@ -373,13 +375,103 @@ impl EventBus {
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Subscription {
         let (rx, observed, fence, controls) = self.tx.receiver();
         let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-        let handle =
-            intent_core::spawn_daemon(delivery_task(rx, filter, out_tx, observed, controls));
+        let handle = intent_core::spawn_daemon(delivery_task(
+            rx, filter, out_tx, observed, controls, None, None,
+        ));
         Subscription {
             rx: out_rx,
             handle,
             fence,
+            monitor_recipient: None,
         }
+    }
+    /// Subscribe on the existing queue with an original native monitor recipient.
+    /// Every private event still needs fresh original account/workspace admission.
+    #[must_use]
+    pub fn subscribe_monitor(
+        &self,
+        filter: SubscriptionFilter,
+        owner: Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>,
+        subscription_id: String,
+    ) -> Subscription {
+        let (out, rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (raw, observed, fence, controls) = self.tx.receiver();
+        let recipient = Recipient {
+            owner: owner.clone(),
+            subscription_id,
+        };
+        let handle = intent_core::spawn_daemon(delivery_task(
+            raw,
+            filter,
+            out,
+            observed,
+            controls,
+            Some(recipient),
+            None,
+        ));
+        Subscription {
+            rx,
+            handle,
+            fence,
+            monitor_recipient: Some(owner),
+        }
+    }
+
+    /// Opt an original qualified chat recipient into payload-free history
+    /// invalidations. The notification grants no read or output authority:
+    /// consumers must re-read under this same recipient and retain its fences.
+    #[must_use]
+    pub fn subscribe_history(
+        &self,
+        filter: SubscriptionFilter,
+        agent_id: String,
+        owner: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>,
+    ) -> Subscription {
+        let (out, rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+        let (raw, observed, fence, controls) = self.tx.receiver();
+        let handle = intent_core::spawn_daemon(delivery_task(
+            raw,
+            filter,
+            out,
+            observed,
+            controls,
+            None,
+            Some((agent_id, owner)),
+        ));
+        Subscription {
+            rx,
+            handle,
+            fence,
+            monitor_recipient: None,
+        }
+    }
+
+    /// Called only after the original qualified message commit. Generic event
+    /// subscriptions never receive this notification, even as a public marker.
+    pub(crate) fn notify_monitor_history(&self, agent_id: &str) {
+        self.tx.send(Arc::new(BroadcastEvent::HistoryChanged(
+            agent_id.to_owned(),
+        )));
+    }
+
+    pub(crate) fn publish_monitor(
+        &self,
+        event: Event,
+        binding: Option<intent_core::review_monitor::ReviewMonitorBinding>,
+        source: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+    ) -> Result<()> {
+        let fence = source.clone();
+        let mut envelope = Some(BroadcastEvent::Monitor(MonitorEvent {
+            event,
+            binding,
+            source,
+        }));
+        fence.with_current(&mut || {
+            if let Some(envelope) = envelope.take() {
+                self.tx.send(Arc::new(envelope));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -408,6 +500,11 @@ pub enum Delivery {
     Lagged(u64),
     /// Private ordered control receipt, emitted after all preceding raw items.
     Fence(oneshot::Sender<()>),
+    /// Already-authorized private native frame; never flatten into public events.
+    Monitor(PrivateEventDelivery),
+    /// Private history changed; re-read with the original qualified recipient.
+    /// Contains no private row, metadata, or authority.
+    HistoryChanged,
 }
 
 /// A live subscription. Yields filtered (and optionally batched) events via
@@ -416,6 +513,8 @@ pub struct Subscription {
     rx: mpsc::Receiver<Delivery>,
     fence: FenceHandle,
     handle: JoinHandle<()>,
+    monitor_recipient:
+        Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>>,
 }
 
 impl Subscription {
@@ -433,7 +532,10 @@ impl Subscription {
         loop {
             match self.rx.recv().await? {
                 Delivery::Batch(batch) => return Some(batch),
-                Delivery::Lagged(_) | Delivery::Fence(_) => {}
+                Delivery::Lagged(_)
+                | Delivery::Fence(_)
+                | Delivery::Monitor(_)
+                | Delivery::HistoryChanged => {}
             }
         }
     }
@@ -453,6 +555,9 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        if let Some(recipient) = &self.monitor_recipient {
+            recipient.retire();
+        }
         self.handle.abort();
     }
 }
@@ -612,7 +717,7 @@ pub(crate) async fn flush_prepared<F, Fut>(
                 evt.data = orig.data;
                 let _ = tx.send(Ok(evt.clone()));
                 // Broadcast in insertion order (append-then-broadcast semantics).
-                broadcast_tx.send(Arc::new(evt));
+                broadcast_tx.send(Arc::new(BroadcastEvent::Public(evt)));
             }
         }
         Err(e) => {
@@ -689,11 +794,16 @@ impl LagWarnThrottle {
 
 /// Per-subscriber delivery loop: filter, then coalesce within `batch_window`.
 async fn delivery_task(
-    mut rx: broadcast::Receiver<Arc<Event>>,
+    mut rx: broadcast::Receiver<Arc<BroadcastEvent>>,
     filter: SubscriptionFilter,
     out: mpsc::Sender<Delivery>,
     mut observed: u128,
     mut controls: mpsc::Receiver<FenceRequest>,
+    recipient: Option<Recipient>,
+    history: Option<(
+        String,
+        Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>,
+    )>,
 ) {
     let mut pending: Option<FenceRequest> = None;
     let mut controls_open = true;
@@ -724,7 +834,34 @@ async fn delivery_task(
             recv = rx.recv() => match recv {
                 Ok(ev) => {
                     observed += 1;
-                    if !event_matches(&filter, &ev) {
+                    let ev = match ev.as_ref() {
+                        BroadcastEvent::Public(ev) => ev,
+                        BroadcastEvent::HistoryChanged(agent_id) => {
+                            let Some((original_agent, _owner)) = &history else { continue };
+                            if agent_id != original_agent { continue; }
+                            if !buffer.is_empty() {
+                                deadline = None;
+                                if out.send(Delivery::Batch(std::mem::take(&mut buffer))).await.is_err() { return; }
+                            }
+                            if out.send(Delivery::HistoryChanged).await.is_err() { return; }
+                            continue;
+                        }
+                        BroadcastEvent::Monitor(ev) => {
+                            let Some(recipient) = &recipient else { continue };
+                            if !event_matches(&filter, &ev.event) { continue; }
+                            // Preserve barriers across public batches without a
+                            // second queue or a plain-event private fallback.
+                            if !buffer.is_empty() {
+                                deadline = None;
+                                if out.send(Delivery::Batch(std::mem::take(&mut buffer))).await.is_err() { return; }
+                            }
+                            if let Ok(output) = recipient.project(ev).await {
+                                if out.send(Delivery::Monitor(output)).await.is_err() { return; }
+                            }
+                            continue;
+                        }
+                    };
+                    if !event_matches(&filter, ev) {
                         continue;
                     }
                     match batch_window {

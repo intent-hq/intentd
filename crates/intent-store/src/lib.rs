@@ -96,8 +96,10 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage, SessionMessageProjection,
-    UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
+    PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
+    ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -118,7 +120,7 @@ pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
     pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
     MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
-    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
+    PreparedMonitorWrite, QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
@@ -435,7 +437,7 @@ impl Store {
         // database must never hydrate or convert the stale note backlog.
         let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
         let note_index_jobs = note_index_job::domain_for(db_path)?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
             note_pages,

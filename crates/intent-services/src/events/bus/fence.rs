@@ -1,5 +1,5 @@
 //! Private raw-delivery receipts. Controls never occupy the broadcast ring.
-use super::{Delivery, Event};
+use super::{BroadcastEvent, Delivery, Event};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -7,12 +7,12 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// A captured cursor counts raw deliveries, including filtered transient events.
 #[derive(Clone)]
 pub(crate) struct RawBus {
-    pub(super) sender: broadcast::Sender<Arc<Event>>,
+    pub(super) sender: broadcast::Sender<Arc<BroadcastEvent>>,
     tail: Arc<Mutex<u128>>,
 }
 
-impl From<broadcast::Sender<Arc<Event>>> for RawBus {
-    fn from(sender: broadcast::Sender<Arc<Event>>) -> Self {
+impl From<broadcast::Sender<Arc<BroadcastEvent>>> for RawBus {
+    fn from(sender: broadcast::Sender<Arc<BroadcastEvent>>) -> Self {
         Self {
             sender,
             tail: Arc::new(Mutex::new(0)),
@@ -21,14 +21,14 @@ impl From<broadcast::Sender<Arc<Event>>> for RawBus {
 }
 
 impl std::ops::Deref for RawBus {
-    type Target = broadcast::Sender<Arc<Event>>;
+    type Target = broadcast::Sender<Arc<BroadcastEvent>>;
     fn deref(&self) -> &Self::Target {
         &self.sender
     }
 }
 
 impl RawBus {
-    pub(super) fn send(&self, event: Arc<Event>) {
+    pub(super) fn send(&self, event: Arc<BroadcastEvent>) {
         let mut tail = self.tail.lock().expect("raw bus cursor");
         *tail += 1;
         let _ = self.sender.send(event);
@@ -37,7 +37,7 @@ impl RawBus {
     pub(super) fn receiver(
         &self,
     ) -> (
-        broadcast::Receiver<Arc<Event>>,
+        broadcast::Receiver<Arc<BroadcastEvent>>,
         u128,
         FenceHandle,
         mpsc::Receiver<FenceRequest>,
@@ -126,7 +126,7 @@ mod tests {
             batch_window: Some(window),
             ..Default::default()
         };
-        let worker = super::super::delivery_task(rx, filter, out, observed, requests);
+        let worker = super::super::delivery_task(rx, filter, out, observed, requests, None, None);
         tokio::pin!(worker);
         let event = Event {
             id: "buffered".into(),
@@ -140,7 +140,7 @@ mod tests {
             metadata: None,
             data: serde_json::json!({}),
         };
-        raw.send(Arc::new(event));
+        raw.send(Arc::new(BroadcastEvent::Public(event)));
         assert!(worker
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))

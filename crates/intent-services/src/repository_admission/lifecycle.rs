@@ -17,15 +17,43 @@ use super::{AdmissionError, AdmissionResult, RepositoryRetirement};
 #[derive(Default)]
 struct State {
     next_id: u64,
+    shutdown: bool,
     pending: HashMap<u64, HashSet<RepositoryLifecycleKey>>,
     subscriptions: HashMap<u64, Subscription>,
     retiring: HashMap<u64, Subscription>,
     origins: HashMap<u64, Origin>,
     creations: HashMap<u64, physical_owner::Pending>,
+    native_retirements: Vec<(
+        HashSet<RepositoryLifecycleKey>,
+        Arc<native_allocation::NativeAllocation>,
+    )>,
 }
 
 impl State {
+    fn prune_joined_native_retirements(&mut self) {
+        self.native_retirements
+            .retain(|(_, native)| !native.is_joined());
+    }
+
+    fn retain_native_retirement(
+        &mut self,
+        keys: HashSet<RepositoryLifecycleKey>,
+        native: Arc<native_allocation::NativeAllocation>,
+    ) {
+        native.retire();
+        self.prune_joined_native_retirements();
+        if !native.is_joined()
+            && !self
+                .native_retirements
+                .iter()
+                .any(|(_, old)| Arc::ptr_eq(old, &native))
+        {
+            self.native_retirements.push((keys, native));
+        }
+    }
+
     fn next(&mut self) -> AdmissionResult<u64> {
+        self.prune_joined_native_retirements();
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -34,7 +62,7 @@ impl State {
     }
 
     fn blocked(&self, keys: &HashSet<RepositoryLifecycleKey>) -> bool {
-        self.pending.values().any(|pending| overlaps(pending, keys))
+        self.shutdown || self.pending.values().any(|pending| overlaps(pending, keys))
     }
 
     fn detach(&mut self, matches: impl Fn(&Subscription) -> bool) {
@@ -74,6 +102,7 @@ struct Origin {
     caller: Caller,
     keys: HashSet<RepositoryLifecycleKey>,
     retired: bool,
+    native: Option<Arc<native_allocation::NativeAllocation>>,
 }
 
 fn overlaps(
@@ -96,6 +125,14 @@ pub(crate) struct RepositoryPhysicalOrigin {
     registry: Weak<RepositoryLifecycleRegistry>,
     id: u64,
     token: Weak<()>,
+}
+
+impl RepositoryPhysicalOrigin {
+    pub(super) fn same_allocation(&self, other: &Self) -> bool {
+        self.id == other.id
+            && Weak::ptr_eq(&self.registry, &other.registry)
+            && Weak::ptr_eq(&self.token, &other.token)
+    }
 }
 
 /// Caller-owned session input, never a serialized or default permission grant.
@@ -225,6 +262,164 @@ fn finish_retirement(state: &Mutex<State>, leaves: &[(u64, RepositoryRetirement)
 }
 
 impl RepositoryLifecycleRegistry {
+    /// Close this Services lifetime before any shutdown await. Retain the exact
+    /// allocations while their producers and transports can still settle.
+    pub(crate) fn begin_native_shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.shutdown = true;
+        let mut native = physical_owner::shutdown_pending_native(&mut state);
+        native.extend(state.origins.values().filter_map(|origin| {
+            origin
+                .native
+                .clone()
+                .map(|native| (origin.keys.clone(), native))
+        }));
+        for (keys, native) in native {
+            state.retain_native_retirement(keys, native);
+        }
+    }
+
+    /// Read actual terminal outcomes, not merely completion of driver tasks.
+    /// Unknown/negative obligations remain retained for every later waiter.
+    pub(crate) async fn join_native_shutdown(&self) -> AdmissionResult<()> {
+        self.begin_native_shutdown();
+        let native = self
+            .state
+            .lock()
+            .map_err(|_| AdmissionError::Unavailable)?
+            .native_retirements
+            .iter()
+            .map(|(_, native)| native.clone())
+            .collect::<Vec<_>>();
+        let mut outcome = Ok(());
+        for original in native {
+            if let Err(error) = original.join().await {
+                outcome = Err(error);
+            }
+        }
+        self.state
+            .lock()
+            .map_err(|_| AdmissionError::Unavailable)?
+            .prune_joined_native_retirements();
+        outcome
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn verify_native_retirement_churn(
+        callbacks: intent_acp::callback_registration::CallbackClient,
+    ) {
+        use intent_acp::review_monitoring::ReviewMonitoringContext;
+        use native_allocation::NativeAllocation;
+        let keys = HashSet::from([RepositoryLifecycleKey::Database]);
+        let mut state = State::default();
+        let pending = NativeAllocation::new(
+            callbacks.clone(),
+            ReviewMonitoringContext::new("pending-family".into()).unwrap(),
+        );
+        let unknown = NativeAllocation::new(
+            callbacks.clone(),
+            ReviewMonitoringContext::new("unknown-family".into()).unwrap(),
+        );
+        state.retain_native_retirement(keys.clone(), pending.clone());
+        state.retain_native_retirement(keys.clone(), unknown.clone());
+        unknown.producer_finished();
+        unknown.clone().drive().await;
+        assert!(unknown.join().await.is_err());
+        for _ in 0..16 {
+            let native = NativeAllocation::new(
+                callbacks.clone(),
+                ReviewMonitoringContext::new("churn-family".into()).unwrap(),
+            );
+            native.bind_response("native-original").unwrap();
+            let weak = Arc::downgrade(&native);
+            state.retain_native_retirement(keys.clone(), native.clone());
+            let driver = intent_core::caller::spawn_with_current_caller(native.clone().drive());
+            native.join().await.unwrap();
+            driver.await.unwrap();
+            state.prune_joined_native_retirements();
+            assert_eq!(
+                state.native_retirements.len(),
+                2,
+                "churn retained completed entries or pruned uncertain originals"
+            );
+            assert!(state
+                .native_retirements
+                .iter()
+                .any(|(_, old)| Arc::ptr_eq(old, &pending)));
+            assert!(state
+                .native_retirements
+                .iter()
+                .any(|(_, old)| Arc::ptr_eq(old, &unknown)));
+            native.join().await.unwrap();
+            drop(native);
+            assert!(
+                weak.upgrade().is_none(),
+                "pruned exact allocation still owned"
+            );
+        }
+        assert!(!pending.is_joined());
+        assert!(!unknown.is_joined());
+    }
+
+    /// Snapshot original obligations under the registry, then join without any
+    /// registry lock. Settlement callers must retain their original barrier.
+    pub(crate) async fn join_native_retirements(
+        &self,
+        keys: &[RepositoryLifecycleKey],
+    ) -> AdmissionResult<()> {
+        let keys = keys.iter().cloned().collect::<HashSet<_>>();
+        let obligations = {
+            let state = self.state.lock().map_err(|_| AdmissionError::Retired)?;
+            native_obligations(&state, &keys)
+        };
+        for native in obligations {
+            native.join().await?;
+        }
+        self.state
+            .lock()
+            .map_err(|_| AdmissionError::Retired)?
+            .prune_joined_native_retirements();
+        Ok(())
+    }
+
+    /// Resolve only the allocation retained by this captured physical token.
+    /// Release the registry before acquiring credential or ACP transfer fences.
+    pub(super) fn native_allocation(
+        self: &Arc<Self>,
+        origin: &RepositoryPhysicalOrigin,
+        caller: &Caller,
+    ) -> AdmissionResult<Arc<native_allocation::NativeAllocation>> {
+        let bound = origin.registry.upgrade().ok_or(AdmissionError::Retired)?;
+        if !Arc::ptr_eq(self, &bound) {
+            return Err(AdmissionError::Denied);
+        }
+        let state = self.state.lock().map_err(|_| AdmissionError::Retired)?;
+        let physical = state
+            .origins
+            .get(&origin.id)
+            .ok_or(AdmissionError::Retired)?;
+        if physical.retired
+            || physical.token.upgrade().is_none()
+            || origin.token.upgrade().is_none()
+        {
+            return Err(AdmissionError::Retired);
+        }
+        if &physical.caller != caller || !Weak::ptr_eq(&physical.token, &origin.token) {
+            return Err(AdmissionError::Denied);
+        }
+        if state.blocked(&physical.keys) {
+            return Err(AdmissionError::Retired);
+        }
+        let native = physical.native.clone().ok_or(AdmissionError::Unavailable)?;
+        if native.is_retired() {
+            return Err(AdmissionError::Retired);
+        }
+        Ok(native)
+    }
+
     pub(super) fn capture_request(
         self: &Arc<Self>,
         origin: &RepositoryPhysicalOrigin,
@@ -323,14 +518,51 @@ impl RepositoryLifecycleRegistry {
     }
 }
 
+fn native_obligations(
+    state: &State,
+    keys: &HashSet<RepositoryLifecycleKey>,
+) -> Vec<Arc<native_allocation::NativeAllocation>> {
+    let mut obligations = physical_owner::pending_native_retirements(state, keys);
+    for (source, native) in &state.native_retirements {
+        if overlaps(keys, source) && !obligations.iter().any(|old| Arc::ptr_eq(old, native)) {
+            obligations.push(native.clone());
+        }
+    }
+    obligations
+}
+
 struct Mutation {
     state: Arc<Mutex<State>>,
     id: u64,
 }
 
 impl RepositoryLifecycleMutationTicket for Mutation {
+    fn settle_after_retirement(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = intent_core::Result<()>> + Send>> {
+        Box::pin(async move {
+            let obligations = {
+                let state = self.state.lock().map_err(|_| {
+                    intent_core::Error::Internal("original native retirement unavailable".into())
+                })?;
+                let keys = state.pending.get(&self.id).ok_or_else(|| {
+                    intent_core::Error::Internal("original native retirement unavailable".into())
+                })?;
+                native_obligations(&state, keys)
+            };
+            for native in obligations {
+                native.join().await.map_err(|_| {
+                    intent_core::Error::Internal("original native retirement unconfirmed".into())
+                })?;
+            }
+            self.settle_confirmed();
+            Ok(())
+        })
+    }
+
     fn settle_confirmed(self: Box<Self>) {
         if let Ok(mut state) = self.state.lock() {
+            state.prune_joined_native_retirements();
             state.pending.remove(&self.id);
         }
     }
@@ -351,8 +583,23 @@ impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
         let mut state = self.state.lock().map_err(|_| denied())?;
         let id = state.next().map_err(|_| denied())?;
         state.pending.insert(id, keys.clone());
-        // A reversible grace marker ends requests, preserving original physical
-        // owners and pending creators. Fresh requests still wait for settlement.
+        // Preserve ordinary physical owners, but a qualified private native
+        // context cannot keep dispatching after its pending-delete fence closes.
+        let native = state
+            .origins
+            .values()
+            .filter(|origin| overlaps(&keys, &origin.keys))
+            .filter_map(|origin| {
+                origin
+                    .native
+                    .clone()
+                    .map(|native| (origin.keys.clone(), native))
+            })
+            .collect::<Vec<_>>();
+        for (source, native) in native {
+            state.retain_native_retirement(source, native);
+        }
+        physical_owner::retire_pending_native_contexts(&mut state, &keys);
         state.detach(|entry| overlaps(&keys, &entry.keys));
         let retire = state.pending_leaves(|entry| overlaps(&keys, &entry.keys));
         drop(state);
@@ -385,12 +632,19 @@ impl RepositoryLifecycleObserver for RepositoryLifecycleRegistry {
         let id = state.next().map_err(|_| denied())?;
         state.pending.insert(id, keys.clone());
         physical_owner::invalidate_pending(&mut state, &keys, None);
+        let mut native = Vec::new();
         let mut origins = HashSet::new();
         for (origin_id, origin) in &mut state.origins {
             if overlaps(&keys, &origin.keys) {
                 origin.retired = true;
+                if let Some(allocation) = origin.native.clone() {
+                    native.push((origin.keys.clone(), allocation));
+                }
                 origins.insert(*origin_id);
             }
+        }
+        for (keys, allocation) in native {
+            state.retain_native_retirement(keys, allocation);
         }
         let affected =
             |entry: &Subscription| origins.contains(&entry.origin) || overlaps(&keys, &entry.keys);
@@ -436,6 +690,7 @@ impl RepositoryWireOrigin {
                 caller: original.caller().clone(),
                 keys,
                 retired: false,
+                native: None,
             },
         );
         Ok(Self {
@@ -506,6 +761,7 @@ impl FixtureOriginOwner {
                 caller,
                 keys,
                 retired: false,
+                native: None,
             },
         );
         Ok(Self {
@@ -547,3 +803,6 @@ mod tests;
 
 #[path = "lifecycle/physical_owner.rs"]
 pub(crate) mod physical_owner;
+
+#[path = "lifecycle/native_allocation.rs"]
+pub(crate) mod native_allocation;

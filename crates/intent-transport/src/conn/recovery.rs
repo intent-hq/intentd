@@ -83,6 +83,16 @@ impl Output {
     }
     /// Capture control metadata before the writer takes ownership of the frame.
     /// Ordinary traffic does not copy its payload.
+    pub(crate) fn prepare_frame(&self, frame: &crate::OutboundFrame) -> PendingWrite {
+        frame.public_text().map_or_else(
+            || PendingWrite {
+                output: self.clone(),
+                frame: None,
+                leases: Vec::new(),
+            },
+            |text| self.prepare(text),
+        )
+    }
     pub(crate) fn prepare(&self, frame: &str) -> PendingWrite {
         let receipts = self.receipts.lock().expect("receipts");
         let (frame, leases) = receipts.get(frame).map_or((None, Vec::new()), |receipt| {
@@ -94,6 +104,7 @@ impl Output {
             leases,
         }
     }
+    #[cfg(test)]
     pub(crate) async fn write<F: Future<Output = bool>>(&self, frame: &str, write: F) -> bool {
         self.prepare(frame).finish(write).await
     }
@@ -393,7 +404,7 @@ impl Forwarder {
             // Re-authorize buffered frames AFTER acquiring output capacity.
             match self.allowed(item.event()).await {
                 Some(true) if !self.out.recovery.is_closed() => {
-                    permit.send(item.into_frame(&self.id));
+                    permit.send(item.into_frame(&self.id).into());
                     return true;
                 }
                 Some(false) => return true,
@@ -409,7 +420,7 @@ impl Forwarder {
         }
         true
     }
-    async fn control(&mut self, frame: String) -> bool {
+    async fn control(&mut self, frame: crate::OutboundFrame) -> bool {
         let lane = self.out.bulk_sender();
         loop {
             match guarded(lane.reserve(), &mut self.membership).await {
@@ -452,7 +463,7 @@ impl Forwarder {
             return false;
         };
         let work = async {
-            if !self.drain().await || !self.control(frame.clone()).await {
+            if !self.drain().await || !self.control(frame.clone().into()).await {
                 return false;
             }
             loop {
@@ -555,6 +566,16 @@ pub(super) async fn forward(
                 }
                 Input::Delivery(Some(Delivery::Lagged(_))) => {
                     if f.recovery && !f.loss().await {
+                        return;
+                    }
+                }
+                Input::Delivery(Some(Delivery::HistoryChanged)) => {}
+                Input::Delivery(Some(Delivery::Monitor(output))) => {
+                    if !f.drain().await
+                        || !f
+                            .control(crate::OutboundFrame::private(output.into_output()))
+                            .await
+                    {
                         return;
                     }
                 }

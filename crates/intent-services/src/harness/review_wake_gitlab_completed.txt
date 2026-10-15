@@ -1,0 +1,6 @@
+[MR monitor Team/Sub/App!7] "Review" was MERGED (https://git.example:8443/gitlab/Team/Sub/App/-/merge_requests/7).
+
+Monitoring has STOPPED — this monitor is retired and will not report again.
+
+Changes since the last report:
+- state: open → merged
