@@ -23,6 +23,7 @@ agent-client-protocol = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

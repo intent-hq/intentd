@@ -272,6 +272,7 @@ pub(crate) struct CacheDelivery {
     cache: usize,
     receipt: Arc<dyn Any + Send + Sync>,
     check: Arc<DeliveryCheck>,
+    controls: Vec<Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>>,
 }
 type DeliveryCheck =
     dyn Fn(&[&CacheDelivery], &mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Send + Sync;
@@ -285,7 +286,9 @@ impl CacheDelivery {
         &self,
         action: &mut CacheAdmissionAction<'_>,
     ) -> CredentialResult<()> {
-        (self.check)(&[self], action)
+        Self::with_controls(&self.controls.iter().collect::<Vec<_>>(), &mut || {
+            (self.check)(&[self], action)
+        })
     }
 
     /// A request may retain several reads (and repeated aliases) from the same
@@ -297,7 +300,33 @@ impl CacheDelivery {
     ) -> CredentialResult<()> {
         let mut ordered = deliveries.to_vec();
         ordered.sort_unstable_by_key(|delivery| delivery.cache);
-        Self::with_groups(&ordered, action)
+        let mut controls = deliveries
+            .iter()
+            .flat_map(|d| d.controls.iter())
+            .collect::<Vec<_>>();
+        controls.sort_unstable_by_key(|c| Arc::as_ptr(c).cast::<()>() as usize);
+        controls.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        Self::with_controls(&controls, &mut || Self::with_groups(&ordered, action))
+    }
+
+    /// Retain the requesting native lifetime alongside the original observation.
+    /// All later queue, prepared SQL, prompt-transfer and ACK uses share it.
+    pub(crate) fn with_control(
+        mut self,
+        control: Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>,
+    ) -> Self {
+        self.controls.push(control);
+        self
+    }
+
+    fn with_controls(
+        controls: &[&Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>],
+        action: &mut CacheAdmissionAction<'_>,
+    ) -> CredentialResult<()> {
+        let Some((first, rest)) = controls.split_first() else {
+            return action();
+        };
+        with_monitor_control(first.as_ref(), &mut || Self::with_controls(rest, action))
     }
 
     fn with_groups(
@@ -331,6 +360,7 @@ fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + '
     let identity = cache.as_ptr().addr();
     CacheDelivery {
         cache: identity,
+        controls: Vec::new(),
         receipt: Arc::new(DeliveryReceipt {
             key,
             connection,
@@ -890,3 +920,19 @@ where
 
 #[cfg(test)]
 mod tests;
+
+/// The native control contributes a lifetime, never forge authority. Keep the
+/// original credential error without nesting another account/cache lock.
+pub(crate) fn with_monitor_control(
+    control: &dyn intent_core::repository_request::RepositoryMonitorEventSource,
+    action: &mut CacheAdmissionAction<'_>,
+) -> CredentialResult<()> {
+    let mut result = None;
+    control
+        .with_current(&mut || {
+            result = Some(action());
+            Ok(())
+        })
+        .map_err(|_| RepositoryCredentialError::Retired)?;
+    result.ok_or(RepositoryCredentialError::Retired)?
+}

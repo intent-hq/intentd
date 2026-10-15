@@ -29,7 +29,8 @@ use crate::repository_admission::request_context::{
 use crate::repository_admission::AdmissionResult;
 use crate::repository_context_live::{PreparedContextFacts, RepositoryContextOwner};
 use crate::repository_read_source::{
-    with_context_only, with_context_records, ContextOptional, OptionalContextOrigin, ReadRecord,
+    with_context_only, with_context_records, ContextOptional, MonitorRecord, OptionalContextOrigin,
+    ReadRecord,
 };
 
 impl RepositoryContextOwner {
@@ -142,6 +143,20 @@ impl McpPrivatePolicy for ContextPolicy {
                         .await
                 };
             };
+            // Optional guidance cannot compose monitor receipts with its Git
+            // source locks. Keep the complete private result under the original
+            // required admission; omit only the optional guidance. Unknown or
+            // retired receipts are still refused by that original policy.
+            if sealed
+                .records()
+                .iter()
+                .any(|record| record.downcast_ref::<MonitorRecord>().is_some())
+            {
+                return self
+                    .original
+                    .admit(boundary, sealed.records(), packet.without_guidance())
+                    .await;
+            }
             let consume = |include| {
                 packet.transfer(
                     boundary,
@@ -380,6 +395,36 @@ impl PromptOrigin {
 }
 
 impl RepositoryPromptContext {
+    pub(crate) async fn recover_monitor(
+        self,
+        row: &intent_store::QualifiedPrMonitor,
+        connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<crate::repository_read_source::MonitorAuthority>> {
+        let services = self.owner.services.clone();
+        let destination = self.into_monitor_destination()?;
+        destination
+            .run(Box::pin(async {
+                let retained = destination.original().read().retain_monitor()?;
+                crate::repository_read_source::MonitorAuthority::recover(
+                    &services, retained, row, connection,
+                )
+                .await
+            }))
+            .await
+    }
+
+    pub(crate) fn into_monitor_destination(
+        self,
+    ) -> AdmissionResult<RepositoryManagerPromptRequest> {
+        match self.original {
+            PromptOrigin::Manager(original) => {
+                original.check_entry()?;
+                Ok(original)
+            }
+            PromptOrigin::Strict(_) => Err(crate::repository_admission::AdmissionError::Denied),
+        }
+    }
+
     pub(crate) fn prepare(self) -> BoxFuture<'static, Option<intent_acp::session::PromptGuidance>> {
         let entry = self.original.construction_check();
         Box::pin(async move {

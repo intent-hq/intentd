@@ -21,8 +21,8 @@ use crate::reverse::ReverseChannel;
 
 /// Build a `ReverseChannel` whose outbound queue is deep enough that
 /// `request()` succeeds up to the timeout.
-fn idle_channel() -> (ReverseChannel, mpsc::Receiver<String>) {
-    let (tx, rx) = mpsc::channel::<String>(4);
+fn idle_channel() -> (ReverseChannel, mpsc::Receiver<crate::OutboundFrame>) {
+    let (tx, rx) = mpsc::channel::<crate::OutboundFrame>(4);
     (ReverseChannel::new(tx), rx)
 }
 
@@ -56,7 +56,7 @@ async fn dispatch_and_reply(
     reg: &PrimaryReverseRegistry,
     target: ReverseTarget,
     channel: &ReverseChannel,
-    rx: &mut mpsc::Receiver<String>,
+    rx: &mut mpsc::Receiver<crate::OutboundFrame>,
     result: serde_json::Value,
 ) -> Result<serde_json::Value, ReverseDispatchError> {
     let dispatch = tokio::spawn({
@@ -146,7 +146,7 @@ async fn ineligible_and_unhelloed_connections_never_receive_default_dispatch() {
 #[tokio::test]
 async fn non_administrator_connections_are_never_eligible_reverse_targets() {
     let reg = PrimaryReverseRegistry::new();
-    let (guest_tx, mut rx_guest) = mpsc::channel::<String>(4);
+    let (guest_tx, mut rx_guest) = mpsc::channel::<crate::OutboundFrame>(4);
     let guest = ReverseChannel::new(guest_tx).with_administrator(false);
     let (owner, mut rx_owner) = idle_channel();
     let g_guest = reg.register(guest, ReverseTransport::Wss);
@@ -466,7 +466,7 @@ fn bind_and_drop_queue_logical_client_transitions_in_mutation_order() {
 fn non_administrator_hellos_never_enter_presence_projections() {
     let reg = PrimaryReverseRegistry::new();
     let mut rx = reg.take_transitions().expect("queue");
-    let (guest_tx, _rx_guest) = mpsc::channel::<String>(4);
+    let (guest_tx, _rx_guest) = mpsc::channel::<crate::OutboundFrame>(4);
     let guest = ReverseChannel::new(guest_tx).with_administrator(false);
     let g_guest = reg.register(guest, ReverseTransport::Wss);
     g_guest.bind(identity("owner", true));

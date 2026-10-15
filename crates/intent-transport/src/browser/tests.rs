@@ -23,7 +23,7 @@ use crate::reverse::{
 /// convention) so a bug that never forwards the frame surfaces as a clear
 /// test failure instead of hanging the runtime.
 fn mock_fe_replies_with(
-    mut out_rx: mpsc::Receiver<String>,
+    mut out_rx: mpsc::Receiver<crate::OutboundFrame>,
     reverse: ReverseChannel,
     reply: Value,
 ) -> tokio::task::JoinHandle<Value> {

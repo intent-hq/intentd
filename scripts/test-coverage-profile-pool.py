@@ -57,11 +57,16 @@ fn main() {
                     f"-instr-profile={merged}"], text=True))
                 return profiles, report
 
-            baseline_files, baseline = collect("baseline", "fixture-%p-%m.profraw")
+            baseline_files, baseline = collect("baseline", "fixture-%p-%32m.profraw")
             pooled_files, pooled = collect("pooled", pattern)
             self.assertEqual(len(baseline_files), 64)
             self.assertGreater(len(pooled_files), 0)
             self.assertLessEqual(len(pooled_files), 8)
+            baseline_bytes = sum(p.stat().st_size for p in baseline_files)
+            pooled_bytes = sum(p.stat().st_size for p in pooled_files)
+            self.assertLess(pooled_bytes, baseline_bytes)
+            print(json.dumps({"baseline_files": len(baseline_files), "pooled_files": len(pooled_files),
+                              "baseline_bytes": baseline_bytes, "pooled_bytes": pooled_bytes}), flush=True)
             self.assertEqual(pooled, baseline, "pooling changed coverage or execution counts")
             functions = {f["name"]: f["count"] for f in pooled["data"][0]["functions"]}
             self.assertIn(42, functions.values())
