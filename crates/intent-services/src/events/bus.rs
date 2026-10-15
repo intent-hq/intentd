@@ -29,6 +29,9 @@ use uuid::Uuid;
 
 use super::filter::{event_matches, SubscriptionFilter};
 
+mod invalidation;
+pub use invalidation::InvalidationSubscription;
+
 /// Capacity of the broadcast channel that fans published events out to every
 /// subscriber's delivery task. Slow subscribers that fall this far behind are
 /// signalled via `Lagged` and skip the dropped events (they remain in the log).

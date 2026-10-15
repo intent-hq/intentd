@@ -268,7 +268,9 @@ pub fn is_numbered_read_presentation(content: &str) -> bool {
     let Some(first) = lines.next().and_then(numbered_read_line) else {
         return false;
     };
-    lines.next().and_then(numbered_read_line) == Some(first + 1)
+    first
+        .checked_add(1)
+        .is_some_and(|next| lines.next().and_then(numbered_read_line) == Some(next))
 }
 
 /// Write-path guard for every content-accepting `ws.note.*` mutation and
@@ -1958,6 +1960,18 @@ mod tests {
         assert!(validate_set_content("  ").is_err());
         assert!(validate_set_content("\"quoted\" lead").is_ok());
         assert!(validate_set_content("long enough\nto keep...").is_ok());
+    }
+
+    #[test]
+    fn numbered_read_presentation_checks_counter_overflow_without_wrapping() {
+        for suffix in ["", "\nplain", "\n   0 | wrapped"] {
+            assert!(!is_numbered_read_presentation(&format!(
+                "18446744073709551615 | last{suffix}"
+            )));
+        }
+        assert!(is_numbered_read_presentation(
+            "18446744073709551614 | before\n18446744073709551615 | last"
+        ));
     }
 
     #[test]

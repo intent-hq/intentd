@@ -780,9 +780,38 @@ async function handlePrompt(id, params) {
   const toolResults = [];
   for (const toolCall of toolCalls) {
     try {
+      // Opt-in real-time tool lifecycle: expose the open call before invoking
+      // MCP, with a test-owned barrier to observe the pre-write state.
+      const earlyToolCallId = active.toolInvocationReleaseFile
+        ? `tc_${Math.random().toString(36).slice(2, 11)}`
+        : null;
+      if (earlyToolCallId) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call', toolCallId: earlyToolCallId,
+            title: toolCall.name, name: toolCall.name, kind: 'mcp',
+            status: 'in_progress', rawInput: toolCall.arguments || {},
+          },
+        });
+        const deadline = Date.now() + 10_000;
+        while (!fs.existsSync(active.toolInvocationReleaseFile)) {
+          if (Date.now() >= deadline) throw new Error('tool invocation barrier timed out');
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      }
       const res = await callWorkspaceTool(toolCall);
+      if (earlyToolCallId) {
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call_update', toolCallId: earlyToolCallId,
+            status: res.isError ? 'failed' : 'completed', rawOutput: res.content,
+          },
+        });
+      }
       log(`tool call ok: ${JSON.stringify(res).slice(0, 120)}`);
-      toolResults.push({ toolCall, result: res });
+      toolResults.push({ toolCall, result: res, earlyToolCallId });
     } catch (err) {
       log(`tool call failed: ${err.message}`);
       return result(id, { stopReason: 'refusal' });
@@ -892,7 +921,8 @@ async function handlePrompt(id, params) {
 
   // Emit tool blocks if emitToolBlocks is enabled (opt-in for transcript persistence testing)
   if (active.emitToolBlocks && toolResults.length > 0) {
-    for (const { toolCall, result } of toolResults) {
+    for (const { toolCall, result, earlyToolCallId } of toolResults) {
+      if (earlyToolCallId) continue;
       // Emit tool_call notification (creates tool_use block in transcript)
       const toolCallId = `tc_${Math.random().toString(36).slice(2, 11)}`;
       const rawInput = toolCall.arguments || {};
@@ -1222,6 +1252,14 @@ async function dispatch(msg) {
       });
     }
     case 'session/prompt':
+      // Codex's supported title control is not a model turn or transcript item.
+      if (process.env.CODEX_PATH && extractPromptText(msg.params).startsWith('/rename ')) {
+        note('session/update', {
+          sessionId: msg.params.sessionId,
+          update: { sessionUpdate: 'session_info_update', title: extractPromptText(msg.params).slice(8).trim() },
+        });
+        return result(msg.id, { stopReason: 'end_turn' });
+      }
       // Test-owned receipt barrier: turnInFlight can be true before this child
       // records the prompt. Hold only the selected current prompt, so replayed
       // history in a fresh child's follow-up cannot accidentally re-enter it.

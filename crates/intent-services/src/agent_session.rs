@@ -2854,6 +2854,16 @@ impl Services {
                 )
         }
         .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                opened.response.session_id.0.as_ref(),
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+        }
         Ok(PreparedAcpSession {
             response: opened.response,
             query: opened.query,
@@ -3187,6 +3197,16 @@ impl Services {
                 )
         }
         .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                &acp_session_id,
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+        }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
             query: opened.query,

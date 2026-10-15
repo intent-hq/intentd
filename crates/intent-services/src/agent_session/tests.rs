@@ -677,6 +677,20 @@ where
                 continue;
             };
             seen.lock().unwrap().push(value.clone());
+            if method == "session/prompt" {
+                if let Some(title) = value["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .and_then(|text| text.strip_prefix("/rename "))
+                {
+                    let note = json!({"jsonrpc":"2.0", "method":"session/update",
+                        "params":{"sessionId":value["params"]["sessionId"],
+                            "update":{"sessionUpdate":"session_info_update", "title":title.trim()}}});
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
             let result = match method {
                 "initialize" => {
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })

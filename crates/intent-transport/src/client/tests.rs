@@ -101,10 +101,16 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
     for local in [true, false] {
         let server = server_json(false, "linux", "x86_64", "test", None, local);
         assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(
+            server["capabilities"]["workspaceMembershipEvents"],
+            json!(1)
+        );
         assert_eq!(server["capabilities"]["invitationAccountSearch"], 1);
         assert_eq!(server["capabilities"]["personalPairing"], 1);
         assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
         assert_eq!(server["capabilities"]["agentRetire"], 1);
+        assert_eq!(server["capabilities"]["scriptMonitors"], 2);
+        assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
         assert_eq!(server["capabilities"]["submissionCorrelation"], json!(1));
         for capability in [
             "repositoryContext",
@@ -414,4 +420,33 @@ async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
         // input takes the same path; there is no connection-local namespace map.
         binding = None;
     }
+}
+
+#[tokio::test]
+async fn paging_only_api_does_not_advertise_delete_grace() {
+    struct PagingOnly;
+    impl WorkspaceApi for PagingOnly {
+        fn note_paging_backend_id(&self) -> Option<String> {
+            Some("paging-only".into())
+        }
+        fn upsert_client(
+            &self,
+            _id: ClientId,
+            _name: Option<String>,
+            _capabilities: Option<Value>,
+            _host: ClientHostInfo,
+        ) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let req =
+        classify(&json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{}})).unwrap();
+    let result = parsed(handle(req, &PagingOnly, &mut None, true).await);
+    assert_eq!(
+        result["result"]["server"]["capabilities"]["notePagingRead"],
+        1
+    );
+    assert!(result["result"]["server"]["capabilities"]
+        .get("noteDeleteGrace")
+        .is_none());
 }
