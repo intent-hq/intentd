@@ -282,8 +282,9 @@ view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
 workspaces remain visible. In list view, **Status** groups workspace statuses in
 this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
-**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
-**Done & idle** (waiting, idle, or complete).
+**In progress**, **Waiting** (when a reminder is personally dismissed),
+**PR open**, **PR mergeable**, **PR queued**, **PR merged**, then **Done & idle**
+(idle or complete).
 **Repository** groups by repository; **None** removes grouping.
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
