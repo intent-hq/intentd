@@ -67,6 +67,8 @@ mod sharing_projection;
 mod stop_redelivery_repo;
 mod subscription_agent_repo;
 mod task_agent_link_repo;
+mod task_event_repo;
+pub use task_event_repo::TaskEventBaselines;
 mod tracked_changes_repo;
 mod transfer_authorship;
 mod transfer_repo;
@@ -382,6 +384,8 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    task_event_baselines: std::sync::Arc<TaskEventBaselines>,
+    task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
     note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
@@ -435,6 +439,8 @@ impl Store {
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            task_event_baselines: std::sync::Arc::default(),
+            task_events_enabled: std::sync::Arc::default(),
             note_index_jobs,
             note_index_owner: std::sync::Arc::default(),
             write_pool,

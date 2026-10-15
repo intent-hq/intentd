@@ -191,6 +191,7 @@ impl Store {
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the
         // DEFERRED-mode transaction-upgrade race that surfaces SQLITE_BUSY
         // when concurrent connections hold read locks (STAB-1).
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         // Execute the transaction body; rollback explicitly on error.

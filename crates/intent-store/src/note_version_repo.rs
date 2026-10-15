@@ -108,6 +108,7 @@ impl Store {
         date: &str,
         orphaned: &[String],
     ) -> Result<(i64, i64)> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         let result = async {
@@ -188,6 +189,7 @@ impl Store {
         date: &str,
         orphaned: &[String],
     ) -> Result<(i64, i64)> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         // The gated parent UPDATE runs first so a miss leaves the body with
@@ -254,6 +256,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<i64> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         let result = async {

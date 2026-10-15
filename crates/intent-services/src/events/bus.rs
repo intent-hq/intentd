@@ -30,6 +30,7 @@ use uuid::Uuid;
 use super::filter::{event_matches, SubscriptionFilter};
 
 mod invalidation;
+mod task_push;
 pub use invalidation::InvalidationSubscription;
 
 /// Capacity of the broadcast channel that fans published events out to every
@@ -126,12 +127,14 @@ pub struct EventBus {
     /// Attribution names by principal, each with its load time; entries
     /// older than [`ATTRIBUTION_NAME_TTL`] are reloaded on next use.
     attribution_names: Arc<Mutex<HashMap<PrincipalId, (Instant, String)>>>,
+    task_event_baselines: Arc<intent_store::TaskEventBaselines>,
 }
 
 impl EventBus {
     /// Wire a bus over a persistence handle and spawn the writer task.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        let task_event_baselines = store.task_event_baselines();
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_CHANNEL_CAPACITY);
         // Spawn the writer task that drains events and batch-persists them.
@@ -142,6 +145,7 @@ impl EventBus {
             writer_tx: Arc::new(Mutex::new(Some(writer_tx))),
             writer: Arc::new(tokio::sync::Mutex::new(Some(writer))),
             attribution_names: Arc::default(),
+            task_event_baselines,
         }
     }
 
@@ -214,6 +218,24 @@ impl EventBus {
     /// # Panics
     /// Panics if the writer admission mutex is poisoned.
     pub async fn publish(&self, ev: &NewEvent) -> Result<Event> {
+        if matches!(
+            ev.event_type.as_str(),
+            intent_core::events::NOTE_CREATED
+                | intent_core::events::NOTE_UPDATED
+                | intent_core::events::NOTE_DELETED
+                | intent_core::events::TASK_CREATED
+                | intent_core::events::TASK_STATUS_CHANGED
+        ) {
+            // Keep projection futures off the deeply nested agent delivery stack.
+            return Box::pin(self.publish_note_and_task_changes(ev)).await;
+        }
+        if ev.event_type == intent_core::events::WORKSPACE_DELETED {
+            self.task_event_baselines.remove(&ev.workspace_id);
+        }
+        self.publish_raw(ev).await
+    }
+
+    async fn publish_raw(&self, ev: &NewEvent) -> Result<Event> {
         // Admission also covers the attribution lookup, which uses the store.
         // The admitted sender keeps the receiver alive through enqueue; no
         // new sender can be obtained once shutdown takes the shared sender.

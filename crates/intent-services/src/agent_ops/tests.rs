@@ -48410,3 +48410,34 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             .is_empty());
     }
 }
+
+#[intent_test_macros::daemon_test]
+async fn task_push_assignment_cleanup_publishes_complete_metadata() {
+    let (_tmp, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Cleanup").await;
+    let stale = AgentId::from("stale-assignment");
+    let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
+    note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
+    svc.store().update_note_metadata(&note).await.unwrap();
+    let bus = EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus.clone());
+    svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])
+        .await
+        .unwrap();
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec![intent_core::events::NOTE_UPDATED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["note"]["id"], note_id.as_str());
+    assert!(events[0].data["note"]["metadata"]["task"]
+        .get("assignedAgentIds")
+        .is_none());
+    assert!(events[0].data["note"].get("content").is_none());
+    bus.shutdown().await.unwrap();
+}
