@@ -245,6 +245,25 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+## Home Workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+
+In **Home → Workspaces**, open **View options → Group by** in either list or board
+view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
+groups. In list view, **Status** groups workspace statuses in this order:
+**Needs attention** (failed, blocked, or needing attention), **Not started**,
+**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
+**Done & idle** (idle or complete).
+**Repository** groups by repository; **None** removes grouping.
+
+The board uses **Activity** while the list is grouped by **Status**. Switching back
+to the list restores its detailed groups.
+
+The grouping choice is remembered with Home's settings for the current signed-in
+user and connected backend. **Activity** remains the default; existing saved
+grouping choices keep their behavior.
+
 ## Home workspace status icons
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
@@ -296,7 +315,7 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,ChatPanel}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
 In the existing conversation, **Couldn't complete this response** summarizes a
 stopped response. Open **Details** to inspect the technical error, then **Copy
@@ -306,6 +325,10 @@ scheduled. Inspect that message and use its available controls before sending
 another copy. Active work keeps its normal **Thinking** or activity status; do not
 infer a retry from that status alone. Controls depend on the conversation's state
 and your access.
+
+For one queued message, use **Edit**, **Send now**, or **Remove** in the queue
+header. While editing, **Save** and **Cancel** stay beside the message. With
+several queued messages, each message has its own controls; the header offers bulk actions.
 
 Earlier failures may appear as **1 recorded failure** or **N recorded failures**.
 Expand that label to inspect the saved errors and timestamps and use **Copy
@@ -385,7 +408,10 @@ succeeded. Use live workspace, note, and agent tools for actual IDs, progress, a
 available actions. Never construct links from guessed IDs or claim completion from
 this static guide.
 
-Workspace file links open a file panel. Excel workbooks and other binary files
+Workspace file links open a file panel. Markdown files open in a read-only preview
+that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
 Binary files are not editable in the file panel or Files view. Delete is unavailable
@@ -393,7 +419,7 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
 
 ## Daemon lifecycle from the terminal
 

@@ -41,6 +41,8 @@ mod metrics_repo;
 mod node_repo;
 pub mod note_annotation_repo;
 pub mod note_delete_repo;
+mod note_index_budget;
+mod note_index_job;
 mod note_line_attribution_repo;
 mod note_page_html;
 mod note_page_index;
@@ -380,6 +382,8 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
+    note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -423,29 +427,16 @@ impl Store {
         })?;
         let write_pool = StorePool::new(write_pool, owner.is_some());
         let read_pool = StorePool::new(read_pool, owner.is_some());
-        // Keep the derived-index startup future off enclosing callers' stacks,
-        // and leave the read pool cold until the first actual read.
-        let note_pages = std::sync::Arc::new(
-            Box::pin(async {
-                let mut index_conn =
-                    note_write_connection::NoteWriteConnection::begin_pool(&write_pool).await?;
-                let indexed = async {
-                    note_page_index::retire_changed_profiles(&mut index_conn).await?;
-                    note_page_index::rebuild_pending(&mut index_conn).await?;
-                    note_annotation_repo::rebuild_pending_source_anchors(&mut index_conn).await
-                }
-                .await;
-                index_conn
-                    .finish(indexed, "note index backfill commit")
-                    .await?;
-                note_page_repo::Runtime::open(&write_pool).await
-            })
-            .await?,
-        );
+        // Profiles/readiness are checked only for a demanded note. Opening the
+        // database must never hydrate or convert the stale note backlog.
+        let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
+        let note_index_jobs = note_index_job::domain_for(db_path)?;
         lifecycle.settle();
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            note_index_jobs,
+            note_index_owner: std::sync::Arc::default(),
             write_pool,
             read_pool,
             _daemon_owner: owner,
@@ -690,6 +681,7 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
+        self.note_index_jobs.close(&self.note_index_owner).await;
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).

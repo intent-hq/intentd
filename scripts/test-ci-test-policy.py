@@ -190,10 +190,23 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn("has_selection=" + expected, output)
                 self.assertEqual(json.loads((root / "coverage-changed-plan.json").read_text())["plans"], [])
 
+    def test_full_coverage_budget_includes_report_generation(self):
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+
+    def test_full_coverage_uses_verified_bounded_profile_pool(self):
+        job = self.workflow["jobs"]["coverage-all"]
+        self.assertEqual(job["env"].get("LLVM_PROFILE_FILE_NAME"), "intent-%8m.profraw")
+        proof = next(s for s in job["steps"] if s.get("name") == "Verify bounded coverage profile pooling")
+        self.assertEqual(proof["run"], "python3 -I -B scripts/test-coverage-profile-pool.py")
+        self.assertFalse(proof.get("if"))
+        self.assertFalse(proof.get("continue-on-error"))
+        names = [s.get("name") for s in job["steps"]]
+        self.assertLess(names.index(proof["name"]), names.index("Run combined coverage"))
+
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
         step = next(s for s in job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
-        self.assertEqual(job["timeout-minutes"], 30)
+        self.assertEqual(job["timeout-minutes"], 60)
         names = job["env"]["CALLBACK_FIXTURE_TESTS"].split()
         self.assertEqual(len(names), 6)
         for mode in ("valid", "missing", "extra", "duplicate", "env-failure", "metadata-failure", "list-failure", "run-failure"):

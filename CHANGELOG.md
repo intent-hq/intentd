@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.46] - 2026-10-13
+
+### 📚 Documentation
+
+- Describe Mermaid diagrams in Markdown file previews ([#2402](https://github.com/intent-hq/intentd/pull/2402))
+
+
 ## [0.10.45] - 2026-10-13
 
 ### 📚 Documentation

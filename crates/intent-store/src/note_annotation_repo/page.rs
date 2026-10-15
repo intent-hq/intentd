@@ -63,6 +63,8 @@ struct Query {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Lease {
+    #[serde(default)]
+    content_generation: String,
     scope: NoteScope,
     principal: String,
     source_revision: String,
@@ -264,6 +266,13 @@ impl Store {
         }
         if state["scope"] != serde_json::to_value(scope).map_err(|_| invalid())? {
             return Err(bad_cursor());
+        }
+        if self
+            .ready_note_content_generation(&scope.workspace_id, &scope.note_id)
+            .await?
+            != lease.content_generation
+        {
+            return Err(failure(NotePageError::Expired));
         }
         let epochs = self.note_annotation_epochs(&ws, &note).await?;
         let actual = if lease.query.kind == AnnotationKind::Attribution {

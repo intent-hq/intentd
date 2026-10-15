@@ -460,6 +460,8 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     legacy.run(&pool).await.unwrap();
     let store = Store {
         note_pages: std::sync::Arc::default(),
+        note_index_jobs: std::sync::Arc::default(),
+        note_index_owner: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: pool.into(),
         read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),
