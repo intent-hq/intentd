@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Default-deny isolation for retirement tests, including their child processes.
 
-These suites run on Linux locally and in the ubuntu-latest release-scripts gate.
+These suites run on Linux locally, in release-scripts, and in the cleanup job.
 Install before loading production modules. Unsupported hosts fail closed: never
 silently run cancellation tests without the inherited OS network restriction.
 """
