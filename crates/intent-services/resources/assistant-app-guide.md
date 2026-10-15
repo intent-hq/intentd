@@ -255,7 +255,12 @@ title in the conversation header. The title field uses the available header widt
 Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
 select conversations and cannot be edited there.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; messages/en.json. -->
+
+In **Home → Workspaces**, PR badges update as Intent observes changes.
+**Queued** means the PR is in the merge queue, including while queue checks
+are running. You do not need to open the workspace or hover over the PR to
+receive these updates.
 
 In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
