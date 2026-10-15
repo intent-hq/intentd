@@ -208,6 +208,28 @@ async fn setup_finishes_without_terminal_client_input() {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // Exercise Windows' main-stack budget on Linux too. Runtime worker stacks
+    // do not protect the main thread while it constructs background workers.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: the child-only pre-exec hook calls only setrlimit and obtains
+        // errno on failure; it performs no allocation or locking after fork.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 1024 * 1024,
+                    rlim_max: 1024 * 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_STACK, &raw const limit) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
     let child = command.spawn().expect("spawn daemon");
     let _daemon = common::DaemonGuard::process_only(child);
     timeout(common::daemon_startup_timeout(), async {

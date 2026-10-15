@@ -18,6 +18,7 @@ use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 mod line_attribution_retry;
 mod skill_list;
 mod task_list_latency;
+mod task_push;
 pub(crate) mod workspace_delete;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
@@ -10411,6 +10412,18 @@ mod change_event_parity {
     /// Subscribe to this workspace with immediate (un-batched) delivery.
     fn subscribe(h: &Harness) -> Subscription {
         h.bus.subscribe(SubscriptionFilter {
+            // This suite asserts the legacy event sequence; task_push tests
+            // assert the additive projections independently.
+            event_types: intent_core::events::ALL_EVENT_TYPES
+                .iter()
+                .filter(|event_type| {
+                    !matches!(
+                        **event_type,
+                        "task:updated" | "workspace:task-stats-changed"
+                    )
+                })
+                .map(|event_type| (*event_type).to_owned())
+                .collect(),
             workspace_id: Some(h.ws.0.clone()),
             ..Default::default()
         })
@@ -10459,9 +10472,12 @@ mod change_event_parity {
             .note;
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
+        let mut expected_note = serde_json::to_value(&created).unwrap();
+        expected_note.as_object_mut().unwrap().remove("content");
+        expected_note["metadata"] = json!({});
         assert_eq!(
             ev["data"],
-            json!({ "noteId": created.id.0, "title": "Note", "action": "create" })
+            json!({ "noteId": created.id.0, "title": "Note", "action": "create", "note": expected_note })
         );
     }
 
@@ -11867,10 +11883,12 @@ mod change_event_parity {
         assert_eq!(added.note_rev, 1);
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:updated");
-        assert_eq!(
-            ev["data"],
-            json!({ "noteId": "n-1", "title": "Title", "action": "update" })
-        );
+        assert_eq!(ev["data"]["noteId"], "n-1");
+        assert_eq!(ev["data"]["title"], "Title");
+        assert_eq!(ev["data"]["action"], "update");
+        assert_eq!(ev["data"]["note"]["id"], "n-1");
+        assert_eq!(ev["data"]["note"]["rev"], added.note_rev);
+        assert!(ev["data"]["note"].get("content").is_none());
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "comment:added");
         assert_eq!(
@@ -48253,7 +48271,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
-        assert_eq!(agent["harnessVersion"], "3.1");
+        assert_eq!(agent["harnessVersion"], "3.2");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -48279,7 +48297,7 @@ mod harness_versioning {
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
         let full = svc.agent_get_session_op(id).await.expect("getSession");
-        assert_eq!(full.harness_version, "3.1");
+        assert_eq!(full.harness_version, "3.2");
         assert_eq!(full.harness_features.as_ref(), Some(&persisted));
         assert_eq!(agent["harnessFeatures"], persisted);
     }
@@ -48301,19 +48319,19 @@ mod harness_versioning {
         .await
         .unwrap();
         let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
-        assert_eq!(child["agent"]["harnessVersion"], "3.1");
+        assert_eq!(child["agent"]["harnessVersion"], "3.2");
         assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
         assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
         let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
         let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
-        assert_eq!(child_row.harness_version, "3.1");
+        assert_eq!(child_row.harness_version, "3.2");
         assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
         assert_eq!(
             child_row.harness_features.as_ref(),
             Some(&child["agent"]["harnessFeatures"])
         );
         let child_full = svc.agent_get_session_op(child_id).await.unwrap();
-        assert_eq!(child_full.harness_version, "3.1");
+        assert_eq!(child_full.harness_version, "3.2");
         assert_eq!(child_full.harness_features, child_row.harness_features);
         let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
         assert_eq!(parent.harness_version, "2.9");

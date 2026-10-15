@@ -112,7 +112,7 @@ async fn forward(
             if previous.as_ref() == Some(&snapshot) {
                 drop(permit);
             } else {
-                permit.send(subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot));
+                permit.send(subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot).into());
                 seq += 1;
                 previous = Some(snapshot);
             }

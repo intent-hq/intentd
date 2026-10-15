@@ -250,7 +250,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -403,7 +403,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         match row {
             Some(row) => col(&row, "branch"),
             None => Err(Error::NotFound(format!("workspace {}", ws.id))),
@@ -446,7 +446,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() != 0)
     }
 
@@ -878,7 +878,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
         if res.rows_affected() > 0 {
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             return Ok(true);
         }
         // Zero rows: either the row is already active (no flip) or the
@@ -894,7 +894,7 @@ impl Store {
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(false)
     }
 
@@ -1157,7 +1157,7 @@ impl Store {
                 // completed. Preserve this fact even if ticket settlement panics.
                 committed.store(true, std::sync::atomic::Ordering::Release);
             }
-            lifecycle.finish(result)
+            lifecycle.finish(result).await
         })
         .await
         .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?

@@ -429,6 +429,16 @@ class LifecycleCleanupTests(CleanupTests):
         self.assertTrue((unknown / 'aarch64-apple-darwin/debug/deps/old.rmeta').exists())
 
 
+class ServicesRuntimeCleanupTests(CleanupTests):
+    target_name = 'macos-services-runtime-aarch64-apple-darwin'
+
+    def test_only_exact_services_runtime_root_is_eligible(self):
+        unknown = self.root.with_name(self.target_name + '-other')
+        self.root.rename(unknown)
+        self.assertEqual(self.run_cleanup(False)['candidates'], [])
+        self.assertTrue((unknown / 'aarch64-apple-darwin/debug/deps/old.rmeta').exists())
+
+
 class OwnershipTests(unittest.TestCase):
     good = '10 1 /runner/bin/Runner.Listener\n20 10 /runner/bin/Runner.Worker\n30 20 /bin/bash\n40 30 python3\n'
 

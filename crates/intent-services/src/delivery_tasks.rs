@@ -42,7 +42,7 @@ impl DeliveryTasks {
         &self,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> Option<JoinHandle<()>> {
-        self.spawn_owned(future, false)
+        self.spawn_owned(future, false, false)
     }
 
     /// A committed hook outcome must finish queueing its wake. Its scheduler
@@ -51,7 +51,16 @@ impl DeliveryTasks {
         &self,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Option<JoinHandle<T>> {
-        self.spawn_owned(future, true)
+        self.spawn_owned(future, true, false)
+    }
+
+    /// Retain a finite original request through cancellation without replacing
+    /// its caller or wire credential with daemon authority.
+    pub(crate) fn spawn_draining_with_current_caller<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Option<JoinHandle<T>> {
+        self.spawn_owned(future, true, true)
     }
 
     pub(crate) async fn closed(&self) {
@@ -67,6 +76,7 @@ impl DeliveryTasks {
         &self,
         future: impl Future<Output = T> + Send + 'static,
         finish_on_shutdown: bool,
+        preserve_caller: bool,
     ) -> Option<JoinHandle<T>> {
         let mut state = self.0.lock().unwrap();
         if state.closed {
@@ -76,10 +86,18 @@ impl DeliveryTasks {
         let (finished, receiver) = oneshot::channel();
         // Capture the sender BEFORE spawning: cancellation before the first poll
         // must also signal completion. Callers may still own/abort the JoinHandle.
-        let handle = intent_core::spawn_daemon(async move {
+        // Pin before the caller wrappers: moving a large delivery future through
+        // their by-value scopes can overflow Windows' 1 MiB main stack while
+        // starting the completion worker, before Tokio can box the task.
+        let owned = Box::pin(async move {
             let _finished = finished;
             future.await
         });
+        let handle = if preserve_caller {
+            intent_core::caller::spawn_with_current_caller(owned)
+        } else {
+            intent_core::spawn_daemon(owned)
+        };
         state.tasks.push(DeliveryTask {
             abort: handle.abort_handle(),
             finished: receiver,
@@ -178,6 +196,57 @@ impl DeliveryTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn draining_request_retains_original_caller_and_absence_after_waiter_drop() {
+        use intent_core::caller::{current_caller, with_caller, Caller};
+        use intent_core::caller::{current_wire_credential, with_wire_credential, WireCredential};
+        let tasks = DeliveryTasks::default();
+        let caller = Caller::Agent {
+            agent_id: intent_core::AgentId::new(),
+        };
+        let (release, wait) = oneshot::channel();
+        let (seen, observed) = oneshot::channel();
+        let (handle,) = with_caller(caller.clone(), async {
+            (tasks
+                .spawn_draining_with_current_caller(async move {
+                    wait.await.unwrap();
+                    seen.send(current_caller()).unwrap();
+                })
+                .unwrap(),)
+        })
+        .await;
+        drop(handle);
+        release.send(()).unwrap();
+        assert_eq!(observed.await.unwrap(), Some(caller));
+        let absent = tasks
+            .spawn_draining_with_current_caller(async { current_caller() })
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(absent, None);
+
+        let credential = WireCredential::Principal {
+            principal_id: intent_core::PrincipalId("original-wire-principal".into()),
+            token_hash: "fixture-credential-hash".into(),
+        };
+        let (handle,) = with_wire_credential(Some(credential), async {
+            (tasks
+                .spawn_draining_with_current_caller(async { current_wire_credential() })
+                .unwrap(),)
+        })
+        .await;
+        let Some(WireCredential::Principal {
+            principal_id,
+            token_hash,
+        }) = handle.await.unwrap()
+        else {
+            panic!("original wire credential was lost");
+        };
+        assert_eq!(principal_id.as_str(), "original-wire-principal");
+        assert_eq!(token_hash, "fixture-credential-hash");
+        tasks.drain_finite().await;
+    }
 
     #[tokio::test]
     async fn finite_drain_joins_children_registered_by_admitted_parents() {

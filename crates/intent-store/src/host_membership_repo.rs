@@ -446,7 +446,7 @@ impl Store {
         }
         let revision = state_in_tx(&mut tx).await?.revision;
         tx.commit().await.map_err(db_error)?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(HostInviteJoinOutcome::Joined {
             principal: Box::new(principal),
             membership_added,
@@ -600,7 +600,7 @@ impl Store {
                 .bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?;
         }
         tx.commit().await.map_err(db_error)?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(result)
     }
 }

@@ -16,6 +16,12 @@ impl RepositoryReadOwner {
         let store = original.store().clone();
         let registry = original.repository_lifecycle_registry.clone();
         let owner = Self::retain_original(original.clone(), store, registry)?;
+        #[cfg(test)]
+        let owner = if original.test_review_monitoring_recipient {
+            owner.with_review_monitoring()
+        } else {
+            owner
+        };
         Ok(owner.with_policy(Arc::new(move |request| {
             Arc::new(crate::repository_read_policy::RepositoryReadPolicy::new(
                 original.clone(),

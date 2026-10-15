@@ -55,6 +55,45 @@ use crate::{git_ops, publish_event, system_actor, Services};
 /// MiB encoded frame stays comfortably under the 40 MiB cap (PROTOCOL §1.3).
 pub(crate) const EXPORT_MAX_CHUNK_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
 
+#[cfg(test)]
+pub(crate) type MonitorExportBarrier = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+fn reject_private_monitor_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
+    fn parsed(row: &serde_json::Value, key: &str) -> serde_json::Value {
+        row[key]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default()
+    }
+    let private = rows.iter().any(|(table, objects)| {
+        objects.iter().any(|row| match table.as_str() {
+            "agent_message" => crate::agent_ops::is_qualified_monitor_envelope(
+                &parsed(row, "content"),
+                Some(&parsed(row, "metadata")),
+            ),
+            "pr_monitor" => {
+                row["target_provenance"] == "captured-request"
+                    || ["last_snapshot", "baseline_snapshot"].iter().any(|key| {
+                        let value = parsed(row, key);
+                        value.get("monitorBinding").is_some()
+                            || value.get("qualifiedSnapshot").is_some()
+                    })
+            }
+            _ => false,
+        })
+    });
+    if private {
+        return Err(Error::Unsupported(
+            "This workspace contains private review-monitor history that cannot be transferred"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The sealed archive of a [`ExportState::Ready`] session.
 pub(crate) struct ReadyArchive {
     pub archive_path: PathBuf,
@@ -129,6 +168,15 @@ impl Services {
             ));
         }
         let ws = self.store.get_workspace(&id).await?;
+        reject_private_monitor_export(&self.store.transfer_monitor_rows(&id).await?)?;
+        #[cfg(test)]
+        {
+            let barrier = self.test_export_monitor_preflight.lock().unwrap().take();
+            if let Some((entered, release)) = barrier {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         let export_id = format!("export-{}", uuid::Uuid::new_v4());
         let staging_dir = self.export_staging_root().join(&export_id);
         {
@@ -357,6 +405,9 @@ impl Services {
             .await;
         let manifest = self.workspace_transfer_plan_op(id.clone()).await?.manifest;
         let mut rows = self.store.transfer_export_rows(&id).await?;
+        // Preflight is advisory against races. Refuse the exact immutable row
+        // snapshot that would enter the archive, before any bytes are sealed.
+        reject_private_monitor_export(&rows)?;
         // Pin the source's effective default provider into the exported
         // session rows (archive copy only; the table is never written), so
         // a session that inherited `model.defaultProvider` here keeps that
@@ -1075,6 +1126,165 @@ mod tests {
         let dir = assets_root.join(&id.0);
         std::fs::create_dir_all(&dir).expect("assets dir");
         std::fs::write(dir.join("img.png"), b"asset-bytes").expect("asset");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn qualified_monitor_export_refuses_before_source_side_effects() {
+        let root = crate::test_support::test_tempdir("private-monitor-export");
+        let assets = root.path().join("assets");
+        let workspaces = root.path().join("workspaces");
+        let (_db, svc) = fresh_services(&workspaces, &assets).await;
+        let id = WorkspaceId::new();
+        seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
+        let agent = AgentId("agent-exp".into());
+        let metadata = serde_json::json!({"type":"pr_monitor_wake","resource":{
+            "repository":{"provider":"gitlab","instanceBaseUrl":"https://original.invalid","projectPath":"private/project"},
+            "kind":"merge-request","number":42},"monitorId":"retained-monitor","repo":"private/project","prNumber":42,"reason":"changes"});
+        let content = serde_json::json!([{"type":"text","text":"private-export-regression-sentinel","messageMetadata":metadata}]);
+        sqlx::query("INSERT INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('retained-private',?,0,'user',?,?,?)")
+            .bind(&agent.0).bind(content.to_string()).bind(metadata.to_string()).bind(now_iso())
+            .execute(svc.store.write_pool()).await.unwrap();
+        let before = svc.store.get_agent_session(&agent).await.unwrap();
+        let result = svc.workspace_export_start_op(id).await;
+        if let Ok(started) = &result {
+            let export_id = started["exportId"].as_str().unwrap();
+            if wait_ready(&svc, export_id).await {
+                let path = {
+                    let exports = svc.transfer_exports.lock().unwrap();
+                    match &exports.get(export_id).unwrap().state {
+                        ExportState::Ready(archive) => archive.archive_path.clone(),
+                        ExportState::Building { .. } => unreachable!(),
+                    }
+                };
+                let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+                let mut rows = String::new();
+                zip.by_name("rows/agent_message.jsonl")
+                    .unwrap()
+                    .read_to_string(&mut rows)
+                    .unwrap();
+                eprintln!(
+                    "actual sealed archive contains private monitor body: {}",
+                    rows.contains("private-export-regression-sentinel")
+                );
+                eprintln!(
+                    "actual sealed archive exposes a readable chunk: {}",
+                    svc.workspace_export_read_op(export_id.to_owned(), 0)
+                        .await
+                        .is_ok()
+                );
+            }
+        }
+        assert!(
+            result.is_err(),
+            "private monitor transfer must fail before export admission"
+        );
+        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(!svc.export_staging_root().exists());
+        assert_eq!(svc.store.get_agent_session(&agent).await.unwrap(), before);
+        let messages = svc.store.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(messages[0].content, content);
+        assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
+    }
+
+    #[test]
+    fn qualified_monitor_export_classifies_retained_envelopes_without_provider_guessing() {
+        use serde_json::json;
+        for state in ["active", "completed", "cancelled"] {
+            for field in ["last_snapshot", "baseline_snapshot"] {
+                let mut row = json!({"state":state,"target_provenance":"unresolved"});
+                row[field] = json!(json!({"monitorBinding":{"original":"private"}}).to_string());
+                assert!(
+                    reject_private_monitor_export(&[("pr_monitor".into(), vec![row])]).is_err()
+                );
+            }
+        }
+        for provider in ["github", "gitlab", "future"] {
+            let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":provider}});
+            for top_level in [false, true] {
+                let row = if top_level {
+                    json!({"content":"[]","metadata":metadata.to_string()})
+                } else {
+                    json!({"content":json!([{"type":"text","messageMetadata":metadata}]).to_string(),"metadata":null})
+                };
+                assert!(
+                    reject_private_monitor_export(&[("agent_message".into(), vec![row])]).is_err()
+                );
+            }
+        }
+        let legacy = vec![
+            (
+                "pr_monitor".into(),
+                vec![
+                    json!({"target_provenance":"legacy-github-writer","last_snapshot":"{\"state\":\"open\"}"}),
+                ],
+            ),
+            (
+                "agent_message".into(),
+                vec![
+                    json!({"content":"[]","metadata":"{\"type\":\"pr_monitor_wake\",\"repo\":\"o/r\",\"prNumber\":42}"}),
+                ],
+            ),
+        ];
+        assert!(reject_private_monitor_export(&legacy).is_ok());
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn qualified_monitor_export_rechecks_insert_after_preflight() {
+        let root = crate::test_support::test_tempdir("private-monitor-export-race");
+        let assets = root.path().join("assets");
+        let workspaces = root.path().join("workspaces");
+        let (_db, svc) = fresh_services(&workspaces, &assets).await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
+        let id = WorkspaceId::new();
+        seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *svc.test_export_monitor_preflight.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
+            workspace_id: Some(id.0.clone()),
+            ..Default::default()
+        });
+        let exporting = svc.clone();
+        let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
+        entered.notified().await;
+        sqlx::query("INSERT INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('private-race','agent-exp',0,'user','[]',?,?)")
+            .bind(r#"{"type":"pr_monitor_wake","resource":{}}"#).bind(now_iso())
+            .execute(svc.store.write_pool()).await.unwrap();
+        release.notify_one();
+        let started = start.await.unwrap().unwrap();
+        let export_id = started["exportId"].as_str().unwrap();
+        assert!(
+            !wait_ready(&svc, export_id).await,
+            "racing private history cannot be sealed"
+        );
+        assert!(svc
+            .workspace_export_read_op(export_id.to_owned(), 0)
+            .await
+            .is_err());
+        // Registry removal precedes asynchronous staging cleanup. The existing
+        // terminal event is published only after that cleanup has completed.
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
+            .await
+            .expect("failed export cleanup completes")
+            .expect("failure subscription remains open");
+        let failed = batch
+            .iter()
+            .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
+            .expect("failed export event");
+        assert_eq!(failed.data["exportId"], export_id);
+        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(!svc.export_staging_root().join(export_id).exists());
+        assert_eq!(
+            svc.store
+                .get_agent_messages(&AgentId("agent-exp".into()), None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[intent_test_macros::daemon_test]

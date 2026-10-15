@@ -68,6 +68,8 @@ mod sharing_projection;
 mod stop_redelivery_repo;
 mod subscription_agent_repo;
 mod task_agent_link_repo;
+mod task_event_repo;
+pub use task_event_repo::TaskEventBaselines;
 mod tracked_changes_repo;
 mod transfer_authorship;
 mod transfer_repo;
@@ -95,8 +97,10 @@ pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
     normalize_compound_model, AgentTurnEffort, AgentUsageCellRow, ChildAgentCounts,
-    MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage, SessionMessageProjection,
-    UsageMessageOrigin, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
+    PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
+    ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
+    PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
@@ -117,7 +121,7 @@ pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;
 pub use pr_monitor_repo::{
     pr_monitor_pause_error, MonitorQualificationOutcome, MonitorTargetProvenance,
     MonitorTargetUnresolvedReason, PersistedMonitorTarget, PrMonitorListEntry, PrMonitorPollUpdate,
-    QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
+    PreparedMonitorWrite, QualifiedPrMonitor, WorkspacePrMonitorReads, PR_MONITOR_PAUSE_MARKER,
 };
 pub use principal_repo::{
     ArchivedGuestSweep, CollaboratorAddOutcome, EffectiveWorkspaceMember, InviteInsertOutcome,
@@ -383,6 +387,8 @@ pub struct Store {
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     note_pages: std::sync::Arc<note_page_repo::Runtime>,
+    task_event_baselines: std::sync::Arc<TaskEventBaselines>,
+    task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
     note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
@@ -432,10 +438,12 @@ impl Store {
         // database must never hydrate or convert the stale note backlog.
         let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
         let note_index_jobs = note_index_job::domain_for(db_path)?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
             note_pages,
+            task_event_baselines: std::sync::Arc::default(),
+            task_events_enabled: std::sync::Arc::default(),
             note_index_jobs,
             note_index_owner: std::sync::Arc::default(),
             write_pool,
