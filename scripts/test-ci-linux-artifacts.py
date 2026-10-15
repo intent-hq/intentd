@@ -7,6 +7,7 @@ import tarfile
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import shutil
@@ -132,6 +133,37 @@ class LinuxTests(unittest.TestCase):
             fallback_env.pop('CARGO_MANIFEST_DIR', None)
             fallback = subprocess.run([str(binary)], env=fallback_env, capture_output=True, text=True)
             self.assertEqual(fallback.returncode, 0, fallback.stderr)
+
+    def test_startup_cli_commands_use_relocated_binary_not_producer_decoy(self):
+        text = (ROOT / 'crates/intentd/tests/wss_integration/startup.rs').read_text()
+        expressions = re.findall(r'(?:std|tokio)::process::Command::new\((.*?)\)\s*(?:;|\.args?\()', text, re.S)
+        expressions = [expression for expression in expressions if 'CARGO_BIN_EXE_intentd' in expression]
+        self.assertEqual(len(expressions), 3, 'all active startup CLI launch sites must be covered')
+        with tempfile.TemporaryDirectory(prefix='intent-startup-relocation-') as tmp:
+            root = Path(tmp)
+            producer, consumer = root / 'producer', root / 'consumer'
+            for binary, value in ((producer, 'decoy'), (consumer, 'consumer')):
+                binary.write_text('#!/bin/sh\nprintf ' + value)
+                binary.chmod(0o755)
+            source = root / 'main.rs'
+            source.write_text('#![allow(dead_code)]\nextern crate self as intentd_test_support;\n' +
+                '#[path=' + json.dumps(str(ROOT / 'crates/intentd-test-support/src/runtime_paths.rs')) + '] pub mod runtime_paths;\n' +
+                'fn main() {\n' + ''.join('let result = std::process::Command::new(' + expression +
+                ').output().unwrap(); assert_eq!(String::from_utf8(result.stdout).unwrap(), std::env::var("EXPECTED_OUTPUT").unwrap());\n'
+                for expression in expressions) + '}\n')
+            proof = root / 'proof'
+            subprocess.run(['rustc', '--edition=2021', str(source), '-o', str(proof)],
+                           env=dict(os.environ, CARGO_BIN_EXE_intentd=str(producer)), check=True, capture_output=True)
+            env = dict(os.environ, NEXTEST_BIN_EXE_intentd=str(consumer), EXPECTED_OUTPUT='consumer')
+            for exists in (True, False):
+                with self.subTest(producer_exists=exists):
+                    if not exists:
+                        producer.unlink()
+                    run = subprocess.run([str(proof)], env=env, capture_output=True, text=True)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+            invalid = subprocess.run([str(proof)], env={**env, 'NEXTEST_BIN_EXE_intentd': str(root / 'missing')},
+                                     capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
 
     def plan(self, args):
         return {'version': 1, 'head': 'a'*40, 'mergeBase': 'b'*40, 'plans': args}

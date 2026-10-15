@@ -192,20 +192,26 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let mut preparation = barrier(&listener, b'p').await;
     assert!(!common::daemon_is_ready(&dir.path().join("intentd.sock")).await);
     let cfg = startup_client_config(dir.path());
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("status")
-        .env("INTENTD_DATA_DIR", dir.path())
-        .output()
-        .unwrap();
+    let output = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .arg("status")
+    .env("INTENTD_DATA_DIR", dir.path())
+    .output()
+    .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("not ready (preparing)"));
     // Old installed sitters execute this NEW binary for their liveness probe.
     // The CLI may confirm liveness, but the protected wire stays not-ready.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .args(["call", "system.status"])
-        .env("INTENTD_DATA_DIR", dir.path())
-        .output()
-        .unwrap();
+    let output = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+        "intentd",
+        env!("CARGO_BIN_EXE_intentd"),
+    ))
+    .args(["call", "system.status"])
+    .env("INTENTD_DATA_DIR", dir.path())
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -857,14 +863,17 @@ async fn frozen_sitter_preserves_new_daemon_startup() {
         std::env::var("INTENTD_TEST_LEGACY_SITTER").expect("frozen sitter binary required");
     let budget = std::env::var("INTENTD_TEST_LEGACY_BUDGET_MS").unwrap_or_else(|_| "2000".into());
     let millis: u64 = budget.parse().unwrap();
-    let daemon = std::env::var("INTENTD_TEST_LEGACY_DAEMON")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_intentd").to_owned());
+    let daemon = std::env::var("INTENTD_TEST_LEGACY_DAEMON").unwrap_or_else(|_| {
+        intentd_test_support::runtime_paths::binary_path("intentd", env!("CARGO_BIN_EXE_intentd"))
+            .to_string_lossy()
+            .into_owned()
+    });
     let mut command = std::process::Command::new("python3");
+    command.arg(
+        intentd_test_support::runtime_paths::manifest_dir(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/legacy-sitter-startup.py"),
+    );
     command.args([
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/legacy-sitter-startup.py"
-        ),
         &sitter,
         &daemon,
         intentd_sitter::manifest::TARGET_TRIPLE,
@@ -929,7 +938,11 @@ async fn cli_startup_liveness_uses_server_identity_and_rejects_invalid_probes() 
                 .await
                 .unwrap();
         };
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
+        let mut command =
+            tokio::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+                "intentd",
+                env!("CARGO_BIN_EXE_intentd"),
+            ));
         command
             .args(["call", method, "--params", params])
             .env("INTENTD_DATA_DIR", dir.path())
