@@ -43,7 +43,10 @@ impl Fixture {
             Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
         registry
             .apply(&[
-                ("sourceControl.gitlab.host".into(), json!("gitlab.test")),
+                (
+                    "sourceControl.gitlab.host".into(),
+                    json!(server.host.host()),
+                ),
                 (
                     "sourceControl.gitlab.instanceBaseUrl".into(),
                     json!(server.descriptor.instance().as_str()),

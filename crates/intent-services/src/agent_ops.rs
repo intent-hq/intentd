@@ -1359,6 +1359,10 @@ impl RecoverySource {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct QueuedMessage {
+    /// An original current-runtime owner. It is never a serialized payload or
+    /// restored permission; unsupported queue projections withhold this entry.
+    #[serde(skip)]
+    pub(crate) monitor_turn: Option<Arc<crate::agent_manager::QueuedMonitorTurn>>,
     /// Ordered message payloads on a combined retry; legacy aggregate fields
     /// remain for old clients. Stored in the existing queue JSON payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1521,6 +1525,9 @@ impl QueuedMessage {
     /// [`crate::principal_ops::MessageAuthorResolver::attach_queue`] on the
     /// surfaces that resolve it — a consumer never sees the key absent.
     pub(crate) fn to_value(&self, position: usize) -> Value {
+        if self.monitor_turn.is_some() {
+            return Value::Null;
+        }
         let mut v = json!({
             "id": self.id,
             "content": self.content,
@@ -3046,7 +3053,10 @@ fn is_delegated_background_task_session(session: &AgentSession) -> bool {
 }
 
 /// Project an [`AgentSession`] (with its loaded messages) into [`AgentLite`].
-fn project_lite(session: AgentSession) -> AgentLite {
+fn project_lite(mut session: AgentSession) -> AgentLite {
+    session
+        .messages
+        .retain(|message| !is_qualified_monitor_message(message));
     let (last_response, digest) = last_response_and_digest(&session.messages);
     let last_user = last_user_message(&session.messages);
     let (last_role, last_id) = last_message_role_and_id(&session.messages);
@@ -3198,6 +3208,28 @@ fn degrade_legacy_file_blocks(mut message: AgentMessage) -> AgentMessage {
         crate::tool_block::degrade_inline_file_blocks(blocks);
     }
     message
+}
+
+/// Classification only for withholding: persisted metadata never grants access.
+/// These general read/event routes have no original monitor delivery receipt.
+fn is_qualified_monitor_metadata(metadata: Option<&Value>) -> bool {
+    metadata.is_some_and(|metadata| {
+        metadata["type"] == "pr_monitor_wake"
+            && (metadata.get("resource").is_some() || metadata.get("availability").is_some())
+    })
+}
+
+pub(crate) fn is_qualified_monitor_message(message: &AgentMessage) -> bool {
+    is_qualified_monitor_envelope(&message.content, message.metadata.as_ref())
+}
+
+pub(crate) fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
+    is_qualified_monitor_metadata(metadata)
+        || content.as_array().is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| is_qualified_monitor_metadata(block.get("messageMetadata")))
+        })
 }
 
 /// The serve-time projection every persisted or in-flight message passes
@@ -3646,12 +3678,7 @@ impl Services {
         let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
         // Idle-visibility (unified external-wait): same overlay for active
         // PR monitors (`waitingOnPrMonitors`, omitted when empty).
-        let waiting_on_pr_monitors = self
-            .active_pr_monitors_for_agent(&agent_id)
-            .await
-            .iter()
-            .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
-            .collect();
+        let waiting_on_pr_monitors = self.legacy_pr_monitor_wait_entries(&agent_id).await;
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
         lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
@@ -4131,6 +4158,13 @@ impl Services {
                 .get_agent_messages_page(&agent_id, page_offset, page_limit)
                 .await?
         };
+        let raw_page = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            raw_page,
+        )
+        .await?;
         let mut page: Vec<AgentMessage> =
             raw_page.into_iter().map(project_served_message).collect();
         // Serve-time author projection (multiplayer w2): every user row gets
@@ -4193,6 +4227,8 @@ impl Services {
                 }
             }
         }
+        // Physical cursors retain their original positions. Qualified entries
+        // came from the exact freshly admitted envelope before projection.
         let mut messages = serde_json::to_value(&page).expect("messages serialize");
         // In-progress tail (monorepo#3647): append the in-flight turn's
         // partial assistant message when the caller opted in and this page
@@ -4304,6 +4340,13 @@ impl Services {
             .store
             .get_agent_history_batch(&agent_id, before_seq, limit)
             .await?;
+        let messages = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            messages,
+        )
+        .await?;
         let mut page: Vec<_> = messages.into_iter().map(project_served_message).collect();
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut page)
@@ -4421,6 +4464,15 @@ impl Services {
                 }
             },
         };
+        let message = crate::repository_native_wire::monitor::history(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            vec![message],
+        )
+        .await?
+        .pop()
+        .ok_or_else(|| Error::NotFound("message block unavailable".into()))?;
         let message = project_served_message(message);
         let block = message
             .content
@@ -4471,6 +4523,14 @@ impl Services {
             .store
             .get_agent_user_message_index(&agent_id, preview_chars)
             .await?;
+        let items = crate::repository_native_wire::monitor::history_index(
+            self,
+            &session.workspace_id,
+            &agent_id,
+            items,
+            preview_chars,
+        )
+        .await?;
         let total = items.len();
         let items: Vec<Value> = items
             .into_iter()
@@ -4532,6 +4592,11 @@ impl Services {
         message: &AgentMessage,
         turn_id: Option<&str>,
     ) {
+        // The generic bus has no supported original monitor recipient. Neither
+        // the body nor its metadata may be copied into a general event envelope.
+        if is_qualified_monitor_message(message) {
+            return;
+        }
         let mut payload = agent_message_event_payload(agent_id, message, turn_id);
         let mut last_payload = agent_last_message_event_payload(agent_id, message, turn_id);
         // Serve-time author (multiplayer w2): a user-row echo carries the
@@ -5754,7 +5819,7 @@ impl Services {
         }
         if known_completion {
             if let Some(claim) = claim {
-                claim.settle_confirmed();
+                claim.settle_confirmed().await?;
             }
         }
         Ok(json!({ "success": true }))
@@ -14736,6 +14801,15 @@ impl Services {
         content: &str,
         message_metadata: Option<&Value>,
     ) -> Result<Value> {
+        if message_metadata.is_some_and(|metadata| {
+            metadata["type"] == "pr_monitor_wake"
+                && (metadata.get("resource").is_some()
+                    || metadata.get("monitorAvailability").is_some())
+        }) {
+            // A qualified envelope must enter through its retained delivery
+            // obligation. Public metadata cannot supply that permission.
+            return Err(crate::repository_read_source::unsupported());
+        }
         crate::workspace_mutations::boxed(self.deliver_wake_message_admitted(
             workspace_id,
             agent_id,
@@ -15214,6 +15288,17 @@ impl Services {
             note.metadata.task = Some(task);
             note.updated_at = now;
             self.store.update_note_metadata(&note).await?;
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::note_change_event(
+                    workspace_id,
+                    &note.id,
+                    &note.title,
+                    intent_core::events::NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
         }
         Ok(())
     }
@@ -15284,6 +15369,29 @@ impl Services {
         )
     }
 
+    /// Called only inside the original monitor's queue-insertion fence. The
+    /// ordinary queue carries no private text, metadata, attachments or URL.
+    pub(crate) fn enqueue_monitor_turn(
+        &self,
+        agent_id: &AgentId,
+        owner: Arc<crate::agent_manager::QueuedMonitorTurn>,
+    ) {
+        let draining = self.draining_queue_entries.lock().unwrap();
+        self.enqueue_message_with_id_locked(
+            agent_id,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+            &draining,
+            Some(owner),
+        );
+    }
+
     /// Queue a message under a caller-selected durable id. Completion-watch
     /// delivery uses this so a restart retry adopts the already-persisted queue
     /// entry instead of creating a duplicate terminal wake. `origin` is stored
@@ -15316,6 +15424,7 @@ impl Services {
             interrupt,
             origin,
             &draining,
+            None,
         )
     }
 
@@ -15350,6 +15459,7 @@ impl Services {
             interrupt,
             origin,
             &draining,
+            None,
         ))
     }
 
@@ -15441,6 +15551,7 @@ impl Services {
         interrupt: bool,
         origin: MessageOrigin,
         draining: &HashMap<AgentId, Vec<QueuedMessage>>,
+        monitor_turn: Option<Arc<crate::agent_manager::QueuedMonitorTurn>>,
     ) -> (QueuedMessage, usize) {
         let prepend = prepend.unwrap_or_default();
         let id = message_id.unwrap_or_else(new_message_id);
@@ -15469,6 +15580,7 @@ impl Services {
             return (existing.clone(), position);
         }
         let queued = QueuedMessage {
+            monitor_turn,
             delivery_groups: None,
             prepend_delivery_groups: prepend.delivery_groups,
             turn_id: id.clone(),
@@ -15571,6 +15683,7 @@ impl Services {
             interrupt,
             origin,
             &draining,
+            None,
         );
         self.mark_parked_recovery_send(agent_id, queued.id.clone());
         Ok((queued, position))
@@ -15613,6 +15726,7 @@ impl Services {
             } else {
                 let id = new_message_id();
                 let queued = QueuedMessage {
+                    monitor_turn: None,
                     delivery_groups: None,
                     prepend_delivery_groups: None,
                     turn_id: id.clone(),
@@ -16122,7 +16236,8 @@ impl Services {
         // Preserve each script wake's durable identity and lifecycle fence through worker admission.
         if queue.iter().any(|m| {
             m.ready_to_send()
-                && crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some()
+                && (m.monitor_turn.is_some()
+                    || crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some())
         }) {
             return None;
         }
@@ -16578,6 +16693,7 @@ impl Services {
             })
             .map(|m| (m, false))
             .chain(live.iter().map(|m| (m, eligible == Some(m.id.as_str()))))
+            .filter(|(message, _)| message.monitor_turn.is_none())
             .enumerate()
             .map(|(i, (m, eligible))| {
                 let mut value = m.to_value(i);
@@ -16696,6 +16812,12 @@ impl Services {
                 let idx = queue
                     .iter()
                     .position(|m| m.matches_submission(message_id))?;
+                if queue[idx].monitor_turn.is_some() {
+                    refused = Some(Error::Forbidden(
+                        "monitor updates require their original delivery route".into(),
+                    ));
+                    return None;
+                }
                 if let Some(gate) = gate {
                     if let Err(e) = gate.check(&queue[idx]) {
                         refused = Some(e);
@@ -16771,6 +16893,7 @@ impl Services {
                 gate.check(entry)?;
             }
             if !entry.ready_to_send()
+                || entry.monitor_turn.is_some()
                 || crate::script_monitor::monitor_id(entry.message_metadata.as_ref()).is_some()
             {
                 return Err(Error::InvalidParams(
@@ -16942,6 +17065,7 @@ impl Services {
                     .any(|d| m.matches_submission(&d.id) || d.turn_id == m.turn_id)
             }))
             .filter(|m| seen_ids.insert(m.id.clone()))
+            .filter(|m| m.monitor_turn.is_none())
             .enumerate()
             .map(|(i, m)| intent_store::AgentQueueRow {
                 id: m.id.clone(),
@@ -17251,6 +17375,12 @@ impl Services {
         workspace_id: &WorkspaceId,
         messages: &[QueuedMessage],
     ) {
+        if messages
+            .iter()
+            .any(|message| message.monitor_turn.is_some())
+        {
+            return;
+        }
         let Some(message) = messages.first() else {
             return;
         };
@@ -17771,6 +17901,11 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
     let mut image_rows: Vec<Vec<Value>> = Vec::new();
     let mut file_rows: Vec<Vec<Value>> = Vec::new();
     for m in messages.iter().rev() {
+        // A stored private wake is not a receipt for a new prompt. Restored
+        // delivery must reauthorize the whole envelope through its scoped route.
+        if is_qualified_monitor_message(m) {
+            continue;
+        }
         match m.role.as_str() {
             "system" => {}
             "assistant" => {

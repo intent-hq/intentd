@@ -225,6 +225,7 @@ pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 // parallels `task:status-changed` so a feed renders the new task without a
 // follow-up read.
 pub const TASK_CREATED: &str = "task:created";
+pub const TASK_UPDATED: &str = "task:updated";
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
 // Task↔agent linkage events (new in intentd; PROTOCOL §5.4 / §6.5). Migrate
@@ -342,6 +343,8 @@ pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-chan
 // `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
 // no follow-up fetch.
 pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
+/// Changed-only authoritative workspace task counts.
+pub const WORKSPACE_TASK_STATS_CHANGED: &str = "workspace:task-stats-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -631,6 +634,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_DELETE_OPERATION,
     LINE_ATTRIBUTION_UPDATED,
     TASK_CREATED,
+    TASK_UPDATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TASK_AGENT_LINKED,
@@ -678,6 +682,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_TASK_STATS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
     WORKSPACE_TRANSFER_PROGRESS,
@@ -945,6 +950,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (TASK_CREATED, "Task: a task note was created."),
     (TASK_READY_TASKS_CHANGED, "Task: the startable task set changed; task ids."),
     (TASK_STATUS_CHANGED, "Task: a task's status changed."),
+    (TASK_UPDATED, "Task: complete changed task summaries and removed ids."),
     (WORKSPACE_ACTIVITY, "Workspace: activity heartbeat of a workspace the guest is a member of."),
     (WORKSPACE_ACTIVITY_CHANGED, "Workspace: the aggregated activity marker changed (workspace channel delta)."),
     (WORKSPACE_ATTENTION_CHANGED, "Workspace: the attention marker changed (workspace channel delta)."),
@@ -958,6 +964,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
+    (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
     (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),

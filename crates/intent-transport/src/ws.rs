@@ -1291,7 +1291,7 @@ impl WsInner {
             Revoked(std::result::Result<intent_core::PrincipalRevocation, ()>),
             RoleChanged(bool),
             Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
-            Outbound(String),
+            Outbound(crate::OutboundFrame),
             Command(Option<ConnCmd>),
         }
 
@@ -1321,6 +1321,7 @@ impl WsInner {
             },
         )
         .await;
+        let mut discard_private_output = false;
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
         // Bind reverse authority independently of hello metadata. Members may
@@ -1424,7 +1425,9 @@ impl WsInner {
                                 let next =
                                     tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
                                 let Ok(Some(frame)) = next else { break };
-                                if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                                if frame.is_private()
+                                    || frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES
+                                {
                                     continue;
                                 }
                                 if serde_json::from_str::<serde_json::Value>(&frame)
@@ -1433,11 +1436,8 @@ impl WsInner {
                                     continue;
                                 }
                                 if !matches!(
-                                    tokio::time::timeout_at(
-                                        deadline,
-                                        sink.send(Message::Text(frame.into()))
-                                    )
-                                    .await,
+                                    tokio::time::timeout_at(deadline, frame.write_wss(&mut sink))
+                                        .await,
                                     Ok(Ok(()))
                                 ) {
                                     break;
@@ -1558,7 +1558,10 @@ impl WsInner {
                         );
                         continue;
                     }
-                    if sink.send(Message::Text(frame.into())).await.is_err() {
+                    if frame.write_wss(&mut sink).await.is_err() {
+                        discard_private_output = frame.is_private();
+                        #[cfg(feature = "repository-test-fixtures")]
+                        crate::private_output::fixture_discarded_queue(&mut app_rx);
                         break;
                     }
                 }
@@ -1589,7 +1592,11 @@ impl WsInner {
         if let Some(mut gate) = self.cleanup_gate.clone() {
             let _ = gate.wait_for(|open| *open).await;
         }
-        let _ = sink.close().await;
+        // Closing a WebSocket flushes its buffered data. A refused private
+        // write must drop the sink without flushing a retired envelope.
+        if !discard_private_output {
+            let _ = sink.close().await;
+        }
         self.deregister(id);
     }
 }

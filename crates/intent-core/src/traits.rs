@@ -8421,6 +8421,52 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Planned addressed observation seam. No binding dispatches here until
+    /// reviewMonitoring capability version 1 is implemented. Original private
+    /// request admission must be captured synchronously before the first await.
+    /// Defaults refuse; they must never reinterpret a target as legacy GitHub.
+    fn pr_state_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned agent-owned registration seam, sharing the existing registry,
+    /// caller ownership, limits and adoption rules across both aliases.
+    fn pr_monitor_start_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned addressed cancellation of the original caller's own monitor.
+    /// No provider read is needed to cancel; never cancel by a colliding number.
+    fn pr_monitor_stop_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
     /// `ws.pr.monitor`: register (idempotently) a centralized monitor on
     /// `pr_number` for `agent_id`, returning the monitor row plus the freshly
     /// fetched merge-requirements checklist — `requirements: null` plus a

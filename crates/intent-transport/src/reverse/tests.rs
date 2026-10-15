@@ -10,7 +10,7 @@ use super::*;
 #[tokio::test]
 async fn shutdown_releases_reverse_request_blocked_on_full_outbound_lane() {
     let (tx, _idle_peer) = mpsc::channel(1);
-    tx.send("occupied".to_string()).await.unwrap();
+    tx.send("occupied".into()).await.unwrap();
     let reverse = ReverseChannel::new(tx);
     let request = reverse.request("browser.exec", json!({}), Duration::from_secs(60));
     tokio::pin!(request);
@@ -70,7 +70,7 @@ fn unrelated_reverse_requests_keep_the_default_deadline() {
 
 #[tokio::test]
 async fn request_round_trips_through_a_mock_client() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -101,7 +101,7 @@ async fn request_round_trips_through_a_mock_client() {
 
 #[tokio::test]
 async fn client_error_response_propagates() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -135,10 +135,10 @@ async fn client_error_response_propagates() {
 /// every reverse RPC up front (`-32003`) and puts nothing on the wire.
 #[tokio::test]
 async fn non_administrator_channel_refuses_reverse_requests_without_sending() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx).with_administrator(false);
     assert!(!reverse.is_administrator());
-    assert!(ReverseChannel::new(mpsc::channel::<String>(1).0).is_administrator());
+    assert!(ReverseChannel::new(mpsc::channel::<crate::OutboundFrame>(1).0).is_administrator());
 
     let err = reverse
         .request(
@@ -157,7 +157,7 @@ async fn non_administrator_channel_refuses_reverse_requests_without_sending() {
 
 #[test]
 fn route_response_ignores_non_replies() {
-    let (out_tx, _out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, _out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
     // A client request (has `method`) is not a reverse reply.
     assert!(!reverse.route_response(&json!({ "jsonrpc": "2.0", "id": "rev-1", "method": "x" })));
@@ -169,7 +169,7 @@ fn route_response_ignores_non_replies() {
 
 #[tokio::test]
 async fn request_times_out_without_a_reply() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
     // Keep the receiver alive but never reply.
     tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
@@ -193,11 +193,11 @@ async fn request_times_out_without_a_reply() {
 
 #[tokio::test]
 async fn request_timeout_includes_outbound_queue_wait() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
     reverse
         .out_tx
-        .send("occupied".to_string())
+        .send("occupied".into())
         .await
         .expect("fill outbound queue");
 
@@ -219,7 +219,7 @@ async fn request_timeout_includes_outbound_queue_wait() {
 
 #[tokio::test]
 async fn cancelled_login_requests_release_registrations_and_ignore_late_replies() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
     for _ in 0..3 {
         let mut request = Box::pin(reverse.request(
@@ -242,9 +242,9 @@ async fn cancelled_login_requests_release_registrations_and_ignore_late_replies(
 
 #[tokio::test]
 async fn cancelled_request_during_queue_wait_never_enqueues() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
-    reverse.out_tx.send("occupied".to_string()).await.unwrap();
+    reverse.out_tx.send("occupied".into()).await.unwrap();
     let mut request = Box::pin(reverse.request(
         "providers.setup.openLogin",
         json!({ "operationId": "setup-1" }),
@@ -264,7 +264,7 @@ async fn cancelled_request_during_queue_wait_never_enqueues() {
 
 #[tokio::test]
 async fn cancelling_one_request_preserves_an_independent_request() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(2);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(2);
     let reverse = ReverseChannel::new(out_tx);
     let mut cancelled = Box::pin(reverse.request(
         "providers.setup.openLogin",
@@ -288,7 +288,7 @@ async fn cancelling_one_request_preserves_an_independent_request() {
 
 #[tokio::test]
 async fn request_fails_when_connection_closed() {
-    let (out_tx, out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     drop(out_rx);
     let reverse = ReverseChannel::new(out_tx);
     let err = reverse
@@ -305,11 +305,11 @@ async fn request_fails_when_connection_closed() {
 
 #[tokio::test]
 async fn blocked_request_fails_when_connection_closes() {
-    let (out_tx, out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
     reverse
         .out_tx
-        .send("occupied".to_string())
+        .send("occupied".into())
         .await
         .expect("fill outbound queue");
 
@@ -338,7 +338,7 @@ async fn blocked_request_fails_when_connection_closes() {
 
 #[tokio::test]
 async fn accepted_request_fails_when_connection_closes() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
     let caller = reverse.clone();
     let request = tokio::spawn(async move {
@@ -364,7 +364,7 @@ async fn accepted_request_fails_when_connection_closes() {
 
 #[tokio::test]
 async fn request_after_close_fails_without_enqueuing() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(1);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(1);
     let reverse = ReverseChannel::new(out_tx);
     reverse.close();
 

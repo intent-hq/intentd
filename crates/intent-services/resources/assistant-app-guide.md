@@ -78,6 +78,17 @@ Check the provider's official setup instructions before choosing a URL or local 
 
 A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
 
+## Mac update availability
+
+Mac update availability can differ by architecture. Intel Macs stay on their last
+compatible available release in the selected update channel when a newer release
+has no Intel build. Older Apple Silicon apps may also remain on an earlier
+compatible release; manually installing a current Apple Silicon build lets them
+receive newer releases. Do not
+suggest an Apple Silicon build for an Intel Mac.
+
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
+
 ## Manage Assistant chats
 
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
@@ -146,6 +157,15 @@ and configuring a tunnel are separate choices from displaying pairing informatio
 Read current state and respect the user's requested scope.
 
 ## Start or continue work
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+
+In **Home → Workspaces**, list rows and board cards show organization/repository
+labels in views that include multiple repositories. When an organization is selected,
+labels show only the repository name. Narrow lists hide the row label; the selected
+workspace's preview header shows its repository. Local repositories show their name
+or path. Long labels truncate; hover to read the full name. Repository-specific
+views identify the repository in the page heading.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
@@ -264,6 +284,32 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
+## Home workspace status icons
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+
+In **Home → Workspaces**, the status icon in list and board views describes the
+workspace's current status. Hover over it for an explanation:
+
+- **PR Open** (pull request icon): a pull request is open.
+- **PR Mergeable** (pull request icon): a pull request is reported ready to merge.
+- **PR Queued** (hourglass): a pull request is in the merge queue; it has not merged yet.
+
+Colors follow the current theme: Open and Queued use its informational color;
+Mergeable uses its success color. Use the label and tooltip to identify the state.
+
+Questions, review requests, failures, and blockers can take precedence over PR
+icons. **PR Mergeable** does not grant permission to merge: agents still need the
+user's explicit authorization and must check the current merge requirements.
+
+A muted hourglass indicates waiting on external events or delegated work in the
+workspace; it does not mean every agent is waiting. It replaces an otherwise idle
+dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+hourglass, with additional waiting explained in its tooltip. Waiting is also
+included in accessible status text. The waiting indicator is hidden when the main
+status shows active work, unread updates, a question, a review request, a failure,
+or a blocker.
+
 ## Workspace numbers for Micro keys
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
@@ -288,6 +334,14 @@ Disconnecting hides them without deleting saved assignments. If they are missing
 check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts. -->
+
+**Switch To** notifications for agent failures, attention requests, and automatic
+workspace unarchiving are skipped when that workspace is already selected, even
+if another conversation, file, or note is open. Notifications for other workspaces
+can still appear. The workspace's agent status and conversation notices remain
+available.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 

@@ -91,7 +91,7 @@ impl Drop for PendingRequest<'_> {
 /// durable authority on each request. Hello metadata never grants that role.
 #[derive(Clone)]
 pub struct ReverseChannel {
-    out_tx: mpsc::Sender<String>,
+    out_tx: mpsc::Sender<crate::OutboundFrame>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
     administrator: bool,
@@ -105,7 +105,7 @@ impl ReverseChannel {
     /// administrator's (the legacy single-user default); see
     /// [`ReverseChannel::with_administrator`].
     #[must_use]
-    pub fn new(out_tx: mpsc::Sender<String>) -> Self {
+    pub fn new(out_tx: mpsc::Sender<crate::OutboundFrame>) -> Self {
         Self {
             out_tx,
             pending: Arc::new(Mutex::new(ReverseState {
@@ -254,7 +254,7 @@ impl ReverseChannel {
                     code: 0,
                     message: "client connection closed".to_string(),
                 })),
-                result = self.out_tx.send(frame) => result.map_err(|_| ReverseError {
+                result = self.out_tx.send(frame.into()) => result.map_err(|_| ReverseError {
                 data: None,
                     code: 0,
                     message: "client connection closed".to_string(),

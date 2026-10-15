@@ -14,6 +14,98 @@ const PRESTAGED_ROWS: i64 = 7;
 mod annotation_retirement;
 mod review;
 
+#[tokio::test]
+async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
+    use crate::{
+        RepositoryLifecycleKey, RepositoryLifecycleMutationTicket, RepositoryLifecycleObserver,
+    };
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Retirement {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl RepositoryLifecycleObserver for Retirement {
+        fn begin_mutation(
+            &self,
+            _: &[RepositoryLifecycleKey],
+        ) -> crate::Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+    impl RepositoryLifecycleMutationTicket for Retirement {
+        fn settle_confirmed(self: Box<Self>) {
+            panic!("agent deletion must join retirement, not only confirm SQL");
+        }
+        fn settle_after_retirement(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send>>
+        {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            })
+        }
+    }
+
+    for workspace_sweep in [false, true] {
+        let db = TempDb::new();
+        let store = Store::open(&db.path).await.unwrap();
+        let workspace = seed_workspace(&store, "retirement").await;
+        let agent = AgentId::from("retiring-agent");
+        store
+            .insert_agent_session(&sample_agent_session(&agent, &workspace))
+            .await
+            .unwrap();
+        let observer = Arc::new(Retirement::default());
+        store
+            .install_repository_lifecycle_observer(observer.clone())
+            .await
+            .unwrap();
+        // The workspace path is called after its desktop/history sweeps, so
+        // this fixture intentionally has no remaining private desktop state.
+        let operation = async {
+            if workspace_sweep {
+                store
+                    .delete_workspace_agent_session(&workspace, &agent)
+                    .await
+            } else {
+                store.delete_agent_session(&workspace, &agent).await
+            }
+        };
+        tokio::pin!(operation);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut operation => panic!("completed before retirement: {result:?}"),
+                () = observer.entered.notified() => {}
+            }
+        })
+        .await
+        .expect("agent deletion reaches retirement");
+        assert!(
+            matches!(
+                store.get_agent_session(&agent).await,
+                Err(Error::NotFound(_))
+            ),
+            "SQL commits before retirement joins"
+        );
+        // Retirement must not retain the sole SQL writer while awaiting a
+        // native owner; unrelated writes can still progress.
+        let writer = tokio::time::timeout(Duration::from_secs(5), store.write_pool().acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(writer);
+        observer.release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap());
+    }
+}
+
 async fn seed_history(store: &Store, workspace: &WorkspaceId, name: &str, count: i64) -> AgentId {
     let agent = AgentId::from(name);
     store

@@ -35,6 +35,59 @@ fn parsed(outcome: HelloOutcome) -> Value {
 }
 
 #[tokio::test]
+async fn monitor_attachment_cannot_fall_through_to_profile_upsert_without_source_admission() {
+    let api = RecordingApi::default();
+    let mut binding = Some(ClientId::from_string("original-desktop"));
+    let req = classify(&json!({
+        "jsonrpc":"2.0", "id":1, "method":"client.hello",
+        "params": {
+            "clientId":"original-desktop", "connectionRole":"review-monitor",
+            "name":"replacement", "hostname":"replacement-host",
+            "capabilities":{"reviewMonitoring":1,"browserExec":true}
+        }
+    }))
+    .unwrap();
+    let outcome = handle(req, &api, &mut binding, true).await;
+    assert!(
+        outcome.bound.is_none(),
+        "attachment requires admitted physical source"
+    );
+    assert!(parsed(outcome).get("error").is_some());
+    assert!(
+        api.last.lock().unwrap().is_none(),
+        "attachment cannot overwrite desktop profile"
+    );
+    assert_eq!(binding.unwrap().as_str(), "original-desktop");
+}
+
+#[tokio::test]
+async fn unknown_or_malformed_connection_role_cannot_mutate_client_profile() {
+    for role in [
+        json!("unknown"),
+        Value::Null,
+        json!(false),
+        json!(1),
+        json!({}),
+    ] {
+        let api = RecordingApi::default();
+        let mut binding = None;
+        let req = classify(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"client.hello",
+            "params":{"clientId":"desktop", "connectionRole":role}
+        }))
+        .unwrap();
+        let outcome = handle(req, &api, &mut binding, true).await;
+        assert!(
+            outcome.bound.is_none(),
+            "unknown role cannot become ordinary hello"
+        );
+        assert_eq!(parsed(outcome)["error"]["code"], -32602);
+        assert!(api.last.lock().unwrap().is_none());
+        assert!(binding.is_none());
+    }
+}
+
+#[tokio::test]
 async fn mints_client_id_when_omitted() {
     let api = RecordingApi::default();
     let mut binding: Option<ClientId> = None;
@@ -427,6 +480,27 @@ async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
         // input takes the same path; there is no connection-local namespace map.
         binding = None;
     }
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+#[test]
+fn monitor_test_host_support_requires_explicit_opt_in() {
+    let ordinary = server_json(false, "linux", "x86_64", "test", None, true);
+    assert!(ordinary["capabilities"].get("reviewMonitoring").is_none());
+    let mut disabled = ordinary.clone();
+    apply_monitor_test_support(&mut disabled, false);
+    assert_eq!(disabled, ordinary);
+    let mut enabled = ordinary.clone();
+    apply_monitor_test_support(&mut enabled, true);
+    assert_eq!(enabled["capabilities"]["reviewMonitoring"], 1);
+    enabled["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reviewMonitoring");
+    assert_eq!(
+        enabled, ordinary,
+        "test support changes no other host claims"
+    );
 }
 
 #[tokio::test]

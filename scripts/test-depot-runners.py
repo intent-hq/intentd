@@ -76,7 +76,7 @@ class DepotRunners(unittest.TestCase):
 
     def test_compiling_jobs_configure_managed_cache(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-        for name in ['check', 'build', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
+        for name in ['check', 'build', 'macos-services-runtime', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
             with self.subTest(job=name):
                 steps = doc['jobs'][name]['steps']
                 configure = next(i for i, step in enumerate(steps) if step.get('run') == 'python3 scripts/setup-depot-sccache.py')

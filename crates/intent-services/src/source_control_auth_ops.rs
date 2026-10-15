@@ -384,48 +384,99 @@ pub(crate) async fn run_gitlab_poll_loop(
                     let lease = gate_lease.clone();
                     lease
                 };
-                let registry = registry.clone();
-                let worker_bus = bus.clone();
-                let worker_host = host.clone();
-                let write = write.clone();
-                // The poll supervisor retains gate_lease through worker failure
-                // and receipt settlement. The state guard preserves the existing
-                // atomic write/slot/binding/event transition on ordinary results.
+                let worker_write = write.clone();
+                // The original supervisor retains physical leases through the
+                // persistence worker. It keeps the logical write after releasing
+                // those leases to await an outstanding native retirement.
                 let worker = intent_core::spawn_daemon(async move {
                     worker_secrets
                         .persist_gitlab_grant_observed(
                             grant,
                             lease,
-                            write
-                                .clone()
-                                .map(|write| write as Arc<dyn GitlabWriteObserver>),
+                            worker_write.map(|write| write as Arc<dyn GitlabWriteObserver>),
                         )
                         .await?;
                     guard.flow = None;
                     drop(guard);
-                    let bound =
-                        bind_gitlab_host_owned(registry.as_deref(), &worker_host, write.as_deref());
-                    if let Some(write) = &write {
-                        write.confirm_publication(bound);
-                        if write.has_prepared_connect() && !bound {
-                            return Err(Error::Internal(
-                                "GitLab connection publication unavailable".into(),
-                            ));
-                        }
-                    }
-                    publish_auth_changed(
-                        worker_bus.as_ref(),
-                        Provider::Gitlab,
-                        &worker_host,
-                        "authorized",
-                    )
-                    .await;
                     Ok::<(), Error>(())
                 });
-                let committed = worker.await;
+                let mut committed = worker.await;
                 #[cfg(test)]
                 if committed.is_err() {
                     operation.gitlab_poll_worker_failed.notify_one();
+                }
+                let _publication_gate = if let Some(write) = write
+                    .as_ref()
+                    .filter(|write| write.native_retirement_pending())
+                {
+                    operation.finish_operation().await;
+                    let source = operation.paired_gitlab_source();
+                    let completed = match &source {
+                        Ok(store) => {
+                            write
+                                .completed_source(store.clone(), gate_lease.clone())
+                                .await
+                        }
+                        Err(_) => Err(Error::Internal(
+                            "original paired GitLab source unavailable".into(),
+                        )),
+                    };
+                    drop(gate_lease);
+                    drop(credential_guard);
+                    if let Err(error) = write.join_native_retirement().await {
+                        if matches!(&committed, Ok(Ok(()))) {
+                            committed = Ok(Err(error));
+                        }
+                    }
+                    let guard = gate.lock().await;
+                    let current = match source {
+                        Ok(store) => {
+                            write
+                                .check_completed_source(completed, store, guard.lease())
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = current {
+                        if matches!(&committed, Ok(Ok(()))) {
+                            committed = Ok(Err(error));
+                        }
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
+                if matches!(&committed, Ok(Ok(()))) {
+                    let registry = registry.clone();
+                    let worker_bus = bus.clone();
+                    let worker_host = host.clone();
+                    let write = write.clone();
+                    // Preserve the existing worker-panic boundary for the
+                    // settings/event tail, still owned by this supervisor.
+                    committed = intent_core::spawn_daemon(async move {
+                        let bound = bind_gitlab_host_owned(
+                            registry.as_deref(),
+                            &worker_host,
+                            write.as_deref(),
+                        );
+                        if let Some(write) = &write {
+                            write.confirm_publication(bound);
+                            if write.has_prepared_connect() && !bound {
+                                return Err(Error::Internal(
+                                    "GitLab connection publication unavailable".into(),
+                                ));
+                            }
+                        }
+                        publish_auth_changed(
+                            worker_bus.as_ref(),
+                            Provider::Gitlab,
+                            &worker_host,
+                            "authorized",
+                        )
+                        .await;
+                        Ok::<(), Error>(())
+                    })
+                    .await;
                 }
                 operation.finish_operation().await;
                 match committed {
@@ -573,15 +624,25 @@ async fn load_gitlab_token(
 /// Clear a device-grant connection whose access token can no longer be
 /// renewed, and tell subscribers (`status: "expired"`). The caller holds the
 /// [`GitlabCredentialGate`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "retain the original credential owner and both gate references through completion"
+)]
 async fn disconnect_gitlab(
     store: FileSecretStore,
     secrets: &crate::settings::AsyncSecretStore,
     bus: Option<&EventBus>,
     host: &str,
-    guard: &GitlabCredentialGuard,
+    guard: GitlabCredentialGuard,
+    gate: &GitlabCredentialGate,
+    retained: &probe_owner::RetainedGate,
     write: Option<Arc<RepositoryWrite>>,
 ) -> Result<()> {
-    revoke_owned(store, secrets, guard, write).await?;
+    let deletion = revoke_owned(store.clone(), secrets, &guard, write.clone()).await;
+    let completion =
+        probe_owner::complete_native_phase(gate, &store, retained, guard, write.as_deref()).await;
+    deletion?;
+    let _guard = completion?;
     publish_auth_changed(bus, Provider::Gitlab, host, "expired").await;
     Ok(())
 }
@@ -634,7 +695,17 @@ async fn disconnect_gitlab_if_current(
         let write = gate
             .reserve(host, RepositoryMutationKind::Disconnect)
             .map_err(crate::pr_ops::map_sc_err)?;
-        disconnect_gitlab(store, secrets, bus, host.host(), &credential_guard, write).await?;
+        disconnect_gitlab(
+            store,
+            secrets,
+            bus,
+            host.host(),
+            credential_guard,
+            gate,
+            retained,
+            write,
+        )
+        .await?;
     }
     retained.lock().unwrap().take();
     Ok(())
@@ -650,6 +721,10 @@ async fn disconnect_gitlab_if_current(
 /// transient refresh failure keeps the stored pair. A PAT / absent
 /// credential is never refreshed. The caller holds the
 /// [`GitlabCredentialGate`] and has checked the binding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "retain exact credential guard and supervisor lease across native completion"
+)]
 async fn refresh_stored_credential_if_needed(
     secrets: &crate::settings::AsyncSecretStore,
     host: &GitlabHost,
@@ -657,13 +732,14 @@ async fn refresh_stored_credential_if_needed(
     store: &FileSecretStore,
     bus: Option<&EventBus>,
     gate: &GitlabCredentialGate,
-    guard: &GitlabCredentialGuard,
-) -> Result<Option<(StoredCredential, bool)>> {
+    mut guard: GitlabCredentialGuard,
+    retained: &probe_owner::RetainedGate,
+) -> Result<(Option<(StoredCredential, bool)>, GitlabCredentialGuard)> {
     if !gate
-        .original_source_current(host, store, guard, None)
+        .original_source_current(host, store, &guard, None)
         .await?
     {
-        return Ok(None);
+        return Ok((None, guard));
     }
     let mut credential = stored_credential(store.clone())
         .await
@@ -673,16 +749,37 @@ async fn refresh_stored_credential_if_needed(
         let write = gate
             .reserve(host, RepositoryMutationKind::Refresh)
             .map_err(crate::pr_ops::map_sc_err)?;
-        match try_refresh(
+        let result = try_refresh(
             host,
             client_id,
             store.clone(),
             secrets,
-            guard,
+            &guard,
             write.clone(),
         )
-        .await
-        {
+        .await;
+        // Failed refresh deletion uses the same original mutation. Its event
+        // follows the retained native join, never merely the secret-store write.
+        let deletion = if matches!(&result, Err(RefreshFailure::Unrecoverable)) {
+            Some(revoke_owned(store.clone(), secrets, &guard, write.clone()).await)
+        } else {
+            None
+        };
+        let completion =
+            probe_owner::complete_native_phase(gate, store, retained, guard, write.as_deref())
+                .await;
+        // Preserve original persistence/local error information after driving
+        // retirement, without inventing a successful completion from it.
+        match result {
+            Err(RefreshFailure::Persistence(error)) => return Err(error),
+            Err(RefreshFailure::Local(error)) => return Err(crate::pr_ops::map_sc_err(error)),
+            _ => {}
+        }
+        if let Some(Err(error)) = deletion {
+            return Err(error);
+        }
+        guard = completion?;
+        match result {
             Ok(()) => {
                 refreshed = true;
                 credential = stored_credential(store.clone())
@@ -690,15 +787,16 @@ async fn refresh_stored_credential_if_needed(
                     .map_err(crate::pr_ops::map_sc_err)?;
             }
             Err(RefreshFailure::Unrecoverable) => {
-                disconnect_gitlab(store.clone(), secrets, bus, host.host(), guard, write).await?;
-                return Ok(None);
+                publish_auth_changed(bus, Provider::Gitlab, host.host(), "expired").await;
+                return Ok((None, guard));
             }
             Err(RefreshFailure::Transient) => {}
-            Err(RefreshFailure::Local(error)) => return Err(crate::pr_ops::map_sc_err(error)),
-            Err(RefreshFailure::Persistence(error)) => return Err(error),
+            Err(RefreshFailure::Local(_) | RefreshFailure::Persistence(_)) => {
+                unreachable!("original error returned above")
+            }
         }
     }
-    Ok(Some((credential, refreshed)))
+    Ok((Some((credential, refreshed)), guard))
 }
 
 /// Probe the credential in use for `host` against `GET /api/v4/user`, running
@@ -760,17 +858,18 @@ async fn probe_gitlab_owned(
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
         }
-        let Some((credential, refreshed)) = refresh_stored_credential_if_needed(
+        let (refreshed_credential, credential_guard) = refresh_stored_credential_if_needed(
             secrets,
             host,
             client_id,
             &store,
             bus,
             gate,
-            &credential_guard,
+            credential_guard,
+            retained,
         )
-        .await?
-        else {
+        .await?;
+        let Some((credential, refreshed)) = refreshed_credential else {
             return Ok(ProbeOutcome::NotConfigured);
         };
         let Some((token, method)) = load_gitlab_token(&store, credential).await? else {
@@ -816,7 +915,7 @@ async fn probe_gitlab_owned(
     // 401 on the original device credential: one refresh, one retry. An
     // intervening replacement belongs to its own request, never this retry.
     let (token, method, retry_receipt) = {
-        let credential_guard = probe_owner::acquire(gate, retained).await;
+        let mut credential_guard = probe_owner::acquire(gate, retained).await;
         if !bound() {
             return Ok(ProbeOutcome::NotConfigured);
         }
@@ -836,7 +935,7 @@ async fn probe_gitlab_owned(
             let write = gate
                 .reserve(host, RepositoryMutationKind::Refresh)
                 .map_err(crate::pr_ops::map_sc_err)?;
-            match try_refresh(
+            let result = try_refresh(
                 host,
                 client_id,
                 store.clone(),
@@ -844,18 +943,43 @@ async fn probe_gitlab_owned(
                 &credential_guard,
                 write.clone(),
             )
-            .await
-            {
+            .await;
+            let deletion = if matches!(&result, Err(RefreshFailure::Unrecoverable)) {
+                Some(revoke_owned(store.clone(), secrets, &credential_guard, write.clone()).await)
+            } else {
+                None
+            };
+            let completion = probe_owner::complete_native_phase(
+                gate,
+                &store,
+                retained,
+                credential_guard,
+                write.as_deref(),
+            )
+            .await;
+            match result {
+                Err(RefreshFailure::Local(error)) => return Err(crate::pr_ops::map_sc_err(error)),
+                Err(RefreshFailure::Persistence(error)) => return Err(error),
+                _ => {}
+            }
+            if let Some(Err(error)) = deletion {
+                return Err(error);
+            }
+            credential_guard = completion?;
+            match result {
                 Ok(()) => {}
                 Err(RefreshFailure::Unrecoverable) => {
-                    disconnect_gitlab(store, secrets, bus, host.host(), &credential_guard, write)
-                        .await?;
+                    publish_auth_changed(bus, Provider::Gitlab, host.host(), "expired").await;
                     return Ok(ProbeOutcome::NotConfigured);
                 }
                 Err(RefreshFailure::Transient) => return Ok(ProbeOutcome::Rejected),
-                Err(RefreshFailure::Local(error)) => return Err(crate::pr_ops::map_sc_err(error)),
-                Err(RefreshFailure::Persistence(error)) => return Err(error),
+                Err(RefreshFailure::Local(_) | RefreshFailure::Persistence(_)) => {
+                    unreachable!("original error returned above")
+                }
             }
+        }
+        if !bound() {
+            return Ok(ProbeOutcome::NotConfigured);
         }
         let credential = stored_credential(store.clone())
             .await
@@ -1430,7 +1554,7 @@ impl crate::Services {
         token: intent_sourcecontrol::SecretString,
         guard: &GitlabCredentialGuard,
         write: Option<Arc<RepositoryWrite>>,
-    ) -> Result<Value> {
+    ) -> Result<crate::direct_secret_ops::Completion> {
         self.secrets
             .persist_gitlab_pat_observed(
                 self.gitlab_secret_store.clone(),
@@ -1451,6 +1575,14 @@ impl crate::Services {
             state.flow = None;
             state.starting = None;
         }
+        Ok(crate::direct_secret_ops::Completion::GitlabPat(host, write))
+    }
+
+    pub(crate) async fn publish_gitlab_pat(
+        &self,
+        host: GitlabHost,
+        write: Option<Arc<RepositoryWrite>>,
+    ) -> Result<Value> {
         let bound = crate::source_control_auth_ops::bind_gitlab_host_owned(
             self.settings_registry.as_deref(),
             host.host(),
@@ -1479,7 +1611,7 @@ impl crate::Services {
         host: intent_sourcecontrol::gitlab_auth::GitlabHost,
         guard: &GitlabCredentialGuard,
         write: crate::direct_secret_ops::RevokeWrite,
-    ) -> Result<Value> {
+    ) -> Result<crate::direct_secret_ops::Completion> {
         {
             let mut state = self.gitlab_auth.lock().await;
             if state
@@ -1505,7 +1637,9 @@ impl crate::Services {
                 .original_source_current(&host, &self.gitlab_secret_store, guard, None)
                 .await?
             {
-                return Ok(json!({"ok":true}));
+                return Ok(crate::direct_secret_ops::Completion::Done(
+                    json!({"ok":true}),
+                ));
             }
             let stored = intent_sourcecontrol::gitlab_auth::stored_credential(
                 self.gitlab_secret_store.clone(),
@@ -1514,26 +1648,26 @@ impl crate::Services {
             .map_err(crate::pr_ops::map_sc_err)?;
             if stored != intent_sourcecontrol::StoredCredential::None {
                 let Some(write) = write else {
-                    return Ok(json!({"ok":true}));
+                    return Ok(crate::direct_secret_ops::Completion::Done(
+                        json!({"ok":true}),
+                    ));
                 };
                 let write = write.map_err(crate::pr_ops::map_sc_err)?;
                 crate::source_control_auth_ops::revoke_owned(
                     self.gitlab_secret_store.clone(),
                     &self.secrets,
                     guard,
-                    write,
+                    write.clone(),
                 )
                 .await?;
-                crate::source_control_auth_ops::publish_auth_changed(
-                    self.event_bus.as_ref(),
-                    crate::source_control_auth_ops::Provider::Gitlab,
-                    host.host(),
-                    "revoked",
-                )
-                .await;
+                return Ok(crate::direct_secret_ops::Completion::GitlabRevoke(
+                    host, write,
+                ));
             }
         }
-        Ok(json!({"ok":true}))
+        Ok(crate::direct_secret_ops::Completion::Done(
+            json!({"ok":true}),
+        ))
     }
 
     /// Capture this request's original disconnect before it awaits the owner.

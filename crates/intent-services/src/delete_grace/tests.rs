@@ -208,9 +208,9 @@ async fn zero_delay_claim_is_original_and_marker_is_removed_before_user_code() {
         .await
         .unwrap();
     assert_eq!(f.probe.state.lock().unwrap().begins, 2);
-    immediate.settle_confirmed();
+    immediate.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
-    claim.settle_confirmed();
+    claim.settle_confirmed().await.unwrap();
     assert!(!f.probe.blocked(&f.subject));
 }
 
@@ -405,7 +405,7 @@ async fn immediate_and_cascade_move_original_guard_without_settlement_or_reacqui
         .await
         .unwrap()
         .is_none());
-    immediate.settle_confirmed();
+    immediate.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
     drop(cascade); // Unknown work cannot be confirmed by another operation.
     let own = f
@@ -413,7 +413,7 @@ async fn immediate_and_cascade_move_original_guard_without_settlement_or_reacqui
         .take_for_immediate_delete(f.subject.clone())
         .await
         .unwrap();
-    own.settle_confirmed();
+    own.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
 }
 
@@ -443,7 +443,7 @@ async fn claim_survives_response_ack_and_is_settled_only_by_original_background_
             intent_store::RepositoryWorkspaceDeleteDisposition::Committed
         );
         outcome.result.unwrap();
-        claim.settle_confirmed();
+        claim.settle_confirmed().await.unwrap();
     });
     assert!(!f.registry.cancel_owned(&f.subject).await.unwrap());
     assert!(f.probe.blocked(&f.subject));

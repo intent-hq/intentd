@@ -233,6 +233,81 @@ async fn primary_actor(bus: &EventBus) -> Value {
     json!({ "type": "user", "id": p.id, "name": name })
 }
 
+/// Compare the full pushed metadata with committed state, excluding body data.
+async fn assert_note_metadata(event: &Value, bus: &EventBus, ws: &str, id: &str) {
+    let workspace_id = WorkspaceId::from(ws);
+    let note = bus
+        .store()
+        .get_note(&workspace_id, &id.into())
+        .await
+        .unwrap();
+    let mut expected = serde_json::to_value(&note).unwrap();
+    expected.as_object_mut().unwrap().remove("content");
+    expected["metadata"] = serde_json::to_value(&note.metadata).unwrap();
+    if note.metadata.task.is_some() {
+        let tasks = bus
+            .store()
+            .list_workspace_tasks(&workspace_id, None)
+            .await
+            .unwrap();
+        let task = tasks
+            .tasks
+            .iter()
+            .find(|task| task.id.as_str() == id)
+            .unwrap();
+        expected["metadata"]["task"]["unmetDependsOn"] = json!(task.unmet_depends_on);
+    }
+    let pushed = &event["data"]["note"];
+    assert_eq!(pushed, &expected);
+    assert!(pushed.get("content").is_none());
+    assert!(pushed.get("contentPreview").is_none());
+    assert!(pushed.get("contentLength").is_none());
+}
+
+/// Every mutation in this fixture changes its only task, so the complete
+/// upsert batch must equal the authoritative task.list projection.
+async fn expect_task_projection(
+    reader: &mut BufReader<OwnedReadHalf>,
+    bus: &EventBus,
+    ws: &str,
+    removed: &[&str],
+) {
+    let frame = read_json(reader).await;
+    assert_eq!(frame["method"], "events.event");
+    let event = &frame["params"]["event"];
+    assert_eq!(event["type"], "task:updated");
+    assert_eq!(event["workspaceId"], ws);
+    assert_eq!(event["actor"], primary_actor(bus).await);
+    let expected = bus
+        .store()
+        .list_workspace_tasks(&WorkspaceId::from(ws), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        event["data"],
+        json!({"workspaceId": ws, "tasks": expected.tasks, "removedIds": removed})
+    );
+}
+
+async fn expect_task_stats(
+    reader: &mut BufReader<OwnedReadHalf>,
+    bus: &EventBus,
+    ws: &str,
+    total: u64,
+    in_progress: u64,
+) {
+    let frame = read_json(reader).await;
+    assert_eq!(frame["method"], "events.event");
+    let event = &frame["params"]["event"];
+    assert_eq!(event["type"], "workspace:task-stats-changed");
+    assert_eq!(event["workspaceId"], ws);
+    assert_eq!(event["actor"], primary_actor(bus).await);
+    assert_eq!(
+        event["data"],
+        json!({"workspaceId": ws, "taskStats": {"total": total, "completed": 0, "inProgress": in_progress}})
+    );
+}
+
 /// End-to-end change-event proof (M2.6): one connection subscribes; another runs
 /// CRUD across workspace/note/task/comment over JSON-RPC; the subscriber receives
 /// the matching `events.event` notifications with the camelCase envelope + payload
@@ -304,13 +379,13 @@ async fn crud_mutations_emit_change_events_over_uds() {
         .to_string();
     wait_for_subscriber_count(&bus, 1).await;
 
-    // note.create → note:created { noteId, title, action: "create" }.
+    // note.create → note:created with complete metadata and no body.
     let created = rpc(
         &mut rpc_write,
         &mut rpc_reader,
         11,
         "note.create",
-        json!({ "workspaceId": ws_id, "title": "Note" }),
+        json!({ "workspaceId": ws_id, "title": "Note", "parentId": "spec", "tags": ["contract"] }),
     )
     .await;
     let note_id = created["note"]["id"].as_str().unwrap().to_string();
@@ -326,8 +401,10 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["actor"], primary_actor(&bus).await);
     assert_eq!(
         e["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "create" })
+        json!({ "noteId": note_id, "title": "Note", "action": "create", "note": e["data"]["note"] })
     );
+
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
 
     // note.update (content) → note:updated.
     rpc(
@@ -340,14 +417,26 @@ async fn crud_mutations_emit_change_events_over_uds() {
     .await;
     let ev = read_json(&mut sub_reader).await;
     assert_eq!(ev["params"]["event"]["type"], "note:updated");
+    let e = &ev["params"]["event"];
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
     assert_eq!(
-        ev["params"]["event"]["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+        e["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update", "note": e["data"]["note"] })
     );
 
-    // task.markAsTask makes it a task → note:updated (the metadata write) then
-    // task:created, since the note was not already a task. task.updateNoteStatus
-    // then → task:status-changed with the previous/new status payload.
+    // Link the direct spec child so count changes must be pushed too. These
+    // ordinary note writes do not emit task/stat events: strict reads below
+    // would fail if an unchanged-stat notification were inserted.
+    rpc(&mut rpc_write, &mut rpc_reader, 120, "note.update",
+        json!({"workspaceId": ws_id, "noteId": "spec", "content": format!("[Note](intent://local/task/{note_id})")})).await;
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "note:updated");
+    assert_eq!(e["data"]["noteId"], "spec");
+    assert_note_metadata(e, &bus, &ws_id, "spec").await;
+
+    // Marking the task emits metadata, complete task/stat projections, then
+    // the legacy task:created. Status changes retain their legacy payload.
     rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -358,10 +447,14 @@ async fn crud_mutations_emit_change_events_over_uds() {
     .await;
     let ev = read_json(&mut sub_reader).await;
     assert_eq!(ev["params"]["event"]["type"], "note:updated");
+    let e = &ev["params"]["event"];
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
     assert_eq!(
-        ev["params"]["event"]["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+        e["data"],
+        json!({ "noteId": note_id, "title": "Note", "action": "update", "note": e["data"]["note"] })
     );
+    expect_task_projection(&mut sub_reader, &bus, &ws_id, &[]).await;
+    expect_task_stats(&mut sub_reader, &bus, &ws_id, 1, 0).await;
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "task:created");
@@ -371,6 +464,7 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["data"]["status"], "not_started");
     assert!(e["data"]["createdAt"].is_string());
     assert!(e["data"].get("agentId").is_none());
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
 
     rpc(
         &mut rpc_write,
@@ -388,20 +482,26 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["data"]["previousStatus"], "not_started");
     assert_eq!(e["data"]["newStatus"], "in_progress");
     assert!(e["data"]["changedAt"].is_string());
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
+    expect_task_projection(&mut sub_reader, &bus, &ws_id, &[]).await;
+    expect_task_stats(&mut sub_reader, &bus, &ws_id, 1, 1).await;
 
     // The status change recomputes the ready set → task:ready-tasks-changed
     // carrying the full readyTaskIds list plus the triggering transition.
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "task:ready-tasks-changed");
-    assert_eq!(e["data"]["readyTaskIds"], json!([note_id]));
+    // This fixture is a child of the ordinary spec note, so it is not a
+    // root in the task-only readiness tree.
+    assert_eq!(e["data"]["readyTaskIds"], json!([]));
     assert_eq!(e["data"]["triggeredBy"]["noteId"], note_id.as_str());
     assert_eq!(e["data"]["triggeredBy"]["previousStatus"], "not_started");
     assert_eq!(e["data"]["triggeredBy"]["newStatus"], "in_progress");
     assert!(e["data"]["computedAt"].is_string());
 
     // comment.add → note:updated (the add rewrites the note markdown with
-    // anchor markers, monorepo#638) followed by comment:added.
+    // anchor markers, monorepo#638), then a task upsert and comment:added.
+    // The task timestamp changes, while the statistics stay unchanged.
     let added = rpc(
         &mut rpc_write,
         &mut rpc_reader,
@@ -422,8 +522,11 @@ async fn crud_mutations_emit_change_events_over_uds() {
     assert_eq!(e["type"], "note:updated");
     assert_eq!(
         e["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+        json!({ "noteId": note_id, "title": "Note", "action": "update", "note": e["data"]["note"] })
     );
+    assert_note_metadata(e, &bus, &ws_id, &note_id).await;
+    assert_eq!(e["data"]["note"]["rev"], added["noteRev"]);
+    expect_task_projection(&mut sub_reader, &bus, &ws_id, &[]).await;
     let ev = read_json(&mut sub_reader).await;
     let e = &ev["params"]["event"];
     assert_eq!(e["type"], "comment:added");
@@ -472,6 +575,28 @@ async fn crud_mutations_emit_change_events_over_uds() {
         e["data"],
         json!({ "workspaceId": ws_id, "attention": "none" })
     );
+
+    // Deleting the task preserves the legacy tombstone and pushes removal
+    // plus authoritative zero counts. Its unchanged empty ready set emits
+    // no further event.
+    rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        18,
+        "note.delete",
+        json!({"workspaceId": ws_id, "noteId": note_id}),
+    )
+    .await;
+    let ev = read_json(&mut sub_reader).await;
+    let e = &ev["params"]["event"];
+    assert_eq!(e["type"], "note:deleted");
+    assert_eq!(
+        e["data"],
+        json!({"noteId": note_id, "title": "Note", "action": "delete"})
+    );
+    expect_task_projection(&mut sub_reader, &bus, &ws_id, &[&note_id]).await;
+    expect_task_stats(&mut sub_reader, &bus, &ws_id, 0, 0).await;
+    expect_no_frame(&mut sub_reader).await;
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
