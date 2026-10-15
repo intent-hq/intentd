@@ -433,7 +433,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
         mac = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"][0]
-        self.assertEqual(mac["name"], "build (aarch64-apple-darwin, macos-14)")
+        self.assertEqual(mac["name"], "build (aarch64-apple-darwin)")
         self.assertEqual(self.workflow["jobs"]["daemon-lifecycle"]["name"], "Daemon lifecycle (${{ matrix.platform }})")
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):

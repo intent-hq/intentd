@@ -1,0 +1,74 @@
+name: Retire obsolete merge runs
+# Scheduled events execute default-branch workflow code. No merge_group destroyed
+# trigger exists in Actions. Reconciliation does not depend on delete delivery.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Preview by default; apply requests exact eligible-run cancellation
+        type: choice
+        options: [dry-run, apply]
+        default: dry-run
+
+permissions: {}
+concurrency:
+  group: retire-obsolete-merge-runs
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    env:
+      RETIREMENT_MODE: ${{ github.event_name == 'schedule' && 'apply' || inputs.mode || 'dry-run' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify trusted retirement policy and caller before cleanup
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+      # Main caches are invisible to PR writes; a missing/evicted checkpoint
+      # safely starts a fresh sweep. Cache state is never cancellation evidence.
+      - uses: actions/cache/restore@v4
+        id: cursor
+        with:
+          path: .retirement/cursor.json
+          key: obsolete-merge-cursor-v1-${{ env.RETIREMENT_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: obsolete-merge-cursor-v1-${{ env.RETIREMENT_MODE }}-
+      - name: Probe credential and reconcile bounded sweep
+        id: sweep
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETIREMENT_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+        # Reads require the independently probed existing read credential.
+        # The job token is used only for the exact local cancellation POST.
+        # Both protection and activity are checked again before every apply;
+        # null queue heads and unknown protection stop this sweep without writes.
+        run: |
+          case "$RETIREMENT_MODE" in dry-run|apply) ;; *) echo "Invalid retirement mode" >&2; exit 2 ;; esac
+          python3 -I -B scripts/retire-obsolete-merge-runs-caller.py \
+            --repository intent-hq/intentd --workflow-credentials --"$RETIREMENT_MODE" \
+            --state .retirement/cursor.json | tee retirement-report.json
+      - uses: actions/cache/save@v4
+        if: always() && steps.sweep.outcome != 'skipped' && hashFiles('.retirement/cursor.json') != ''
+        with:
+          path: .retirement/cursor.json
+          key: obsolete-merge-cursor-v1-${{ env.RETIREMENT_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: obsolete-merge-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: retirement-report.json
+          retention-days: 14

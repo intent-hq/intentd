@@ -705,10 +705,10 @@ jobs:
           #   os: depot-ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
           # use the latest hosted ARM64 image. Empty route output also falls back to
-          # hosted. Retain the historical macos-14 check name for continuity.
+          # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
-            name: build (aarch64-apple-darwin, macos-14)
+            name: build (aarch64-apple-darwin)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
           # depot-windows-2022-16 runner otherwise (fail-open to burst, like the
@@ -2019,6 +2019,11 @@ jobs:
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+      - name: Test obsolete merge-run policy and workflow integration (offline)
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler

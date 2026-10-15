@@ -403,13 +403,16 @@ After confirming recovery, the agent can clear its warning while a release or
 scheduled check is still pending. A recorded blocker notice can remain in the
 conversation after the current warning clears.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
-whose usage limit was reached. For sign-in errors, run the displayed CLI login
-command; signing in to the Claude desktop app does not sign in its CLI. For
-**Agent session corrupted**, retry starts a fresh session and carries over the
-conversation history. Do not promise a model or provider switch unless the UI
-offers it; inspect **Settings → Providers** for setup problems.
+whose usage limit was reached. For sign-in errors, including an expired Claude
+OAuth login, run the displayed CLI login command on the host running the agent,
+complete sign-in, then retry. Signing in to the Claude desktop app does not sign
+in its CLI. For **Agent session corrupted**, retry starts a fresh session and
+carries over the conversation history. Do not promise a model or provider switch
+unless the UI offers it; inspect **Settings → Providers** for setup problems.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
