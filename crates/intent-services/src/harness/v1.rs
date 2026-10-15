@@ -45,6 +45,7 @@ pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("scripts", "Saved scripts (ws.script.*)"),
     ("terminalAccess", "Terminal read access (ws.terminal.*)"),
     ("browserAutomation", "Browser automation (ws.browser.*)"),
+    ("desktopControl", "Desktop control (ws.desktop.*)"),
     ("richChatBlocks", "Rich chat block guidance"),
     (
         "structuredQuestions",

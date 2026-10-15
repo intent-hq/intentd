@@ -34,7 +34,7 @@ impl Document {
         caller: Caller,
     ) -> Self {
         let api: Arc<dyn WorkspaceApi> = services;
-        let connection = with_credential_context(false, Some(caller.clone()), None, async {
+        let connection = with_credential_context(false, Some(caller.clone()), None, None, async {
             ReadConnectionGuard::bind(api.as_ref(), RepositoryWireEntry::AdmittedLocal)
         })
         .await;
@@ -68,6 +68,7 @@ impl Document {
                     false,
                     Some(self.caller.clone()),
                     None,
+                    self.guard.desktop_connection(),
                     self.connection.run(async {
                         process_frame(
                             &raw,

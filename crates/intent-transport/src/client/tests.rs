@@ -116,6 +116,7 @@ async fn mints_client_id_when_omitted() {
         "omitted capabilities normalize to an empty object"
     );
     assert!(!bound.browser_exec());
+    assert_eq!(bound.capabilities.get("desktopControl"), None);
     assert_eq!(
         bound.host,
         ClientHostInfo::default(),
@@ -127,6 +128,12 @@ async fn mints_client_id_when_omitted() {
         "explicit top-level protocolVersion in the hello result"
     );
     let server = &resp["result"]["server"];
+    // Advertising these APIs does not grant capabilities to the connecting client.
+    assert_eq!(server["capabilities"]["desktopControl"], 1);
+    assert_eq!(server["capabilities"]["workspaceMembershipEvents"], 1);
+    assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
+    assert_eq!(server["capabilities"]["scriptMonitors"], 2);
+    assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(server["version"], json!(env!("CARGO_PKG_VERSION")));
     match crate::BUILD_COMMIT {

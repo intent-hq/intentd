@@ -190,15 +190,19 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Protocol 13.0 removes the deprecated git.commit router method.
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
+// Desktop control adds four router methods; reverse methods are counted separately.
+// GitLab checkout repository configuration adds one router method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 435;
+// Compact script lists add two router methods.
+// Protected startup status adds one fast-path method.
+const EXPECTED_TOTAL_METHODS: usize = 439;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+const EXPECTED_ROUTER_METHODS: usize = 382;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -210,7 +214,7 @@ const EXPECTED_ALIASES: usize = 0;
 const EXPECTED_NOTIFICATIONS: usize = 5;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 5;
+const EXPECTED_REVERSE_METHODS: usize = 6;
 
 #[test]
 fn router_methods_match_actual_source() {
@@ -582,6 +586,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
     "drafts.clear",
     "drafts.get",
     "drafts.set",
@@ -1229,6 +1237,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.syncTabs",
     "browser.upsertTab",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -1846,6 +1857,18 @@ mod unbound_owner_only_methods {
                 json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
             ),
             ("debug.sampleStacks", json!({ "durationMs": 1 })),
+            (
+                "desktop.getState",
+                json!({ "workspaceId": ws, "agentId": "a1" }),
+            ),
+            (
+                "desktop.respondPermission",
+                json!({ "workspaceId": ws, "requestId": "r1", "decision": "allow_once" }),
+            ),
+            (
+                "desktop.setPermission",
+                json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
+            ),
             ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
             ("file-tracking.getChanges", json!({ "workspaceId": ws })),
             ("file-tracking.loadCommits", json!({ "workspaceId": ws })),

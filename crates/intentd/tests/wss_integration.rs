@@ -20,6 +20,8 @@ mod comment_deletion;
 mod common;
 #[path = "wss_integration/demand_note_indexes.rs"]
 mod demand_note_indexes;
+#[path = "wss_integration/desktop_control.rs"]
+mod desktop_control;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
 #[path = "wss_integration/git_commit_removal.rs"]

@@ -228,7 +228,7 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let hello = call(
         &mut ws,
         "client.hello",
-        json!({"clientId":"must-not-persist","name":"pending client"}),
+        json!({"clientId":"must-not-persist","name":"pending client","capabilities":{"browserExec":true,"desktopControl":1}}),
     )
     .await;
     assert_eq!(hello["error"]["data"]["code"], "daemon-not-ready");
@@ -252,6 +252,10 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
         "workspace.list",
         "note.add",
         "events.subscribe",
+        "desktop.getState",
+        "desktop.respondPermission",
+        "desktop.setPermission",
+        "desktop.revoke",
         "principal.me",
         "system.shutdown",
         "unknown",
@@ -305,6 +309,14 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
             .await
             .unwrap(),
         0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM settings WHERE key GLOB 'desktop.v1/*'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "bootstrap desktop requests cannot create consent or session state"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT rev FROM note WHERE id='spec'")
@@ -393,12 +405,16 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let hello = call(
         &mut ready,
         "client.hello",
-        json!({"clientId":"now-ready","name":"ready client"}),
+        json!({"clientId":"now-ready","name":"ready client","capabilities":{"browserExec":true,"desktopControl":1}}),
     )
     .await;
     assert_eq!(
         hello["result"]["server"]["capabilities"]["startupStatus"], 1,
         "{hello}"
+    );
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["desktopControl"],
+        1
     );
     assert_eq!(
         call(&mut ready, "unknown", json!({})).await["error"]["code"],

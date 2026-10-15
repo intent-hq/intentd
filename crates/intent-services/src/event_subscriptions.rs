@@ -357,7 +357,13 @@ impl Services {
                 if batch.is_empty() {
                     continue;
                 }
-                let refs: Vec<&Event> = batch.iter().collect();
+                let refs: Vec<&Event> = batch
+                    .iter()
+                    .filter(|event| !event.event_type.starts_with("desktop:"))
+                    .collect();
+                if refs.is_empty() {
+                    continue;
+                }
                 let wake = format_event_subscription_wake(&refs);
                 let metadata = crate::build_event_notification_metadata(&refs);
                 if let Err(e) = services
