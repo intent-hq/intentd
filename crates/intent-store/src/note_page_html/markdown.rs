@@ -17,6 +17,7 @@ struct Output<'a> {
 impl fmt::Write for Output<'_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         let start = self.html.len();
+        crate::note_index_budget::charge(value.len());
         self.html.push_str(value);
         let range = &mut self.ranges[self.current.get()];
         if let Some(range) = range {
@@ -1055,7 +1056,7 @@ pub(crate) fn append_codes(
             let reference = format!("d:{}:pieces", ids[&id]);
             for (position, piece) in pieces.iter().enumerate() {
                 let piece_id = entries.id();
-                entries.rows.push((reference.clone(),position,json!({"kind":"sourcePiece","id":piece_id,"nodeRef":format!("d:{}",ids[&id]),"sourceRange":range_value(piece),"role":"body"})));
+                entries.push((reference.clone(),position,json!({"kind":"sourcePiece","id":piece_id,"nodeRef":format!("d:{}",ids[&id]),"sourceRange":range_value(piece),"role":"body"})));
             }
             native["provenance"] = json!("repaired");
             native["sourcePiecesRef"] = json!(reference);
@@ -1086,7 +1087,7 @@ pub(crate) fn append_codes(
                 native.clone(),
             ));
         }
-        entries.rows.push((format!("d:{}", ids[&id]), 0, native));
+        entries.push((format!("d:{}", ids[&id]), 0, native));
     }
     if !document_ranges.is_empty() || source.is_empty() {
         let document_id = entries.id();
@@ -1103,7 +1104,7 @@ pub(crate) fn append_codes(
         }
         for (position, range) in document_ranges.into_iter().enumerate() {
             let id = entries.id();
-            entries.rows.push((
+            entries.push((
                 format!("h:{document_id}"),
                 position,
                 json!({"kind":"sourceMap","id":id,
@@ -1197,7 +1198,7 @@ pub(crate) fn append_codes(
             let leaf = leaf.filter(|id| ids.contains_key(id));
             let text_ref =
                 (!map.text.is_empty()).then(|| entries.fragment("renderedText", &map.text));
-            entries.rows.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,
+            entries.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,
                 "ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),
                 "sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
         }
@@ -1257,7 +1258,7 @@ pub(crate) fn append_codes(
             let id = entries.id();
             let text_ref =
                 (!map.text.is_empty()).then(|| entries.fragment("renderedText", &map.text));
-            entries.rows.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
+            entries.push((format!("h:{owner}"),position,json!({"kind":"sourceMap","id":id,"profile":"canonicalNote","profileVersion":1,"ownerRef":format!("d:{owner}"),"textNodeId":leaf.map(|id|ids[&id].clone()),"textNodeRef":leaf.map(|id|format!("d:{}",ids[&id])),"sourceRange":range_value(&map.raw),"renderedRange":{"start":map.rendered.start,"end":map.rendered.end},"mapping":map.mapping,"textRef":text_ref})));
         }
     }
 }

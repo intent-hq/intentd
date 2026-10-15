@@ -52,6 +52,9 @@ impl Node {
         opening: Option<Range<usize>>,
         integration: bool,
     ) -> Handle {
+        crate::note_index_budget::charge(
+            512 + attrs.iter().map(|a| a.value.len() + 128).sum::<usize>(),
+        );
         Rc::new(Self {
             name,
             attrs: RefCell::new(attrs),
@@ -93,6 +96,17 @@ impl SourceTree {
     }
 
     fn insert(&self, parent: &Handle, at: usize, child: NodeOrText<Handle>) {
+        // Bound the DOM before recursive traversal/destruction, not only at
+        // the later output visitor. Parent links are weak and acyclic.
+        if crate::note_index_budget::active() {
+            let mut ancestor = Some(parent.clone());
+            let mut depth = 0;
+            while let Some(node) = ancestor {
+                depth += 1;
+                crate::note_index_budget::check_depth(depth);
+                ancestor = node.parent.borrow().upgrade();
+            }
+        }
         match child {
             NodeOrText::AppendNode(node) => {
                 Self::detach(&node);
@@ -113,6 +127,7 @@ impl SourceTree {
                     parent.children.borrow_mut().insert(at, node.clone());
                     node
                 };
+                crate::note_index_budget::charge(text.len() + 64);
                 node.text.borrow_mut().push_str(&text);
                 // Table text can be buffered until the following tag. Its
                 // provenance belongs to the character token, not that tag.
@@ -272,6 +287,7 @@ fn parse(source: &str) -> Handle {
     };
     let mut tokenizer = Tokenizer::new_with_emitter(source, emitter);
     while let Some(result) = tokenizer.next() {
+        crate::note_index_budget::charge(256);
         let token = result.expect("string reader is infallible");
         let (token, current) = match token {
             html5gum::Token::StartTag(tag) => {
@@ -599,6 +615,8 @@ impl<'a> NativeTree<'a> {
         source: Option<Handle>,
         attributes: Value,
     ) -> usize {
+        crate::note_index_budget::charge(512);
+        crate::note_index_budget::value(&attributes);
         let id = self.nodes.len();
         self.nodes.push(NativeNode {
             kind,
@@ -740,6 +758,8 @@ impl<'a> NativeTree<'a> {
         }
     }
     fn visit(&mut self, node: &Handle, parent: usize, marks: &[Value]) {
+        let _depth = crate::note_index_budget::enter();
+        crate::note_index_budget::charge(marks.len().saturating_mul(256));
         let tag = node.name.local.as_ref();
         if tag == "#text" {
             self.text(node, parent, marks);

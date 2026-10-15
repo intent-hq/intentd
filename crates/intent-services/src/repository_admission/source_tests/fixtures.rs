@@ -87,7 +87,13 @@ impl Fixture {
             .env_remove("GIT_COMMON_DIR")
             .output()
             .unwrap();
-        assert!(output.status.success(), "fixture Git failed");
+        assert!(
+            output.status.success(),
+            "fixture Git {:?} failed ({}): {}",
+            args.first(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap()
     }
 }
