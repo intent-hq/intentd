@@ -30,6 +30,7 @@ REQUIRED = {
     "push": ALWAYS_REQUIRED | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
+DOCS_JOBS = {"docs-scope", "docs-lint", "docs-compiled"}
 NATIVE_STEPS = {
     "Check (native production configuration)": {"macOS", "Windows"},
     "Clippy (target-gated code)": {"macOS", "Windows"},
@@ -77,33 +78,37 @@ def condition(value, context, *, success=True, cancelled=False):
     return (has_status or success) and bool(eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}}))
 
 
-def context(event, *, fork=False, fast_path="", platform="macOS"):
+def context(event, *, fork=False, fast_path="", platform="macOS", docs_tier="full"):
     return {
         "github.event_name": event,
         "github.repository": "intent-hq/intentd",
         "github.event.pull_request.head.repo.full_name": "outside/intentd" if fork else "intent-hq/intentd",
         "needs.release-fast-path.outputs.fast_path": fast_path,
+        "needs.docs-scope.outputs.tier": docs_tier,
         "runner.os": platform,
     }
 
 
-def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False):
+def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False,
+              docs_tier="full", docs_result="success"):
     results = {}
     for name, job in workflow["jobs"].items():
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        values = context(event, fork=fork, fast_path=fast_path)
+        values = context(event, fork=fork, fast_path=fast_path, docs_tier=docs_tier)
         values.update({f"needs.{key}.result": value for key, value in results.items()})
         runs = condition(job.get("if", True), values,
                          success=all(results[n] == "success" for n in needs), cancelled=cancelled)
-        results[name] = (route if name == "route" else "success") if runs else "skipped"
+        result = route if name == "route" else docs_result if name == "docs-scope" else "success"
+        results[name] = result if runs else "skipped"
     return results
 
 
-def gate_passes(workflow, event, results):
+def gate_passes(workflow, event, results, docs_tier="full"):
     body = next(s["run"] for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
-    values = {"github.event_name": event, **{f"needs.{k}.result": v for k, v in results.items()}}
+    values = {"github.event_name": event, "needs.docs-scope.outputs.tier": docs_tier,
+              **{f"needs.{k}.result": v for k, v in results.items()}}
     body = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], body)
     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], capture_output=True, text=True, timeout=5)
     return result.returncode == 0
@@ -116,17 +121,22 @@ def gate_errors(workflow):
     if gate.get("continue-on-error") or step.get("continue-on-error") or step.get("if"):
         errors.append("gate result check must be unconditional and fatal")
     needs = set(workflow["jobs"]["gate"]["needs"])
-    expected = set.union(*REQUIRED.values(), PR_METADATA)
+    expected = set.union(*REQUIRED.values(), PR_METADATA, DOCS_JOBS)
     if needs != expected:
         errors.append("gate dependencies changed")
     for event, required in REQUIRED.items():
         baseline = {name: "success" if name in required or (event == "pull_request" and name in PR_METADATA)
                     else "skipped" for name in expected}
+        baseline["docs-scope"] = "skipped" if event == "push" else "success"
         if not gate_passes(workflow, event, baseline):
             errors.append(f"{event}: intended skips rejected")
         for name in expected:
             for result in RESULTS:
                 accepted = result == "success" or (result == "skipped" and name not in required)
+                if name == "docs-scope":
+                    accepted = True
+                elif name in DOCS_JOBS:
+                    accepted = result == "skipped"
                 if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
                     errors.append(f"{event}: {name}={result}")
     return errors
@@ -138,6 +148,8 @@ def routing_errors(workflow):
         for fast_path in ("", "false", "true") if event == "pull_request" else ("",):
             jobs = scheduled(workflow, event, fast_path=fast_path)
             expected = REQUIRED[event] | {"route", "gate"}
+            if event != "push":
+                expected.add("docs-scope")
             if event == "pull_request":
                 expected |= PR_METADATA | {"release-fast-path"}
             actual = {name for name, result in jobs.items() if result == "success"}

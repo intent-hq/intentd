@@ -34,6 +34,8 @@ on:
   # PRs and merge groups with real Windows/macOS/Linux runtime proof.
   # CI Gate requires native check, Clippy and runtime proofs on merge_group,
   # and its release builds on push. CI Gate is the sole required status check.
+  # Docs-only PRs and whole merge groups use docs-lint; compiled docs also
+  # run docs-compiled and consumer checks. Unknown/mixed diffs use full CI.
   # Merge groups are created by the repo's own ruleset from already-filed
   # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
   # are PR-metadata checks that stay pull_request-only — the gate accepts
@@ -64,6 +66,76 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Positive classification is required to skip any normal validation. A failed
+  # classifier job leaves empty outputs and its consumers take the full path.
+  docs-scope:
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tier: ${{ steps.decide.outputs.tier }}
+      scope: ${{ steps.decide.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Classify the complete event diff
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        run: python3 -I -B scripts/docs-ci.py classify "$BASE_SHA" "$HEAD_SHA"
+
+  docs-lint:
+    needs: docs-scope
+    if: needs.docs-scope.outputs.tier == 'docs' || needs.docs-scope.outputs.tier == 'compiled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check documentation diff whitespace
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git diff --check "$BASE_SHA" "$HEAD_SHA"
+
+  docs-compiled:
+    needs: docs-scope
+    if: needs.docs-scope.outputs.tier == 'compiled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_PROGRESS_WHEN: never
+      DOCS_SCOPE: ${{ needs.docs-scope.outputs.scope }}
+      INTENTD_ASSERT_BOUND_CALLER: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: |
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$channel" --profile minimal --component clippy --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - name: Configure Depot managed compiler cache
+        shell: bash
+        env:
+          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        run: python3 scripts/setup-depot-sccache.py
+      - name: Acquire the shared transfer selection contract
+        uses: ./.github/actions/transfer-selection-fixtures
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+      - name: Build the pinned callback fixture from verified source
+        run: |
+          fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
+            --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
+          echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
+      - name: Check, lint and test compiled documentation consumers
+        run: python3 -I -B scripts/docs-ci.py compiled
+
   # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
   # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
   # Depot larger runners otherwise. Runs on a Depot runner so
@@ -82,6 +154,7 @@ jobs:
   # Both macOS native consumers use m1mac only when an online, idle ARM64
   # runner is confirmed; otherwise they use Depot’s latest macOS (ARM64).
   route:
+    needs: docs-scope
     # Runs on push / merge_group / same-repo pull_request. Linux PR checks
     # consume its decision; the native build entries use it on push and
     # merge_group (intent-hq/intent#5518). On push its Linux consumers
@@ -93,7 +166,7 @@ jobs:
     # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
     # Runs on merge_group (see the trigger comment) — merge groups come from
     # the repo's own ruleset, so no same-repo guard applies there.
-    if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -317,13 +390,10 @@ jobs:
             core.setOutput("macos_burst", String(macosUseBurst));
 
   check:
-    # Skipped on push to main — redundant re-test of a tree the PR CI already
-    # checked (see the `on: push` comment). The expression carries no status
-    # function, so the implicit success() still applies: a route failure —
-    # or a route skip, as on fork PRs — skips this job on pull_request
-    # exactly as before.
-    if: github.event_name != 'push'
-    needs: route
+    # Full-path checks require successful routing, even if docs classification
+    # failed. Main pushes keep the existing release-only validation.
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.route.result == 'success' && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
+    needs: [route, docs-scope]
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
@@ -653,10 +723,11 @@ jobs:
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
   release-fast-path:
+    needs: docs-scope
     runs-on: depot-ubuntu-24.04
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     timeout-minutes: 5
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
@@ -693,8 +764,8 @@ jobs:
     # matrix) and runs on every event this job runs on. route runs on
     # depot-ubuntu-24.04, so this dependency can never queue behind the
     # self-hosted runners it decides about.
-    needs: [release-fast-path, route]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
+    needs: [release-fast-path, route, docs-scope]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -962,8 +1033,8 @@ jobs:
   # job and independent target directory rather than extending timeouts.
   macos-services-runtime:
     name: macOS Services runtime
-    needs: [release-fast-path, route]
-    if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+    needs: [release-fast-path, route, docs-scope]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -1091,8 +1162,8 @@ jobs:
     # merge_group and must not be required; the fast-path skip it used to
     # provide is subsumed by the pull_request skip. Merge groups come from
     # the repo's own ruleset, so no same-repo fork guard applies.
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
+    needs: [route, docs-scope]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     timeout-minutes: 30
     env:
@@ -1303,8 +1374,8 @@ jobs:
     # merge_group. No github.event.pull_request reference (absent on
     # merge_group) and no release-fast-path dependency (pull_request-only,
     # empty output on merge_group).
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
+    needs: [route, docs-scope]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     # Include LLVM report generation after the full suite on shared runners.
     timeout-minutes: 45
@@ -1503,8 +1574,8 @@ jobs:
   # it is job-level skipped by design. github.event.pull_request is only
   # read inside the job (absent on merge_group, where the job never runs).
   coverage-changed:
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
+    needs: [route, docs-scope]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
@@ -1893,7 +1964,8 @@ jobs:
   # the `pull_request` trigger comment); skipped on push to main, where the
   # tree was already checked by its PR run. Seconds-long on depot-ubuntu-24.04.
   monorepo-consumer-checks:
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: docs-scope
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (needs.docs-scope.result != 'success' || needs.docs-scope.outputs.tier != 'docs') }}
     permissions:
       contents: read
     uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
@@ -1910,10 +1982,11 @@ jobs:
   # depot-ubuntu-24.04, which has the required dpkg-deb / tar+xz toolchain
   # preinstalled.
   deb-packaging:
+    needs: docs-scope
     runs-on: depot-ubuntu-24.04
     # Runs on push and same-repo PRs; skipped on fork PRs (see the
     # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1960,10 +2033,11 @@ jobs:
   # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
   # the other utility jobs, so it runs directly on depot-ubuntu-24.04.
   release-scripts:
+    needs: docs-scope
     runs-on: depot-ubuntu-24.04
     # Runs on push, merge_group and same-repo PRs; skipped on fork PRs (see the
     # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1999,6 +2073,10 @@ jobs:
           python3 -I -B -S scripts/test-callback-build-scope.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
+      - name: Test docs classification and focused checks
+        run: |
+          python3 -I -B -S scripts/test-docs-ci-scope.py
+          python3 -I -B scripts/test-docs-ci.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -2059,9 +2137,10 @@ jobs:
   # here — the register block self-skips off Windows, so a skip on this job
   # means the module went missing, and the step fails on it.
   install-ps1:
+    needs: docs-scope
     # Runs on push and same-repo PRs; skipped on fork PRs (see the
     # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -2100,7 +2179,8 @@ jobs:
   # Linux platform simulation. Both platforms also cover extension forwarding.
   # The shipping-pin matrix is strict and required by CI Gate.
   pi-session-paths:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: docs-scope
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -2161,8 +2241,8 @@ jobs:
 
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
-    needs: route
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [route, docs-scope]
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && (needs.docs-scope.result != 'success' || (needs.docs-scope.outputs.tier != 'docs' && needs.docs-scope.outputs.tier != 'compiled')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -2290,10 +2370,52 @@ jobs:
     # would run the gate against all-skipped needs and report a spurious
     # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [docs-scope, docs-lint, docs-compiled, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
+          tier="${{ needs.docs-scope.outputs.tier }}"
+          if [ "${{ github.event_name }}" != "push" ] && \
+             [ "${{ needs.docs-scope.result }}" = "success" ] && \
+             { [ "$tier" = "docs" ] || [ "$tier" = "compiled" ]; }; then
+            if [ "${{ needs.docs-lint.result }}" != "success" ]; then
+              echo "docs-lint must succeed for either documentation tier"
+              exit 1
+            fi
+            if [ "$tier" = "compiled" ]; then
+              if [ "${{ needs.docs-compiled.result }}" != "success" ] || \
+                 [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
+                echo "Compiled docs require focused Rust and consumer checks"
+                exit 1
+              fi
+            elif [ "${{ needs.docs-compiled.result }}" != "skipped" ] || \
+                 [ "${{ needs.monorepo-consumer-checks.result }}" != "skipped" ]; then
+              echo "Unexpected compiled-docs jobs for pure docs"
+              exit 1
+            fi
+            for result in \
+              "${{ needs.daemon-lifecycle.result }}" "${{ needs.check.result }}" \
+              "${{ needs.build.result }}" "${{ needs.coverage-e2e.result }}" \
+              "${{ needs.macos-services-runtime.result }}" \
+              "${{ needs.coverage-all.result }}" "${{ needs.coverage-changed.result }}" \
+              "${{ needs.deb-packaging.result }}" "${{ needs.release-scripts.result }}" \
+              "${{ needs.pi-session-paths.result }}" "${{ needs.install-ps1.result }}"; do
+              case "$result" in success|skipped) ;; *) exit 1 ;; esac
+            done
+            for result in "${{ needs.pr-title.result }}" "${{ needs.conflict-markers.result }}"; do
+              if [ "${{ github.event_name }}" = "pull_request" ]; then
+                [ "$result" = "success" ] || exit 1
+              else
+                case "$result" in success|skipped) ;; *) exit 1 ;; esac
+              fi
+            done
+            echo "Documentation CI passed ($tier)"
+            exit 0
+          fi
+          # Failure or missing classification takes the original full gate.
+          for result in "${{ needs.docs-lint.result }}" "${{ needs.docs-compiled.result }}"; do
+            [ "$result" = "skipped" ] || exit 1
+          done
           if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
             echo "daemon-lifecycle must execute successfully on PR and merge queue"
             exit 1

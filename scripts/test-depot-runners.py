@@ -34,8 +34,11 @@ class DepotRunners(unittest.TestCase):
                 if path.name in MAINTENANCE:
                     self.assertIn('workflow_dispatch', doc.get('on', doc.get(True)))
                     continue
-                for job in doc['jobs'].values():
+                for name, job in doc['jobs'].items():
                     self.assertNotIsInstance(job.get('runs-on'), list)
+                    if path.name == 'ci.yml' and name in {'docs-scope', 'docs-lint', 'docs-compiled'}:
+                        self.assertEqual(job['runs-on'], 'ubuntu-latest')
+                        job = {key: value for key, value in job.items() if key != 'runs-on'}
                     visit(job)
         config = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']
         for value in config['github-custom-runners'].values():
@@ -76,11 +79,13 @@ class DepotRunners(unittest.TestCase):
 
     def test_compiling_jobs_configure_managed_cache(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
-        for name in ['check', 'build', 'macos-services-runtime', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
+        for name in ['docs-compiled', 'check', 'build', 'macos-services-runtime', 'coverage-e2e', 'coverage-all', 'coverage-changed', 'daemon-lifecycle']:
             with self.subTest(job=name):
                 steps = doc['jobs'][name]['steps']
                 configure = next(i for i, step in enumerate(steps) if step.get('run') == 'python3 scripts/setup-depot-sccache.py')
-                builds = [i for i, s in enumerate(steps) if re.search(r'\bcargo (?:check|clippy|build|test|nextest|llvm-cov)\b', s.get('run', ''))]
+                builds = [i for i, s in enumerate(steps)
+                          if re.search(r'\bcargo (?:check|clippy|build|test|nextest|llvm-cov)\b', s.get('run', ''))
+                          or s.get('run') == 'python3 -I -B scripts/docs-ci.py compiled']
                 self.assertTrue(builds)
                 self.assertLess(configure, min(builds))
 
