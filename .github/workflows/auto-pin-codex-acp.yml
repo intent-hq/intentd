@@ -36,6 +36,9 @@ jobs:
     # with the publication token. The checkout resolves main afresh.
     if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Check for RELEASE_PLZ_TOKEN
         id: token
         env:

@@ -82,6 +82,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -151,6 +154,9 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
@@ -341,6 +347,9 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -389,6 +398,9 @@ jobs:
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false

@@ -47,6 +47,9 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
     - uses: actions/checkout@v7
       with:
         persist-credentials: false
@@ -70,6 +73,9 @@ jobs:
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
     timeout-minutes: 60
     steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
     - name: Enable Windows long paths
       shell: bash
       run: git config --global core.longpaths true
@@ -235,6 +241,9 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
     steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
     - uses: actions/checkout@v7
       with:
         persist-credentials: false

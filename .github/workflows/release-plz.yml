@@ -71,6 +71,9 @@ jobs:
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
       # config scoped to the workspace, which release-plz's temp-dir copy of the
       # repo can't use, breaking `git fetch` on this private repo. Keep v5 until
@@ -146,6 +149,9 @@ jobs:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       # Pinned to v5 for the same release-plz temp-dir auth reason as above
       # (release-plz/release-plz#2957, intent-hq/monorepo#1037).
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

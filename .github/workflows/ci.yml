@@ -150,7 +150,7 @@ jobs:
                 const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
                 const limit = native ? capacity - 1 : Math.min(threshold, capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
-            burst[key] = disabled[key] || capacity === 0 || stale || depth > limit;
+                burst[key] = disabled[key] || capacity === 0 || stale || depth > limit;
                 reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}`;
               }
             } catch (error) {
@@ -200,6 +200,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -603,6 +606,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
@@ -844,6 +850,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -976,6 +985,9 @@ jobs:
       # route.
       NEXTEST_TEST_THREADS: 16
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -1192,6 +1204,9 @@ jobs:
       # burst runner, so the value no longer varies by route.
       NEXTEST_TEST_THREADS: 16
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -1396,6 +1411,9 @@ jobs:
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
       # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
       # selection's base is HEAD^1 itself. The base is resolved from that
@@ -1790,7 +1808,7 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@8f7fe66d517ce572852d288ee1ef6aa2943b2b26
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@5321a6cd476039cc017b9c97ecbe69126d451446
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1861,6 +1879,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
@@ -2082,6 +2106,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the

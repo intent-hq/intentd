@@ -35,6 +35,13 @@ jobs:
         self.assertIn('    needs:\n      - plan\n      - previous\n      - runner-route\n', result)
         self.assertEqual(result, routing.configure(result))
 
+    def test_generated_python_steps_have_a_tomllib_capable_interpreter(self):
+        source = 'name: Release\njobs:\n  plan:\n    runs-on: depot-ubuntu-24.04\n    steps:\n      - run: python3 scripts/optional-intel-release.py\n'
+        result = routing.configure(source)
+        self.assertIn("python-version: '3.11'", result)
+        self.assertLess(result.index('uses: actions/setup-python@'), result.index('- run: python3'))
+        self.assertEqual(result, routing.configure(result))
+
     def test_checked_in_release_is_already_routed(self):
         source = (ROOT / '.github/workflows/v-release.yml').read_text()
         self.assertEqual(routing.configure(source), source)

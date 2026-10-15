@@ -60,6 +60,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Check cleanup controls
         id: controls
         shell: bash

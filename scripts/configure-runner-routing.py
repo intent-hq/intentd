@@ -20,6 +20,13 @@ def configure(text):
     result = []
     for block in blocks:
         match = re.search(r'^    runs-on: (.+)$', block, re.M)
+        if match and 'python3' in block and 'uses: actions/setup-python@' not in block:
+            steps = re.search(r'^    steps:\n( +)-', block, re.M)
+            if steps:
+                indent = steps[1]
+                setup = f"{indent}- uses: actions/setup-python@v6\n{indent}  with:\n{indent}    python-version: '3.11'\n"
+                block = block.replace('    steps:\n', '    steps:\n' + setup, 1)
+            match = re.search(r'^    runs-on: (.+)$', block, re.M)
         if not match or 'needs.runner-route.outputs.runners' in match[1]:
             result.append(block)
             continue

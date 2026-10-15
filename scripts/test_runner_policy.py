@@ -8,6 +8,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 # The probe must work when the fleet is offline; Depot smoke tests test Depot itself.
 EXCEPTIONS = {('runner-route.yml', 'probe'), ('depot-cache-smoke.yml', 'populate'), ('depot-cache-smoke.yml', 'verify'), ('manual-signed-build.yml', 'smoke-macos')}
+# Control jobs must remain independent of the queues they inspect or retire.
+HOSTED_CONTROL = {('retire-obsolete-merge-runs.yml', 'cleanup'), ('retirement-credential-probe.yml', 'existing-read-credential')}
 MAINTENANCE = {('m1mac-smoke.yml', 'smoke'), ('provision-m1mac.yml', 'provision'), ('provision-m1mac.yml', 'verify'), ('macos-prune.yml', 'prune'), ('tinybox-prune.yml', 'prune'), ('windows-prune.yml', 'prune')}
 
 
@@ -17,6 +19,8 @@ def violations(text, filename):
         job, body = match.groups()
         runner = re.search(r'^    runs-on: (.+)$', body, re.M)
         if not runner:
+            continue
+        if (filename, job) in HOSTED_CONTROL and runner[1] == 'ubuntu-latest' and 'matrix:' not in body:
             continue
         runner = runner[1].strip('"\'')
         if (filename, job) in EXCEPTIONS or (job == 'route' and 'id: decide' in body and 'listSelfHostedRunnersForOrg' in body):
@@ -38,6 +42,13 @@ class RunnerPolicy(unittest.TestCase):
     def test_policy_rejects_new_cloud_pins(self):
         for label in ['depot-ubuntu-24.04', 'ubuntu-latest', '${{ matrix.runner }}', '${{ needs.unrelated.outputs.runner }}']:
             self.assertEqual(violations(f'jobs:\n  new-work:\n    runs-on: {label}\n', 'new.yml'), ['new-work'])
+
+    def test_control_exceptions_are_exact(self):
+        for filename, job in HOSTED_CONTROL:
+            for label in ['depot-ubuntu-24.04', '[ubuntu-latest]', '${{ matrix.os }}']:
+                self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: {label}\n', filename), [job])
+            self.assertEqual(violations(f'jobs:\n  unexpected:\n    runs-on: ubuntu-latest\n', filename), ['unexpected'])
+            self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: ubuntu-latest\n', 'copy.yml'), [job])
 
     def test_routing_behavior(self):
         subprocess.run(['node', '--test', str(ROOT / 'scripts/runner-policy.test.cjs')], check=True)
