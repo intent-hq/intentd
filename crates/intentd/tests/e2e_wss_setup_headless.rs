@@ -137,6 +137,7 @@ async fn rpc(socket: &mut Socket, id: i64, method: &str, params: Value) -> Value
 }
 
 async fn wait_for_output(socket: &mut Socket, terminal_id: &str, markers: &[&str]) -> String {
+    let mut last_output = String::new();
     timeout(common::test_timeout(Duration::from_secs(30)), async {
         loop {
             let result = rpc(
@@ -150,6 +151,7 @@ async fn wait_for_output(socket: &mut Socket, terminal_id: &str, markers: &[&str
                 .decode(result["data"].as_str().unwrap())
                 .unwrap();
             let output = String::from_utf8_lossy(&bytes).into_owned();
+            last_output.clone_from(&output);
             if markers.iter().all(|marker| output.contains(marker)) {
                 break output;
             }
@@ -157,7 +159,11 @@ async fn wait_for_output(socket: &mut Socket, terminal_id: &str, markers: &[&str
         }
     })
     .await
-    .expect("terminal output did not reach its completion markers")
+    .unwrap_or_else(|_| {
+        let tail: String = last_output.chars().rev().take(2000).collect();
+        let tail: String = tail.chars().rev().collect();
+        panic!("terminal output did not reach {markers:?}; last output: {tail}")
+    })
 }
 
 fn seed_repo(path: &Path) {
@@ -234,7 +240,7 @@ async fn setup_finishes_without_terminal_client_input() {
     let _daemon = common::DaemonGuard::process_only(child);
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            if common::daemon_is_ready(&data.path().join("intentd.sock")).await {
                 break;
             }
             // timing-guard: poll the observable WSS listener bind during daemon startup.
@@ -373,7 +379,9 @@ async fn setup_finishes_without_terminal_client_input() {
             let terminal_id = terminal["terminalId"].as_str().unwrap();
             wait_for_output(&mut client, terminal_id, &["IO_READY"]).await;
             let line_end = if cfg!(windows) { "\r" } else { "\n" };
-            let input = format!("{}{line_end}", "x".repeat(1024)).repeat(128);
+            // Keep each line below macOS's canonical-input limit while still
+            // sending 128 KiB, enough to exercise simultaneous IO backpressure.
+            let input = format!("{}{line_end}", "x".repeat(511)).repeat(256);
             let write = timeout(
                 common::test_timeout(Duration::from_secs(30)),
                 rpc(
@@ -403,7 +411,7 @@ async fn setup_finishes_without_terminal_client_input() {
             assert!(terminals["terminals"].as_array().unwrap().is_empty());
             let tail = output.chars().rev().take(512).collect::<String>();
             let tail = tail.chars().rev().collect::<String>();
-            evidence.push(json!({"case":"simultaneous_terminal_io","terminalId":terminal_id,"inputBytes":input.len(),"inputLines":128,"bufferTail":tail,"terminals":terminals}));
+            evidence.push(json!({"case":"simultaneous_terminal_io","terminalId":terminal_id,"inputBytes":input.len(),"inputLines":256,"bufferTail":tail,"terminals":terminals}));
         }
     }
     let evidence_dir = std::env::var_os("INTENTD_SETUP_EVIDENCE_DIR")

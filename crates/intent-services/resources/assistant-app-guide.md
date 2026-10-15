@@ -168,6 +168,27 @@ local machine, connect to it first. Enabling access, changing listening addresse
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/{startup-status,startup-monitor}.ts; messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+
+When the app and connected daemon support startup status, the connection screen
+shows **Starting intentd** and **Finishing startup** while services initialize.
+Keep the app open; it reconnects when ready. Unopened notes stay lazy: startup does
+not rebuild their indexes or report indexing counts or an ETA. Preparing a note
+on demand after startup does not make the daemon unready again.
+
+If a connected daemon reports an indexing phase, **Rebuilding note indexes** shows
+its measured counts and approximate indexing-only estimate; an unchanged count
+alone does not mean failure. **Startup status unavailable** means fresh status
+could not be received; do not present cached progress as current. For **Daemon
+startup failed**, check the daemon logs.
+
+With matching mobile and daemon support, iPhone and iPad show **Starting Desktop**
+and **Finishing Startup** during initial connection or reconnection over saved
+direct or Tailcat routes. **Indexing Notes** appears only when the daemon reports
+that phase. **Startup status unavailable. Reconnecting securely…** means current
+status is unavailable. For **Startup Failed**, use **Retry Connection** after
+checking the desktop daemon. **Back to Home** keeps saved credentials.
+
 ## Start or continue work
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
@@ -267,7 +288,12 @@ title in the conversation header. The title field uses the available header widt
 Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
 select conversations and cannot be edited there.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; messages/en.json. -->
+
+In **Home → Workspaces**, PR badges update as Intent observes changes.
+**Queued** means the PR is in the merge queue, including while queue checks
+are running. You do not need to open the workspace or hover over the PR to
+receive these updates.
 
 In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
@@ -362,6 +388,14 @@ Disconnecting hides them without deleting saved assignments. If they are missing
 check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts. -->
+
+**Switch To** notifications for agent failures, attention requests, and automatic
+workspace unarchiving are skipped when that workspace is already selected, even
+if another conversation, file, or note is open. Notifications for other workspaces
+can still appear. The workspace's agent status and conversation notices remain
+available.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
@@ -489,11 +523,16 @@ already stopped succeeds), and `intentd restart` to replace the supervised daemo
 or start it if stopped. These commands act on the
 host where they run; stopping the daemon disconnects its clients.
 
-`start` waits for readiness (60-second default budget); starting a healthy daemon
+Startup-aware launchers keep waiting while fresh startup status arrives, with a
+60-second budget for silence. Older launchers can return once the daemon is alive
+but still preparing; check `intentd status` before using it. Starting a healthy daemon
 again succeeds without restarting it. Startup errors return nonzero and point to
 `<data-dir>/sitter/start.log`. `restart` from stopped uses that same startup path.
 For a running supervisor, restart retains its launch options; Windows waits for
 replacement readiness, while macOS/Linux return after signaling, so check `status`.
+During startup, `intentd status` reports not ready. The scripting command
+`intentd call system.status` can return successful liveness JSON with `ready: false`;
+that is not application readiness. This preserves live startup with older launchers.
 This also works with supervisors launched by services or Windows Scheduled Tasks.
 Background start/restart does not install or enable boot/login services or tasks;
 stop does not disable an existing one.

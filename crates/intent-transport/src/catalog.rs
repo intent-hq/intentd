@@ -505,6 +505,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "system.status",
     "workspace.invite.create",
 ];

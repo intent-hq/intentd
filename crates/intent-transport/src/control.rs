@@ -237,6 +237,11 @@ impl SystemServices {
 /// Lets a listener answer `system.status` from real state and trigger a
 /// graceful shutdown for `system.shutdown` without reaching into domain code.
 pub trait SystemControl: Send + Sync {
+    /// In-memory startup status, available only in the full daemon composition.
+    fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
+        None
+    }
+
     /// Select the installed services. Existing providers retain their full surface.
     fn services(&self) -> SystemServices {
         SystemServices::Full
