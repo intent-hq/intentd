@@ -44,7 +44,7 @@ permissions:
   pull-requests: read
 
 env:
-  # Burst the Linux jobs to Depot larger runners when more than
+  # Burst the Linux jobs to their selected larger runners when more than
   # this many Linux jobs are queued/running ahead of this run (see the
   # route job). tinybox runs 8 concurrent runner slots, so the threshold
   # tolerates one queued/running job per slot before bursting. Note that
@@ -67,7 +67,7 @@ concurrency:
 jobs:
   # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
   # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
-  # Depot larger runners otherwise. Runs on a Depot runner so
+  # Depot or the large-storage Linux pool otherwise. Runs on a Depot runner so
   # the burst decision is independent of the tinybox queue: when the probe
   # ran on tinybox it queued behind the very backlog it measures (and
   # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:

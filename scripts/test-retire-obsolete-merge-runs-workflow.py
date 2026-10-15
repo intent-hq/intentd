@@ -194,9 +194,14 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
     def test_gate_and_protected_events_stay_unchanged(self):
         ci = workflow('ci.yml')
         self.assertEqual(set(ci[True]), {'push', 'pull_request', 'merge_group'})
-        self.assertEqual(ci['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}")
+        # Shared artifact callers keep exact-source executions queued; the
+        # separate retirement policy may still cancel obsolete merge refs.
+        self.assertIs(ci['concurrency']['cancel-in-progress'], False)
+        self.assertEqual(ci['concurrency']['queue'], 'max')
+        self.assertEqual(ci['concurrency']['group'],
+                         'ci-caller-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}')
         self.assertEqual(set(ci['jobs']['gate']['needs']), {
-            'daemon-lifecycle', 'check', 'build', 'macos-services-runtime', 'coverage-e2e', 'coverage-all',
+            'daemon-lifecycle', 'check', 'build', 'coverage-e2e', 'coverage-all',
             'coverage-changed', 'pr-title', 'conflict-markers', 'monorepo-consumer-checks',
             'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths'})
         commands = '\n'.join(s.get('run', '') for s in ci['jobs']['release-scripts']['steps'])
