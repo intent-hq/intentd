@@ -179,7 +179,7 @@ checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -187,6 +187,12 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+The PR badge in list and board views prioritizes draft PRs, then open PRs
+(including conflicted or queued PRs), then merged and closed PRs. Within the same
+state, it shows the most recently updated available PR. Home's shortened PR list
+keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
+includes the other linked PRs, even when their details are not loaded.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 

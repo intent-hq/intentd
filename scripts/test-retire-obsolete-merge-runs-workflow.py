@@ -201,6 +201,7 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
         self.assertEqual(ci['concurrency']['group'],
                          'ci-caller-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}')
         self.assertEqual(set(ci['jobs']['gate']['needs']), {
+            'route',
             'daemon-lifecycle', 'check', 'build', 'coverage-e2e', 'coverage-all',
             'coverage-changed', 'pr-title', 'conflict-markers', 'monorepo-consumer-checks',
             'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths'})

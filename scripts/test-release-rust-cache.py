@@ -31,7 +31,10 @@ class ManagedCache(unittest.TestCase):
         warm = workflow('release-cache.yml')
         self.assertEqual(warm['permissions'], {'contents': 'read'})
         self.assertNotIn('retention', warm['jobs'])
-        for job in warm['jobs'].values():
+        self.assertEqual(warm['jobs']['runner-route']['uses'], './.github/workflows/runner-route.yml')
+        for name, job in warm['jobs'].items():
+            if name == 'runner-route':
+                continue
             self.assertIn("github.ref == 'refs/heads/main'", job['if'])
             for step in job['steps']:
                 self.assertNotIn('actions/cache/save', step.get('uses', ''))

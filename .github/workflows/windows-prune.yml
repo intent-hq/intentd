@@ -19,6 +19,11 @@ on:
         type: boolean
         default: false
   workflow_call:
+    secrets:
+      DEPOT_TOKEN:
+        required: false
+      CI_QUEUE_READ_TOKEN:
+        required: false
     inputs:
       apply:
         type: boolean
@@ -32,9 +37,18 @@ concurrency:
   group: windows-ci-disk-maintenance-${{ github.event_name == 'pull_request' && github.ref || '5090pc' }}
   cancel-in-progress: false
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   safety-tests:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: depot-windows-2022
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-windows-2022'] || fromJSON('["depot-windows-2022"]') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
