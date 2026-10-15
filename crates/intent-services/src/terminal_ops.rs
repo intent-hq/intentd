@@ -1438,13 +1438,25 @@ mod tests {
         )));
     }
 
-    /// The gate short-circuits injection: no registry and setting-off both
-    /// yield no pairs.
+    /// The GitHub gate suppresses its helper only. GitLab remains registered
+    /// for its full root, with credential release gated by the owner policy.
     #[test]
     fn git_credential_env_respects_gate() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[(
+            intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
+            None,
+        )]);
         assert!(git_credential_env(None, None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
-        assert!(git_credential_env(Some(&off), None).is_empty());
+        let pairs = git_credential_env(Some(&off), None);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, intent_git::auth::GIT_CONFIG_PARAMETERS_ENV);
+        let parameters = &pairs[0].1;
+        assert!(!parameters.contains("credential.https://github.com.helper="));
+        assert!(parameters.contains("credential.https://gitlab.com.helper="));
+        assert!(parameters.contains("credential.https://gitlab.com.useHttpPath=true"));
+        assert!(parameters.contains("http.https://gitlab.com.followRedirects=false"));
+        assert!(parameters.contains("git-credential"));
     }
 
     /// Gate on ⇒ exactly the single daemon-backed helper pair: the
