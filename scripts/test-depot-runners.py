@@ -2,6 +2,9 @@
 """Audit static, matrix and generated runner choices; maintenance is manual."""
 from pathlib import Path
 import re
+import os
+import subprocess
+import sys
 import tomllib
 import unittest
 import yaml
@@ -12,6 +15,36 @@ LABEL = re.compile(r'depot-(?:ubuntu-(?:22\.04|24\.04)(?:-arm)?(?:-(?:4|8|16|32|
 
 
 class DepotRunners(unittest.TestCase):
+    def test_self_hosted_cache_smoke_is_manual_and_requires_credentials(self):
+        doc = yaml.safe_load((ROOT / '.github/workflows/depot-cache-smoke.yml').read_text())
+        events = doc.get('on', doc.get(True))
+        option = events['workflow_dispatch']['inputs']['self_hosted_windows']
+        self.assertEqual(option['type'], 'boolean')
+        self.assertFalse(option['default'])
+        self.assertEqual(doc['jobs']['verify']['needs'], 'populate')
+        for phase in ('populate', 'verify'):
+            job = doc['jobs'][phase]
+            self.assertEqual(job['runs-on'], '${{ fromJSON(github.event_name == \'workflow_dispatch\' && inputs.self_hosted_windows && \'["self-hosted","Windows","X64"]\' || \'["depot-ubuntu-24.04"]\') }}')
+            steps = job['steps']
+            path = next(i for i, s in enumerate(steps) if s.get('shell') == 'cmd')
+            guard = next(i for i, s in enumerate(steps) if s.get('name') == 'Require 5090pc and its Depot token')
+            setup = next(i for i, s in enumerate(steps) if s.get('run') == 'python3 scripts/setup-depot-sccache.py')
+            smoke = next(i for i, s in enumerate(steps) if s.get('run') == 'python3 -I -B scripts/test-release-cache-smoke.py --managed --phase ' + phase)
+            self.assertLess(path, guard)
+            self.assertLess(guard, setup)
+            self.assertLess(setup, smoke)
+            self.assertEqual(steps[guard]['if'], "github.event_name == 'workflow_dispatch' && inputs.self_hosted_windows")
+            self.assertEqual(steps[guard]['env']['DEPOT_SCCACHE_TOKEN'], '${{ secrets.DEPOT_TOKEN }}')
+            # Execute the actual workflow guard: absent credentials and the wrong
+            # physical runner must fail before any compiler/cache operation.
+            code = steps[guard]['run'].split("python3 - <<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+            for runner, token, expected in [('5090pc', '', 1), ('another-host', 'fixture-secret', 1), ('5090pc', 'fixture-secret', 0)]:
+                with self.subTest(phase=phase, runner=runner, token_present=bool(token)):
+                    env = {**os.environ, 'RUNNER_NAME': runner, 'DEPOT_SCCACHE_TOKEN': token}
+                    result = subprocess.run([sys.executable, '-c', code], env=env, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertNotIn('fixture-secret', result.stdout + result.stderr)
+
     def test_static_and_matrix_labels(self):
         def visit(value):
             if isinstance(value, dict):
