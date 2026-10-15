@@ -3391,8 +3391,8 @@ esac
 // The CLI may reject a request before opening the private socket. That must
 // fail the assertion with its output, never leave this fixture blocked in join.
 fn serve_stop_eof(
-    listener: std::os::unix::net::UnixListener,
-    finished: std::sync::mpsc::Receiver<()>,
+    listener: &std::os::unix::net::UnixListener,
+    finished: &std::sync::mpsc::Receiver<()>,
 ) -> bool {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3425,7 +3425,7 @@ fn stop_eof_fixture_finishes_when_cli_exits_before_connecting() {
             finished.send(()).unwrap();
         }
         drop(finished);
-        assert!(!serve_stop_eof(listener, signal));
+        assert!(!serve_stop_eof(&listener, &signal));
     }
 }
 
@@ -3438,7 +3438,7 @@ fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
             .unwrap();
     fs::write(&fixture.paths.pid_path, std::process::id().to_string()).unwrap();
     let (finished, signal) = std::sync::mpsc::channel();
-    let server = thread::spawn(move || serve_stop_eof(listener, signal));
+    let server = thread::spawn(move || serve_stop_eof(&listener, &signal));
     let out = background_call(dir.path(), &dead_url(), &["stop"]);
     let _ = finished.send(());
     fs::remove_file(&fixture.paths.pid_path).unwrap();
