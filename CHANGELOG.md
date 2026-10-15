@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.50] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Preserve unfinished PRs in workspace summaries ([#2435](https://github.com/intent-hq/intentd/pull/2435))
+
+
 ## [0.10.49] - 2026-10-15
 
 ### 🐛 Bug Fixes
