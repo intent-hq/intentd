@@ -51,6 +51,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   # Neither job uses the implicit GITHUB_TOKEN (all steps authenticate with
   # the RELEASE_PLZ_TOKEN PAT), so jobs inherit the top-level `permissions: {}`
   # and the implicit token stays powerless.
@@ -59,7 +67,8 @@ jobs:
   # nothing is compiled or published).
   release-plz-release:
     name: Release-plz release
-    runs-on: depot-ubuntu-24.04-16
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
     steps:
       # Pinned to v5: checkout v6+ stores the credential via an includeIf.gitdir
@@ -112,7 +121,7 @@ jobs:
   # 16-core runner) than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     outputs:
       no_release_needed: ${{ steps.no_release.outputs.no_release_needed }}
       baseline_tag: ${{ steps.no_release.outputs.baseline_tag }}
@@ -121,7 +130,7 @@ jobs:
     # pushed before release-pr computes the next version, or it races on tag
     # visibility and can open a spurious Release PR. On ordinary commits the
     # release job no-ops quickly, so the ordering costs nothing.
-    needs: release-plz-release
+    needs: [release-plz-release, runner-route]
     if: ${{ github.repository_owner == 'intent-hq' }}
     # The workflow-level groups split release-merge and ordinary pushes, so
     # two runs can be in flight at once. Serialize their release-pr jobs:
@@ -236,8 +245,8 @@ jobs:
   # or a release-pr failure must never count as a confirmed no-op.
   release-plz-no-release:
     name: "Release-plz no release needed: ${{ needs.release-plz-pr.outputs.baseline_tag }}@${{ needs.release-plz-pr.outputs.baseline_sha }}"
-    needs: release-plz-pr
+    needs: [release-plz-pr, runner-route]
     if: ${{ needs.release-plz-pr.result == 'success' && needs.release-plz-pr.outputs.no_release_needed == 'true' }}
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
     steps:
       - run: echo 'Release-plz confirmed no release is needed for this commit.'

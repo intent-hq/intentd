@@ -42,8 +42,17 @@ on:
       - "sitter-v[0-9]+.[0-9]+.[0-9]+*"
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   plan:
-    runs-on: depot-ubuntu-24.04-16
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
@@ -87,7 +96,7 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     continue-on-error: ${{ matrix.target == 'x86_64-apple-darwin' }}
-    needs: plan
+    needs: [plan, runner-route]
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +123,7 @@ jobs:
             zigbuild: true
           - target: x86_64-pc-windows-msvc
             os: depot-windows-2022-16
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 30
     env:
       TARGET: ${{ matrix.target }}
@@ -236,9 +245,8 @@ jobs:
   # having published the release assets.
   publish:
     needs:
-      - plan
-      - build
-    runs-on: depot-ubuntu-24.04-16
+      [plan, build, runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     timeout-minutes: 10
     # Serialize sitter-latest updates so two tags pushed close together cannot
     # interleave and leave the fixed release with mixed assets.
@@ -327,10 +335,8 @@ jobs:
   # missing secret never blocks the release itself.
   mirror:
     needs:
-      - plan
-      - publish
-      - deb
-    runs-on: depot-ubuntu-24.04-16
+      [plan, publish, deb, runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     timeout-minutes: 10
     outputs:
       enabled: ${{ steps.mirror.outputs.enabled }}
@@ -410,11 +416,9 @@ jobs:
   # `brew install` with 404s.
   publish-homebrew:
     needs:
-      - plan
-      - publish
-      - mirror
+      [plan, publish, mirror, runner-route]
     if: ${{ needs.plan.outputs.prerelease == 'false' && needs.mirror.outputs.enabled == 'true' }}
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     timeout-minutes: 10
     # Serialize tap pushes so two tags pushed close together cannot race the
     # non-fast-forward push.
@@ -479,9 +483,8 @@ jobs:
   # accumulate on the fixed release).
   deb:
     needs:
-      - plan
-      - publish
-    runs-on: depot-ubuntu-24.04-16
+      [plan, publish, runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
     timeout-minutes: 10
     # Own group (not the publish one): asset names are disjoint from the
     # archives, so deb refreshes only need to serialize against themselves.
