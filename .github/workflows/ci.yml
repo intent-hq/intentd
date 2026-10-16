@@ -1780,7 +1780,8 @@ jobs:
   # to a binding's help line); it stays a hard error in the monorepo.
   # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
   # the `pull_request` trigger comment); skipped on push to main, where the
-  # tree was already checked by its PR run. Seconds-long on depot-ubuntu-24.04.
+  # tree was already checked in the queue. PRs run static contracts; the
+  # queued tree also runs the connected runtime proof.
   monorepo-consumer-checks:
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
@@ -1789,7 +1790,7 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@a34c437dbb1b1a355a6018e58f6eb6cbb6272951
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@0e12255c6207b474a218e633ec61e9b051d3e990
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
