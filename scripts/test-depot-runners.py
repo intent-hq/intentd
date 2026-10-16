@@ -1,45 +1,17 @@
 #!/usr/bin/env python3
 """Audit static, matrix and generated runner choices; maintenance is manual."""
 from pathlib import Path
-import re
-import tomllib
 import unittest
+import re
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-MAINTENANCE = {'m1mac-smoke.yml', 'provision-m1mac.yml', 'macos-prune.yml', 'tinybox-prune.yml', 'windows-prune.yml'}
-LABEL = re.compile(r'depot-(?:ubuntu-(?:22\.04|24\.04)(?:-arm)?(?:-(?:4|8|16|32|64))?|windows-(?:2022|2025)(?:-(?:4|8|16|32|64))?|macos-latest)\Z')
 
 
 class DepotRunners(unittest.TestCase):
-    def test_static_and_matrix_labels(self):
-        def visit(value):
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if key in {'runs-on', 'os', 'runner'}:
-                        for label in item if isinstance(item, list) else [item]:
-                            if not isinstance(label, str):
-                                continue
-                            if '${{' not in label:
-                                self.assertRegex(label, LABEL)
-                            else:
-                                self.assertNotRegex(label, r'(?<![\w-])(?:ubuntu|windows|macos|gh-linux|gh-windows)-[\w.-]+')
-                    visit(item)
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item)
-        for path in (ROOT / '.github/workflows').glob('*.yml'):
-            with self.subTest(workflow=path.name):
-                doc = yaml.safe_load(path.read_text())
-                if path.name in MAINTENANCE:
-                    self.assertIn('workflow_dispatch', doc.get('on', doc.get(True)))
-                    continue
-                for job in doc['jobs'].values():
-                    self.assertNotIsInstance(job.get('runs-on'), list)
-                    visit(job)
-        config = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']
-        for value in config['github-custom-runners'].values():
-            self.assertRegex(value if isinstance(value, str) else value['runner'], LABEL)
+    def test_workloads_use_self_hosted_first_policy(self):
+        import subprocess
+        subprocess.run(['python3', '-B', str(ROOT / 'scripts/test_runner_policy.py')], check=True)
 
     def test_windows_cleanup_requires_native_tests_and_excludes_pr_deletion(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/windows-prune.yml').read_text())

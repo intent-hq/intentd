@@ -6410,14 +6410,6 @@ impl SystemControl for BusyDaemonControl {
     fn request_update(&self) -> std::result::Result<(), String> {
         Ok(())
     }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
-    }
     fn git_credential(
         &self,
         _client_pid: Option<u64>,
@@ -22558,14 +22550,6 @@ impl SystemControl for WatchHealthControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Err("not supported in this test".to_string())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,

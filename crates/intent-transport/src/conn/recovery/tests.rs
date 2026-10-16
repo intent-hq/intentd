@@ -24,7 +24,8 @@ fn scenario(id: &str) -> Value {
 struct Api;
 impl WorkspaceApi for Api {}
 struct Harness {
-    dir: tempfile::TempDir,
+    // Keeps the store directory alive; only the Unix socket test reads its path.
+    _dir: tempfile::TempDir,
     bus: EventBus,
     api: Arc<dyn WorkspaceApi>,
     out: OutboundSender,
@@ -37,7 +38,7 @@ impl Harness {
         let store = Store::open(&dir.path().join("events.db")).await.unwrap();
         let (out, rx) = outbound_channel();
         Self {
-            dir,
+            _dir: dir,
             bus: EventBus::new(store),
             api: Arc::new(Api),
             out,
@@ -553,7 +554,7 @@ async fn recovery_membership_loss_clears_a_previously_allowed_guest_cache() {
 async fn recovery_uds_loss_and_fence_follow_physical_write_order() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let h = Harness::new().await;
-    let path = h.dir.path().join("recovery.sock");
+    let path = h._dir.path().join("recovery.sock");
     let (stop, stopped) = oneshot::channel();
     let api = h.api.clone();
     let bus = h.bus.clone();

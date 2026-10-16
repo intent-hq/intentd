@@ -94,6 +94,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   # Read-only queries authenticate with the implicit GITHUB_TOKEN, so the
   # job grants it exactly the read scopes those queries need (top-level
   # permissions stay `{}`); the RELEASE_PLZ_TOKEN PAT is used only for the
@@ -103,7 +111,8 @@ jobs:
     # Lightweight job (seconds on cron/dispatch runs; up to ~15 min of polling
     # on push-triggered runs): pinned to depot-ubuntu-24.04 (same rationale as
     # ci.yml's pr-title/gate jobs — a tinybox slot would be wasted on it).
-    runs-on: depot-ubuntu-24.04
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
     # Covers the 15-min push-run polling budget plus headroom; cron and
     # dispatch runs still finish in seconds.

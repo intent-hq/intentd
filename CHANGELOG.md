@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-10-16
+
+### 🔧 Refactor
+
+- [**breaking**] Retire legacy workspace importer ([#1630](https://github.com/intent-hq/intentd/pull/1630))
+
+
+## [0.10.50] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Preserve unfinished PRs in workspace summaries ([#2435](https://github.com/intent-hq/intentd/pull/2435))
+
+
+## [0.10.49] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Keep Home PR queue status synchronized ([#2416](https://github.com/intent-hq/intentd/pull/2416))
+- Show login guidance for expired Claude OAuth sessions ([#2420](https://github.com/intent-hq/intentd/pull/2420))
+- Report protected daemon startup status ([#2419](https://github.com/intent-hq/intentd/pull/2419))
+
+### 🧪 Testing
+
+- Guard restart readiness and bootstrap signal registration ([#2408](https://github.com/intent-hq/intentd/pull/2408))
+
+
 ## [0.10.48] - 2026-10-15
 
 ### 📚 Documentation

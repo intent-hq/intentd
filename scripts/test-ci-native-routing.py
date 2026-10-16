@@ -23,11 +23,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ("success", "skipped", "failure", "cancelled")
-ALWAYS_REQUIRED = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
+ALWAYS_REQUIRED = {"route"}
+RUNTIME = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
-    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
-    "push": ALWAYS_REQUIRED | {"build"},
+    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
+    "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
 NATIVE_STEPS = {
@@ -116,7 +117,7 @@ def gate_errors(workflow):
     if gate.get("continue-on-error") or step.get("continue-on-error") or step.get("if"):
         errors.append("gate result check must be unconditional and fatal")
     needs = set(workflow["jobs"]["gate"]["needs"])
-    expected = set.union(*REQUIRED.values(), PR_METADATA)
+    expected = set.union(*REQUIRED.values(), PR_METADATA) | {"route"}
     if needs != expected:
         errors.append("gate dependencies changed")
     for event, required in REQUIRED.items():
@@ -126,7 +127,7 @@ def gate_errors(workflow):
             errors.append(f"{event}: intended skips rejected")
         for name in expected:
             for result in RESULTS:
-                accepted = result == "success" or (result == "skipped" and name not in required)
+                accepted = result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
                 if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
                     errors.append(f"{event}: {name}={result}")
     return errors
@@ -231,21 +232,23 @@ const outputs = {}, calls = [], logs = [];
 const github = {
   rest: { actions: {
     listSelfHostedRunnersForOrg: 'org', listSelfHostedRunnersForRepo: 'repo',
-    async listWorkflowRunsForRepo(args) {
-      if ((fixture.queueErrors || []).includes(args.repo)) throw new Error('queue unavailable');
-      return { data: { workflow_runs: args.repo === 'intentd' && args.status === 'queued' ? [{ id: 1 }] : [] } };
-    },
-    async listJobsForWorkflowRun() { return { data: { jobs: fixture.jobs || [] } }; },
+    listWorkflowRunsForRepo: 'runs', listJobsForWorkflowRun: 'jobs',
   } },
   async paginate(endpoint, args) {
+    if (endpoint === 'runs') {
+      if ((fixture.queueErrors || []).includes(args.repo)) throw new Error('queue unavailable');
+      return args.repo === 'intentd' && args.status === 'queued' ? [{id: 1}] : [];
+    }
+    if (endpoint === 'jobs') return fixture.jobs || [];
     calls.push({ endpoint, args });
     if (fixture[endpoint + 'Error']) throw new Error(fixture[endpoint + 'Error']);
     return fixture[endpoint] ?? [];
   },
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
-const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99 };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: 'push', payload: {} };
 process.env.THRESHOLD = '8';
+process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
@@ -341,21 +344,21 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                      else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
 
     def test_linux_keeps_queue_semantics_and_idle_windows_stays_self_hosted(self):
-        fleet = [runner("Linux", "X64", busy=True), runner("Windows", "X64"), runner()]
+        fleet = [runner("Linux", "X64", busy=True)] * 8 + [runner("Windows", "X64"), runner()]
         for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
-                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "monorepo"], False)):
+                                               (0, ["intentd"], True), (0, ["cloudlands-fe", "intent"], True)):
             with self.subTest(depth=depth, queue_errors=queue_errors):
-                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux"]}
+                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux", "X64"], "created_at": "2099-01-01T00:00:00Z"}
                         for i in range(depth)]
                 jobs += [{"status": "in_progress", "labels": ["depot-ubuntu-24.04-16"]}] * 20
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["self-hosted", "macOS", "ARM64"])
+                                              ["depot-macos-latest"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-8"] if linux_burst else ["self-hosted", "Linux", "X64"])
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
-                self.assertEqual(outputs["windows_burst"], "false")
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"] if queue_errors else ["self-hosted", "Windows", "X64"])
+                self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
                         {"org": [runner("Linux", "X64", status="offline"), runner("Windows", "X64", status="offline")]},
                         {"org": [runner("linux", "x64"), runner("windows", "x64")]}):
@@ -433,7 +436,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
         mac = self.workflow["jobs"]["build"]["strategy"]["matrix"]["include"][0]
-        self.assertEqual(mac["name"], "build (aarch64-apple-darwin, macos-14)")
+        self.assertEqual(mac["name"], "build (aarch64-apple-darwin)")
         self.assertEqual(self.workflow["jobs"]["daemon-lifecycle"]["name"], "Daemon lifecycle (${{ matrix.platform }})")
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
@@ -463,6 +466,35 @@ class LifecycleCacheTests(unittest.TestCase):
             setup = next(i for i, step in enumerate(steps) if step.get('name') == 'Configure Depot managed compiler cache')
             git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
             self.assertLess(git_bash, setup, name)
+
+    def test_pi_windows_uses_git_bash_before_any_shell_steps(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['pi-session-paths']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Put Git Bash first on PATH (Windows)'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'cmd')
+        self.assertIn('Git\\bin', setup['run'])
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertTrue(condition(setup['if'], context('merge_group', platform='Windows')))
+        self.assertFalse(condition(setup['if'], context('merge_group', platform='Linux')))
+        for step in steps[:steps.index(setup)]:
+            self.assertNotIn('run', step)
+
+    def test_installer_bootstraps_shell_and_nuget_without_prompting(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['install-ps1']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Prepare PowerShell 7'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'powershell')
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertIn('Get-FileHash', setup['run'])
+        pester = next(s for s in steps if s.get('name', '').startswith('Pester ('))
+        self.assertLess(steps.index(setup), steps.index(pester))
+        self.assertIn('Install-PackageProvider -Name NuGet', pester['run'])
+        self.assertLess(pester['run'].index('Install-PackageProvider'), pester['run'].index('Install-Module'))
+        provider = next(line for line in pester['run'].splitlines() if 'Install-PackageProvider' in line)
+        self.assertIn('-Force', provider)
+        self.assertIn('-Scope CurrentUser', provider)
 
     def test_managed_cache_covers_all_routed_runners(self):
         cache = self.step("Configure Depot managed compiler cache")
@@ -601,6 +633,11 @@ class LifecycleCacheTests(unittest.TestCase):
 
 
 class NativeRoutingTests(unittest.TestCase):
+    def test_consumer_workflow_allows_nested_runner_probe_reads(self):
+        caller = self.workflow["jobs"]["monorepo-consumer-checks"]
+        self.assertEqual(caller["permissions"].get("contents"), "read")
+        self.assertEqual(caller["permissions"].get("actions"), "read")
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -731,6 +768,47 @@ class NativeRoutingTests(unittest.TestCase):
         workflow["jobs"]["gate"]["needs"].remove("build")
         self.assertIn("gate dependencies changed", gate_errors(workflow))
 
+    def test_auxiliary_native_workflows_cannot_run_on_prs(self):
+        for name in ("windows-setup.yml", "windows-prune.yml", "depot-cache-smoke.yml"):
+            doc = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+            self.assertNotIn("pull_request", doc.get("on", doc.get(True)), name)
+        cache = yaml.safe_load((ROOT / ".github/workflows/depot-cache-smoke.yml").read_text())
+        self.assertIn("workflow_call", cache.get("on", cache.get(True)))
+        self.assertEqual(self.workflow["jobs"]["cache-smoke"]["uses"], "./.github/workflows/depot-cache-smoke.yml")
+        release = yaml.safe_load((ROOT / ".github/workflows/v-release.yml").read_text())
+        self.assertIn("github.event_name != 'pull_request'", release["jobs"]["build-local-artifacts"]["if"])
+
+    def test_pr_static_does_not_compile_or_install_application_dependencies(self):
+        job = self.workflow["jobs"]["pr-static"]
+        self.assertIn("depot-ubuntu-24.04", job["runs-on"])
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertIn("cargo fmt --all -- --check", commands)
+        self.assertIn("python3 -I -B scripts/test-ci-native-routing.py", commands)
+        self.assertNotRegex(commands, r"cargo (build|check|clippy|test|nextest|llvm-cov)|pnpm install|npm install")
+
+    def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
+        step = next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
+                    if s.get("name") == "Resolve queue base from the event")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stub = root / "git"
+            stub.write_text("#!/bin/sh\ncase \"$1\" in rev-parse) echo \"$TEST_HEAD\" ;; fetch) exit \"$FETCH_STATUS\" ;; *) exit 99 ;; esac\n")
+            stub.chmod(0o755)
+            for base, head, actual, fetch_status, accepted in (
+                ("a"*40, "b"*40, "b"*40, "0", True),
+                ("", "b"*40, "b"*40, "0", False),
+                ("a"*40, "b"*40, "c"*40, "0", False),
+                ("a"*40, "b"*40, "b"*40, "19", False),
+            ):
+                output = root / "env"
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+                    env={**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"],
+                         "QUEUE_BASE_SHA": base, "QUEUE_HEAD_SHA": head, "TEST_HEAD": actual,
+                         "FETCH_STATUS": fetch_status, "GITHUB_ENV": str(output)}, capture_output=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual(output.read_text() if output.exists() else "", "BASE_SHA=" + base + "\n" if accepted else "")
+
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]
         self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"linux", "macos", "windows"})
@@ -740,7 +818,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings", step["run"])
         self.assertNotIn("if", step)
         self.assertFalse(step.get("continue-on-error", False))
-        for event in ("pull_request", "merge_group"):
+        for event in ("merge_group",):
             workflow = copy.deepcopy(self.workflow)
             gate = next(step for step in workflow["jobs"]["gate"]["steps"] if step.get("name") == "Check results")
             gate["run"] = gate["run"].replace("${{ needs.daemon-lifecycle.result }}", "success")

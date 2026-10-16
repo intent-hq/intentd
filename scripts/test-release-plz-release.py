@@ -208,7 +208,7 @@ class WorkflowTests(unittest.TestCase):
         release, pr = workflow.split("  release-plz-pr:\n", 1)
         self.assertIn("python3 -S scripts/release-plz-release.py", release)
         self.assertNotIn("continue-on-error:", workflow)
-        self.assertIn("    needs: release-plz-release\n", pr)
+        self.assertIn("    needs: [release-plz-release, runner-route]\n", pr)
         self.assertIn("if: ${{ github.repository_owner == 'intent-hq' }}", pr)
         self.assertEqual(sum(line.strip() == "cancel-in-progress: false"
                              for line in workflow.splitlines()), 2)

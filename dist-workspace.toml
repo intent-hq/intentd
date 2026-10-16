@@ -51,13 +51,14 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # called reusable workflow requests or the run startup-fails. Overriding here
 # replaces the inherited workflow-level permissions, so contents: write must
 # be restated.
-github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read" } }
+github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read", actions = "read" } }
 # v-release.yml is hand-edited: `gh release create` always passes --prerelease
 # so every tagged release lands as an alpha Pre-release (promote-stable.yml clears
 # the flag and marks the promoted version Latest). dist has no config knob for
 # that, and `dist plan` fails the PR check on any hand edit, so the CI freshness
 # check is relaxed here. Re-apply the customization after any `dist init` /
 # `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
+# Also run python3 scripts/configure-runner-routing.py after generation.
 # Release writer concurrency is also a local customization: after generation run
 # `python3 scripts/configure-release-concurrency.py` to restore the shared lock.
 # Then run `python3 scripts/configure-optional-intel-release.py` to restore
@@ -70,7 +71,7 @@ allow-dirty = ["ci"]
 # runner image guarantees (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Depot runs every release job. Pin host triples explicitly so cargo-dist's
+# Depot labels are fallback keys resolved by runner-route.yml. Pin host triples so cargo-dist's
 # runner-name heuristic cannot change cross-compilation behavior. Both Apple
 # targets build on ARM64; Linux musl keeps its existing x64 glibc build host.
 [dist.github-custom-runners]

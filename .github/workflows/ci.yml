@@ -16,28 +16,9 @@ on:
   # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
   # are completely unaffected.
   pull_request:
-  # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
-  # merged tree before it lands on main. CI is tiered by event: pull_request
-  # runs the fast feedback jobs (check / pr-title / conflict-markers /
-  # monorepo-consumer-checks / deb-packaging / release-scripts) plus
-  # coverage-changed, which runs only
-  # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
-  # comment); merge_group additionally runs the native build matrix, GitLab
-  # feature suite, and full instrumented coverage jobs (coverage-e2e /
-  # coverage-all), which are merge_group-ONLY — they no
-  # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
-  # once, on the merged tree, instead of on every push to the PR. The gate is
-  # event-aware about this (see the gate comment): it requires the coverage
-  # jobs outright on merge_group and accepts their skip on pull_request /
-  # push, and the reverse for coverage-changed. The native matrix is skipped
-  # at job level on PRs; the focused daemon-lifecycle matrix still runs on
-  # PRs and merge groups with real Windows/macOS/Linux runtime proof.
-  # CI Gate requires native check, Clippy and runtime proofs on merge_group,
-  # and its release builds on push. CI Gate is the sole required status check.
-  # Merge groups are created by the repo's own ruleset from already-filed
-  # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
-  # are PR-metadata checks that stay pull_request-only — the gate accepts
-  # their skip.
+  # PRs run Linux metadata, formatting, routing-policy and static consumer
+  # checks only. The queue runs compilation, runtime/platform matrices and
+  # instrumented coverage on the merged tree; CI Gate enforces each tier.
   merge_group:
 
 permissions:
@@ -64,45 +45,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
-  # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
-  # Depot larger runners otherwise. Runs on a Depot runner so
-  # the burst decision is independent of the tinybox queue: when the probe
-  # ran on tinybox it queued behind the very backlog it measures (and
-  # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:
-  # tinybox is only selected when the probe positively confirms an online
-  # self-hosted Linux runner AND an acceptable queue depth — any API error,
-  # missing permission, or an offline fleet routes to the burst runners, so
-  # CI cannot queue-deadlock when the fleet is down. If the job itself fails
-  # (timeout), the routed Linux jobs are skipped and need a re-run — a
-  # deliberate trade-off. The same probe also places the build job's Windows
-  # matrix entry (intent-hq/intent#5518): the self-hosted 5090pc runner when
-  # it is confirmed online, the org-hosted depot-windows-2022-16 runner otherwise —
-  # same fail-open rule, no queue-depth check (5090pc is single-slot).
-  # Both macOS native consumers use m1mac only when an online, idle ARM64
-  # runner is confirmed; otherwise they use Depot’s latest macOS (ARM64).
+  # All workloads prefer compatible self-hosted capacity. Keep the probe
+  # hosted so unavailable self-hosted runners cannot block Depot fallback.
   route:
-    # Runs on push / merge_group / same-repo pull_request. Linux PR checks
-    # consume its decision; the native build entries use it on push and
-    # merge_group (intent-hq/intent#5518). On push its Linux consumers
-    # (check / coverage-e2e / coverage-all / coverage-changed) are
-    # push-skipped by their own `if`s (see the `on: push` comment), so only
-    # the native build decisions are used there.
-    # Skipped on fork PRs (see the `pull_request` trigger comment): route's
-    # skip cascades over the needs chain, skipping check / coverage-e2e /
-    # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
-    # Runs on merge_group (see the trigger comment) — merge groups come from
-    # the repo's own ruleset, so no same-repo guard applies there.
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 5
     permissions:
       contents: read
-      # Reads the Actions queue; job-level so the other jobs don't inherit
-      # it (the optional cross-repo CI_QUEUE_READ_TOKEN is likewise only
-      # exposed to this job).
       actions: read
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 5
     outputs:
+      runners: ${{ steps.decide.outputs.runners }}
       linux_labels: ${{ steps.decide.outputs.linux_labels }}
       check_labels: ${{ steps.decide.outputs.check_labels }}
       linux_burst: ${{ steps.decide.outputs.linux_burst }}
@@ -115,206 +68,128 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+          LINUX_SIZE: '16'
+          LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
-          LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
         with:
-          # tinybox serves several repos on its runner slots, so the probe
-          # wants to size the queue across all of them — but the default
-          # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
-          # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
-          # on the sibling repos) to enable cross-repo counting; without
-          # it those repos are skipped and contribute 0. Routing to tinybox
-          # additionally requires the token to list the tinybox fleet: the
-          # runners are registered at the ORG level (shared across the
-          # repos via a runner group), so the token needs the org-level
-          # "Self-hosted runners" read permission for the org list to
-          # succeed. The default GITHUB_TOKEN cannot carry that permission,
-          # so without a suitably-scoped CI_QUEUE_READ_TOKEN the org list
-          # errors and the probe falls back to this repo's own runner list
-          # (fine-grained "Administration" repository permission, read) —
-          # currently empty, so every run bursts (safe: burst is the
-          # fail-open default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
-            const tinybox = ["self-hosted", "Linux", "X64"];
-            // The coverage jobs run the whole instrumented suite, so they
-            // burst to the biggest Depot Linux runner (16-core); check
-            // (fmt + clippy + a couple of tests) doesn't come close to
-            // saturating that, so it bursts to a cheaper 8-core runner
-            // instead.
-            const burst = ["depot-ubuntu-24.04-16"];
-            const checkBurst = ["depot-ubuntu-24.04-8"];
-            // The Windows build entry: the self-hosted 5090pc runner, or
-            // the org-hosted 16-core Windows runner (the one
-            // release-sitter.yml builds on) — cold workspace Clippy
-            // is slow on the 4-core windows-latest
-            // image.
-            const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
-            const windowsBurst = ["depot-windows-2022-16"];
-            const macosSelfHosted = ["self-hosted", "macOS", "ARM64"];
-            // Latest standard Apple Silicon image.
-            const macosBurst = ["depot-macos-latest"];
-            const threshold = parseInt(process.env.THRESHOLD || "8", 10);
-            // FAIL OPEN TO BURST: tinybox is only selected when the probe
-            // positively confirms (a) an online self-hosted Linux runner
-            // visible to this repo (org-level list, or the repo-level
-            // fallback) and (b) a queue depth within the threshold. Any
-            // probe error — including a token that cannot list runners —
-            // routes to burst, so CI cannot queue-deadlock when the fleet
-            // is offline or unreadable. The Windows decision below shares
-            // the runner list and rule (a); it has no queue-depth rule.
-            //
-            // The self-hosted runners are registered at the ORG level
-            // (shared across the repos via a runner group), so probe the
-            // org runner list first. That call needs the org-level
-            // "Self-hosted runners" read permission on the token (see the
-            // github-token comment above); when it errors, fall back to
-            // the repo-level list, which only sees repo-registered
-            // runners (currently none — the degraded mode keeps
-            // bursting). An empty list still routes to burst by design
-            // (never deadlock on an invisible fleet).
-            // NOTE: the org list is NOT scoped to the runner groups this
-            // repo can access, so the probe assumes every online
-            // self-hosted+Linux+X64 org runner is the tinybox fleet in a
-            // group visible to this repo (and likewise every online
-            // self-hosted+Windows+X64 runner is 5090pc and every
-            // self-hosted+macOS+ARM64 runner is m1mac). Ops invariant:
-            // keep the fleet's group visible to the CI repos, and never
-            // register generically-labeled org runners outside it — a
-            // matching but inaccessible runner would route jobs onto
-            // labels nothing can serve. (Group-scoped listing via the
-            // runner-groups API was considered and rejected: it needs
-            // extra calls per group and fails on plans without
-            // runner-group support, which would silently regress the
-            // probe to always-burst.)
-            let runners = null;
-            let runnerSource = "org";
-            let runnerListError = null;
+            // No checkout: routing never executes code from a pull request.
+            // Org runners with these labels must be in groups shared with all three CI repos.
+            const fleets = {
+              linux: ['self-hosted', 'Linux', 'X64'],
+              arm: ['self-hosted', 'Linux', 'ARM64'],
+              windows: ['self-hosted', 'Windows', 'X64'],
+              macos: ['self-hosted', 'macOS', 'ARM64'],
+              intel: ['self-hosted', 'macOS', 'X64'],
+            };
+            const disabled = {
+              linux: process.env.LINUX_RUNNER_DISABLED === 'true',
+              arm: process.env.LINUX_RUNNER_DISABLED === 'true',
+              windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
+              macos: process.env.MACOS_RUNNER_DISABLED === 'true',
+              intel: process.env.MACOS_RUNNER_DISABLED === 'true',
+            };
+            const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
+            const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
+            const pr = context.payload?.pull_request;
+            const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
             try {
+              if (fork) throw new Error('fork pull request requires an isolated hosted runner');
+              let runners;
               try {
-                runners = await github.paginate(
-                  github.rest.actions.listSelfHostedRunnersForOrg,
-                  { org: context.repo.owner, per_page: 100 }
-                );
-              } catch (e) {
-                core.info(`org runner list failed (${e.message}); falling back to repo-level list`);
-                runnerSource = "repo";
-                runners = await github.paginate(
-                  github.rest.actions.listSelfHostedRunnersForRepo,
-                  { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
-                );
+                runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForOrg, {org: context.repo.owner, per_page: 100});
+              } catch (error) {
+                core.info(`org runner list failed (${error.message}); trying repository-visible runners`);
+                runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForRepo, {...context.repo, per_page: 100});
               }
-            } catch (e) {
-              runnerListError = e;
-            }
-            const onlineWith = (labels, ignoreCase = false) => (runners || []).filter(r =>
-              r.status === "online" &&
-              labels.every(l => (r.labels || []).some(x => ignoreCase
-                ? typeof x.name === "string" && x.name.toLowerCase() === l.toLowerCase()
-                : x.name === l))
-            );
-            let useBurst = true;
-            let reason = "fail-open default";
-            try {
-              if (runnerListError) throw runnerListError;
-              const online = onlineWith(tinybox);
-              if (online.length === 0) {
-                reason = `no online self-hosted Linux runner (${runnerSource} list)`;
-              } else {
-                // Count self-hosted Linux jobs that are queued or running in
-                // queued/in-progress runs: a running job occupies a tinybox
-                // slot just as much as a queued one. Depot jobs
-                // — including this route job and bursted heavy jobs — don't
-                // match the self-hosted+Linux label filter, so they never
-                // inflate the depth. Sibling-repo probe failures are the
-                // documented degraded mode (skip, contribute 0); a failure
-                // on this repo's own probe means the depth is unknowable,
-                // so it rethrows into the fail-open burst path.
-                const owner = context.repo.owner;
-                const repos = ["intentd", "cloudlands-fe", "monorepo"];
-                let depth = 0;
-                for (const repo of repos) {
-                  try {
-                    for (const status of ["queued", "in_progress"]) {
-                      const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
-                      for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
-                        const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                        depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
-                      }
+              const online = Object.fromEntries(Object.entries(fleets).map(([key, labels]) => [key,
+                runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => ['macos', 'intel'].includes(key) ? x.name?.toLowerCase() === l.toLowerCase() : x.name === l))),
+              ]));
+              const jobs = [];
+              // A missing sibling view is unknown demand, not zero demand. Fail open to Depot.
+              if (Object.values(online).some(rs => rs.length)) {
+                for (const repo of new Set(['intent', 'intentd', 'cloudlands-fe', context.repo.repo])) {
+                  const seen = new Set();
+                  for (const status of ['queued', 'in_progress']) {
+                    const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {owner: context.repo.owner, repo, status, per_page: 100});
+                    for (const run of runs) {
+                      if (run.id === context.runId || seen.has(run.id)) continue;
+                      seen.add(run.id);
+                      jobs.push(...await github.paginate(github.rest.actions.listJobsForWorkflowRun, {owner: context.repo.owner, repo, run_id: run.id, per_page: 100}));
                     }
-                  } catch (e) {
-                    if (repo === context.repo.repo) throw e;
-                    core.info(`queue probe skipped ${repo}: ${e.message}`);
                   }
                 }
-                useBurst = depth > threshold;
-                reason = `queue depth=${depth} threshold=${threshold} online=${online.length} (${runnerSource} list)`;
               }
-            } catch (e) {
-              useBurst = true;
-              reason = `probe failed (${e.message})`;
-            }
-            if (process.env.LINUX_RUNNER_DISABLED === "true") {
-              useBurst = true;
-              reason = "self-hosted Linux disabled for maintenance";
-            }
-            core.info(`linux routing: burst=${useBurst} (${reason})`);
-            core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
-            core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
-            core.setOutput("linux_burst", String(useBurst));
-            // 5090pc is shared by native builds and lifecycle jobs. Prefer
-            // its free slot only when explicitly idle; a busy or unknown
-            // slot must burst rather than exhaust the merge queue timeout.
-            let windowsUseBurst = true;
-            let windowsReason = "fail-open default";
-            try {
-              if (runnerListError) throw runnerListError;
-              const idle = onlineWith(windowsSelfHosted).filter(r => r.busy === false);
-              if (idle.length === 0) {
-                windowsReason = `no idle online self-hosted Windows runner (${runnerSource} list)`;
-              } else {
-                windowsUseBurst = false;
-                windowsReason = `idle=${idle.length} (${runnerSource} list)`;
+              const threshold = Number(process.env.THRESHOLD || '8');
+              if (!Number.isInteger(threshold) || threshold < 0) throw new Error('invalid queue threshold');
+              for (const [key, labels] of Object.entries(fleets)) {
+                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).includes(l)));
+                const stale = demand.some(j => j.status === 'queued' && (!Number.isFinite(Date.parse(j.created_at)) || Date.parse(j.created_at) < Date.now() - 15 * 60 * 1000));
+                const native = key !== 'linux';
+                const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
+                const limit = native ? capacity - 1 : Math.min(threshold, capacity);
+                const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
+                burst[key] = disabled[key] || capacity === 0 || stale || depth > limit;
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}`;
               }
-            } catch (e) {
-              windowsUseBurst = true;
-              windowsReason = `probe failed (${e.message})`;
+            } catch (error) {
+              for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
             }
-            // Allow maintenance without abandoning the free runner preference.
-            if (process.env.WINDOWS_RUNNER_DISABLED === "true") {
-              windowsUseBurst = true;
-              windowsReason = "self-hosted Windows disabled for maintenance";
-            }
-            core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
-            core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
-            core.setOutput("windows_burst", String(windowsUseBurst));
-            // macOS has no queue budget: only explicit idle availability
-            // selects self-hosted. Missing busy state is not proof of a
-            // free slot. Labels are case-insensitive in Actions; keep the
-            // existing Linux/Windows matching semantics above unchanged.
-            let macosUseBurst = true;
-            let macosReason = "fail-open default";
-            try {
-              if (runnerListError) throw runnerListError;
-              const idle = onlineWith(macosSelfHosted, true).filter(r => r.busy === false);
-              if (idle.length === 0) {
-                macosReason = `no idle online self-hosted macOS ARM64 runner (${runnerSource} list)`;
-              } else {
-                macosUseBurst = false;
-                macosReason = `idle=${idle.length} (${runnerSource} list)`;
+            const mapping = {};
+            for (const version of ['22.04', '24.04']) {
+              for (const size of ['', '-4', '-8', '-16', '-32', '-64']) {
+                for (const arch of ['', '-arm']) {
+                  const label = `depot-ubuntu-${version}${arch}${size}`;
+                  const key = arch ? 'arm' : 'linux';
+                  mapping[label] = burst[key] ? [label] : fleets[key];
+                }
               }
-            } catch (e) {
-              macosUseBurst = true;
-              macosReason = `probe failed (${e.message})`;
             }
-            if (process.env.MACOS_RUNNER_DISABLED === "true") {
-              macosUseBurst = true;
-              macosReason = "self-hosted macOS disabled for maintenance";
+            for (const version of ['2022', '2025']) {
+              for (const size of ['', '-4', '-8', '-16', '-32', '-64']) {
+                const label = `depot-windows-${version}${size}`;
+                mapping[label] = burst.windows ? [label] : fleets.windows;
+              }
             }
-            core.info(`macos routing: burst=${macosUseBurst} (${macosReason})`);
-            core.setOutput("macos_labels", JSON.stringify(macosUseBurst ? macosBurst : macosSelfHosted));
-            core.setOutput("macos_burst", String(macosUseBurst));
+            mapping['depot-macos-latest'] = burst.macos ? ['depot-macos-latest'] : fleets.macos;
+            mapping['macos-latest-large'] = burst.intel ? ['macos-latest-large'] : fleets.intel;
+            for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
+            core.setOutput('runners', JSON.stringify(mapping));
+            core.setOutput('linux_labels', JSON.stringify(mapping[`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`]));
+            core.setOutput('check_labels', JSON.stringify(mapping['depot-ubuntu-24.04-8']));
+            core.setOutput('windows_labels', JSON.stringify(mapping['depot-windows-2022-16']));
+            core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
+            for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+
+  # No compilation, application dependencies, or native runners before queueing.
+  pr-static:
+    needs: route
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install 'PyYAML==6.0.3'
+      - name: Check CI routing and gate failures
+        run: python3 -I -B scripts/test-ci-native-routing.py
+      - name: Resolve formatting toolchain
+        id: rust
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  cache-smoke:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/depot-cache-smoke.yml
+    secrets: inherit
 
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
@@ -322,7 +197,7 @@ jobs:
     # function, so the implicit success() still applies: a route failure —
     # or a route skip, as on fork PRs — skips this job on pull_request
     # exactly as before.
-    if: github.event_name != 'push'
+    if: github.event_name == 'merge_group'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
@@ -334,6 +209,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -653,7 +531,8 @@ jobs:
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
   release-fast-path:
-    runs-on: depot-ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -705,10 +584,10 @@ jobs:
           #   os: depot-ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
           # use the latest hosted ARM64 image. Empty route output also falls back to
-          # hosted. Retain the historical macos-14 check name for continuity.
+          # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
-            name: build (aarch64-apple-darwin, macos-14)
+            name: build (aarch64-apple-darwin)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
           # depot-windows-2022-16 runner otherwise (fail-open to burst, like the
@@ -736,6 +615,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
@@ -923,7 +805,9 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
           INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+        run: |
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
       - uses: actions/upload-artifact@v7
         if: always() && needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         with:
@@ -977,6 +861,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -1109,6 +996,9 @@ jobs:
       # route.
       NEXTEST_TEST_THREADS: 16
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -1325,6 +1215,9 @@ jobs:
       # burst runner, so the value no longer varies by route.
       NEXTEST_TEST_THREADS: 16
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - name: Configure Depot managed compiler cache
         shell: bash
@@ -1486,25 +1379,12 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # pull_request-ONLY counterpart of coverage-e2e / coverage-all
-  # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
-  # under the merge queue's llvm-cov instrumentation and ejected the PR, so
-  # every same-repo PR now runs the nextest selection derived from its own
-  # changed paths (scripts/changed-tests.sh --instrumented — the same env,
-  # flags and auggie_context_e2e exclusion as scripts/coverage-e2e.sh) under
-  # instrumentation before it can be enqueued. The full instrumented suite
-  # stays merge_group-only (intent-hq/intent#4260). Two phases: a cheap
-  # bash+git dry run FIRST computes the selection, and every heavy step
-  # (disk preflight, libssl, toolchain, caches, cargo-llvm-cov / nextest
-  # install, the run itself) is gated on it having found something, so a PR
-  # without crates/ changes finishes in seconds. Gated like check on
-  # pull_request: required outright by the gate there (a skip after a route
-  # failure fails the gate), accepted as skipped on merge_group / push where
-  # it is job-level skipped by design. github.event.pull_request is only
-  # read inside the job (absent on merge_group, where the job never runs).
+  # Queue-only focused coverage retains the callback fixture composition proof
+  # and its evidence alongside the full instrumented suites. Local changed-test
+  # commands remain available for earlier feedback; PRs do not compile tests.
   coverage-changed:
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
@@ -1526,42 +1406,28 @@ jobs:
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
     steps:
-      # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
-      # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
-      # selection's base is HEAD^1 itself. The base is resolved from that
-      # merge commit, never from pull_request.base.sha: the payload's base.sha
-      # is not guaranteed to be the first parent of the merge commit the job
-      # checks out (github.sha), and when the two differ the depth-1 fetch of
-      # base.sha is a disconnected object `git merge-base` cannot connect to
-      # HEAD (intent-hq/intent#5414). Should the checkout ever be the branch head
-      # itself (no merge commit), the base branch and the PR head are fetched
-      # unshallowed so origin/<base> connects to HEAD. Both changed-tests.sh
-      # runs below read the same resolved BASE_SHA.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Configure Depot managed compiler cache
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
         run: python3 scripts/setup-depot-sccache.py
-      - name: Resolve PR base from the merge commit
+      - name: Resolve queue base from the event
         run: |
           set -euo pipefail
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            base=$(git rev-parse 'HEAD^1')
-            echo "base: HEAD^1 (merge-commit parent) = $base"
-          else
-            git fetch --no-tags --unshallow origin \
-              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
-              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
-            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
-            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
-          fi
-          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          [[ "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$QUEUE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$QUEUE_HEAD_SHA"
+          git fetch --no-tags --depth=1 origin "$QUEUE_BASE_SHA"
+          echo "BASE_SHA=$QUEUE_BASE_SHA" >> "$GITHUB_ENV"
       - name: Select changed tests (dry run)
         id: select
         run: |
@@ -1808,7 +1674,8 @@ jobs:
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
   pr-title:
-    runs-on: depot-ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1859,7 +1726,8 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    runs-on: depot-ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1912,12 +1780,17 @@ jobs:
   # to a binding's help line); it stays a hard error in the monorepo.
   # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
   # the `pull_request` trigger comment); skipped on push to main, where the
-  # tree was already checked by its PR run. Seconds-long on depot-ubuntu-24.04.
+  # tree was already checked in the queue. PRs run static contracts; the
+  # queued tree also runs the connected runtime proof.
   monorepo-consumer-checks:
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
+      actions: read
       contents: read
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+      DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@0e12255c6207b474a218e633ec61e9b051d3e990
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1927,14 +1800,12 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Seconds-long like the other utility jobs, so it runs directly on
-  # depot-ubuntu-24.04, which has the required dpkg-deb / tar+xz toolchain
-  # preinstalled.
+  # Both the self-hosted Linux fleet and Depot fallback provide dpkg-deb / tar+xz.
   deb-packaging:
-    runs-on: depot-ubuntu-24.04
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1979,15 +1850,21 @@ jobs:
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
   # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
-  # the other utility jobs, so it runs directly on depot-ubuntu-24.04.
+  # the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
-    runs-on: depot-ubuntu-24.04
-    # Runs on push, merge_group and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
@@ -2007,6 +1884,7 @@ jobs:
           python3 -B scripts/test-setup-depot-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-depot-runners.py
+          python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test optional Intel cargo-dist publication
         shell: bash
@@ -2019,6 +1897,11 @@ jobs:
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+      - name: Test obsolete merge-run policy and workflow integration (offline)
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
@@ -2074,22 +1957,21 @@ jobs:
   # that polls the task's log need Windows — scripts/install.ps1.Tests.ps1
   # (Pester) executes those marked blocks of the shipped script with the Task
   # Scheduler cmdlets mocked. Runs under both Windows PowerShell 5.1 (what
-  # `powershell -c "irm … | iex"` in the README uses) and pwsh 7. A
-  # GitHub-hosted runner rather than the self-hosted Windows build box: the
-  # tests need no Rust toolchain, and the hosted image ships Pester 5 and the
-  # ScheduledTasks module. Minutes-long, so no cache. Every test must run
+  # `powershell -c "irm … | iex"` in the README uses) and pwsh 7.
+  # Tests need no Rust toolchain; both runner paths must provide Pester 5 and
+  # the ScheduledTasks module. Minutes-long, so no cache. Every test must run
   # here — the register block self-skips off Windows, so a skip on this job
   # means the module went missing, and the step fails on it.
   install-ps1:
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
     name: install-ps1 (${{ matrix.shell }})
-    runs-on: depot-windows-2025
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-windows-2025'] || fromJSON('["depot-windows-2025"]') }}
     timeout-minutes: 15
     # The matrix context is not available in a step-level `shell:` (the
     # workflow fails validation with "Unrecognized named-value: 'matrix'"),
@@ -2099,11 +1981,32 @@ jobs:
         shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v7
+      - name: Prepare PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command pwsh -ErrorAction SilentlyContinue) { exit 0 }
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $archive = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7') {
+            throw 'PowerShell archive checksum mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          & (Join-Path $destination 'pwsh.exe') -NoProfile -Command '$PSVersionTable.PSVersion'
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 failed to start' }
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Pester (${{ matrix.shell }})
         run: |
           $ErrorActionPreference = 'Stop'
           $PSVersionTable.PSVersion
-          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0' })) {
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5' })) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            if (-not (Get-PackageProvider -ListAvailable | Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' })) {
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+            }
             Install-Module Pester -Force -SkipPublisherCheck -Scope CurrentUser -MinimumVersion 5.5
           }
           Import-Module Pester -MinimumVersion 5.0
@@ -2122,13 +2025,14 @@ jobs:
   # Linux platform simulation. Both platforms also cover extension forwarding.
   # The shipping-pin matrix is strict and required by CI Gate.
   pi-session-paths:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
         os: [depot-ubuntu-24.04, depot-windows-2025]
         node: [22, 24]
-    runs-on: ${{ matrix.os }}
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 10
     env:
       PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
@@ -2143,6 +2047,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Install the exact production adapter pin
         run: |
           pin=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_ACP_NPX_PACKAGE: &str = "(pi-acp@[^"]+)";/); if (!m) throw new Error("Missing production Pi adapter pin"); console.log(m[1]);')
@@ -2184,7 +2092,7 @@ jobs:
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
     needs: route
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -2202,6 +2110,9 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
       # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
@@ -2293,157 +2204,80 @@ jobs:
         shell: bash
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # CI Gate is the sole required status check. Every failed/cancelled result
-  # fails it; skips are accepted only for jobs intentionally absent by event.
-  # build is required on merge_group (native check, Clippy and runtime proofs) and push
-  # (release compilation); only pull_request accepts its job-level skip.
-  # check / monorepo-consumer-checks must succeed on PRs and merge_group.
-  # Full coverage is required on merge_group, changed coverage on PRs.
-  # pr-title / conflict-markers retain their PR-metadata skip handling.
-  # deb-packaging / release-scripts / install-ps1 / pi-session-paths must
-  # succeed on every non-fork run. The gate itself is skipped on fork PRs.
+  # Required context for each event: PRs certify only the lightweight tier.
+  # Queue entries require all native/runtime/coverage proofs; push keeps its
+  # release-build and packaging checks. Missing/failed results never pass.
   gate:
     name: CI Gate
-    # Seconds-long job: pinned to depot-ubuntu-24.04 (see pr-title).
-    runs-on: depot-ubuntu-24.04
-    permissions: {}
-    # The same-repo clause skips the gate on fork PRs along with every other
-    # job (see the `pull_request` trigger comment): without it, always()
-    # would run the gate against all-skipped needs and report a spurious
-    # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    needs: [route, pr-static, cache-smoke, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
-          if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
-            echo "daemon-lifecycle must execute successfully on PR and merge queue"
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.daemon-lifecycle.result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          fi
-          # PRs deliberately skip the general native build matrix. A skip on
-          # merge_group or push must never pass as native validation.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            case "${{ needs.build.result }}" in
-              success|skipped) ;;
-              *)
-                echo "build did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.build.result }}" != "success" ]; then
-            echo "build must succeed outright on merge_group / push"
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            if [ "${{ needs.macos-services-runtime.result }}" != "success" ]; then
-              echo "macos-services-runtime must succeed outright on merge_group"
-              exit 1
-            fi
-          else
-            case "${{ needs.macos-services-runtime.result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          fi
-          if [ "${{ needs.deb-packaging.result }}" != "success" ] || \
-             [ "${{ needs.release-scripts.result }}" != "success" ] || \
-             [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
-             [ "${{ needs.install-ps1.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: check must succeed outright on
-          # pull_request; only push runs (where it is job-skipped as
-          # redundant) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.check.result }}" in
-              success|skipped) ;;
-              *)
-                echo "check did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.check.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: monorepo-consumer-checks must succeed
-          # outright on pull_request and merge_group; only push runs (where it
-          # is job-skipped as already checked by the PR run) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.monorepo-consumer-checks.result }}" in
-              success|skipped) ;;
-              *)
-                echo "monorepo-consumer-checks did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
-            echo "monorepo-consumer-checks must succeed outright on pull_request / merge_group"
-            exit 1
-          fi
-          # Event-aware on purpose: coverage-changed is pull_request-only, so
-          # there it must succeed outright (a skip after a route failure must
-          # not let an uninstrumented PR through); on merge_group and push it
-          # is job-skipped by design and the gate accepts skipped.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if [ "${{ needs.coverage-changed.result }}" != "success" ]; then
-              echo "coverage-changed must succeed outright on pull_request"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-changed.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-changed did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          # Event-aware on purpose: coverage-e2e / coverage-all are
-          # merge_group-only, so on merge_group they must succeed outright
-          # (a skip must never let the queue land an untested tree); on
-          # pull_request and push they are job-skipped by design and the
-          # gate accepts skipped.
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
-               [ "${{ needs.coverage-all.result }}" != "success" ]; then
-              echo "coverage-e2e / coverage-all must succeed outright on merge_group"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-e2e.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-e2e did not succeed or skip"
-                exit 1
-                ;;
-            esac
-            case "${{ needs.coverage-all.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-all did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          case "${{ needs.pr-title.result }}" in
-            success|skipped) ;;
-            *)
-              echo "pr-title did not succeed or skip"
-              exit 1
+          require() {
+            if [ "$2" != success ]; then echo "$1 must succeed ($2)"; exit 1; fi
+          }
+          optional() {
+            case "$2" in success|skipped) ;; *) echo "$1 failed ($2)"; exit 1 ;; esac
+          }
+          case "${{ github.event_name }}" in
+            pull_request)
+              require route "${{ needs.route.result }}"
+              require pr-static "${{ needs.pr-static.result }}"
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              optional check "${{ needs.check.result }}"
+              optional build "${{ needs.build.result }}"
+              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              require pr-title "${{ needs.pr-title.result }}"
+              require conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              optional deb-packaging "${{ needs.deb-packaging.result }}"
+              optional release-scripts "${{ needs.release-scripts.result }}"
+              optional install-ps1 "${{ needs.install-ps1.result }}"
+              optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
-          esac
-          case "${{ needs.conflict-markers.result }}" in
-            success|skipped) ;;
-            *)
-              echo "conflict-markers did not succeed or skip"
-              exit 1
+            merge_group)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              require cache-smoke "${{ needs.cache-smoke.result }}"
+              require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              require check "${{ needs.check.result }}"
+              require build "${{ needs.build.result }}"
+              require macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              require coverage-e2e "${{ needs.coverage-e2e.result }}"
+              require coverage-all "${{ needs.coverage-all.result }}"
+              require coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              require install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
+            push)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              optional check "${{ needs.check.result }}"
+              require build "${{ needs.build.result }}"
+              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              optional monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              require install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
+              ;;
+            *) exit 1 ;;
           esac
