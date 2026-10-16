@@ -87,9 +87,10 @@ reinstall just because they use the older update feed. Beta and stable receive a
 release only after it is promoted to that channel.
 
 An Intel app running under Rosetta on Apple Silicon can update to the native Apple
-Silicon build. Some installed versions have a compatibility check that treats
-Rosetta as Intel and blocks that update; those installations need a manual reinstall
-of the Apple Silicon build. This workaround is only for Apple Silicon hardware.
+Silicon build. If an Intel build contains a compatibility check that treats Rosetta
+as Intel and blocks that transition, a manual Apple Silicon reinstall is needed.
+Do not assume all Rosetta installations have that check or require reinstallation.
+This workaround is only for Apple Silicon hardware.
 
 On Intel Macs, clients with the compatibility check reject ARM-only updates. Older
 clients can show an available update and then fail before downloading because no
