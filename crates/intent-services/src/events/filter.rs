@@ -346,6 +346,7 @@ mod tests {
             "note:presence",
             "discussion:message",
             "discussion:*",
+            "discussion:reaction",
             "discussion:future-type",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
@@ -410,7 +411,11 @@ mod tests {
                 exclude_agent_events: true,
                 ..Default::default()
             };
-            for kind in ["discussion:message", "discussion:future-type"] {
+            for kind in [
+                "discussion:message",
+                "discussion:reaction",
+                "discussion:future-type",
+            ] {
                 assert!(!event_matches(
                     &filter,
                     &event(kind, Some("human"), ActorType::User)

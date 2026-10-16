@@ -9,6 +9,7 @@ pub const DISCUSSION_RECIPIENT_MAX: usize = 31;
 pub const DISCUSSION_BODY_MAX_BYTES: usize = 16 * 1024;
 pub const DISCUSSION_PAGE_MAX: u32 = 100;
 pub const DISCUSSION_PAGE_DEFAULT: u32 = 50;
+pub const DISCUSSION_REACTIONS: [&str; 2] = ["👍", "🙂"];
 
 /// Profile snapshot captured from the authenticated human at send time.
 /// After workspace transfer the principal id is inert source attribution;
@@ -33,6 +34,39 @@ pub struct DiscussionMessage {
     pub body: String,
     pub author: DiscussionAuthor,
     pub created_at: String,
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
+    #[serde(default)]
+    pub reply_to: Option<DiscussionReply>,
+    #[serde(default)]
+    pub reactions: Vec<DiscussionReaction>,
+    #[serde(default)]
+    pub reaction_version: i64,
+}
+
+/// Immutable same-conversation quote; source identity remains inert on import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionReply {
+    pub id: String,
+    pub author: DiscussionAuthor,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionReaction {
+    pub reaction: String,
+    pub count: i64,
+    pub reacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionReactionState {
+    pub message_id: String,
+    pub reactions: Vec<DiscussionReaction>,
+    pub reaction_version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,4 +101,5 @@ pub struct DiscussionSendResult {
 pub struct DiscussionTarget {
     pub conversation_id: Option<String>,
     pub recipient_principal_ids: Option<Vec<PrincipalId>>,
+    pub reply_to_message_id: Option<String>,
 }

@@ -1177,6 +1177,27 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             to_result_value(&page)
         }
+        "discussion.react" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let reaction = require_str_param(params, "reaction")?;
+            let active = params
+                .get("active")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("active must be a boolean"))?;
+            let result = api
+                .discussion_react(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    message_id,
+                    reaction,
+                    active,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         "discussion.send" => {
             let id = require_workspace_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -1209,6 +1230,7 @@ async fn dispatch_other(
                     intent_core::discussion::DiscussionTarget {
                         conversation_id,
                         recipient_principal_ids,
+                        reply_to_message_id: discussion_optional_id(params, "replyToMessageId")?,
                     },
                 )
                 .await

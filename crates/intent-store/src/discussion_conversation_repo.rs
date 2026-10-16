@@ -61,7 +61,7 @@ async fn read_conversation(
         .ok_or_else(missing)?;
     conversation(&row)
 }
-const ELIGIBLE: &str = "(p.is_primary=1 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.workspace_id=? AND m.principal_id=p.id) OR (? <> '__chief__' AND EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id=p.id)))";
+pub(super) const ELIGIBLE: &str = "(p.is_primary=1 OR EXISTS(SELECT 1 FROM workspace_member m WHERE m.workspace_id=? AND m.principal_id=p.id) OR (? <> '__chief__' AND EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id=p.id)))";
 
 impl Store {
     /// Transfer preflight must not expose private history through an archive.
@@ -219,9 +219,12 @@ impl Store {
                     .unwrap_or(DEFAULT_CONVERSATION)
                     == message.conversation_id
             };
-            if message.body != body || !same_target {
+            if message.body != body
+                || !same_target
+                || message.reply_to_message_id != target.reply_to_message_id
+            {
                 return Err(Error::InvalidParams(
-                    "messageId was already used with a different body or conversation".into(),
+                    "messageId was already used with a different body, conversation or reply target".into(),
                 ));
             }
             if message.conversation_id != DEFAULT_CONVERSATION {
@@ -279,8 +282,23 @@ impl Store {
             }
             read_conversation(&mut tx, ws, id).await?
         };
+        let reply = if let Some(reply_id) = &target.reply_to_message_id {
+            let row = sqlx::query("SELECT * FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=? AND id=?")
+                .bind(ws.as_str()).bind(&conversation.id).bind(reply_id).fetch_optional(&mut *tx).await.map_err(|e|db(&e))?.ok_or_else(missing)?;
+            let original = super::discussion_repo::message(&row)?;
+            Some(
+                serde_json::to_string(&intent_core::discussion::DiscussionReply {
+                    id: original.id,
+                    author: original.author,
+                    body: original.body,
+                })
+                .map_err(|e| Error::Internal(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let id = uuid::Uuid::now_v7().to_string();
-        sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(author.principal_id.as_str()).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).execute(&mut *tx).await.map_err(|e|db(&e))?;
+        sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at,reply_to_message_id,reply_to_json) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(author.principal_id.as_str()).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).bind(&target.reply_to_message_id).bind(reply).execute(&mut *tx).await.map_err(|e|db(&e))?;
         let row = sqlx::query("SELECT * FROM workspace_discussion_message WHERE id=?")
             .bind(&id)
             .fetch_one(&mut *tx)

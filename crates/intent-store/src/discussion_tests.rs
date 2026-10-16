@@ -219,7 +219,7 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .insert_workspace(&sample_workspace(&ws, "Existing discussion", false))
         .await
         .unwrap();
-    sqlx::raw_sql("DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
+    sqlx::raw_sql("DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
         .execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../migrations/0161_workspace_discussions.sql"))
         .execute(store.write_pool())
@@ -235,6 +235,12 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .bind(ws.as_str()).bind(author.principal_id.as_str()).bind(serde_json::to_string(&author).unwrap()).execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!(
         "../migrations/0162_discussion_conversations.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0163_discussion_message_actions.sql"
     ))
     .execute(store.write_pool())
     .await
@@ -290,6 +296,7 @@ async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer()
     let create = DiscussionTarget {
         conversation_id: None,
         recipient_principal_ids: Some(vec![owner.id]),
+        ..DiscussionTarget::default()
     };
     let (private, _) = store
         .send_discussion_message(&ws, "private", "body", &author, &create)
@@ -308,6 +315,7 @@ async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer()
             DiscussionTarget {
                 conversation_id: Some(private.conversation.id.clone()),
                 recipient_principal_ids: None,
+                ..Default::default()
             },
         ),
     ] {
@@ -328,6 +336,30 @@ async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer()
             result=&mut pending => panic!("send unexpectedly passed held writer: {result:?}"),
             ()=std::future::ready(()) => {}
         }
+        sqlx::query("DELETE FROM workspace_member WHERE workspace_id=? AND principal_id=?")
+            .bind(ws.as_str())
+            .bind(person.id.as_str())
+            .execute(&mut *removal)
+            .await
+            .unwrap();
+        removal.commit().await.unwrap();
+        assert!(matches!(pending.await, Err(Error::NotFound(_))));
+    }
+    for conversation in ["default", private.conversation.id.as_str()] {
+        store
+            .add_workspace_member(&ws, &person.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        let page = store
+            .list_discussion_messages_in(&ws, conversation, None, None, 1)
+            .await
+            .unwrap();
+        let message = &page.messages[0].id;
+        let mut removal = store.write_pool().begin().await.unwrap();
+        let pending =
+            store.set_discussion_reaction(&ws, conversation, message, &person.id, "👍", true);
+        tokio::pin!(pending);
+        tokio::select! { biased; result=&mut pending => panic!("reaction bypassed writer: {result:?}"), ()=std::future::ready(())=>{} }
         sqlx::query("DELETE FROM workspace_member WHERE workspace_id=? AND principal_id=?")
             .bind(ws.as_str())
             .bind(person.id.as_str())

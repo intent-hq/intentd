@@ -5270,6 +5270,18 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = (workspace_id, message_id, body, target);
         Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
     }
+    /// Set one human's desired reaction state; retries are no-ops.
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionReactionState>> {
+        let _ = (workspace_id, conversation_id, message_id, reaction, active);
+        Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
+    }
     /// Bounded participant-only discovery.
     fn discussion_conversations(
         &self,

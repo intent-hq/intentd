@@ -22,6 +22,7 @@ async fn discussion_history_is_filtered_from_agent_event_queries_before_paging()
         "note:updated",
         "discussion:message",
         "agent:idle",
+        "discussion:reaction",
         "discussion:future-type",
         "file:changed",
         "discussion:message",
@@ -51,6 +52,7 @@ async fn discussion_history_is_filtered_from_agent_event_queries_before_paging()
     for kind in [
         "discussion:message",
         "discussion:*",
+        "discussion:reaction",
         "discussion:future-type",
     ] {
         for paginate in [false, true] {
@@ -177,6 +179,7 @@ async fn discussion_agent_subscription_admission_rejects_exact_wildcard_and_mixe
     let agent = AgentId::new();
     for types in [
         vec!["discussion:message".into()],
+        vec!["discussion:reaction".into()],
         vec!["discussion:*".into()],
         vec!["file:*".into(), "discussion:message".into()],
     ] {
@@ -325,6 +328,7 @@ fn recipients(ids: &[PrincipalId]) -> DiscussionTarget {
     DiscussionTarget {
         conversation_id: None,
         recipient_principal_ids: Some(ids.to_vec()),
+        ..DiscussionTarget::default()
     }
 }
 
@@ -390,6 +394,7 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
         DiscussionTarget {
             conversation_id: Some("default".into()),
             recipient_principal_ids: Some(vec![p[2].id.clone()]),
+            ..DiscussionTarget::default()
         },
     ] {
         assert!(matches!(
@@ -446,6 +451,7 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
             &DiscussionTarget {
                 conversation_id: Some(a.conversation.id.clone()),
                 recipient_principal_ids: None,
+                ..Default::default()
             },
         ),
     )
@@ -497,6 +503,7 @@ async fn discussion_conversations_authorize_participants_even_for_owner_and_offl
     let target = DiscussionTarget {
         conversation_id: Some(created.conversation.id.clone()),
         recipient_principal_ids: None,
+        ..Default::default()
     };
     let mut all = Vec::new();
     let mut after: Option<String> = None;
@@ -716,6 +723,7 @@ async fn discussion_store_rechecks_sender_membership_but_retry_survives_recipien
             DiscussionTarget {
                 conversation_id: Some(created.conversation.id.clone()),
                 recipient_principal_ids: None,
+                ..Default::default()
             },
         ),
         ("new-public", DiscussionTarget::default()),
@@ -777,4 +785,354 @@ async fn discussion_export_cannot_bypass_participant_authorization() {
         svc.transfer_exports.lock().unwrap().is_empty(),
         "no readable export session"
     );
+}
+
+#[tokio::test]
+async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() {
+    let (_tmp, svc, ws, p) = conversation_fixture().await;
+    let made = with_caller(
+        human(&p[1].id),
+        svc.discussion_send_to_op(&ws, "dm", "private", &recipients(&[p[2].id.clone()])),
+    )
+    .await
+    .unwrap();
+    let id = &made.conversation.id;
+    let message = &made.message.id;
+    let (a, b) = tokio::join!(
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_react_op(&ws, id, message, "👍", true)
+        ),
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_react_op(&ws, id, message, "👍", true)
+        ),
+    );
+    let a = a.unwrap();
+    assert_eq!(a, b.unwrap());
+    assert_eq!(a.reaction_version, 1);
+    assert_eq!(
+        serde_json::to_value(&a.reactions).unwrap(),
+        json!([{"reaction":"👍","count":1,"reacted":true}])
+    );
+    let bob = with_caller(
+        human(&p[2].id),
+        svc.discussion_history_op(&ws, id, None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bob["messages"][0]["reactions"][0]["reacted"], false);
+    let both = with_caller(
+        human(&p[2].id),
+        svc.discussion_react_op(&ws, id, message, "👍", true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(both.reaction_version, 2);
+    assert_eq!(both.reactions[0].count, 2);
+    let other = with_caller(
+        human(&p[2].id),
+        svc.discussion_react_op(&ws, id, message, "🙂", true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other.reaction_version, 3);
+    assert_eq!(other.reactions.len(), 2);
+    let removed = with_caller(
+        human(&p[1].id),
+        svc.discussion_react_op(&ws, id, message, "👍", false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed.reaction_version, 4);
+    assert_eq!(removed.reactions[0].count, 1);
+    assert!(!removed.reactions[0].reacted);
+    assert_eq!(
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_react_op(&ws, id, message, "👍", false)
+        )
+        .await
+        .unwrap(),
+        removed
+    );
+    let event = intent_core::Event {
+        id: "reaction".into(),
+        workspace_id: ws.clone(),
+        timestamp: intent_core::now_iso(),
+        event_type: DISCUSSION_REACTION.into(),
+        actor: EventActor::default(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: json!({"workspaceId":ws,"conversationId":id,"messageId":message,"reactionVersion":0}),
+    };
+    for (i, selected) in [(1, false), (2, true)] {
+        let projected = with_caller(
+            human(&p[i].id),
+            svc.discussion_project_event_op(event.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            projected.data,
+            json!({"workspaceId":ws,"conversationId":id,"messageId":message,"reactionVersion":4,"reactions":[{"reaction":"👍","count":1,"reacted":selected},{"reaction":"🙂","count":1,"reacted":selected}]})
+        );
+    }
+    for caller in [
+        human(&p[0].id),
+        human(&p[3].id),
+        human(&p[4].id),
+        Caller::Agent {
+            agent_id: AgentId::new(),
+        },
+        Caller::Daemon,
+    ] {
+        assert!(with_caller(
+            caller.clone(),
+            svc.discussion_react_op(&ws, id, message, "👍", true)
+        )
+        .await
+        .is_err());
+        assert!(
+            with_caller(caller, svc.discussion_project_event_op(event.clone()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for invalid in ["", "❤️", "👍🏻", "thumbs-up"] {
+        assert!(matches!(
+            with_caller(
+                human(&p[1].id),
+                svc.discussion_react_op(&ws, id, message, invalid, true)
+            )
+            .await,
+            Err(Error::InvalidParams(_))
+        ));
+    }
+    assert!(with_caller(
+        human(&p[1].id),
+        svc.discussion_react_op(&ws, "default", message, "👍", true)
+    )
+    .await
+    .is_err());
+    svc.store
+        .remove_workspace_member(&ws, &p[2].id)
+        .await
+        .unwrap();
+    assert!(with_caller(
+        human(&p[2].id),
+        svc.discussion_react_op(&ws, id, message, "👍", false)
+    )
+    .await
+    .is_err());
+    assert!(
+        with_caller(human(&p[2].id), svc.discussion_project_event_op(event))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let history = with_caller(
+        human(&p[1].id),
+        svc.discussion_history_op(&ws, id, None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["sequence"], 1);
+    assert_eq!(history["messages"][0]["reactionVersion"], 4);
+}
+
+#[tokio::test]
+async fn discussion_replies_bind_retry_and_snapshot_without_cross_conversation_leaks() {
+    let (_tmp, svc, ws, p) = conversation_fixture().await;
+    let caller = human(&p[1].id);
+    let made = with_caller(
+        caller.clone(),
+        svc.discussion_send_to_op(
+            &ws,
+            "original",
+            "Original quote",
+            &recipients(&[p[2].id.clone()]),
+        ),
+    )
+    .await
+    .unwrap();
+    let target = DiscussionTarget {
+        conversation_id: Some(made.conversation.id.clone()),
+        reply_to_message_id: Some(made.message.id.clone()),
+        ..Default::default()
+    };
+    let reply = with_caller(
+        human(&p[2].id),
+        svc.discussion_send_to_op(&ws, "reply", "A reply", &target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reply.message.reply_to_message_id,
+        Some(made.message.id.clone())
+    );
+    assert_eq!(
+        serde_json::to_value(&reply.message.reply_to).unwrap(),
+        json!({"id":made.message.id,"author":made.message.author,"body":"Original quote"})
+    );
+    let mut changed = p[1].clone();
+    changed.display_name = Some("Changed after send".into());
+    svc.store.upsert_principal(&changed).await.unwrap();
+    let retry = with_caller(
+        human(&p[2].id),
+        svc.discussion_send_to_op(&ws, "reply", "A reply", &target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.message, reply.message);
+    for reply_id in [None, Some(reply.message.id.clone())] {
+        let different = DiscussionTarget {
+            reply_to_message_id: reply_id,
+            ..target.clone()
+        };
+        assert!(matches!(
+            with_caller(
+                human(&p[2].id),
+                svc.discussion_send_to_op(&ws, "reply", "A reply", &different)
+            )
+            .await,
+            Err(Error::InvalidParams(_))
+        ));
+    }
+    for bad in [
+        DiscussionTarget {
+            reply_to_message_id: Some(made.message.id.clone()),
+            ..Default::default()
+        },
+        DiscussionTarget {
+            reply_to_message_id: Some(made.message.id.clone()),
+            ..recipients(&[p[3].id.clone()])
+        },
+        DiscussionTarget {
+            reply_to_message_id: Some("missing".into()),
+            ..target.clone()
+        },
+    ] {
+        assert!(matches!(
+            with_caller(
+                caller.clone(),
+                svc.discussion_send_to_op(&ws, "bad", "Must not exist", &bad)
+            )
+            .await,
+            Err(Error::NotFound(_))
+        ));
+    }
+    let other = WorkspaceId::new();
+    svc.store
+        .insert_workspace(&workspace(&other))
+        .await
+        .unwrap();
+    assert!(with_caller(
+        human(&p[0].id),
+        svc.discussion_send_to_op(
+            &other,
+            "bad",
+            "Cross workspace",
+            &DiscussionTarget {
+                reply_to_message_id: Some(made.message.id.clone()),
+                ..Default::default()
+            }
+        )
+    )
+    .await
+    .is_err());
+    let all = with_caller(
+        caller.clone(),
+        svc.discussion_conversations_op(&ws, None, 100),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all["conversations"].as_array().unwrap().len(), 2);
+    let nested = DiscussionTarget {
+        reply_to_message_id: Some(reply.message.id.clone()),
+        ..target
+    };
+    let next = with_caller(
+        caller,
+        svc.discussion_send_to_op(&ws, "next", "Reply to a reply", &nested),
+    )
+    .await
+    .unwrap();
+    assert_eq!(next.message.sequence, 3);
+    assert_eq!(next.message.reply_to.unwrap().body, "A reply");
+    let wire = serde_json::to_value(next.message.reply_to_message_id).unwrap();
+    assert_eq!(wire, reply.message.id);
+}
+
+#[tokio::test]
+async fn discussion_reaction_concurrency_and_send_retry_keep_viewer_state() {
+    let (tmp, svc, ws, p) = conversation_fixture().await;
+    let original = with_caller(
+        human(&p[1].id),
+        svc.discussion_send_op(&ws, "original", "Shared"),
+    )
+    .await
+    .unwrap();
+    let (alice, bob) = tokio::join!(
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_react_op(&ws, "default", &original.id, "👍", true)
+        ),
+        with_caller(
+            human(&p[2].id),
+            svc.discussion_react_op(&ws, "default", &original.id, "👍", true)
+        ),
+    );
+    let mut versions = vec![
+        alice.unwrap().reaction_version,
+        bob.unwrap().reaction_version,
+    ];
+    versions.sort_unstable();
+    assert_eq!(versions, vec![1, 2]);
+    let retry = with_caller(
+        human(&p[1].id),
+        svc.discussion_send_op(&ws, "original", "Shared"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.id, original.id);
+    assert_eq!(retry.reaction_version, 2);
+    assert_eq!(retry.reactions[0].count, 2);
+    assert!(retry.reactions[0].reacted);
+    let (removed, added) = tokio::join!(
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_react_op(&ws, "default", &original.id, "👍", false)
+        ),
+        with_caller(
+            human(&p[3].id),
+            svc.discussion_react_op(&ws, "default", &original.id, "👍", true)
+        ),
+    );
+    let mut versions = vec![
+        removed.unwrap().reaction_version,
+        added.unwrap().reaction_version,
+    ];
+    versions.sort_unstable();
+    assert_eq!(versions, vec![3, 4]);
+    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    for (person, selected) in [(1, false), (2, true), (3, true)] {
+        let history = with_caller(
+            human(&p[person].id),
+            reopened.discussion_history_op(&ws, "default", None, None, 50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history["messages"][0]["reactions"],
+            json!([{"reaction":"👍","count":2,"reacted":selected}])
+        );
+        assert_eq!(history["messages"][0]["reactionVersion"], 4);
+        assert_eq!(history["messages"][0]["sequence"], 1);
+    }
 }

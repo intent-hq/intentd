@@ -2,7 +2,7 @@
 use intent_core::discussion::{
     DiscussionAuthor, DiscussionMessage, DiscussionPage, DISCUSSION_PAGE_MAX,
 };
-use intent_core::{Error, Result, WorkspaceId};
+use intent_core::{Error, PrincipalId, Result, WorkspaceId};
 use sqlx::{sqlite::SqliteRow, Row};
 
 use crate::Store;
@@ -12,6 +12,15 @@ fn store_error(error: &sqlx::Error) -> Error {
 }
 
 pub(super) fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
+    let mut reactions: Vec<intent_core::discussion::DiscussionReaction> =
+        serde_json::from_str(row.get("reactions_json"))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    let selected: Vec<String> =
+        serde_json::from_str(row.try_get::<&str, _>("viewer_reactions").unwrap_or("[]"))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    for reaction in &mut reactions {
+        reaction.reacted = selected.contains(&reaction.reaction);
+    }
     Ok(DiscussionMessage {
         id: row.get("id"),
         workspace_id: WorkspaceId(row.get("workspace_id")),
@@ -21,6 +30,14 @@ pub(super) fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
         author: serde_json::from_str(row.get("author_json"))
             .map_err(|e| Error::Internal(format!("discussion author: {e}")))?,
         created_at: row.get("created_at"),
+        reply_to_message_id: row.get("reply_to_message_id"),
+        reply_to: row
+            .get::<Option<&str>, _>("reply_to_json")
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| Error::Internal(e.to_string()))?,
+        reactions,
+        reaction_version: row.get("reaction_version"),
     })
 }
 
@@ -83,6 +100,30 @@ impl Store {
         after_sequence: Option<i64>,
         limit: u32,
     ) -> Result<DiscussionPage> {
+        self.list_discussion_messages_for(
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    /// Read a bounded page and viewer reaction selection in a single snapshot.
+    /// Aggregate counts are persisted on write; the indexed selection is at most two rows per message.
+    /// # Errors
+    /// Returns invalid bounds or database errors.
+    pub async fn list_discussion_messages_for(
+        &self,
+        workspace_id: &WorkspaceId,
+        conversation_id: &str,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+        principal: Option<&PrincipalId>,
+    ) -> Result<DiscussionPage> {
         if limit == 0
             || limit > DISCUSSION_PAGE_MAX
             || before_sequence.is_some_and(|n| n <= 0)
@@ -98,11 +139,12 @@ impl Store {
             None => ("<", "DESC", before_sequence.unwrap_or(i64::MAX)),
         };
         let sql = format!(
-            "SELECT id,workspace_id,conversation_id,sequence,body,author_json,created_at \
-             FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=? AND sequence {comparison} ? \
+            "SELECT m.*, (SELECT json_group_array(reaction) FROM discussion_reaction r WHERE r.message_id=m.id AND r.principal_id=?) AS viewer_reactions \
+             FROM workspace_discussion_message m WHERE workspace_id=? AND conversation_id=? AND sequence {comparison} ? \
              ORDER BY sequence {order} LIMIT ?"
         );
         let rows = sqlx::query(&sql)
+            .bind(principal.map(PrincipalId::as_str))
             .bind(workspace_id.as_str())
             .bind(conversation_id)
             .bind(cursor)

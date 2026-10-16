@@ -112,7 +112,11 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     let first = sent["result"]["message"].clone();
     assert!(first["id"].is_string(), "{sent}");
     assert_ne!(first["id"], "same-client-id");
-    assert_eq!(first.as_object().unwrap().len(), 7);
+    assert_eq!(first.as_object().unwrap().len(), 11);
+    assert_eq!(first["replyToMessageId"], Value::Null);
+    assert_eq!(first["replyTo"], Value::Null);
+    assert_eq!(first["reactions"], json!([]));
+    assert_eq!(first["reactionVersion"], 0);
     assert_eq!(first["workspaceId"], ws.0);
     assert_eq!(first["sequence"], 1);
     assert_eq!(first["body"], "Hello\nteam");
@@ -806,5 +810,197 @@ async fn discussion_private_conversations_events_typing_and_retry_over_wss() {
     for client in [alice, bob, carol, owner, reconnected] {
         client.close().await;
     }
+    srv.ws.stop().await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn discussion_reactions_and_replies_are_durable_private_and_projected_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    let at = "a7".repeat(32);
+    let bt = "b7".repeat(32);
+    let ap = seed_principal(&srv.store, "alice-actions", &at).await;
+    let bp = seed_principal(&srv.store, "bob-actions", &bt).await;
+    for p in [&ap, &bp] {
+        srv.store
+            .add_workspace_member(&ws, &p.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+    }
+    let mut alice = PresenceClient::open(srv.port, srv.cfg.clone(), &at).await;
+    let mut bob = PresenceClient::open(srv.port, srv.cfg.clone(), &bt).await;
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    for client in [&mut alice, &mut bob, &mut owner] {
+        let hello = client
+            .call(
+                1,
+                "client.hello",
+                json!({"clientId":"actions","name":"Actions"}),
+            )
+            .await;
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["discussionMessageActions"], 1,
+            "{hello}"
+        );
+        let sub = client
+            .call(
+                2,
+                "events.subscribe",
+                json!({"eventTypes":["discussion:*"]}),
+            )
+            .await;
+        assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
+    }
+    let caps = alice.call(3, "system.capabilities", json!({})).await;
+    assert_eq!(caps["result"]["discussionMessageActions"], 1);
+    let made=alice.call(4,"discussion.send",json!({"workspaceId":ws,"messageId":"first","body":"Original","recipientPrincipalIds":[bp.id]})).await;
+    let message = made["result"]["message"].clone();
+    let id = message["id"].as_str().unwrap();
+    let conversation = message["conversationId"].as_str().unwrap();
+    assert_eq!(message["replyToMessageId"], Value::Null);
+    assert_eq!(message["replyTo"], Value::Null);
+    assert_eq!(message["reactions"], json!([]));
+    assert_eq!(message["reactionVersion"], 0);
+    alice.event("discussion:message").await;
+    bob.event("discussion:message").await;
+    let react = json!({"workspaceId":ws,"conversationId":conversation,"messageId":id,"reaction":"👍","active":true});
+    let added = alice.call(5, "discussion.react", react.clone()).await;
+    assert_eq!(
+        added["result"],
+        json!({"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":true}],"reactionVersion":1})
+    );
+    for (client, selected) in [(&mut alice, true), (&mut bob, false)] {
+        let event = client.event("discussion:reaction").await;
+        assert_eq!(
+            event["data"],
+            json!({"workspaceId":ws,"conversationId":conversation,"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":selected}],"reactionVersion":1})
+        );
+        assert!(
+            event["actor"].get("id").is_none(),
+            "reaction events expose no reactor identity"
+        );
+    }
+    let retry = alice.call(6, "discussion.react", react.clone()).await;
+    assert_eq!(retry["result"], added["result"]);
+    assert!(
+        bob.all_events("discussion:reaction").await.is_empty(),
+        "no-op emitted an event"
+    );
+    assert!(
+        bob.all_events("discussion:message").await.is_empty(),
+        "reactions must not become unread messages"
+    );
+    for invalid in [json!("❤️"), json!(42), Value::Null] {
+        let mut bad = react.clone();
+        bad["reaction"] = invalid;
+        let denied = alice.call(7, "discussion.react", bad).await;
+        assert_eq!(denied["error"]["code"], -32602, "{denied}");
+    }
+    let mut bad = react.clone();
+    bad["active"] = json!("true");
+    let denied = alice.call(8, "discussion.react", bad).await;
+    assert_eq!(denied["error"]["code"], -32602);
+    let denied = owner.call(9, "discussion.react", react.clone()).await;
+    assert_eq!(denied["error"]["data"]["code"], "not-found");
+    let reply_params = json!({"workspaceId":ws,"conversationId":conversation,"messageId":"reply","body":"Reply","replyToMessageId":id});
+    let reply = bob.call(10, "discussion.send", reply_params.clone()).await;
+    assert_eq!(reply["result"]["message"]["sequence"], 2);
+    assert_eq!(reply["result"]["message"]["replyToMessageId"], id);
+    assert_eq!(
+        reply["result"]["message"]["replyTo"],
+        json!({"id":id,"author":message["author"],"body":"Original"})
+    );
+    let incoming = alice.event("discussion:message").await;
+    assert_eq!(incoming["data"]["message"], reply["result"]["message"]);
+    bob.event("discussion:message").await;
+    let retry = bob.call(11, "discussion.send", reply_params.clone()).await;
+    assert_eq!(retry["result"], reply["result"]);
+    let mut mismatch = reply_params.clone();
+    mismatch.as_object_mut().unwrap().remove("replyToMessageId");
+    let denied = bob.call(12, "discussion.send", mismatch).await;
+    assert_eq!(denied["error"]["code"], -32602);
+    let denied = alice
+        .call(
+            13,
+            "discussion.send",
+            json!({"workspaceId":ws,"messageId":"cross","body":"Leak","replyToMessageId":id}),
+        )
+        .await;
+    assert_eq!(denied["error"]["data"]["code"], "not-found");
+    let mut reconnected = PresenceClient::open(srv.port, srv.cfg.clone(), &at).await;
+    let history = reconnected
+        .call(
+            14,
+            "discussion.list",
+            json!({"workspaceId":ws,"conversationId":conversation}),
+        )
+        .await;
+    assert_eq!(
+        history["result"]["messages"][0]["reactions"],
+        added["result"]["reactions"]
+    );
+    assert_eq!(history["result"]["messages"][1], reply["result"]["message"]);
+    let history = bob
+        .call(
+            15,
+            "discussion.list",
+            json!({"workspaceId":ws,"conversationId":conversation}),
+        )
+        .await;
+    assert_eq!(
+        history["result"]["messages"][0]["reactions"][0]["reacted"],
+        false
+    );
+    let history = owner
+        .call(
+            16,
+            "event.query",
+            json!({"workspaceId":ws,"eventType":"discussion:*"}),
+        )
+        .await;
+    assert_eq!(history["result"], json!([]));
+    assert!(owner.all_events("discussion:message").await.is_empty());
+    assert!(owner.all_events("discussion:reaction").await.is_empty());
+    let removed = owner
+        .call(
+            17,
+            "workspace.members.remove",
+            json!({"workspaceId":ws,"principalId":bp.id}),
+        )
+        .await;
+    assert_eq!(removed["result"]["removed"], true);
+    let denied = bob.call(18, "discussion.react", react.clone()).await;
+    assert_eq!(denied["error"]["data"]["code"], "not-found");
+    let mut remove = react.clone();
+    remove["active"] = json!(false);
+    let removed = alice.call(19, "discussion.react", remove).await;
+    assert_eq!(
+        removed["result"],
+        json!({"messageId":id,"reactions":[],"reactionVersion":2})
+    );
+    alice.event("discussion:reaction").await;
+    assert!(
+        bob.all_events("discussion:reaction").await.is_empty(),
+        "removed member saw reaction metadata"
+    );
+    let durable = srv
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(durable
+        .iter()
+        .all(|e| !e.event_type.starts_with("discussion:")));
+    reconnected.close().await;
+    alice.close().await;
+    bob.close().await;
+    owner.close().await;
     srv.ws.stop().await;
 }

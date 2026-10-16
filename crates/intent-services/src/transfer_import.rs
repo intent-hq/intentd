@@ -1347,7 +1347,7 @@ fn transform_rows(
     for (table, mut objects) in rows {
         match table.as_str() {
             "draft" => continue,
-            "workspace_discussion_message" | "discussion_participant" => {
+            "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
                 for object in &mut objects {
                     expect_object(&table, object)?
                         .insert("principal_id".into(), serde_json::Value::Null);
@@ -1727,8 +1727,31 @@ mod tests {
             )
             .await
             .unwrap();
-        let (original, _) = source
+        let (mut original, _) = source
             .insert_discussion_message(&ws(), "same-key", "source history", &author)
+            .await
+            .unwrap();
+        source
+            .set_discussion_reaction(&ws(), "default", &original.id, &source_owner.id, "👍", true)
+            .await
+            .unwrap();
+        original = source
+            .list_discussion_messages(&ws(), None, None, 50)
+            .await
+            .unwrap()
+            .messages
+            .remove(0);
+        let (reply, _) = source
+            .send_discussion_message(
+                &ws(),
+                "source-reply",
+                "Quoted response",
+                &author,
+                &intent_core::discussion::DiscussionTarget {
+                    reply_to_message_id: Some(original.id.clone()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let mut peer = source_owner.clone();
@@ -1748,6 +1771,7 @@ mod tests {
                 &intent_core::discussion::DiscussionTarget {
                     conversation_id: None,
                     recipient_principal_ids: Some(vec![peer.id]),
+                    ..Default::default()
                 },
             )
             .await
@@ -1790,7 +1814,37 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(history.messages, vec![original.clone()]);
+        assert_eq!(
+            history.messages,
+            vec![original.clone(), reply.message.clone()]
+        );
+        assert_eq!(
+            history.messages[1].reply_to.as_ref().unwrap().author,
+            author
+        );
+        let inert = service
+            .store
+            .discussion_reaction_state(&ws(), "default", &original.id, &local.id)
+            .await
+            .unwrap();
+        assert_eq!(inert.reactions[0].count, 1);
+        assert!(!inert.reactions[0].reacted);
+        let (removed, changed) = service
+            .store
+            .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", false)
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(removed, inert);
+        let (added, changed) = service
+            .store
+            .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", true)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(added.reactions[0].count, 2);
+        assert!(added.reactions[0].reacted);
+        assert_eq!(added.reaction_version, 2);
         let next = with_caller(
             caller.clone(),
             service.discussion_send_op(&ws(), "same-key", "destination message"),
@@ -1798,7 +1852,7 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(next.id, original.id);
-        assert_eq!(next.sequence, 2);
+        assert_eq!(next.sequence, 3);
         assert_eq!(next.body, "destination message");
         assert_eq!(next.author.principal_id, local.id);
         assert_eq!(next.author.login, local.login);

@@ -3,7 +3,7 @@ use intent_core::discussion::{
     DiscussionAuthor, DiscussionSendResult, DiscussionTarget, DEFAULT_CONVERSATION,
     DISCUSSION_BODY_MAX_BYTES, DISCUSSION_RECIPIENT_MAX,
 };
-use intent_core::events::DISCUSSION_MESSAGE;
+use intent_core::events::{DISCUSSION_MESSAGE, DISCUSSION_REACTION};
 use intent_core::{
     current_caller, ActorType, Caller, Error, EventActor, PrincipalId, Result, WorkspaceId,
 };
@@ -76,10 +76,10 @@ impl Services {
         after: Option<i64>,
         limit: u32,
     ) -> Result<Value> {
-        self.discussion_access(ws, id).await?;
+        let principal = self.discussion_access(ws, id).await?;
         let page = self
             .store
-            .list_discussion_messages_in(ws, id, before, after, limit)
+            .list_discussion_messages_for(ws, id, before, after, limit, Some(&principal))
             .await?;
         let conversation = self.store.discussion_conversation(ws, id).await?;
         Ok(json!({"messages":page.messages,"hasMore":page.has_more,"conversation":conversation}))
@@ -128,6 +128,15 @@ impl Services {
                 "body must be nonblank and at most 16384 UTF-8 bytes".into(),
             ));
         }
+        if target
+            .reply_to_message_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id.len() > 128)
+        {
+            return Err(Error::InvalidParams(
+                "replyToMessageId must be nonblank and at most 128 UTF-8 bytes".into(),
+            ));
+        }
         if target.conversation_id.is_some() && target.recipient_principal_ids.is_some() {
             return Err(Error::InvalidParams(
                 "conversationId and recipientPrincipalIds are mutually exclusive".into(),
@@ -164,7 +173,7 @@ impl Services {
             display_name: principal.display_name,
             avatar_url: principal.avatar_url,
         };
-        let (result, inserted) = self
+        let (mut result, inserted) = self
             .store
             .send_discussion_message(workspace_id, message_id, body, &author, target)
             .await?;
@@ -179,7 +188,7 @@ impl Services {
                     event_type: DISCUSSION_MESSAGE.into(),
                     actor: EventActor {
                         actor_type: ActorType::User,
-                        id: Some(author.principal_id.0),
+                        id: Some(author.principal_id.0.clone()),
                         name: Some(actor_name),
                         ..EventActor::default()
                     },
@@ -191,7 +200,55 @@ impl Services {
                 },
             );
         }
+        let state = self
+            .store
+            .discussion_reaction_state(
+                workspace_id,
+                &result.message.conversation_id,
+                &result.message.id,
+                &author.principal_id,
+            )
+            .await?;
+        result.message.reactions = state.reactions;
+        result.message.reaction_version = state.reaction_version;
         Ok(result)
+    }
+
+    pub(crate) async fn discussion_react_op(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        message: &str,
+        reaction: &str,
+        active: bool,
+    ) -> Result<intent_core::discussion::DiscussionReactionState> {
+        let principal = self.discussion_access(ws, conversation).await?;
+        let (state, changed) = self
+            .store
+            .set_discussion_reaction(ws, conversation, message, &principal, reaction, active)
+            .await?;
+        if changed {
+            // Only the target identity crosses the bus. Delivery projects the
+            // current committed version and personal selection for each viewer.
+            crate::publish_event_transient(
+                self.event_bus.as_ref(),
+                &NewEvent {
+                    workspace_id: ws.clone(),
+                    timestamp: intent_core::now_iso(),
+                    event_type: DISCUSSION_REACTION.into(),
+                    actor: EventActor {
+                        actor_type: ActorType::User,
+                        ..EventActor::default()
+                    },
+                    session_id: None,
+                    correlation_id: None,
+                    parent_event_id: None,
+                    metadata: None,
+                    data: json!({"workspaceId":ws,"conversationId":conversation,"messageId":message}),
+                },
+            );
+        }
+        Ok(state)
     }
     /// Projection is applied for every human transport, including owners.
     pub(crate) async fn discussion_project_event_op(
@@ -204,12 +261,32 @@ impl Services {
                 .get("conversationId")
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_CONVERSATION);
-            if self
-                .discussion_access(&event.workspace_id, id)
-                .await
-                .is_err()
-            {
+            let Ok(principal) = self.discussion_access(&event.workspace_id, id).await else {
                 return Ok(None);
+            };
+            let message_id = if event.event_type == DISCUSSION_REACTION {
+                event.data.get("messageId").and_then(Value::as_str)
+            } else {
+                event
+                    .data
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+            };
+            if let Some(message_id) = message_id {
+                let Ok(state) = self
+                    .store
+                    .discussion_reaction_state(&event.workspace_id, id, message_id, &principal)
+                    .await
+                else {
+                    return Ok(None);
+                };
+                if event.event_type == DISCUSSION_REACTION {
+                    event.data = json!({"workspaceId":event.workspace_id,"conversationId":id,"messageId":state.message_id,"reactions":state.reactions,"reactionVersion":state.reaction_version});
+                } else {
+                    event.data["message"]["reactions"] = json!(state.reactions);
+                    event.data["message"]["reactionVersion"] = json!(state.reaction_version);
+                }
             }
         } else if event.event_type == intent_core::events::PRESENCE_CHANGED {
             if !matches!(current_caller(), Some(Caller::Wire { .. })) {

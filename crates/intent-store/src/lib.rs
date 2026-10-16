@@ -28,6 +28,7 @@ mod store_pool;
 pub use store_pool::{StorePool, StorePoolOptions};
 mod diffs_repo;
 mod discussion_conversation_repo;
+mod discussion_reaction_repo;
 mod discussion_repo;
 mod draft_repo;
 mod event_repo;

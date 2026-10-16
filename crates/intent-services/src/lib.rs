@@ -18576,6 +18576,7 @@ impl WorkspaceApi for Services {
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
             caps.insert("discussionConversations".into(), serde_json::json!(1));
+            caps.insert("discussionMessageActions".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -34006,6 +34007,25 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
                 .await
+        })
+    }
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionReactionState>> {
+        Box::pin(async move {
+            self.discussion_react_op(
+                &workspace_id,
+                &conversation_id,
+                &message_id,
+                &reaction,
+                active,
+            )
+            .await
         })
     }
     fn discussion_conversations(
