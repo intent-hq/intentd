@@ -1089,6 +1089,19 @@ async fn dispatch_other(
                         .ok_or_else(|| invalid_params("beforeSequence must be a positive integer"))
                 })
                 .transpose()?;
+            let after = params
+                .get("afterSequence")
+                .map(|v| {
+                    v.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                        invalid_params("afterSequence must be a nonnegative integer")
+                    })
+                })
+                .transpose()?;
+            if before.is_some() && after.is_some() {
+                return Err(invalid_params(
+                    "beforeSequence and afterSequence are mutually exclusive",
+                ));
+            }
             let limit = params
                 .get("limit")
                 .map(|v| {
@@ -1100,7 +1113,7 @@ async fn dispatch_other(
                 .transpose()?
                 .unwrap_or(intent_core::discussion::DISCUSSION_PAGE_DEFAULT);
             let page = api
-                .discussion_list(id, before, limit)
+                .discussion_list(id, before, after, limit)
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&page)

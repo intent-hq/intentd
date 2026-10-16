@@ -56,9 +56,11 @@ pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// `chat:stream:delta` and the transient presence pair (`presence:changed`,
 /// `note:presence` — up to ten caret moves a second per viewer, multiplayer
 /// w5; a `note:*` subscriber must not be woken by them). The prefix rule
-/// also covers the `agent:*` pattern itself.
+/// also covers the `agent:*` pattern itself. Human-only `discussion:` events
+/// are never admitted or delivered to agents, including restored subscriptions.
 pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
     event_type.starts_with("agent:")
+        || event_type.starts_with("discussion:")
         || event_type == "chat:stream:delta"
         || event_type == PRESENCE_CHANGED
         || event_type == NOTE_PRESENCE
@@ -342,6 +344,9 @@ mod tests {
             "chat:stream:delta",
             "presence:changed",
             "note:presence",
+            "discussion:message",
+            "discussion:*",
+            "discussion:future-type",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
         }
@@ -390,6 +395,35 @@ mod tests {
         assert!(event_matches(
             &fe,
             &event("agent:message", Some("a"), ActorType::Agent)
+        ));
+    }
+
+    #[test]
+    fn discussion_events_never_match_agent_filters_including_legacy_rows() {
+        for patterns in [
+            vec![],
+            vec!["discussion:*".into()],
+            vec!["discussion:message".into()],
+        ] {
+            let filter = SubscriptionFilter {
+                event_types: patterns,
+                exclude_agent_events: true,
+                ..Default::default()
+            };
+            for kind in ["discussion:message", "discussion:future-type"] {
+                assert!(!event_matches(
+                    &filter,
+                    &event(kind, Some("human"), ActorType::User)
+                ));
+            }
+        }
+        let human = SubscriptionFilter {
+            event_types: vec!["discussion:*".into()],
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &human,
+            &event("discussion:message", Some("human"), ActorType::User)
         ));
     }
 

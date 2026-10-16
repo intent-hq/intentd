@@ -120,12 +120,34 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     assert_eq!(event["workspaceId"], ws.0);
     assert_eq!(event["data"], json!({"workspaceId":ws,"message":first}));
     assert_eq!(event["actor"]["id"], alice.principal.id.0);
+    assert_eq!(event["actor"]["type"], "user");
+    assert_eq!(event["actor"]["name"], "alice");
+    assert!(
+        srv.store
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(ws.clone()),
+                event_type_prefix: Some("discussion:".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "live discussion messages must not duplicate durable history in the event log"
+    );
     alice.principal.login = Some("renamed".into());
     srv.store.upsert_principal(&alice.principal).await.unwrap();
-    let retry = alice
+    let mismatch = alice
         .call(
             "discussion.send",
             json!({"workspaceId":ws,"messageId":"same-client-id","body":"attempted change"}),
+        )
+        .await;
+    assert_eq!(mismatch["error"]["code"], -32602);
+    assert_eq!(mismatch["error"]["data"]["code"], "invalid-params");
+    let retry = alice
+        .call(
+            "discussion.send",
+            json!({"workspaceId":ws,"messageId":"same-client-id","body":"Hello\nteam"}),
         )
         .await;
     assert_eq!(retry["result"]["message"], first);
@@ -161,6 +183,19 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
         earlier["result"],
         json!({"messages":[first],"hasMore":false})
     );
+    for (after, messages, more) in [
+        (0, json!([first]), true),
+        (1, json!([second]), false),
+        (2, json!([]), false),
+    ] {
+        let page = alice
+            .call(
+                "discussion.list",
+                json!({"workspaceId":ws,"afterSequence":after,"limit":1}),
+            )
+            .await;
+        assert_eq!(page["result"], json!({"messages":messages,"hasMore":more}));
+    }
     // A fresh authenticated connection catches up from durable history.
     let mut reconnect = PresenceClient::open(srv.port, srv.cfg.clone(), &"da".repeat(32)).await;
     let history = reconnect
@@ -193,6 +228,12 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
         json!({"limit":1.5}),
         json!({"beforeSequence":0}),
         json!({"beforeSequence":"1"}),
+        json!({"afterSequence":-1}),
+        json!({"afterSequence":"1"}),
+        json!({"afterSequence":1.5}),
+        json!({"afterSequence":null}),
+        json!({"afterSequence":u64::MAX}),
+        json!({"beforeSequence":2,"afterSequence":0}),
     ] {
         let mut params = params;
         params["workspaceId"] = json!(ws);

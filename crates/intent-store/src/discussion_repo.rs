@@ -28,7 +28,8 @@ impl Store {
     /// Sequence allocation and retry lookup share the serialized write transaction.
     ///
     /// # Errors
-    /// Returns a storage error if the workspace does not exist or `SQLite` fails.
+    /// Returns `InvalidParams` for a retry with a different body, or a storage
+    /// error if the workspace does not exist or `SQLite` fails.
     pub async fn insert_discussion_message(
         &self,
         workspace_id: &WorkspaceId,
@@ -73,11 +74,17 @@ impl Store {
         .await
         .map_err(|e| store_error(&e))?;
         let message = message(&row)?;
+        if message.body != body {
+            return Err(Error::InvalidParams(
+                "messageId was already used with a different body".into(),
+            ));
+        }
         tx.commit().await.map_err(|e| store_error(&e))?;
         Ok((message, inserted))
     }
 
-    /// Read the newest bounded page before an exclusive sequence, oldest first.
+    /// Read a bounded page, oldest first. After a cursor, take the first newer
+    /// rows; otherwise take the newest rows before the optional cursor.
     ///
     /// # Errors
     /// Returns `InvalidParams` for invalid bounds or a storage error on failure.
@@ -85,31 +92,44 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
         limit: u32,
     ) -> Result<DiscussionPage> {
-        if limit == 0 || limit > DISCUSSION_PAGE_MAX || before_sequence.is_some_and(|n| n <= 0) {
+        if limit == 0
+            || limit > DISCUSSION_PAGE_MAX
+            || before_sequence.is_some_and(|n| n <= 0)
+            || after_sequence.is_some_and(|n| n < 0)
+            || (before_sequence.is_some() && after_sequence.is_some())
+        {
             return Err(Error::InvalidParams(
                 "invalid discussion page bounds".into(),
             ));
         }
-        let rows = sqlx::query(
+        let (comparison, order, cursor) = match after_sequence {
+            Some(after) => (">", "ASC", after),
+            None => ("<", "DESC", before_sequence.unwrap_or(i64::MAX)),
+        };
+        let sql = format!(
             "SELECT id,workspace_id,sequence,body,author_json,created_at \
-             FROM workspace_discussion_message WHERE workspace_id=? AND sequence < ? \
-             ORDER BY sequence DESC LIMIT ?",
-        )
-        .bind(workspace_id.as_str())
-        .bind(before_sequence.unwrap_or(i64::MAX))
-        .bind(i64::from(limit) + 1)
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(|e| store_error(&e))?;
+             FROM workspace_discussion_message WHERE workspace_id=? AND sequence {comparison} ? \
+             ORDER BY sequence {order} LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(workspace_id.as_str())
+            .bind(cursor)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| store_error(&e))?;
         let has_more = rows.len() > limit as usize;
         let mut messages = rows
             .iter()
             .take(limit as usize)
             .map(message)
             .collect::<Result<Vec<_>>>()?;
-        messages.reverse();
+        if after_sequence.is_none() {
+            messages.reverse();
+        }
         Ok(DiscussionPage { messages, has_more })
     }
 }

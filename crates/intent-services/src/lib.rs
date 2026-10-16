@@ -33980,10 +33980,11 @@ impl WorkspaceApi for Services {
         &self,
         workspace_id: WorkspaceId,
         before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
         limit: u32,
     ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionPage>> {
         Box::pin(async move {
-            self.discussion_list_op(&workspace_id, before_sequence, limit)
+            self.discussion_list_op(&workspace_id, before_sequence, after_sequence, limit)
                 .await
         })
     }

@@ -3,7 +3,9 @@ use intent_core::discussion::{
     DiscussionAuthor, DiscussionMessage, DiscussionPage, DISCUSSION_BODY_MAX_BYTES,
 };
 use intent_core::events::DISCUSSION_MESSAGE;
-use intent_core::{current_caller, Caller, Error, EventActor, PrincipalId, Result, WorkspaceId};
+use intent_core::{
+    current_caller, ActorType, Caller, Error, EventActor, PrincipalId, Result, WorkspaceId,
+};
 use intent_store::NewEvent;
 use serde_json::json;
 
@@ -25,11 +27,12 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
         limit: u32,
     ) -> Result<DiscussionPage> {
         self.discussion_human(workspace_id).await?;
         self.store
-            .list_discussion_messages(workspace_id, before_sequence, limit)
+            .list_discussion_messages(workspace_id, before_sequence, after_sequence, limit)
             .await
     }
 
@@ -51,6 +54,7 @@ impl Services {
             ));
         }
         let principal = self.store.get_principal(&principal_id).await?;
+        let actor_name = crate::principal_ops::principal_attribution_name(&principal);
         let author = DiscussionAuthor {
             principal_id,
             login: principal.login,
@@ -62,15 +66,18 @@ impl Services {
             .insert_discussion_message(workspace_id, message_id, body, &author)
             .await?;
         if inserted {
-            crate::publish_event(
+            // History is committed above. Broadcast its full snapshot without
+            // duplicating human message bodies in the durable event log.
+            crate::publish_event_transient(
                 self.event_bus.as_ref(),
-                NewEvent {
+                &NewEvent {
                     workspace_id: workspace_id.clone(),
                     timestamp: message.created_at.clone(),
                     event_type: DISCUSSION_MESSAGE.into(),
                     actor: EventActor {
+                        actor_type: ActorType::User,
                         id: Some(author.principal_id.0),
-                        name: author.login,
+                        name: Some(actor_name),
                         ..EventActor::default()
                     },
                     session_id: None,
@@ -79,8 +86,7 @@ impl Services {
                     metadata: None,
                     data: json!({"workspaceId":workspace_id,"message":message}),
                 },
-            )
-            .await;
+            );
         }
         Ok(message)
     }

@@ -1730,9 +1730,12 @@ mod tests {
             principal_id: local.id.clone(),
             host_role: HostRole::Owner,
         };
-        let history = with_caller(caller.clone(), service.discussion_list_op(&ws(), None, 50))
-            .await
-            .unwrap();
+        let history = with_caller(
+            caller.clone(),
+            service.discussion_list_op(&ws(), None, None, 50),
+        )
+        .await
+        .unwrap();
         assert_eq!(history.messages, vec![original.clone()]);
         let next = with_caller(
             caller.clone(),
@@ -1749,7 +1752,7 @@ mod tests {
         assert_eq!(next.author.avatar_url, local.avatar_url);
         let retry = with_caller(
             caller,
-            service.discussion_send_op(&ws(), "same-key", "different retry body"),
+            service.discussion_send_op(&ws(), "same-key", "destination message"),
         )
         .await
         .unwrap();

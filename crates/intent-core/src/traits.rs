@@ -5246,9 +5246,10 @@ pub trait WorkspaceApi: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
         limit: u32,
     ) -> BoxFuture<'_, Result<crate::discussion::DiscussionPage>> {
-        let _ = (workspace_id, before_sequence, limit);
+        let _ = (workspace_id, before_sequence, after_sequence, limit);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::discussion_list not implemented".into(),

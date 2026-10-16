@@ -19717,6 +19717,73 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     );
 }
 
+#[intent_test_macros::daemon_test]
+async fn discussion_rehydrated_agent_subscription_excludes_human_events() {
+    let (_tmp, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    // An old row can name human discussions even though new admissions reject
+    // them. Exercise the actual startup rehydration and wake-delivery path.
+    let id = "legacy-discussion-subscription";
+    svc.store
+        .upsert_event_subscription(&intent_store::PersistedEventSubscription {
+            id: id.into(),
+            workspace_id: ws.clone(),
+            subscriber_agent_id: subscriber.clone(),
+            event_types: vec!["discussion:*".into(), "file:*".into()],
+            exclude_self: true,
+            batch_window_ms: 1,
+            created_at: now_iso(),
+        })
+        .await
+        .unwrap();
+    let subscribers = bus.subscriber_count();
+    assert_eq!(svc.heal_event_subscriptions_on_startup().await.unwrap(), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while bus.subscriber_count() <= subscribers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rehydrated subscription attached");
+    for (kind, data) in [
+        ("discussion:message", json!({"body":"human-secret"})),
+        ("file:changed", json!({"path":"sentinel.rs"})),
+    ] {
+        let _ = bus.publish_transient(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: now_iso(),
+            event_type: kind.into(),
+            actor: EventActor {
+                actor_type: ActorType::User,
+                id: Some("human".into()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        });
+    }
+    let messages = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let session = svc.store.get_agent_session(&subscriber).await.unwrap();
+            if !session.messages.is_empty() {
+                break session.messages;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("allowed sentinel delivered");
+    let text = serde_json::to_string(&messages).unwrap();
+    assert!(text.contains("file:changed"));
+    assert!(!text.contains("human-secret"));
+    assert!(!text.contains("discussion:message"));
+    assert_eq!(messages.len(), 1);
+    svc.remove_event_subscription(id).await;
+}
+
 /// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
 /// rows whose subscriber agent is gone are pruned.
 #[intent_test_macros::daemon_test]
