@@ -7,6 +7,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
+import tomllib
+
+import yaml
 import subprocess
 import sys
 import tempfile
@@ -125,6 +129,38 @@ class ArchiveTests(unittest.TestCase):
                 self.assertNotIn("--workspace", command)
                 self.assertIn("--locked", command)
         self.assertEqual(mac["sitter-production"]["kind"], "binary")
+
+    def test_windows_conpty_workflow_uses_real_nextest_library_id(self):
+        project = Path(__file__).resolve().parents[1]
+        workflow = yaml.safe_load((project / '.github/workflows/native-artifacts.yml').read_text())
+        step = next(s for s in workflow['jobs']['native']['steps']
+                    if s.get('name') == 'Headless workspace setup (Windows runtime)')
+        command = shlex.split(step['run'].splitlines()[0])
+        self.assertEqual(command[command.index('--variant') + 1], 'pty')
+        binary_id = command[command.index('--binary') + 1]
+        args = command[command.index('--') + 1:]
+        self.assertEqual(args, ['conpty_startup::tests', '--nocapture'])
+        # Compile the real dependency-free handshake module in a package with
+        # the actual manifest's name, then consume nextest's archived inventory.
+        # This detects a lib's package ID vs its underscored binary-name.
+        package = tomllib.loads((project / 'crates/intent-pty/Cargo.toml').read_text())['package']['name']
+        with tempfile.TemporaryDirectory(prefix='conpty-archive-id-') as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            (source / 'src').mkdir(parents=True)
+            (source / 'Cargo.toml').write_text('[package]\nname=' + json.dumps(package) + '\nversion="0.0.0"\nedition="2021"\n[workspace]\n')
+            (source / 'src/lib.rs').write_text('#![allow(dead_code)]\nmod conpty_startup;\n')
+            shutil.copyfile(project / 'crates/intent-pty/src/host/conpty_startup.rs', source / 'src/conpty_startup.rs')
+            archive = root / 'pty.tar.zst'
+            subprocess.run(['cargo', 'nextest', 'archive', '--offline', '--lib', '--archive-file', str(archive)],
+                           cwd=source, check=True, capture_output=True)
+            restored = root / 'restored'
+            runtime = artifacts.extract_nextest(archive, source, restored)
+            self.assertIn(binary_id, runtime['tests'])
+            prepared = {'source': str(source), 'target': str(restored / 'target'), 'runtime': runtime}
+            self.assertEqual(artifacts.run_libtest(prepared, binary_id, args), 0)
+            with self.assertRaisesRegex(ValueError, 'missing exact test binary'):
+                artifacts.run_libtest(prepared, package + '::' + package.replace('-', '_'), args)
 
     def test_real_archives_relocate_and_preserve_sequential_variants(self):
         with tempfile.TemporaryDirectory(prefix="intent-archive-test-") as tmp:
