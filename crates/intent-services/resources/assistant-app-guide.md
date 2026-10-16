@@ -80,14 +80,23 @@ A failed local server start or restart reports `error` with `lastError`. Fix its
 
 ## Mac update availability
 
-Mac update availability can differ by architecture. Intel Macs stay on their last
-compatible available release in the selected update channel when a newer release
-has no Intel build. Older Apple Silicon apps may also remain on an earlier
-compatible release; manually installing a current Apple Silicon build lets them
-receive newer releases. Do not
-suggest an Apple Silicon build for an Intel Mac.
+Current Intent desktop releases for macOS support **Apple Silicon only**; new Intel
+Mac builds are no longer published. Older native Apple Silicon installations can
+discover updates in their selected channel automatically; they do not need a manual
+reinstall just because they use the older update feed. Beta and stable receive a
+release only after it is promoted to that channel.
 
-<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
+An Intel app running under Rosetta on Apple Silicon can update to the native Apple
+Silicon build. Some installed versions have a compatibility check that treats
+Rosetta as Intel and blocks that update; those installations need a manual reinstall
+of the Apple Silicon build. This workaround is only for Apple Silicon hardware.
+
+On Intel Macs, clients with the compatibility check reject ARM-only updates. Older
+clients can show an available update and then fail before downloading because no
+compatible Intel ZIP exists; they do not install the ARM build. Do not suggest an
+Apple Silicon installer for an Intel Mac or promise new Intel releases.
+
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/cloudlands-fe/.github/workflows/{release-alpha.yml,promote-beta.yml,release-stable.yml}; electron-updater/out/MacUpdater.js (the version pinned by packages/cloudlands-fe/pnpm-lock.yaml). -->
 
 ## Manage Assistant chats
 
