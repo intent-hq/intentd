@@ -7198,7 +7198,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }]),
         "{ev}"
     );
 
@@ -7652,7 +7652,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     }
     let ws = ws_id.0.clone();
     let hello = json!({ "clientId": "cli-alice", "name": "Alice" });
-    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" } });
+    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" }, "discussionTyping": { "workspaceId": ws } });
     let alice_row = |ev: &Value| -> Value {
         ev["data"]["members"]
             .as_array()
@@ -7713,7 +7713,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -7767,6 +7767,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .as_u64()
         .unwrap_or_else(|| panic!("pulse: {ev}"));
 
+    let discussion = &row["discussionTyping"][0];
+    assert_eq!(discussion["source"], s1);
+    assert_eq!(pulse1, 1);
+    assert_eq!(discussion["pulse"], 1, "each typing kind owns its counter");
+
     // A1 keeps typing to the same agent: the pulse advances (the receiver's
     // freshness signal) while `since` stays the episode start.
     let v = a1.call(3, "presence.update", typing.clone()).await;
@@ -7779,7 +7784,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         let next = row["typing"][0]["pulse"]
             .as_u64()
             .unwrap_or_else(|| panic!("pulse: {ev}"));
-        assert!(next > pulse1, "a repeated pulse is fresher: {ev}");
+        assert_eq!(
+            next,
+            pulse1 + 1,
+            "discussion typing leaves the agent counter unchanged: {ev}"
+        );
         next
     };
 

@@ -5389,8 +5389,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
-    /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// typing?: { agentId } | null, discussionTyping?: { workspaceId } | null })`:
+    /// replace the connection's focus set (sent whole) and typing targets → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
     /// `presence:changed`, so the client can suppress only itself). Every
@@ -5401,7 +5401,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
-    /// `presence:changed` to each workspace whose aggregate changed.
+    /// `presence:changed` to each workspace whose aggregate changed. Discussion
+    /// typing requires a human member in its target workspace, shares the
+    /// connection source with a separate counter, and clears when omitted or null.
     fn presence_update(
         &self,
         connection_id: String,
@@ -5420,7 +5422,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// with the same member rows the event carries — for a client that
     /// attached its event subscription after its hello (or a second
     /// connection of an already-online principal, whose hello publishes
-    /// nothing). Member+; a non-member sees `NotFound`.
+    /// nothing). Member+; a non-member sees `NotFound`. Human rows include
+    /// `discussionTyping: [{ source, since, pulse }]` (empty when idle);
+    /// agent/daemon snapshots omit that field.
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,

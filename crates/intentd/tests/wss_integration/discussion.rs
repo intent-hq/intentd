@@ -292,3 +292,187 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     owner.close().await;
     srv.ws.stop().await;
 }
+
+#[intent_test_macros::daemon_test]
+async fn discussion_typing_presence_over_wss_is_transient_scoped_and_connection_owned() {
+    use intent_core::events::PRESENCE_CHANGED;
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    let alice_token = "e1".repeat(32);
+    let bob_token = "e2".repeat(32);
+    let outsider_token = "e3".repeat(32);
+    let alice = seed_principal(&srv.store, "alice", &alice_token).await;
+    let bob = seed_principal(&srv.store, "bob", &bob_token).await;
+    seed_principal(&srv.store, "outsider", &outsider_token).await;
+    for principal in [&alice.id, &bob.id] {
+        srv.store
+            .add_workspace_member(&ws, principal, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+    }
+    let mut one = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let mut two = PresenceClient::open(srv.port, srv.cfg.clone(), &alice_token).await;
+    let mut observer = PresenceClient::open(srv.port, srv.cfg.clone(), &bob_token).await;
+    let mut outsider = PresenceClient::open(srv.port, srv.cfg.clone(), &outsider_token).await;
+    let active = json!({"focus":[],"discussionTyping":{"workspaceId":ws}});
+    let before_hello = one.call(1, "presence.update", active.clone()).await;
+    assert_eq!(before_hello["error"]["code"], -32602);
+    assert_eq!(before_hello["error"]["data"]["code"], "invalid-params");
+    for client in [&mut one, &mut two, &mut observer, &mut outsider] {
+        let hello = client
+            .call(
+                2,
+                "client.hello",
+                json!({"clientId":"typing-client","name":"Typing"}),
+            )
+            .await;
+        assert!(hello.get("error").is_none(), "{hello}");
+    }
+    for client in [&mut observer, &mut outsider] {
+        let sub = client
+            .call(
+                3,
+                "events.subscribe",
+                json!({"eventTypes":["presence:changed"]}),
+            )
+            .await;
+        assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
+    }
+    let row = |data: &Value| {
+        data["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["principalId"] == alice.id.0)
+            .unwrap()
+            .clone()
+    };
+    let snapshot = observer
+        .call(4, "presence.snapshot", json!({"workspaceId":ws}))
+        .await;
+    assert_eq!(row(&snapshot["result"])["discussionTyping"], json!([]));
+    let sent = one.call(4, "presence.update", active.clone()).await;
+    assert_eq!(sent["jsonrpc"], "2.0");
+    assert_eq!(sent["id"], 4);
+    let source = sent["result"]["typingSource"].as_str().unwrap().to_string();
+    assert_eq!(sent["result"], json!({"ok":true,"typingSource":source}));
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert_eq!(event["workspaceId"], ws.0);
+    let first = row(&event["data"])["discussionTyping"][0].clone();
+    assert_eq!(first["source"], source);
+    assert_eq!(first.as_object().unwrap().len(), 3);
+    assert!(intent_core::parse_iso(first["since"].as_str().unwrap()).is_some());
+    assert!(first["pulse"].as_u64().unwrap() > 0);
+    one.call(5, "presence.update", active.clone()).await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    let repeated = row(&event["data"])["discussionTyping"][0].clone();
+    assert_eq!(repeated["since"], first["since"]);
+    assert!(repeated["pulse"].as_u64().unwrap() > first["pulse"].as_u64().unwrap());
+    let sent = two.call(4, "presence.update", active.clone()).await;
+    let source2 = sent["result"]["typingSource"].as_str().unwrap();
+    assert_ne!(source2, source);
+    let event = observer.event(PRESENCE_CHANGED).await;
+    let both = row(&event["data"])["discussionTyping"].clone();
+    let entries = both.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0]["source"].as_str().unwrap() < entries[1]["source"].as_str().unwrap());
+    assert_eq!(
+        entries.iter().find(|t| t["source"] == source).unwrap(),
+        &repeated
+    );
+    observer
+        .call(5, "presence.update", json!({"focus":[{"workspaceId":ws}]}))
+        .await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert_eq!(
+        row(&event["data"])["discussionTyping"],
+        both,
+        "unrelated updates do not refresh another source"
+    );
+    let snapshot = observer
+        .call(6, "presence.snapshot", json!({"workspaceId":ws}))
+        .await;
+    assert_eq!(row(&snapshot["result"])["discussionTyping"], both);
+    for (i, target) in [
+        json!({}),
+        json!([]),
+        json!({"workspaceId":""}),
+        json!({"workspaceId":7}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let invalid = one
+            .call(
+                10 + u64::try_from(i).unwrap(),
+                "presence.update",
+                json!({"focus":[],"discussionTyping":target}),
+            )
+            .await;
+        assert_eq!(invalid["error"]["data"]["code"], "invalid-params");
+    }
+    let denied = outsider.call(4, "presence.update", active.clone()).await;
+    assert_eq!(denied["error"]["data"]["code"], "not-found");
+    let hidden = outsider
+        .call(5, "presence.snapshot", json!({"workspaceId":ws}))
+        .await;
+    assert_eq!(hidden["error"]["data"]["code"], "not-found");
+    two.call(
+        5,
+        "presence.update",
+        json!({"focus":[],"discussionTyping":null}),
+    )
+    .await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert_eq!(row(&event["data"])["discussionTyping"], json!([repeated]));
+    one.call(20, "presence.update", json!({"focus":[]})).await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert_eq!(
+        row(&event["data"])["discussionTyping"],
+        json!([]),
+        "omission clears"
+    );
+    one.call(21, "presence.update", active).await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert!(
+        row(&event["data"])["discussionTyping"][0]["pulse"]
+            .as_u64()
+            .unwrap()
+            > repeated["pulse"].as_u64().unwrap()
+    );
+    one.close().await;
+    let event = observer.event(PRESENCE_CHANGED).await;
+    assert_eq!(
+        row(&event["data"])["discussionTyping"],
+        json!([]),
+        "disconnect clears only that connection"
+    );
+    assert!(srv
+        .store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws.clone()),
+            event_types: vec![PRESENCE_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        observer
+            .call(7, "discussion.list", json!({"workspaceId":ws}))
+            .await["result"],
+        json!({"messages":[],"hasMore":false})
+    );
+    assert!(
+        outsider.all_events(PRESENCE_CHANGED).await.is_empty(),
+        "outsider receives no roster events"
+    );
+    two.close().await;
+    observer.close().await;
+    outsider.close().await;
+    srv.ws.stop().await;
+}
