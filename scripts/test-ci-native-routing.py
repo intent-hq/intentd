@@ -467,6 +467,35 @@ class LifecycleCacheTests(unittest.TestCase):
             git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
             self.assertLess(git_bash, setup, name)
 
+    def test_pi_windows_uses_git_bash_before_any_shell_steps(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['pi-session-paths']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Put Git Bash first on PATH (Windows)'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'cmd')
+        self.assertIn('Git\\bin', setup['run'])
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertTrue(condition(setup['if'], context('merge_group', platform='Windows')))
+        self.assertFalse(condition(setup['if'], context('merge_group', platform='Linux')))
+        for step in steps[:steps.index(setup)]:
+            self.assertNotIn('run', step)
+
+    def test_installer_bootstraps_shell_and_nuget_without_prompting(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['install-ps1']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Prepare PowerShell 7'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'powershell')
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertIn('Get-FileHash', setup['run'])
+        pester = next(s for s in steps if s.get('name', '').startswith('Pester ('))
+        self.assertLess(steps.index(setup), steps.index(pester))
+        self.assertIn('Install-PackageProvider -Name NuGet', pester['run'])
+        self.assertLess(pester['run'].index('Install-PackageProvider'), pester['run'].index('Install-Module'))
+        provider = next(line for line in pester['run'].splitlines() if 'Install-PackageProvider' in line)
+        self.assertIn('-Force', provider)
+        self.assertIn('-Scope CurrentUser', provider)
+
     def test_managed_cache_covers_all_routed_runners(self):
         cache = self.step("Configure Depot managed compiler cache")
         self.assertEqual(cache["run"], "python3 scripts/setup-depot-sccache.py")
