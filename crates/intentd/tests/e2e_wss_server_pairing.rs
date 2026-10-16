@@ -684,10 +684,13 @@ async fn fresh_daemon_does_not_import_legacy_workspaces() {
 #[test]
 fn retired_legacy_import_commands_are_rejected() {
     for command in ["import", "import-legacy"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
-            .args([command, "--help"])
-            .output()
-            .unwrap();
+        let output = std::process::Command::new(intentd_test_support::runtime_paths::binary_path(
+            "intentd",
+            env!("CARGO_BIN_EXE_intentd"),
+        ))
+        .args([command, "--help"])
+        .output()
+        .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
     }

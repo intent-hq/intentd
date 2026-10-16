@@ -165,6 +165,42 @@ class LinuxTests(unittest.TestCase):
                                      capture_output=True, text=True)
             self.assertNotEqual(invalid.returncode, 0)
 
+    def test_retired_import_cli_uses_relocated_binary_with_both_assertions(self):
+        text = (ROOT / 'crates/intentd/tests/e2e_wss_server_pairing.rs').read_text()
+        function = 'fn retired_legacy_import_commands_are_rejected() {' + text.split(
+            'fn retired_legacy_import_commands_are_rejected() {', 1)[1].split('\n}', 1)[0] + '\n}'
+        with tempfile.TemporaryDirectory(prefix='intent-retired-cli-relocation-') as tmp:
+            root = Path(tmp)
+            producer, consumer = root / 'producer', root / 'consumer'
+            consumer.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CLI_CALLS"\necho "unrecognized subcommand" >&2\nexit 2\n')
+            consumer.chmod(0o755)
+            producer.write_text('#!/bin/sh\nexit 89\n')
+            producer.chmod(0o755)
+            source = root / 'main.rs'
+            source.write_text('#![allow(dead_code)]\nextern crate self as intentd_test_support;\n' +
+                '#[path=' + json.dumps(str(ROOT / 'crates/intentd-test-support/src/runtime_paths.rs')) + '] pub mod runtime_paths;\n' +
+                function + '\nfn main() { retired_legacy_import_commands_are_rejected(); }\n')
+            proof = root / 'proof'
+            subprocess.run(['rustc', '--edition=2021', str(source), '-o', str(proof)],
+                           env=dict(os.environ, CARGO_BIN_EXE_intentd=str(producer)), check=True, capture_output=True)
+            calls = root / 'calls'
+            env = dict(os.environ, NEXTEST_BIN_EXE_intentd=str(consumer), CLI_CALLS=str(calls))
+            for case in ('decoy', 'missing', 'cargo-fallback'):
+                with self.subTest(case=case):
+                    if case == 'missing':
+                        producer.unlink()
+                    elif case == 'cargo-fallback':
+                        shutil.copyfile(consumer, producer)
+                        producer.chmod(0o755)
+                        env.pop('NEXTEST_BIN_EXE_intentd')
+                    calls.unlink(missing_ok=True)
+                    result = subprocess.run([str(proof)], env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(calls.read_text().splitlines(), ['import --help', 'import-legacy --help'])
+            invalid = subprocess.run([str(proof)], env={**env, 'NEXTEST_BIN_EXE_intentd': str(root / 'missing')},
+                                     capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
+
     def plan(self, args):
         return {'version': 1, 'head': 'a'*40, 'mergeBase': 'b'*40, 'plans': args}
 
