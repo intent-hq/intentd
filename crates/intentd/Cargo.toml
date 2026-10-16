@@ -14,9 +14,6 @@ clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Legacy note frontmatter (`.workspace/notes/*.md`) parsing; already in the
-# workspace dependency tree via intent-services.
-serde_yaml = "0.9"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
