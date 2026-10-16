@@ -18575,6 +18575,7 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
+            caps.insert("discussionConversations".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -33979,26 +33980,62 @@ impl WorkspaceApi for Services {
     fn discussion_list(
         &self,
         workspace_id: WorkspaceId,
+        conversation_id: String,
         before_sequence: Option<i64>,
         after_sequence: Option<i64>,
         limit: u32,
-    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionPage>> {
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.discussion_list_op(&workspace_id, before_sequence, after_sequence, limit)
-                .await
+            self.discussion_history_op(
+                &workspace_id,
+                &conversation_id,
+                before_sequence,
+                after_sequence,
+                limit,
+            )
+            .await
         })
     }
-
     fn discussion_send(
         &self,
         workspace_id: WorkspaceId,
         message_id: String,
         body: String,
-    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionMessage>> {
+        target: intent_core::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionSendResult>> {
         Box::pin(async move {
-            self.discussion_send_op(&workspace_id, &message_id, &body)
+            self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
                 .await
         })
+    }
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_conversations_op(&workspace_id, before_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_recipients_op(&workspace_id, &query, after_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_project_event(
+        &self,
+        event: intent_core::Event,
+    ) -> BoxFuture<'_, Result<Option<intent_core::Event>>> {
+        Box::pin(async move { self.discussion_project_event_op(event).await })
     }
 
     fn workspace_members_list(

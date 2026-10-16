@@ -1131,7 +1131,7 @@ async fn discussion_typing_lifecycle_sources_pulses_targets_and_clearing() {
     let source = update("one", &ws).await.unwrap()["typingSource"].clone();
     let first = snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
     assert_eq!(first["source"], source);
-    assert_eq!(first.as_object().unwrap().len(), 3);
+    assert_eq!(first.as_object().unwrap().len(), 4);
     update("one", &ws).await.unwrap();
     let second = snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
     assert_eq!(first["since"], second["since"]);

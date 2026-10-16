@@ -48,6 +48,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("comment", "workspace_id = ?1"),
     // Historical human identity is immutable attribution, not a grant or a
     // principal FK. Import clears the private retry principal to avoid rebinding.
+    ("discussion_conversation", "workspace_id = ?1"),
+    ("discussion_participant", "workspace_id = ?1"),
     ("workspace_discussion_message", "workspace_id = ?1"),
     ("draft", "workspace_id = ?1"),
     ("agent_session", "workspace_id = ?1"),
@@ -1518,6 +1520,8 @@ mod tests {
             format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('n1', '{ws}', 1, '{t}', 'u', 'U', 'user', 'N', 'body')"),
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
+            format!(r#"INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES ('conversation-{ws}','{ws}','direct','[]','{t}')"#),
+            format!(r#"INSERT INTO discussion_participant(conversation_id,workspace_id,source_principal_id,principal_id) VALUES ('conversation-{ws}','{ws}','human-{ws}','human-{ws}')"#),
             format!(r#"INSERT INTO workspace_discussion_message (id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES ('discussion-{ws}','{ws}',1,'human-{ws}','retry','hello','{{"principalId":"human-{ws}","login":"human","displayName":null,"avatarUrl":null}}','{t}')"#),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at, usage_model, usage_origin) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}', 'test-model', 'human')"),
@@ -2202,7 +2206,9 @@ note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archiv
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
-workspace_discussion_message: id, workspace_id, sequence, principal_id, client_message_id, body, author_json, created_at
+discussion_conversation: id, workspace_id, kind, participants_json, created_at
+discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
+workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
 script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent

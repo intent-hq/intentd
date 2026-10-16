@@ -15,7 +15,7 @@ async fn discussion_atomic_retries_page_boundaries_and_reopen() {
             .unwrap();
     }
     let author = DiscussionAuthor {
-        principal_id: PrincipalId::new(),
+        principal_id: store.get_primary_principal().await.unwrap().id,
         login: Some("original".into()),
         display_name: None,
         avatar_url: None,
@@ -43,7 +43,19 @@ async fn discussion_atomic_retries_page_boundaries_and_reopen() {
             .await,
         Err(Error::InvalidParams(_))
     ));
-    renamed.principal_id = PrincipalId::new();
+    let mut second_person = store.get_primary_principal().await.unwrap();
+    second_person.id = PrincipalId::new();
+    second_person.is_primary = false;
+    store.upsert_principal(&second_person).await.unwrap();
+    store
+        .add_workspace_member(
+            &ws,
+            &second_person.id,
+            intent_core::WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    renamed.principal_id = second_person.id;
     let (second, _) = store
         .insert_discussion_message(&ws, "retry", "other human", &renamed)
         .await
@@ -112,7 +124,7 @@ async fn discussion_forward_pages_follow_sequences_and_skip_gaps() {
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: PrincipalId::new(),
+        principal_id: store.get_primary_principal().await.unwrap().id,
         login: None,
         display_name: None,
         avatar_url: None,
@@ -173,7 +185,7 @@ async fn discussion_concurrent_mismatched_retries_insert_exactly_once() {
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: PrincipalId::new(),
+        principal_id: store.get_primary_principal().await.unwrap().id,
         login: None,
         display_name: None,
         avatar_url: None,
@@ -196,4 +208,151 @@ async fn discussion_concurrent_mismatched_retries_insert_exactly_once() {
         .await
         .unwrap();
     assert_eq!(next.sequence, 2);
+}
+
+#[tokio::test]
+async fn discussion_conversation_migration_preserves_default_history_and_retry() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Existing discussion", false))
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
+        .execute(store.write_pool()).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0161_workspace_discussions.sql"))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let author = DiscussionAuthor {
+        principal_id: store.get_primary_principal().await.unwrap().id,
+        login: Some("original".into()),
+        display_name: None,
+        avatar_url: None,
+    };
+    sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES('old-message',?,7,?,'retry','preserved',?,'2026-01-01T00:00:00Z')")
+        .bind(ws.as_str()).bind(author.principal_id.as_str()).bind(serde_json::to_string(&author).unwrap()).execute(store.write_pool()).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0162_discussion_conversations.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    let page = store
+        .list_discussion_messages(&ws, None, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(page.messages.len(), 1);
+    let old = &page.messages[0];
+    assert_eq!(old.id, "old-message");
+    assert_eq!(old.conversation_id, "default");
+    assert_eq!(old.sequence, 7);
+    assert_eq!(old.author, author);
+    let (retry, inserted) = store
+        .insert_discussion_message(&ws, "retry", "preserved", &author)
+        .await
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(&retry, old);
+    let (next, _) = store
+        .insert_discussion_message(&ws, "next", "next", &author)
+        .await
+        .unwrap();
+    assert_eq!(next.sequence, 8);
+}
+
+#[tokio::test]
+async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer() {
+    use intent_core::discussion::DiscussionTarget;
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Writer race", false))
+        .await
+        .unwrap();
+    let owner = store.get_primary_principal().await.unwrap();
+    let mut person = owner.clone();
+    person.id = PrincipalId::new();
+    person.is_primary = false;
+    store.upsert_principal(&person).await.unwrap();
+    store
+        .add_workspace_member(&ws, &person.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let author = DiscussionAuthor {
+        principal_id: person.id.clone(),
+        login: None,
+        display_name: None,
+        avatar_url: None,
+    };
+    let create = DiscussionTarget {
+        conversation_id: None,
+        recipient_principal_ids: Some(vec![owner.id]),
+    };
+    let (private, _) = store
+        .send_discussion_message(&ws, "private", "body", &author, &create)
+        .await
+        .unwrap();
+    store
+        .insert_discussion_message(&ws, "public", "body", &author)
+        .await
+        .unwrap();
+    for (key, target) in [
+        ("public", DiscussionTarget::default()),
+        ("new-public", DiscussionTarget::default()),
+        ("private", create),
+        (
+            "new-private",
+            DiscussionTarget {
+                conversation_id: Some(private.conversation.id.clone()),
+                recipient_principal_ids: None,
+            },
+        ),
+    ] {
+        store
+            .add_workspace_member(&ws, &person.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        assert!(store
+            .get_workspace_member_role(&ws, &person.id)
+            .await
+            .unwrap()
+            .is_some());
+        let mut removal = store.write_pool().begin().await.unwrap();
+        let pending = store.send_discussion_message(&ws, key, "body", &author, &target);
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            result=&mut pending => panic!("send unexpectedly passed held writer: {result:?}"),
+            ()=std::future::ready(()) => {}
+        }
+        sqlx::query("DELETE FROM workspace_member WHERE workspace_id=? AND principal_id=?")
+            .bind(ws.as_str())
+            .bind(person.id.as_str())
+            .execute(&mut *removal)
+            .await
+            .unwrap();
+        removal.commit().await.unwrap();
+        assert!(matches!(pending.await, Err(Error::NotFound(_))));
+    }
+    assert_eq!(
+        store
+            .list_discussion_messages(&ws, None, None, 50)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .list_discussion_messages_in(&ws, &private.conversation.id, None, None, 50)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
 }

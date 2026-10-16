@@ -2,7 +2,7 @@
 use intent_core::discussion::{
     DiscussionAuthor, DiscussionMessage, DiscussionPage, DISCUSSION_PAGE_MAX,
 };
-use intent_core::{now_iso, Error, Result, WorkspaceId};
+use intent_core::{Error, Result, WorkspaceId};
 use sqlx::{sqlite::SqliteRow, Row};
 
 use crate::Store;
@@ -11,10 +11,11 @@ fn store_error(error: &sqlx::Error) -> Error {
     Error::Internal(format!("workspace discussion: {error}"))
 }
 
-fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
+pub(super) fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
     Ok(DiscussionMessage {
         id: row.get("id"),
         workspace_id: WorkspaceId(row.get("workspace_id")),
+        conversation_id: row.get("conversation_id"),
         sequence: row.get("sequence"),
         body: row.get("body"),
         author: serde_json::from_str(row.get("author_json"))
@@ -37,50 +38,16 @@ impl Store {
         body: &str,
         author: &DiscussionAuthor,
     ) -> Result<(DiscussionMessage, bool)> {
-        let mut tx = self
-            .write_pool()
-            .begin()
-            .await
-            .map_err(|e| store_error(&e))?;
-        let inserted = sqlx::query(
-            "INSERT INTO workspace_discussion_message \
-             (id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) \
-             VALUES (?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message \
-             WHERE workspace_id=?),?,?,?,?,?) \
-             ON CONFLICT(workspace_id,principal_id,client_message_id) DO NOTHING",
-        )
-        .bind(uuid::Uuid::now_v7().to_string())
-        .bind(workspace_id.as_str())
-        .bind(workspace_id.as_str())
-        .bind(author.principal_id.as_str())
-        .bind(client_message_id)
-        .bind(body)
-        .bind(serde_json::to_string(author).map_err(|e| Error::Internal(e.to_string()))?)
-        .bind(now_iso())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| store_error(&e))?
-        .rows_affected()
-            > 0;
-        let row = sqlx::query(
-            "SELECT id,workspace_id,sequence,body,author_json,created_at \
-             FROM workspace_discussion_message \
-             WHERE workspace_id=? AND principal_id=? AND client_message_id=?",
-        )
-        .bind(workspace_id.as_str())
-        .bind(author.principal_id.as_str())
-        .bind(client_message_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| store_error(&e))?;
-        let message = message(&row)?;
-        if message.body != body {
-            return Err(Error::InvalidParams(
-                "messageId was already used with a different body".into(),
-            ));
-        }
-        tx.commit().await.map_err(|e| store_error(&e))?;
-        Ok((message, inserted))
+        let (result, inserted) = self
+            .send_discussion_message(
+                workspace_id,
+                client_message_id,
+                body,
+                author,
+                &intent_core::discussion::DiscussionTarget::default(),
+            )
+            .await?;
+        Ok((result.message, inserted))
     }
 
     /// Read a bounded page, oldest first. After a cursor, take the first newer
@@ -91,6 +58,27 @@ impl Store {
     pub async fn list_discussion_messages(
         &self,
         workspace_id: &WorkspaceId,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> Result<DiscussionPage> {
+        self.list_discussion_messages_in(
+            workspace_id,
+            "default",
+            before_sequence,
+            after_sequence,
+            limit,
+        )
+        .await
+    }
+
+    /// Read one conversation's bounded history.
+    /// # Errors
+    /// Returns invalid bounds or database errors.
+    pub async fn list_discussion_messages_in(
+        &self,
+        workspace_id: &WorkspaceId,
+        conversation_id: &str,
         before_sequence: Option<i64>,
         after_sequence: Option<i64>,
         limit: u32,
@@ -110,12 +98,13 @@ impl Store {
             None => ("<", "DESC", before_sequence.unwrap_or(i64::MAX)),
         };
         let sql = format!(
-            "SELECT id,workspace_id,sequence,body,author_json,created_at \
-             FROM workspace_discussion_message WHERE workspace_id=? AND sequence {comparison} ? \
+            "SELECT id,workspace_id,conversation_id,sequence,body,author_json,created_at \
+             FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=? AND sequence {comparison} ? \
              ORDER BY sequence {order} LIMIT ?"
         );
         let rows = sqlx::query(&sql)
             .bind(workspace_id.as_str())
+            .bind(conversation_id)
             .bind(cursor)
             .bind(i64::from(limit) + 1)
             .fetch_all(self.read_pool())

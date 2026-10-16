@@ -1323,6 +1323,7 @@ pub(crate) async fn handle_fast_path(
                 // Spawned with the request context re-established: the gate's
                 // membership re-reads run under the subscriber's caller.
                 let handle = spawn_forwarder(forward_subscription(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,
@@ -1382,6 +1383,7 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
 /// entries its principal may see
 /// ([`events::project_queue_event_for_current_caller`]).
 async fn forward_subscription(
+    api: Arc<dyn WorkspaceApi>,
     mut subscription: Subscription,
     membership: Option<(events::MembershipGate, Subscription)>,
     scoped_workspace: Option<String>,
@@ -1462,6 +1464,10 @@ async fn forward_subscription(
                         // no `content` in `agent:queue:processing` for a
                         // foreign entry.
                         events::project_queue_event_for_current_caller(&mut event);
+                    }
+                    if event.event_type.starts_with("discussion:") || event.event_type == intent_core::events::PRESENCE_CHANGED {
+                        let Ok(Some(projected))=api.discussion_project_event(event).await else {continue;};
+                        event=projected;
                     }
                     if let Some(key) = conflate::event_key(&event) {
                         let item = EventItem::new(&key, event);

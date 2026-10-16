@@ -192,16 +192,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
-// Human workspace discussions (15.1): +2 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 436;
+// Human workspace discussions (15.1): +4 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 438;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-/// Protocol 15.1 adds two human workspace discussion methods.
-const EXPECTED_ROUTER_METHODS: usize = 380;
+/// Protocol 15.1 adds four human workspace discussion methods.
+const EXPECTED_ROUTER_METHODS: usize = 382;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -586,7 +586,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "discussion.conversations",
     "discussion.list",
+    "discussion.recipients",
     "discussion.send",
     "drafts.clear",
     "drafts.get",

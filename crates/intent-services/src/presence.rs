@@ -191,6 +191,7 @@ struct Typing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiscussionTyping {
     workspace: String,
+    conversation: String,
     since: String,
     pulse: u64,
 }
@@ -376,7 +377,7 @@ impl State {
                     row["discussionTyping"] = json!(discussion_typing
                         .into_iter()
                         .map(|(source, t)| {
-                            json!({"source":source,"since":t.since,"pulse":t.pulse})
+                            json!({"source":source,"since":t.since,"pulse":t.pulse,"conversationId":t.conversation})
                         })
                         .collect::<Vec<_>>());
                 }
@@ -559,24 +560,26 @@ fn parse_update(params: &Value) -> Result<(Vec<Focus>, Option<String>)> {
 }
 
 /// Discussion typing replaces the connection's prior target on every update.
-fn parse_discussion_typing(params: &Value) -> Result<Option<String>> {
-    match params.get("discussionTyping") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(target)) => target
-            .get("workspaceId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(|id| Some(id.to_string()))
-            .ok_or_else(|| {
-                Error::InvalidParams(
-                    "presence.update: discussionTyping.workspaceId must be a non-empty string"
-                        .into(),
-                )
-            }),
-        Some(_) => Err(Error::InvalidParams(
-            "presence.update: discussionTyping must be an object or null".into(),
-        )),
-    }
+fn parse_discussion_typing(params: &Value) -> Result<Option<(String, String)>> {
+    let Some(target) = params.get("discussionTyping").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let workspace = target
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidParams("discussionTyping.workspaceId must be a non-empty string".into())
+        })?;
+    let conversation = match target.get("conversationId") {
+        None => "default",
+        Some(value) => value.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+            Error::InvalidParams(
+                "discussionTyping.conversationId must be a non-empty string".into(),
+            )
+        })?,
+    };
+    Ok(Some((workspace.into(), conversation.into())))
 }
 
 /// Parse a `note.presence.update` caret: `{ rev, anchor, head }`, each a
@@ -797,18 +800,15 @@ impl Services {
             }
             None => None,
         };
-        if let Some(workspace) = &discussion_typing {
+        if let Some((workspace, _)) = &discussion_typing {
             targets.insert(workspace.clone());
         }
         for workspace_id in &targets {
             self.require_member(&WorkspaceId::from(workspace_id.as_str()))
                 .await?;
         }
-        if let Some(workspace) = &discussion_typing {
-            // Owners bypass membership checks, but typing still needs a real
-            // discussion target, just like discussion.list/send.
-            self.store
-                .get_workspace(&WorkspaceId::from(workspace.as_str()))
+        if let Some((workspace, conversation)) = &discussion_typing {
+            self.discussion_access(&WorkspaceId::from(workspace.as_str()), conversation)
                 .await?;
         }
         let (affected, typing_source): (HashSet<String>, String) = {
@@ -838,14 +838,17 @@ impl Services {
                     pulse: conn.typing_pulses,
                 }
             });
-            conn.discussion_typing = discussion_typing.map(|workspace| {
+            conn.discussion_typing = discussion_typing.map(|(workspace, conversation)| {
                 conn.discussion_typing_pulses += 1;
                 let since = match &conn.discussion_typing {
-                    Some(t) if t.workspace == workspace => t.since.clone(),
+                    Some(t) if t.workspace == workspace && t.conversation == conversation => {
+                        t.since.clone()
+                    }
                     _ => now_iso(),
                 };
                 DiscussionTyping {
                     workspace,
+                    conversation,
                     since,
                     pulse: conn.discussion_typing_pulses,
                 }
@@ -917,7 +920,10 @@ impl Services {
             .presence
             .lock()
             .roster(workspace_id.as_str(), &members, human);
-        Ok(json!({ "workspaceId": workspace_id.as_str(), "members": roster }))
+        let mut data = json!({ "workspaceId": workspace_id.as_str(), "members": roster });
+        self.project_discussion_typing(&workspace_id, &mut data)
+            .await?;
+        Ok(data)
     }
 
     /// See [`intent_core::WorkspaceApi::presence_disconnect`].

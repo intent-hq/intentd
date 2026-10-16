@@ -5241,35 +5241,71 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Read a bounded human discussion page. Human connections only; member-gated.
+    /// Human-only conversation history with participant authorization.
     fn discussion_list(
         &self,
         workspace_id: WorkspaceId,
+        conversation_id: String,
         before_sequence: Option<i64>,
         after_sequence: Option<i64>,
         limit: u32,
-    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionPage>> {
-        let _ = (workspace_id, before_sequence, after_sequence, limit);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::discussion_list not implemented".into(),
-            ))
-        })
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+        );
+        Box::pin(async { Err(Error::Internal("discussion.list not implemented".into())) })
     }
-
-    /// Send as the authenticated human. The retry key is scoped to workspace and principal.
+    /// Atomic first send or participant-authorized append with exact retry semantics.
     fn discussion_send(
         &self,
         workspace_id: WorkspaceId,
         message_id: String,
         body: String,
-    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionMessage>> {
-        let _ = (workspace_id, message_id, body);
+        target: crate::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionSendResult>> {
+        let _ = (workspace_id, message_id, body, target);
+        Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
+    }
+    /// Bounded participant-only discovery.
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, before_id, limit);
         Box::pin(async {
             Err(Error::Internal(
-                "WorkspaceApi::discussion_send not implemented".into(),
+                "discussion.conversations not implemented".into(),
             ))
         })
+    }
+    /// Bounded offline-capable effective member picker.
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, after_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.recipients not implemented".into(),
+            ))
+        })
+    }
+    /// Delivery-time participant projection, including owners. Fail closed by default.
+    fn discussion_project_event(
+        &self,
+        event: crate::Event,
+    ) -> BoxFuture<'_, Result<Option<crate::Event>>> {
+        let _ = event;
+        Box::pin(async { Ok(None) })
     }
 
     /// `workspace.members.list` (multiplayer w3): the members of a workspace

@@ -75,9 +75,9 @@ impl crate::Services {
         &self,
         q: &mut EventQuery,
     ) -> intent_core::Result<bool> {
-        if matches!(intent_core::current_caller(), Some(Caller::Agent { .. })) {
-            q.exclude_discussion_events = true;
-        }
+        // Discussion history is participant-scoped in its own store. Legacy
+        // event copies cannot bypass that boundary, even for host owners.
+        q.exclude_discussion_events = true;
         let member = match intent_core::current_caller() {
             Some(Caller::Wire { principal_id, .. }) if is_collaborator_caller() => {
                 let member = matches!(

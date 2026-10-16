@@ -1,7 +1,10 @@
-//! One human discussion per workspace, separate from agent conversations.
+//! Human workspace discussions, separate from agent conversations.
 use serde::{Deserialize, Serialize};
 
 use crate::{PrincipalId, WorkspaceId};
+
+pub const DEFAULT_CONVERSATION: &str = "default";
+pub const DISCUSSION_RECIPIENT_MAX: usize = 31;
 
 pub const DISCUSSION_BODY_MAX_BYTES: usize = 16 * 1024;
 pub const DISCUSSION_PAGE_MAX: u32 = 100;
@@ -24,6 +27,8 @@ pub struct DiscussionAuthor {
 pub struct DiscussionMessage {
     pub id: String,
     pub workspace_id: WorkspaceId,
+    #[serde(default = "default_conversation_id")]
+    pub conversation_id: String,
     pub sequence: i64,
     pub body: String,
     pub author: DiscussionAuthor,
@@ -35,4 +40,31 @@ pub struct DiscussionMessage {
 pub struct DiscussionPage {
     pub messages: Vec<DiscussionMessage>,
     pub has_more: bool,
+}
+
+fn default_conversation_id() -> String {
+    DEFAULT_CONVERSATION.into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionConversation {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub kind: String,
+    pub participants: Vec<DiscussionAuthor>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionSendResult {
+    pub message: DiscussionMessage,
+    pub conversation: DiscussionConversation,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscussionTarget {
+    pub conversation_id: Option<String>,
+    pub recipient_principal_ids: Option<Vec<PrincipalId>>,
 }

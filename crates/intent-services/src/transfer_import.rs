@@ -1347,7 +1347,7 @@ fn transform_rows(
     for (table, mut objects) in rows {
         match table.as_str() {
             "draft" => continue,
-            "workspace_discussion_message" => {
+            "workspace_discussion_message" | "discussion_participant" => {
                 for object in &mut objects {
                     expect_object(&table, object)?
                         .insert("principal_id".into(), serde_json::Value::Null);
@@ -1714,8 +1714,42 @@ mod tests {
             display_name: Some("Source Human".into()),
             avatar_url: Some("https://example.test/source.png".into()),
         };
+        let mut source_owner = local.clone();
+        source_owner.is_primary =
+            source.get_primary_principal().await.unwrap().id == source_owner.id;
+        source_owner.login = author.login.clone();
+        source.upsert_principal(&source_owner).await.unwrap();
+        source
+            .add_workspace_member(
+                &ws(),
+                &source_owner.id,
+                intent_core::WorkspaceRole::Collaborator,
+            )
+            .await
+            .unwrap();
         let (original, _) = source
             .insert_discussion_message(&ws(), "same-key", "source history", &author)
+            .await
+            .unwrap();
+        let mut peer = source_owner.clone();
+        peer.id = intent_core::PrincipalId::new();
+        peer.is_primary = false;
+        source.upsert_principal(&peer).await.unwrap();
+        source
+            .add_workspace_member(&ws(), &peer.id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        let (private, _) = source
+            .send_discussion_message(
+                &ws(),
+                "private-key",
+                "private history",
+                &author,
+                &intent_core::discussion::DiscussionTarget {
+                    conversation_id: None,
+                    recipient_principal_ids: Some(vec![peer.id]),
+                },
+            )
             .await
             .unwrap();
         let rows = source.transfer_export_rows(&ws()).await.unwrap();
@@ -1730,6 +1764,26 @@ mod tests {
             principal_id: local.id.clone(),
             host_role: HostRole::Owner,
         };
+        assert!(!service
+            .store
+            .discussion_is_participant(&ws(), &private.conversation.id, &local.id)
+            .await
+            .unwrap());
+        assert!(with_caller(
+            caller.clone(),
+            service.discussion_history_op(&ws(), &private.conversation.id, None, None, 50)
+        )
+        .await
+        .is_err());
+        let archived = service
+            .store
+            .discussion_conversation(&ws(), &private.conversation.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived, private.conversation,
+            "source snapshots survive without destination grants"
+        );
         let history = with_caller(
             caller.clone(),
             service.discussion_list_op(&ws(), None, None, 50),
