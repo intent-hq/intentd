@@ -68,6 +68,8 @@ def native_recipes(platform, event, target):
         recipes["services"] = tests("intent-services", ["--lib"], [])
     if event == "merge_group" and platform == "macos":
         recipes["transport"] = tests("intent-transport", ["--lib"], [])
+    if event == "merge_group" and platform == "windows":
+        recipes["pty"] = tests("intent-pty", ["--lib"], [])
     recipes["daemon"] = tests("intentd", daemon, ["intentd"])
     recipes["sitter"] = tests("intentd-sitter", sitter, ["intentd-sitter"])
     recipes["sitter-production"] = {"kind": "binary", "command": ["cargo", "build", *common, "-p", "intentd-sitter", "--bin", "intentd-sitter", "--message-format=json"], "companions": ["intentd-sitter"]}

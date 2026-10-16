@@ -204,17 +204,43 @@ class LinuxTests(unittest.TestCase):
             self.assertFalse(linux.full_proof([path]))
         self.assertTrue(linux.full_proof(None))
 
-    def test_gate_requires_both_reports_on_pipeline_pr_and_merge_group(self):
+    def test_queue_requires_all_reports_and_changed_execution_but_pr_is_static(self):
         baseline = {name: 'success' for name in WORKFLOW['jobs']['gate']['needs']}
-        for event in ('pull_request', 'merge_group'):
-            self.assertTrue(routing.gate_passes(WORKFLOW, event, baseline, full_coverage='true'))
-            for name in ('coverage-e2e', 'coverage-all'):
-                for result in ('skipped', 'failure', 'cancelled', ''):
-                    self.assertFalse(routing.gate_passes(WORKFLOW, event, {**baseline, name: result}, full_coverage='true'), (event, name, result))
-        for demand in ('', 'unknown'):
-            self.assertFalse(routing.gate_passes(WORKFLOW, 'pull_request', baseline, full_coverage=demand))
-        baseline.update({'coverage-e2e': 'skipped', 'coverage-all': 'skipped'})
-        self.assertTrue(routing.gate_passes(WORKFLOW, 'pull_request', baseline, full_coverage='false'))
+        self.assertTrue(routing.gate_passes(WORKFLOW, 'merge_group', baseline))
+        for name in ('coverage-e2e', 'coverage-all', 'coverage-changed'):
+            for result in ('skipped', 'failure', 'cancelled', ''):
+                self.assertFalse(routing.gate_passes(WORKFLOW, 'merge_group', {**baseline, name: result}), (name, result))
+        baseline.update({name: 'skipped' for name in ('coverage-e2e', 'coverage-all', 'coverage-changed', 'check', 'daemon-lifecycle')})
+        self.assertTrue(routing.gate_passes(WORKFLOW, 'pull_request', baseline))
+
+    def test_queue_producer_and_consumer_resolve_identical_event_base(self):
+        jobs = WORKFLOW['jobs']
+        bodies = []
+        for name in ('check', 'coverage-changed'):
+            job = jobs[name]
+            self.assertEqual(job['env']['QUEUE_BASE_SHA'], '${{ github.event.merge_group.base_sha }}')
+            self.assertEqual(job['env']['QUEUE_HEAD_SHA'], '${{ github.event.merge_group.head_sha }}')
+            bodies.append(next(s['run'] for s in job['steps'] if s.get('name') == 'Resolve queue base from the event'))
+        self.assertEqual(*bodies)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = self.plan([['-p', 'intent-core', '--lib', '--bins', '--tests']])
+            def selection(command, **kwargs):
+                self.assertEqual(command[command.index('--base') + 1], 'b'*40)
+                (root / 'changed-plan.json').write_text(json.dumps(plan))
+            with mock.patch.object(linux.archives, 'source_commit', return_value='a'*40), \
+                 mock.patch.object(linux.subprocess, 'run', side_effect=selection) as run, \
+                 mock.patch.object(linux.archives, 'output', return_value='scripts/changed-tests.sh'):
+                selected, changed = linux.select(ROOT, root, 'merge_group', 'b'*40)
+                run.assert_called_once()
+                self.assertEqual(selected, plan)
+                self.assertTrue(changed)
+                with self.assertRaisesRegex(ValueError, 'connected base'):
+                    linux.select(ROOT, root, 'merge_group', None)
+            recipes = linux.recipes('host', 'merge_group', selected, callback_changed=changed)
+            self.assertTrue({'coverage-all', 'coverage-e2e', 'changed-0', 'callback', 'check-gitlab'} <= recipes.keys())
+            for part in ('-p', 'intent-acp', 'intent-services'):
+                self.assertIn(part, recipes['callback'][0]['command'])
 
     def test_one_linux_producer_and_no_coverage_build_commands(self):
         check = WORKFLOW['jobs']['check']

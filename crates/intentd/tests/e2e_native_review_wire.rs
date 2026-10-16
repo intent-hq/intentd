@@ -269,14 +269,6 @@ impl intent_transport::SystemControl for FixtureMetadata {
         self.unsupported();
         Err("metadata fixture has no updater".into())
     }
-    fn import_legacy(
-        &self,
-        _: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
-    {
-        self.unsupported();
-        Box::pin(async { Err("metadata fixture has no importer".into()) })
-    }
     fn git_credential(
         &self,
         _: Option<u64>,
@@ -4408,7 +4400,6 @@ async fn native_fixture_metadata_unsupported_matches_absent() {
             ("system.requestUpdate", json!({})),
             ("system.requestUpdate", json!({"targetVersion":"1.2.3"})),
             ("system.requestUpdate", json!({"targetVersion":42})),
-            ("system.importLegacy", json!({"force":true})),
             (
                 "system.gitCredential",
                 json!({"protocol":"https","host":"github.com"}),

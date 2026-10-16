@@ -86,7 +86,7 @@ def recipes(target, event, plan, *, callback_changed=False, full_proof=False):
     if event == 'merge_group' or full_proof:
         add('coverage-e2e', ['-p', 'intentd'], True)
         add('coverage-all', ['--workspace'], True)
-    if event == 'pull_request':
+    if event in ('pull_request', 'merge_group'):
         scope = callback.scope(plan, plan['head'])  # validates every structured argv
         for index, args in enumerate(plan['plans']):
             add('changed-' + str(index), args, True)
@@ -99,9 +99,9 @@ def select(source, root, event, base):
     head = archives.source_commit(source)
     plan = {'version': 1, 'head': head, 'mergeBase': head, 'plans': []}
     changed = False
-    if event == 'pull_request':
+    if event in ('pull_request', 'merge_group'):
         if not base:
-            raise ValueError('PR changed selection requires a connected base')
+            raise ValueError('changed selection requires a connected base')
         subprocess.run(['bash', 'scripts/changed-tests.sh', '--instrumented', '--dry-run', '--base', base,
                         '--plan-json', str(root / 'changed-plan.json')], cwd=source, check=True)
         plan = json.loads((root / 'changed-plan.json').read_text())

@@ -156,7 +156,7 @@ REQUIRED_TEST_STEPS = {
     ("daemon-lifecycle", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("daemon-lifecycle", "Retained workspace CoW fixtures (macOS runtime)"): None,
     ("daemon-lifecycle", "Native lifecycle runtime proof"): 1,
-    ("daemon-lifecycle", "Headless workspace setup (Windows runtime)"): 1,
+    ("daemon-lifecycle", "Headless workspace setup (Windows runtime)"): 2,
     ("daemon-lifecycle", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("daemon-lifecycle", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,

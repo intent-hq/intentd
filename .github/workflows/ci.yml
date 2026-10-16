@@ -16,27 +16,9 @@ on:
   # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
   # are completely unaffected.
   pull_request:
-  # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
-  # merged tree before it lands on main. CI is tiered by event: pull_request
-  # runs the fast feedback jobs (check / pr-title / conflict-markers /
-  # monorepo-consumer-checks / deb-packaging / release-scripts) plus
-  # coverage-changed, which runs only
-  # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
-  # comment); merge_group additionally runs the full native proof set, GitLab
-  # feature suite, and full instrumented coverage jobs (coverage-e2e /
-  # coverage-all). PRs changing the Linux artifact pipeline also require both
-  # full reports before queue entry; ordinary Rust PRs retain narrow coverage.
-  # The gate requires requested reports and rejects a missing demand output.
-  # The check job owns Linux production; daemon-lifecycle owns macOS/Windows,
-  # with one producer per platform, focused PR demand and full
-  # merge-group demand. PRs touching native CI/config/harness inputs also run
-  # full native proofs, so the migration can be verified before queue entry.
-  # CI Gate requires native check, Clippy and runtime proofs on merge_group,
-  # and its release builds on push. CI Gate is the sole required status check.
-  # Merge groups are created by the repo's own ruleset from already-filed
-  # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
-  # are PR-metadata checks that stay pull_request-only — the gate accepts
-  # their skip.
+  # PRs run Linux metadata, formatting, routing-policy and static consumer
+  # checks only. The queue runs compilation, runtime/platform matrices and
+  # instrumented coverage on the merged tree; CI Gate enforces each tier.
   merge_group:
 
 permissions:
@@ -184,13 +166,41 @@ jobs:
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
 
+  # No compilation, application dependencies, or native runners before queueing.
+  pr-static:
+    needs: route
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'PyYAML==6.0.3'
+      - name: Check CI routing and gate failures
+        run: python3 -I -B scripts/test-ci-native-routing.py
+      - name: Resolve formatting toolchain
+        id: rust
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  cache-smoke:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/depot-cache-smoke.yml
+    secrets: inherit
+
   check:
     # Skipped on push to main — redundant re-test of a tree the PR CI already
     # checked (see the `on: push` comment). The expression carries no status
     # function, so the implicit success() still applies: a route failure —
     # or a route skip, as on fork PRs — skips this job on pull_request
     # exactly as before.
-    if: github.event_name != 'push'
+    if: github.event_name == 'merge_group'
     needs: route
     permissions:
       contents: read
@@ -206,8 +216,8 @@ jobs:
     # Keep per-test timeouts unchanged; allow the combined cold-build budget.
     timeout-minutes: 90
     env:
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
@@ -217,22 +227,15 @@ jobs:
           python-version: '3.11'
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
-      - name: Resolve PR base from the merge commit
-        if: github.event_name == 'pull_request'
+          fetch-depth: 0
+      - name: Resolve queue base from the event
         run: |
           set -euo pipefail
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            base=$(git rev-parse 'HEAD^1')
-            echo "base: HEAD^1 (merge-commit parent) = $base"
-          else
-            git fetch --no-tags --unshallow origin \
-              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
-              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
-            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
-            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
-          fi
-          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          [[ "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$QUEUE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$QUEUE_HEAD_SHA"
+          git fetch --no-tags --depth=1 origin "$QUEUE_BASE_SHA"
+          echo "BASE_SHA=$QUEUE_BASE_SHA" >> "$GITHUB_ENV"
       # Fail-fast disk preflight (tinybox only; monorepo#1253): the 8 runner
       # slots share one /raid CI-scratch volume, and the per-slot persistent
       # target dirs (see "Point CARGO_TARGET_DIR outside the work dir" below)
@@ -797,7 +800,7 @@ jobs:
     # Full reports run on merge groups and PRs changing the Linux pipeline.
     # The check producer publishes the exact daemon and workspace graphs first.
     needs: [route, check]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || needs.check.outputs.full_coverage == 'true') && needs.route.result == 'success' && needs.check.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 30
     permissions:
@@ -1023,7 +1026,7 @@ jobs:
   coverage-all:
     # Same full-report demand as coverage-e2e; the gate requires both reports.
     needs: [route, check]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || needs.check.outputs.full_coverage == 'true') && needs.route.result == 'success' && needs.check.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 30
     permissions:
@@ -1222,27 +1225,11 @@ jobs:
         shell: bash
         run: python3 -I -B scripts/ci-artifact-storage.py cleanup
 
-  # pull_request-ONLY counterpart of coverage-e2e / coverage-all
-  # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
-  # under the merge queue's llvm-cov instrumentation and ejected the PR, so
-  # every same-repo PR now runs the nextest selection derived from its own
-  # changed paths (scripts/changed-tests.sh --instrumented — the same env,
-  # flags and auggie_context_e2e exclusion as scripts/coverage-e2e.sh) under
-  # instrumentation before it can be enqueued. The full instrumented suite
-  # also runs on pipeline-changing PRs. Two phases: a cheap
-  # bash+git dry run FIRST computes the selection, and every heavy step
-  # (disk preflight, libssl, toolchain, caches, cargo-llvm-cov / nextest
-  # install, the run itself) is gated on it having found something, so a PR
-  # without crates/ changes finishes in seconds. Gated like check on
-  # pull_request: required outright by the gate there (a skip after a route
-  # failure fails the gate), accepted as skipped on merge_group / push where
-  # it is job-level skipped by design. github.event.pull_request is only
-  # read inside the job (absent on merge_group, where the job never runs).
-
-
+  # Queue-only changed coverage uses the same producer and exact event base.
+  # It retains all six callback controls alongside both full reports.
   coverage-changed:
     needs: [route, check]
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' && needs.check.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' && needs.check.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     timeout-minutes: 30
     permissions:
@@ -1265,40 +1252,23 @@ jobs:
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
     steps:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-      # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
-      # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
-      # selection's base is HEAD^1 itself. The base is resolved from that
-      # merge commit, never from pull_request.base.sha: the payload's base.sha
-      # is not guaranteed to be the first parent of the merge commit the job
-      # checks out (github.sha), and when the two differ the depth-1 fetch of
-      # base.sha is a disconnected object `git merge-base` cannot connect to
-      # HEAD (intent-hq/intent#5414). Should the checkout ever be the branch head
-      # itself (no merge commit), the base branch and the PR head are fetched
-      # unshallowed so origin/<base> connects to HEAD. Both changed-tests.sh
-      # runs below read the same resolved BASE_SHA.
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
-      - name: Resolve PR base from the merge commit
+          fetch-depth: 0
+      - name: Resolve queue base from the event
         run: |
           set -euo pipefail
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            base=$(git rev-parse 'HEAD^1')
-            echo "base: HEAD^1 (merge-commit parent) = $base"
-          else
-            git fetch --no-tags --unshallow origin \
-              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
-              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
-            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
-            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
-          fi
-          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          [[ "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$QUEUE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$QUEUE_HEAD_SHA"
+          git fetch --no-tags --depth=1 origin "$QUEUE_BASE_SHA"
+          echo "BASE_SHA=$QUEUE_BASE_SHA" >> "$GITHUB_ENV"
       - name: Select changed tests (dry run)
         id: select
         run: |
@@ -1609,7 +1579,8 @@ jobs:
   # to a binding's help line); it stays a hard error in the monorepo.
   # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
   # the `pull_request` trigger comment); skipped on push to main, where the
-  # tree was already checked by its PR run. Seconds-long on depot-ubuntu-24.04.
+  # tree was already checked in the queue. PRs run static contracts; the
+  # queued tree also runs the connected runtime proof.
   monorepo-consumer-checks:
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
@@ -1618,7 +1589,7 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@a34c437dbb1b1a355a6018e58f6eb6cbb6272951
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@0e12255c6207b474a218e633ec61e9b051d3e990
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1632,9 +1603,8 @@ jobs:
   deb-packaging:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1683,9 +1653,8 @@ jobs:
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    # Runs on push, merge_group and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1810,9 +1779,8 @@ jobs:
   # here — the register block self-skips off Windows, so a skip on this job
   # means the module went missing, and the step fails on it.
   install-ps1:
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -1829,11 +1797,32 @@ jobs:
         shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v7
+      - name: Prepare PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command pwsh -ErrorAction SilentlyContinue) { exit 0 }
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $archive = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7') {
+            throw 'PowerShell archive checksum mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          & (Join-Path $destination 'pwsh.exe') -NoProfile -Command '$PSVersionTable.PSVersion'
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 failed to start' }
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Pester (${{ matrix.shell }})
         run: |
           $ErrorActionPreference = 'Stop'
           $PSVersionTable.PSVersion
-          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0' })) {
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5' })) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            if (-not (Get-PackageProvider -ListAvailable | Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' })) {
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+            }
             Install-Module Pester -Force -SkipPublisherCheck -Scope CurrentUser -MinimumVersion 5.5
           }
           Import-Module Pester -MinimumVersion 5.0
@@ -1852,7 +1841,7 @@ jobs:
   # Linux platform simulation. Both platforms also cover extension forwarding.
   # The shipping-pin matrix is strict and required by CI Gate.
   pi-session-paths:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -1874,6 +1863,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Install the exact production adapter pin
         run: |
           pin=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_ACP_NPX_PACKAGE: &str = "(pi-acp@[^"]+)";/); if (!m) throw new Error("Missing production Pi adapter pin"); console.log(m[1]);')
@@ -1915,7 +1908,7 @@ jobs:
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
     needs: route
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
@@ -1934,150 +1927,77 @@ jobs:
       platform: ${{ matrix.platform }}
       runner_labels: ${{ toJSON(matrix.os) }}
 
-  # CI Gate is the sole required status check. Every failed/cancelled result
-  # fails it; skips are accepted only for jobs intentionally absent by event.
-  # build is required on push (release compilation); daemon-lifecycle requires
-  # native check, Clippy and runtime proofs on merge_group and focused PR proof.
-  # check / monorepo-consumer-checks must succeed on PRs and merge_group.
-  # Full coverage is required on merge_group, changed coverage on PRs.
-  # pr-title / conflict-markers retain their PR-metadata skip handling.
-  # deb-packaging / release-scripts / install-ps1 / pi-session-paths must
-  # succeed on every non-fork run. The gate itself is skipped on fork PRs.
+  # Required context for each event: PRs certify only the lightweight tier.
+  # Queue entries require all native/runtime/coverage proofs; push keeps its
+  # release-build and packaging checks. Missing/failed results never pass.
   gate:
     name: CI Gate
-    # Gate follows the same route as other workloads, with a hosted failure fallback.
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    permissions: {}
-    # The same-repo clause skips the gate on fork PRs along with every other
-    # job (see the `pull_request` trigger comment): without it, always()
-    # would run the gate against all-skipped needs and report a spurious
-    # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [daemon-lifecycle, check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths, route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    needs: [route, pr-static, cache-smoke, daemon-lifecycle, check, build, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
-          if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
-            echo "daemon-lifecycle must execute successfully on PR and merge queue"
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.daemon-lifecycle.result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          fi
-          # Native validation lives in required daemon-lifecycle. The release
-          # build matrix is push-only; a skipped release build must fail push.
-          if [ "${{ github.event_name }}" != "push" ]; then
-            case "${{ needs.build.result }}" in
-              success|skipped) ;;
-              *)
-                echo "build did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.build.result }}" != "success" ]; then
-            echo "build must succeed outright on push"
-            exit 1
-          fi
-          if [ "${{ needs.route.result }}" != "success" ] || \
-             [ "${{ needs.deb-packaging.result }}" != "success" ] || \
-             [ "${{ needs.release-scripts.result }}" != "success" ] || \
-             [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
-             [ "${{ needs.install-ps1.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: check must succeed outright on
-          # pull_request; only push runs (where it is job-skipped as
-          # redundant) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.check.result }}" in
-              success|skipped) ;;
-              *)
-                echo "check did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.check.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: monorepo-consumer-checks must succeed
-          # outright on pull_request and merge_group; only push runs (where it
-          # is job-skipped as already checked by the PR run) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.monorepo-consumer-checks.result }}" in
-              success|skipped) ;;
-              *)
-                echo "monorepo-consumer-checks did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
-            echo "monorepo-consumer-checks must succeed outright on pull_request / merge_group"
-            exit 1
-          fi
-          # Event-aware on purpose: coverage-changed is pull_request-only, so
-          # there it must succeed outright (a skip after a route failure must
-          # not let an uninstrumented PR through); on merge_group and push it
-          # is job-skipped by design and the gate accepts skipped.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if [ "${{ needs.coverage-changed.result }}" != "success" ]; then
-              echo "coverage-changed must succeed outright on pull_request"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-changed.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-changed did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          # Require full reports on every merge group and whenever the PR
-          # changes the Linux pipeline. A missing demand output fails closed.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            case "${{ needs.check.outputs.full_coverage }}" in
-              true|false) ;;
-              *) echo "Linux full-coverage demand is missing or invalid"; exit 1 ;;
-            esac
-          fi
-          if [ "${{ github.event_name }}" = "merge_group" ] || [ "${{ needs.check.outputs.full_coverage }}" = "true" ]; then
-            if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
-               [ "${{ needs.coverage-all.result }}" != "success" ]; then
-              echo "coverage-e2e / coverage-all must succeed outright when full coverage is requested"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-e2e.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-e2e did not succeed or skip"
-                exit 1
-                ;;
-            esac
-            case "${{ needs.coverage-all.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-all did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          case "${{ needs.pr-title.result }}" in
-            success|skipped) ;;
-            *)
-              echo "pr-title did not succeed or skip"
-              exit 1
+          require() {
+            if [ "$2" != success ]; then echo "$1 must succeed ($2)"; exit 1; fi
+          }
+          optional() {
+            case "$2" in success|skipped) ;; *) echo "$1 failed ($2)"; exit 1 ;; esac
+          }
+          case "${{ github.event_name }}" in
+            pull_request)
+              require route "${{ needs.route.result }}"
+              require pr-static "${{ needs.pr-static.result }}"
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              optional check "${{ needs.check.result }}"
+              optional build "${{ needs.build.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              require pr-title "${{ needs.pr-title.result }}"
+              require conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              optional deb-packaging "${{ needs.deb-packaging.result }}"
+              optional release-scripts "${{ needs.release-scripts.result }}"
+              optional install-ps1 "${{ needs.install-ps1.result }}"
+              optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
-          esac
-          case "${{ needs.conflict-markers.result }}" in
-            success|skipped) ;;
-            *)
-              echo "conflict-markers did not succeed or skip"
-              exit 1
+            merge_group)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              require cache-smoke "${{ needs.cache-smoke.result }}"
+              require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              require check "${{ needs.check.result }}"
+              optional build "${{ needs.build.result }}"
+              require coverage-e2e "${{ needs.coverage-e2e.result }}"
+              require coverage-all "${{ needs.coverage-all.result }}"
+              require coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              require install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
+            push)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              optional check "${{ needs.check.result }}"
+              require build "${{ needs.build.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              optional monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              require install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
+              ;;
+            *) exit 1 ;;
           esac

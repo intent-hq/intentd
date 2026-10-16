@@ -30,11 +30,12 @@ _workflow_tests = importlib.util.module_from_spec(_workflow_spec)
 _workflow_spec.loader.exec_module(_workflow_tests)
 
 RESULTS = ("success", "skipped", "failure", "cancelled")
-ALWAYS_REQUIRED = {"route", "deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
+ALWAYS_REQUIRED = {"route"}
+RUNTIME = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-changed", "monorepo-consumer-checks"},
-    "merge_group": ALWAYS_REQUIRED | {"daemon-lifecycle", "check", "coverage-e2e", "coverage-all", "monorepo-consumer-checks"},
-    "push": ALWAYS_REQUIRED | {"build"},
+    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
+    "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
 NATIVE_STEPS = {
@@ -122,7 +123,7 @@ def gate_errors(workflow):
             errors.append(f"{event}: intended skips rejected")
         for name in expected:
             for result in RESULTS:
-                accepted = result == "success" or (result == "skipped" and name not in required)
+                accepted = result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
                 if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
                     errors.append(f"{event}: {name}={result}")
     return errors
@@ -455,6 +456,35 @@ class LifecycleCacheTests(unittest.TestCase):
             git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
             self.assertLess(git_bash, setup, name)
 
+    def test_pi_windows_uses_git_bash_before_any_shell_steps(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['pi-session-paths']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Put Git Bash first on PATH (Windows)'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'cmd')
+        self.assertIn('Git\\bin', setup['run'])
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertTrue(condition(setup['if'], context('merge_group', platform='Windows')))
+        self.assertFalse(condition(setup['if'], context('merge_group', platform='Linux')))
+        for step in steps[:steps.index(setup)]:
+            self.assertNotIn('run', step)
+
+    def test_installer_bootstraps_shell_and_nuget_without_prompting(self):
+        job = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']['install-ps1']
+        steps = job['steps']
+        setup = next((s for s in steps if s.get('name') == 'Prepare PowerShell 7'), None)
+        self.assertIsNotNone(setup)
+        self.assertEqual(setup['shell'], 'powershell')
+        self.assertIn('GITHUB_PATH', setup['run'])
+        self.assertIn('Get-FileHash', setup['run'])
+        pester = next(s for s in steps if s.get('name', '').startswith('Pester ('))
+        self.assertLess(steps.index(setup), steps.index(pester))
+        self.assertIn('Install-PackageProvider -Name NuGet', pester['run'])
+        self.assertLess(pester['run'].index('Install-PackageProvider'), pester['run'].index('Install-Module'))
+        provider = next(line for line in pester['run'].splitlines() if 'Install-PackageProvider' in line)
+        self.assertIn('-Force', provider)
+        self.assertIn('-Scope CurrentUser', provider)
+
     def test_managed_cache_covers_all_routed_runners(self):
         cache = self.step("Configure Depot managed compiler cache")
         self.assertEqual(cache["run"], "python3 scripts/setup-depot-sccache.py")
@@ -665,7 +695,7 @@ class NativeRoutingTests(unittest.TestCase):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
         caller = workflow['jobs']['monorepo-consumer-checks']
         self.assertEqual(caller['permissions'], {'contents': 'read', 'actions': 'read'})
-        self.assertEqual(caller['uses'], 'intent-hq/intent/.github/workflows/consumer-checks.yml@a34c437dbb1b1a355a6018e58f6eb6cbb6272951')
+        self.assertEqual(caller['uses'], 'intent-hq/intent/.github/workflows/consumer-checks.yml@0e12255c6207b474a218e633ec61e9b051d3e990')
         self.assertEqual(caller['secrets'], {'CI_QUEUE_READ_TOKEN': '${{ secrets.CI_QUEUE_READ_TOKEN }}', 'DEPOT_TOKEN': '${{ secrets.DEPOT_TOKEN }}'})
 
     @classmethod
@@ -799,6 +829,47 @@ class NativeRoutingTests(unittest.TestCase):
         workflow["jobs"]["gate"]["needs"].remove("build")
         self.assertIn("gate dependencies changed", gate_errors(workflow))
 
+    def test_auxiliary_native_workflows_cannot_run_on_prs(self):
+        for name in ("windows-setup.yml", "windows-prune.yml", "depot-cache-smoke.yml", "native-reuse-proof.yml"):
+            doc = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+            self.assertNotIn("pull_request", doc.get("on", doc.get(True)), name)
+        cache = yaml.safe_load((ROOT / ".github/workflows/depot-cache-smoke.yml").read_text())
+        self.assertIn("workflow_call", cache.get("on", cache.get(True)))
+        self.assertEqual(self.workflow["jobs"]["cache-smoke"]["uses"], "./.github/workflows/depot-cache-smoke.yml")
+        release = yaml.safe_load((ROOT / ".github/workflows/v-release.yml").read_text())
+        self.assertIn("github.event_name != 'pull_request'", release["jobs"]["build-local-artifacts"]["if"])
+
+    def test_pr_static_does_not_compile_or_install_application_dependencies(self):
+        job = self.workflow["jobs"]["pr-static"]
+        self.assertIn("depot-ubuntu-24.04", job["runs-on"])
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertIn("cargo fmt --all -- --check", commands)
+        self.assertIn("python3 -I -B scripts/test-ci-native-routing.py", commands)
+        self.assertNotRegex(commands, r"cargo (build|check|clippy|test|nextest|llvm-cov)|pnpm install|npm install")
+
+    def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
+        step = next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
+                    if s.get("name") == "Resolve queue base from the event")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stub = root / "git"
+            stub.write_text("#!/bin/sh\ncase \"$1\" in rev-parse) echo \"$TEST_HEAD\" ;; fetch) exit \"$FETCH_STATUS\" ;; *) exit 99 ;; esac\n")
+            stub.chmod(0o755)
+            for base, head, actual, fetch_status, accepted in (
+                ("a"*40, "b"*40, "b"*40, "0", True),
+                ("", "b"*40, "b"*40, "0", False),
+                ("a"*40, "b"*40, "c"*40, "0", False),
+                ("a"*40, "b"*40, "b"*40, "19", False),
+            ):
+                output = root / "env"
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+                    env={**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"],
+                         "QUEUE_BASE_SHA": base, "QUEUE_HEAD_SHA": head, "TEST_HEAD": actual,
+                         "FETCH_STATUS": fetch_status, "GITHUB_ENV": str(output)}, capture_output=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual(output.read_text() if output.exists() else "", "BASE_SHA=" + base + "\n" if accepted else "")
+
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]
         self.assertEqual({row["platform"] for row in job["strategy"]["matrix"]["include"]}, {"macos", "windows"})
@@ -810,7 +881,7 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn('--archives "$NATIVE_ARTIFACT_ROOT"', step["run"])
         self.assertNotIn("if", step)
         self.assertFalse(step.get("continue-on-error", False))
-        for event in ("pull_request", "merge_group"):
+        for event in ("merge_group",):
             workflow = copy.deepcopy(self.workflow)
             gate = next(step for step in workflow["jobs"]["gate"]["steps"] if step.get("name") == "Check results")
             gate["run"] = gate["run"].replace("${{ needs.daemon-lifecycle.result }}", "success")

@@ -1,19 +1,10 @@
 name: Native reuse proof
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/native-*.yml'
-      - 'scripts/ci-*artifacts.py'
-      - 'scripts/ci-artifact-reuse.py'
-      - 'scripts/test-ci-artifact-reuse.py'
-      - 'scripts/ci-artifact-storage.py'
-      - 'scripts/ci-publish-variants.cjs'
-      - '.github/actions/publish-variants/**'
+  merge_group:
 permissions:
   contents: read
   actions: read
-# A second workflow, with the same actual PR merge SHA, exercises the real
+# A second workflow, with the same actual queue merge SHA, exercises the real
 # v3 index/variant storage and lock boundary. Each caller reruns its Linux lint and runtime proofs.
 concurrency:
   group: native-proof-caller-${{ github.ref }}-${{ github.sha }}
@@ -21,13 +12,11 @@ concurrency:
   queue: max
 jobs:
   route:
-    if: github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/runner-route.yml
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
   reuse:
     needs: route
-    if: github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/native-artifacts.yml
     secrets:
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}

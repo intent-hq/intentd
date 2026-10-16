@@ -263,7 +263,9 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_SETUP_EVIDENCE_DIR: ${{ runner.temp }}/setup-headless-evidence
-        run: python3 -I -B scripts/ci-native-artifacts.py libtest --variant daemon --binary intentd::e2e_wss_setup_headless -- --nocapture
+        run: |
+          python3 -I -B scripts/ci-native-artifacts.py libtest --variant pty --binary intent-pty::intent_pty -- conpty_startup::tests --nocapture
+          python3 -I -B scripts/ci-native-artifacts.py libtest --variant daemon --binary intentd::e2e_wss_setup_headless -- --nocapture
       - uses: actions/upload-artifact@v7
         if: always() && steps.native-scope.outputs.event == 'merge_group' && runner.os == 'Windows'
         with:
