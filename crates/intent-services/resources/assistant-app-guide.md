@@ -81,10 +81,13 @@ A failed local server start or restart reports `error` with `lastError`. Fix its
 ## Mac update availability
 
 Current Intent desktop releases for macOS support **Apple Silicon only**; new Intel
-Mac builds are no longer published. Older native Apple Silicon installations can
-discover updates in their selected channel automatically; they do not need a manual
-reinstall just because they use the older update feed. Beta and stable receive a
-release only after it is promoted to that channel.
+Mac builds are no longer published. Existing beta and stable installations discover
+native Apple Silicon updates automatically through the standard Mac feed. These
+channels receive a release only after it is promoted to the respective channel.
+
+Alpha builds that used the temporary ARM-specific feed need a one-time reinstall
+of the Apple Silicon build to return to the standard feed. That temporary feed
+never reached beta or stable.
 
 Intel Macs are unsupported. Do not suggest an Apple Silicon installer for an Intel
 Mac or promise new Intel releases.
