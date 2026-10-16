@@ -179,7 +179,13 @@ checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+Legacy workspace import has been retired. Settings no longer offers the Data import
+section, and a fresh daemon does not discover or import old Electron workspace
+directories. Workspaces already stored in the daemon remain available.
+
+<!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -187,6 +193,12 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+The PR badge in list and board views prioritizes draft PRs, then open PRs
+(including conflicted or queued PRs), then merged and closed PRs. Within the same
+state, it shows the most recently updated available PR. Home's shortened PR list
+keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
+includes the other linked PRs, even when their details are not loaded.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
 
@@ -397,13 +409,16 @@ After confirming recovery, the agent can clear its warning while a release or
 scheduled check is still pending. A recorded blocker notice can remain in the
 conversation after the current warning clears.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
-whose usage limit was reached. For sign-in errors, run the displayed CLI login
-command; signing in to the Claude desktop app does not sign in its CLI. For
-**Agent session corrupted**, retry starts a fresh session and carries over the
-conversation history. Do not promise a model or provider switch unless the UI
-offers it; inspect **Settings → Providers** for setup problems.
+whose usage limit was reached. For sign-in errors, including an expired Claude
+OAuth login, run the displayed CLI login command on the host running the agent,
+complete sign-in, then retry. Signing in to the Claude desktop app does not sign
+in its CLI. For **Agent session corrupted**, retry starts a fresh session and
+carries over the conversation history. Do not promise a model or provider switch
+unless the UI offers it; inspect **Settings → Providers** for setup problems.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 

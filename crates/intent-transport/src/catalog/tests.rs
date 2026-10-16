@@ -191,17 +191,20 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 437;
+// Legacy workspace import removal (15.0): -1 fast-path method.
+// Human workspace discussions (15.1): +2 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 436;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
+/// Protocol 15.1 adds two human workspace discussion methods.
 const EXPECTED_ROUTER_METHODS: usize = 380;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+const EXPECTED_FASTPATH_METHODS: usize = 56;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -859,7 +862,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "stats.getUsage",
     "system.capabilities",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -1391,7 +1393,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "specialist.delete",
     "specialist.edit",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -2582,7 +2583,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "specialist.delete",
         "specialist.edit",
         "system.gitCredential",
-        "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
         "system.startupStatus",
