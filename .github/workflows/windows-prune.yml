@@ -2,12 +2,6 @@ name: Windows CI disk cleanup
 on:
   schedule:
     - cron: "45 11,23 * * *"
-  pull_request:
-    paths:
-      - .github/workflows/windows-prune.yml
-      - .github/workflows/macos-prune.yml
-      - scripts/windows-ci-cleanup.py
-      - scripts/test-windows-ci-cleanup.py
   workflow_dispatch:
     inputs:
       apply:

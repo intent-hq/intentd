@@ -1,17 +1,14 @@
 name: Depot managed cache smoke
 on:
-  pull_request:
-    paths:
-      - 'scripts/setup-depot-sccache.py'
-      - '.github/workflows/depot-cache-smoke.yml'
-      - 'scripts/test-release-cache-smoke.py'
-      - 'rust-toolchain.toml'
   workflow_dispatch:
+  workflow_call:
+    secrets:
+      DEPOT_TOKEN:
+        required: false
 permissions:
   contents: read
 jobs:
   populate:
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     steps:
