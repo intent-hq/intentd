@@ -94,7 +94,7 @@ jobs:
           channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
           echo "CARGO_TARGET_DIR=$USERPROFILE/ci-target/intentd/build-x86_64-pc-windows-msvc" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-09-11
         if: inputs.apply && inputs.verify_build
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
