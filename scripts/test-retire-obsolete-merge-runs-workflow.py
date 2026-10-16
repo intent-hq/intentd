@@ -196,7 +196,7 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
         self.assertEqual(set(ci[True]), {'push', 'pull_request', 'merge_group'})
         self.assertEqual(ci['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}")
         self.assertEqual(set(ci['jobs']['gate']['needs']), {
-            'route',
+            'route', 'pr-static', 'cache-smoke',
             'daemon-lifecycle', 'check', 'build', 'macos-services-runtime', 'coverage-e2e', 'coverage-all',
             'coverage-changed', 'pr-title', 'conflict-markers', 'monorepo-consumer-checks',
             'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths'})

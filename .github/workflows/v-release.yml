@@ -42,6 +42,15 @@ permissions:
 # and marks the promoted version as Latest.
 on:
   pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'dist-workspace.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/*release*.yml'
+      - '.github/workflows/dist-*.yml'
+      - 'scripts/*release*'
+      - 'scripts/*dist*'
   push:
     tags:
       - 'v**[0-9]+.[0-9]+.[0-9]+*'
@@ -132,7 +141,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       [plan, runner-route]
-    if: ${{ needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    if: ${{ github.event_name != 'pull_request' && needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
