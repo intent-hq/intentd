@@ -86,18 +86,10 @@ discover updates in their selected channel automatically; they do not need a man
 reinstall just because they use the older update feed. Beta and stable receive a
 release only after it is promoted to that channel.
 
-An Intel app running under Rosetta on Apple Silicon can update to the native Apple
-Silicon build. If an Intel build contains a compatibility check that treats Rosetta
-as Intel and blocks that transition, a manual Apple Silicon reinstall is needed.
-Do not assume all Rosetta installations have that check or require reinstallation.
-This workaround is only for Apple Silicon hardware.
+Intel Macs are unsupported. Do not suggest an Apple Silicon installer for an Intel
+Mac or promise new Intel releases.
 
-On Intel Macs, clients with the compatibility check reject ARM-only updates. Older
-clients can show an available update and then fail before downloading because no
-compatible Intel ZIP exists; they do not install the ARM build. Do not suggest an
-Apple Silicon installer for an Intel Mac or promise new Intel releases.
-
-<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/cloudlands-fe/.github/workflows/{release-alpha.yml,promote-beta.yml,release-stable.yml}; electron-updater/out/MacUpdater.js (the version pinned by packages/cloudlands-fe/pnpm-lock.yaml). -->
+<!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/cloudlands-fe/.github/workflows/{release-alpha.yml,promote-beta.yml,release-stable.yml}. -->
 
 ## Manage Assistant chats
 
