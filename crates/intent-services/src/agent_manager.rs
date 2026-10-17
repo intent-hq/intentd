@@ -2897,6 +2897,16 @@ pub struct AgentManager {
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
     auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// Agents (with their slot workspace) whose slot holder published the
+    /// terminal `agent:idle` of a completed turn and has admitted no new work
+    /// since. `agent:idle` precedes the worker's post-turn tail, slot release
+    /// and `RuntimeIdle` write, so neither busy-slot membership nor the
+    /// persisted status tells graceful shutdown that a turn is unfinished.
+    /// Set by [`AgentManager::mark_turn_settled_if_slot_held`]; cleared by
+    /// every slot claim, every new unit of work the holder takes on, and the
+    /// holder's own completed `end_turn` write. Shutdown persists the idle
+    /// status for any remaining entry instead of recording an interruption.
+    settled_turns: Mutex<HashMap<AgentId, WorkspaceId>>,
     /// Armed by [`AgentManager::arm_send_now_handback_gate`]; see
     /// [`HandbackGate`].
     #[cfg(test)]
@@ -3012,6 +3022,7 @@ impl AgentManager {
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            settled_turns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
@@ -6896,6 +6907,8 @@ impl AgentManager {
         // slot it kept is cleared like any other orphan.
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
+        // A new claim owns unfinished work until its own turn settles.
+        self.settled_turns.lock().unwrap().remove(agent_id);
         busy.insert(agent_id.clone());
         let admission = TurnAdmission(self.next_admission.fetch_add(1, AtomicOrdering::Relaxed));
         self.turn_admissions
@@ -7220,6 +7233,46 @@ impl AgentManager {
         }
     }
 
+    /// Record that the current slot holder completed its turn and published
+    /// its terminal `agent:idle`. Decided under the `busy` lock (lock order
+    /// busy → `settled_turns`, matching [`Self::claim_slot_sync`]) so a mark
+    /// can never outlive into a later claim's unfinished work.
+    pub(crate) fn mark_turn_settled_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if !busy.contains(agent_id) {
+            return;
+        }
+        let workspace_id = self.agent_ws.lock().unwrap().get(agent_id).cloned();
+        if let Some(workspace_id) = workspace_id {
+            self.settled_turns
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone(), workspace_id);
+        }
+    }
+
+    /// The slot holder is taking on new work (a drained entry, a redrive or
+    /// warning turn, or the next loop iteration): shutdown must again treat
+    /// it as interrupted. Synchronous, so a worker abort cannot land between
+    /// committing the work and clearing the mark.
+    fn clear_turn_settled(&self, agent_id: &AgentId) {
+        self.settled_turns.lock().unwrap().remove(agent_id);
+    }
+
+    fn turn_settled(&self, agent_id: &AgentId) -> bool {
+        self.settled_turns.lock().unwrap().contains_key(agent_id)
+    }
+
+    /// The released holder durably wrote `RuntimeIdle`; shutdown has nothing
+    /// left to settle. A newer claim already cleared (and may re-mark) the
+    /// entry, so only an unclaimed slot's mark is retired here.
+    fn retire_turn_settled_if_slot_free(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if !busy.contains(agent_id) {
+            self.settled_turns.lock().unwrap().remove(agent_id);
+        }
+    }
+
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
@@ -7233,6 +7286,7 @@ impl AgentManager {
             self.services.agent_activity_end(&workspace_id);
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;
+            self.retire_turn_settled_if_slot_free(agent_id);
         }
     }
 
@@ -10840,6 +10894,21 @@ impl AgentManager {
             let _ = worker.await;
         }
         self.services.persist_shutdown_drains().await;
+        // A settled holder aborted after releasing its slot but before its
+        // `RuntimeIdle` write is outside `in_flight`; finish that write so the
+        // next startup heal does not mistake the completed turn for a crash.
+        let settled_released: Vec<(AgentId, WorkspaceId)> = self
+            .settled_turns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| !in_flight.iter().any(|(busy, _)| busy == *id))
+            .map(|(id, ws)| (id.clone(), ws.clone()))
+            .collect();
+        for (id, workspace_id) in &settled_released {
+            self.persist_status(id, workspace_id, AgentStatus::RuntimeIdle, false)
+                .await;
+        }
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
         let now = intent_core::now_iso();
@@ -10863,11 +10932,22 @@ impl AgentManager {
             self.services
                 .flush_pinned_turn_on_interruption(id, InterruptReason::DaemonShutdown, None)
                 .await;
+            // Workers are joined, so the mark is final. A holder that already
+            // published its completed turn's `agent:idle` and admitted no new
+            // work is only finishing post-turn bookkeeping: recording it would
+            // make the next startup deliver a second continuation.
+            if self.turn_settled(id) {
+                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no interrupted_agent row");
+                self.persist_status(id, workspace_id, AgentStatus::RuntimeIdle, false)
+                    .await;
+                continue;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
-            // shutdown in that window may read Pending. Busy-set membership is authoritative:
-            // if the agent is in busy, it's mid-turn regardless of the persisted status.
+            // shutdown in that window may read Pending. Busy-set membership without a
+            // settled mark is authoritative: the agent is mid-turn regardless of the
+            // persisted status.
             let prev_status = match self.services.store.get_agent_session_status(id).await {
                 Ok(status) => status,
                 Err(e) => {
@@ -12864,6 +12944,8 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        // Every iteration drives new work for the held slot.
+        mgr.clear_turn_settled(&agent_id);
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
                 // Keep the qualified turn future out of the ordinary worker frame.
@@ -13626,6 +13708,7 @@ async fn run_message_worker(
                 .services
                 .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
+                mgr.clear_turn_settled(&agent_id);
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
@@ -13647,6 +13730,7 @@ async fn run_message_worker(
             }
         }
         if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
+            mgr.clear_turn_settled(&agent_id);
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
@@ -14291,6 +14375,9 @@ async fn persist_user(
     turn_id: Option<&str>,
     user_origin: bool,
 ) -> bool {
+    // A persisted user row is new work for the held slot (drain, redrive
+    // nudge, or warning turn); clear before the first await.
+    mgr.clear_turn_settled(agent_id);
     #[cfg(test)]
     {
         let pause = mgr.user_persist_pause.lock().unwrap().take();
