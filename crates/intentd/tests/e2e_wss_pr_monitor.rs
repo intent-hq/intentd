@@ -18,6 +18,8 @@ mod ancestry;
 mod common;
 #[path = "../../intent-sourcecontrol/tests/support/qwen.rs"]
 mod qwen;
+#[path = "e2e_wss_pr_monitor/registration_visibility.rs"]
+mod registration_visibility;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
