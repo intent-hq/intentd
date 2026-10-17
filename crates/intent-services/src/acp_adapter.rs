@@ -269,10 +269,13 @@ impl AcpAdapterCommand {
     ) -> Result<Self, String> {
         // A context discovered without this command's profile gets it here,
         // before the account home is read for isolation.
-        let context = if context.profile().is_none() {
-            context.with_profile(self.profile.clone())
-        } else {
-            context
+        let context = match (context.profile(), self.profile.clone()) {
+            (None, Some(profile)) => {
+                tokio::task::spawn_blocking(move || context.with_profile(Some(profile)))
+                    .await
+                    .map_err(|_| "installed CLI profile task failed")?
+            }
+            _ => context,
         };
         let cli = context.runtime.cli();
         self.installed_cli = Some(cli);
