@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.6] - 2026-10-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Updated the following local packages: intent-core, intent-core, intent-git, intent-js, intent-providers, intent-providers, intent-acp, intent-acp, intent-context, intent-linear, intent-sentry, intent-sourcecontrol, intent-sourcecontrol, intent-store, intent-store, intent-services, intent-services, intent-transport
+
+
 ## [0.11.5] - 2026-10-17
 
 
