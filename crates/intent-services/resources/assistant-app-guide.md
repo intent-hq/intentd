@@ -110,8 +110,9 @@ recover a chat after deletion has completed.
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
 the workspace creation form where offered. Available choices depend on configured
-providers; diagnose a missing provider in **Providers**. Do not promise a default
-change will switch an existing agent. Specialist entries appear
+providers; diagnose a missing provider in **Providers**. Changing a default provider
+or model affects new agents only; each existing agent keeps its own provider, model
+and reasoning level until changed in its own model picker. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
 `/settings?tab=specialists&view=create-specialist#create-specialist`; select an
 existing specialist to edit its behavior. Global defaults and a specialist's
