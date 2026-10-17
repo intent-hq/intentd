@@ -51,6 +51,46 @@ fn legacy_alias_lookup_retains_unknown_provider_distinction() {
     }
 }
 
+/// A well-formed profile reference names its base provider's static
+/// configuration (never the auggie fallback); `find_provider` stays strict so
+/// front doors cannot mistake a reference for a registered id.
+#[test]
+fn profile_references_resolve_to_their_base_configuration() {
+    assert_eq!(
+        split_profile_ref("codex@p3k9x2m4q7t1a"),
+        Some(("codex", "p3k9x2m4q7t1a"))
+    );
+    assert_eq!(
+        split_profile_ref("claude-code@work-1"),
+        Some(("claude-code", "work-1"))
+    );
+    for reference in ["codex@p1", "claude-code@p1"] {
+        let base = base_provider_id(reference);
+        assert_eq!(provider_config(reference).id, base);
+        assert_eq!(find_provider_or_legacy_alias(reference).unwrap().id, base);
+        assert!(find_provider(reference).is_none(), "{reference}");
+    }
+    for malformed in [
+        "codex",
+        "codex@",
+        "codex@P1",
+        "codex@-p1",
+        "codex@p1@p2",
+        "codex@ p1",
+        " codex@p1",
+        "Codex@p1",
+        "auggie@p1",
+        "acp@p1",
+        "grok@p1",
+        "codex@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(split_profile_ref(malformed).is_none(), "{malformed}");
+        assert_eq!(base_provider_id(malformed), malformed);
+    }
+    assert!(find_provider_or_legacy_alias("auggie@p1").is_none());
+    assert_eq!(base_provider_id("codex"), "codex");
+}
+
 #[test]
 fn unknown_provider_fallback_warn_gate() {
     // Fallback behavior is preserved for every suppressed alias and for
