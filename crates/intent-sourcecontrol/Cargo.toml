@@ -25,7 +25,7 @@ hyper-timeout = "0.5"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 tower = { version = "0.5", features = ["util", "retry"] }
-tower-http = { version = "0.6", features = ["follow-redirect"] }
+tower-http = { version = "0.7", features = ["follow-redirect"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
