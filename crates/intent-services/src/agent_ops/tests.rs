@@ -17840,7 +17840,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
         .await
         .expect("plan while auggie is enabled and authenticated");
     assert_eq!(plan.model.as_deref(), Some("sonnet4.5"));
-    assert_eq!(plan.provider.as_deref(), Some("auggie"));
+    assert_eq!(plan.provider, "auggie");
     assert_eq!(plan.reasoning_effort.as_deref(), Some("high"));
 
     // Demote the planned provider on both create-seam gates between plan and

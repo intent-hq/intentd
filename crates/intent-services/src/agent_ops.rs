@@ -410,6 +410,8 @@ mod tests_specialist_frontmatter;
 #[cfg(test)]
 mod tests_creation_preferences;
 #[cfg(test)]
+mod tests_identity_pin;
+#[cfg(test)]
 mod tests_specialist_provider;
 
 #[cfg(test)]
@@ -494,6 +496,11 @@ pub(crate) enum DefaultModelSource {
 /// provider / model / effort gate has passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateModelAndEffort {
+    /// The effective provider the session spawns on, always pinned on the
+    /// row: an explicit caller / specialist provider, else the
+    /// settings-derived default at create time. A session never follows a
+    /// later `model.defaultProvider` change.
+    pub(crate) provider: String,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
 }
@@ -534,7 +541,8 @@ pub(crate) struct AgentCreatePlan {
     /// Canonical specialist id (alias already rewritten).
     pub(crate) specialist: Option<String>,
     pub(crate) model: Option<String>,
-    pub(crate) provider: Option<String>,
+    /// Always pinned (never inherited from a later default change).
+    pub(crate) provider: String,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) metadata: Option<Value>,
     pub(crate) delegation_depth: Option<i64>,
@@ -4746,9 +4754,14 @@ impl Services {
         // provider (auggie), installed or not.
         let derived_default =
             crate::agent_session::derived_default_provider(&self.effective_settings());
-        if provider.is_none() && derived_default.is_none() {
+        // Every session pins its effective provider (caller / specialist
+        // pin → the settings-derived default at create time); a NULL
+        // provider column is a legacy row the turn-start repair handles.
+        let Some(effective_provider) =
+            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
+        else {
             return Err(crate::agent_session::no_default_provider_error(method));
-        }
+        };
         // monorepo#3178: the provider this session would spawn on must not be
         // one the user explicitly disabled in `providers.enabled` — fail fast
         // with the distinct "not enabled" -32602 before any session row is
@@ -4763,20 +4776,16 @@ impl Services {
         // Explicit/default-provider direct creates keep their existing
         // spawn-time installed-ness check. A derived specialist pin is
         // already checked by `plan_agent_create`, like delegation.
-        if let Some(p) =
-            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
-        {
-            ensure_provider_enabled(
-                method,
-                &p,
-                self.effective_settings().providers.enabled.as_ref(),
-            )?;
-            ensure_provider_authenticated(
-                method,
-                &p,
-                crate::provider_auth::cached_auth_verdict(&p),
-            )?;
-        }
+        ensure_provider_enabled(
+            method,
+            &effective_provider,
+            self.effective_settings().providers.enabled.as_ref(),
+        )?;
+        ensure_provider_authenticated(
+            method,
+            &effective_provider,
+            crate::provider_auth::cached_auth_verdict(&effective_provider),
+        )?;
         // A bare model that provably belongs to a different provider (cached
         // dynamic catalogs) must not be persisted: the spawn would feed the
         // effective provider another provider's model id (monorepo#607). The
@@ -4793,9 +4802,7 @@ impl Services {
         // until settings change; drop it to the CLI default instead
         // (session.model stays None).
         if let Some(m) = resolved_model.as_deref() {
-            let effective = provider
-                .or(derived_default.as_deref())
-                .expect("guarded above: provider or derived default present");
+            let effective = effective_provider.as_str();
             match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
                 Ok(()) => {}
                 Err(e) if model_explicit => return Err(e),
@@ -4812,6 +4819,20 @@ impl Services {
                 }
             }
         }
+        // A dropped mismatched default still pins a concrete model when the
+        // provider's cached catalog names its `isDefault` row (the same
+        // cache-only step 4 the resolver runs). A cold cache leaves the model
+        // unset; the first session open then pins the provider's reported
+        // current model (`Services::fill_identity_from_session_open`).
+        if resolved_model.is_none() {
+            if let Some(m) = self
+                .cached_models()
+                .cached_default_model(&effective_provider)
+            {
+                resolved_model = Some(m);
+                model_source = DefaultModelSource::CatalogDefault;
+            }
+        }
         // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
         // `agent.create` naming a specialist consults the same model-option >
         // frontmatter order as delegation, keyed on the model that was
@@ -4826,9 +4847,7 @@ impl Services {
             // pool (monorepo#4148).
             let services = self.clone();
             let specialist = specialist.map(str::to_string);
-            let effective_provider = provider
-                .map(str::to_string)
-                .or_else(|| derived_default.clone());
+            let effective_provider = Some(effective_provider.clone());
             let resolved_model = resolved_model.clone();
             let spec_wp = spec_wp.map(Path::to_path_buf);
             tokio::task::spawn_blocking(move || {
@@ -4867,6 +4886,7 @@ impl Services {
             resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
         Ok(CreateModelAndEffort {
+            provider: effective_provider,
             model: resolved_model,
             reasoning_effort,
         })
@@ -5133,8 +5153,9 @@ impl Services {
 
         // With neither caller choice supplied, honor the specialist's
         // provider before resolving its model/effort. Explicit model-only
-        // creates deliberately retain the settings-provider behavior, as
-        // they do in delegate. Persist the effective pin in the plan so
+        // creates deliberately resolve on the settings default provider, as
+        // they do in delegate — which the plan then pins on the row, like
+        // every other effective provider. Persist the effective pin so
         // spawn and previews use the same pair; reject unusable pins here,
         // before even workspace.create's workspace row can be written.
         let provider = if provider.is_none() && model.is_none() && specialist.is_some() {
@@ -5165,6 +5186,7 @@ impl Services {
         // model only via explicit agent.setModel. The provider / model /
         // reasoning-effort chain is the last `-32602` producer of the plan.
         let CreateModelAndEffort {
+            provider,
             model: resolved_model,
             reasoning_effort,
         } = self
@@ -5362,7 +5384,7 @@ impl Services {
             model: resolved_model,
             reasoning_effort,
             effort_levels: None,
-            provider,
+            provider: Some(provider),
             system_prompt: None,
             specialist,
             // Reference parity: `agent-factory.ts:435` persists `AgentStatus.Idle`
@@ -5581,28 +5603,30 @@ impl Services {
             // dynamic catalogs) is the same misroute vector (monorepo#607).
             // With neither set the session could never spawn — fail loudly
             // instead of validating against a positional default
-            // (monorepo#3044).
-            let derived;
-            let effective = if let Some(p) = session.provider.as_deref().filter(|p| !p.is_empty()) {
-                p
-            } else {
-                derived =
-                    crate::agent_session::derived_default_provider(&self.effective_settings())
-                        .ok_or_else(|| {
-                            crate::agent_session::no_default_provider_error("agent.setModel")
-                        })?;
-                derived.as_str()
+            // (monorepo#3044). A legacy session (NULL provider) validates
+            // against — and is pinned onto — the provider its last turn ran
+            // (`legacy_session_provider`), never left following the default.
+            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => p.to_string(),
+                None => crate::agent_session::legacy_session_provider(
+                    self,
+                    &session.workspace_id,
+                    &agent_id,
+                )
+                .await
+                .ok_or_else(|| crate::agent_session::no_default_provider_error("agent.setModel"))?,
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
                 &self.cached_models(),
-                effective,
+                &effective,
                 &model_id,
             )?;
-            None
+            Some(effective)
         };
-        // Reconcile the provider to the explicit providerId (models without
-        // one keep the session's provider). The
+        // Reconcile the provider to the explicit providerId, else pin the
+        // effective provider the model was just validated against (so a
+        // legacy NULL provider never survives a setModel). The
         // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
@@ -5610,7 +5634,7 @@ impl Services {
         // `update_agent_session`'s immutability guard (monorepo#882); the
         // next turn then respawns the new provider's binary, opens a fresh
         // `session/new`, and replays history as `<supervisor>` XML.
-        let provider = model_provider.or(session.provider);
+        let provider = model_provider;
         let workspace_id = session.workspace_id;
         self.store
             .set_agent_session_model(
