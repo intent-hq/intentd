@@ -5,6 +5,106 @@ use MonitorTargetProvenance::{CapturedRequest, LegacyGithubWriter};
 use RepositoryProvider::{Github, Gitlab};
 use RepositoryResourceKind::{Issue, MergeRequest, PullRequest};
 
+#[tokio::test]
+async fn registration_repair_guards_lifecycle_and_target_evidence() {
+    for change in [
+        "state='cancelled'",
+        "state='completed'",
+        "updated_at='newer'",
+        "agent_id='b'",
+        "target_unresolved_reason='unverified-import'",
+        "target_provider='github'",
+    ] {
+        let (_dir, store) = store().await;
+        let old = monitor("repair");
+        store.insert_pr_monitor(&old).await.unwrap();
+        sqlx::query(&format!(
+            "UPDATE pr_monitor SET {change} WHERE monitor_id='repair'"
+        ))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        let before = original_bytes(store.read_pool(), "repair").await;
+        let result = store
+            .rearm_legacy_pr_monitor(
+                &old,
+                &old.agent_id,
+                &gh(),
+                Some("new baseline"),
+                "new time",
+                None,
+            )
+            .await;
+        assert!(!matches!(result, Ok(true)), "must not overwrite {change}");
+        assert_eq!(original_bytes(store.read_pool(), "repair").await, before);
+        assert!(matches!(
+            store
+                .get_qualified_pr_monitor(&old.monitor_id)
+                .await
+                .unwrap()
+                .target(),
+            PersistedMonitorTarget::Unresolved { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn registration_repair_sets_target_and_baseline_in_one_guarded_write() {
+    let (_dir, store) = store().await;
+    let old = monitor("repair");
+    store.insert_pr_monitor(&old).await.unwrap();
+    let new_owner = AgentId("b".into());
+    let pause = pr_monitor_pause_error(Some("2030-01-01T00:00:00Z"));
+    store
+        .annotate_active_pr_monitors_pause(&pause)
+        .await
+        .unwrap();
+    assert!(store
+        .rearm_legacy_pr_monitor(
+            &old,
+            &new_owner,
+            &gh(),
+            None,
+            "2026-10-16T09:00:00Z",
+            Some(&pause)
+        )
+        .await
+        .unwrap());
+    let captured = store
+        .get_qualified_pr_monitor(&old.monitor_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        captured.target(),
+        PersistedMonitorTarget::Resolved {
+            provenance: LegacyGithubWriter,
+            ..
+        }
+    ));
+    let row = captured.monitor();
+    assert_eq!(row.agent_id, new_owner);
+    assert_eq!(row.created_at, old.created_at);
+    assert!(row.last_snapshot.is_none());
+    assert!(row.baseline_snapshot.is_none());
+    assert!(row.pending_changes.is_empty());
+    assert!(row.pending_since.is_none());
+    assert!(row.last_change_at.is_none());
+    assert!(row.last_polled_at.is_none());
+    assert_eq!(row.last_error.as_deref(), Some(pause.as_str()));
+    assert!(!store
+        .rearm_legacy_pr_monitor(
+            &old,
+            &old.agent_id,
+            &gh(),
+            Some("stale"),
+            "2026-10-16T09:01:00Z",
+            None
+        )
+        .await
+        .unwrap());
+    assert_eq!(store.get_pr_monitor(&old.monitor_id).await.unwrap(), *row);
+}
+
 async fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("monitors.db")).await.unwrap();

@@ -196,6 +196,7 @@ mod tests {
                 priority,
                 bulk,
                 shutdown: None,
+                recovery: crate::conn::recovery::Output::default(),
             },
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), api.entered.notified())
@@ -280,6 +281,7 @@ mod tests {
                     priority,
                     bulk,
                     shutdown: None,
+                    recovery: crate::conn::recovery::Output::default(),
                 },
             ));
             let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())

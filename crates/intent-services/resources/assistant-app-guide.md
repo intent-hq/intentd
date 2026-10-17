@@ -430,6 +430,13 @@ in its CLI. For **Agent session corrupted**, retry starts a fresh session and
 carries over the conversation history. Do not promise a model or provider switch
 unless the UI offers it; inspect **Settings → Providers** for setup problems.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/provider_auth.rs; packages/intentd/crates/intent-core/src/{path_utils.rs,cli_env.rs}. -->
+
+Claude authentication checks also use exported credentials from the execution
+host's login shell, including `CLAUDE_CODE_OAUTH_TOKEN`. Restart that host's
+daemon after changing shell exports so it reloads them; an existing daemon
+environment value takes precedence. Never paste tokens into chat.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
 Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies
@@ -438,6 +445,20 @@ If Pi works in a terminal but fails in Intent, copy the conversation's failure
 details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
+
+## Missed display updates
+
+<!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
+
+When the app and connected daemon support recovery, detected gaps in state
+updates trigger a refresh of affected visible data. Inactive cached views refresh
+when next used. Recovery respects current access; it does not repeat commands or
+replay notifications, chat transcripts, or terminal output. Temporary terminal
+directory, title, and command indicators may clear until live updates resume.
+
+Older daemons retain their existing reconnect and refresh behavior; do not promise
+recovery from a missed final update. If a view stays stale, use its refresh action
+where available or reconnect, and check the app and daemon versions.
 
 ## Restore workspace browser use
 

@@ -277,7 +277,29 @@ struct ClaudeCliStatus {
 /// identity. The shared wrapper discards the identity so `intentd doctor`
 /// keeps its verdict-only view.
 async fn check_claude_code_auth_cli(program: &OsStr, auth_check_args: &[&str]) -> ClaudeCliStatus {
-    let mut cmd = probe_command(program);
+    // Services/GUI launches may inherit no shell credentials. Use the same
+    // cached shell inputs and provider allow-list as installed Claude launches;
+    // inherited values (including empty or non-Unicode ones) still win. The
+    // first shell capture can block, so keep it off the async executor.
+    let program = program.to_owned();
+    let Ok(mut cmd) = tokio::task::spawn_blocking(move || {
+        let mut cmd = probe_command(&program);
+        for (key, value) in intent_core::path_utils::login_shell_credential_env() {
+            if intent_providers::installed_cli::InstalledCli::Claude.accepts_env(key)
+                && std::env::var_os(key).is_none()
+            {
+                cmd.env(key, value);
+            }
+        }
+        cmd
+    })
+    .await
+    else {
+        return ClaudeCliStatus {
+            probe: CliAuthProbe::Failed,
+            identity: None,
+        };
+    };
     cmd.args(auth_check_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -291,6 +291,12 @@ fn terminal_cursor(data: &Value, byte_len: usize) -> TerminalCursor<'_> {
 }
 
 impl EventItem {
+    pub(crate) fn event(&self) -> &Event {
+        match self {
+            Self::Latest(event) | Self::Terminal { event, .. } => event,
+        }
+    }
+
     /// Wrap a conflatable bus event for buffering, per its key kind.
     pub(crate) fn new(key: &Key, event: Event) -> Self {
         match key {
