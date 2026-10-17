@@ -225,12 +225,21 @@ mod tests {
         blocker
     }
 
+    /// The intentional internal acquisition timeout. It also covers opening the
+    /// scenario connection before its guarded PRAGMA blocks, so it is far above
+    /// loaded-host connect latency while staying below `SCENARIO_BUSY_TIMEOUT`.
+    const SCENARIO_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// The scenario connection waits in `SQLite`'s busy handler until the test
+    /// commits its blocker, not until a production-sized busy window expires.
+    const SCENARIO_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// Stretches fixture setup past the scenario's acquisition budget. The delay
     /// only lengthens setup, so it cannot make a correct fixture fail under load.
-    const SLOW_SETUP_HOLD: Duration = Duration::from_millis(300);
+    const SLOW_SETUP_HOLD: Duration = Duration::from_millis(1500);
 
-    /// Setup budget, kept separate from the scenario's 100 ms acquisition timeout
-    /// and well above `SLOW_SETUP_HOLD` and loaded-host connect latency.
+    /// Setup budget, separate from the scenario budget and well above
+    /// `SLOW_SETUP_HOLD` and loaded-host connect latency.
     const SETUP_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
     async fn internal_timeout_retains_worker(read: bool, slow_setup: bool) {
@@ -242,7 +251,7 @@ mod tests {
         let lock = directory.path().join("timeout.db.daemon.lock");
         let owner = Arc::new(crate::daemon_ownership::DaemonOwnership::acquire(&lock).unwrap());
         let weak_owner = Arc::downgrade(&owner);
-        let timeout = Duration::from_millis(100);
+        let setup_started = std::time::Instant::now();
         let setup_blocker = if slow_setup {
             let mut blocker = exclusive_blocker(&db).await;
             Some(tokio::spawn(async move {
@@ -253,9 +262,9 @@ mod tests {
         } else {
             None
         };
-        // Fixture setup runs the production connect path (eager connection and
-        // owned initialization PRAGMAs) under a budget that host load cannot
-        // plausibly exhaust. Only the intentional acquisition below is timed.
+        // Fixture setup runs the production connect path, whose eager connection
+        // runs the owned initialization PRAGMAs (the positive control), under a
+        // budget that host load cannot plausibly exhaust.
         let setup_raw = if read {
             crate::connect_read_owned_timeout(&db, Some(owner.clone()), SETUP_ACQUIRE_TIMEOUT)
                 .await
@@ -269,46 +278,40 @@ mod tests {
             release
                 .await
                 .expect("fixture setup: slow-setup blocker released");
+            // The lock was held before setup began, so setup outlasted the
+            // scenario budget whether or not it reached a PRAGMA before release.
+            assert!(setup_started.elapsed() > SCENARIO_ACQUIRE_TIMEOUT);
         }
-        // Positive control: the owned configuration initializes when unblocked.
-        let setup = StorePool::new(setup_raw.clone(), true);
-        setup
-            .acquire()
-            .await
-            .expect("fixture setup: owned acquisition succeeds while unblocked")
-            .close()
-            .await
-            .unwrap();
         // Same pool options (including the owned after_connect hook) and connect
-        // options (including the ownership collation), with only the scenario
-        // budget changed. A lazy pool opens nothing until the timed acquisition.
+        // options (including the ownership collation); only the scenario budget
+        // and busy window differ. A lazy pool opens nothing until the timed
+        // acquisition.
         let pool = StorePool::new(
             setup_raw
                 .options()
                 .clone()
-                .acquire_timeout(timeout)
-                .connect_lazy_with((*setup_raw.connect_options()).clone()),
+                .acquire_timeout(SCENARIO_ACQUIRE_TIMEOUT)
+                .connect_lazy_with(
+                    (*setup_raw.connect_options())
+                        .clone()
+                        .busy_timeout(SCENARIO_BUSY_TIMEOUT),
+                ),
             true,
         );
-        setup.close().await;
-        drop((setup, setup_raw));
-        assert_eq!(pool.options().get_acquire_timeout(), timeout);
         assert_eq!(
             pool.options().get_max_connections(),
-            if read { 32 } else { 1 }
+            setup_raw.options().get_max_connections()
         );
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            SCENARIO_ACQUIRE_TIMEOUT
+        );
+        setup_raw.close().await;
+        drop(setup_raw);
         // No idle connection: the timed acquisition must open and initialize one.
         assert_eq!(pool.size(), 0);
         drop(owner);
-        let mut blocker = sqlx::SqliteConnection::connect_with(
-            &sqlx::sqlite::SqliteConnectOptions::new().filename(&db),
-        )
-        .await
-        .unwrap();
-        sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
-            .execute(&mut blocker)
-            .await
-            .unwrap();
+        let mut blocker = exclusive_blocker(&db).await;
         let result = pool.acquire().await;
         assert!(
             matches!(result, Err(sqlx::Error::PoolTimedOut)),
@@ -318,18 +321,17 @@ mod tests {
         // The acquisition and facade are gone, but SQLite is still busy inside
         // its guarded initialization PRAGMA. Check the actual OS lease as well
         // as eventual destructor release; do not keep a strong test owner alive.
-        assert!(weak_owner.upgrade().is_some());
+        assert!(
+            weak_owner.upgrade().is_some(),
+            "blocked initialization worker must retain the lease after the internal timeout"
+        );
         assert!(crate::daemon_ownership::DaemonOwnership::acquire(&lock).is_err());
         sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
         blocker.close().await.unwrap();
         // The worker thread drops the last strong reference when SQLite closes the
         // connection. Arc reports no strong owners just before that thread runs
-        // the destructor that unlocks the file, so wait for both observable
-        // effects: the Arc released, then the OS lease released.
+        // the destructor that unlocks the file, so wait on the OS lease itself.
         let reacquired = tokio::time::timeout(Duration::from_secs(10), async {
-            while weak_owner.upgrade().is_some() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
             loop {
                 if let Ok(owner) = crate::daemon_ownership::DaemonOwnership::acquire(&lock) {
                     break owner;
@@ -339,6 +341,7 @@ mod tests {
         })
         .await
         .expect("initialization worker must eventually release the lease");
+        assert!(weak_owner.upgrade().is_none());
         drop(reacquired);
     }
 
