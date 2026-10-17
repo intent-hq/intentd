@@ -426,7 +426,8 @@ mod tests_catalog_default_model;
 /// was removed in monorepo#1000; the background-agent tier was removed in
 /// monorepo#1729 — the renamed `quickActions.*` keys scope to single-shot
 /// quick actions and never to agent sessions, delegated ones included):
-/// 1. `model.providerDefaults[resolved provider]`
+/// 1. `model.providerDefaults[resolved provider]` (for a profile reference,
+///    then `model.providerDefaults[base provider]`)
 /// 2. `model.default`
 /// 3. None → CLI default (current behavior, last resort)
 ///
@@ -450,9 +451,17 @@ fn resolve_default_model_from_settings(
         derived = crate::agent_session::derived_default_provider(&settings);
         derived.as_deref()
     };
-    if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
-        if !model.is_empty() {
-            return Some(model.clone());
+    // A profile reference walks its own key, then its base provider's
+    // (PROTOCOL §5.54); a bare id has a single key.
+    let keys = provider_key.into_iter().flat_map(|k| {
+        let base = intent_providers::base_provider_id(k);
+        std::iter::once(k).chain((base != k).then_some(base))
+    });
+    for key in keys {
+        if let Some(model) = settings.model.provider_defaults.get(key) {
+            if !model.is_empty() {
+                return Some(model.clone());
+            }
         }
     }
 
@@ -741,6 +750,22 @@ pub(crate) fn ensure_known_provider(method: &str, provider_id: &str) -> Result<(
     Ok(())
 }
 
+impl Services {
+    /// Front-door provider validation for every selection path (create,
+    /// setModel, delegate, specialist pins, the settings default): a bare id
+    /// must be registered ([`ensure_known_provider`]); a profile reference
+    /// must name a saved, enabled profile
+    /// ([`Services::ensure_provider_ref_selectable`]) and fails with
+    /// `provider-profile-replacement-required` otherwise — never falling back
+    /// to the bare base (PROTOCOL §5.54).
+    pub(crate) fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
+        if crate::provider_profiles::is_qualified_ref(provider_id) {
+            return self.ensure_provider_ref_selectable(provider_id);
+        }
+        ensure_known_provider(method, provider_id)
+    }
+}
+
 /// Reject a bare model id that provably belongs to a different provider with
 /// `-32602` (`InvalidParams`). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
@@ -936,7 +961,7 @@ fn resolve_delegate_provider(
 
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
-            ensure_known_provider("agent.delegate", &derived)?;
+            services.ensure_selectable_provider("agent.delegate", &derived)?;
             ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
             Ok(Some(derived))
         }
@@ -962,7 +987,7 @@ fn resolve_specialist_provider(
             .resolve_coding_agent(id, workspace_path)
     });
     if let Some(provider) = provider.as_deref() {
-        ensure_known_provider(method, provider)?;
+        services.ensure_selectable_provider(method, provider)?;
         ensure_provider_available(method, provider, &services.effective_settings().providers)?;
     }
     Ok(provider)
@@ -984,7 +1009,9 @@ pub(crate) fn resolve_delegate_provider_preview(
     definition: &serde_json::Value,
 ) -> Option<String> {
     if let Some(provider_id) = crate::specialists::config_scalar(definition, "codingAgent") {
-        if intent_providers::find_provider(provider_id).is_some() {
+        if intent_providers::find_provider(provider_id).is_some()
+            || intent_providers::split_profile_ref(provider_id).is_some()
+        {
             return Some(provider_id.to_string());
         }
     }
@@ -1022,7 +1049,7 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    intent_providers::find_provider(provider_id)
+    intent_providers::find_provider(intent_providers::base_provider_id(provider_id))
         .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
 }
 
@@ -1110,9 +1137,11 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    let availability = intent_providers::provider_availability_for(provider_id, &|key| {
-        providers.paths.get(key).cloned()
-    });
+    // A profile shares its base provider's installation and paths.
+    let availability = intent_providers::provider_availability_for(
+        intent_providers::base_provider_id(provider_id),
+        &|key| providers.paths.get(key).cloned(),
+    );
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
@@ -4737,7 +4766,7 @@ impl Services {
         // silently spawn the default binary. Absent provider (defaulting)
         // remains valid.
         if let Some(p) = provider {
-            ensure_known_provider(method, p)?;
+            self.ensure_selectable_provider(method, p)?;
         }
         // monorepo#3044: with no explicit provider and no settings-derived
         // default, no spawn provider could ever resolve for this session.
@@ -4766,16 +4795,25 @@ impl Services {
         if let Some(p) =
             crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
         {
+            // A profile default (or explicit reference) must still name a
+            // saved, enabled profile: never persist a session that would run
+            // the base's Default account (PROTOCOL §5.54).
+            self.ensure_provider_ref_selectable(&p)?;
             ensure_provider_enabled(
                 method,
                 &p,
                 self.effective_settings().providers.enabled.as_ref(),
             )?;
-            ensure_provider_authenticated(
-                method,
-                &p,
-                crate::provider_auth::cached_auth_verdict(&p),
-            )?;
+            // A profile is gated on its own saved settings' verdict, never
+            // the base provider's Default verdict.
+            let verdict = if crate::provider_profiles::is_qualified_ref(&p) {
+                Box::pin(self.resolve_profile_env(&p))
+                    .await?
+                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
+            } else {
+                crate::provider_auth::cached_auth_verdict(&p)
+            };
+            ensure_provider_authenticated(method, &p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
         // dynamic catalogs) must not be persisted: the spawn would feed the
@@ -5511,7 +5549,7 @@ impl Services {
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).
         if let Some(pid) = provider_id.as_deref() {
-            ensure_known_provider("agent.setModel", pid)?;
+            self.ensure_selectable_provider("agent.setModel", pid)?;
         }
         let model_provider = if let Some(pid) = provider_id {
             // Explicit providerId: ownership is validated against the GIVEN
@@ -5561,7 +5599,7 @@ impl Services {
                 .provider
                 .as_deref()
                 .filter(|p| !p.is_empty())
-                .map(|p| intent_providers::provider_config(p).id.to_string())
+                .map(crate::provider_profiles::canonical_selection)
                 .or_else(|| {
                     crate::agent_session::derived_default_provider(&self.effective_settings())
                 });
@@ -7120,6 +7158,11 @@ impl Services {
             response["providerId"] = Value::String(provider_id);
             return Ok(response);
         }
+        if crate::provider_profiles::is_qualified_ref(&provider_id) {
+            return self
+                .models_list_profile_op(provider_id, force_refresh)
+                .await;
+        }
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
@@ -7187,6 +7230,50 @@ impl Services {
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
         }
+    }
+
+    /// `models.list { providerId: providerRef }` (PROTOCOL §5.54): the
+    /// profile's own catalog, probed with the profile's saved overlay on the
+    /// base provider's installation and cached under the reference plus the
+    /// profile's settings fingerprint, so catalogs never cross profiles, the
+    /// Default configuration or saved edits. Rows report
+    /// `provider = providerRef`. A missing profile or disabled base provider
+    /// needs a replacement.
+    async fn models_list_profile_op(
+        &self,
+        reference: String,
+        force_refresh: bool,
+    ) -> Result<Value> {
+        let profile = self.resolve_selected_profile(&reference).await?;
+        let resolved = self
+            .models_catalog
+            .resolve_installed_for(&reference, profile, force_refresh)
+            .await;
+        let Some(models) = resolved.models else {
+            return Ok(static_provider_response(
+                &reference,
+                &resolved
+                    .warning
+                    .unwrap_or_else(|| format!("model discovery for '{reference}' failed")),
+            ));
+        };
+        let models: Vec<Value> = models
+            .into_iter()
+            .map(|mut row| {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("provider".into(), Value::String(reference.clone()));
+                }
+                row
+            })
+            .collect();
+        let mut out = json!({ "providerId": reference, "models": models, "source": reference });
+        if resolved.stale {
+            out["stale"] = Value::Bool(true);
+        }
+        if let Some(w) = resolved.warning {
+            out["warning"] = Value::String(w);
+        }
+        Ok(out)
     }
 
     /// The legacy no-`providerId` `models.list` path, routed through the same
@@ -10805,7 +10892,7 @@ impl Services {
                         .canonical_id_or_err(spec_id, ws_path.as_deref())?;
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
-                    ensure_known_provider("agent.delegate", provider_param)?;
+                    services.ensure_selectable_provider("agent.delegate", provider_param)?;
                     ensure_provider_available(
                         "agent.delegate",
                         provider_param,
@@ -11320,7 +11407,7 @@ impl Services {
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
-            ensure_known_provider("agent.delegate", provider_param)?;
+            self.ensure_selectable_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
