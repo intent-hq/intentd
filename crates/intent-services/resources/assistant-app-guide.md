@@ -420,6 +420,13 @@ in its CLI. For **Agent session corrupted**, retry starts a fresh session and
 carries over the conversation history. Do not promise a model or provider switch
 unless the UI offers it; inspect **Settings → Providers** for setup problems.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/provider_auth.rs; packages/intentd/crates/intent-core/src/{path_utils.rs,cli_env.rs}. -->
+
+Claude authentication checks also use exported credentials from the execution
+host's login shell, including `CLAUDE_CODE_OAUTH_TOKEN`. Restart that host's
+daemon after changing shell exports so it reloads them; an existing daemon
+environment value takes precedence. Never paste tokens into chat.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
 Pi requires the installed Pi CLI version shown in **Providers**. Intent supplies
