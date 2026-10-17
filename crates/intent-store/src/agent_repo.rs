@@ -3189,13 +3189,11 @@ impl Store {
         provider: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        let mut lifecycle = self.repository_lifecycle_write().await?;
+        // No lifecycle invalidation: the pinned provider is the one the
+        // session already resolves to (its last turn's, else the current
+        // default), so its repository bindings stay valid.
+        let lifecycle = self.repository_lifecycle_write().await?;
         let current = self.get_agent_session_summary(id).await?;
-        if current.workspace_id == *workspace_id
-            && current.provider.as_deref().is_none_or(str::is_empty)
-        {
-            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
-        }
         let rows = sqlx::query(
             "UPDATE agent_session SET provider=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND (provider IS NULL OR provider='')",
@@ -3239,18 +3237,10 @@ impl Store {
         if model.is_none() && reasoning_effort.is_none() {
             return Ok(false);
         }
-        let mut lifecycle = self.repository_lifecycle_write().await?;
-        let current = self.get_agent_session_summary(id).await?;
-        if current.workspace_id != *workspace_id {
-            lifecycle.settle_after_retirement().await?;
-            return Ok(false);
-        }
-        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
-        if (model.is_some() && blank(current.model.as_deref()))
-            || (reasoning_effort.is_some() && blank(current.reasoning_effort.as_deref()))
-        {
-            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
-        }
+        // No lifecycle invalidation: the filled values are the ones the
+        // running provider already reports, so nothing the session's
+        // repository bindings depend on changes.
+        let lifecycle = self.repository_lifecycle_write().await?;
         let rows = sqlx::query(
             "UPDATE agent_session SET \
                model = CASE WHEN (model IS NULL OR model='') AND ?1 IS NOT NULL \
