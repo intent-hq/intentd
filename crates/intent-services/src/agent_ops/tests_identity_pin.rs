@@ -180,3 +180,112 @@ async fn set_model_pins_a_never_run_legacy_session_onto_the_current_default() {
         .expect("setModel");
     assert_eq!(stored_provider(&svc, &id).await.as_deref(), Some("grok"));
 }
+
+/// An explicit `providerId` is gated against the legacy row's EFFECTIVE
+/// provider — its last turn's, not the current default: naming the default
+/// is a real cross-provider move and must pass the availability gate.
+#[tokio::test]
+async fn set_model_gates_an_explicit_provider_against_the_last_turn_provider() {
+    let (_tmp, svc, ws) = setup().await;
+    let id = create_plain(&svc, &ws, Some("default-model"), None).await;
+    make_legacy(&svc, &ws, &id, Some("auggie")).await;
+    set(&svc, "providers.enabled", json!({"grok": false}));
+    let err = svc
+        .agent_set_model_op(id.clone(), "default-model".into(), Some("grok".into()))
+        .await
+        .expect_err("moving off auggie onto a disabled grok is gated");
+    assert!(err.to_string().contains("not enabled"), "{err}");
+    assert_eq!(stored_provider(&svc, &id).await, None, "nothing written");
+}
+
+/// A level the daemon pinned from Auto follows the model: a real model
+/// switch resets it to Auto (the new model's default applies). A level
+/// someone chose survives the switch, and choosing one clears the Auto pin.
+#[tokio::test]
+async fn model_switch_resets_only_an_auto_pinned_effort() {
+    let (_tmp, svc, ws) = setup().await;
+    let store = svc.store();
+    let auto = create_plain(&svc, &ws, Some("default-model"), None).await;
+    let mut row = store.get_agent_session(&auto).await.unwrap();
+    row.reasoning_effort = None;
+    store.update_agent_session(&ws, &row).await.unwrap();
+    assert!(store
+        .fill_agent_session_identity_if_null(
+            &ws,
+            &auto,
+            None,
+            Some("high"),
+            &intent_core::now_iso()
+        )
+        .await
+        .unwrap());
+    // Rewriting the row with the same level keeps the Auto pin.
+    let same = store.get_agent_session(&auto).await.unwrap();
+    store.update_agent_session(&ws, &same).await.unwrap();
+    svc.agent_set_model_op(auto.clone(), "default-model".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent_session(&auto)
+            .await
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("high"),
+        "same model: nothing to reset"
+    );
+    svc.models_catalog.store_for_test(
+        "grok",
+        &(crate::model_catalog::source_for("grok")
+            .unwrap()
+            .version_key)(),
+        vec![
+            json!({"id": "default-model", "name": "default-model", "provider": "grok"}),
+            json!({"id": "other-model", "name": "other-model", "provider": "grok"}),
+        ],
+    );
+    svc.agent_set_model_op(auto.clone(), "other-model".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent_session(&auto)
+            .await
+            .unwrap()
+            .reasoning_effort,
+        None,
+        "an Auto-pinned level resets on a model switch"
+    );
+
+    let chosen = create_plain(&svc, &ws, Some("default-model"), None).await;
+    let mut row = store.get_agent_session(&chosen).await.unwrap();
+    row.reasoning_effort = None;
+    store.update_agent_session(&ws, &row).await.unwrap();
+    store
+        .fill_agent_session_identity_if_null(
+            &ws,
+            &chosen,
+            None,
+            Some("high"),
+            &intent_core::now_iso(),
+        )
+        .await
+        .unwrap();
+    let mut row = store.get_agent_session(&chosen).await.unwrap();
+    row.reasoning_effort = Some("low".into());
+    store.update_agent_session(&ws, &row).await.unwrap();
+    svc.agent_set_model_op(chosen.clone(), "other-model".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_agent_session(&chosen)
+            .await
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("low"),
+        "a chosen level survives the switch"
+    );
+}

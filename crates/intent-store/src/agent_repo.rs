@@ -2930,7 +2930,10 @@ impl Store {
                  WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
                  THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
+             stop_reason=?, stop_reason_timestamp=?, \
+             reasoning_effort_auto=CASE WHEN reasoning_effort IS ? \
+                 THEN reasoning_effort_auto ELSE 0 END, \
+             reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -2962,6 +2965,9 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
+        // Any effort change (an explicit choice) clears the daemon's
+        // Auto-pin flag; rewriting the same value keeps it.
+        .bind(&s.reasoning_effort)
         .bind(&s.reasoning_effort)
         .bind(&s.id.0)
         .bind(&workspace_id.0);
@@ -3078,9 +3084,18 @@ impl Store {
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
+        // A level the daemon pinned from Auto (`reasoning_effort_auto`)
+        // belongs to the old model's default: a real model change resets it
+        // to Auto, so the new model's default applies (and is re-pinned at
+        // the next confirmed turn). A level someone chose is kept.
         let rows = sqlx::query(
-            "UPDATE agent_session SET model=?, provider=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
+            "UPDATE agent_session SET \
+               reasoning_effort = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                       THEN NULL ELSE reasoning_effort END, \
+               reasoning_effort_auto = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                            THEN 0 ELSE reasoning_effort_auto END, \
+               model=?1, provider=?2, updated_at=?3 \
+             WHERE id=?4 AND workspace_id=?5",
         )
         .bind(model)
         .bind(provider)
@@ -3137,7 +3152,8 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
         let rows = sqlx::query(
-            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, \
+             reasoning_effort_auto=0, updated_at=? \
              WHERE id=? AND workspace_id=? AND provider IS ?",
         )
         .bind(provider)
@@ -3218,8 +3234,11 @@ impl Store {
     /// legacy row, or a create that could not resolve them up front — a cold
     /// catalog cache, or an effort left to the provider). Values already set
     /// are never overwritten, so an `agent.setModel` / effort change racing
-    /// the commit wins. `None` arguments leave their column alone. Returns
-    /// whether any column changed. Scoped to `workspace_id`.
+    /// the commit wins. `None` arguments leave their column alone. A filled
+    /// effort is the provider's level for an Auto session, so it sets
+    /// `reasoning_effort_auto` (reset on the next real model change by
+    /// [`Store::set_agent_session_model`]). Returns whether any column
+    /// changed. Scoped to `workspace_id`.
     ///
     /// # Errors
     ///
@@ -3245,6 +3264,8 @@ impl Store {
             "UPDATE agent_session SET \
                model = CASE WHEN (model IS NULL OR model='') AND ?1 IS NOT NULL \
                             THEN ?1 ELSE model END, \
+               reasoning_effort_auto = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN 1 ELSE reasoning_effort_auto END, \
                reasoning_effort = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
                                         AND ?2 IS NOT NULL THEN ?2 ELSE reasoning_effort END, \
                updated_at = ?3 \
@@ -13565,12 +13586,6 @@ mod tests {
         assert!(result4.is_ok(), "name change should succeed");
     }
 
-    /// The narrow `set_agent_session_model` writer (`agent.setModel`,
-    /// monorepo#882): a cross-provider switch lands even after first real use
-    /// (`acp_session_id` set) — the case `update_agent_session`'s
-    /// immutability guard rejects — while `acp_session_id` and unrelated
-    /// columns stay untouched. Wrong-workspace writes are `NotFound` and
-    /// mutate nothing.
     /// `pin_agent_session_provider_if_null` only lands on a NULL/blank
     /// provider (compare-and-set: a provider pinned first wins), and
     /// `fill_agent_session_identity_if_null` only fills NULL/blank columns.
@@ -13647,6 +13662,12 @@ mod tests {
         assert_eq!(got.acp_session_id.as_deref(), Some("acp-live"));
     }
 
+    /// The narrow `set_agent_session_model` writer (`agent.setModel`,
+    /// monorepo#882): a cross-provider switch lands even after first real use
+    /// (`acp_session_id` set) — the case `update_agent_session`'s
+    /// immutability guard rejects — while `acp_session_id` and unrelated
+    /// columns stay untouched. Wrong-workspace writes are `NotFound` and
+    /// mutate nothing.
     #[tokio::test]
     async fn set_agent_session_model_allows_cross_provider_after_first_use() {
         use intent_core::now_iso;

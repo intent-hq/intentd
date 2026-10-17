@@ -11091,8 +11091,9 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
 
 /// 0161 backfills legacy rows' NULL / blank provider, model and reasoning
 /// effort from the identity their last turn ran under — fill-only, skipping
-/// rows without evidence, legacy provider aliases and the `"default"` effort
-/// sentinel — and replaying it changes nothing.
+/// rows without evidence, legacy provider aliases, malformed JSON, the
+/// `"default"` alias and any model/effort from a provider the session has
+/// since left — and replaying it changes nothing.
 #[tokio::test]
 async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
     // (id, provider, model, effort, last_turn_provider, last_turn_model, last_turn_effort)
@@ -11112,7 +11113,7 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
         .insert_workspace(&sample_workspace(&ws, "0161", false))
         .await
         .expect("insert workspace");
-    let seeds: [Seed; 7] = [
+    let seeds: [Seed; 10] = [
         (
             "agent-legacy",
             None,
@@ -11174,6 +11175,35 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
             None,
             Some("not json"),
         ),
+        (
+            "agent-moved",
+            Some("claude-code"),
+            None,
+            None,
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":"xhigh","default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-compound",
+            None,
+            None,
+            None,
+            Some("codex"),
+            Some("codex:gpt-5"),
+            None,
+        ),
+        (
+            "agent-default-model",
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            Some("default"),
+            None,
+        ),
     ];
     for (id, provider, model, effort, ltp, ltm, lte) in seeds {
         let mut s = sample_agent_session(&AgentId::from(id), &ws);
@@ -11211,7 +11241,8 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
     let replay = || async {
         for statement in sql.split(';') {
             let body = statement.trim();
-            if !body.is_empty() {
+            // The column ALTER already ran at open; replay the data backfill.
+            if !body.is_empty() && !body.starts_with("ALTER TABLE") {
                 sqlx::query(body)
                     .execute(store.write_pool())
                     .await
@@ -11224,7 +11255,8 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
         let mut rows = Vec::new();
         for (id, ..) in seeds {
             let row = sqlx::query(
-                "SELECT provider, model, reasoning_effort FROM agent_session WHERE id=?",
+                "SELECT provider, model, reasoning_effort, reasoning_effort_auto \
+                 FROM agent_session WHERE id=?",
             )
             .bind(id)
             .fetch_one(store.read_pool())
@@ -11235,6 +11267,7 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
                 row.get::<Option<String>, _>("provider"),
                 row.get::<Option<String>, _>("model"),
                 row.get::<Option<String>, _>("reasoning_effort"),
+                row.get::<i64, _>("reasoning_effort_auto"),
             ));
         }
         rows
@@ -11244,13 +11277,20 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
     assert_eq!(
         first,
         vec![
-            ("agent-legacy", s("codex"), s("gpt-6-astra"), s("max")),
-            ("agent-blank", s("claude-code"), s("opus"), s("high")),
-            ("agent-effort-only-evidence", s("grok"), s("m"), s("low")),
-            ("agent-no-evidence", None, None, None),
-            ("agent-alias", None, s("m"), None),
-            ("agent-set", s("auggie"), s("sonnet"), s("low")),
-            ("agent-bad-json", None, s("m"), None),
+            // An Auto turn's default is flagged as Auto-pinned (1); an
+            // explicit selection is not (0).
+            ("agent-legacy", s("codex"), s("gpt-6-astra"), s("max"), 1),
+            ("agent-blank", s("claude-code"), s("opus"), s("high"), 0),
+            ("agent-effort-only-evidence", s("grok"), s("m"), s("low"), 1),
+            ("agent-no-evidence", None, None, None, 0),
+            ("agent-alias", None, s("m"), None, 0),
+            ("agent-set", s("auggie"), s("sonnet"), s("low"), 0),
+            ("agent-bad-json", None, s("m"), None, 0),
+            // Provider since moved: the old provider's model/effort never
+            // carries over.
+            ("agent-moved", s("claude-code"), None, None, 0),
+            ("agent-compound", s("codex"), s("gpt-5"), None, 0),
+            ("agent-default-model", s("claude-code"), None, None, 0),
         ]
     );
     replay().await;

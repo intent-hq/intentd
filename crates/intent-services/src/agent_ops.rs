@@ -4819,20 +4819,6 @@ impl Services {
                 }
             }
         }
-        // A dropped mismatched default still pins a concrete model when the
-        // provider's cached catalog names its `isDefault` row (the same
-        // cache-only step 4 the resolver runs). A cold cache leaves the model
-        // unset; the first session open then pins the provider's reported
-        // current model (`Services::fill_identity_from_session_open`).
-        if resolved_model.is_none() {
-            if let Some(m) = self
-                .cached_models()
-                .cached_default_model(&effective_provider)
-            {
-                resolved_model = Some(m);
-                model_source = DefaultModelSource::CatalogDefault;
-            }
-        }
         // Reasoning effort (PROTOCOL §5.11), specialist rungs: a *direct*
         // `agent.create` naming a specialist consults the same model-option >
         // frontmatter order as delegation, keyed on the model that was
@@ -4885,6 +4871,19 @@ impl Services {
         } else {
             resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
+        // A create that ends without a model (a dropped mismatched default,
+        // or nothing configured) still pins a concrete one when the
+        // provider's cached catalog names its `isDefault` row (the cache-only
+        // step 4 the resolver runs). Filled only AFTER the effort rungs and
+        // validation above, which keep running against the model as resolved
+        // so far (a specialist effort with no model evidence still passes). A
+        // cold cache leaves the model unset; the first session open then pins
+        // the provider's reported current model
+        // (`Services::fill_identity_from_session_open`).
+        let resolved_model = resolved_model.or_else(|| {
+            self.cached_models()
+                .cached_default_model(&effective_provider)
+        });
         Ok(CreateModelAndEffort {
             provider: effective_provider,
             model: resolved_model,
@@ -5575,18 +5574,24 @@ impl Services {
             // spawn would actually run — not the raw column: a legacy alias
             // (`acp`/`default`/`augment`) normalizes through `provider_config`
             // exactly as `resolve_spawn` and the ownership check above do, and
-            // a NULL column resolves to the settings-derived default. Comparing
-            // the raw column would treat an explicit `providerId` naming that
-            // same effective provider as a cross-provider switch and gate a
-            // same-provider model change — the very exemption above.
-            let current_effective = session
-                .provider
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .map(|p| intent_providers::provider_config(p).id.to_string())
-                .or_else(|| {
-                    crate::agent_session::derived_default_provider(&self.effective_settings())
-                });
+            // a NULL column (a legacy row) resolves to the provider its last
+            // turn ran, else the settings-derived default
+            // (`legacy_session_provider`, the same rule the turn-start repair
+            // pins). Comparing the raw column would treat an explicit
+            // `providerId` naming that same effective provider as a
+            // cross-provider switch and gate a same-provider model change —
+            // the very exemption above.
+            let current_effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => Some(intent_providers::provider_config(p).id.to_string()),
+                None => {
+                    crate::agent_session::legacy_session_provider(
+                        self,
+                        &session.workspace_id,
+                        &agent_id,
+                    )
+                    .await?
+                }
+            };
             if current_effective.as_deref() != Some(pid.as_str()) {
                 ensure_provider_available(
                     "agent.setModel",
@@ -5613,7 +5618,7 @@ impl Services {
                     &session.workspace_id,
                     &agent_id,
                 )
-                .await
+                .await?
                 .ok_or_else(|| crate::agent_session::no_default_provider_error("agent.setModel"))?,
             };
             ensure_bare_model_matches_provider(

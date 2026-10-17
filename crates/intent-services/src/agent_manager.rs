@@ -2567,6 +2567,10 @@ struct AgentHandle {
     /// env config) — passing servers they'd ignore is avoided for wire parity.
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
+    /// The model the session-open fill persisted onto a session spawned
+    /// without one (`AcpSessionOpened::filled_model`): the fill's own landed
+    /// value, taken by `adopt_filled_model` on the spawn path.
+    session_open_filled_model: Option<String>,
     spawned_provider: String,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
@@ -3750,6 +3754,7 @@ impl AgentManager {
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -4645,6 +4650,9 @@ impl AgentManager {
         if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.config_options.clone_from(&opened.config_options);
             crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+            handle
+                .session_open_filled_model
+                .clone_from(&opened.filled_model);
         }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
@@ -9996,20 +10004,47 @@ impl AgentManager {
         }
     }
 
-    /// Adopt a `model` the session-open fill just persisted for a session
-    /// spawned without one (see the call site; `model` is what
-    /// `resolve_spawn` derives from the refreshed row). Updates the live handle's
+    /// Adopt the model the session-open fill persisted for a session spawned
+    /// without one. The value is the fill's own landed model, recorded on the
+    /// live handle (`session_open_filled_model`) — never re-read from the
+    /// row, so a racing `agent.setModel` is not mistaken for an applied
+    /// model. Only a model `resolve_spawn` itself would pass is adopted (a
+    /// provider that always spawns on its default — the E2E mock — must not
+    /// see a phantom mismatch that respawns every turn). Sets the handle's
     /// `spawned_model` and `resolved.model`; when the last committed turn ran
     /// the same provider on its default (`last_turn_model` NULL) the baseline
-    /// is moved to the adopted id too, so the provider default → its concrete
-    /// id is not announced as a model change. Best-effort.
+    /// moves to the adopted id too, so the provider default → its concrete id
+    /// is not announced as a model change. Best-effort.
     async fn adopt_filled_model(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
+        session: &AgentSession,
+        workspace: Option<&intent_core::Workspace>,
+        settings: &intent_core::settings_file::SettingsFile,
         resolved: &mut ResolvedSpawn,
-        model: String,
     ) {
+        let filled = self
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .and_then(|h| h.session_open_filled_model.take());
+        let Some(filled) = filled else { return };
+        if resolved.model.is_some() {
+            return;
+        }
+        let probe = AgentSession {
+            model: Some(filled),
+            ..session.clone()
+        };
+        let Some(model) =
+            resolve_spawn(&probe, workspace, settings, self.chief_cwd_root.as_deref())
+                .ok()
+                .and_then(|r| r.model)
+        else {
+            return;
+        };
         if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
             handle.spawned_model = Some(model.clone());
         }
@@ -10084,10 +10119,15 @@ impl AgentManager {
                     .clone()
                     .or_else(|| Some(e.default_value.clone()).filter(|d| !d.is_empty()))
             };
-            let same = match (effective(from), effective(&state)) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
-                (None, None) => true,
-                _ => false,
+            let same = if from.effort.is_none() && state.effort.is_none() {
+                // Auto → Auto is never a change, whatever the default did.
+                true
+            } else {
+                match (effective(from), effective(&state)) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+                    (None, None) => true,
+                    _ => false,
+                }
             };
             if !same {
                 let content = json!([{"type":"text", "text": format!(
@@ -10129,6 +10169,53 @@ impl AgentManager {
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn effort");
+            }
+        }
+        // Every session carries a concrete reasoning level: a session that ran
+        // this turn on Auto (no stored effort) is pinned to the level the
+        // provider confirmed for it — its explicit selection, else its known
+        // default — never the adapter's `"default"` sentinel. Fill-only, so a
+        // concurrent effort change wins; the effective-level comparison above
+        // keeps Auto → that same level silent on the next turn.
+        let confirmed = state
+            .effort
+            .clone()
+            .or_else(|| Some(state.default_value.clone()))
+            .filter(|level| !level.trim().is_empty() && !level.eq_ignore_ascii_case("default"));
+        if let (None, Some(level)) = (resolved.reasoning_effort.as_deref(), confirmed) {
+            match self
+                .services
+                .store
+                .fill_agent_session_identity_if_null(
+                    workspace_id,
+                    agent_id,
+                    None,
+                    Some(&level),
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        reasoning_effort = %level,
+                        field = "reasoning_effort",
+                        "legacy session repaired"
+                    );
+                    self.services.invalidate_agent_list_cache(workspace_id);
+                    self.services
+                        .publish_agent_mutation_event(
+                            workspace_id,
+                            agent_id,
+                            intent_core::events::AGENT_UPDATED,
+                            json!({ "agentId": agent_id.0, "reasoningEffort": level }),
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "fill confirmed effort failed");
+                }
             }
         }
     }
@@ -10246,11 +10333,21 @@ impl AgentManager {
         {
             return Ok(session);
         }
-        let Some(provider) =
-            crate::agent_session::legacy_session_provider(&self.services, workspace_id, agent_id)
-                .await
-        else {
-            return Ok(session);
+        let provider = match crate::agent_session::legacy_session_provider(
+            &self.services,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(session),
+            Err(e) => {
+                // Never pin on a failed read: this turn resolves as before
+                // and the next turn retries the repair.
+                tracing::warn!(agent = %agent_id, error = %e, "legacy provider repair skipped");
+                return Ok(session);
+            }
         };
         let landed = self
             .services
@@ -10540,12 +10637,6 @@ impl AgentManager {
             .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();
-        // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
-        // a provider the user switched off in Settings > Agents never spawns
-        // it — re-home onto the usable default (persisted before
-        // `resolve_spawn`, so the respawn branch below sees the new identity)
-        // or fail the turn with the same "not enabled" rejection the create
-        // front doors raise.
         // Legacy provider repair: every session pins its provider at create,
         // so a NULL column is a pre-pin row. Pin it once onto the provider its
         // last turn ran (else the current default) BEFORE the disabled gate
@@ -10554,6 +10645,12 @@ impl AgentManager {
         let session = self
             .pin_legacy_session_provider(agent_id, workspace_id, session)
             .await?;
+        // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
+        // a provider the user switched off in Settings > Agents never spawns
+        // it — re-home onto the usable default (persisted before
+        // `resolve_spawn`, so the respawn branch below sees the new identity)
+        // or fail the turn with the same "not enabled" rejection the create
+        // front doors raise.
         let (session, rehomed) = self
             .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
             .await?;
@@ -10855,34 +10952,17 @@ impl AgentManager {
         // A session spawned on the provider default (no stored model) had its
         // `model` filled at session open from the provider's current option
         // id (`fill_identity_from_session_open`). The child runs exactly that
-        // model, so adopt it as the spawned identity: the next turn's
-        // respawn comparison and the notice/commit below see the same id.
-        if resolved.model.is_none() && session.model.as_deref().is_none_or(|m| m.trim().is_empty())
-        {
-            // Only a model the spawn path itself would pass is adopted (a
-            // provider that always spawns on its default — the E2E mock —
-            // must not see a phantom mismatch that respawns every turn).
-            let filled = self
-                .services
-                .store
-                .get_agent_session(agent_id)
-                .await
-                .ok()
-                .and_then(|fresh| {
-                    resolve_spawn(
-                        &fresh,
-                        workspace.as_ref(),
-                        &settings,
-                        self.chief_cwd_root.as_deref(),
-                    )
-                    .ok()
-                })
-                .and_then(|r| r.model);
-            if let Some(model) = filled {
-                self.adopt_filled_model(agent_id, workspace_id, &mut resolved, model)
-                    .await;
-            }
-        }
+        // model, so adopt it as the resolved identity: the notice/commit
+        // below and the next turn's respawn comparison see the same id.
+        self.adopt_filled_model(
+            agent_id,
+            workspace_id,
+            &session,
+            workspace.as_ref(),
+            &settings,
+            &mut resolved,
+        )
+        .await;
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -18890,6 +18970,7 @@ mod dead_child_respawn_tests {
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         }
@@ -20410,6 +20491,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20459,6 +20541,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
