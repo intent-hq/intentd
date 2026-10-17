@@ -546,5 +546,14 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert!(!secrets.contains(&id), "the env secret is removed");
     let list = ok(&mut ws, 22, "providers.profiles.list", json!({})).await;
     assert_eq!(list["profiles"], json!([]));
+    // Values never reach the settings file or the daemon log.
+    let config = std::fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    assert!(!config.contains(SECRET), "{config}");
+    let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+    assert!(!log.is_empty(), "the daemon log is captured");
+    assert!(
+        !log.contains(SECRET),
+        "a profile value reached the daemon log"
+    );
     drop(daemon);
 }
