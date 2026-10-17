@@ -797,8 +797,16 @@ fn cache() -> &'static AuthStatusCache {
 /// the id that actually runs, not the persisted alias — otherwise an
 /// alias-backed demotion is a no-op and alias-backed creates stay permissive
 /// (PR #1650 review). Known catalog ids map to themselves.
-fn auth_cache_key(provider_id: &str) -> &'static str {
-    intent_providers::provider_config(provider_id).id
+///
+/// A named profile reference has no base-keyed verdict (`None`): its verdict
+/// lives under [`profile_auth_cache_key`], so a profile's outcome never
+/// demotes, promotes or stands in for the base's Default configuration, and
+/// vice versa (PROTOCOL §5.54).
+fn auth_cache_key(provider_id: &str) -> Option<&'static str> {
+    if crate::provider_profiles::is_qualified_ref(provider_id) {
+        return None;
+    }
+    Some(intent_providers::provider_config(provider_id).id)
 }
 
 /// Read-only view of one provider's *fresh* cached auth verdict:
@@ -813,7 +821,7 @@ fn auth_cache_key(provider_id: &str) -> &'static str {
 /// influences the gate — it is wire-only enrichment.
 pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
     cache()
-        .fresh(auth_cache_key(provider_id))
+        .fresh(auth_cache_key(provider_id)?)
         .and_then(|verdict| verdict.authenticated)
 }
 
@@ -827,7 +835,7 @@ pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
 pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
     let display = intent_providers::provider_config(provider_id).display_name;
     let login_cmd = intent_providers::login_command(provider_id);
-    let caveat = if provider_id == "claude-code" {
+    let caveat = if intent_providers::base_provider_id(provider_id) == "claude-code" {
         " Note: signing into the Claude desktop app does not carry over to the CLI — run \
          \"claude\" in a terminal, then \"/login\"."
     } else {
@@ -850,7 +858,9 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
 /// overwrite this authoritative `false`, and clears any cached identity
 /// metadata with it.
 pub(crate) fn demote_auth_verdict(provider_id: &str) {
-    cache().demote(auth_cache_key(provider_id));
+    if let Some(key) = auth_cache_key(provider_id) {
+        cache().demote(key);
+    }
 }
 
 /// Promote one provider's cached auth verdict to a hard `true` after the
@@ -863,7 +873,9 @@ pub(crate) fn demote_auth_verdict(provider_id: &str) {
 /// this authoritative `true`. Cached identity metadata is preserved on the
 /// refreshed entry.
 pub(crate) fn promote_auth_verdict(provider_id: &str) {
-    cache().promote(auth_cache_key(provider_id));
+    if let Some(key) = auth_cache_key(provider_id) {
+        cache().promote(key);
+    }
 }
 
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
@@ -934,12 +946,18 @@ pub(crate) fn profile_auth_cache_key(profile: &intent_acp::ProfileEnv) -> String
     profile.cache_key()
 }
 
+/// [`promote_auth_verdict`] for one profile's saved settings only.
+pub(crate) fn promote_profile_auth_verdict(profile: &intent_acp::ProfileEnv) {
+    cache().promote(&profile_auth_cache_key(profile));
+}
+
+/// [`demote_auth_verdict`] for one profile's saved settings only.
+pub(crate) fn demote_profile_auth_verdict(profile: &intent_acp::ProfileEnv) {
+    cache().demote(&profile_auth_cache_key(profile));
+}
+
 /// The fresh cached verdict of one profile's saved settings (see
 /// [`cached_auth_verdict`]); never consults the base provider's verdict.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by provider profile selection routing")
-)]
 pub(crate) fn cached_profile_auth_verdict(profile: &intent_acp::ProfileEnv) -> Option<bool> {
     cache()
         .fresh(&profile_auth_cache_key(profile))
@@ -951,7 +969,6 @@ pub(crate) fn cached_profile_auth_verdict(profile: &intent_acp::ProfileEnv) -> O
 /// probes, one-shot calls and persistent launches use — and cached under
 /// [`profile_auth_cache_key`]. A missing installation is unknown. Returns the
 /// wire entry `{ id: providerRef, authenticated, identity? }`.
-#[expect(dead_code, reason = "consumed by provider profile selection routing")]
 pub(crate) async fn profile_auth_status(
     profile: Arc<intent_acp::ProfileEnv>,
     force: bool,
@@ -1740,10 +1757,28 @@ while IFS= read -r unexpected; do exit 95; done
         // parallel tests could observe through the gate.
         let fallback = intent_providers::provider_config("acp").id;
         for alias in ["acp", "augment", "default", "not-a-provider"] {
-            assert_eq!(auth_cache_key(alias), fallback, "{alias}");
+            assert_eq!(auth_cache_key(alias), Some(fallback), "{alias}");
         }
-        assert_eq!(auth_cache_key("pi"), "pi");
-        assert_eq!(auth_cache_key("claude-code"), "claude-code");
+        assert_eq!(auth_cache_key("pi"), Some("pi"));
+        assert_eq!(auth_cache_key("claude-code"), Some("claude-code"));
+    }
+
+    /// A profile reference never reads, demotes or promotes the base
+    /// provider's Default verdict (PROTOCOL §5.54): the runtime auth-failure
+    /// path and the create gate key profiles separately.
+    #[test]
+    fn profile_references_never_touch_the_base_default_verdict() {
+        let prior = cache().fresh("pi");
+        cache().store("pi", AuthVerdict::plain(Some(true)));
+        for reference in ["codex@xwork", "claude-code@xwork", "codex@BAD"] {
+            assert_eq!(auth_cache_key(reference), None, "{reference}");
+            assert_eq!(cached_auth_verdict(reference), None, "{reference}");
+            demote_auth_verdict(reference);
+            promote_auth_verdict(reference);
+        }
+        assert_eq!(cached_auth_verdict("pi"), Some(true));
+        cache().store("pi", prior.unwrap_or_default());
+        assert!(not_authenticated_message("claude-code@xwork").contains("desktop app"));
     }
 
     /// A probe already in flight when a runtime demotion lands must not
@@ -2066,7 +2101,10 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(cached_profile_auth_verdict(&work), Some(true));
         cache().demote(&profile_auth_cache_key(&personal));
         assert_eq!(cached_profile_auth_verdict(&work), Some(true));
-        assert_ne!(profile_auth_cache_key(&work), auth_cache_key("codex"));
+        assert_ne!(
+            Some(profile_auth_cache_key(&work).as_str()),
+            auth_cache_key("codex")
+        );
         assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

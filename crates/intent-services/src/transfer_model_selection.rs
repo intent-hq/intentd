@@ -50,7 +50,7 @@ use intent_store::normalize_compound_model;
 use serde_json::{Map, Value};
 
 use crate::agent_ops::{
-    ensure_effort_supported_by_model, ensure_known_provider, ensure_provider_available,
+    ensure_effort_supported_by_model, ensure_provider_available,
     resolve_agent_default_model_with_source, resolve_settings_default_reasoning_effort,
 };
 
@@ -133,7 +133,7 @@ impl crate::Services {
             availability
                 .entry(provider.to_string())
                 .or_insert_with(|| {
-                    ensure_known_provider(IMPORT_METHOD, provider)
+                    self.ensure_selectable_provider(IMPORT_METHOD, provider)
                         .and_then(|()| {
                             ensure_provider_available(IMPORT_METHOD, provider, &settings.providers)
                         })

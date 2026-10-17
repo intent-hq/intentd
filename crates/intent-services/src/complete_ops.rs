@@ -486,16 +486,20 @@ impl Services {
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         if run_provider != "auggie" {
+            // A named profile default runs the one-shot with that profile's
+            // saved overlay on its base provider's installation; a missing
+            // profile or disabled base needs a replacement (PROTOCOL §5.54).
+            let profile = Box::pin(self.resolve_selected_profile(&run_provider)).await?;
             return self
                 .complete_once_via_acp(
-                    &run_provider,
+                    intent_providers::base_provider_id(&run_provider),
                     &prompt,
                     system_prompt,
                     model.as_deref(),
                     cwd,
                     timeout,
                     &effort,
-                    None,
+                    profile,
                 )
                 .await;
         }

@@ -1524,9 +1524,17 @@ pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
+        let id = id.trim();
+        // A profile reference is kept verbatim, even when it is malformed or
+        // its profile is gone: the selection gate then fails it with
+        // `provider-profile-replacement-required` instead of reading it as
+        // unset or running the base's Default account (PROTOCOL §5.54).
+        if crate::provider_profiles::is_qualified_ref(id) {
+            return Some(id.to_string());
+        }
         // Accept the candidate only when it names a registered provider
         // (whitespace-trimmed, so padded settings values still resolve).
-        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
     })
 }
 
@@ -1556,6 +1564,19 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// [`resolve_provider_id`] reduced to the base provider id: a named profile
+/// reference (`<base>@<profileId>`, PROTOCOL §5.54) runs its base provider's
+/// adapter, so provider-keyed protocol shaping (session `_meta`, usage
+/// semantics, orchestrator tooling) keys on the base. Selection identity and
+/// native-session ownership keep the full reference.
+pub(crate) fn resolve_base_provider_id(
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> Option<String> {
+    resolve_provider_id(provider, configured_default)
+        .map(|id| intent_providers::base_provider_id(&id).to_owned())
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -2845,7 +2866,7 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
+        let provider_id = resolve_base_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
@@ -3299,7 +3320,9 @@ impl Services {
             .get_agent_session_last_turn_model(&workspace_id, agent_id)
             .await?;
         if let Some(owner) = last_turn_provider {
-            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            // A profile reference is its own owner: a native session never
+            // crosses profiles or a profile and Default (PROTOCOL §5.54).
+            let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
                 tracing::info!(
                     agent = %agent_id,
@@ -3310,6 +3333,7 @@ impl Services {
                 return Ok(None);
             }
         }
+        let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
         let is_orchestrator = self
@@ -5595,7 +5619,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((_, _, provider, _)) => resolve_provider_id(
+            Ok((_, _, provider, _)) => resolve_base_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -5656,7 +5680,7 @@ impl Services {
             .await
         {
             Ok((_, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(
+                let provider_id = resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -5795,7 +5819,7 @@ impl Services {
         // below).
         let provider_id = prev_readable
             .then(|| {
-                resolve_provider_id(
+                resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )
