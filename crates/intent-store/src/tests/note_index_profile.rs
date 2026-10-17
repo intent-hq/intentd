@@ -4,6 +4,8 @@
 #[path = "../../build/note_index_dependencies.rs"]
 mod deps;
 
+mod release_fixture;
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -287,11 +289,10 @@ fn release_only_workspace_version_bumps_preserve_profile() {
         }
     }
     let bumped_lock = join(&header, &lock_blocks);
-    let quoted = format!("\"{version}\"");
     let bumped_manifests: Vec<String> = inputs
         .manifests
         .iter()
-        .map(|manifest| manifest.replace(&quoted, "\"99.0.0\""))
+        .map(|manifest| release_fixture::bump_manifest(manifest, &version))
         .collect();
     assert_ne!(bumped_lock, inputs.lock);
     assert_ne!(bumped_manifests, inputs.manifests);
