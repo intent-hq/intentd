@@ -127,6 +127,33 @@ async fn services_failed_compensation_cancelled_waiter_retains_native_completion
     .await;
 }
 
+// A milestone is positive progress, never permission for the held mutation to
+// complete. Poll the mutation first even when both futures are ready together.
+async fn while_retirement_held<T, R: std::fmt::Debug>(
+    mutation: std::pin::Pin<&mut impl std::future::Future<Output = R>>,
+    milestone: impl std::future::Future<Output = T>,
+    description: &str,
+) -> T {
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            result = mutation => panic!("Store completion escaped held retirement while waiting for {description}: {result:?}"),
+            value = milestone => value,
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("held retirement did not reach {description}"))
+}
+
+#[tokio::test]
+#[should_panic(
+    expected = "Store completion escaped held retirement while waiting for ready milestone"
+)]
+async fn retirement_progress_rejects_simultaneous_completion() {
+    let mut mutation = Box::pin(std::future::ready(()));
+    while_retirement_held(mutation.as_mut(), std::future::ready(()), "ready milestone").await;
+}
+
 async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: HeldMutation) {
     let batch_error = matches!(
         mutation_case,
@@ -1237,6 +1264,35 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         } else {
             "replacement"
         };
+        let native = outcome.owner.as_ref().unwrap().native_allocation_for_test();
+        // Force the schedule that used to fail: retirement has begun, but the
+        // SQLite worker cannot commit until the test observes the old row.
+        // Capture eligibility BEFORE blocking: waiting for a retirement request
+        // here first would conceal a write-before-retirement regression.
+        let commit_hold = if pending_delete {
+            None
+        } else {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let mut first_commit = Some((entered, blocked));
+            let native = native.clone();
+            let mut writer = services.store.write_pool().acquire().await.unwrap();
+            writer
+                .lock_handle()
+                .await
+                .unwrap()
+                .set_commit_hook(move || {
+                    let Some((entered, blocked)) = first_commit.take() else {
+                        return true;
+                    };
+                    let _ = entered.send(native.is_retired());
+                    // Timeout bounds a broken fixture; sender drop on assertion
+                    // failure also unblocks the worker (and rejects the commit).
+                    blocked.recv_timeout(Duration::from_secs(10)).is_ok()
+                });
+            Some((waiting, release))
+        };
+        let (settlement_started, settlement_ready) = tokio::sync::oneshot::channel();
         let mut mutation = Box::pin(async {
             if mutation_case == HeldMutation::Retired {
                 services
@@ -1256,7 +1312,25 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                         intent_store::RepositoryLifecycleKey::Agent(agent.clone()),
                     ])
                     .await?;
-                guard.settle_confirmed().await?;
+                // Pending deletion releases serialization before begin and
+                // does not write SQL. Neither a row nor an unlocked writer
+                // proves retained settlement ownership. Its first poll spawns
+                // that owner synchronously before waiting for the native join.
+                assert!(
+                    native.is_retired(),
+                    "pending deletion did not close native eligibility"
+                );
+                let mut settlement = Box::pin(guard.settle_confirmed());
+                let first_poll = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(settlement.as_mut(), cx))
+                })
+                .await;
+                assert!(
+                    first_poll.is_pending(),
+                    "Store completion escaped held retirement during pending deletion"
+                );
+                settlement_started.send(()).unwrap();
+                settlement.await?;
                 Ok(expected.to_owned())
             } else if initialize {
                 let replacement = RepositoryCreationOwner::allocate(
@@ -1296,48 +1370,107 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                     .await
             }
         });
-        tokio::select! {
-            _ = &mut retire_ready => {},
-            result = &mut mutation => panic!("Store mutation completed before native retirement: {result:?}"),
-            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("Store mutation failed to retire native allocation"),
+        if let Some((entered, release)) = commit_hold {
+            let retired_at_commit =
+                while_retirement_held(mutation.as_mut(), entered, "SQLite commit entry")
+                    .await
+                    .unwrap();
+            assert!(retired_at_commit, "Store commit preceded native retirement");
+            while_retirement_held(
+                mutation.as_mut(),
+                &mut retire_ready,
+                "native retirement request",
+            )
+            .await
+            .unwrap();
+            let before_commit = while_retirement_held(
+                mutation.as_mut(),
+                services.store.get_agent_session(&agent),
+                "held precommit row",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                before_commit.acp_session_id.as_deref(),
+                Some("native-original")
+            );
+            assert!(before_commit.retired_at.is_none());
+            release.send(()).unwrap();
+            while_retirement_held(
+                mutation.as_mut(),
+                async {
+                    loop {
+                        let row = services.store.get_agent_session(&agent).await.unwrap();
+                        let committed = if mutation_case == HeldMutation::Retired {
+                            row.retired_at.as_deref() == Some("2026-10-10T12:19:00Z")
+                        } else {
+                            row.acp_session_id.as_deref() == Some(expected)
+                        };
+                        if committed {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                },
+                "committed row",
+            )
+            .await;
+        } else {
+            while_retirement_held(
+                mutation.as_mut(),
+                &mut retire_ready,
+                "native retirement request",
+            )
+            .await
+            .unwrap();
+            while_retirement_held(
+                mutation.as_mut(),
+                settlement_ready,
+                "retained pending-delete settlement",
+            )
+            .await
+            .unwrap();
         }
-        assert!(
-            timeout(Duration::from_millis(30), &mut mutation)
-                .await
-                .is_err(),
-            "Store completion escaped held retirement"
-        );
         assert_eq!(
-            services
-                .store
-                .get_agent_session(&agent)
-                .await
-                .unwrap()
-                .acp_session_id
-                .as_deref(),
+            while_retirement_held(
+                mutation.as_mut(),
+                services.store.get_agent_session(&agent),
+                "intermediate session ID",
+            )
+            .await
+            .unwrap()
+            .acp_session_id
+            .as_deref(),
             Some(expected)
         );
-        // Preserve the no-effect API control. Its same-ID fast path reads;
-        // independently acquire the actual single-connection writer below.
-        timeout(
-            Duration::from_secs(5),
+        // Preserve the no-effect API control. Its same-ID fast path takes
+        // lifecycle serialization before reading. For SQL mutations this is
+        // a separate milestone from visibility: releasing serialization and
+        // spawning retained settlement happen in the same poll. Keep driving
+        // the mutation through this boundary before cancelling its caller.
+        while_retirement_held(
+            mutation.as_mut(),
             services
                 .store
                 .set_acp_session_id(&workspace, &agent, expected),
+            "Store serialization release",
         )
         .await
-        .expect("native join retained Store serialization")
         .unwrap();
-        timeout(Duration::from_secs(5), async {
-            let mut writer = services.store.write_pool().acquire().await.unwrap();
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *writer)
-                .await
-                .unwrap();
-            sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
-        })
-        .await
-        .expect("native join retained the actual single-writer pool");
+        // Independently acquire the actual single-connection writer.
+        while_retirement_held(
+            mutation.as_mut(),
+            async {
+                let mut writer = services.store.write_pool().acquire().await.unwrap();
+                sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *writer)
+                    .await
+                    .unwrap();
+                sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+            },
+            "actual single-writer pool release",
+        )
+        .await;
         let allocate = || {
             RepositoryCreationOwner::allocate(
                 &registry,
