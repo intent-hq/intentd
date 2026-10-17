@@ -337,8 +337,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, InvalidationSubscription, SharedWatchHub, Subscription,
-    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, InvalidationSubscription, SharedWatchHub,
+    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;

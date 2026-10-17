@@ -193,7 +193,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
 // Human workspace discussions (15.1): +5 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 439;
+// Generic event recovery adds the events.fence fast path.
+const EXPECTED_TOTAL_METHODS: usize = 440;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -204,13 +205,13 @@ const EXPECTED_TOTAL_METHODS: usize = 439;
 const EXPECTED_ROUTER_METHODS: usize = 383;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 56;
+const EXPECTED_FASTPATH_METHODS: usize = 57;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 5;
+const EXPECTED_NOTIFICATIONS: usize = 6;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -597,6 +598,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
     "file-tracking.getAgentLocks",
@@ -1588,6 +1590,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
+        "events.fence",
         "events.subscribe",
         "chat.subscribe",
         "workspace.subscribe",

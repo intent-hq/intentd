@@ -459,6 +459,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "drafts.clear",
     "drafts.get",
     "drafts.set",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
     "host.checkAuggie",
@@ -514,6 +515,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 pub(crate) const NOTIFICATIONS: &[&str] = &[
     "accept-changes.retired",
     "events.event",
+    "events.lost",
     "sourceControl.read.retired",
     "workspace.repositoryContext.retired",
     "workspace.repositorySelection.retired",
@@ -629,6 +631,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("event.agentActivity", "Read: durable event log for an agent. Rows are narrowed by the collaborator event allowlist."),
     ("event.query", "Read: durable event query. Rows are narrowed by the collaborator event allowlist."),
     ("event.workspaceSummary", "Read: aggregated workspace activity. Built from allowlisted event rows only."),
+    ("events.fence", "Recovery: drains all admitted subscription tails before an authoritative read."),
     ("events.subscribe", "Client boot: the general event bus subscription. Non-administrator filters are narrowed to the collaborator event allowlist at fan-out."),
     ("events.unsubscribe", "Client boot: drops an event bus subscription."),
     ("file.attachmentUpload.abort", "Edit: aborts a chat attachment upload. Attachment store under the workspace, no arbitrary host path."),

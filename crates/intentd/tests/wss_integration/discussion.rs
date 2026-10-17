@@ -534,10 +534,11 @@ async fn discussion_private_conversations_events_typing_and_retry_over_wss() {
             .call(
                 2,
                 "events.subscribe",
-                json!({"eventTypes":["discussion:message","presence:changed"]}),
+                json!({"eventTypes":["discussion:message","presence:changed"],"lossRecovery":1}),
             )
             .await;
         assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
+        assert_eq!(sub["result"]["lossRecovery"], 1, "{sub}");
         client.all_events("presence:changed").await;
     }
     let caps = alice.call(3, "system.capabilities", json!({})).await;
@@ -850,10 +851,11 @@ async fn discussion_reactions_and_replies_are_durable_private_and_projected_over
             .call(
                 2,
                 "events.subscribe",
-                json!({"eventTypes":["discussion:*"]}),
+                json!({"eventTypes":["discussion:*"],"lossRecovery":1}),
             )
             .await;
         assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
+        assert_eq!(sub["result"]["lossRecovery"], 1, "{sub}");
     }
     let caps = alice.call(3, "system.capabilities", json!({})).await;
     assert_eq!(caps["result"]["discussionMessageActions"], 1);
