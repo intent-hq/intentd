@@ -27,7 +27,7 @@ sha2 = "0.11"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-toon-format = { version = "0.5.0", default-features = false }
+toon-format = { version = "0.6.1", default-features = false }
 
 [target."cfg(unix)".dependencies]
 libc.workspace = true
