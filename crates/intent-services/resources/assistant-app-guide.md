@@ -249,6 +249,16 @@ or edit its full definition. Output is temporary and may no longer be available 
 only active monitors and disappear when they finish, trigger, expire, or are
 cancelled; completion notices remain in the agent conversation.
 
+<!-- Sources: packages/ios/Intent/Views/Conversation/StatusStrip/{MonitoredScriptsRow,ScriptMonitorDetailView,ScriptMonitorPresentation}.swift; packages/ios/Intent/Services/{WorkspaceScriptMonitorsStore,ConnectionCapabilities}.swift. -->
+
+On iPhone and iPad, **Watching scripts** in an agent's conversation shows that
+agent's active script watches and their expiry times. Tap a watch for its owner,
+watched run, and any output condition. A watch ending or expiring does not by
+itself mean the script stopped. **Load more script watches** loads another page
+when offered. If the deadline has passed but the watch remains visible, wait for
+confirmation; do not assume the run finished. This view requires a
+compatible host and provides details only, without script or watch controls.
+
 To delete a saved script, use **Delete script** beside its play/edit controls in
 the bottom bar, or open the script panel's **…** menu and choose **Delete script**
 immediately after **Show in bottom bar**. Both actions ask **Delete “[name]”?**;
