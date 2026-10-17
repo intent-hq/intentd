@@ -210,7 +210,26 @@ mod tests {
     use sqlx::Connection;
     use std::sync::Arc;
 
-    async fn internal_timeout_retains_worker(read: bool) {
+    /// A plain connection holding an exclusive rollback-journal lock, so any
+    /// other connection's lock-taking PRAGMA waits in SQLite's busy handler.
+    async fn exclusive_blocker(db: &std::path::Path) -> sqlx::SqliteConnection {
+        let mut blocker = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(db),
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+        blocker
+    }
+
+    /// Stretches fixture setup past the scenario's acquisition budget. The delay
+    /// only lengthens setup, so it cannot make a correct fixture fail under load.
+    const SLOW_SETUP_HOLD: Duration = Duration::from_millis(300);
+
+    async fn internal_timeout_retains_worker(read: bool, slow_setup: bool) {
         let directory = tempfile::tempdir().unwrap();
         let db = directory.path().join("timeout.db");
         let initial = crate::Store::open(&db).await.unwrap();
@@ -220,6 +239,16 @@ mod tests {
         let owner = Arc::new(crate::daemon_ownership::DaemonOwnership::acquire(&lock).unwrap());
         let weak_owner = Arc::downgrade(&owner);
         let timeout = Duration::from_millis(100);
+        let setup_blocker = if slow_setup {
+            let mut blocker = exclusive_blocker(&db).await;
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(SLOW_SETUP_HOLD).await;
+                sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
+                blocker.close().await.unwrap();
+            }))
+        } else {
+            None
+        };
         let raw = if read {
             crate::connect_read_owned_timeout(&db, Some(owner.clone()), timeout)
                 .await
@@ -229,6 +258,9 @@ mod tests {
                 .await
                 .unwrap()
         };
+        if let Some(release) = setup_blocker {
+            release.await.unwrap();
+        }
         let pool = StorePool::new(raw, true);
         pool.acquire().await.unwrap().close().await.unwrap();
         assert_eq!(pool.size(), 0);
@@ -264,11 +296,21 @@ mod tests {
 
     #[tokio::test]
     async fn write_internal_timeout_retains_initializing_worker() {
-        internal_timeout_retains_worker(false).await;
+        internal_timeout_retains_worker(false, false).await;
     }
 
     #[tokio::test]
     async fn read_internal_timeout_retains_initializing_worker() {
-        internal_timeout_retains_worker(true).await;
+        internal_timeout_retains_worker(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn write_internal_timeout_survives_slow_setup() {
+        internal_timeout_retains_worker(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn read_internal_timeout_survives_slow_setup() {
+        internal_timeout_retains_worker(true, true).await;
     }
 }
