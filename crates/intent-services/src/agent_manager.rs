@@ -3662,12 +3662,15 @@ impl AgentManager {
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
-            let context = crate::installed_cli::InstalledContext::discover(cli)
-                .await
-                .map_err(Error::InvalidInput)?;
-            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
-                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
-            context.apply(&mut prepared.command);
+            // A named profile resolves before account lookup; the spawn layer
+            // applies the same overlay to the prepared command.
+            let context = crate::installed_cli::InstalledContext::discover_for(
+                cli,
+                spawn_opts.profile_env.cloned().map(Arc::new),
+            )
+            .await
+            .map_err(Error::InvalidInput)?;
+            let prepared = prepare_installed_launch(&context, &spawn_opts)?;
             let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
@@ -12699,6 +12702,20 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
+/// Build a persistent installed-CLI launch: the spawn layer's command (provider
+/// env, Intent wiring, the profile overlay over captured credentials), frozen
+/// to the installed context, which re-asserts the selected executable and
+/// enforced policy.
+fn prepare_installed_launch(
+    context: &crate::installed_cli::InstalledContext,
+    spawn_opts: &SpawnOptions<'_>,
+) -> Result<intent_acp::spawn::PreparedProvider> {
+    let mut prepared = intent_acp::spawn::prepare_provider(spawn_opts)
+        .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+    context.apply(&mut prepared.command);
+    Ok(prepared)
+}
+
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
@@ -12727,6 +12744,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
+    spawn_opts.profile_env = opts.profile_env;
     spawn_opts
 }
 
@@ -23069,3 +23087,188 @@ mod effort_notice_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+/// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
+/// command carries the profile over inherited and captured values, never over
+/// Intent's wiring, executable selection or enforced policy.
+#[cfg(all(test, unix))]
+mod profile_launch_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    #[test]
+    fn persistent_launch_applies_profile_but_never_over_intent_wiring() {
+        for (base, cli, account_var) in [
+            ("codex", InstalledCli::Codex, "CODEX_HOME"),
+            ("claude-code", InstalledCli::Claude, "CLAUDE_CONFIG_DIR"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                vec![
+                    ("PROFILE_LAUNCH_TOKEN".into(), Some("work".into())),
+                    (
+                        account_var.into(),
+                        Some(work.to_string_lossy().into_owned()),
+                    ),
+                    ("LOGNAME".into(), None),
+                    ("INTENT_TEST_WIRING".into(), Some("profile".into())),
+                ],
+            );
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.profile_env = Some(&profile);
+            opts.extra_env
+                .insert("INTENT_TEST_WIRING".into(), "intent".into());
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let command = &prepared.command;
+            assert_eq!(
+                env(command, "PROFILE_LAUNCH_TOKEN"),
+                Some("work".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, account_var),
+                Some(work.into_os_string()),
+                "{base}"
+            );
+            assert!(env(command, "LOGNAME").is_none(), "{base}");
+            assert_eq!(
+                env(command, "INTENT_TEST_WIRING"),
+                Some("intent".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, cli.path_env()),
+                Some(context.runtime.path().as_os_str().to_owned()),
+                "{base}"
+            );
+            if cli == InstalledCli::Codex {
+                assert_eq!(
+                    env(command, "CODEX_CONFIG"),
+                    Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+                );
+            }
+            assert!(std::env::var_os("PROFILE_LAUNCH_TOKEN").is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_spawn_options_keep_the_profile() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let profile = intent_acp::ProfileEnv::new("codex@work", "f1", Vec::new());
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let rebuilt = rebuild_spawn_opts(&opts, None, None, None);
+        assert_eq!(rebuilt.profile_env, Some(&profile));
+    }
+}
+
+/// Every key a profile may save reaches the persistent launch and the probe
+/// paths unchanged, even when Intent injects its own git wiring.
+#[cfg(all(test, unix))]
+mod profile_reach_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+        "INITIAL_AGENT_MODE",
+        "CORP_GATEWAY_TOKEN",
+        "LANG",
+    ];
+
+    #[test]
+    fn every_non_reserved_profile_key_reaches_launch_and_probes_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(repo.path()).unwrap();
+        let mut config = git.config().unwrap();
+        config.set_str("user.name", "Intent Wiring").unwrap();
+        config
+            .set_str("user.email", "wiring@example.invalid")
+            .unwrap();
+        for (base, cli) in [
+            ("codex", InstalledCli::Codex),
+            ("claude-code", InstalledCli::Claude),
+        ] {
+            let allowed: Vec<&str> = CANDIDATES
+                .iter()
+                .copied()
+                .filter(|k| crate::provider_profiles::reserved_key_reason(k, base).is_none())
+                .collect();
+            assert_eq!(
+                allowed.contains(&"INITIAL_AGENT_MODE"),
+                base == "claude-code"
+            );
+            let value = |k: &str| format!("profile-{k}");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                allowed
+                    .iter()
+                    .map(|k| ((*k).to_owned(), Some(value(k))))
+                    .collect(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.cwd = Some(repo.path());
+            opts.profile_env = Some(&profile);
+            inject_git_identity_env(&mut opts.extra_env, Some(repo.path()));
+            inject_git_credential_env(&mut opts.extra_env, Some(repo.path()), true);
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let mut auth_probe = tokio::process::Command::new(context.runtime.path());
+            context.apply(&mut auth_probe);
+            let mut model_probe = tokio::process::Command::new("unused");
+            context.apply_isolated(&mut model_probe);
+            for key in &allowed {
+                let expected = Some(OsString::from(value(key)));
+                assert_eq!(env(&prepared.command, key), expected, "{base} launch {key}");
+                assert_eq!(env(&auth_probe, key), expected, "{base} auth {key}");
+                assert_eq!(env(&model_probe, key), expected, "{base} model {key}");
+            }
+        }
+    }
+}
