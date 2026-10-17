@@ -2463,7 +2463,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
     mgr.send_message(
@@ -2713,6 +2713,7 @@ fn mock_handle() -> AgentHandle {
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
+        spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
         thought_level: None,
         config_options: None,
         confirmed_effort: None,
@@ -5087,6 +5088,7 @@ fn track_mock_agent_inner(
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -5245,6 +5247,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: spawned_provider.to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command(spawned_provider),
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9246,6 +9249,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9341,7 +9345,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → `interrupt` would fall back to the kill path).
     mgr.services
@@ -10444,7 +10448,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
     mgr.services
         .store
@@ -10577,7 +10581,7 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-stop-progress")
@@ -11157,7 +11161,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → the preemption would be skipped).
     mgr.services
@@ -11356,7 +11360,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let sent = intent_core::with_caller(
         caller,
         mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
@@ -11528,7 +11532,7 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-zero")
@@ -11802,7 +11806,7 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // Keep the preemption on the keep-alive interrupt path (no session →
     // `interrupt` would fall back to the kill path).
     mgr.services
@@ -11954,7 +11958,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-dup")
@@ -18842,7 +18846,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-img-failure")
@@ -18978,7 +18982,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     mgr.start_session(
         &id,
         tmp.path.parent().unwrap().to_path_buf(),
@@ -21973,6 +21977,7 @@ mod harness_wake_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -23434,6 +23439,7 @@ mod model_change_notice_tests {
     fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
         ResolvedSpawn {
             provider: *intent_providers::provider_config(provider_id),
+            selection: crate::provider_profiles::canonical_selection(provider_id),
             model: model.map(str::to_string),
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
@@ -28456,5 +28462,186 @@ fn qualified_monitor_redelivery_withholds_private_envelope() {
         message.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
         message.content = json!([{"type":"text","text":"GitHub monitor update"}]);
         assert!(super::redelivery_prepend(&[message], None, None).is_some());
+    }
+}
+
+/// Turn-start routing for named provider profiles (PROTOCOL §5.54): a profile
+/// runs on its base installation under its own selection identity, a switch
+/// between profiles (or a profile and Default) never reuses the other's
+/// process or native session, and a missing profile or disabled base needs an
+/// explicit replacement instead of the disabled-provider re-home.
+mod profile_routing_tests {
+    use super::*;
+
+    /// Seed `id` in its own workspace (`seed_agent` inserts the workspace).
+    async fn session_on(mgr: &AgentManager, id: &AgentId, provider: &str) -> WorkspaceId {
+        let ws = WorkspaceId::from(format!("ws-{}", id.0).as_str());
+        let ws = &ws;
+        seed_agent(mgr, ws, id).await;
+        mgr.services
+            .store
+            .set_agent_session_model(ws, id, "same-model", Some(provider), &now_iso())
+            .await
+            .unwrap();
+        ws.clone()
+    }
+
+    fn replacement_reason(err: &Error) -> String {
+        let Error::ProviderProfile(failure) = err else {
+            panic!("expected provider-profile-replacement-required, got {err:?}");
+        };
+        assert_eq!(
+            failure.data["code"], "provider-profile-replacement-required",
+            "{err:?}"
+        );
+        failure.data["reason"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_profile_runs_on_its_base_installation_under_its_own_selection() {
+        let (_tmp, mgr) = manager().await;
+        let settings = intent_core::settings_file::SettingsFile::default();
+        for (provider, base) in [
+            ("codex@pwork", "codex"),
+            ("claude-code@pwork", "claude-code"),
+            ("codex", "codex"),
+        ] {
+            let id = AgentId::from(format!("a-pr1-{base}-{}", provider.len()).as_str());
+            session_on(&mgr, &id, provider).await;
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+            assert_eq!(resolved.provider.id, base, "{provider}");
+            assert_eq!(resolved.selection, provider, "{provider}");
+            assert_eq!(resolved.model.as_deref(), Some("same-model"));
+        }
+    }
+
+    #[test]
+    fn a_profile_switch_never_reuses_the_live_process() {
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        let command = intent_providers::provider_config("codex").command;
+        let live = |selection: &str, target: &str| {
+            super::super::spawn_identity_changed(
+                Some("same-model"),
+                command,
+                selection,
+                &resolved(target),
+            )
+        };
+        assert!(!live("codex", "codex"));
+        assert!(!live("codex@pwork", "codex@pwork"));
+        assert!(live("codex", "codex@pwork"), "Default → Work");
+        assert!(live("codex@pwork", "codex"), "Work → Default");
+        assert!(live("codex@pwork", "codex@ppersonal"), "Work → Personal");
+    }
+
+    #[tokio::test]
+    async fn a_profile_switch_commits_the_reference_as_the_native_session_owner() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-pr2"), AgentId::from("a-pr2"));
+        seed_agent(&mgr, &ws, &id).await;
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex"))
+            .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex@pwork"))
+            .await;
+        let (_, owner) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some("codex@pwork"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "same model, new profile is a switch");
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["fromProvider"], "codex");
+        assert_eq!(md["toProvider"], "codex@pwork");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn missing_or_disabled_profiles_require_replacement_instead_of_rehoming() {
+        let (_tmp, mgr) = manager().await;
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.model.default_provider = Some("auggie".into());
+
+        let gone = AgentId::from("a-pr3-gone");
+        let ws = session_on(&mgr, &gone, "codex@pgone").await;
+        let session = mgr.services.store.get_agent_session(&gone).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&gone, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "profile-missing");
+
+        let created = mgr
+            .services
+            .provider_profiles_create_impl(json!({ "baseProviderId": "codex", "name": "Work" }))
+            .await
+            .unwrap();
+        let reference = created["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let work = AgentId::from("a-pr3-work");
+        let ws = session_on(&mgr, &work, &reference).await;
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let (kept, rehomed) = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap();
+        assert!(!rehomed);
+        assert_eq!(kept.provider.as_deref(), Some(reference.as_str()));
+
+        settings.providers.enabled = Some(std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            false,
+        )]));
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "provider-disabled");
+        let after = mgr.services.store.get_agent_session(&work).await.unwrap();
+        assert_eq!(
+            after.provider.as_deref(),
+            Some(reference.as_str()),
+            "never moved to the app default"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&work, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no provider_rehomed notice");
     }
 }

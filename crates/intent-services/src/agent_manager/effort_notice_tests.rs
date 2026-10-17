@@ -5,6 +5,7 @@ use intent_core::AgentMessage;
 fn resolved() -> ResolvedSpawn {
     ResolvedSpawn {
         provider: *intent_providers::provider_config("auggie"),
+        selection: "auggie".into(),
         model: None,
         reasoning_effort: None,
         cwd: std::env::temp_dir(),
