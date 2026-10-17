@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.2] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Recover shell credentials for Claude auth checks ([#2445](https://github.com/intent-hq/intentd/pull/2445))
+- Surface generic event loss with ordered recovery fences ([#2404](https://github.com/intent-hq/intentd/pull/2404))
+
+
 ## [0.11.1] - 2026-10-17
 
 ### 🐛 Bug Fixes
