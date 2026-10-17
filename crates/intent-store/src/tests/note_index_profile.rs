@@ -278,6 +278,95 @@ fn index_sources_reference_only_audited_crates() {
     }
 }
 
+/// Simulate a workspace release without changing registry dependency constraints.
+fn bump_workspace_manifest(manifest: &str, old_version: &str) -> String {
+    fn bump_sections(table: &mut toml::Table, old_version: &str) {
+        if let Some(package) = table.get_mut("package").and_then(toml::Value::as_table_mut) {
+            if package.get("version").and_then(toml::Value::as_str) == Some(old_version) {
+                package.insert("version".into(), toml::Value::String("99.0.0".into()));
+            }
+        }
+        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(dependencies) = table.get_mut(section).and_then(toml::Value::as_table_mut) {
+                for dependency in dependencies.values_mut() {
+                    if let Some(spec) = dependency.as_table_mut() {
+                        if spec.contains_key("path")
+                            && spec.get("version").and_then(toml::Value::as_str)
+                                == Some(old_version)
+                        {
+                            spec.insert("version".into(), toml::Value::String("99.0.0".into()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(targets) = table.get_mut("target").and_then(toml::Value::as_table_mut) {
+            for target in targets.values_mut().filter_map(toml::Value::as_table_mut) {
+                bump_sections(target, old_version);
+            }
+        }
+        if let Some(workspace) = table
+            .get_mut("workspace")
+            .and_then(toml::Value::as_table_mut)
+        {
+            bump_sections(workspace, old_version);
+        }
+    }
+    let mut table: toml::Table = manifest.parse().unwrap();
+    bump_sections(&mut table, old_version);
+    toml::to_string(&table).unwrap()
+}
+
+#[test]
+fn release_fixture_preserves_external_versions_equal_to_workspace_version() {
+    let manifest = r#"
+[package]
+name = "fixture"
+version = "0.11.0"
+[dependencies]
+sha2 = "0.11.0"
+renamed = { package = "sha2", version = "0.11.0", features = ["std"] }
+local = { path = "../local", version = "0.11.0" }
+[dev-dependencies]
+sha2 = { version = "0.11.0" }
+[target.'cfg(unix)'.build-dependencies]
+local = { path = "../local", version = "0.11.0" }
+external = { version = "0.11.0" }
+[workspace.package]
+version = "0.11.0"
+[workspace.dependencies]
+local = { path = "local", version = "0.11.0" }
+external = "0.11.0"
+"#;
+    let original: toml::Table = manifest.parse().unwrap();
+    let mut expected = original.clone();
+    for path in [
+        vec!["package", "version"],
+        vec!["dependencies", "local", "version"],
+        vec![
+            "target",
+            "cfg(unix)",
+            "build-dependencies",
+            "local",
+            "version",
+        ],
+        vec!["workspace", "package", "version"],
+        vec!["workspace", "dependencies", "local", "version"],
+    ] {
+        let mut table = &mut expected;
+        for key in &path[..path.len() - 1] {
+            table = table.get_mut(*key).unwrap().as_table_mut().unwrap();
+        }
+        table.insert(
+            path[path.len() - 1].into(),
+            toml::Value::String("99.0.0".into()),
+        );
+    }
+    let actual: toml::Table = bump_workspace_manifest(manifest, "0.11.0").parse().unwrap();
+    assert_eq!(actual, expected);
+    assert_ne!(actual, original);
+}
+
 #[test]
 fn release_only_workspace_version_bumps_preserve_profile() {
     let inputs = real_inputs();
@@ -289,11 +378,10 @@ fn release_only_workspace_version_bumps_preserve_profile() {
         }
     }
     let bumped_lock = join(&header, &lock_blocks);
-    let quoted = format!("\"{version}\"");
     let bumped_manifests: Vec<String> = inputs
         .manifests
         .iter()
-        .map(|manifest| manifest.replace(&quoted, "\"99.0.0\""))
+        .map(|manifest| bump_workspace_manifest(manifest, &version))
         .collect();
     assert_ne!(bumped_lock, inputs.lock);
     assert_ne!(bumped_manifests, inputs.manifests);
