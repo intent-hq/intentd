@@ -70,6 +70,16 @@ pub enum Error {
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
 
+    /// A named provider profile request failed (PROTOCOL §5.54). `data`
+    /// carries the machine-readable discriminator (`data.code`, e.g.
+    /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
+    /// `provider-profile-not-found`, `provider-profiles-unreadable`) and is
+    /// passed through verbatim as `error.data`. `internal` selects `-32603`
+    /// (an unreadable profile file); otherwise `-32602`. Neither `message`
+    /// nor `data` ever carries an environment value.
+    #[error("{}", .0.message)]
+    ProviderProfile(Box<ProviderProfileFailure>),
+
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
     /// detail (git stderr tail with credentials redacted) so clients can show
@@ -534,6 +544,13 @@ impl Error {
                 _ => -32603,
             },
 
+            Error::ProviderProfile(failure) => {
+                if failure.internal {
+                    -32603
+                } else {
+                    -32602
+                }
+            }
             Error::NotePage(crate::note_page::NotePageError::Preparing | crate::note_page::NotePageError::ResourceLimit) => -32006,
             Error::NotePage(crate::note_page::NotePageError::Stale)
             | Error::Conflict { .. } => -32005,
@@ -574,6 +591,33 @@ impl Error {
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
+    }
+}
+
+/// Payload of [`Error::ProviderProfile`], boxed to keep [`Error`] small.
+#[derive(Debug)]
+pub struct ProviderProfileFailure {
+    /// `-32603` when true (unreadable profile file); otherwise `-32602`.
+    pub internal: bool,
+    /// Human message; never carries an environment value.
+    pub message: String,
+    /// `error.data`, passed through verbatim (`data.code` plus details).
+    pub data: serde_json::Value,
+}
+
+impl Error {
+    /// Build an [`Error::ProviderProfile`].
+    #[must_use]
+    pub fn provider_profile(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::ProviderProfile(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
     }
 }
 

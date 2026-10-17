@@ -1932,11 +1932,15 @@ async fn cmd_serve_owned(
         .with_assets_root(assets_root)
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
+        // Named provider profile metadata lives next to config.toml (§5.54).
+        .with_provider_profiles_dir(&config.data_dir)
         .with_event_bus(bus.clone())
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    // Remove secrets journaled by an interrupted profile create/delete.
+    services.sweep_provider_profile_secrets().await;
     #[cfg(feature = "repository-test-fixtures")]
     let fixture_installed = match initialize_gitlab_test_transports(&services).await {
         Ok(installed) => installed,
