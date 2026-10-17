@@ -8498,7 +8498,10 @@ async fn open_session_resolves_effective_model_for_null_model() {
         .await
         .expect("open session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model, None, "NULL model stays NULL");
+    // Every session carries a concrete model: a NULL one is filled with the
+    // model select's selectable option id (`currentValue`), never the D13
+    // display name, which stays a stats-only resolution (monorepo#1534).
+    assert_eq!(stored.model.as_deref(), Some("default"));
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)
