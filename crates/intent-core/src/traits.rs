@@ -6398,6 +6398,65 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.list` (PROTOCOL §5.54): `{ profiles, revision }`,
+    /// optionally filtered by `baseProviderId`. Env values are masked.
+    /// Administrator-only.
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = base_provider_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId`, `name` and optional `env`; returns
+    /// `{ profile, revision }` and emits `providers:profiles-changed`.
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name` and
+    /// complete `env` list; returns `{ profile, revision, activation }`.
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (profile_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.delete` (PROTOCOL §5.54): `{ profileId, revision }`;
+    /// refused with `provider-profile-in-use` while saved settings select it.
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = profile_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
     /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
     /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:
