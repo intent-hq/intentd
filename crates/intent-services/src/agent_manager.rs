@@ -10171,12 +10171,23 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn effort");
             }
         }
-        // Every session carries a concrete reasoning level: a session that ran
-        // this turn on Auto (no stored effort) is pinned to the level the
-        // provider confirmed for it — its explicit selection, else its known
-        // default — never the adapter's `"default"` sentinel. Fill-only, so a
-        // concurrent effort change wins; the effective-level comparison above
-        // keeps Auto → that same level silent on the next turn.
+        Box::pin(self.fill_confirmed_effort(agent_id, workspace_id, resolved, &state)).await;
+    }
+
+    /// Every session carries a concrete reasoning level: a session that ran
+    /// this turn on Auto (no stored effort) is pinned to the level the
+    /// provider confirmed for it — its explicit selection, else its known
+    /// default — never the adapter's `"default"` sentinel. Fill-only, so a
+    /// concurrent effort change wins; the store marks the level Auto-pinned
+    /// (`reasoning_effort_auto`), and the effective-level comparison keeps
+    /// Auto → that same level silent on the next turn.
+    async fn fill_confirmed_effort(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+        state: &intent_store::AgentTurnEffort,
+    ) {
         let confirmed = state
             .effort
             .clone()
@@ -10642,9 +10653,10 @@ impl AgentManager {
         // last turn ran (else the current default) BEFORE the disabled gate
         // and `resolve_spawn`, so the session stops following
         // `model.defaultProvider` changes from this turn on.
-        let session = self
-            .pin_legacy_session_provider(agent_id, workspace_id, session)
-            .await?;
+        // Boxed: keeps the repair's state off `ensure_started`'s future (the
+        // deep send/interrupt paths otherwise overflow the test stack).
+        let session =
+            Box::pin(self.pin_legacy_session_provider(agent_id, workspace_id, session)).await?;
         // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
         // a provider the user switched off in Settings > Agents never spawns
         // it — re-home onto the usable default (persisted before
@@ -10954,14 +10966,14 @@ impl AgentManager {
         // id (`fill_identity_from_session_open`). The child runs exactly that
         // model, so adopt it as the resolved identity: the notice/commit
         // below and the next turn's respawn comparison see the same id.
-        self.adopt_filled_model(
+        Box::pin(self.adopt_filled_model(
             agent_id,
             workspace_id,
             &session,
             workspace.as_ref(),
             &settings,
             &mut resolved,
-        )
+        ))
         .await;
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must

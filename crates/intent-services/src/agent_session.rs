@@ -3217,9 +3217,10 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            let filled_model = self
-                .fill_identity_from_session_open(&stored, resp.config_options.as_deref())
-                .await;
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
             (resp.modes, thought_level, filled_model)
         } else {
             (None, None, None)
@@ -3551,9 +3552,9 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
-        let filled_model = self
-            .fill_identity_from_session_open(&stored, resp.config_options.as_deref())
-            .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
