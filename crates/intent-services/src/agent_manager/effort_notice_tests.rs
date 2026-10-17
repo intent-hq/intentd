@@ -331,3 +331,24 @@ async fn effort_notice_does_not_advance_on_failed_spawn() {
     );
     mgr.shutdown().await;
 }
+
+/// Auto resolves to the provider's default level, so Auto → that same
+/// explicit level (the session-open fill pinning the provider's current
+/// level) is not announced; a real change still is.
+#[tokio::test]
+async fn effort_notice_treats_auto_and_its_default_level_as_unchanged() {
+    let (mgr, id, conn, _, _db, _task) = setup(Some(option("medium"))).await;
+    turn(&mgr, &id, &conn, None).await;
+    turn(&mgr, &id, &conn, Some("medium")).await;
+    assert!(
+        notices(&mgr, &id).await.is_empty(),
+        "Auto(medium) == medium"
+    );
+    turn(&mgr, &id, &conn, Some("high")).await;
+    let rows = notices(&mgr, &id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].metadata,
+        Some(json!({"type": "effort_changed", "from": "medium", "to": "high"}))
+    );
+}

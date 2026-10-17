@@ -9996,6 +9996,48 @@ impl AgentManager {
         }
     }
 
+    /// Adopt a `model` the session-open fill just persisted for a session
+    /// spawned without one (see the call site; `model` is what
+    /// `resolve_spawn` derives from the refreshed row). Updates the live handle's
+    /// `spawned_model` and `resolved.model`; when the last committed turn ran
+    /// the same provider on its default (`last_turn_model` NULL) the baseline
+    /// is moved to the adopted id too, so the provider default → its concrete
+    /// id is not announced as a model change. Best-effort.
+    async fn adopt_filled_model(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &mut ResolvedSpawn,
+        model: String,
+    ) {
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.spawned_model = Some(model.clone());
+        }
+        if let Ok((None, Some(prev))) = self
+            .services
+            .store
+            .get_agent_session_last_turn_model(workspace_id, agent_id)
+            .await
+        {
+            if intent_providers::provider_config(&prev).id == resolved.provider.id {
+                if let Err(e) = self
+                    .services
+                    .store
+                    .set_agent_session_last_turn_model(
+                        workspace_id,
+                        agent_id,
+                        Some(&model),
+                        resolved.provider.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to rebase last-turn model");
+                }
+            }
+        }
+        resolved.model = Some(model);
+    }
+
     /// Commit a confirmed effort at the successful turn boundary, never a
     /// picker update. SQL NULL is an unobserved baseline; JSON effort:null is
     /// Auto. The system row is excluded from provider history replay.
@@ -10033,8 +10075,17 @@ impl AgentManager {
             model: resolved.model.clone(),
         };
         if let Some(from) = &previous {
-            let same = match (&from.effort, &state.effort) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            // Compare the EFFECTIVE level: Auto resolves to the provider's
+            // default value, so Auto → that same explicit level (e.g. the
+            // session-open fill pinning the provider's current level) is not
+            // a change.
+            let effective = |e: &intent_store::AgentTurnEffort| {
+                e.effort
+                    .clone()
+                    .or_else(|| Some(e.default_value.clone()).filter(|d| !d.is_empty()))
+            };
+            let same = match (effective(from), effective(&state)) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
                 (None, None) => true,
                 _ => false,
             };
@@ -10168,6 +10219,66 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
             }
         }
+    }
+
+    /// Turn-start repair of a legacy session whose `provider` column is NULL
+    /// (written before every create pinned its provider). The provider comes
+    /// from [`crate::agent_session::legacy_session_provider`]: the provider
+    /// its last committed turn actually ran, else the settings default in
+    /// effect now (a session that never ran). Persisted through the
+    /// compare-and-set [`intent_store::Store::pin_agent_session_provider_if_null`],
+    /// so a concurrent `agent.setModel` that pinned a provider first wins and
+    /// the fresh row is used instead. The effective spawn identity of a
+    /// session that last ran on the pinned provider is unchanged, so no
+    /// respawn and no `model_changed` row follow. Emits `agent:updated` so
+    /// clients re-read the projection. With nothing to pin onto the session
+    /// is returned unchanged and `resolve_spawn` raises its own loud error.
+    async fn pin_legacy_session_provider(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: AgentSession,
+    ) -> Result<AgentSession> {
+        if session
+            .provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
+            return Ok(session);
+        }
+        let Some(provider) =
+            crate::agent_session::legacy_session_provider(&self.services, workspace_id, agent_id)
+                .await
+        else {
+            return Ok(session);
+        };
+        let landed = self
+            .services
+            .store
+            .pin_agent_session_provider_if_null(workspace_id, agent_id, &provider, &now_iso())
+            .await?;
+        if !landed {
+            return self.services.store.get_agent_session(agent_id).await;
+        }
+        tracing::info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            field = "provider",
+            "legacy session repaired"
+        );
+        self.services.invalidate_agent_list_cache(workspace_id);
+        self.services
+            .publish_agent_mutation_event(
+                workspace_id,
+                agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": agent_id.0, "providerId": provider }),
+            )
+            .await;
+        Ok(AgentSession {
+            provider: Some(provider),
+            ..session
+        })
     }
 
     /// Turn-start disabled-provider gate (intent-hq/intent#5737). When the
@@ -10435,6 +10546,14 @@ impl AgentManager {
         // `resolve_spawn`, so the respawn branch below sees the new identity)
         // or fail the turn with the same "not enabled" rejection the create
         // front doors raise.
+        // Legacy provider repair: every session pins its provider at create,
+        // so a NULL column is a pre-pin row. Pin it once onto the provider its
+        // last turn ran (else the current default) BEFORE the disabled gate
+        // and `resolve_spawn`, so the session stops following
+        // `model.defaultProvider` changes from this turn on.
+        let session = self
+            .pin_legacy_session_provider(agent_id, workspace_id, session)
+            .await?;
         let (session, rehomed) = self
             .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
             .await?;
@@ -10733,6 +10852,37 @@ impl AgentManager {
                 return Err(error);
             }
         };
+        // A session spawned on the provider default (no stored model) had its
+        // `model` filled at session open from the provider's current option
+        // id (`fill_identity_from_session_open`). The child runs exactly that
+        // model, so adopt it as the spawned identity: the next turn's
+        // respawn comparison and the notice/commit below see the same id.
+        if resolved.model.is_none() && session.model.as_deref().is_none_or(|m| m.trim().is_empty())
+        {
+            // Only a model the spawn path itself would pass is adopted (a
+            // provider that always spawns on its default — the E2E mock —
+            // must not see a phantom mismatch that respawns every turn).
+            let filled = self
+                .services
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .and_then(|fresh| {
+                    resolve_spawn(
+                        &fresh,
+                        workspace.as_ref(),
+                        &settings,
+                        self.chief_cwd_root.as_deref(),
+                    )
+                    .ok()
+                })
+                .and_then(|r| r.model);
+            if let Some(model) = filled {
+                self.adopt_filled_model(agent_id, workspace_id, &mut resolved, model)
+                    .await;
+            }
+        }
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -18928,7 +19078,8 @@ mod disabled_provider_rehome_tests {
 
     /// Manager over a temp store with a settings registry wired and NO
     /// seeded session — each test seeds its own row.
-    async fn registry_manager() -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
+    pub(super) async fn registry_manager(
+    ) -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
         let db_dir = crate::tests::test_tempdir("intentd-rehome-");
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
@@ -18954,7 +19105,7 @@ mod disabled_provider_rehome_tests {
         )
     }
 
-    fn set(mgr: &AgentManager, path: &str, value: Value) {
+    pub(super) fn set(mgr: &AgentManager, path: &str, value: Value) {
         mgr.services
             .settings_registry()
             .expect("registry wired")
@@ -23065,6 +23216,10 @@ mod agent_retry_tests {
 #[cfg(all(test, unix))]
 #[path = "agent_manager/effort_notice_tests.rs"]
 mod effort_notice_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/legacy_identity_tests.rs"]
+mod legacy_identity_tests;
 
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]

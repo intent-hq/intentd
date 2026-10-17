@@ -1558,6 +1558,32 @@ pub(crate) fn resolve_provider_id(
         })
 }
 
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`].
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Option<String> {
+    let last_turn = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await
+        .ok()
+        .and_then(|(_, provider)| provider)
+        .and_then(|raw| intent_providers::find_provider_or_legacy_alias(raw.trim()))
+        .map(|p| p.id.to_string());
+    last_turn.or_else(|| derived_default_provider(&services.effective_settings()))
+}
+
 /// Resolve the provider id the agent's failing TURN ran on, for event
 /// annotation: `last_turn_provider` (the identity the turn committed) with
 /// the session's persisted `provider` column — under the same precedence
@@ -2695,6 +2721,86 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` / `reasoning_effort` from what
+    /// the provider reports at session open, so every session ends up with a
+    /// concrete identity even when creation could not resolve one (a cold
+    /// catalog cache, an effort left to the provider, or a legacy row):
+    ///
+    /// - `model` ← the model select's `currentValue` — a selectable option
+    ///   id, never the display name the D13 resolution derives
+    ///   (monorepo#1534).
+    /// - `reasoning_effort` ← the thought-level select's current value, when
+    ///   it is a real level (the adapter's `"default"` sentinel is not; such
+    ///   a session keeps NULL = provider-decided, as does one whose provider
+    ///   advertises no levels at all).
+    ///
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten. The
+    /// running child already runs exactly these values, so the manager
+    /// treats the filled model as its spawned model (no respawn, no
+    /// `model_changed` row). Best-effort: failures are logged, never
+    /// propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+        thought_level: Option<&ThoughtLevelOption>,
+    ) {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| !m.trim().is_empty() && !m.contains(char::is_whitespace));
+        let effort = blank(stored.reasoning_effort.as_deref())
+            .then_some(thought_level)
+            .flatten()
+            .filter(|t| {
+                t.surfaced_levels()
+                    .is_some_and(|levels| levels.iter().any(|l| l == &t.current_value))
+            })
+            .map(|t| t.current_value.clone());
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                model.as_deref(),
+                effort.as_deref(),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?model,
+                    reasoning_effort = ?effort,
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({
+                        "agentId": stored.id.0,
+                        "modelId": model,
+                        "reasoningEffort": effort,
+                    }),
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -3107,6 +3213,12 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
+            self.fill_identity_from_session_open(
+                &stored,
+                resp.config_options.as_deref(),
+                thought_level.as_ref(),
+            )
+            .await;
             (resp.modes, thought_level)
         } else {
             (None, None)
@@ -3434,6 +3546,12 @@ impl Services {
         self.persist_session_effort_levels(
             &stored.workspace_id,
             &stored.id,
+            thought_level.as_ref(),
+        )
+        .await;
+        self.fill_identity_from_session_open(
+            &stored,
+            resp.config_options.as_deref(),
             thought_level.as_ref(),
         )
         .await;
