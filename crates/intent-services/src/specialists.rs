@@ -32,6 +32,15 @@ const BUNDLED_DIR_ENV: &str = "INTENTD_BUNDLED_SPECIALISTS_DIR";
 /// Reported as a settings pin (`specialists.dir`) like the other `INTENTD_*`
 /// env pins; the empty string counts as unset (no replacement).
 const REPLACEMENT_DIR_ENV: &str = "INTENTD_SPECIALISTS_DIR";
+/// Env var that relocates the USER tier (default `~/.intent/specialists/`):
+/// when set to a non-empty path, user-scope reads, writes (create/edit/
+/// delete/reset) and the specialists watcher use that directory instead.
+/// Unlike [`REPLACEMENT_DIR_ENV`] it leaves the base tier untouched. The
+/// Claude user-agents fallback (`~/.claude/agents`) and skill discovery stay
+/// on the real home. Dev sandboxes set it so specialist Settings can be
+/// exercised without touching the developer's real overrides; the empty
+/// string counts as unset.
+pub(crate) const USER_DIR_ENV: &str = "INTENTD_USER_SPECIALISTS_DIR";
 
 /// The reference specialist definitions embedded at compile time (PP-2,
 /// byte-identical to the reference bundle, kept under the versioned
@@ -251,9 +260,32 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Default user specialists directory (`~/.intent/specialists/`).
-fn default_user_dir() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".intent").join(SPECIALISTS_FOLDER))
+/// Parse a raw [`USER_DIR_ENV`] value: a non-empty path relocates the user
+/// tier; unset/empty means the default `~/.intent/specialists/`.
+fn user_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    raw.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// The [`USER_DIR_ENV`] override currently in effect, if any.
+pub(crate) fn user_dir_override_from_env() -> Option<PathBuf> {
+    user_dir_override(std::env::var_os(USER_DIR_ENV))
+}
+
+/// Pure resolution of the user tier: the [`USER_DIR_ENV`] override wins,
+/// else `<home>/.intent/specialists/`.
+fn resolve_user_dir(
+    raw_override: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    user_dir_override(raw_override)
+        .or_else(|| home.map(|h| h.join(".intent").join(SPECIALISTS_FOLDER)))
+}
+
+/// Default user specialists directory: [`USER_DIR_ENV`] if set, else
+/// `~/.intent/specialists/`. Shared with the specialists watcher so the
+/// watched and written directories cannot drift.
+pub(crate) fn default_user_dir() -> Option<PathBuf> {
+    resolve_user_dir(std::env::var_os(USER_DIR_ENV), home_dir())
 }
 
 /// Default bundled specialists directory: the [`BUNDLED_DIR_ENV`] override if
@@ -2689,6 +2721,84 @@ mod tests {
 
     /// [`replacement_dir`] parsing: unset and empty mean no replacement; a
     /// non-empty value is the replacement path.
+    #[test]
+    fn user_dir_resolution_prefers_non_empty_override() {
+        let home = Some(PathBuf::from("/home/dev"));
+        let default = PathBuf::from("/home/dev/.intent/specialists");
+        assert_eq!(resolve_user_dir(None, home.clone()), Some(default.clone()));
+        assert_eq!(
+            resolve_user_dir(Some(std::ffi::OsString::new()), home.clone()),
+            Some(default)
+        );
+        assert_eq!(
+            resolve_user_dir(Some("/sandbox/specialists".into()), home),
+            Some(PathBuf::from("/sandbox/specialists"))
+        );
+        assert_eq!(
+            resolve_user_dir(Some("/sandbox/specialists".into()), None),
+            Some(PathBuf::from("/sandbox/specialists"))
+        );
+        assert_eq!(resolve_user_dir(None, None), None);
+    }
+
+    /// A relocated user tier (the dev-sandbox case) takes user-scope writes,
+    /// edits and deletes; the real `~/.intent/specialists` is never touched.
+    #[test]
+    fn relocated_user_dir_receives_writes_and_leaves_home_tier_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join(".intent").join("specialists");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("keep.md"), "---\nname: \"Keep\"\n---\n\nreal").unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let relocated = resolve_user_dir(
+            Some(sandbox.path().join("specialists").into_os_string()),
+            Some(home.path().to_path_buf()),
+        );
+        let svc = SpecialistsService::new(relocated.clone(), Some(sandbox.path().join("bundled")));
+        let spec = json!({"name": "Probe", "description": "d", "prompt": "body"});
+        let created = svc.create("probe", &spec, Some("user"), None).unwrap();
+        assert!(
+            sandbox.path().join("specialists/probe.md").exists(),
+            "{created}"
+        );
+        svc.delete("probe", "user", None).unwrap();
+        assert!(!sandbox.path().join("specialists/probe.md").exists());
+        let entries: Vec<_> = std::fs::read_dir(&real)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.md")]);
+        assert!(
+            svc.resolve("keep", None).is_none(),
+            "real user tier must not be read"
+        );
+    }
+
+    /// The Claude user-agents fallback stays on the real home when the user
+    /// tier is relocated, and still derives from an `.intent/specialists`
+    /// tier otherwise.
+    #[test]
+    fn claude_user_root_follows_real_home_when_user_tier_relocated() {
+        let home = Some(PathBuf::from("/home/dev"));
+        let relocated = Path::new("/sandbox/specialists");
+        assert_eq!(
+            claude_agents::user_root_for(relocated, Some(relocated), home.clone()),
+            Some(PathBuf::from("/home/dev/.claude/agents"))
+        );
+        assert_eq!(
+            claude_agents::user_root_for(relocated, None, home.clone()),
+            None
+        );
+        assert_eq!(
+            claude_agents::user_root_for(
+                Path::new("/tmp/x/.intent/specialists"),
+                Some(relocated),
+                home
+            ),
+            Some(PathBuf::from("/tmp/x/.claude/agents"))
+        );
+    }
+
     #[test]
     fn replacement_dir_parses_unset_empty_and_set() {
         assert_eq!(replacement_dir(None), None);

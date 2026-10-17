@@ -18,6 +18,22 @@ pub(crate) fn user_root(intent_root: Option<&Path>) -> Option<PathBuf> {
         return Some(PathBuf::from(root).join("agents"));
     }
     let intent_root = intent_root?;
+    let relocated = super::user_dir_override_from_env();
+    user_root_for(intent_root, relocated.as_deref(), super::home_dir())
+}
+
+/// Pure [`user_root`] resolution: `<home>/.claude/agents` derived from an
+/// `<home>/.intent/specialists` user tier, or from the real home when the
+/// user tier was relocated by `INTENTD_USER_SPECIALISTS_DIR` (the relocated
+/// directory has no `.intent` parent to derive from).
+pub(super) fn user_root_for(
+    intent_root: &Path,
+    relocated: Option<&Path>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if relocated == Some(intent_root) {
+        return home.map(|home| home.join(".claude/agents"));
+    }
     let parent = intent_root.parent()?;
     if parent.file_name()? != ".intent" || intent_root.file_name()? != "specialists" {
         return None;
