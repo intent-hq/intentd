@@ -23,10 +23,20 @@ fn native_review_execution_diagnostics_preserve_errors_without_payloads() {
     }
     let output = Arc::new(Mutex::new(Vec::new()));
     let writer = Writer(output.clone());
+    // Exercise the actual hosted wire-test filter: this module is path-mapped,
+    // so its tracing target differs from its source directory.
+    let wire_test = include_str!("../../../../intentd/tests/e2e_native_review_wire.rs");
+    let filter = wire_test
+        .split_once(".with_env_filter(\"")
+        .unwrap()
+        .1
+        .split_once('"')
+        .unwrap()
+        .0;
     let subscriber = tracing_subscriber::fmt()
         .without_time()
         .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
+        .with_env_filter(filter)
         .with_writer(move || writer.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || {
