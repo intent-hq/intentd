@@ -110,6 +110,7 @@ pub(super) fn handle(
             antigravity_profile: None,
             session_mcp_servers: vec![],
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "claude-agent-acp".into(),
             thought_level: None,
             config_options: None,

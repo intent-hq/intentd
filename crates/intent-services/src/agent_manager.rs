@@ -2567,6 +2567,10 @@ struct AgentHandle {
     /// env config) — passing servers they'd ignore is avoided for wire parity.
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
+    /// The model the session-open fill persisted onto a session spawned
+    /// without one (`AcpSessionOpened::filled_model`): the fill's own landed
+    /// value, taken by `adopt_filled_model` on the spawn path.
+    session_open_filled_model: Option<String>,
     spawned_provider: String,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
@@ -3750,6 +3754,7 @@ impl AgentManager {
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -4645,6 +4650,9 @@ impl AgentManager {
         if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.config_options.clone_from(&opened.config_options);
             crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+            handle
+                .session_open_filled_model
+                .clone_from(&opened.filled_model);
         }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
@@ -9996,6 +10004,75 @@ impl AgentManager {
         }
     }
 
+    /// Adopt the model the session-open fill persisted for a session spawned
+    /// without one. The value is the fill's own landed model, recorded on the
+    /// live handle (`session_open_filled_model`) — never re-read from the
+    /// row, so a racing `agent.setModel` is not mistaken for an applied
+    /// model. Only a model `resolve_spawn` itself would pass is adopted (a
+    /// provider that always spawns on its default — the E2E mock — must not
+    /// see a phantom mismatch that respawns every turn). Sets the handle's
+    /// `spawned_model` and `resolved.model`; when the last committed turn ran
+    /// the same provider on its default (`last_turn_model` NULL) the baseline
+    /// moves to the adopted id too, so the provider default → its concrete id
+    /// is not announced as a model change. Best-effort.
+    async fn adopt_filled_model(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+        workspace: Option<&intent_core::Workspace>,
+        settings: &intent_core::settings_file::SettingsFile,
+        resolved: &mut ResolvedSpawn,
+    ) {
+        let filled = self
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .and_then(|h| h.session_open_filled_model.take());
+        let Some(filled) = filled else { return };
+        if resolved.model.is_some() {
+            return;
+        }
+        let probe = AgentSession {
+            model: Some(filled),
+            ..session.clone()
+        };
+        let Some(model) =
+            resolve_spawn(&probe, workspace, settings, self.chief_cwd_root.as_deref())
+                .ok()
+                .and_then(|r| r.model)
+        else {
+            return;
+        };
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.spawned_model = Some(model.clone());
+        }
+        if let Ok((None, Some(prev))) = self
+            .services
+            .store
+            .get_agent_session_last_turn_model(workspace_id, agent_id)
+            .await
+        {
+            if intent_providers::provider_config(&prev).id == resolved.provider.id {
+                if let Err(e) = self
+                    .services
+                    .store
+                    .set_agent_session_last_turn_model(
+                        workspace_id,
+                        agent_id,
+                        Some(&model),
+                        resolved.provider.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to rebase last-turn model");
+                }
+            }
+        }
+        resolved.model = Some(model);
+    }
+
     /// Commit a confirmed effort at the successful turn boundary, never a
     /// picker update. SQL NULL is an unobserved baseline; JSON effort:null is
     /// Auto. The system row is excluded from provider history replay.
@@ -10033,10 +10110,24 @@ impl AgentManager {
             model: resolved.model.clone(),
         };
         if let Some(from) = &previous {
-            let same = match (&from.effort, &state.effort) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                (None, None) => true,
-                _ => false,
+            // Compare the EFFECTIVE level: Auto resolves to the provider's
+            // default value, so Auto → that same explicit level (e.g. the
+            // session-open fill pinning the provider's current level) is not
+            // a change.
+            let effective = |e: &intent_store::AgentTurnEffort| {
+                e.effort
+                    .clone()
+                    .or_else(|| Some(e.default_value.clone()).filter(|d| !d.is_empty()))
+            };
+            let same = if from.effort.is_none() && state.effort.is_none() {
+                // Auto → Auto is never a change, whatever the default did.
+                true
+            } else {
+                match (effective(from), effective(&state)) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+                    (None, None) => true,
+                    _ => false,
+                }
             };
             if !same {
                 let content = json!([{"type":"text", "text": format!(
@@ -10078,6 +10169,64 @@ impl AgentManager {
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn effort");
+            }
+        }
+        Box::pin(self.fill_confirmed_effort(agent_id, workspace_id, resolved, &state)).await;
+    }
+
+    /// Every session carries a concrete reasoning level: a session that ran
+    /// this turn on Auto (no stored effort) is pinned to the level the
+    /// provider confirmed for it — its explicit selection, else its known
+    /// default — never the adapter's `"default"` sentinel. Fill-only, so a
+    /// concurrent effort change wins; the store marks the level Auto-pinned
+    /// (`reasoning_effort_auto`), and the effective-level comparison keeps
+    /// Auto → that same level silent on the next turn.
+    async fn fill_confirmed_effort(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+        state: &intent_store::AgentTurnEffort,
+    ) {
+        let confirmed = state
+            .effort
+            .clone()
+            .or_else(|| Some(state.default_value.clone()))
+            .filter(|level| !level.trim().is_empty() && !level.eq_ignore_ascii_case("default"));
+        if let (None, Some(level)) = (resolved.reasoning_effort.as_deref(), confirmed) {
+            match self
+                .services
+                .store
+                .fill_agent_session_identity_if_null(
+                    workspace_id,
+                    agent_id,
+                    None,
+                    Some(&level),
+                    &now_iso(),
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        reasoning_effort = %level,
+                        field = "reasoning_effort",
+                        "legacy session repaired"
+                    );
+                    self.services.invalidate_agent_list_cache(workspace_id);
+                    self.services
+                        .publish_agent_mutation_event(
+                            workspace_id,
+                            agent_id,
+                            intent_core::events::AGENT_UPDATED,
+                            json!({ "agentId": agent_id.0, "reasoningEffort": level }),
+                        )
+                        .await;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "fill confirmed effort failed");
+                }
             }
         }
     }
@@ -10168,6 +10317,76 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
             }
         }
+    }
+
+    /// Turn-start repair of a legacy session whose `provider` column is NULL
+    /// (written before every create pinned its provider). The provider comes
+    /// from [`crate::agent_session::legacy_session_provider`]: the provider
+    /// its last committed turn actually ran, else the settings default in
+    /// effect now (a session that never ran). Persisted through the
+    /// compare-and-set [`intent_store::Store::pin_agent_session_provider_if_null`],
+    /// so a concurrent `agent.setModel` that pinned a provider first wins and
+    /// the fresh row is used instead. The effective spawn identity of a
+    /// session that last ran on the pinned provider is unchanged, so no
+    /// respawn and no `model_changed` row follow. Emits `agent:updated` so
+    /// clients re-read the projection. With nothing to pin onto the session
+    /// is returned unchanged and `resolve_spawn` raises its own loud error.
+    async fn pin_legacy_session_provider(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: AgentSession,
+    ) -> Result<AgentSession> {
+        if session
+            .provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
+            return Ok(session);
+        }
+        let provider = match crate::agent_session::legacy_session_provider(
+            &self.services,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(session),
+            Err(e) => {
+                // Never pin on a failed read: this turn resolves as before
+                // and the next turn retries the repair.
+                tracing::warn!(agent = %agent_id, error = %e, "legacy provider repair skipped");
+                return Ok(session);
+            }
+        };
+        let landed = self
+            .services
+            .store
+            .pin_agent_session_provider_if_null(workspace_id, agent_id, &provider, &now_iso())
+            .await?;
+        if !landed {
+            return self.services.store.get_agent_session(agent_id).await;
+        }
+        tracing::info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            field = "provider",
+            "legacy session repaired"
+        );
+        self.services.invalidate_agent_list_cache(workspace_id);
+        self.services
+            .publish_agent_mutation_event(
+                workspace_id,
+                agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": agent_id.0, "providerId": provider }),
+            )
+            .await;
+        Ok(AgentSession {
+            provider: Some(provider),
+            ..session
+        })
     }
 
     /// Turn-start disabled-provider gate (intent-hq/intent#5737). When the
@@ -10429,6 +10648,15 @@ impl AgentManager {
             .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();
+        // Legacy provider repair: every session pins its provider at create,
+        // so a NULL column is a pre-pin row. Pin it once onto the provider its
+        // last turn ran (else the current default) BEFORE the disabled gate
+        // and `resolve_spawn`, so the session stops following
+        // `model.defaultProvider` changes from this turn on.
+        // Boxed: keeps the repair's state off `ensure_started`'s future (the
+        // deep send/interrupt paths otherwise overflow the test stack).
+        let session =
+            Box::pin(self.pin_legacy_session_provider(agent_id, workspace_id, session)).await?;
         // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
         // a provider the user switched off in Settings > Agents never spawns
         // it — re-home onto the usable default (persisted before
@@ -10733,6 +10961,20 @@ impl AgentManager {
                 return Err(error);
             }
         };
+        // A session spawned on the provider default (no stored model) had its
+        // `model` filled at session open from the provider's current option
+        // id (`fill_identity_from_session_open`). The child runs exactly that
+        // model, so adopt it as the resolved identity: the notice/commit
+        // below and the next turn's respawn comparison see the same id.
+        Box::pin(self.adopt_filled_model(
+            agent_id,
+            workspace_id,
+            &session,
+            workspace.as_ref(),
+            &settings,
+            &mut resolved,
+        ))
+        .await;
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -18740,6 +18982,7 @@ mod dead_child_respawn_tests {
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         }
@@ -18928,7 +19171,8 @@ mod disabled_provider_rehome_tests {
 
     /// Manager over a temp store with a settings registry wired and NO
     /// seeded session — each test seeds its own row.
-    async fn registry_manager() -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
+    pub(super) async fn registry_manager(
+    ) -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
         let db_dir = crate::tests::test_tempdir("intentd-rehome-");
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
@@ -18954,7 +19198,7 @@ mod disabled_provider_rehome_tests {
         )
     }
 
-    fn set(mgr: &AgentManager, path: &str, value: Value) {
+    pub(super) fn set(mgr: &AgentManager, path: &str, value: Value) {
         mgr.services
             .settings_registry()
             .expect("registry wired")
@@ -20259,6 +20503,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20308,6 +20553,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -23065,6 +23311,10 @@ mod agent_retry_tests {
 #[cfg(all(test, unix))]
 #[path = "agent_manager/effort_notice_tests.rs"]
 mod effort_notice_tests;
+
+#[cfg(all(test, unix))]
+#[path = "agent_manager/legacy_identity_tests.rs"]
+mod legacy_identity_tests;
 
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
