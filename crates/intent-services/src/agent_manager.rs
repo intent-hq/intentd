@@ -3771,10 +3771,13 @@ impl AgentManager {
         // The child read the profile's saved settings now; track it until
         // it is torn down so earlier-settings state stays accurate.
         let activation = match opts.profile_env {
+            // Boxed: keeps the spawn future's stack frame unchanged.
             Some(profile) => {
-                self.services
-                    .register_profile_process(&workspace_id, &agent_id, profile)
-                    .await
+                Box::pin(
+                    self.services
+                        .register_profile_process(&workspace_id, &agent_id, profile),
+                )
+                .await
             }
             None => None,
         };

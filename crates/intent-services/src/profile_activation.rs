@@ -239,7 +239,8 @@ impl ProfileActivation {
 /// process is torn down: stop, idle reap, crash cleanup, respawn) removes
 /// the registration and emits the resulting activation events.
 pub(crate) struct ActivationLease {
-    services: crate::Services,
+    /// Boxed: `Services` is large and the lease lives in every agent handle.
+    services: Box<crate::Services>,
     agent_id: AgentId,
     token: u64,
 }
@@ -247,7 +248,7 @@ pub(crate) struct ActivationLease {
 impl ActivationLease {
     pub(crate) fn new(services: crate::Services, agent_id: AgentId, token: u64) -> Self {
         Self {
-            services,
+            services: Box::new(services),
             agent_id,
             token,
         }
@@ -263,7 +264,7 @@ impl Drop for ActivationLease {
         if changes.is_empty() {
             return;
         }
-        let services = self.services.clone();
+        let services = (*self.services).clone();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(async move { services.publish_activation_changes(changes).await });

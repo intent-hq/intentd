@@ -11136,6 +11136,10 @@ mod profile_auth_failure_tests {
             .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
             .await
             .unwrap();
+        // Opened under Work's current settings (a session open records it).
+        p.services
+            .bind_native_session_settings(&p.workspace_id, &p.agent_id, p.work.fingerprint())
+            .await;
         let (conn, _rx, _agent) = connect_failing("session/load");
         let err = p
             .services
@@ -11176,6 +11180,10 @@ mod profile_auth_failure_tests {
             .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
             .await
             .unwrap();
+        // Opened under Work's current settings (a session open records it).
+        p.services
+            .bind_native_session_settings(&p.workspace_id, &p.agent_id, p.work.fingerprint())
+            .await;
         let work = p.work.provider_ref().to_string();
         for owner in ["claude-code", p.personal.provider_ref(), work.as_str()] {
             p.services

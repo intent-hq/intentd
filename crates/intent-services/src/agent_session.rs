@@ -3188,7 +3188,7 @@ impl Services {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
-            self.bind_profile_native_session(&stored).await;
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3411,9 +3411,8 @@ impl Services {
         // A profile's native session also belongs to the settings it was
         // opened under: after an edit takes effect (account or home may
         // differ) recreate with Intent history instead of loading it.
-        if let Some(fingerprint) = self
-            .profile_process_fingerprint(agent_id, &provider_id)
-            .await
+        if let Some(fingerprint) =
+            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
         {
             if !Self::native_session_bound_to(&stored, &fingerprint) {
                 tracing::info!(
