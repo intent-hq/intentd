@@ -24,9 +24,10 @@
 //! (omitted when empty, so the steady-state file is exactly the documented
 //! shape); startup removes the secrets of journaled ids that have no metadata.
 //!
-//! Profiles are not yet selectable for execution: routing, catalog groups and
-//! environment application land separately, so `activation.runningProcesses`
-//! is always `0` here.
+//! [`Services::resolve_profile_env`] turns a qualified reference into the
+//! overlay every execution path applies (see `intent_acp::ProfileEnv`).
+//! Profiles are not yet selectable for execution: routing and catalog groups
+//! land separately, so `activation.runningProcesses` is always `0` here.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -246,6 +247,20 @@ fn profile_not_found(profile_id: &str) -> Error {
         false,
         format!("not found: provider profile {profile_id}"),
         json!({ "code": "not-found" }),
+    )
+}
+
+/// A qualified reference names no usable saved profile. Execution never falls
+/// back to the base provider's Default configuration.
+pub(crate) fn replacement_required(reference: &str, reason: &str) -> Error {
+    Error::provider_profile(
+        false,
+        format!("invalid params: provider profile {reference} needs a replacement ({reason})"),
+        json!({
+            "code": "provider-profile-replacement-required",
+            "providerRef": reference,
+            "reason": reason,
+        }),
     )
 }
 
@@ -898,6 +913,56 @@ impl Services {
         if let Err(e) = store.persist(profiles.as_ref().clone(), remaining) {
             tracing::warn!(error = %e, "provider profile cleanup journal update failed");
         }
+    }
+
+    /// Resolve the provider reference a process or probe is about to use into
+    /// its saved overlay. A bare id is the Default configuration (`None`). A
+    /// qualified reference that is malformed, unknown, deleted or unreadable
+    /// fails with `provider-profile-replacement-required`; an unreadable
+    /// environment document fails closed. Reserved keys are dropped even if
+    /// the stored document was edited outside the daemon. Values are read
+    /// fresh, so a newly started process always uses the saved settings.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by provider profile selection routing")
+    )]
+    pub(crate) async fn resolve_profile_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        if !is_qualified_ref(reference) {
+            return Ok(None);
+        }
+        let missing = || replacement_required(reference, "profile-missing");
+        let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
+        let known = self
+            .provider_profiles
+            .profiles()
+            .map_err(|_| missing())?
+            .iter()
+            .any(|p| p.id == id && p.base_provider == base);
+        if !known {
+            return Err(missing());
+        }
+        let doc = load_env(&self.secrets, id).await?.ok_or_else(|| {
+            Error::Internal(format!(
+                "provider profile {reference} environment is unavailable"
+            ))
+        })?;
+        let entries = doc
+            .entries
+            .into_iter()
+            .filter(|e| reserved_key_reason(e.key(), base).is_none())
+            .map(|e| match e {
+                StoredEnv::Set { key, value } => (key, Some(value)),
+                StoredEnv::Unset { key } => (key, None),
+            })
+            .collect();
+        Ok(Some(intent_acp::ProfileEnv::new(
+            reference,
+            doc.fingerprint,
+            entries,
+        )))
     }
 
     pub(crate) async fn provider_profiles_list_impl(

@@ -1186,3 +1186,166 @@ async fn profile_values_never_reach_config_toml() {
         "{config}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Execution context: resolving a reference into its saved overlay.
+// ---------------------------------------------------------------------------
+
+fn entries_of(profile: &intent_acp::ProfileEnv) -> Vec<(String, Option<String>)> {
+    profile
+        .entries()
+        .map(|(k, v)| (k.to_owned(), v.map(str::to_owned)))
+        .collect()
+}
+
+#[intent_test_macros::daemon_test]
+async fn bare_references_resolve_to_the_default_configuration() {
+    let fx = Fixture::new().await;
+    for bare in ["codex", "claude-code", "auggie"] {
+        assert!(fx.svc.resolve_profile_env(bare).await.unwrap().is_none());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn qualified_reference_resolves_saved_set_empty_and_unset_entries() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "codex",
+            "Work",
+            json!([
+                { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+                { "key": "EMPTY", "kind": "set", "value": "" },
+                { "key": "OPENAI_BASE_URL", "kind": "unset" },
+            ]),
+        )
+        .await;
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let fingerprint = created["profile"]["settingsFingerprint"].as_str().unwrap();
+    let profile = fx
+        .svc
+        .resolve_profile_env(reference)
+        .await
+        .unwrap()
+        .expect("qualified reference resolves");
+    assert_eq!(profile.provider_ref(), reference);
+    assert_eq!(profile.fingerprint(), fingerprint);
+    assert_eq!(
+        entries_of(&profile),
+        vec![
+            ("OPENAI_API_KEY".into(), Some(SECRET.into())),
+            ("EMPTY".into(), Some(String::new())),
+            ("OPENAI_BASE_URL".into(), None),
+        ]
+    );
+    assert!(!format!("{profile:?}").contains(SECRET));
+}
+
+#[intent_test_macros::daemon_test]
+async fn saved_edits_change_the_resolved_fingerprint_and_values() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "claude-code",
+            "Team",
+            json!([{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "first" }]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    let reference = format!("claude-code@{id}");
+    let before = fx
+        .svc
+        .resolve_profile_env(&reference)
+        .await
+        .unwrap()
+        .unwrap();
+    fx.svc
+        .provider_profiles_update_impl(
+            id.clone(),
+            json!({ "env": [{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "second" }] }),
+        )
+        .await
+        .unwrap();
+    let after = fx
+        .svc
+        .resolve_profile_env(&reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(before.fingerprint(), after.fingerprint());
+    assert_ne!(before.cache_key(), after.cache_key());
+    assert_eq!(
+        entries_of(&after),
+        vec![("ANTHROPIC_API_KEY".into(), Some("second".into()))]
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn missing_or_malformed_references_require_replacement_never_default() {
+    let fx = Fixture::new().await;
+    for reference in ["codex@p0000000000000", "codex@", "codex@Bad", "auggie@p1"] {
+        let err = fx.svc.resolve_profile_env(reference).await.unwrap_err();
+        assert_eq!(
+            data_code(&err),
+            "provider-profile-replacement-required",
+            "{reference}"
+        );
+        let Error::ProviderProfile(failure) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(failure.data["providerRef"], reference);
+        assert_eq!(failure.data["reason"], "profile-missing");
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn deleted_profile_reference_requires_replacement() {
+    let fx = Fixture::new().await;
+    let created = fx.create("codex", "Gone", json!([])).await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    fx.svc
+        .provider_profiles_delete_impl(id.clone())
+        .await
+        .unwrap();
+    let err = fx
+        .svc
+        .resolve_profile_env(&format!("codex@{id}"))
+        .await
+        .unwrap_err();
+    assert_eq!(data_code(&err), "provider-profile-replacement-required");
+}
+
+#[intent_test_macros::daemon_test]
+async fn tampered_reserved_entries_are_never_resolved() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "codex",
+            "Work",
+            json!([{ "key": "OPENAI_API_KEY", "kind": "set", "value": "kept" }]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    // Simulate an edited secret-store document carrying reserved keys.
+    let doc = json!({
+        "fingerprint": "ftampered",
+        "entries": [
+            { "kind": "set", "key": "PATH", "value": "/evil" },
+            { "kind": "set", "key": "codex_path", "value": "/evil/codex" },
+            { "kind": "unset", "key": "HOME" },
+            { "kind": "set", "key": "INTENT_SESSION", "value": "evil" },
+            { "kind": "set", "key": "OPENAI_API_KEY", "value": "kept" },
+        ],
+    });
+    SecretStore::store(&*fx.secrets, &env_account(&id), &doc.to_string()).unwrap();
+    let profile = fx
+        .svc
+        .resolve_profile_env(&format!("codex@{id}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entries_of(&profile),
+        vec![("OPENAI_API_KEY".into(), Some("kept".into()))]
+    );
+}
