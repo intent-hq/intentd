@@ -203,6 +203,11 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
+/// A newly persisted human discussion message.
+pub const DISCUSSION_MESSAGE: &str = "discussion:message";
+/// Transient committed reaction metadata; never a new message.
+pub const DISCUSSION_REACTION: &str = "discussion:reaction";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
@@ -619,6 +624,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_REGISTERED,
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
+    DISCUSSION_MESSAGE,
+    DISCUSSION_REACTION,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
@@ -891,6 +898,8 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
+    (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),

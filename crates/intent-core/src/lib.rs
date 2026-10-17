@@ -25,6 +25,7 @@ pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
+pub mod discussion;
 pub mod error;
 pub mod events;
 pub mod execution;

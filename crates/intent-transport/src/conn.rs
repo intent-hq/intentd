@@ -1375,6 +1375,7 @@ pub(crate) async fn handle_fast_path(
                     fences.push(membership.fence_handle());
                 }
                 let handle = spawn_forwarder(recovery::forward(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,

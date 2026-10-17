@@ -61,6 +61,27 @@ pub(crate) type MonitorExportBarrier = (
     std::sync::Arc<tokio::sync::Notify>,
 );
 
+fn private_discussion_export_error() -> Error {
+    Error::Unsupported(
+        "This workspace contains private discussions that cannot be transferred".into(),
+    )
+}
+
+fn reject_private_discussion_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
+    if rows.iter().any(|(table, objects)| {
+        (table == "discussion_conversation" && !objects.is_empty())
+            || (table == "workspace_discussion_message"
+                && objects.iter().any(|row| {
+                    row["conversation_id"]
+                        .as_str()
+                        .is_some_and(|id| id != "default")
+                }))
+    }) {
+        return Err(private_discussion_export_error());
+    }
+    Ok(())
+}
+
 fn reject_private_monitor_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
     fn parsed(row: &serde_json::Value, key: &str) -> serde_json::Value {
         row[key]
@@ -168,6 +189,9 @@ impl Services {
             ));
         }
         let ws = self.store.get_workspace(&id).await?;
+        if self.store.has_private_discussions(&id).await? {
+            return Err(private_discussion_export_error());
+        }
         reject_private_monitor_export(&self.store.transfer_monitor_rows(&id).await?)?;
         #[cfg(test)]
         {
@@ -408,6 +432,7 @@ impl Services {
         // Preflight is advisory against races. Refuse the exact immutable row
         // snapshot that would enter the archive, before any bytes are sealed.
         reject_private_monitor_export(&rows)?;
+        reject_private_discussion_export(&rows)?;
         // Pin the source's effective default provider into the exported
         // session rows (archive copy only; the table is never written), so
         // a session that inherited `model.defaultProvider` here keeps that
@@ -1285,6 +1310,62 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn discussion_export_rechecks_first_conversation_after_preflight() {
+        let root = crate::test_support::test_tempdir("private-discussion-export-race");
+        let assets = root.path().join("assets");
+        let workspaces = root.path().join("workspaces");
+        let (_db, svc) = fresh_services(&workspaces, &assets).await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
+        let id = WorkspaceId::new();
+        seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *svc.test_export_monitor_preflight.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
+        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
+            workspace_id: Some(id.0.clone()),
+            ..Default::default()
+        });
+        let id_for_insert = id.clone();
+        let exporting = svc.clone();
+        let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
+        entered.notified().await;
+        sqlx::query("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES('private-race',?,'direct','[]',?)")
+            .bind(&id_for_insert.0).bind(now_iso()).execute(svc.store.write_pool()).await.unwrap();
+        release.notify_one();
+        let started = start.await.unwrap().unwrap();
+        let export_id = started["exportId"].as_str().unwrap();
+        assert!(
+            !wait_ready(&svc, export_id).await,
+            "racing private history cannot be sealed"
+        );
+        assert!(svc
+            .workspace_export_read_op(export_id.to_owned(), 0)
+            .await
+            .is_err());
+        // Registry removal precedes asynchronous staging cleanup. The existing
+        // terminal event is published only after that cleanup has completed.
+        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
+            .await
+            .expect("failed export cleanup completes")
+            .expect("failure subscription remains open");
+        let failed = batch
+            .iter()
+            .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
+            .expect("failed export event");
+        assert_eq!(failed.data["exportId"], export_id);
+        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(!svc.export_staging_root().join(export_id).exists());
+        assert!(svc
+            .store
+            .has_private_discussions(&id_for_insert)
+            .await
+            .unwrap());
     }
 
     #[intent_test_macros::daemon_test]

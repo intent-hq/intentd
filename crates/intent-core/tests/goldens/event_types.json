@@ -63,6 +63,8 @@
     "comment:added",
     "comment:deleted",
     "comment:resolved",
+    "discussion:message",
+    "discussion:reaction",
     "draft:changed",
     "file:changed",
     "file:created",

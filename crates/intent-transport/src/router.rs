@@ -817,6 +817,33 @@ async fn dispatch_workspace_create(
     Ok(result)
 }
 
+fn discussion_optional_id(
+    params: &Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, RpcErr> {
+    params
+        .get(key)
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| invalid_params(format!("{key} must be a non-empty string")))
+        })
+        .transpose()
+}
+fn discussion_limit(params: &Map<String, Value>) -> std::result::Result<u32, RpcErr> {
+    params
+        .get("limit")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| (1..=100).contains(n))
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+        })
+        .transpose()
+        .map(|v| v.unwrap_or(50))
+}
+
 async fn dispatch_other(
     api: &dyn WorkspaceApi,
     method: &str,
@@ -1078,6 +1105,137 @@ async fn dispatch_other(
             let id = require_workspace_id(params)?;
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        "discussion.conversations" | "discussion.recipients" => {
+            let id = require_workspace_id(params)?;
+            let limit = discussion_limit(params)?;
+            if method == "discussion.conversations" {
+                api.discussion_conversations(id, discussion_optional_id(params, "beforeId")?, limit)
+                    .await
+                    .map_err(domain_to_rpc)
+            } else {
+                let query = match params.get("query") {
+                    None => String::new(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| invalid_params("query must be a string"))?
+                        .to_string(),
+                };
+                api.discussion_recipients(
+                    id,
+                    query,
+                    discussion_optional_id(params, "afterPrincipalId")?,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)
+            }
+        }
+        "discussion.list" => {
+            let id = require_workspace_id(params)?;
+            let before = params
+                .get("beforeSequence")
+                .map(|v| {
+                    v.as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("beforeSequence must be a positive integer"))
+                })
+                .transpose()?;
+            let after = params
+                .get("afterSequence")
+                .map(|v| {
+                    v.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                        invalid_params("afterSequence must be a nonnegative integer")
+                    })
+                })
+                .transpose()?;
+            if before.is_some() && after.is_some() {
+                return Err(invalid_params(
+                    "beforeSequence and afterSequence are mutually exclusive",
+                ));
+            }
+            let limit = params
+                .get("limit")
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|n| (1..=100).contains(n))
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+                })
+                .transpose()?
+                .unwrap_or(intent_core::discussion::DISCUSSION_PAGE_DEFAULT);
+            let page = api
+                .discussion_list(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    before,
+                    after,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&page)
+        }
+        "discussion.react" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let reaction = require_str_param(params, "reaction")?;
+            let active = params
+                .get("active")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("active must be a boolean"))?;
+            let result = api
+                .discussion_react(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    message_id,
+                    reaction,
+                    active,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "discussion.send" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let body = require_str_param(params, "body")?;
+            let conversation_id = discussion_optional_id(params, "conversationId")?;
+            let recipient_principal_ids = params
+                .get("recipientPrincipalIds")
+                .map(|v| {
+                    v.as_array()
+                        .ok_or_else(|| invalid_params("recipientPrincipalIds must be an array"))?
+                        .iter()
+                        .map(|p| {
+                            p.as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(intent_core::PrincipalId::from)
+                                .ok_or_else(|| {
+                                    invalid_params(
+                                        "recipientPrincipalIds must contain nonempty strings",
+                                    )
+                                })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let result = api
+                .discussion_send(
+                    id,
+                    message_id,
+                    body,
+                    intent_core::discussion::DiscussionTarget {
+                        conversation_id,
+                        recipient_principal_ids,
+                        reply_to_message_id: discussion_optional_id(params, "replyToMessageId")?,
+                    },
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
         }
         // `workspace.members.*` (multiplayer w3): membership roster of one
         // workspace. Member+ may list; add / removal are Owner-only in the

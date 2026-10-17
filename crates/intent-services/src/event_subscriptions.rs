@@ -34,6 +34,11 @@ use crate::Services;
 /// categories at resolution time ([`events::resolve_event_types_for_agent`]).
 pub(crate) fn validate_agent_event_types(event_types: &[String]) -> Result<()> {
     for t in event_types {
+        if t.starts_with("discussion:") {
+            return Err(Error::InvalidParams(format!(
+                "\"{t}\" is not subscribable by agents: workspace discussions are human-only."
+            )));
+        }
         if events::is_agent_restricted_event_type(t) {
             return Err(Error::InvalidParams(format!(
                 "\"{t}\" is not subscribable by agents: agent events are internal. Use \
@@ -344,7 +349,7 @@ impl Services {
             )),
             // Match-time guard (monorepo#1229): agent-owned subscriptions —
             // including rehydrated rows persisted before the subscribe-time
-            // guard existed — never match agent events or `chat:stream:delta`.
+            // guard existed — never match restricted streams or human discussions.
             exclude_agent_events: true,
             ..Default::default()
         };

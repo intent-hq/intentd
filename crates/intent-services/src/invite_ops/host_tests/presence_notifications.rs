@@ -189,8 +189,13 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
             !presence.is_empty(),
             "committed addition must notify {workspace}; cached={cached}, online={online}: {received:?}"
         );
+        // The bus carries the human roster; daemon snapshots intentionally
+        // omit discussion typing. Compare against a human with inherited access.
         let expected = with_caller(
-            Caller::Daemon,
+            Caller::Wire {
+                principal_id: f.primary.clone(),
+                host_role: HostRole::Owner,
+            },
             f.services.presence_snapshot_op(workspace.clone()),
         )
         .await
