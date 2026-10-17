@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.1] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Restore legacy PR monitor visibility on re-registration ([#2441](https://github.com/intent-hq/intentd/pull/2441))
+
+
 ## [0.11.0] - 2026-10-16
 
 ### 🔧 Refactor
