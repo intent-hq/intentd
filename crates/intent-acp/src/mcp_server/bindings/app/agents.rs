@@ -871,6 +871,8 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
             metadata: AgentMetadata {

@@ -221,6 +221,7 @@ mod pr_ops;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
+mod profile_activation;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_cli;
@@ -1022,6 +1023,9 @@ pub struct Services {
     /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
     /// the composition root calls [`Services::with_provider_profiles_dir`].
     provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
+    /// Live profile processes and the settings fingerprint each started
+    /// with (PROTOCOL §5.54 activation); in-memory, per daemon process.
+    profile_activation: Arc<profile_activation::ProfileActivation>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1721,6 +1725,7 @@ impl Services {
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
             provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
+            profile_activation: Arc::default(),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
