@@ -3420,7 +3420,13 @@ fn stop_eof_fixture_finishes_when_cli_exits_before_connecting() {
             finished.send(()).unwrap();
         }
         drop(finished);
+        let started = Instant::now();
         assert!(!serve_stop_eof(&listener, &signal));
+        // The 15s deadline also returns false; only the finished signal is prompt.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fixture ignored the CLI-finished signal (disconnected: {disconnected})"
+        );
     }
 }
 
