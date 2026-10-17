@@ -8,6 +8,82 @@ use intent_core::repository_request::{
 };
 use intent_core::{HostRole, WorkspaceApi};
 
+#[test]
+fn native_review_execution_diagnostics_preserve_errors_without_payloads() {
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = Writer(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for error in [
+            Error::Forbidden("private-token".into()),
+            Error::Internal("https://secret@private/repo".into()),
+            Error::GitAuthorization("private-credential".into()),
+            Error::InvalidParams("private-params".into()),
+            Error::InvalidInput("private-content".into()),
+            Error::NotFound("/private/path".into()),
+            Error::Conflict {
+                current: json!({"private": "body"}),
+            },
+        ] {
+            let original = error.to_string();
+            let result = execution_result::<()>("owned-id", "worker", Err(error));
+            assert_eq!(result.unwrap_err().to_string(), original);
+        }
+        for error in [
+            AdmissionError::BindingChanged,
+            AdmissionError::Retired,
+            AdmissionError::StageOrder,
+        ] {
+            assert_eq!(
+                admission_result::<()>("owned-id", "stage-authority", Err(error)),
+                Err(error)
+            );
+        }
+        assert_eq!(execution_result("owned-id", "worker", Ok(7)).unwrap(), 7);
+        assert_eq!(admission_result("owned-id", "source", Ok(9)), Ok(9));
+    });
+    let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(output.lines().count(), 10);
+    for category in [
+        "forbidden",
+        "internal",
+        "git-authorization",
+        "invalid-params",
+        "invalid-input",
+        "not-found",
+        "other",
+        "BindingChanged",
+        "Retired",
+        "StageOrder",
+    ] {
+        assert!(
+            output.contains(category),
+            "missing safe category: {category}"
+        );
+    }
+    assert!(output.contains("worker"));
+    assert!(output.contains("stage-authority"));
+    for payload in ["private", "secret", "https://", "/path", "body"] {
+        assert!(!output.contains(payload), "diagnostic disclosed {payload}");
+    }
+}
+
 async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
     let f = Fixture::new().await;
     let s = f.socket().await;

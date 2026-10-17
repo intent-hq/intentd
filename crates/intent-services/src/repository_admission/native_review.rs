@@ -846,6 +846,42 @@ fn invalid() -> Error {
 fn local(_: impl std::fmt::Debug) -> AdmissionError {
     AdmissionError::Unavailable
 }
+
+// Keep the pre-dispatch cause observable before public receipt classification
+// replaces it. Error payloads may contain credentials, paths or file content;
+// log only a fixed category/code, never Display/Debug on a domain error.
+fn execution_result<T>(operation: &str, phase: &'static str, result: Result<T>) -> Result<T> {
+    result.inspect_err(|error| {
+        let kind = match error {
+            Error::Forbidden(_) => "forbidden",
+            Error::Internal(_) => "internal",
+            Error::GitAuthorization(_) => "git-authorization",
+            Error::InvalidParams(_) => "invalid-params",
+            Error::InvalidInput(_) => "invalid-input",
+            Error::NotFound(_) => "not-found",
+            _ => "other",
+        };
+        tracing::warn!(
+            operation,
+            phase,
+            kind,
+            code = error.code(),
+            "native review execution failed"
+        );
+    })
+}
+
+fn admission_result<T>(
+    operation: &str,
+    phase: &'static str,
+    result: AdmissionResult<T>,
+) -> AdmissionResult<T> {
+    result.inspect_err(|error| {
+        // AdmissionError is a closed enum of static categories with no payload.
+        tracing::warn!(operation, phase, ?error, "native review admission failed");
+    })
+}
+
 fn credential_error(_: impl std::fmt::Debug) -> CredentialError {
     CredentialError::AuthorityDenied
 }
@@ -2829,7 +2865,11 @@ pub(crate) fn execute(s: &Services, q: Execute) -> BoxFuture<'_, Result<Value>> 
                             Some(capacity)
                         };
                         let _finish = owned.companion.is_none().then(|| Completion(owned.clone()));
-                        let result = run(&c, &owned, &q, queue_deadline).await;
+                        let result = execution_result(
+                            &owned.id,
+                            "execute",
+                            run(&c, &owned, &q, queue_deadline).await,
+                        );
                         if let Some(finish) = &mut companion_finish {
                             finish.normal = result.is_ok();
                         }
@@ -3001,8 +3041,8 @@ async fn run(
     command: &Execute,
     queue_deadline: Instant,
 ) -> Result<()> {
-    op.write_current()?;
-    op.metadata.validate(true).await?;
+    execution_result(&op.id, "entry-lifetime", op.write_current())?;
+    execution_result(&op.id, "entry-metadata", op.metadata.validate(true).await)?;
     let (life, registration) = c.new_lifetime().map_err(denied)?;
     let retirement = life.retirement();
     op.write
@@ -3050,8 +3090,9 @@ async fn run(
             let command = command.clone();
             let queue = queue.clone();
             async move {
-                op.write_current().map_err(local)?;
-                op.metadata.validate(true).await.map_err(local)?;
+                execution_result(&op.id, "worker-lifetime", op.write_current()).map_err(local)?;
+                execution_result(&op.id, "worker-metadata", op.metadata.validate(true).await)
+                    .map_err(local)?;
                 op.progress.lock().map_err(local)?.engine = Some(admission.clone());
                 let runtime = tokio::runtime::Handle::current();
                 let caller = c.caller.caller().clone();
@@ -3059,13 +3100,14 @@ async fn run(
                 // The actual blocking worker exists before ANY stage admission. It
                 // retains the shared worktree lock and capacity through real completion.
                 tokio::task::spawn_blocking(move || {
-                    runtime.block_on(with_caller(
+                    let result = runtime.block_on(with_caller(
                         caller,
                         with_wire_credential(
                             wire,
                             run_stages(&c, &op, &command, &admission, &queue),
                         ),
-                    ))
+                    ));
+                    execution_result(&op.id, "worker", result)
                 })
                 .await
                 .map_err(local)?
@@ -3081,7 +3123,7 @@ async fn run(
         biased;
         () = cancelled.native_cancelled() => {
             if observation_entered.load(Ordering::Acquire) {
-                operation.await.map_err(denied)
+                admission_result(&op.id, "source-cancelled", operation.await).map_err(denied)
             } else {
                 Err(unavailable())
             }
@@ -3094,12 +3136,12 @@ async fn run(
                 op.retire();
             }
             if observation_entered.load(Ordering::Acquire) {
-                operation.await.map_err(denied)
+                admission_result(&op.id, "source-deadline", operation.await).map_err(denied)
             } else {
                 Err(unavailable())
             }
         }
-        result = &mut operation => result.map_err(denied),
+        result = &mut operation => admission_result(&op.id, "source", result).map_err(denied),
     }
 }
 // Before a consuming stamp exists, every exit must classify the actual pending
@@ -3202,12 +3244,12 @@ async fn run_stages(
             op.metadata.validate(true).await.inspect_err(|_| {
                 tracing::debug!(operation = %op.id, ?stage, phase = "metadata", "native review admission refused");
             })?;
-            engine::revalidate_repository_stage(admission, stage)
-                .await
-                .inspect_err(|_| {
-                    tracing::debug!(operation = %op.id, ?stage, phase = "stage-authority", "native review admission refused");
-                })
-                .map_err(denied)
+            admission_result(
+                &op.id,
+                "stage-authority",
+                engine::revalidate_repository_stage(admission, stage).await,
+            )
+            .map_err(denied)
         }
         .await;
         let Ok(checked) = preflight else {
@@ -3293,8 +3335,8 @@ async fn run_stages(
                 queue.claim(claim)
             })
         })
-        .inspect_err(|_| {
-            tracing::debug!(operation = %op.id, ?stage, phase, "native review admission refused");
+        .inspect_err(|error| {
+            tracing::warn!(operation = %op.id, ?stage, phase, ?error, "native review admission refused");
         })
         .map_err(denied)?;
         pending.stage = None;
