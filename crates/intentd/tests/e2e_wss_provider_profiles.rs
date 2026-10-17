@@ -365,6 +365,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(
         keys,
         vec![
+            "activation",
             "baseProviderId",
             "createdAt",
             "env",
@@ -375,6 +376,8 @@ async fn provider_profiles_crud_contract_over_wss() {
             "updatedAt"
         ]
     );
+    // No provider process runs this profile yet.
+    assert_eq!(profile["activation"], json!({ "runningProcesses": 0 }));
     let ev = next_event(&mut sub, "providers:profiles-changed").await;
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
@@ -641,6 +644,55 @@ async fn provider_profile_selection_surfaces_over_wss() {
     assert_eq!(
         models["error"]["data"]["code"], "provider-profile-replacement-required",
         "{models}"
+    );
+
+    // An agent on the profile: no activation state while nothing runs, and
+    // after removal its next turn needs an explicit replacement.
+    ok(
+        &mut ws,
+        7,
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.paths", "value": { "codex": "/bin/sh" } }] }),
+    )
+    .await;
+    let workspace = ok(
+        &mut ws,
+        8,
+        "workspace.create",
+        json!({ "title": "Profiles WSS E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap().to_string();
+    let agent = ok(
+        &mut ws,
+        9,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "provider": reference }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().unwrap().to_string();
+    assert_eq!(agent["agent"]["provider"], reference.as_str());
+    let get = ok(&mut ws, 10, "agent.get", json!({ "agentId": agent_id })).await;
+    assert!(
+        get["agent"].get("usingEarlierProfileSettings").is_none(),
+        "{get}"
+    );
+    assert!(
+        get["agent"].get("providerReplacementRequired").is_none(),
+        "{get}"
+    );
+    ok(
+        &mut ws,
+        11,
+        "providers.profiles.delete",
+        json!({ "profileId": profile["id"] }),
+    )
+    .await;
+    let get = ok(&mut ws, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        get["agent"]["providerReplacementRequired"],
+        json!({ "providerRef": reference, "reason": "profile-missing" }),
+        "{get}"
     );
     drop(daemon);
 }

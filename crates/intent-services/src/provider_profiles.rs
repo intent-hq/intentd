@@ -55,7 +55,7 @@ pub(crate) const PROFILE_BASE_PROVIDERS: &[&str] = intent_providers::PROFILE_BAS
 pub(crate) const REF_SEPARATOR: char = intent_providers::PROFILE_REF_SEPARATOR;
 /// `agent_session.metadata` key holding the profile `settingsFingerprint`
 /// the stored native session was opened under (an opaque token, never env
-/// keys or values; not part of the AgentLite metadata projection).
+/// keys or values; not part of the `AgentLite` metadata projection).
 pub(crate) const NATIVE_SESSION_SETTINGS_KEY: &str = "nativeSessionSettings";
 /// Masked read value of a saved non-empty `set` entry.
 pub(crate) const MASK: &str = "********";
@@ -1035,7 +1035,7 @@ impl Services {
         None
     }
 
-    /// AgentLite `providerReplacementRequired` for a session's saved
+    /// `AgentLite` `providerReplacementRequired` for a session's saved
     /// provider: `{ providerRef, reason }` when its next turn would be
     /// refused. Bare (legacy) selections never carry it.
     pub(crate) fn provider_replacement_required(&self, provider: Option<&str>) -> Option<Value> {

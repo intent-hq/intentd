@@ -28,6 +28,10 @@ fn profile_id_of(reference: &str) -> Option<&str> {
     crate::provider_profiles::parse_profile_ref(reference).map(|(_, id)| id)
 }
 
+/// A profile's `runningProcesses` count and each of its agents' workspace
+/// and earlier-settings flag, at one instant.
+type Snapshot = (usize, HashMap<AgentId, (WorkspaceId, bool)>);
+
 #[derive(Debug, Clone)]
 struct LiveProcess {
     workspace_id: WorkspaceId,
@@ -62,7 +66,7 @@ impl State {
 
     /// Per-profile counts and per-agent flags for `profile_id`, used to diff
     /// a mutation's before/after.
-    fn snapshot(&self, profile_id: &str) -> (usize, HashMap<AgentId, (WorkspaceId, bool)>) {
+    fn snapshot(&self, profile_id: &str) -> Snapshot {
         let agents = self
             .live
             .iter()
@@ -87,11 +91,7 @@ impl ActivationChanges {
         self.profiles.is_empty() && self.agents.is_empty()
     }
 
-    fn diff(
-        profile_id: &str,
-        before: (usize, HashMap<AgentId, (WorkspaceId, bool)>),
-        after: (usize, HashMap<AgentId, (WorkspaceId, bool)>),
-    ) -> Self {
+    fn diff(profile_id: &str, before: &Snapshot, after: &Snapshot) -> Self {
         let mut changes = Self::default();
         if before.0 != after.0 {
             changes.profiles.insert(profile_id.to_owned());
@@ -102,12 +102,10 @@ impl ActivationChanges {
             let was = before.1.get(id).is_some_and(|(_, stale)| *stale);
             let now = after.1.get(id).is_some_and(|(_, stale)| *stale);
             if was != now {
-                let ws = after
-                    .1
-                    .get(id)
-                    .or_else(|| before.1.get(id))
-                    .map(|(ws, _)| ws.clone())
-                    .unwrap_or_else(|| WorkspaceId::from_string(String::new()));
+                let ws = after.1.get(id).or_else(|| before.1.get(id)).map_or_else(
+                    || WorkspaceId::from_string(String::new()),
+                    |(ws, _)| ws.clone(),
+                );
                 changes.agents.push((ws, id.clone(), now));
             }
         }
@@ -198,13 +196,11 @@ impl ProfileActivation {
         Self::collect(&state, before)
     }
 
-    fn collect(
-        state: &State,
-        before: Vec<(String, (usize, HashMap<AgentId, (WorkspaceId, bool)>))>,
-    ) -> ActivationChanges {
+    fn collect(state: &State, before: Vec<(String, Snapshot)>) -> ActivationChanges {
         let mut changes = ActivationChanges::default();
         for (profile_id, snapshot) in before {
-            let diff = ActivationChanges::diff(&profile_id, snapshot, state.snapshot(&profile_id));
+            let diff =
+                ActivationChanges::diff(&profile_id, &snapshot, &state.snapshot(&profile_id));
             changes.profiles.extend(diff.profiles);
             for agent in diff.agents {
                 if !changes.agents.iter().any(|(_, id, _)| *id == agent.1) {
