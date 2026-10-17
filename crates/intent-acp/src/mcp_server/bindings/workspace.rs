@@ -128,11 +128,11 @@ fn new_sibling_idempotency_key() -> String {
 enum SiblingCheckout {
     /// Linked worktree (or `CoW` copy) of the caller's source repository.
     Worktree,
-    /// Worktree although `origin` is on GitHub: the named base ref is
-    /// local-only, so a clone would not have it.
+    /// Worktree although `origin` is the caller's GitHub repository: the base
+    /// ref is local-only, so a clone would not have it.
     WorktreeForLocalBaseRef,
     /// Standalone checkout hydrated from the repo cache of the GitHub `origin`.
-    GithubClone(RepoRef),
+    GithubClone,
 }
 
 /// The GitHub repository the source repo's `origin` names (HTTPS or SSH,
@@ -145,27 +145,35 @@ fn sibling_github_origin(repo_path: &std::path::Path) -> Option<RepoRef> {
         .and_then(|url| url.github_repo())
 }
 
-/// Clone when `origin` is on GitHub, unless a named `base_ref` resolves
-/// locally but has no `refs/remotes/origin/<ref>` — a local-only ref the
-/// clone would lack. A ref that resolves nowhere keeps the clone (Apply
+/// Clone when `origin` is the caller row's own GitHub repository
+/// (`row_repo`, case-insensitive `RepoRef` identity). Requiring the row's
+/// identity keeps the clone a `crossWorkspace.*` sibling of its parent — the
+/// clone no longer shares `repositoryPath`, so the owner/name pair is the only
+/// remaining link — and keeps the persisted identity consistent with
+/// `githubUrl` (a fork / renamed `origin` stays a worktree). The resolved
+/// `base_ref` (named or the default branch) must also have a
+/// `refs/remotes/origin/<ref>`: a ref that resolves only locally would be
+/// missing from the clone. A ref that resolves nowhere keeps the clone (Apply
 /// fails the same way either way, and pushing the ref later fixes it).
 fn sibling_checkout(
     repo_path: &std::path::Path,
-    base_ref: Option<&str>,
+    row_repo: Option<&RepoRef>,
+    base_ref: &str,
     base_ref_resolves_locally: bool,
 ) -> SiblingCheckout {
-    let Some(repo) = sibling_github_origin(repo_path) else {
+    let Some(row_repo) = row_repo else {
         return SiblingCheckout::Worktree;
     };
-    if let Some(named_ref) = base_ref {
-        let canonical = intent_git::refs::canonicalise_base_ref(named_ref);
-        let on_origin = intent_git::remote::remote_tracking_exists(repo_path, "origin", &canonical)
-            .unwrap_or(false);
-        if !on_origin && base_ref_resolves_locally {
-            return SiblingCheckout::WorktreeForLocalBaseRef;
-        }
+    if sibling_github_origin(repo_path).as_ref() != Some(row_repo) {
+        return SiblingCheckout::Worktree;
     }
-    SiblingCheckout::GithubClone(repo)
+    let canonical = intent_git::refs::canonicalise_base_ref(base_ref);
+    let on_origin = intent_git::remote::remote_tracking_exists(repo_path, "origin", &canonical)
+        .unwrap_or(false);
+    if !on_origin && base_ref_resolves_locally {
+        return SiblingCheckout::WorktreeForLocalBaseRef;
+    }
+    SiblingCheckout::GithubClone
 }
 
 fn github_https_url(repo: &RepoRef) -> String {
@@ -244,26 +252,27 @@ async fn propose_sibling(
         base_ref_resolves_locally = resolves;
     }
 
+    let row_repo = workspace.repo();
     let repo_path = repository_path.clone();
-    let probe_base_ref = base_ref.clone();
+    let probe_row_repo = row_repo.clone();
+    let probe_base_ref = resolved_base_ref.to_string();
     let checkout = tokio::task::spawn_blocking(move || {
         sibling_checkout(
             std::path::Path::new(&repo_path),
-            probe_base_ref.as_deref(),
+            probe_row_repo.as_ref(),
+            &probe_base_ref,
             base_ref_resolves_locally,
         )
     })
     .await
     .map_err(|error| format!("Could not inspect the current workspace repository: {error}"))?;
-    if let (SiblingCheckout::WorktreeForLocalBaseRef, Some(named_ref)) =
-        (&checkout, base_ref.as_deref())
-    {
+    if checkout == SiblingCheckout::WorktreeForLocalBaseRef {
         warnings.push(format!(
-            "Base ref '{named_ref}' is not on origin, so this workspace will be a linked worktree of the current repository instead of a fresh clone"
+            "Base ref '{resolved_base_ref}' has no branch on origin, so this workspace will be a linked worktree of the current repository instead of a fresh clone"
         ));
     }
-    let clone_repo = match &checkout {
-        SiblingCheckout::GithubClone(repo) => Some(repo),
+    let clone_repo = match checkout {
+        SiblingCheckout::GithubClone => row_repo.as_ref(),
         SiblingCheckout::Worktree | SiblingCheckout::WorktreeForLocalBaseRef => None,
     };
 
@@ -273,19 +282,15 @@ async fn propose_sibling(
     // GitHub origin: a `githubUrl` with no `repositoryPath` / `clonePath`
     // hydrates a standalone checkout from the repo cache (PROTOCOL §5.1) —
     // the FE's GitHub-pick request shape. Otherwise a linked worktree.
-    let mut repository_owner = workspace.repository_owner.clone();
-    let mut repository_name = workspace.repository_name.clone();
     if let Some(repo) = clone_repo {
         create_params.insert("githubUrl".to_string(), json!(github_https_url(repo)));
-        repository_owner.get_or_insert_with(|| repo.owner.clone());
-        repository_name.get_or_insert_with(|| repo.name.clone());
     } else {
         create_params.insert("repositoryPath".to_string(), json!(repository_path));
     }
-    if let Some(owner) = repository_owner.as_deref() {
+    if let Some(owner) = workspace.repository_owner.as_deref() {
         create_params.insert("repositoryOwner".to_string(), json!(owner));
     }
-    if let Some(name) = repository_name.as_deref() {
+    if let Some(name) = workspace.repository_name.as_deref() {
         create_params.insert("repositoryName".to_string(), json!(name));
     }
     create_params.insert("baseRef".to_string(), json!(resolved_base_ref));
@@ -303,16 +308,7 @@ async fn propose_sibling(
     create_params.insert("initialAgent".to_string(), Value::Object(initial_agent));
     create_params.insert("idempotencyKey".to_string(), json!(idempotency_key));
 
-    let github_url = match clone_repo {
-        Some(repo) => Some(github_https_url(repo)),
-        None => match (
-            workspace.repository_owner.as_deref(),
-            workspace.repository_name.as_deref(),
-        ) {
-            (Some(owner), Some(name)) => Some(format!("https://github.com/{owner}/{name}")),
-            _ => None,
-        },
-    };
+    let github_url = row_repo.as_ref().map(github_https_url);
     let mut workspace_create = serde_json::Map::new();
     workspace_create.insert("mode".to_string(), json!("sibling"));
     workspace_create.insert("title".to_string(), json!(title));

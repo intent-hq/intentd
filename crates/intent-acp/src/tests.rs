@@ -7277,20 +7277,79 @@ mod workspace_api_tool_tests {
         }
     }
 
-    /// GitHub identity for the clone comes from `origin`, not the workspace
-    /// row: a row with no owner/name still gets them from the remote.
-    #[tokio::test]
-    async fn propose_sibling_clone_seeds_owner_and_name_from_origin() {
-        let repo = git_repo();
-        add_origin(repo.path(), "git@github.com:Acme/Widgets.git");
+    fn server_with_identity(
+        repo: &std::path::Path,
+        owner: Option<&str>,
+        name: Option<&str>,
+    ) -> WorkspaceMcpServer {
         let api = WorkspaceInfoMockApi::new("amber-forest", None);
-        api.ws.lock().unwrap().repository_path = Some(repo.path().to_string_lossy().into_owned());
-        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        {
+            let mut workspace = api.ws.lock().unwrap();
+            workspace.repository_path = Some(repo.to_string_lossy().into_owned());
+            workspace.repository_owner = owner.map(str::to_string);
+            workspace.repository_name = name.map(str::to_string);
+        }
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    /// The clone needs the caller row's own GitHub identity: it no longer
+    /// shares `repositoryPath` with its parent, so owner/name is the only
+    /// `crossWorkspace.*` sibling link, and a fork / renamed `origin` must not
+    /// persist an identity that disagrees with `githubUrl`. Identity compares
+    /// case-insensitively (`RepoRef`).
+    #[tokio::test]
+    async fn propose_sibling_clones_only_when_origin_matches_row_identity() {
+        let repo = git_repo();
+        add_origin(repo.path(), "git@github.com:clement/intentd.git");
+        for (owner, name) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("intent-hq"), Some("intentd")),
+        ] {
+            let srv = server_with_identity(repo.path(), owner, name);
+            let params = &propose(&srv, None).await["proposal"]["payload"]["params"];
+            assert_eq!(
+                params["repositoryPath"],
+                repo.path().to_string_lossy().as_ref(),
+                "{owner:?}/{name:?}"
+            );
+            assert!(params.get("githubUrl").is_none(), "{owner:?}/{name:?}");
+        }
+
+        let srv = server_with_identity(repo.path(), Some("Clement"), Some("IntentD"));
         let params = &propose(&srv, None).await["proposal"]["payload"]["params"];
-        assert_eq!(params["githubUrl"], "https://github.com/Acme/Widgets");
-        assert_eq!(params["repositoryOwner"], "Acme");
-        assert_eq!(params["repositoryName"], "Widgets");
+        assert_eq!(params["githubUrl"], "https://github.com/Clement/IntentD");
+        assert_eq!(params["repositoryOwner"], "Clement");
+        assert_eq!(params["repositoryName"], "IntentD");
         assert!(params.get("repositoryPath").is_none());
+    }
+
+    /// The default branch is checked too: with no `origin/HEAD`,
+    /// `repo_default_branch` can fall back to an unpushed local branch the
+    /// clone would lack.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_unpushed_default_branch() {
+        let repo = git_repo();
+        git2::Repository::open(repo.path())
+            .unwrap()
+            .remote("origin", "https://github.com/intent-hq/intentd.git")
+            .unwrap();
+        let srv = server_with_repo("amber-forest", repo.path());
+        let result = propose(&srv, None).await;
+        let params = &result["proposal"]["payload"]["params"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        let warning = result["proposal"]["preview"]["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(
+            warning.contains(params["baseRef"].as_str().unwrap()),
+            "{warning}"
+        );
+        assert!(warning.contains("worktree"), "{warning}");
     }
 
     /// A non-GitHub `origin` keeps today's linked-worktree request.
