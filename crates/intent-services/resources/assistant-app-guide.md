@@ -436,6 +436,20 @@ details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
 
+## Missed display updates
+
+<!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
+
+When the app and connected daemon support recovery, detected gaps in state
+updates trigger a refresh of affected visible data. Inactive cached views refresh
+when next used. Recovery respects current access; it does not repeat commands or
+replay notifications, chat transcripts, or terminal output. Temporary terminal
+directory, title, and command indicators may clear until live updates resume.
+
+Older daemons retain their existing reconnect and refresh behavior; do not promise
+recovery from a missed final update. If a view stays stale, use its refresh action
+where available or reconnect, and check the app and daemon versions.
+
 ## Restore workspace browser use
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
