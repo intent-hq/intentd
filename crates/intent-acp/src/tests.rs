@@ -7215,6 +7215,140 @@ mod workspace_api_tool_tests {
         assert_eq!(first_apply["idempotencyKey"], params["idempotencyKey"]);
     }
 
+    /// Give `repo` an `origin` remote at `url` whose fetched `main` tracking
+    /// ref points at the current `main` commit (a pushed default branch).
+    fn add_origin(repo: &std::path::Path, url: &str) {
+        let repo = git2::Repository::open(repo).unwrap();
+        repo.remote("origin", url).unwrap();
+        let main = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference("refs/remotes/origin/main", main, true, "test fetch")
+            .unwrap();
+    }
+
+    async fn propose(srv: &WorkspaceMcpServer, base_ref: Option<&str>) -> Value {
+        let base = base_ref.map_or(String::new(), |r| format!(", baseRef: '{r}'"));
+        let code = format!(
+            "return await ws.workspace.proposeSibling({{ title: 'Follow up', initialPrompt: 'Do it.'{base} }});"
+        );
+        tool_json(&call_workspace_api(srv, &code).await)
+    }
+
+    /// A GitHub `origin` (HTTPS or SSH, with or without `.git`) makes the
+    /// proposal a repo-cache clone: canonical https `githubUrl`, no
+    /// `repositoryPath` / `clonePath` (the FE + daemon cache-hydration
+    /// contract), `repoType: "github"` in the preview.
+    #[tokio::test]
+    async fn propose_sibling_clones_when_origin_is_github() {
+        for origin in [
+            "https://github.com/intent-hq/intentd.git",
+            "https://github.com/intent-hq/intentd",
+            "git@github.com:intent-hq/intentd.git",
+            "ssh://git@github.com/intent-hq/intentd.git",
+        ] {
+            let repo = git_repo();
+            add_origin(repo.path(), origin);
+            let srv = server_with_repo("amber-forest", repo.path());
+            let result = propose(&srv, None).await;
+            let params = &result["proposal"]["payload"]["params"];
+            let create = &result["proposal"]["preview"]["workspaceCreate"];
+            assert_eq!(
+                params["githubUrl"], "https://github.com/intent-hq/intentd",
+                "{origin}"
+            );
+            assert!(params.get("repositoryPath").is_none(), "{origin}: {params}");
+            assert!(params.get("clonePath").is_none(), "{origin}: {params}");
+            assert_eq!(params["repositoryOwner"], "intent-hq");
+            assert_eq!(params["repositoryName"], "intentd");
+            assert_eq!(params["baseRef"], "main");
+            assert!(params["idempotencyKey"]
+                .as_str()
+                .unwrap()
+                .starts_with("sibling-workspace-"));
+            assert_eq!(create["mode"], "sibling");
+            assert_eq!(create["repoType"], "github", "{origin}");
+            assert_eq!(create["githubUrl"], "https://github.com/intent-hq/intentd");
+            assert_eq!(create["repoPath"], repo.path().to_string_lossy().as_ref());
+            assert!(result["proposal"]["preview"].get("warnings").is_none());
+        }
+    }
+
+    /// GitHub identity for the clone comes from `origin`, not the workspace
+    /// row: a row with no owner/name still gets them from the remote.
+    #[tokio::test]
+    async fn propose_sibling_clone_seeds_owner_and_name_from_origin() {
+        let repo = git_repo();
+        add_origin(repo.path(), "git@github.com:Acme/Widgets.git");
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        api.ws.lock().unwrap().repository_path = Some(repo.path().to_string_lossy().into_owned());
+        let srv = WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"));
+        let params = &propose(&srv, None).await["proposal"]["payload"]["params"];
+        assert_eq!(params["githubUrl"], "https://github.com/Acme/Widgets");
+        assert_eq!(params["repositoryOwner"], "Acme");
+        assert_eq!(params["repositoryName"], "Widgets");
+        assert!(params.get("repositoryPath").is_none());
+    }
+
+    /// A non-GitHub `origin` keeps today's linked-worktree request.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_non_github_origin() {
+        let repo = git_repo();
+        add_origin(repo.path(), "git@gitlab.com:intent-hq/intentd.git");
+        let srv = server_with_repo("amber-forest", repo.path());
+        let result = propose(&srv, None).await;
+        let params = &result["proposal"]["payload"]["params"];
+        let create = &result["proposal"]["preview"]["workspaceCreate"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        assert_eq!(create["repoType"], "local");
+    }
+
+    /// A named base ref that exists locally but was never pushed would be
+    /// missing from the clone: keep the worktree and say why.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_local_only_base_ref() {
+        let repo = git_repo();
+        add_origin(repo.path(), "https://github.com/intent-hq/intentd.git");
+        let srv = server_with_repo("amber-forest", repo.path());
+
+        let local_only = propose(&srv, Some("feature/ready")).await;
+        let params = &local_only["proposal"]["payload"]["params"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        assert_eq!(params["baseRef"], "feature/ready");
+        assert_eq!(
+            local_only["proposal"]["preview"]["workspaceCreate"]["repoType"],
+            "local"
+        );
+        let warning = local_only["proposal"]["preview"]["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("feature/ready"), "{warning}");
+        assert!(warning.contains("worktree"), "{warning}");
+
+        for pushed in ["main", "origin/main"] {
+            let result = propose(&srv, Some(pushed)).await;
+            let params = &result["proposal"]["payload"]["params"];
+            assert_eq!(
+                params["githubUrl"], "https://github.com/intent-hq/intentd",
+                "{pushed}"
+            );
+            assert!(params.get("repositoryPath").is_none(), "{pushed}");
+            assert_eq!(params["baseRef"], pushed);
+            assert!(result["proposal"]["preview"].get("warnings").is_none());
+        }
+    }
+
     #[tokio::test]
     async fn propose_sibling_preserves_valid_and_invalid_named_refs_without_fallback() {
         let repo = git_repo();
