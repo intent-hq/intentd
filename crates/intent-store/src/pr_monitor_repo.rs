@@ -17,6 +17,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use crate::Store;
 
 mod prepared_write;
+mod registration;
 pub use prepared_write::PreparedMonitorWrite;
 
 pub(crate) fn captured_monitor_exists(

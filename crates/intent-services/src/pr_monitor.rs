@@ -2341,6 +2341,15 @@ impl Services {
 
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
+        let target = intent_core::ReviewTarget {
+            repository: intent_core::RepositoryTarget {
+                provider: intent_core::RepositoryProvider::Github,
+                instance_base_url: "https://github.com".into(),
+                project_path: format!("{repo_owner}/{repo_name}"),
+            },
+            kind: intent_core::RepositoryResourceKind::PullRequest,
+            number: pr_number,
+        };
         // A full fetch, stored for the sweep and the on-demand readers
         // (the generation bump keeps an in-flight sweep read from
         // overwriting it) — or deferred while the forge quota is exhausted.
@@ -2360,7 +2369,10 @@ impl Services {
 
         let mut adopted_from = None;
         let mut monitor = match existing {
-            Some(m) => self.rearm_pr_monitor(m, baseline.clone(), &now).await?,
+            Some(m) => {
+                self.rearm_pr_monitor(m, &target, baseline.clone(), &now)
+                    .await?
+            }
             None => None,
         };
         if monitor.is_none() {
@@ -2392,7 +2404,7 @@ impl Services {
             if let Some(o) = adoptable {
                 let from = o.agent_id.clone();
                 monitor = self
-                    .adopt_pr_monitor(o, agent_id, baseline.clone(), &now)
+                    .adopt_pr_monitor(o, agent_id, &target, baseline.clone(), &now)
                     .await?;
                 adopted_from = monitor.is_some().then_some(from);
             }
@@ -2433,15 +2445,7 @@ impl Services {
                 self.store
                     .insert_qualified_pr_monitor(
                         &m,
-                        &intent_core::ReviewTarget {
-                            repository: intent_core::RepositoryTarget {
-                                provider: intent_core::RepositoryProvider::Github,
-                                instance_base_url: "https://github.com".into(),
-                                project_path: format!("{repo_owner}/{repo_name}"),
-                            },
-                            kind: intent_core::RepositoryResourceKind::PullRequest,
-                            number: pr_number,
-                        },
+                        &target,
                         intent_store::MonitorTargetProvenance::LegacyGithubWriter,
                     )
                     .await?
@@ -2457,7 +2461,9 @@ impl Services {
                 // Lost an insert race against a concurrent register of the
                 // same triple: re-arm the winner's row instead of surfacing
                 // the unique-index violation (the call stays idempotent).
-                monitor = self.rearm_pr_monitor(winner, baseline, &now).await?;
+                monitor = self
+                    .rearm_pr_monitor(winner, &target, baseline, &now)
+                    .await?;
             } else {
                 match self
                     .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
@@ -2475,13 +2481,17 @@ impl Services {
                     Some(PrMonitorHolder::Orphaned(o)) => {
                         transferred_from = None;
                         let from = o.agent_id.clone();
-                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        monitor = self
+                            .adopt_pr_monitor(o, agent_id, &target, baseline, &now)
+                            .await?;
                         adopted_from = monitor.is_some().then_some(from);
                     }
                     Some(PrMonitorHolder::SettledChild(o)) => {
                         transferred_from = Some(o.clone());
                         let from = o.agent_id.clone();
-                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        monitor = self
+                            .adopt_pr_monitor(o, agent_id, &target, baseline, &now)
+                            .await?;
                         adopted_from = monitor.is_some().then_some(from);
                     }
                     None => {}
@@ -2717,25 +2727,24 @@ impl Services {
         &self,
         mut m: PrMonitor,
         agent_id: &AgentId,
+        target: &intent_core::ReviewTarget,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
         let polled_at = baseline.is_some().then_some(now);
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
+        let pause = self
+            .sweeps_rate_limited()
+            .then(|| self.rate_limit_pause_error());
         let updated = self
             .store
-            .adopt_pr_monitor(
-                &m.monitor_id,
-                &m.agent_id,
+            .rearm_legacy_pr_monitor(
+                &m,
                 agent_id,
-                PrMonitorPollUpdate {
-                    last_snapshot: baseline.as_deref(),
-                    baseline_snapshot: baseline.as_deref(),
-                    pending_changes: &[],
-                    last_polled_at: polled_at,
-                    updated_at: now,
-                    expected_updated_at: &m.updated_at,
-                    ..Default::default()
-                },
+                target,
+                baseline.as_deref(),
+                now,
+                pause.as_deref(),
             )
             .await?;
         if !updated {
@@ -2760,7 +2769,7 @@ impl Services {
         m.pending_since = None;
         m.last_change_at = None;
         m.last_polled_at = polled_at.map(str::to_string);
-        m.last_error = None;
+        m.last_error = pause;
         m.updated_at = now.to_string();
         Ok(Some(m))
     }
@@ -2776,23 +2785,24 @@ impl Services {
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
+        target: &intent_core::ReviewTarget,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
         let polled_at = baseline.is_some().then_some(now);
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
+        let pause = self
+            .sweeps_rate_limited()
+            .then(|| self.rate_limit_pause_error());
         let updated = self
             .store
-            .update_pr_monitor_poll(
-                &m.monitor_id,
-                PrMonitorPollUpdate {
-                    last_snapshot: baseline.as_deref(),
-                    baseline_snapshot: baseline.as_deref(),
-                    pending_changes: &[],
-                    last_polled_at: polled_at,
-                    updated_at: now,
-                    expected_updated_at: &m.updated_at,
-                    ..Default::default()
-                },
+            .rearm_legacy_pr_monitor(
+                &m,
+                &m.agent_id,
+                target,
+                baseline.as_deref(),
+                now,
+                pause.as_deref(),
             )
             .await?;
         if !updated {
@@ -2804,7 +2814,7 @@ impl Services {
         m.pending_since = None;
         m.last_change_at = None;
         m.last_polled_at = polled_at.map(str::to_string);
-        m.last_error = None;
+        m.last_error = pause;
         m.updated_at = now.to_string();
         Ok(Some(m))
     }
@@ -4736,6 +4746,7 @@ mod tests {
     mod qualified_recovery;
     mod quota_regression;
     mod qwen_regression;
+    mod registration_visibility;
     use std::path::PathBuf;
 
     use async_trait::async_trait;

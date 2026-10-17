@@ -776,6 +776,124 @@ exit "$code"
     }
 }
 
+/// A service-launched daemon must check Claude with the same shell credentials
+/// as its agent launches. Explicit daemon values, including empty ones, win.
+#[tokio::test]
+async fn host_claude_auth_status_recovers_shell_credentials_over_wss() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for inherited in [
+        None,
+        Some(OsString::from("synthetic-daemon-token")),
+        Some(OsString::new()),
+        Some(OsString::from_vec(b"synthetic-opaque-\xff".to_vec())),
+    ] {
+        let data_dir_guard = temp_data_dir();
+        let data_dir = data_dir_guard.path().to_path_buf();
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let shell = bin_dir.join("fixture-shell");
+        let cli = bin_dir.join("claude");
+        for (path, body) in [
+            (
+                &shell,
+                r#"#!/bin/sh
+export CLAUDE_CODE_OAUTH_TOKEN=synthetic-shell-token
+export CLAUDE_CONFIG_DIR="$HOME/claude-config"
+export CODEX_TEST_AUTH_SECRET=synthetic-other-provider-secret
+export UNRELATED_AUTH_SECRET=synthetic-unrelated-secret
+exec /bin/sh -c "$2"
+"#,
+            ),
+            (
+                &cli,
+                r#"#!/bin/sh
+[ "$*" = 'auth status' ] || exit 127
+if [ "${CLAUDE_CODE_OAUTH_TOKEN-unset}" = "$EXPECTED_CLAUDE_TOKEN" ] &&
+   [ "$CLAUDE_CONFIG_DIR" = "$HOME/claude-config" ] &&
+   [ "${CODEX_TEST_AUTH_SECRET-unset}" = unset ] &&
+   [ "${UNRELATED_AUTH_SECRET-unset}" = unset ]; then
+    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        printf '{"loggedIn":true}\n'
+    else
+        printf '{"loggedIn":false}\n'
+    fi
+else
+    printf '{}\n'
+fi
+"#,
+            ),
+        ] {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        common::enable_ws_api(&data_dir);
+        let log = std::fs::File::create(data_dir.join("daemon.log")).unwrap();
+        let mut command = common::hermetic_serve_command(&data_dir);
+        command
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_TCP_PORT", "0")
+            .env("HOME", &data_dir)
+            .env("USERPROFILE", &data_dir)
+            .env("SHELL", &shell)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .env(
+                "EXPECTED_CLAUDE_TOKEN",
+                inherited
+                    .as_deref()
+                    .unwrap_or(std::ffi::OsStr::new("synthetic-shell-token")),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        if let Some(token) = &inherited {
+            command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
+        common::hermetic_fixture_identity(&mut command, &data_dir);
+        let _daemon = Daemon {
+            child: command.spawn().unwrap(),
+            _data_dir_guard: data_dir_guard,
+            data_dir: data_dir.clone(),
+        };
+        let socket = data_dir.join("intentd.sock");
+        assert!(await_uds(&socket).await, "daemon did not start");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let mut ws = connect_ws(port, cfg).await;
+        let result = wss_rpc(
+            &mut ws,
+            1,
+            "host.providerAuthStatus",
+            json!({ "providerId": "claude-code", "force": true }),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({ "providers": [{ "id": "claude-code", "authenticated": !inherited.as_ref().is_some_and(|v| v.is_empty()) }] }),
+            "shell credentials must fill gaps without overriding daemon values"
+        );
+        let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+        for secret in [
+            "synthetic-shell-token",
+            "synthetic-daemon-token",
+            "synthetic-other-provider-secret",
+            "synthetic-unrelated-secret",
+        ] {
+            assert!(
+                !log.contains(secret),
+                "credentials must not appear in daemon logs"
+            );
+        }
+    }
+}
+
 /// host.checkAuggie over the real WSS wire: resolution-only `{ available,
 /// path? }`. Pinning `context.auggiePath` at a plain (non-executable) file
 /// proves both halves of the contract — the settings-precedence path still

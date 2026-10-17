@@ -214,11 +214,20 @@ async fn check_retirement(action: &str, wss: bool) {
         released: released.clone(),
         bytes: Vec::new(),
     };
-    let mut write: Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> = if wss {
-        Box::pin(frame.write_wss(&mut writer))
-    } else {
-        Box::pin(frame.write_uds(&mut writer))
-    };
+    let pending = document.tx.recovery.prepare_frame(&frame);
+    let mut write: Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> = Box::pin(async {
+        pending
+            .finish(async {
+                if wss {
+                    frame.write_wss(&mut writer).await.is_ok()
+                } else {
+                    frame.write_uds(&mut writer).await.is_ok()
+                }
+            })
+            .await
+            .then_some(())
+            .ok_or(())
+    });
     assert!(futures::poll!(write.as_mut()).is_pending());
     match action {
         "unsubscribe" => {
@@ -230,6 +239,7 @@ async fn check_retirement(action: &str, wss: bool) {
         "replace" => {
             assert_ne!(document.subscribe(&workspace.id).await, id);
         }
+        "recovery" => document.tx.recovery.close(),
         "document" => {
             // The actual transport exit retires its read owner and registry.
             document.connection.retire();
@@ -249,11 +259,20 @@ async fn check_retirement(action: &str, wss: bool) {
         released: Arc::new(AtomicBool::new(true)),
         bytes: Vec::new(),
     };
-    if wss {
-        sibling_frame.write_wss(&mut live_writer).await.unwrap();
-    } else {
-        sibling_frame.write_uds(&mut live_writer).await.unwrap();
-    }
+    assert!(
+        sibling
+            .tx
+            .recovery
+            .prepare_frame(&sibling_frame)
+            .finish(async {
+                if wss {
+                    sibling_frame.write_wss(&mut live_writer).await.is_ok()
+                } else {
+                    sibling_frame.write_uds(&mut live_writer).await.is_ok()
+                }
+            })
+            .await
+    );
     let live: Value = serde_json::from_slice(&live_writer.bytes).unwrap();
     assert_eq!(live["params"]["subscriptionId"], sibling_id);
     assert_eq!(live["params"]["event"]["type"], "prMonitor:cancelled");
@@ -382,11 +401,20 @@ async fn check_chat_retirement(action: &str, wss: bool, progressive: bool) {
         released: released.clone(),
         bytes: Vec::new(),
     };
-    let mut write: Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> = if wss {
-        Box::pin(frame.write_wss(&mut writer))
-    } else {
-        Box::pin(frame.write_uds(&mut writer))
-    };
+    let pending = document.tx.recovery.prepare_frame(&frame);
+    let mut write: Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> = Box::pin(async {
+        pending
+            .finish(async {
+                if wss {
+                    frame.write_wss(&mut writer).await.is_ok()
+                } else {
+                    frame.write_uds(&mut writer).await.is_ok()
+                }
+            })
+            .await
+            .then_some(())
+            .ok_or(())
+    });
     assert!(futures::poll!(write.as_mut()).is_pending());
     match action {
         "unsubscribe" => {
@@ -456,5 +484,12 @@ async fn native_monitor_chat_replacement_retires_queued_history_before_reply() {
 async fn native_monitor_chat_document_retirement_fences_queued_history() {
     for wss in [false, true] {
         Box::pin(check_chat_retirement("document", wss, false)).await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_monitor_output_cancellation_keeps_sibling_authority_isolated() {
+    for wss in [false, true] {
+        check_retirement("recovery", wss).await;
     }
 }
