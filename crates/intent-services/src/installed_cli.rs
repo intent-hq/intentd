@@ -90,6 +90,22 @@ impl InstalledContext {
         };
         profile.apply_to_map(&mut self.env);
         let cli = self.runtime.cli();
+        // A profile that selects its own Codex home also selects the custom
+        // credential names that home's config declares, so the isolated model
+        // probe, fingerprint and redaction use the same names as runs. Bounded
+        // read; callers run this off the executor. An unreadable config keeps
+        // the existing names, as the login-shell capture does.
+        if cli == InstalledCli::Codex && profile.controls("CODEX_HOME") {
+            if let Some(home) = self.codex_home() {
+                if let Ok(names) = intent_core::cli_env::CodexEnvNames::from_home(&home) {
+                    self.names.extend_from(&names);
+                } else {
+                    tracing::warn!(
+                        "could not read Codex config credential references for a provider profile home; using the default names"
+                    );
+                }
+            }
+        }
         self.env.retain(|key, _| {
             let key = key.to_string_lossy();
             !(key.eq_ignore_ascii_case("CODEX_PATH")

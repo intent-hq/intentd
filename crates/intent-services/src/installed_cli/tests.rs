@@ -1698,3 +1698,90 @@ async fn concurrent_profiles_launch_with_their_own_environment() {
     }
     assert!(std::env::var_os(&var).is_none());
 }
+
+#[test]
+fn profile_codex_home_config_names_select_inherited_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    executable(&root.path().join("codex"), "#!/bin/sh\n");
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.toml"),
+        "[model_providers.corp]\nenv_key='CORP_API_KEY'\n",
+    )
+    .unwrap();
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CORP_API_KEY".into(), "corp-secret".into()),
+    ]);
+    let base = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    // The Default home declares nothing: its isolated probe drops the key.
+    let mut default_probe = Command::new("unused");
+    base.apply_isolated(&mut default_probe);
+    assert!(env(&default_probe, "CORP_API_KEY").is_none());
+    assert!(!base.secret_values().contains(&"corp-secret".to_owned()));
+
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(env(&probe, "CORP_API_KEY"), Some("corp-secret".into()));
+    assert!(context.secret_values().contains(&"corp-secret".to_owned()));
+    // Runs keep it too, so checks and runs agree.
+    assert_eq!(
+        env(&launch(&context, root.path()), "CORP_API_KEY"),
+        Some("corp-secret".into())
+    );
+}
+
+#[test]
+fn profile_codex_home_with_unreadable_config_keeps_existing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(work.join("config.toml")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(context.codex_home(), Some(work));
+}
+
+#[test]
+fn profile_path_consumes_captured_shell_credentials_like_default() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let context = base.clone().with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[("ANTHROPIC_BASE_URL", Some("https://work.invalid"))],
+    )));
+    // ANTHROPIC_API_KEY exists only in the captured login shell: the profile
+    // leaves it alone, so launches and probes see it exactly as Default does.
+    for command in [launch(&base, root.path()), launch(&context, root.path())] {
+        assert_eq!(
+            env(&command, "ANTHROPIC_API_KEY"),
+            Some("personal-captured".into())
+        );
+    }
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(
+        env(&probe, "ANTHROPIC_API_KEY"),
+        Some("personal-captured".into())
+    );
+}

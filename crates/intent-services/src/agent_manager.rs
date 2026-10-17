@@ -23301,3 +23301,95 @@ mod profile_launch_tests {
         assert_eq!(rebuilt.profile_env, Some(&profile));
     }
 }
+
+/// Every key a profile may save reaches the persistent launch and the probe
+/// paths unchanged, even when Intent injects its own git wiring.
+#[cfg(all(test, unix))]
+mod profile_reach_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+        "INITIAL_AGENT_MODE",
+        "CORP_GATEWAY_TOKEN",
+        "LANG",
+    ];
+
+    #[test]
+    fn every_non_reserved_profile_key_reaches_launch_and_probes_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(repo.path()).unwrap();
+        let mut config = git.config().unwrap();
+        config.set_str("user.name", "Intent Wiring").unwrap();
+        config
+            .set_str("user.email", "wiring@example.invalid")
+            .unwrap();
+        for (base, cli) in [
+            ("codex", InstalledCli::Codex),
+            ("claude-code", InstalledCli::Claude),
+        ] {
+            let allowed: Vec<&str> = CANDIDATES
+                .iter()
+                .copied()
+                .filter(|k| crate::provider_profiles::reserved_key_reason(k, base).is_none())
+                .collect();
+            assert_eq!(
+                allowed.contains(&"INITIAL_AGENT_MODE"),
+                base == "claude-code"
+            );
+            let value = |k: &str| format!("profile-{k}");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                allowed
+                    .iter()
+                    .map(|k| ((*k).to_owned(), Some(value(k))))
+                    .collect(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.cwd = Some(repo.path());
+            opts.profile_env = Some(&profile);
+            inject_git_identity_env(&mut opts.extra_env, Some(repo.path()));
+            inject_git_credential_env(&mut opts.extra_env, Some(repo.path()), true);
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let mut auth_probe = tokio::process::Command::new(context.runtime.path());
+            context.apply(&mut auth_probe);
+            let mut model_probe = tokio::process::Command::new("unused");
+            context.apply_isolated(&mut model_probe);
+            for key in &allowed {
+                let expected = Some(OsString::from(value(key)));
+                assert_eq!(env(&prepared.command, key), expected, "{base} launch {key}");
+                assert_eq!(env(&auth_probe, key), expected, "{base} auth {key}");
+                assert_eq!(env(&model_probe, key), expected, "{base} model {key}");
+            }
+        }
+    }
+}
