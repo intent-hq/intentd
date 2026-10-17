@@ -105,7 +105,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/SettingsSidebarNav.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -117,6 +117,31 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+**Provider profiles (Codex and Claude Code only).** A profile runs the installed
+CLI with its own environment variables, for example a work and a personal account
+or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
+choose **Add profile**: enter a name and environment variables (literal values,
+**Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` to choose an account; the user signs in or prepares that
+account outside Intent. Saving does not prove sign-in: the status shows
+**Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
+appears as its own model-picker group, such as **Codex · Work**; with profiles,
+the original configuration is **Codex · Default**. Delegated agents follow their
+explicit, specialist, or default selection, never the parent's profile.
+
+Switching a conversation to another profile, even with the same model, applies on
+the next message: a turn in progress finishes first, then a fresh provider session
+starts with the conversation history. Editing a profile's environment never
+interrupts or restarts anything. Running sessions keep their settings and show
+**Using earlier settings**; new provider processes, including ones restarted after
+idling or a crash, use the saved settings. To refresh existing conversations,
+restart Intent when the app runs the daemon on this computer, otherwise restart
+intentd on the provider host; reconnecting alone does not apply the edit. Remove a
+profile from the same view, after changing any default, specialist, or quick-action
+setting that selects it. Conversations keep their history, and their next message
+asks for another model (**Choose another model to continue**), as does a profile
+whose provider is disabled. Intent never switches them to another account.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
