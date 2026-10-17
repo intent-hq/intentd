@@ -528,3 +528,25 @@ async fn profile_auth_status_reports_each_reference_and_requires_a_saved_one() {
         .unwrap_err();
     assert_eq!(replacement(&err).1, "profile-missing");
 }
+
+/// Explicit delegation onto a profile observed signed out fails fast with the
+/// login remedy, while the base's Default configuration and another profile
+/// stay selectable (the profile's own verdict gates; never the base's).
+#[intent_test_macros::daemon_test]
+async fn explicit_delegation_checks_the_profiles_own_auth_verdict() {
+    let fx = Fixture::new().await;
+    let work = fx.profile("codex", "Work").await;
+    let personal = fx.profile("codex", "Personal").await;
+    let env = fx.svc.resolve_profile_env(&work).await.unwrap().unwrap();
+    crate::provider_auth::demote_profile_auth_verdict(&env);
+    let delegate = |provider: &str| AgentDelegateInput {
+        provider: Some(provider.to_string()),
+        ..Default::default()
+    };
+    let err = fx.delegate(delegate(&work), None).await.unwrap_err();
+    assert!(err.to_string().contains("not authenticated"), "{err}");
+    for ok in [personal.as_str(), "codex"] {
+        let child = fx.delegate(delegate(ok), None).await.unwrap();
+        assert_eq!(fx.provider_of(&child).await.as_deref(), Some(ok));
+    }
+}

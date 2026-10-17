@@ -834,7 +834,8 @@ pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
 /// so the two surfaces stay word-for-word consistent.
 pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
     let display = intent_providers::provider_config(provider_id).display_name;
-    let login_cmd = intent_providers::login_command(provider_id);
+    let login_cmd =
+        intent_providers::login_command(intent_providers::base_provider_id(provider_id));
     let caveat = if intent_providers::base_provider_id(provider_id) == "claude-code" {
         " Note: signing into the Claude desktop app does not carry over to the CLI — run \
          \"claude\" in a terminal, then \"/login\"."

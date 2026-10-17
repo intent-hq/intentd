@@ -1715,9 +1715,61 @@ fn prompt_size_error(e: &AcpError) -> Option<Error> {
 /// turn. Everything else keeps the existing opaque
 /// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
 /// method name, e.g. `session/new`).
+#[cfg(test)]
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    map_acp_session_error_for(context, e, &AuthOwner::bare(provider_id))
+}
+
+/// Whose auth verdict a runtime failure belongs to (PROTOCOL §5.54): the
+/// session's selection — a bare provider id, or a named profile reference
+/// with the saved settings it runs under. A profile failure demotes only that
+/// profile's verdict, never the base provider's Default verdict or another
+/// profile's.
+pub(crate) struct AuthOwner {
+    selection: String,
+    profile: Option<intent_acp::ProfileEnv>,
+}
+
+impl AuthOwner {
+    #[cfg(test)]
+    fn bare(provider_id: &str) -> Self {
+        Self {
+            selection: provider_id.to_owned(),
+            profile: None,
+        }
+    }
+
+    fn demote(&self) {
+        match &self.profile {
+            Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+            None => crate::provider_auth::demote_auth_verdict(&self.selection),
+        }
+    }
+}
+
+impl Services {
+    /// The [`AuthOwner`] of a resolved selection. A profile whose saved
+    /// settings cannot be read demotes nothing (and never the Default).
+    pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
+        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
+            Box::pin(self.resolve_profile_env(selection))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        AuthOwner {
+            selection: selection.to_owned(),
+            profile,
+        }
+    }
+}
+
+fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> Error {
+    let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
-        crate::provider_auth::demote_auth_verdict(provider_id);
+        owner.demote();
         return crate::host_execution::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
@@ -2866,11 +2918,15 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_base_provider_id(
+        let selection = resolve_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        // Protocol shaping keys on the base; auth failures belong to the
+        // selection (a profile never demotes the Default verdict).
+        let provider_id = intent_providers::base_provider_id(&selection).to_owned();
+        let owner = self.auth_owner(&selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
@@ -2908,7 +2964,7 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/new", &e, &owner))?;
         if let Some(native) = native {
             native
                 .bind_response(&opened.response.session_id.0)
@@ -2948,7 +3004,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(PreparedAcpSession {
             response: opened.response,
@@ -3333,6 +3389,7 @@ impl Services {
                 return Ok(None);
             }
         }
+        let owner = self.auth_owner(&provider_id).await;
         let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
@@ -3421,7 +3478,7 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -3430,7 +3487,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
@@ -4552,12 +4609,17 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((_, _, provider, _)) => resolve_provider_id(
+                    Ok((_, _, provider, _)) => match resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
-                    )
+                    ) {
+                        Some(provider_id) => {
+                            self.auth_owner(&provider_id).await.demote();
+                            Some(provider_id)
+                        }
+                        None => None,
+                    }
                     .map(|provider_id| {
-                        crate::provider_auth::demote_auth_verdict(&provider_id);
                         crate::host_execution::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
