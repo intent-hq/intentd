@@ -539,14 +539,16 @@ fn fake_daemon_graceful_exit_stops_its_parked_child() {
 /// Sitter command wired to a temp data dir, a manifest base URL, and the
 /// fake-daemon log path; stderr goes to `<data_dir>/sitter-stderr.log`.
 fn sitter_command(data_dir: &Path, base_url: &str) -> Command {
+    sitter_command_with_stderr(data_dir, base_url, &stderr_path(data_dir))
+}
+
+fn sitter_command_with_stderr(data_dir: &Path, base_url: &str, stderr: &Path) -> Command {
     let mut cmd = Command::new(SITTER_BIN);
     cmd.env(DATA_DIR_ENV, data_dir)
         .env(MANIFEST_BASE_URL_ENV, base_url)
         .env(FAKE_DAEMON_LOG, daemon_log_path(data_dir))
         .stdout(Stdio::null())
-        .stderr(Stdio::from(
-            fs::File::create(stderr_path(data_dir)).unwrap(),
-        ));
+        .stderr(Stdio::from(fs::File::create(stderr).unwrap()));
     cmd
 }
 
@@ -3324,31 +3326,169 @@ esac
     }
 }
 
+// Read at most 4096 bytes even if a failing child has flooded its log.
+fn stop_stderr_tail(path: &Path) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let read = || -> std::io::Result<String> {
+        let mut file = fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(4096);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(4096).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    read().unwrap_or_else(|error| format!("<stderr unavailable: {error}>"))
+}
+
 #[test]
-fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
+fn background_start_stop_diagnostics_keep_separate_bounded_logs() {
     let dir = tempfile::tempdir().unwrap();
-    let paths = SitterPaths::from_data_dir(dir.path());
-    preinstall(
-        &paths,
-        "0.1.0",
-        r#"#!/bin/sh
+    let owner_log = stderr_path(dir.path());
+    let stop_log = dir.path().join("stop-stderr.log");
+    fs::write(
+        &owner_log,
+        [vec![b'x'; 8192], b"owner evidence".to_vec()].concat(),
+    )
+    .unwrap();
+    let _command = sitter_command_with_stderr(dir.path(), &dead_url(), &stop_log);
+    fs::write(&stop_log, "stop evidence").unwrap();
+    let tail = stop_stderr_tail(&owner_log);
+    assert_eq!(tail.len(), 4096);
+    assert!(tail.ends_with("owner evidence"));
+    assert_eq!(stop_stderr_tail(&stop_log), "stop evidence");
+}
+
+// This fixture deliberately kills its owner without reaping it. Keep the
+// reserved owner PID until group cleanup, including during unwinding.
+struct StopCrashOwner(GuardedChild);
+
+impl Drop for StopCrashOwner {
+    fn drop(&mut self) {
+        // No caller reaps the owner: its PID still reserves this process group.
+        // GuardedChild alone skips group cleanup once try_wait sees a dead owner.
+        let _ = self.0.signal_group(nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn background_start_stop_crash_fixture_cleans_surviving_group() {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+
+    for unwind in [false, true] {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut owner = StopCrashOwner(spawn_guarded(
+            Command::new("sh")
+                .args(["-c", "exec 3<&0; (printf ready; read -r held <&3) & wait"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null()),
+        ));
+        // Release the child on a regression failure too, without signalling a
+        // PID after its owner has been reaped by GuardedChild::drop.
+        let mut release = owner.0.stdin.take().unwrap();
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        send_signal(&owner.0, "KILL");
+        wait_until("unreaped owner exit", Duration::from_secs(3), || {
+            waitid(
+                Id::Pid(Pid::from_raw(owner.0.id().cast_signed())),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            )
+            .unwrap()
+                != WaitStatus::StillAlive
+        });
+        reader.set_nonblocking(true).unwrap();
+        assert_eq!(
+            reader.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        reader.set_nonblocking(false).unwrap();
+        let outcome = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _owner = owner;
+            assert!(!unwind, "exercise fixture unwind cleanup");
+        }));
+        assert_eq!(outcome.is_err(), unwind);
+        let closed = reader.read(&mut [0]);
+        let _ = release.write_all(b"release\n");
+        assert_eq!(
+            closed.unwrap(),
+            0,
+            "surviving child must close stdout on cleanup"
+        );
+    }
+}
+
+const STOP_CRASH_DAEMON: &str = r#"#!/bin/sh
 case "$1" in
 serve)
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: fixture remains alive after TERM until its owned group is killed
   while :; do sleep 0.05; done
   ;;
 *) exit 1;;
 esac
-"#,
+"#;
+
+#[test]
+fn background_start_stop_fixture_ready_means_term_handler_installed() {
+    use std::io::Read as _;
+    use std::os::fd::OwnedFd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = "  echo \"$$\" > \"$INTENTD_DATA_DIR/owned-daemon\"";
+    assert_eq!(STOP_CRASH_DAEMON.matches(marker).count(), 1);
+    // Park immediately after publishing readiness, before any following line.
+    // TERM must be handled even when the shell has made no further progress.
+    let script = STOP_CRASH_DAEMON.replace(
+        marker,
+        &format!("{marker}\n  printf ready\n  read -r released"),
     );
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    reader
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let child = spawn_guarded(
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("fixture")
+            .arg("serve")
+            .env(DATA_DIR_ENV, dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null()),
+    );
+    let mut ready = [0; 5];
+    reader.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    send_signal(&child, "TERM");
+    wait_until("ready fixture handles TERM", Duration::from_secs(3), || {
+        dir.path().join("stop-seen").exists()
+    });
+    assert!(alive(child.id()), "fixture must survive TERM");
+}
+
+#[test]
+fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", STOP_CRASH_DAEMON);
     let base = dead_url();
-    let owner = spawn_guarded(
+    let owner_group = StopCrashOwner(spawn_guarded(
         sitter_command(dir.path(), &base)
             .env(KILL_TIMEOUT_ENV, "30000")
             .arg("serve"),
-    );
+    ));
+    let owner = &owner_group.0;
     wait_until("owned daemon", Duration::from_secs(10), || {
         dir.path().join("owned-daemon").exists()
     });
@@ -3356,31 +3496,50 @@ esac
         .trim()
         .parse()
         .unwrap();
+    let stop_stderr = dir.path().join("stop-stderr.log");
     let mut stop = spawn_guarded(
-        sitter_command(dir.path(), &base)
+        sitter_command_with_stderr(dir.path(), &base, &stop_stderr)
             .env(KILL_TIMEOUT_ENV, "500")
             .arg("stop"),
     );
-    wait_until(
-        "daemon received forwarded stop",
-        Duration::from_secs(3),
-        || dir.path().join("stop-seen").exists(),
-    );
-    // Kill only the supervisor. The guard still owns its process group and
-    // cleans the intentionally surviving daemon when this scope ends.
-    send_signal(&owner, "KILL");
-    let status = stop
-        .wait_with_timeout(Duration::from_secs(5))
-        .unwrap()
-        .unwrap();
-    assert!(
-        !status.success(),
-        "supervisor crash was mistaken for successful stop"
-    );
-    assert!(
-        alive(daemon_pid),
-        "fixture must prove the daemon survived its supervisor"
-    );
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        wait_until(
+            "daemon received forwarded stop",
+            Duration::from_secs(3),
+            || dir.path().join("stop-seen").exists(),
+        );
+        // Kill only the supervisor for the assertion. StopCrashOwner cleans
+        // the surviving group afterwards, before GuardedChild reaps the owner.
+        send_signal(owner, "KILL");
+        let status = stop
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "supervisor crash was mistaken for successful stop"
+        );
+        assert!(
+            alive(daemon_pid),
+            "fixture must prove the daemon survived its supervisor"
+        );
+    }));
+    if let Err(payload) = result {
+        eprintln!(
+            "stop crash fixture: owner_pid={} owner_present={} daemon_pid={} daemon_present={} \
+             stop_status={:?} stop_seen={}\nowner stderr (last 4096 bytes):\n{}\n\
+             stop stderr (last 4096 bytes):\n{}",
+            owner.id(),
+            alive(owner.id()),
+            daemon_pid,
+            alive(daemon_pid),
+            stop.try_wait(),
+            dir.path().join("stop-seen").exists(),
+            stop_stderr_tail(&stderr_path(dir.path())),
+            stop_stderr_tail(&stop_stderr),
+        );
+        panic::resume_unwind(payload);
+    }
 }
 
 // The CLI may reject a request before opening the private socket. That must
