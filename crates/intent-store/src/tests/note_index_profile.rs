@@ -288,7 +288,7 @@ fn bump_workspace_manifest(manifest: &str, old_version: &str) -> String {
         }
         for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
             if let Some(dependencies) = table.get_mut(section).and_then(toml::Value::as_table_mut) {
-                for dependency in dependencies.values_mut() {
+                for (_, dependency) in dependencies.iter_mut() {
                     if let Some(spec) = dependency.as_table_mut() {
                         if spec.contains_key("path")
                             && spec.get("version").and_then(toml::Value::as_str)
@@ -301,7 +301,10 @@ fn bump_workspace_manifest(manifest: &str, old_version: &str) -> String {
             }
         }
         if let Some(targets) = table.get_mut("target").and_then(toml::Value::as_table_mut) {
-            for target in targets.values_mut().filter_map(toml::Value::as_table_mut) {
+            for target in targets
+                .iter_mut()
+                .filter_map(|(_, value)| value.as_table_mut())
+            {
                 bump_sections(target, old_version);
             }
         }
