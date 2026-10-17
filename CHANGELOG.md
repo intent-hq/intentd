@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.3] - 2026-10-17
+
+### 🧪 Testing
+
+- Synchronize retirement fixture progress and ordering ([#2448](https://github.com/intent-hq/intentd/pull/2448))
+
+
 ## [0.11.2] - 2026-10-17
 
 ### 🐛 Bug Fixes
