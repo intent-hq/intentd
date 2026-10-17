@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.11.4"
+version = "0.11.5"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 
 [dependencies]
-intentd-sitter = { path = "../intentd-sitter", version = "0.1.27" }
+intentd-sitter = { path = "../intentd-sitter", version = "0.1.28" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
