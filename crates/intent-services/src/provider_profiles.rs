@@ -906,8 +906,69 @@ impl Services {
         Ok(json!({ "profiles": rows, "revision": store.revision() }))
     }
 
+    /// Run one profile mutation as an owned daemon task over a settled
+    /// secret-store operation: a write that outlives its budget is awaited to
+    /// its actual outcome (never reported failed while it may still land),
+    /// caller cancellation cannot abandon the journal/secret/metadata
+    /// sequence half-way, and the operation's receipts are acknowledged.
+    async fn owned_profile_mutation<F, Fut>(&self, mutation: F) -> Result<Value>
+    where
+        F: FnOnce(Services) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+    {
+        let caller = intent_core::current_caller()
+            .ok_or_else(|| Error::Internal("provider profile caller missing".into()))?;
+        let credential = intent_core::caller::current_wire_credential();
+        let mut operation = self.clone();
+        operation.secrets = Arc::new(
+            self.secrets
+                .settled_operation(Arc::new(tokio::sync::Notify::new())),
+        );
+        intent_core::spawn_daemon(intent_core::with_caller(
+            caller,
+            intent_core::caller::with_wire_credential(credential, async move {
+                let result = mutation(operation.clone()).await;
+                operation.secrets.finish_operation().await;
+                result
+            }),
+        ))
+        .await
+        .map_err(|e| {
+            Error::Internal(format!(
+                "provider profile operation failed: {e}; state may be unknown"
+            ))
+        })?
+    }
+
     pub(crate) async fn provider_profiles_create_impl(&self, params: Value) -> Result<Value> {
         Self::require_administrator("providers.profiles.create")?;
+        self.owned_profile_mutation(move |svc| async move {
+            svc.provider_profiles_create_owned(params).await
+        })
+        .await
+    }
+
+    pub(crate) async fn provider_profiles_update_impl(
+        &self,
+        profile_id: String,
+        params: Value,
+    ) -> Result<Value> {
+        Self::require_administrator("providers.profiles.update")?;
+        self.owned_profile_mutation(move |svc| async move {
+            svc.provider_profiles_update_owned(profile_id, params).await
+        })
+        .await
+    }
+
+    pub(crate) async fn provider_profiles_delete_impl(&self, profile_id: String) -> Result<Value> {
+        Self::require_administrator("providers.profiles.delete")?;
+        self.owned_profile_mutation(move |svc| async move {
+            svc.provider_profiles_delete_owned(profile_id).await
+        })
+        .await
+    }
+
+    async fn provider_profiles_create_owned(&self, params: Value) -> Result<Value> {
         let base = opt_string(&params, "baseProviderId")?
             .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
         let raw_name = opt_string(&params, "name")?
@@ -988,12 +1049,11 @@ impl Services {
         Ok(json!({ "profile": profile_json(&meta, &env), "revision": revision }))
     }
 
-    pub(crate) async fn provider_profiles_update_impl(
+    async fn provider_profiles_update_owned(
         &self,
         profile_id: String,
         params: Value,
     ) -> Result<Value> {
-        Self::require_administrator("providers.profiles.update")?;
         let raw_name = opt_string(&params, "name")?;
         let writes = opt_env(&params)?;
 
@@ -1092,8 +1152,7 @@ impl Services {
         }))
     }
 
-    pub(crate) async fn provider_profiles_delete_impl(&self, profile_id: String) -> Result<Value> {
-        Self::require_administrator("providers.profiles.delete")?;
+    async fn provider_profiles_delete_owned(&self, profile_id: String) -> Result<Value> {
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
         let profiles = store.profiles()?;
@@ -1160,8 +1219,11 @@ impl Services {
 
         // Prune the profile's `model.providerDefaults` key (emits
         // `settings:changed`). A failure leaves an inert key behind.
-        if settings.model.provider_defaults.contains_key(&reference) {
-            let mut map = settings.model.provider_defaults.clone();
+        // Re-read now: the snapshot above predates the secret I/O, and a
+        // concurrent writer may have replaced the map since.
+        let current = self.effective_settings().model.provider_defaults;
+        if current.contains_key(&reference) {
+            let mut map = current;
             map.remove(&reference);
             let changes = json!([{ "path": "model.providerDefaults", "value": map }]);
             if let Err(e) = self.owned_settings_mutation(changes, None).await {
