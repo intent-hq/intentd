@@ -247,6 +247,88 @@ fn env_key_value_and_reserved_rules() {
 }
 
 #[test]
+fn keys_intent_writes_at_launch_are_reserved_with_a_clear_reason() {
+    for key in [
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_AUTHOR_NAME",
+        "git_author_email",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ] {
+        for base in PROFILE_BASE_PROVIDERS {
+            let reason = reserved_key_reason(key, base)
+                .unwrap_or_else(|| panic!("{key} must be reserved for {base}"));
+            assert!(
+                reason.starts_with(&format!("{key} is reserved: ")),
+                "{reason}"
+            );
+            assert!(reason.contains("Intent sets"), "{reason}");
+        }
+    }
+    let codex = reserved_key_reason("INITIAL_AGENT_MODE", "codex").unwrap();
+    assert!(codex.contains("Intent sets"), "{codex}");
+    // Claude Code launches never write it, so a Claude profile may set it.
+    assert!(reserved_key_reason("INITIAL_AGENT_MODE", "claude-code").is_none());
+
+    let mut errors = Vec::new();
+    validate_env(
+        &[EnvWrite::Set {
+            key: "GIT_AUTHOR_EMAIL".into(),
+            value: "work@example.invalid".into(),
+        }],
+        "codex",
+        None,
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].field, "env[0].key");
+    assert_eq!(errors[0].code, "env-key-reserved");
+    assert!(!errors[0].message.contains("work@example.invalid"));
+}
+
+/// Drift guard: every key the provider launch writes for a profile-capable
+/// provider (provider env, git identity and credential-helper wiring) is
+/// reserved, so a profile can never save a value that launch would override.
+#[test]
+fn every_key_written_at_launch_is_reserved() {
+    let repo = tempfile::tempdir().unwrap();
+    let git_keys: Vec<String> = intent_git::identity::GIT_IDENTITY_ENV_VARS
+        .iter()
+        .map(|k| (*k).to_owned())
+        .chain(
+            intent_git::auth::daemon_helper_env("/opt/intentd", Some(repo.path()), Some("x"))
+                .into_iter()
+                .map(|(k, _)| k),
+        )
+        .collect();
+    assert!(git_keys.iter().any(|k| k == "GIT_CONFIG_PARAMETERS"));
+    for base in PROFILE_BASE_PROVIDERS {
+        let provider = intent_providers::find_provider(base).unwrap();
+        let mut keys = git_keys.clone();
+        for via_npx in [false, true] {
+            keys.extend(
+                intent_providers::build_provider_env_for_spawn(
+                    provider,
+                    Some("model"),
+                    Some("/rules.md"),
+                    Some("{}"),
+                    None,
+                    via_npx,
+                    Some(1024),
+                )
+                .into_keys(),
+            );
+        }
+        for key in keys {
+            assert!(
+                reserved_key_reason(&key, base).is_some(),
+                "{key} is written at {base} launch but not reserved"
+            );
+        }
+    }
+}
+
+#[test]
 fn home_reservation_points_to_the_account_variable() {
     let codex = reserved_key_reason("home", "codex").unwrap();
     assert!(codex.contains("CODEX_HOME"), "{codex}");
