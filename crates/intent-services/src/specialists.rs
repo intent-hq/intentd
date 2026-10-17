@@ -237,9 +237,9 @@ pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
 /// base tier: no shipped specialist survives the replacement.
 const EMPTY_BUNDLE: &[(&str, &str)] = &[];
 
-/// Parse a raw [`REPLACEMENT_DIR_ENV`] value: a non-empty path is the
-/// replacement base-tier directory; unset/empty means no replacement.
-fn replacement_dir(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+/// Parse a raw path env value ([`REPLACEMENT_DIR_ENV`], [`USER_DIR_ENV`]): a
+/// non-empty path is the override; unset/empty means no override.
+fn non_empty_path(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
     raw.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
@@ -260,32 +260,49 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Parse a raw [`USER_DIR_ENV`] value: a non-empty path relocates the user
-/// tier; unset/empty means the default `~/.intent/specialists/`.
-fn user_dir_override(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    raw.map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
-}
-
-/// The [`USER_DIR_ENV`] override currently in effect, if any.
-pub(crate) fn user_dir_override_from_env() -> Option<PathBuf> {
-    user_dir_override(std::env::var_os(USER_DIR_ENV))
-}
-
-/// Pure resolution of the user tier: the [`USER_DIR_ENV`] override wins,
-/// else `<home>/.intent/specialists/`.
-fn resolve_user_dir(
-    raw_override: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    user_dir_override(raw_override)
-        .or_else(|| home.map(|h| h.join(".intent").join(SPECIALISTS_FOLDER)))
+/// The [`USER_DIR_ENV`] override currently in effect, if any. Ignored in unit
+/// tests (like `CLAUDE_CONFIG_DIR` in [`claude_agents::user_root`]) so a value
+/// inherited from a sandbox daemon's shell cannot redirect hermetic fixtures.
+fn user_dir_override_from_env() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    non_empty_path(std::env::var_os(USER_DIR_ENV))
 }
 
 /// Default user specialists directory: [`USER_DIR_ENV`] if set, else
 /// `~/.intent/specialists/`. Shared with the specialists watcher so the
 /// watched and written directories cannot drift.
 pub(crate) fn default_user_dir() -> Option<PathBuf> {
-    resolve_user_dir(std::env::var_os(USER_DIR_ENV), home_dir())
+    user_dir_override_from_env()
+        .or_else(|| home_dir().map(|h| h.join(".intent").join(SPECIALISTS_FOLDER)))
+}
+
+/// The home directory a user tier belongs to: the real home when the tier was
+/// relocated by [`USER_DIR_ENV`] (a relocated directory has no `.intent`
+/// parent to derive from), else the parent of `<home>/.intent/<tier>`.
+/// Shared by the Claude user-agents fallback and skill discovery.
+pub(crate) fn home_for_user_dir(user_dir: &Path) -> Option<PathBuf> {
+    home_for_user_dir_with(
+        user_dir,
+        user_dir_override_from_env().as_deref(),
+        home_dir(),
+    )
+}
+
+/// Pure [`home_for_user_dir`] resolution with the override and home injected.
+fn home_for_user_dir_with(
+    user_dir: &Path,
+    relocated: Option<&Path>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if relocated == Some(user_dir) {
+        return home;
+    }
+    let intent = user_dir.parent()?;
+    (intent.file_name()? == ".intent")
+        .then(|| intent.parent().map(Path::to_path_buf))
+        .flatten()
 }
 
 /// Default bundled specialists directory: the [`BUNDLED_DIR_ENV`] override if
@@ -1221,7 +1238,7 @@ impl SpecialistsService {
     /// explicit roots stay hermetic even when the var is exported.
     pub(crate) fn new(user_dir: Option<PathBuf>, bundled_dir: Option<PathBuf>) -> Self {
         if bundled_dir.is_none() {
-            if let Some(dir) = replacement_dir(std::env::var_os(REPLACEMENT_DIR_ENV)) {
+            if let Some(dir) = non_empty_path(std::env::var_os(REPLACEMENT_DIR_ENV)) {
                 return Self::with_base_replacement(user_dir, dir);
             }
         }
@@ -1752,12 +1769,7 @@ impl SpecialistsService {
             .values()
             .any(|definition| definition.get("requiredSkills").is_some())
         {
-            let home = self.user_dir.as_deref().and_then(|path| {
-                let intent = path.parent()?;
-                (intent.file_name()? == ".intent")
-                    .then(|| intent.parent().map(Path::to_path_buf))
-                    .flatten()
-            });
+            let home = self.user_dir.as_deref().and_then(home_for_user_dir);
             let available = crate::skills::discover_skills_sync(workspace_path, home)
                 .into_iter()
                 .map(|skill| skill.name)
@@ -2719,28 +2731,6 @@ mod tests {
         assert!(svc.resolve("custom", None).is_some());
     }
 
-    /// [`replacement_dir`] parsing: unset and empty mean no replacement; a
-    /// non-empty value is the replacement path.
-    #[test]
-    fn user_dir_resolution_prefers_non_empty_override() {
-        let home = Some(PathBuf::from("/home/dev"));
-        let default = PathBuf::from("/home/dev/.intent/specialists");
-        assert_eq!(resolve_user_dir(None, home.clone()), Some(default.clone()));
-        assert_eq!(
-            resolve_user_dir(Some(std::ffi::OsString::new()), home.clone()),
-            Some(default)
-        );
-        assert_eq!(
-            resolve_user_dir(Some("/sandbox/specialists".into()), home),
-            Some(PathBuf::from("/sandbox/specialists"))
-        );
-        assert_eq!(
-            resolve_user_dir(Some("/sandbox/specialists".into()), None),
-            Some(PathBuf::from("/sandbox/specialists"))
-        );
-        assert_eq!(resolve_user_dir(None, None), None);
-    }
-
     /// A relocated user tier (the dev-sandbox case) takes user-scope writes,
     /// edits and deletes; the real `~/.intent/specialists` is never touched.
     #[test]
@@ -2750,11 +2740,8 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("keep.md"), "---\nname: \"Keep\"\n---\n\nreal").unwrap();
         let sandbox = tempfile::tempdir().unwrap();
-        let relocated = resolve_user_dir(
-            Some(sandbox.path().join("specialists").into_os_string()),
-            Some(home.path().to_path_buf()),
-        );
-        let svc = SpecialistsService::new(relocated.clone(), Some(sandbox.path().join("bundled")));
+        let relocated = non_empty_path(Some(sandbox.path().join("specialists").into_os_string()));
+        let svc = SpecialistsService::new(relocated, Some(sandbox.path().join("bundled")));
         let spec = json!({"name": "Probe", "description": "d", "prompt": "body"});
         let created = svc.create("probe", &spec, Some("user"), None).unwrap();
         assert!(
@@ -2774,37 +2761,43 @@ mod tests {
         );
     }
 
-    /// The Claude user-agents fallback stays on the real home when the user
-    /// tier is relocated, and still derives from an `.intent/specialists`
-    /// tier otherwise.
+    /// The home behind a user tier (Claude user-agents fallback and skill
+    /// discovery) stays the real home when the tier is relocated, and still
+    /// derives from an `<home>/.intent/specialists` tier otherwise.
     #[test]
-    fn claude_user_root_follows_real_home_when_user_tier_relocated() {
+    fn home_for_user_dir_follows_real_home_when_user_tier_relocated() {
         let home = Some(PathBuf::from("/home/dev"));
         let relocated = Path::new("/sandbox/specialists");
         assert_eq!(
-            claude_agents::user_root_for(relocated, Some(relocated), home.clone()),
-            Some(PathBuf::from("/home/dev/.claude/agents"))
+            home_for_user_dir_with(relocated, Some(relocated), home.clone()),
+            Some(PathBuf::from("/home/dev"))
         );
+        assert_eq!(home_for_user_dir_with(relocated, None, home.clone()), None);
         assert_eq!(
-            claude_agents::user_root_for(relocated, None, home.clone()),
-            None
-        );
-        assert_eq!(
-            claude_agents::user_root_for(
+            home_for_user_dir_with(
                 Path::new("/tmp/x/.intent/specialists"),
                 Some(relocated),
                 home
             ),
-            Some(PathBuf::from("/tmp/x/.claude/agents"))
+            Some(PathBuf::from("/tmp/x"))
         );
     }
 
+    /// The override env var is ignored in unit tests so an inherited value
+    /// (e.g. from a sandbox daemon's shell) cannot redirect fixtures.
+    #[test]
+    fn user_dir_override_is_ignored_in_unit_tests() {
+        assert_eq!(user_dir_override_from_env(), None);
+    }
+
+    /// [`non_empty_path`] parsing: unset and empty mean no override; a
+    /// non-empty value is the override path.
     #[test]
     fn replacement_dir_parses_unset_empty_and_set() {
-        assert_eq!(replacement_dir(None), None);
-        assert_eq!(replacement_dir(Some(std::ffi::OsString::new())), None);
+        assert_eq!(non_empty_path(None), None);
+        assert_eq!(non_empty_path(Some(std::ffi::OsString::new())), None);
         assert_eq!(
-            replacement_dir(Some(std::ffi::OsString::from("/tmp/specialists"))),
+            non_empty_path(Some(std::ffi::OsString::from("/tmp/specialists"))),
             Some(PathBuf::from("/tmp/specialists"))
         );
     }
