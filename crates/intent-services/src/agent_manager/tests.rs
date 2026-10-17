@@ -13977,6 +13977,281 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     let _ = mock.await;
 }
 
+/// A completed turn published `agent:idle` and persisted its response, but
+/// its worker still holds the busy slot in the post-turn tail. A graceful
+/// shutdown in that window must not record the finished turn as interrupted:
+/// the next startup sweep would deliver a second automatic continuation.
+/// Reproduces the compaction-restart schedule with explicit barriers.
+#[tokio::test]
+async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-idle-shutdown");
+    let id = AgentId::from("idle-shutdown");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1,
+        "the completed turn's request is durable before shutdown"
+    );
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a settled turn must not be recorded for startup recovery"
+    );
+    // The aborted worker never ran `end_turn`; shutdown must persist the
+    // settled status, or the next startup heal treats it as a crashed turn.
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert!(!stored.is_active);
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// The later half of the same window: `end_turn` has released the slot but
+/// its `RuntimeIdle` write is blocked when shutdown aborts the worker. The
+/// agent is outside the shutdown snapshot, yet its persisted `Active` status
+/// would make the next startup heal record and resume the finished turn.
+#[tokio::test]
+async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-release-shutdown");
+    let id = AgentId::from("release-shutdown");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    // Take the only writer, so end_turn stops after its synchronous release.
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases the slot before awaiting the writer");
+    assert_eq!(
+        mgr.workers.lock().unwrap().len(),
+        1,
+        "worker is still registered while its idle write waits"
+    );
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while !mgr.workers.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown takes the aborted worker");
+    writer.rollback().await.unwrap();
+    timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown completes")
+        .unwrap();
+
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::RuntimeIdle,
+        "shutdown persists the settled turn's idle status"
+    );
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Start one real turn and park its worker after the terminal `agent:idle`,
+/// holding the busy slot at the post-turn drain barrier.
+async fn park_after_settled_turn(
+    mgr: &Arc<AgentManager>,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> (JoinHandle<()>, tokio::sync::oneshot::Sender<()>) {
+    use intent_core::events::AGENT_IDLE;
+
+    seed_agent(mgr, ws, id).await;
+    let mock = track_mock_agent(mgr, id, true);
+    mgr.start_session(id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_IDLE.into()],
+        batch_window: None,
+        ..Default::default()
+    });
+    let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false);
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("worker reached post-turn drain barrier")
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch
+                .iter()
+                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("completed turn published idle");
+    assert!(mgr.is_busy(id));
+    assert!(mgr.turn_settled(id), "terminal idle marks the held slot");
+    (mock, release)
+}
+
+/// Control: the settled mark covers only the finished turn. Once the same
+/// worker drains new input, a shutdown before that work completes must still
+/// leave the agent recoverable.
+#[tokio::test]
+async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-new-work");
+    let id = AgentId::from("settled-new-work");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "drained follow-up".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true, "held slot queues the follow-up");
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .expect("worker drains the follow-up into a new turn");
+    assert!(mgr.is_busy(&id));
+    assert!(!mgr.turn_settled(&id), "new work clears the settled mark");
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the draining worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "unfinished drained work must remain recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Control: a mark retained after a release whose idle write did not finish
+/// never carries into a later claim.
+#[tokio::test]
+async fn settled_mark_is_cleared_by_the_next_slot_claim() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-settled-reclaim");
+    let id = AgentId::from("settled-reclaim");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.mark_turn_settled_if_slot_held(&id);
+    mgr.end_turn(&id).await;
+    assert!(
+        !mgr.turn_settled(&id),
+        "a durable idle write retires the mark"
+    );
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(!mgr.turn_settled(&id), "only a slot holder can be marked");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(mgr.turn_settled(&id));
+    // Release without the end_turn write, as an abort after release would.
+    mgr.release_in_flight_slot(&id);
+    assert!(mgr.turn_settled(&id), "release alone keeps the mark");
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.turn_settled(&id), "a new claim owns unfinished work");
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "a claimed, unfinished turn must remain recoverable"
+    );
+}
+
 #[tokio::test]
 async fn interrupt_returns_false_for_unknown_agent() {
     let (_tmp, mgr) = manager().await;
