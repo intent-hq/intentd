@@ -10415,6 +10415,13 @@ async fn agent_list_row_stays_within_row_budget() {
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
+    // Every shortened preview string carries its truncation flag, and the
+    // flags are measured inside the row budget below.
+    assert!(row.last_agent_response_truncated);
+    assert!(row.last_user_message_truncated);
+    assert!(row.digest_truncated);
+    assert!(row.metadata.completion_report_truncated);
+    assert!(row.metadata.attention_request_reason_truncated);
     assert_eq!(row.waiting_on_hooks.len(), 2);
     assert_eq!(row.waiting_on_pr_monitors.len(), 2);
     assert_eq!(row.waiting_for_agent_ids.len(), 1);
@@ -30267,6 +30274,65 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     // and `stop_reason` stays unset.
     assert_ne!(session.status, intent_core::AgentStatus::Error);
     assert_eq!(session.stop_reason, None);
+}
+
+/// List-row truncation flag (intent-hq/intent#7250 follow-up): a reason over
+/// the 400-byte list cap is served shortened on `agent.list` with
+/// `metadata.attentionRequestReasonTruncated: true`; a short reason carries
+/// no flag; `agent.get` serves the full reason and never the flag.
+#[tokio::test]
+async fn agent_list_flags_shortened_attention_reason() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let long = create_agent(&svc, &ws, "Long").await;
+    let short = create_agent(&svc, &ws, "Short").await;
+    let reason = format!("blocked: {}", "r".repeat(BUDGET * 2));
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        reason.clone(),
+        Some(long.clone()),
+    )
+    .await
+    .expect("long request");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "short reason".into(),
+        Some(short.clone()),
+    )
+    .await
+    .expect("short request");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let wire = |id: &AgentId| {
+        serde_json::to_value(rows.iter().find(|a| a.id == *id).expect("listed")).unwrap()
+    };
+    let long_row = wire(&long);
+    assert_eq!(
+        long_row["metadata"]["attentionRequestReasonTruncated"],
+        json!(true)
+    );
+    let served = long_row["metadata"]["attentionRequestReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(served.len(), BUDGET);
+    assert!(reason.starts_with(served));
+    let short_row = wire(&short);
+    assert_eq!(
+        short_row["metadata"]["attentionRequestReason"],
+        "short reason"
+    );
+    assert!(short_row["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+
+    let got =
+        serde_json::to_value(svc.agent_get_op(long.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(got["metadata"]["attentionRequestReason"], json!(reason));
+    assert!(got["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
 }
 
 /// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
