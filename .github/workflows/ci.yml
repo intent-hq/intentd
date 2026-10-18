@@ -1853,7 +1853,8 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@fad7680163695477075ebe48b6ec1d44954f11d6
+      INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@af04df8ec1ccf0ef46ce236dad12464dfe39397e
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
