@@ -307,8 +307,9 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
 behavior** is **Show choices**, the default). If another workspace worked on that
-PR, the menu offers **Open in Original Workspace**; with several such workspaces it
-opens a submenu of their names, most recent first. Archived workspaces are included
+PR, the last menu item is **Open in original workspace**, followed by that
+workspace's name; with several such workspaces it opens a submenu of their names,
+most recent first. Archived workspaces are included
 and marked **Archived**. Intent links a PR to a workspace when it discovers the PR on
 that workspace's branch or one of its submodules; PRs seen only before this feature
 shipped are not linked until Intent sees them again.
