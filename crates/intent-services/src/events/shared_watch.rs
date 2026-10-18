@@ -97,17 +97,18 @@
 //! recursion flag, the backend no longer auto-watches directories created
 //! later; the group's event callback feeds `Create(Folder)` / rename-to
 //! events back to the registrar, which walks the new directory the same way.
-//! The tier heads `.intent`, `.augment`, `.agents`, `.claude` are narrowed to
-//! what a subscriber reads through the workspace-root watch — the project
-//! skills and specialists tiers ([`subscriber_tiers`]): beneath a tier head
-//! only those subtrees are walked, and nothing is pruned inside them (a nested
-//! name colliding with the noise list, `.intent/skills/build/`, must stay
-//! watched). Every other child of a tier head — nested worktrees under
-//! `.intent/worktrees`, `.intent/attachments`, `.claude/projects` — feeds no
-//! subscriber (`file:*` drops these trees) and is pruned; walking them whole
-//! cost ~107k descriptors on one host (intent-hq/intent#7252). The residual
-//! is a root that itself lives under a tier head (a home-tier skills root): it
-//! is walked unpruned.
+//! The project skills and specialists tiers a subscriber reads through the
+//! workspace-root watch ([`subscriber_tiers`]) are walked whole: nothing is
+//! pruned inside them (a nested name colliding with the noise list,
+//! `.intent/skills/build/`, must stay watched). Their heads `.intent` and
+//! `.augment` are trees the `file:*` stream drops, so every other child of
+//! those — nested worktrees under `.intent/worktrees`, `.intent/attachments`
+//! — feeds no subscriber and is pruned; walking them whole cost ~107k
+//! descriptors on one host (intent-hq/intent#7252). The other heads
+//! (`.claude`, `.agents`) still feed `file:*`, so their non-tier children
+//! (`.claude/commands`) follow the ordinary rules below. The residual is a
+//! root that itself lies in a tier (a home-tier skills root): it is walked
+//! unpruned.
 //!
 //! An ordinary directory no path rule decides is also pruned when the root's
 //! git ignore rules ignore it — the same [`super::watcher::GitignoreMatcher`]
@@ -167,6 +168,26 @@ fn subscriber_tiers() -> impl Iterator<Item = &'static str> {
         .iter()
         .chain(super::specialists_watcher::PROJECT_TIERS)
         .copied()
+}
+
+/// Whether `root` lies at or beneath a subscriber tier from some tier head
+/// in its own path (`~/.intent/skills`, `~/.claude/agents/linked`) — not
+/// merely under a tier head (`<repo>/.claude/worktrees/feat` is an ordinary
+/// tree).
+#[cfg(target_os = "linux")]
+fn root_on_subscriber_tier(root: &Path) -> bool {
+    let names: Vec<Option<&str>> = root.components().map(component_name).collect();
+    names.iter().enumerate().any(|(head, name)| {
+        name.is_some_and(is_tier_head)
+            && subscriber_tiers().any(|tier| {
+                let parts: Vec<&str> = tier.split('/').collect();
+                names.len() - head >= parts.len()
+                    && parts
+                        .iter()
+                        .zip(&names[head..])
+                        .all(|(want, got)| Some(*want) == *got)
+            })
+    })
 }
 
 /// Whether `name` is the first component of a [`subscriber_tiers`] entry.
@@ -1195,6 +1216,12 @@ fn spawn_registrar(
         loop {
             #[cfg(target_os = "linux")]
             let next = match pruned.rules_deadline() {
+                // Due edits run before the next command, so a steady stream
+                // of commands cannot starve them.
+                Some(deadline) if deadline <= std::time::Instant::now() => {
+                    pruned.apply_rule_changes(watcher.as_mut());
+                    continue;
+                }
                 Some(deadline) => {
                     match rx
                         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -1283,6 +1310,11 @@ struct PrunedWatches {
     /// held count last dropped below the threshold.
     #[cfg(target_os = "linux")]
     budget_warned: bool,
+    /// `fs.inotify.max_user_watches` as last read (`None` until read, or
+    /// while unreadable); re-read whenever the held count reaches the
+    /// threshold against it.
+    #[cfg(target_os = "linux")]
+    watch_limit: Option<u64>,
 }
 
 impl PrunedWatches {
@@ -1371,7 +1403,16 @@ impl PrunedWatches {
     /// re-armed once the count falls back below the threshold.
     #[cfg(target_os = "linux")]
     fn note_budget(&mut self) {
-        let over = over_watch_budget(self.dirs.len(), max_user_watches());
+        let held = self.dirs.len();
+        if self.watch_limit.is_none() {
+            self.watch_limit = max_user_watches();
+        }
+        let limit = self.watch_limit;
+        // Re-read the limit before reporting: raising it is the remedy.
+        let over = over_watch_budget(held, limit) && {
+            self.watch_limit = max_user_watches();
+            over_watch_budget(held, self.watch_limit)
+        };
         if over && !self.budget_warned {
             tracing::warn!(
                 held = self.dirs.len(),
@@ -1384,11 +1425,10 @@ impl PrunedWatches {
 
     /// Walk `start` (which lies under `root`, whose prune rules — for its
     /// `kind` — apply) and register one non-recursive descriptor per
-    /// surviving directory, returning how many. The walk yields each
-    /// directory once (symlinks are followed only where [`pruned_dirs`]
-    /// allows, and never to a target already covered), so the count is the
-    /// number of distinct directories, not of `watch()` calls landing on
-    /// inodes inotify already watches (intent-hq/intent#7252). `start` itself is registered first and outside the
+    /// surviving directory, returning how many. Links are entered only where
+    /// [`link_walkable`] allows, so outside the subscriber tiers the count is
+    /// the number of distinct directories rather than of `watch()` calls
+    /// landing on inodes inotify already watches (intent-hq/intent#7252). `start` itself is registered first and outside the
     /// walk, so a missing or unreadable `start` fails with the backend's own
     /// error (the walk would merely yield nothing for it) and the caller
     /// settles the root as failed, as `notify`'s own watch would. The walk
@@ -1404,11 +1444,31 @@ impl PrunedWatches {
         kind: RootKind,
         start: &Path,
     ) -> notify::Result<usize> {
+        self.walk_tree(watcher, root, kind, start, false)
+    }
+
+    /// [`Self::add_tree`], optionally (`skip_held`) leaving directories that
+    /// already hold a descriptor alone while still descending through them —
+    /// what an ignore-rule re-walk wants, since only the directories the edit
+    /// un-ignored are new. Not for created or moved-in trees: a path left in
+    /// [`Self::dirs`] by a rename away may now name a different, unwatched
+    /// directory.
+    #[cfg(target_os = "linux")]
+    fn walk_tree(
+        &mut self,
+        watcher: &mut dyn Watcher,
+        root: &Path,
+        kind: RootKind,
+        start: &Path,
+        skip_held: bool,
+    ) -> notify::Result<usize> {
         watcher.watch(start, RecursiveMode::NonRecursive)?;
-        self.dirs.insert(start.to_path_buf());
-        let mut count = 1;
+        let mut count = usize::from(self.dirs.insert(start.to_path_buf()) || !skip_held);
         let rules = self.rules.get(root).cloned();
         for dir in pruned_dirs(root, kind, rules, start).filter(|dir| dir != start) {
+            if skip_held && self.dirs.contains(&dir) {
+                continue;
+            }
             match watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     self.dirs.insert(dir);
@@ -1443,7 +1503,8 @@ impl PrunedWatches {
         else {
             return;
         };
-        if !follows_symlink(&root, kind, dir) {
+        let is_link = std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink());
+        if is_link && !link_walkable(&root, kind, dir, &Mutex::default()) {
             return;
         }
         let walked = self.add_tree(watcher, &root, kind, dir);
@@ -1531,7 +1592,7 @@ impl PrunedWatches {
                 if walked.iter().any(|done| dir.starts_with(done)) {
                     continue;
                 }
-                match self.add_tree(watcher, &root, kind, &dir) {
+                match self.walk_tree(watcher, &root, kind, &dir, true) {
                     Ok(descriptors) => {
                         tracing::debug!(
                             root = %root.display(),
@@ -1574,28 +1635,41 @@ fn over_watch_budget(held: usize, limit: Option<u64>) -> bool {
     })
 }
 
-/// The host's `fs.inotify.max_user_watches`, read once per process.
+/// The host's current `fs.inotify.max_user_watches`.
 #[cfg(target_os = "linux")]
 fn max_user_watches() -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-    })
+    std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
 }
 
-/// Whether the walk may enter `dir` if it is a symlink. Git does not follow
-/// directory symlinks and a target inside the root is watched at its real
-/// path, so an ordinary symlinked directory is not walked: following them
-/// re-walked pnpm link farms and `.svelte-kit` links once per alias
-/// (intent-hq/intent#7252). Inside a kept subscriber tier links are followed
-/// — `.claude/skills -> ../.agents/skills` and per-skill links are how skills
-/// are shared. A non-symlink always qualifies.
+/// Whether the walk of `root` enters the symlinked directory `link`. Inside
+/// a kept subtree (a subscriber tier) links are followed as before, so a
+/// tier reached through a link (`.claude/skills -> ../skills`) still reports
+/// under the tier path its watcher matches. Elsewhere a link whose target
+/// lies inside the root is not entered — the target is watched at its real
+/// path, or pruned there by the same rules — which stops pnpm link farms and
+/// `.svelte-kit` links being walked once per alias (intent-hq/intent#7252);
+/// a link to a tree outside the root is entered once per walk however many
+/// links reach it (`seen` holds the canonical targets already entered).
 #[cfg(target_os = "linux")]
-fn follows_symlink(root: &Path, kind: RootKind, dir: &Path) -> bool {
-    !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
-        || path_rule(root, kind, dir) == PathRule::Keep
+fn link_walkable(
+    root: &Path,
+    kind: RootKind,
+    link: &Path,
+    seen: &Mutex<std::collections::HashSet<PathBuf>>,
+) -> bool {
+    if path_rule(root, kind, link) == PathRule::Keep {
+        return true;
+    }
+    let Ok(target) = std::fs::canonicalize(link) else {
+        return false;
+    };
+    !target.starts_with(root)
+        && seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target)
 }
 
 /// The ignore-rule file name a change of which re-walks its directory.
@@ -1655,10 +1729,14 @@ fn prunes(root: &Path, kind: RootKind, dir: &Path) -> bool {
 /// [`RootKind::GitDir`] root is under [`git_dir_prunes`] from its top. For a
 /// [`RootKind::Tree`] root the first decisive component on the path from
 /// `root` down to `dir` wins: a noise component prunes; a tier head
-/// ([`is_tier_head`]) keeps only the [`subscriber_tiers`] beneath it and
-/// prunes its other children; a `.git` component hands the rest of the path to
-/// [`git_dir_prunes`]. A `root` that itself lies under a tier head (a
-/// home-tier skills root) is walked unpruned (module header).
+/// ([`is_tier_head`]) keeps the [`subscriber_tiers`] beneath it whole, and
+/// prunes its other children when the `file:*` stream drops the head too
+/// (`.intent`, `.augment` — [`super::watcher::SUBSCRIBER_OWNED_DIRS`]) or
+/// leaves them to the remaining rules when it does not (`.claude/commands`
+/// still feeds `file:*`); a `.git` component hands the rest of the path to
+/// [`git_dir_prunes`]. A `root` that itself lies in a subscriber tier (a
+/// home-tier skills root, a linked specialists dir) is walked unpruned
+/// (module header).
 #[cfg(target_os = "linux")]
 fn path_rule(root: &Path, kind: RootKind, dir: &Path) -> PathRule {
     let git_rule = |below: std::path::Components<'_>| {
@@ -1674,10 +1752,7 @@ fn path_rule(root: &Path, kind: RootKind, dir: &Path) -> PathRule {
     if kind == RootKind::GitDir {
         return git_rule(rel.components());
     }
-    if root
-        .components()
-        .any(|c| component_name(c).is_some_and(is_tier_head))
-    {
+    if root_on_subscriber_tier(root) {
         return PathRule::Keep;
     }
     let mut components = rel.components();
@@ -1685,14 +1760,16 @@ fn path_rule(root: &Path, kind: RootKind, dir: &Path) -> PathRule {
         let name = component_name(component);
         if name.is_some_and(is_tier_head) {
             let tail: Vec<Option<&str>> = std::iter::once(component)
-                .chain(components)
+                .chain(components.clone())
                 .map(component_name)
                 .collect();
-            return if on_subscriber_tier(&tail) {
-                PathRule::Keep
-            } else {
-                PathRule::Prune
-            };
+            if on_subscriber_tier(&tail) {
+                return PathRule::Keep;
+            }
+            if name.is_some_and(|n| super::watcher::SUBSCRIBER_OWNED_DIRS.contains(&n)) {
+                return PathRule::Prune;
+            }
+            continue;
         }
         if name == Some(GIT_DIR_NAME) {
             return git_rule(components);
@@ -1716,10 +1793,8 @@ fn git_dir_prunes(mut below_git_dir: std::path::Components<'_>) -> bool {
 
 /// The directories of `start`'s subtree (itself included) that survive
 /// [`walk_skips`] under `root`'s rules for its `kind`; unreadable entries are
-/// skipped. A symlinked directory is entered only where [`follows_symlink`]
-/// allows, and then only when its target is not already covered: a target
-/// the walk keeps inside the root is watched at its real path, and one
-/// outside it is walked once however many links reach it.
+/// skipped. A symlinked directory is entered only where [`link_walkable`]
+/// allows.
 #[cfg(target_os = "linux")]
 fn pruned_dirs(
     root: &Path,
@@ -1740,22 +1815,9 @@ fn pruned_dirs(
             if walk_skips(&root, kind, rules.as_ref(), path) {
                 return false;
             }
-            if entry.depth() == 0 || !entry.path_is_symlink() {
-                return true;
-            }
-            if path_rule(&root, kind, path) != PathRule::Keep {
-                return false;
-            }
-            let Ok(target) = std::fs::canonicalize(path) else {
-                return false;
-            };
-            if target.starts_with(&root) && !walk_skips(&root, kind, rules.as_ref(), &target) {
-                return false;
-            }
-            link_targets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(target)
+            entry.depth() == 0
+                || !entry.path_is_symlink()
+                || link_walkable(&root, kind, path, &link_targets)
         })
         .build()
         .flatten()
@@ -2730,6 +2792,7 @@ mod tests {
             ".intent/skills/existing",
             ".intent/specialists",
             ".claude/agents",
+            ".claude/commands",
             ".agents/skills/s/build",
         ];
         let pruned = [
@@ -2737,7 +2800,6 @@ mod tests {
             ".intent/worktrees/wt/src/components",
             ".intent/worktrees/wt/node_modules/pkg",
             ".intent/attachments/a",
-            ".claude/projects/p",
         ];
         for rel in watched.iter().chain(pruned.iter()) {
             std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
@@ -3287,8 +3349,6 @@ mod tests {
             ".intent/worktrees",
             ".intent/worktrees/wt/src",
             ".intent/attachments",
-            ".claude/projects/x",
-            ".agents/other",
             ".augment/rules",
             "packages/app/.intent/worktrees/wt",
         ] {
@@ -3298,15 +3358,35 @@ mod tests {
                 "{rel} must be pruned"
             );
         }
+        // `.claude` / `.agents` still feed `file:*`: their non-tier children
+        // follow the ordinary rules.
+        for rel in [".claude/commands", ".claude/projects/x", ".agents/other"] {
+            assert_eq!(
+                path_rule(ws, Tree, &ws.join(rel)),
+                PathRule::Open,
+                "{rel} must be left to the ordinary rules"
+            );
+        }
+        assert!(prunes(ws, Tree, &ws.join(".claude/commands/node_modules")));
+        assert!(prunes(ws, Tree, &ws.join(".claude/x/.intent/worktrees")));
         // Ordinary and noise paths keep their own rule.
         assert_eq!(path_rule(ws, Tree, &ws.join("src/a")), PathRule::Open);
         assert_eq!(path_rule(ws, Tree, ws), PathRule::Open);
         assert!(prunes(ws, Tree, &ws.join("node_modules/.intent/skills")));
-        // A root under a tier head is walked unpruned.
-        let home_tier = Path::new("/home/u/.intent/skills");
+        // A root in a subscriber tier is walked unpruned …
+        for tier_root in ["/home/u/.intent/skills", "/home/u/.claude/agents/linked"] {
+            let tier_root = Path::new(tier_root);
+            assert_eq!(
+                path_rule(tier_root, Tree, &tier_root.join("s/node_modules")),
+                PathRule::Keep
+            );
+        }
+        // … but one merely under a tier head is an ordinary tree.
+        let worktree = Path::new("/repo/.claude/worktrees/feat");
+        assert!(prunes(worktree, Tree, &worktree.join("node_modules")));
         assert_eq!(
-            path_rule(home_tier, Tree, &home_tier.join("s/node_modules")),
-            PathRule::Keep
+            path_rule(worktree, Tree, &worktree.join("src")),
+            PathRule::Open
         );
     }
 
@@ -3357,35 +3437,28 @@ mod tests {
         assert!(!over_watch_budget(usize::MAX, Some(0)));
     }
 
-    /// intent-hq/intent#7252: the walk visits each directory once and the
-    /// count it reports is the number of distinct directories. Symlinked
-    /// directories outside a subscriber tier are not entered (git does not
-    /// follow them; an in-root target is watched at its real path), a tier
-    /// link to an in-root tier is left to the real path, and a tier link to
-    /// an outside tree is walked once however many links reach it.
+    /// intent-hq/intent#7252: outside the subscriber tiers a symlinked
+    /// directory whose target is inside the root is not entered (it is
+    /// watched at its real path), and a tree outside the root is entered once
+    /// however many links reach it, so the count is distinct directories.
+    /// Inside a tier links are followed as before, so the tier watcher sees
+    /// events under the tier path.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_pruned_walk_counts_each_directory_once_through_symlinks() {
+    fn the_pruned_walk_enters_each_linked_tree_once_outside_tiers() {
         use std::os::unix::fs::symlink;
         let base = TempDir::new("walk-symlinks");
         let ws = base.path.join("ws");
         let outside = base.path.join("outside");
-        for rel in [
-            "src/real/a/b",
-            "links",
-            ".agents/skills/s1",
-            ".intent/skills",
-            ".claude",
-        ] {
+        for rel in ["src/real/a/b", "links", ".agents/skills/s1", ".claude"] {
             std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
         }
         std::fs::create_dir_all(outside.join("ext/x")).expect("mk outside");
         symlink(ws.join("src/real"), ws.join("links/l1")).expect("link l1");
         symlink(ws.join("src/real"), ws.join("links/l2")).expect("link l2");
-        symlink(outside.join("ext"), ws.join("links/out")).expect("link out");
-        symlink(ws.join(".agents/skills"), ws.join(".claude/skills")).expect("link claude");
-        symlink(outside.join("ext"), ws.join(".intent/skills/ext")).expect("link ext");
-        symlink(outside.join("ext"), ws.join(".intent/skills/ext2")).expect("link ext2");
+        symlink(outside.join("ext"), ws.join("links/out1")).expect("link out1");
+        symlink(outside.join("ext"), ws.join("links/out2")).expect("link out2");
+        symlink(ws.join(".agents/skills"), ws.join(".claude/skills")).expect("link tier");
         let ws = std::fs::canonicalize(&ws).expect("canonical ws");
 
         let mut watcher =
@@ -3407,8 +3480,8 @@ mod tests {
             ".agents/skills",
             ".agents/skills/s1",
             ".claude",
-            ".intent",
-            ".intent/skills",
+            ".claude/skills",
+            ".claude/skills/s1",
         ]
         .iter()
         .map(|rel| {
@@ -3419,19 +3492,24 @@ mod tests {
             }
         })
         .collect();
-        // Exactly one of the two links to the outside tree is walked.
-        let ext_link = [".intent/skills/ext", ".intent/skills/ext2"]
+        let out_link = ["links/out1", "links/out2"]
             .iter()
             .map(|rel| ws.join(rel))
             .find(|p| pruned.dirs.contains(p))
-            .expect("one link to the outside tree is walked");
-        expected.push(ext_link.clone());
-        expected.push(ext_link.join("x"));
+            .expect("one link to the outside tree is entered");
+        expected.push(out_link.clone());
+        expected.push(out_link.join("x"));
         expected.sort();
         let mut held: Vec<PathBuf> = pruned.dirs.iter().cloned().collect();
         held.sort();
         assert_eq!(held, expected);
-        assert_eq!(count, expected.len(), "count is distinct directories");
+        assert_eq!(count, expected.len(), "count is the directories registered");
+
+        // A re-walk after a rule edit registers nothing it already holds.
+        let rewalked = pruned
+            .walk_tree(&mut watcher, &ws, RootKind::Tree, &ws, true)
+            .expect("re-walk");
+        assert_eq!(rewalked, 0, "a re-walk counts only new directories");
     }
 
     /// A skills tier that is itself a link to a tree outside the workspace
