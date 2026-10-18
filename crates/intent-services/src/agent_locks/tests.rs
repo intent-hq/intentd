@@ -76,7 +76,12 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
-fn session(id: &str, ws: &WorkspaceId, status: AgentStatus, task: Option<&str>) -> AgentSession {
+pub(crate) fn session(
+    id: &str,
+    ws: &WorkspaceId,
+    status: AgentStatus,
+    task: Option<&str>,
+) -> AgentSession {
     let ts = now_iso();
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),

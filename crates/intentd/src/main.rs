@@ -2325,6 +2325,12 @@ async fn cmd_serve_owned(
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = startup_work.spawn(|| services.spawn_agent_locks_loop());
+    // Stale tracked-change sweep (intent-hq/intent#7266): shortly after
+    // startup and then periodically, delete working-stage attribution rows
+    // whose path git reports clean (ignored, deleted, reverted, committed
+    // outside the daemon). Aborted on clean shutdown.
+    let tracked_changes_sweep =
+        startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -2983,6 +2989,8 @@ async fn cmd_serve_owned(
     let _ = auto_commit_loop.await;
     agent_locks_loop.abort();
     let _ = agent_locks_loop.await;
+    tracked_changes_sweep.abort();
+    let _ = tracked_changes_sweep.await;
     execution_context_loop.abort();
     let _ = execution_context_loop.await;
     if let Some(reap_task) = reap_task {
