@@ -618,6 +618,14 @@ pub(crate) async fn refresh_stale_pool_entries(
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
                 return (changed, Some(detail));
             }
+            // Expected local admission, not a forge failure: the next
+            // sweep retries it (intent-hq/intent#7264).
+            Ok(Err(e)) if crate::pr_discovery::is_budget_deferral_sc(&e) => {
+                tracing::debug!(
+                    pr_number = number,
+                    "stale PR pool re-fetch deferred by request budget; keeping persisted snapshot"
+                );
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     pr_number = number,
