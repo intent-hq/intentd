@@ -200,7 +200,11 @@ impl Store {
             "SELECT q.id, q.agent_id, q.position, q.payload, q.created_at, \
                     COALESCE(q.turn_id, q.id) AS turn_id \
              FROM agent_queue q JOIN agent_session s ON s.id = q.agent_id \
-             ORDER BY q.agent_id, q.position",
+             WHERE NOT EXISTS(SELECT 1 FROM agent_queue_admission d WHERE d.id=q.id AND d.phase='completed') \
+             UNION ALL SELECT d.id,d.agent_id,-1,d.payload,d.created_at,d.turn_id
+             FROM agent_queue_admission d JOIN agent_session a ON a.id=d.agent_id
+             WHERE d.phase != 'completed' AND NOT EXISTS(SELECT 1 FROM agent_queue q WHERE q.id=d.id)
+             ORDER BY agent_id, position",
         )
         .fetch_all(self.read_pool())
         .await

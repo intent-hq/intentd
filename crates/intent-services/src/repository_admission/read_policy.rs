@@ -15,7 +15,7 @@ use crate::observation_adapter::ConnectionObservations;
 use crate::repository_admission::read_request::RepositoryReadRequest;
 use crate::repository_admission::request_context::current_read_request;
 use crate::repository_admission::{AdmissionError, AdmissionResult};
-use crate::repository_read_source::{with_records, ReadRecord};
+use crate::repository_read_source::{with_records_and_monitors, MonitorRecord, ReadRecord};
 use crate::Services;
 
 type Connections = HashMap<(ExecutionScope, RepositoryConnectionScope), ConnectionObservations>;
@@ -133,17 +133,22 @@ impl McpPrivatePolicy for RepositoryReadPolicy {
         packet: PreparedMcpTransfer<'a>,
     ) -> intent_js::BoxFuture<'a, McpPrivateAdmission> {
         Box::pin(async move {
-            let Some(records) = originals
-                .iter()
-                .map(McpReadEvidence::downcast_ref::<ReadRecord>)
-                .collect::<Option<Vec<_>>>()
-            else {
-                return McpPrivateAdmission::Refused;
-            };
-            with_records(
+            let mut records = Vec::new();
+            let mut monitors = Vec::new();
+            for evidence in originals {
+                if let Some(record) = evidence.downcast_ref::<ReadRecord>() {
+                    records.push(record);
+                } else if let Some(record) = evidence.downcast_ref::<MonitorRecord>() {
+                    monitors.push(record);
+                } else {
+                    return McpPrivateAdmission::Refused;
+                }
+            }
+            with_records_and_monitors(
                 &self.original.request,
                 &self.original.services,
                 &records,
+                &monitors,
                 || packet.transfer(boundary),
             )
             .await

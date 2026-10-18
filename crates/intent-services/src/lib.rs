@@ -70,6 +70,7 @@ mod browser_tabs;
 mod capability;
 mod clone_ops;
 pub mod codex_diagnostics;
+mod codex_session_title;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
@@ -96,6 +97,7 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
+mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -155,14 +157,11 @@ mod repository_context_live;
 )]
 mod repository_context_output;
 mod repository_context_reader;
-#[expect(
-    dead_code,
-    unused_imports,
-    reason = "Settings and child-policy writer integration remains inactive"
-)]
 #[cfg_attr(
     not(test),
     expect(
+        dead_code,
+        unused_imports,
         clippy::wildcard_imports,
         reason = "Preserve private writer imports while native and child-policy integration is pending"
     )
@@ -202,8 +201,10 @@ mod linear_ops;
 mod member_removal;
 mod model_catalog;
 mod nested_repos;
+mod note_annotation;
 mod note_merge;
 pub mod note_ops;
+mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -222,6 +223,7 @@ mod primitive_ops;
 mod principal_ops;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
+pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
@@ -334,8 +336,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
-    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, InvalidationSubscription, SharedWatchHub,
+    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -695,6 +697,7 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
+    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -1428,6 +1431,26 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
+    /// Original qualified registration lifetimes, never rebuilt from stored IDs.
+    review_monitor_authorities: Arc<
+        Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
+    >,
+    /// GitLab's configured connection has an independent, non-overlapping poll lane.
+    review_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded controls consumed by the existing monitor loop, never a wake queue.
+    review_monitor_controls: Arc<
+        Mutex<Option<tokio::sync::mpsc::Sender<repository_native_wire::monitor::flush::Command>>>,
+    >,
+    /// Current original deliveries; never reconstructed from persisted wake metadata.
+    review_monitor_deliveries: repository_read_source::MonitorDeliveries,
+    /// Explicit fixture receipt for tests that exercise the real session launcher.
+    /// Captured once by the original read owner; absent from production builds.
+    #[cfg(test)]
+    test_review_monitoring_recipient: bool,
+    #[cfg(test)]
+    test_review_monitor_write_ready: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(test)]
+    test_export_monitor_preflight: Arc<Mutex<Option<transfer_export::MonitorExportBarrier>>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1637,6 +1660,7 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
+            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -1791,6 +1815,16 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
+            review_monitor_authorities: Arc::default(),
+            review_monitor_poll_lane: Arc::default(),
+            review_monitor_controls: Arc::default(),
+            review_monitor_deliveries: Arc::default(),
+            #[cfg(test)]
+            test_review_monitoring_recipient: false,
+            #[cfg(test)]
+            test_review_monitor_write_ready: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_export_monitor_preflight: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -6737,6 +6771,8 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
+        self.note_deletions.close();
+        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -8275,17 +8311,16 @@ impl Services {
         // own poll loop will wake the agent when it changes or settles.
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
-        let active_pr_monitors: Vec<serde_json::Value> =
-            if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_pr_monitors_for_agent(child_id)
-                    .await
-                    .iter()
-                    .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let pr_monitor_waiting = !active_pr_monitors.is_empty();
+        let pr_monitor_waiting = if event.event_type == AGENT_IDLE && !completion_reported {
+            !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        } else {
+            false
+        };
+        let active_pr_monitors = if pr_monitor_waiting {
+            self.legacy_pr_monitor_wait_entries(child_id).await
+        } else {
+            Vec::new()
+        };
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
@@ -10976,9 +11011,8 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match persist_note_content(store, &note, Some(current_rev), author).await {
+        match plan.persist(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
-                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -11003,11 +11037,8 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers first persist the note-content change via an atomic
-/// versioned write (`persist_note_content` / the `*_with_version` store
-/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
-/// cannot leave comment rows flagged orphaned while the persisted markdown
-/// still contains the original anchors.
+/// writes. Callers commit source, its version, orphan flags and anchor readiness
+/// together through the versioned writer; a failure leaves every row unchanged.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -11030,7 +11061,7 @@ async fn reanchor_note_comments(
     // debris too.
     let mut live_ids = live_comment_ids(&comments);
     let mut current = content;
-    let mut orphaned: Vec<Comment> = Vec::new();
+    let mut orphaned: Vec<String> = Vec::new();
     for comment in &comments {
         // Only root-level anchored comments carry markers; replies inherit the
         // parent's anchor and never inject their own into the note body.
@@ -11045,18 +11076,12 @@ async fn reanchor_note_comments(
             note_ops::AnchorState::Healthy => {}
             note_ops::AnchorState::Missing => {
                 live_ids.remove(&comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::Degenerate => {
                 live_ids.remove(&comment.id);
                 current = note_ops::remove_anchor_markers(&current, &comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
                 let outcome = note_ops::recover_partial_anchor(
@@ -11077,10 +11102,7 @@ async fn reanchor_note_comments(
                         );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
-                        let mut updated = comment.clone();
-                        updated.is_orphaned = Some(true);
-                        updated.updated_at = now_iso();
-                        orphaned.push(updated);
+                        orphaned.push(comment.id.clone());
                     }
                 }
             }
@@ -11112,22 +11134,27 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 /// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
-    orphaned: Vec<Comment>,
+    orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    /// Persist the queued orphan flips. Callers **must** run this only after
-    /// the note-content write has succeeded so a note-write failure cannot
-    /// leave comment rows marked orphaned while the persisted markdown still
-    /// contains the original anchors. If a comment update fails after the
-    /// note has been written the anchors on disk are still a valid pointer
-    /// (either intact or scrubbed) and the next mutation's reanchor pass
-    /// will finish the job.
-    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
-        for c in self.orphaned {
-            store.update_comment(workspace_id, &c).await?;
-        }
-        Ok(())
+    async fn persist(
+        &self,
+        store: &Store,
+        note: &Note,
+        expected_version: Option<i64>,
+        author: &NoteVersionAuthor,
+    ) -> Result<i64> {
+        store
+            .update_note_with_version_and_orphans(
+                note,
+                expected_version,
+                author,
+                &note.updated_at,
+                &self.orphaned,
+            )
+            .await
+            .map(|(revision, _)| revision)
     }
 }
 
@@ -11252,14 +11279,25 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// The write is idempotent (upsert), so a race between two computes leaves
-    /// the store consistent with the *latest* one to complete.
+    /// A generation ticket binds the computation to its original source and
+    /// prevents an older or superseded job from publishing over newer state.
+    /// Indexed attribution and the compatible legacy snapshot commit together.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
+        let job = self
+            .store
+            .begin_note_attribution(workspace_id, note_id, note.rev)
+            .await?;
+        // Publish the committed pending invalidation without fabricating an
+        // empty legacy attribution result. Existing note listeners can re-read.
+        publish_event_transient(
+            self.event_bus.as_ref(),
+            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
+        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11298,7 +11336,9 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store.upsert_note_line_attribution(&data).await?;
+        self.store
+            .publish_note_attribution(&job, &note.content, &data)
+            .await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -16522,12 +16562,13 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children(
+                .update_note_with_version_and_children_and_orphans(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
+                    &plan.orphaned,
                 )
                 .await
             {
@@ -16541,7 +16582,6 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
-                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -17226,6 +17266,13 @@ impl Services {
         expected: Arc<SettingsSnapshot>,
         mut admission: PreparedReloadAdmission,
     ) -> Result<SettingsChanged> {
+        type Completion = (
+            PreparedReloadAdmission,
+            Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+            Result<SettingsChanged>,
+            Option<source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        );
         let registry = self
             .settings_registry
             .as_deref()
@@ -17238,7 +17285,78 @@ impl Services {
         } else {
             None
         };
-        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let revision_guard = admission
+            .wait(self.settings_revision_gate.clone().write_owned())
+            .await?;
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Completion>();
+        let services = self.clone();
+        // Pre-publication waits remain on the original watcher. Register the
+        // finite completion owner before committing, then hand it the SAME
+        // admitted write and guards without an intervening await.
+        let task =
+            self.store_tasks
+                .spawn_draining_with_current_caller(async move {
+                    let (admission, write, result, credential_guard, revision_guard) = receiver
+                        .await
+                        .map_err(|_| Error::Internal("settings reload was not published".into()))?;
+                    admission
+                        .finish(async {
+                            if let Some(write) = write
+                                .as_ref()
+                                .filter(|write| write.native_retirement_pending())
+                            {
+                                let completed = write
+                                    .completed_source(services.gitlab_secret_store.clone())
+                                    .await;
+                                drop(revision_guard);
+                                write.release_native_wait_lease();
+                                drop(credential_guard);
+                                if let Err(error) = write.join_native_retirement().await {
+                                    // The adopted external file remains authoritative. Keep
+                                    // any original publication error; never invent rollback.
+                                    return result.and(Err(error));
+                                }
+                                let credential_guard = services.gitlab_credential_gate.lock().await;
+                                write.restore_native_wait_lease(&credential_guard);
+                                if let Err(error) = write
+                                    .check_completed_source(
+                                        completed,
+                                        services.gitlab_secret_store.clone(),
+                                    )
+                                    .await
+                                {
+                                    return result.and(Err(error));
+                                }
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        Some(write),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                if let Ok(notice) = &result {
+                                    let _revision = services.settings_revision_gate.write().await;
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                result
+                            } else {
+                                if let Ok(notice) = &result {
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                drop(revision_guard);
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        write.as_deref(),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                result
+                            }
+                        })
+                        .await
+                })
+                .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
         let (write, result) = admission.publish(|| {
             let write = if self.gitlab_credential_gate.has_settings_boundary() {
                 credential_guard
@@ -17257,17 +17375,18 @@ impl Services {
             let result = registry.publish_repository_reload(candidate, write.as_deref());
             Ok((write, result))
         })?;
-        admission
-            .finish(async {
-                if let Ok(notice) = &result {
-                    self.apply_external_settings_change(notice).await;
-                }
-                drop(revision_guard);
-                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
-                    .await;
-                result
-            })
-            .await
+        sender
+            .send((admission, write, result, credential_guard, revision_guard))
+            .map_err(|_| {
+                Error::Internal(
+                    "settings reload completion owner unavailable; state may be unknown".into(),
+                )
+            })?;
+        task.await.map_err(|error| {
+            Error::Internal(format!(
+                "settings reload completion failed: {error}; state may be unknown"
+            ))
+        })?
     }
 
     /// Apply an **externally driven** settings change (config.toml
@@ -18181,7 +18300,9 @@ impl Services {
                 // Cancellation or a late blocking worker drops the claims as unknown.
                 if known_completion {
                     for claim in deletion_claims {
-                        claim.settle_confirmed();
+                        if claim.settle_confirmed().await.is_err() {
+                            tracing::warn!("background cleanup: original retirement completion unavailable");
+                        }
                     }
                 }
                 #[cfg(all(test, unix))]
@@ -20349,6 +20470,72 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn script_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.list")
+                .await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
+            if options.summary {
+                self.script_manager()
+                    .summary_page(&workspace_id, &options)
+                    .await
+            } else {
+                self.script_manager().list(&workspace_id).await
+            }
+        })
+    }
+    fn script_get(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_workspace_manager(&workspace_id, "script.get")
+                .await?;
+            self.script_manager().get(&workspace_id, &script_id).await
+        })
+    }
+    fn script_monitor_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
+            if options.summary {
+                self.store
+                    .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
+                    .await
+            } else {
+                self.script_monitor_list(workspace_id, agent_id).await
+            }
+        })
+    }
+    fn script_monitor_get(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let row = self
+                .store
+                .script_monitor(&workspace_id, &monitor_id)
+                .await?;
+            if owner.is_some_and(|id| id != row.agent_id) {
+                return Err(Error::InvalidParams("unknown monitor ID".into()));
+            }
+            serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))
+        })
+    }
+
     fn script_archive(
         &self,
         workspace_id: WorkspaceId,
@@ -20521,6 +20708,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.output")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -20540,6 +20728,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.status")
                 .await?;
+            mgr.ensure_known(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -25161,6 +25350,60 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn note_paging_backend_id(&self) -> Option<String> {
+        Some(self.store.note_paging_backend_id().to_owned())
+    }
+
+    fn get_note_page(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        request: intent_core::note_page::NotePageRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            let principal = match intent_core::current_caller() {
+                Some(intent_core::Caller::Wire { principal_id, .. }) => {
+                    format!("principal:{}", principal_id.0)
+                }
+                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
+                Some(intent_core::Caller::Daemon) => "daemon".into(),
+                None => return Err(Error::Forbidden("Caller required".into())),
+            };
+            let result = self
+                .store
+                .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
+                .await;
+            #[cfg(test)]
+            note_annotation::tests::pause_after_read(
+                &workspace_id,
+                note_annotation::tests::read_outcome(&result),
+            )
+            .await;
+            self.require_member(&workspace_id).await?;
+            result
+        })
+    }
+
+    fn get_note_annotation_page(
+        &self,
+        method: intent_core::note_annotation::AnnotationMethod,
+        request: intent_core::note_annotation::AnnotationReadRequest,
+        rpc_id: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_annotation_page(method, request, rpc_id))
+    }
+
+    fn get_note_page_state(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        incarnation: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
+    }
+
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -25314,8 +25557,10 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                if let Some(plan) = &reanchor_plan {
+                    plan.persist(&store, &note, expected_version, &user_version_author())
+                        .await?;
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -25328,9 +25573,6 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
-            if let Some(plan) = reanchor_plan {
-                plan.apply_orphaned(&store, &workspace_id).await?;
-            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -25804,6 +26046,31 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
+    }
+
+    fn supports_note_delete_grace(&self) -> bool {
+        true
+    }
+
+    fn schedule_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteSchedule,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_schedule(request))
+    }
+
+    fn cancel_note_delete(
+        &self,
+        request: intent_core::note_delete::NoteDeleteCancel,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
+        Box::pin(self.grace_cancel(request))
+    }
+
+    fn note_delete_status(
+        &self,
+        request: intent_core::note_delete::NoteDeleteStatus,
+    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
+        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(
@@ -26412,9 +26679,8 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                match plan.persist(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
-                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
@@ -31944,6 +32210,46 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_state_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            match captured?
+                .read(self)
+                .await
+                .map_err(|_| repository_read_source::refused())?
+            {
+                repository_read_source::ReadOutcome::Unsupported => Err(Error::Unsupported(
+                    "Addressed review monitoring unavailable".into(),
+                )),
+                repository_read_source::ReadOutcome::Github(repo) => {
+                    self.pr_state(
+                        workspace_id,
+                        request.pr_number,
+                        Some(format!("{}/{}", repo.owner, repo.name)),
+                    )
+                    .await
+                }
+                repository_read_source::ReadOutcome::Managed { target, result } => {
+                    let read = (*result).map_err(|failure| match failure.cause {
+                        pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                            pr_ops::map_sc_err(error)
+                        }
+                        _ => repository_read_source::refused(),
+                    })?;
+                    pr_ops::qualified_review_snapshot(&target, &read.value)
+                }
+            }
+        })
+    }
+
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
@@ -31971,6 +32277,11 @@ impl WorkspaceApi for Services {
                     .await
                     .map_err(|_| repository_read_source::refused())?
                 {
+                    repository_read_source::ReadOutcome::Unsupported => {
+                        return Err(Error::Unsupported(
+                            "Addressed review monitoring unavailable".into(),
+                        ));
+                    }
                     repository_read_source::ReadOutcome::Github(repo) => repo,
                     repository_read_source::ReadOutcome::Managed { target, result } => {
                         let read = (*result).map_err(|failure| match failure.cause {
@@ -34468,11 +34779,16 @@ impl WorkspaceApi for Services {
             let walked = tokio::task::spawn_blocking(move || -> Result<_> {
                 // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
                 let boundary_started = std::time::Instant::now();
-                let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                    &worktree,
-                    base_ref.as_deref(),
-                    base_commit_sha.as_deref(),
-                )?;
+                let snapshot = accept_changes::history_refresh_snapshot(&worktree, &ws);
+                let boundary_sha = if let Some(snapshot) = &snapshot {
+                    snapshot.history.boundary.map(|oid| oid.to_string())
+                } else {
+                    intent_git::history::resolve_workspace_boundary(
+                        &worktree,
+                        base_ref.as_deref(),
+                        base_commit_sha.as_deref(),
+                    )?
+                };
                 let boundary_ms =
                     u64::try_from(boundary_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -34487,21 +34803,41 @@ impl WorkspaceApi for Services {
                 // Metadata-only walk (`include_files = false`): the list
                 // payload skips the O(commits) per-commit tree diff; the FE
                 // fetches per-file data on demand via `git.commitDetails`.
-                let commits = intent_git::history::history_bounded(
-                    &worktree,
-                    boundary_sha.as_deref(),
-                    fetch,
-                    include_older,
-                    false,
-                )?;
+                // Never label a live-ref walk with a separately observed token:
+                // refs can move A -> B -> A between push and response.
+                let commits = if let Some(snapshot) = &snapshot {
+                    intent_git::history::history_bounded_snapshot(
+                        &worktree,
+                        &snapshot.history,
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                } else {
+                    intent_git::history::history_bounded(
+                        &worktree,
+                        boundary_sha.as_deref(),
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                };
+                let history_identity = snapshot.map(|snapshot| snapshot.identity);
                 let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+                Ok(Some((
+                    boundary_sha,
+                    boundary_ms,
+                    commits,
+                    walk_ms,
+                    history_identity,
+                )))
             })
             .await
             .map_err(|e| {
                 Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
             })??;
-            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
+            let Some((boundary_sha, boundary_ms, commits, walk_ms, history_identity)) = walked
+            else {
                 return Ok(empty);
             };
             let has_more = commits.len() > page_end;
@@ -34531,11 +34867,15 @@ impl WorkspaceApi for Services {
                 Some(sha) => serde_json::Value::String(sha),
                 None => serde_json::Value::Null,
             };
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "commits": values,
                 "nextToken": next_token,
                 "boundarySha": boundary_value
-            }))
+            });
+            if let Some(identity) = history_identity {
+                result["historyIdentity"] = serde_json::Value::String(identity);
+            }
+            Ok(result)
         })
     }
 
@@ -35172,7 +35512,51 @@ impl WorkspaceApi for Services {
         })
     }
 
-    /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
+    fn pr_monitor_start_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_start_op(
+                &workspace_id,
+                &agent_id,
+                request.pr_number,
+                captured?,
+                retained,
+            )
+            .await
+        })
+    }
+
+    fn pr_monitor_stop_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_stop_op(&workspace_id, &agent_id, request.pr_number, captured?)
+                .await
+        })
+    }
+
+    /// Explicit legacy GitHub calls retain their original producer. Omission
+    /// resolves the selected original root before choosing a provider.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,
@@ -35180,14 +35564,28 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+            if let Some(captured) = captured {
+                self.review_monitor_start_op(
+                    &workspace_id,
+                    &agent_id,
+                    pr_number,
+                    captured,
+                    retained,
+                )
                 .await
+            } else {
+                self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 
-    /// `ws.pr.unmonitor`: cancel the caller's own monitor on a PR.
     fn pr_monitor_stop(
         &self,
         workspace_id: WorkspaceId,
@@ -35195,10 +35593,18 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
-                .await
+            if let Some(captured) = captured {
+                self.review_monitor_stop_op(&workspace_id, &agent_id, pr_number, captured)
+                    .await
+            } else {
+                self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 
@@ -35212,6 +35618,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // See `hook_list`: gate the workspace, not the optional filter.
             self.require_member(&workspace_id).await?;
+            if let Some(value) =
+                repository_native_wire::monitor::list(self, &workspace_id, agent_id.as_ref())
+                    .await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
                 .await
         })
@@ -35226,6 +35638,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "prMonitor.cancel")
                 .await?;
+            if let Some(value) =
+                repository_native_wire::monitor::cancel(self, &workspace_id, &monitor_id).await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
                 .await
         })
@@ -38173,12 +38590,22 @@ pub(crate) mod setup_runner {
     }
 }
 
+// Retained by the settings supervisor before any effect; caller cancellation
+// cannot abandon the original write or its deferred publication.
+#[derive(Default)]
+struct SettingsNativeCompletion {
+    write: Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+    settlement: Option<(bool, bool)>,
+    event: Option<(Vec<serde_json::Value>, u64)>,
+}
+
 impl Services {
     async fn settings_update_owned(
         &self,
         changes: serde_json::Value,
         is_tcp: bool,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         /// Which store a captured old value belongs to, so the rollback
         /// path restores it through the same seam that persisted it.
@@ -38239,6 +38666,7 @@ impl Services {
         self.settings_service().validate_update(&changes)?;
         let repository_write =
             self.prepare_gitlab_repository_settings(&changes, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let settings = self
             .settings_service()
             .with_repository_write(repository_write.clone());
@@ -38247,7 +38675,8 @@ impl Services {
             let secrets = match settings.update_secrets(&changes).await {
                 Ok(secrets) => secrets,
                 Err(error) => {
-                    self.settle_gitlab_repository_settings(
+                    self.settle_settings_before_native_completion(
+                        native,
                         repository_write.as_deref(),
                         false,
                         false,
@@ -38541,12 +38970,12 @@ impl Services {
                     }
                     self.include_ws_port_assignment(port_was_unassigned, &mut applied);
                     let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        settings_changed_event(&applied, revision),
-                    )
-                    .await;
-                    self.on_settings_applied(&applied);
+                    if repository_write.as_deref().is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+                        native.lock().unwrap().event = Some((applied.clone(), revision));
+                    } else {
+                        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                        self.on_settings_applied(&applied);
+                    }
                     return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
                 }
                 Ok(serde_json::json!({
@@ -38560,7 +38989,8 @@ impl Services {
         drop(revision_guard);
         if let Err(error) = result {
             let rollback_incomplete = !secrets_compensated && secrets.rollback(&self.secrets).await;
-            self.settle_gitlab_repository_settings(
+            self.settle_settings_before_native_completion(
+                native,
                 repository_write.as_deref(),
                 compensation_complete && !rollback_incomplete,
                 true,
@@ -38573,8 +39003,13 @@ impl Services {
             }
             return Err(error);
         }
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         result
     }
 
@@ -38582,6 +39017,7 @@ impl Services {
         &self,
         path: String,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         Self::require_administrator("settings.reset")?;
         // Same serialization and lock order as `settings.update`
@@ -38595,6 +39031,7 @@ impl Services {
             Some(self.settings_revision_gate.write().await)
         };
         let repository_write = self.prepare_gitlab_repository_reset(&path, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let reset = self
             .settings_service()
             .with_repository_write(repository_write.clone())
@@ -38604,8 +39041,13 @@ impl Services {
             Ok(result) => result,
             Err(error) => {
                 drop(revision_guard);
-                self.settle_gitlab_repository_settings(repository_write.as_deref(), false, false)
-                    .await;
+                self.settle_settings_before_native_completion(
+                    native,
+                    repository_write.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -38614,22 +39056,49 @@ impl Services {
         }
         let revision = if changed {
             let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-            publish_event(
-                self.event_bus.as_ref(),
-                settings_changed_event(std::slice::from_ref(&result), revision),
-            )
-            .await;
-            self.on_settings_applied(std::slice::from_ref(&result));
+            if repository_write
+                .as_deref()
+                .is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending)
+            {
+                native.lock().unwrap().event = Some((vec![result.clone()], revision));
+            } else {
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(std::slice::from_ref(&result), revision),
+                )
+                .await;
+                self.on_settings_applied(std::slice::from_ref(&result));
+            }
             revision
         } else {
             self.settings_revision.load(Ordering::SeqCst)
         };
         drop(revision_guard);
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         let mut result = result;
         result["revision"] = serde_json::json!(revision);
         Ok(result)
+    }
+
+    async fn settle_settings_before_native_completion(
+        &self,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
+        write: Option<&source_control_auth_ops::repository_owner::RepositorySettingsWrite>,
+        settled: bool,
+        compensated: bool,
+    ) {
+        if write.is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+            native.lock().unwrap().settlement = Some((settled, compensated));
+        } else {
+            self.settle_gitlab_repository_settings(write, settled, compensated)
+                .await;
+        }
     }
 
     async fn owned_settings_mutation(
@@ -38656,31 +39125,96 @@ impl Services {
             operation.primary_auth_admitted = true;
             let primary = reset.as_deref().is_some_and(|path| path.starts_with("sourceControl.gitlab."))
                 || Self::repository_settings_relevant(&changes);
-            let credential_guard = if primary {
+            let mut credential_guard = if primary {
                 Some(Arc::new(operation.gitlab_credential_gate.lock().await))
             } else { None };
-            let paths: Vec<&str> = match &reset {
-                Some(path) => vec![path.as_str()],
-                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str)).collect(),
+            let paths: Vec<String> = match &reset {
+                Some(path) => vec![path.clone()],
+                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str).map(str::to_owned)).collect(),
             };
-            let _account_guards = operation.settings_secret_gates.write(&paths).await;
+            let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+            let native = Arc::new(std::sync::Mutex::new(SettingsNativeCompletion::default()));
+            let worker_native = native.clone();
             // The supervisor, not the fallible algorithm, owns these guards.
             // A panic becomes an unknown failure, then actual writes still
             // settle before another same-account operation can proceed.
             let worker = operation.clone();
             let worker_credential = credential_guard.clone();
-            let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
-                intent_core::caller::with_wire_credential(credential, async move {
+            let mut result = intent_core::spawn_daemon(intent_core::with_caller(caller.clone(),
+                intent_core::caller::with_wire_credential(credential.clone(), async move {
                     match reset {
-                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref()).await,
-                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref()).await,
+                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref(), &worker_native).await,
+                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref(), &worker_native).await,
                     }
                 })
             )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));
+            intent_core::with_caller(caller, intent_core::caller::with_wire_credential(credential, async {
+            let (original, deferred) = {
+                let state = native.lock().unwrap();
+                (state.write.clone(), state.settlement.is_some() || state.event.is_some())
+            };
+            if let Some(write) = original.filter(|write| deferred || write.native_retirement_pending()) {
+                // Complete actual persistence first, then release every physical
+                // guard. The original logical mutation stays retained in native.
+                operation.secrets.finish_operation().await;
+                let completed = write.completed_source(operation.gitlab_secret_store.clone()).await;
+                write.release_native_wait_lease();
+                drop(account_guards.take());
+                drop(credential_guard.take());
+                if let Err(error) = write.join_native_retirement().await {
+                    if result.is_ok() { result = Err(error); }
+                } else {
+                        credential_guard = Some(Arc::new(operation.gitlab_credential_gate.lock().await));
+                        account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+                        write.restore_native_wait_lease(credential_guard.as_deref().unwrap());
+                        let current = write.check_completed_source(completed, operation.gitlab_secret_store.clone()).await;
+                        if current.is_ok() {
+                            let (settled, compensated) = native.lock().unwrap().settlement.unwrap_or((false, false));
+                            operation.settle_gitlab_repository_settings(Some(&write), settled, compensated).await;
+                        } else if result.is_ok() {
+                            result = current.map(|()| serde_json::Value::Null);
+                        }
+                        let event = native.lock().unwrap().event.take();
+                        if let (Ok(response), Some((applied, _persisted_revision))) = (&mut result, event) {
+                            let _revision = operation.settings_revision_gate.write().await;
+                            // A later update may have superseded overlapping keys
+                            // while native retirement was held. Project the current
+                            // wire values for this batch's paths under the revision
+                            // gate, without reapplying its persisted values.
+                            let current = async {
+                                let settings = operation.settings_service();
+                                let mut current = Vec::with_capacity(applied.len());
+                                for entry in &applied {
+                                    let path = entry["path"].as_str().ok_or_else(|| Error::Internal("settings completion path unavailable".into()))?;
+                                    current.push(settings.completion_value(path).await?);
+                                }
+                                Ok::<_, Error>(current)
+                            }.await;
+                            match current {
+                                Ok(applied) => {
+                                    let revision = operation.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if response.get("applied").is_some() {
+                                        response["applied"] = serde_json::json!(applied);
+                                    } else if let Some(reset) = applied.first() {
+                                        *response = reset.clone();
+                                    }
+                                    response["revision"] = serde_json::json!(revision);
+                                    publish_event(operation.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                                    operation.on_settings_applied(&applied);
+                                }
+                                Err(error) => result = Err(error),
+                            }
+                        }
+                }
+            }
+            })).await;
             let _ = response.send(result);
             // Caller caps and unknown-state response are preserved. This tail
             // never resumes skipped work or blindly restores after that error.
             operation.secrets.finish_operation().await;
+            drop(account_guards);
+            drop(credential_guard);
         }).is_none() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }

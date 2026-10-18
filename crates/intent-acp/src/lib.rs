@@ -28,6 +28,7 @@ pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
 pub mod permission;
+pub mod review_monitoring;
 pub mod session;
 pub mod spawn;
 pub mod terminal;
@@ -52,6 +53,7 @@ pub use mcp_config::{
 };
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
+pub use mcp_server::bindings_prelude_for_workspace;
 pub use mcp_server::{
     make_workspace_host_for_bridge, SpecialistModelOption, SpecialistModelOptions,
     WorkspaceMcpServer, MCP_PROTOCOL_VERSION, WORKSPACE_API_SYSTEM_PROMPT_HEADING,

@@ -365,6 +365,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         read_lane: Mutex::new(None),
         subscriptions: Mutex::new(subscriptions),
         queued_query: None,
+        monitor_receipt: c.monitor.capture(),
     });
     let request = Arc::new_cyclic(|weak| Request {
         base,

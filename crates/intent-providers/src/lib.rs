@@ -22,6 +22,7 @@ fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
+pub mod adapter_cli;
 pub mod antigravity;
 pub mod args;
 pub mod checkpoint;

@@ -25,9 +25,12 @@ impl Hold {
         self.release.acquire().await.unwrap().forget();
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(Duration::from_secs(15), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            crate::test_support::fixture_timeout(Duration::from_secs(15)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn resume(&self) {
         self.release.add_permits(1);
@@ -142,7 +145,7 @@ pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
         .unwrap();
     let mut line = String::new();
     tokio::time::timeout(
-        Duration::from_secs(15),
+        crate::test_support::fixture_timeout(Duration::from_secs(15)),
         BufReader::new(stream).read_line(&mut line),
     )
     .await
@@ -867,7 +870,8 @@ async fn context_output_original_missing_settings_attachment_omits_after_late_in
     .unwrap();
     let owner = RepositoryContextOwner::bind(
         service.clone(),
-        RepositoryReadOwner::capture(service.clone()),
+        RepositoryReadOwner::capture(service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &physical,
     )
     .unwrap();
@@ -1473,5 +1477,131 @@ async fn manager_prompt_output_final_construction_poll_and_consumed_packet_never
         .await;
         f.owner.drain_jobs().await;
         assert_eq!(http.count(), 0);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_guidance_current_context_continuation_preserves_saved_session() {
+    fn delivered_targets(reply: &Value) -> Vec<Value> {
+        let texts = reply["result"]["content"].as_array().unwrap();
+        let guidance: Vec<_> = texts
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .filter_map(|text| text.split_once(FACTS).map(|(_, facts)| facts))
+            .collect();
+        assert_eq!(
+            guidance.len(),
+            1,
+            "one delivered repository context: {reply}"
+        );
+        guidance[0]
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|row| row["targets"].as_array().cloned())
+            .flatten()
+            .collect()
+    }
+    for version in ["3.0", "3.1", "3.2"] {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::with_version(&http, version).await;
+        let store = &f.base.auth.service.store;
+        let original = store.get_agent_session(&f.session.id).await.unwrap();
+        let first = tcp(f.server(), "return 41;").await;
+        let first_targets = delivered_targets(&first);
+        assert_eq!(first_targets.len(), 1);
+        let original_target = &first_targets[0];
+        assert_eq!(
+            original_target["target"],
+            serde_json::json!({
+                "provider":"gitlab",
+                "instanceBaseUrl":http.fixture.descriptor.instance().as_str(),
+                "projectPath":"group/project"
+            })
+        );
+        assert_eq!(original_target["availability"], "connected");
+        assert!(original_target["connection"].is_object());
+        for operation in ["read-review", "read-issue"] {
+            let capabilities: Vec<_> = original_target["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|capability| capability["operation"] == operation)
+                .collect();
+            assert_eq!(
+                capabilities,
+                vec![&serde_json::json!({"operation":operation,"state":"unknown"})]
+            );
+        }
+        let first_text = first.to_string();
+        assert!(first_text.contains("group/project"), "{first}");
+        assert_eq!(
+            first_text.contains("Qualified monitoring is prepared but production-disabled"),
+            version == "3.2"
+        );
+        f.base.git.git(
+            &f.base.git.path,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/team/continued.git",
+            ],
+        );
+        let next = tcp(f.server(), "return 42;").await;
+        let next_text = next.to_string();
+        assert!(next_text.contains("team/continued"), "{next}");
+        assert!(!next_text.contains("group/project"), "{next}");
+        let next_targets = delivered_targets(&next);
+        assert_eq!(next_targets.len(), 1);
+        let continued_target = &next_targets[0];
+        assert_eq!(
+            continued_target["target"],
+            serde_json::json!({
+                "provider":"github",
+                "instanceBaseUrl":"https://github.com",
+                "projectPath":"team/continued"
+            })
+        );
+        assert_eq!(continued_target["availability"], "unknown");
+        assert!(continued_target.get("connection").is_none());
+        let expected_capabilities: Vec<_> = [
+            "read-review",
+            "read-issue",
+            "create-review",
+            "clone",
+            "fetch",
+            "push",
+        ]
+        .into_iter()
+        .map(|operation| serde_json::json!({"operation":operation,"state":"unknown"}))
+        .collect();
+        assert_eq!(
+            continued_target["capabilities"],
+            serde_json::json!(expected_capabilities)
+        );
+        assert_eq!(
+            next_text.contains(
+                "Existing watches and restored history keep their original target and account"
+            ),
+            version == "3.2"
+        );
+        let caller = Caller::Agent {
+            agent_id: f.session.id.clone(),
+        };
+        let capture = f.prompt_capture().await;
+        let continuation = intent_core::with_caller(caller.clone(), capture.prepare()).await;
+        assert!(continuation.is_some());
+        let (frame, ok) =
+            intent_core::with_caller(caller, prompt_exchange(continuation, false)).await;
+        assert!(ok);
+        assert!(frame.to_string().contains("team/continued"));
+        assert!(!frame.to_string().contains("group/project"));
+        let saved = store.get_agent_session(&f.session.id).await.unwrap();
+        assert_eq!(saved.harness_version, original.harness_version);
+        assert_eq!(saved.harness_features, original.harness_features);
+        assert_eq!(saved.acp_session_id, original.acp_session_id);
+        assert_eq!(http.count(), 0, "context guidance does not poll the forge");
+        f.owner.drain_jobs().await;
     }
 }

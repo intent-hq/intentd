@@ -22,6 +22,7 @@ use intent_providers::{auth_error_message, is_provider_authentication_error, Pro
 
 use crate::callback_registration::{CallbackClient, CallbackHandshake, CallbackOffer, META_KEY};
 use crate::error::{AcpError, AcpResult};
+use crate::review_monitoring::{Generation, ReviewMonitoringOffer};
 use crate::transport::Connection;
 
 /// Client name advertised to agents in `clientInfo`.
@@ -101,9 +102,28 @@ pub async fn handshake_with_callbacks(
     provider: &ProviderConfig,
     offer: CallbackOffer,
 ) -> AcpResult<CallbackHandshake> {
-    let initialize = initialize_with_offer(&conn, offer).await?;
+    handshake_with_review_monitoring(conn, provider, offer, ReviewMonitoringOffer::Disabled).await
+}
+
+/// Explicitly negotiate monitor recipient support on this original connection.
+/// Default product callers continue to use the ordinary disabled wrapper.
+///
+/// # Errors
+/// Propagates the unchanged initialization and authentication errors.
+pub async fn handshake_with_review_monitoring(
+    conn: Arc<Connection>,
+    provider: &ProviderConfig,
+    offer: CallbackOffer,
+    monitoring: ReviewMonitoringOffer,
+) -> AcpResult<CallbackHandshake> {
+    let (initialize, generation) = initialize_with_offers(&conn, offer, monitoring).await?;
     let authenticated = authenticate(&conn, provider).await?;
-    let callbacks = CallbackClient::negotiated(conn, offer, initialize.meta.as_ref());
+    let generation = (offer == CallbackOffer::V1
+        && monitoring == ReviewMonitoringOffer::V1
+        && generation.current()
+        && crate::review_monitoring::supported(initialize.meta.as_ref()))
+    .then_some(generation);
+    let callbacks = CallbackClient::negotiated(conn, offer, initialize.meta.as_ref(), generation);
     Ok(CallbackHandshake {
         ordinary: HandshakeResult {
             initialize,
@@ -126,6 +146,16 @@ async fn initialize_with_offer(
     conn: &Connection,
     offer: CallbackOffer,
 ) -> AcpResult<InitializeResponse> {
+    initialize_with_offers(conn, offer, ReviewMonitoringOffer::Disabled)
+        .await
+        .map(|(result, _)| result)
+}
+
+async fn initialize_with_offers(
+    conn: &Connection,
+    offer: CallbackOffer,
+    monitoring: ReviewMonitoringOffer,
+) -> AcpResult<(InitializeResponse, Arc<Generation>)> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
             ClientCapabilities::new()
@@ -141,11 +171,16 @@ async fn initialize_with_offer(
     if offer == CallbackOffer::V1 {
         params["clientCapabilities"]["_meta"] = serde_json::json!({META_KEY: {"version": 1}});
     }
-    let result = conn
-        .request_timeout("initialize", params, initialize_timeout())
+    if offer == CallbackOffer::V1 && monitoring == ReviewMonitoringOffer::V1 {
+        params["clientCapabilities"]["_meta"][crate::review_monitoring::META_KEY] =
+            serde_json::json!(1);
+    }
+    let (result, generation) = conn
+        .initialize_recipient(params, initialize_timeout())
         .await?;
-    serde_json::from_value(result)
-        .map_err(|e| AcpError::Protocol(format!("invalid initialize response: {e}")))
+    let response = serde_json::from_value(result)
+        .map_err(|e| AcpError::Protocol(format!("invalid initialize response: {e}")))?;
+    Ok((response, generation))
 }
 
 /// Conditionally send `authenticate` (§6.4.2).

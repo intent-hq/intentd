@@ -7,9 +7,19 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+#[path = "wss_integration/annotation_comment_writers.rs"]
+mod annotation_comment_writers;
+#[path = "wss_integration/annotation_pages.rs"]
+mod annotation_pages;
+#[path = "wss_integration/annotation_reads.rs"]
+mod annotation_reads;
+#[path = "wss_integration/annotation_writer_anchors.rs"]
+mod annotation_writer_anchors;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/demand_note_indexes.rs"]
+mod demand_note_indexes;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
 #[path = "wss_integration/git_commit_removal.rs"]
@@ -40,6 +50,9 @@ mod script_lifecycle;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[cfg(all(unix, debug_assertions))]
+#[path = "wss_integration/startup.rs"]
+mod startup;
 #[path = "wss_integration/task_list_latency.rs"]
 mod task_list_latency;
 #[cfg(unix)]
@@ -6396,14 +6409,6 @@ impl SystemControl for BusyDaemonControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Ok(())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,
@@ -15382,6 +15387,11 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     .await;
     let result = &resp["result"];
     assert_eq!(result["branch"], "feature/wss");
+    assert!(result["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(result["gitStatus"]["branch"], "feature/wss");
+    assert_eq!(result["gitStatus"]["files"], serde_json::json!([]));
     assert_eq!(result["trunkBranch"], "main");
     assert_eq!(result["hasRemote"], false);
     assert_eq!(result["aheadOfTrunk"], 1);
@@ -15398,6 +15408,63 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     // Metadata-only walk: no per-commit tree diffs in getStatus.
     assert!(c.get("files").is_none());
     assert!(c.get("filesChanged").is_none());
+
+    // A real WSS subscriber receives the same additive snapshot after a
+    // mutation. Adding a remote is network-free and does not change history.
+    let mut subscriber = connect_ws(srv.port, srv.cfg.clone()).await;
+    subscriber
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc":"2.0", "id":10, "method":"events.subscribe",
+                "params":{"workspaceId":ws_id,"eventTypes":["changes:git-status"]}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == 10 {
+                    assert!(response["result"]["subscriptionId"].is_string());
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let added = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":11, "method":"accept-changes.addRemote",
+            "params":{"workspaceId":ws_id,"remoteUrl":"https://github.com/example/history.git"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        added["result"]["historyIdentity"],
+        result["historyIdentity"]
+    );
+    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["method"] == "events.event"
+                    && event["params"]["event"]["type"] == "changes:git-status"
+                {
+                    break event["params"]["event"]["data"]["status"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pushed, added["result"]);
 
     srv.ws.stop().await;
 }
@@ -15467,6 +15534,23 @@ async fn wss_file_tracking_load_commits_bounded() {
         ),
     )
     .await;
+    assert!(resp["result"]["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":20, "method":"accept-changes.getStatus",
+            "params":{"workspaceId":ws_id}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["historyIdentity"],
+        status["result"]["historyIdentity"]
+    );
     assert!(
         resp["result"]["commits"].is_array(),
         "commits field: {resp}"
@@ -22466,14 +22550,6 @@ impl SystemControl for WatchHealthControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Err("not supported in this test".to_string())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,

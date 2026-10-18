@@ -124,7 +124,7 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
   ]
 }
 
-// With the companion frontend update (pending release), a fresh visible agent
+// With the companion frontend update (available in prereleases), a fresh visible agent
 // tab goes immediately behind the current panel's active tab. Content, keyboard
 // focus, and forward history stay intact. Use a different URL here to avoid
 // reusing the hidden tab above; visible: true does not reveal a dedupe hit.
@@ -145,8 +145,8 @@ usable (screenshot / evaluate / navigate) without appearing in the user's panel 
 
 The accompanying chat UI shows successful opens with a tab ID and URL as a
 **Browsing localhost:5173** badge. Clicking it reveals that existing tab, including
-a hidden tab; it does not open a duplicate. The badge requires the companion
-frontend release. `result.url` is the resolved URL used for the open, before any
+a hidden tab; it does not open a duplicate. The badge is available in frontend
+prerelease builds with this update. `result.url` is the resolved URL used for the open, before any
 page redirect; URL rewrites still carry their existing `requestedUrl` / `finalUrl`
 echoes. Older frontend results may omit `url` on fresh opens.
 

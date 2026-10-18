@@ -183,15 +183,19 @@ async fn offline_addition_notifies_guest(cached: bool) {
     }
     let retained = store.list_workspace_members(&wid).await.unwrap();
     let mut guest_rpc = connect_ws(host.port, host.cfg.clone(), &remaining_token).await;
-    result(
+    let hello = result(
         &wss_rpc(
             &mut guest_rpc,
             883,
             "client.hello",
-            json!({"clientId":"remaining-guest"}),
+            json!({"clientId":"remaining-guest","capabilities":{"workspaceMembershipEvents":false}}),
         )
         .await,
         883,
+    );
+    assert_eq!(
+        hello["server"]["capabilities"]["workspaceMembershipEvents"],
+        1
     );
     let mut subscriber = connect_ws(host.port, host.cfg.clone(), &remaining_token).await;
     result(
@@ -354,6 +358,18 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let events = events_through_marker(&mut owner, &mut subscriber, &workspace, "Added").await;
     assert_scoped(&events, &workspace);
+    let invalidations: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "workspace:updated" && event["data"]["changes"]["members"] == true
+        })
+        .collect();
+    assert_eq!(
+        invalidations.len(),
+        1,
+        "offline promotion must invalidate membership: {events:?}"
+    );
+    assert_eq!(invalidations[0]["data"]["workspaceId"], workspace);
     let presence: Vec<_> = events
         .iter()
         .filter(|event| event["type"] == "presence:changed")
@@ -419,7 +435,10 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let noop = events_through_marker(&mut owner, &mut subscriber, &workspace, "Unchanged").await;
     assert_scoped(&noop, &workspace);
-    assert!(noop.iter().all(|event| event["type"] != "presence:changed"));
+    assert!(noop
+        .iter()
+        .all(|event| event["type"] != "presence:changed"
+            && event["data"]["changes"]["members"] != true));
 
     if let Some((mut lease, subscription)) = cached_lease {
         result(
@@ -475,6 +494,12 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let removed = events_through_marker(&mut owner, &mut subscriber, &workspace, "Removed").await;
     assert_scoped(&removed, &workspace);
+    assert!(removed
+        .iter()
+        .any(|event| event["type"] == "workspace:updated"
+            && event["data"]["changes"]["members"] == true
+            && event["data"]["changes"]["removedPrincipalId"] == person.id.0
+            && event["data"]["changes"]["memberCount"] == 2));
     assert!(removed
         .iter()
         .any(|event| event["type"] == "presence:changed"));

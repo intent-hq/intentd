@@ -27,8 +27,6 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
 pub(crate) const CLEAR_NOTE_PARENT_BATCH_SQL: &str =
     "UPDATE note SET parent_id = NULL WHERE rowid IN \
     (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)";
-pub(crate) const DELETE_NOTE_COMMENT_BATCH_SQL: &str = "DELETE FROM comment WHERE rowid IN \
-    (SELECT rowid FROM comment WHERE workspace_id = ? AND note_id IS NOT NULL LIMIT ?)";
 pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
     "DELETE FROM browser_tab WHERE rowid IN \
     (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
@@ -252,7 +250,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -379,7 +377,7 @@ impl Store {
         .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         match row {
             Some(row) => col(&row, "branch"),
             None => Err(Error::NotFound(format!("workspace {}", ws.id))),
@@ -422,7 +420,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() != 0)
     }
 
@@ -835,7 +833,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
         if res.rows_affected() > 0 {
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             return Ok(true);
         }
         // Zero rows: either the row is already active (no flip) or the
@@ -851,7 +849,7 @@ impl Store {
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(false)
     }
 
@@ -1040,27 +1038,15 @@ impl Store {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
 
-        // A note's parent-clear trigger can otherwise update every child in
-        // one statement. Clear the links first, then sweep its heavy children
-        // before the notes themselves. All predicates remain workspace-scoped.
-        delete_in_bounded_batches(
-            self.write_pool(),
-            CLEAR_NOTE_PARENT_BATCH_SQL,
-            &id.0,
-            DELETE_CASCADE_BATCH,
-        )
-        .await?;
-        // Partial indexes contain only remaining parent links and note-bound
-        // comments, so batches do not rescan processed notes or no-note rows.
-        // Preserve comments with no note (no cascade before).
-        delete_in_bounded_batches(
-            self.write_pool(),
-            DELETE_NOTE_COMMENT_BATCH_SQL,
-            &id.0,
-            DELETE_CASCADE_BATCH,
-        )
-        .await?;
+        // Publish a durable retirement fence only after bounded parent clears
+        // and an atomic final parent-link check. Drain annotation fan-out in
+        // separately limited statements before canonical parent deletion.
+        crate::workspace_annotation_cleanup::drain(self, &id.0).await?;
         for table in [
+            // Derived page rows can greatly outnumber notes; do not leave them
+            // to a single note/head foreign-key cascade.
+            "note_page_entry",
+            "note_page_piece",
             "note_version",
             "note_line_attribution",
             "note",
@@ -1126,7 +1112,7 @@ impl Store {
                 // completed. Preserve this fact even if ticket settlement panics.
                 committed.store(true, std::sync::atomic::Ordering::Release);
             }
-            lifecycle.finish(result)
+            lifecycle.finish(result).await
         })
         .await
         .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?

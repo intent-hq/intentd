@@ -75,14 +75,14 @@ impl tracing::Subscriber for LifecycleCapture {
 /// `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
         let dir = crate::test_support::test_tempdir("intentd-agent-");
         let path = dir.path().join("agent.db");
-        Self { path, _dir: dir }
+        Self { path, dir }
     }
 }
 
@@ -677,6 +677,20 @@ where
                 continue;
             };
             seen.lock().unwrap().push(value.clone());
+            if method == "session/prompt" {
+                if let Some(title) = value["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .and_then(|text| text.strip_prefix("/rename "))
+                {
+                    let note = json!({"jsonrpc":"2.0", "method":"session/update",
+                        "params":{"sessionId":value["params"]["sessionId"],
+                            "update":{"sessionUpdate":"session_info_update", "title":title.trim()}}});
+                    write
+                        .write_all(format!("{note}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
             let result = match method {
                 "initialize" => {
                     json!({ "protocolVersion": 1, "agentCapabilities": { "loadSession": true } })
@@ -10533,6 +10547,59 @@ fn is_acp_auth_required_classifies_variants() {
     )));
 }
 
+#[test]
+fn claude_expired_oauth_maps_startup_errors_to_login_remedy() {
+    use intent_acp::{AcpError, JsonRpcError};
+
+    struct ClearClaudeAuth;
+    impl Drop for ClearClaudeAuth {
+        fn drop(&mut self) {
+            crate::provider_auth::seed_auth_verdict_for_tests("claude-code", None);
+        }
+    }
+    let _cleanup = ClearClaudeAuth;
+    for context in ["session/new", "session/load"] {
+        crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(true));
+        let error = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed".into(),
+            data: Some(json!({"errorKind": "authentication_failed"})),
+        });
+        let mapped = super::map_acp_session_error(context, &error, "claude-code");
+        let expected = format!(
+            "{context}: {}",
+            crate::provider_auth::not_authenticated_message("claude-code")
+        );
+        assert!(expected.contains("claude auth login"), "{expected}");
+        assert!(
+            matches!(mapped, intent_core::Error::InvalidParams(ref message) if message == &expected),
+            "{mapped:?}"
+        );
+        assert_eq!(
+            crate::provider_auth::cached_auth_verdict("claude-code"),
+            Some(false)
+        );
+    }
+}
+
+#[test]
+fn auth_looking_error_data_does_not_classify_unrelated_rpc_errors() {
+    use intent_acp::{AcpError, JsonRpcError};
+
+    for data in [
+        json!({"errorKind": "authentication_failed"}),
+        json!({"output": "Unauthorized 401: OAuth session expired and could not be refreshed"}),
+        json!("Failed to authenticate: OAuth session expired and could not be refreshed"),
+    ] {
+        let error = AcpError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(data),
+        });
+        assert!(!super::is_acp_auth_required(&error), "{error:?}");
+    }
+}
+
 /// [`super::map_acp_session_error`] (intent-hq/intent#3941): an
 /// auth-required ACP failure maps to the same actionable
 /// `Error::InvalidParams` login message the create/delegate gate emits AND
@@ -10902,3 +10969,6 @@ async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
         json!({ "workspace-asset://ws-1/a.png": { "width": 20, "height": 10 } })
     );
 }
+
+#[path = "review_startup_tests.rs"]
+mod review_startup_tests;

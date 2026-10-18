@@ -51,10 +51,10 @@ fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Chil
     cmd.spawn().expect("spawn intentd serve")
 }
 
-async fn await_socket(socket: &PathBuf) -> bool {
+async fn await_socket(socket: &std::path::Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

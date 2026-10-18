@@ -54,6 +54,11 @@ use crate::Services;
 #[cfg(test)]
 mod host_role_tests;
 
+#[cfg(test)]
+pub(crate) fn reran_unarmed(test: &str) -> bool {
+    tests::reran_unarmed(test)
+}
+
 /// The log line an unbound gate evaluation emits (once per gate per process).
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
 

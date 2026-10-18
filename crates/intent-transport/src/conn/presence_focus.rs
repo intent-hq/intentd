@@ -112,7 +112,7 @@ async fn forward(
             if previous.as_ref() == Some(&snapshot) {
                 drop(permit);
             } else {
-                permit.send(subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot));
+                permit.send(subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot).into());
                 seq += 1;
                 previous = Some(snapshot);
             }
@@ -196,6 +196,7 @@ mod tests {
                 priority,
                 bulk,
                 shutdown: None,
+                recovery: crate::conn::recovery::Output::default(),
             },
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), api.entered.notified())
@@ -280,6 +281,7 @@ mod tests {
                     priority,
                     bulk,
                     shutdown: None,
+                    recovery: crate::conn::recovery::Output::default(),
                 },
             ));
             let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())

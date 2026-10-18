@@ -2,6 +2,189 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.6] - 2026-10-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Updated the following local packages: intent-core, intent-core, intent-git, intent-js, intent-providers, intent-providers, intent-acp, intent-acp, intent-context, intent-linear, intent-sentry, intent-sourcecontrol, intent-sourcecontrol, intent-store, intent-store, intent-services, intent-services, intent-transport
+
+
+## [0.11.5] - 2026-10-17
+
+
+## [0.11.4] - 2026-10-17
+
+### 🚀 Features
+
+- *(acp)* Clone sibling proposals from a GitHub origin ([#2452](https://github.com/intent-hq/intentd/pull/2452))
+
+
+## [0.11.3] - 2026-10-17
+
+### 🧪 Testing
+
+- Synchronize retirement fixture progress and ordering ([#2448](https://github.com/intent-hq/intentd/pull/2448))
+
+
+## [0.11.2] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Recover shell credentials for Claude auth checks ([#2445](https://github.com/intent-hq/intentd/pull/2445))
+- Surface generic event loss with ordered recovery fences ([#2404](https://github.com/intent-hq/intentd/pull/2404))
+
+
+## [0.11.1] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Restore legacy PR monitor visibility on re-registration ([#2441](https://github.com/intent-hq/intentd/pull/2441))
+
+
+## [0.11.0] - 2026-10-16
+
+### 🔧 Refactor
+
+- [**breaking**] Retire legacy workspace importer ([#1630](https://github.com/intent-hq/intentd/pull/1630))
+
+
+## [0.10.50] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Preserve unfinished PRs in workspace summaries ([#2435](https://github.com/intent-hq/intentd/pull/2435))
+
+
+## [0.10.49] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Keep Home PR queue status synchronized ([#2416](https://github.com/intent-hq/intentd/pull/2416))
+- Show login guidance for expired Claude OAuth sessions ([#2420](https://github.com/intent-hq/intentd/pull/2420))
+- Report protected daemon startup status ([#2419](https://github.com/intent-hq/intentd/pull/2419))
+
+### 🧪 Testing
+
+- Guard restart readiness and bootstrap signal registration ([#2408](https://github.com/intent-hq/intentd/pull/2408))
+
+
+## [0.10.48] - 2026-10-15
+
+### 📚 Documentation
+
+- Explain current workspace toast suppression ([#2374](https://github.com/intent-hq/intentd/pull/2374))
+
+
+## [0.10.47] - 2026-10-15
+
+### 🚀 Features
+
+- Rebuild stale note indexes on demand ([#2417](https://github.com/intent-hq/intentd/pull/2417))
+- Push complete task and workspace statistics updates ([#2409](https://github.com/intent-hq/intentd/pull/2409))
+
+### 🐛 Bug Fixes
+
+- *(store)* Avoid note index rebuilds on release-only changes ([#2415](https://github.com/intent-hq/intentd/pull/2415))
+- Make Intel Mac artifacts optional and release-only ([#2411](https://github.com/intent-hq/intentd/pull/2411))
+
+### 📚 Documentation
+
+- Describe queued message controls in the assistant guide ([#2428](https://github.com/intent-hq/intentd/pull/2428))
+- Describe Home workspace list status groups ([#2423](https://github.com/intent-hq/intentd/pull/2423))
+- Explain repository labels on Home ([#2424](https://github.com/intent-hq/intentd/pull/2424))
+- Explain Home PR and waiting indicators ([#2406](https://github.com/intent-hq/intentd/pull/2406))
+
+### ⚙️ Miscellaneous Tasks
+
+- Migrate hosted builds and compiler caching to Depot ([#2421](https://github.com/intent-hq/intentd/pull/2421))
+
+
+## [0.10.46] - 2026-10-13
+
+### 📚 Documentation
+
+- Describe Mermaid diagrams in Markdown file previews ([#2402](https://github.com/intent-hq/intentd/pull/2402))
+
+
+## [0.10.45] - 2026-10-13
+
+### 📚 Documentation
+
+- Clarify browser primary selection and switching ([#2391](https://github.com/intent-hq/intentd/pull/2391))
+
+
+## [0.10.44] - 2026-10-13
+
+### 🚀 Features
+
+- *(scripts)* Add compact active lists and durable monitor cleanup ([#2393](https://github.com/intent-hq/intentd/pull/2393))
+- Let Assistant manage MCP servers and chats ([#2384](https://github.com/intent-hq/intentd/pull/2384))
+
+### 🐛 Bug Fixes
+
+- Preserve note index lockfile inputs during packaging ([#2399](https://github.com/intent-hq/intentd/pull/2399))
+- Publish sufficient state for push-driven client updates ([#2392](https://github.com/intent-hq/intentd/pull/2392))
+
+### 📚 Documentation
+
+- Explain workspace cycling from Home ([#2390](https://github.com/intent-hq/intentd/pull/2390))
+- Explain composer prompt recall ([#7068](https://github.com/intent-hq/intentd/pull/7068)) ([#2388](https://github.com/intent-hq/intentd/pull/2388))
+
+### 🧪 Testing
+
+- Preserve final Pi child evidence during fixture cleanup ([#2398](https://github.com/intent-hq/intentd/pull/2398))
+
+
+## [0.10.43] - 2026-10-11
+
+### 🚀 Features
+
+- Add bounded note viewing and cancellable deletion ([#2298](https://github.com/intent-hq/intentd/pull/2298))
+
+
+## [0.10.42] - 2026-10-10
+
+### 🐛 Bug Fixes
+
+- Emit compact monitor required-check counts ([#2380](https://github.com/intent-hq/intentd/pull/2380))
+
+### 📚 Documentation
+
+- Explain unsupported binary artifact downloads ([#2373](https://github.com/intent-hq/intentd/pull/2373))
+
+
+## [0.10.41] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain hardware workspace numbering and assignment ([#2369](https://github.com/intent-hq/intentd/pull/2369))
+
+
+## [0.10.40] - 2026-10-10
+
+### 🧪 Testing
+
+- Retain bounded Pi startup diagnostics in CI ([#2370](https://github.com/intent-hq/intentd/pull/2370))
+
+
+## [0.10.39] - 2026-10-10
+
+### 📚 Documentation
+
+- Explain browser recovery after reconnect ([#7004](https://github.com/intent-hq/intentd/pull/7004)) ([#2371](https://github.com/intent-hq/intentd/pull/2371))
+
+### 🧪 Testing
+
+- Wait for durable idle before model recreation ([#2377](https://github.com/intent-hq/intentd/pull/2377))
+
+
+## [0.10.38] - 2026-10-09
+
+### 🐛 Bug Fixes
+
+- Enforce adapter-derived Codex CLI compatibility ([#2372](https://github.com/intent-hq/intentd/pull/2372))
+
+
 ## [0.10.37] - 2026-10-09
 
 ### 🚀 Features

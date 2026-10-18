@@ -25,6 +25,30 @@ pub(super) async fn acquire(
     guard
 }
 
+/// The independently owned probe worker retains the exact write. Release both
+/// its guard and the supervisor's crash-protection lease before native join.
+pub(super) async fn complete_native_phase(
+    gate: &GitlabCredentialGate,
+    store: &intent_core::FileSecretStore,
+    retained: &RetainedGate,
+    guard: super::GitlabCredentialGuard,
+    write: Option<&super::RepositoryWrite>,
+) -> Result<super::GitlabCredentialGuard> {
+    let Some(write) = write.filter(|write| write.native_retirement_pending()) else {
+        return Ok(guard);
+    };
+    let completed = write.completed_source(store.clone(), guard.lease()).await;
+    retained.lock().unwrap().take();
+    drop(guard);
+    write.join_native_retirement().await?;
+    let guard = acquire(gate, retained).await;
+    write
+        .check_completed_source(completed, store.clone(), guard.lease())
+        .await?;
+    write.retry_native_settlement();
+    Ok(guard)
+}
+
 impl crate::Services {
     pub(crate) async fn owned_gitlab_probe(&self, host: GitlabHost, proof: bool) -> Result<Reply> {
         let caller = intent_core::current_caller()
@@ -114,17 +138,18 @@ impl crate::Services {
             ));
         }
         let client_id = self.gitlab_client_id(host);
-        let Some((credential, _)) = refresh_stored_credential_if_needed(
+        let (refreshed, guard) = refresh_stored_credential_if_needed(
             &self.secrets,
             host,
             client_id.as_deref(),
             &self.gitlab_secret_store,
             self.event_bus.as_ref(),
             &self.gitlab_credential_gate,
-            &guard,
+            guard,
+            retained,
         )
-        .await?
-        else {
+        .await?;
+        let Some((credential, _)) = refreshed else {
             return Err(Error::IdentityProof(
                 IdentityProofErrorKind::GitlabNotConnected,
             ));
