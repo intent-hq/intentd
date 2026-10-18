@@ -31,6 +31,19 @@ REQUIRED = {
     "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
+# Required on ordinary PRs; release-shaped PRs (release-fast-path fast_path=true)
+# skip them so release-plz refreshes stay short. The queue always runs both.
+PR_UNLESS_RELEASE = {"check", "coverage-changed"}
+
+
+def required_for(event, fast_path=""):
+    if event == "pull_request" and fast_path == "true":
+        return REQUIRED[event] - PR_UNLESS_RELEASE
+    return REQUIRED[event]
+
+
+def fast_paths(event):
+    return ("", "false", "true") if event == "pull_request" else ("",)
 NATIVE_STEPS = {
     "Check (native production configuration)": {"macOS", "Windows"},
     "Clippy (target-gated code)": {"macOS", "Windows"},
@@ -90,7 +103,15 @@ def context(event, *, fork=False, fast_path="", platform="macOS"):
 
 def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False):
     results = {}
-    for name, job in workflow["jobs"].items():
+    pending = dict(workflow["jobs"])
+    while pending:
+        # GitHub schedules by `needs`, not file order (`check` precedes the
+        # `release-fast-path` job it depends on), so evaluate dependencies first.
+        name = next((n for n, j in pending.items()
+                     if all(d in results for d in ([j["needs"]] if isinstance(j.get("needs"), str) else j.get("needs", [])))), None)
+        if name is None:
+            raise ValueError(f"unresolvable needs among {sorted(pending)}")
+        job = pending.pop(name)
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
@@ -102,9 +123,10 @@ def scheduled(workflow, event, *, fork=False, fast_path="", route="success", can
     return results
 
 
-def gate_passes(workflow, event, results):
+def gate_passes(workflow, event, results, fast_path=""):
     body = next(s["run"] for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
-    values = {"github.event_name": event, **{f"needs.{k}.result": v for k, v in results.items()}}
+    values = {"github.event_name": event, "needs.release-fast-path.outputs.fast_path": fast_path,
+              **{f"needs.{k}.result": v for k, v in results.items()}}
     body = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], body)
     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], capture_output=True, text=True, timeout=5)
     return result.returncode == 0
@@ -117,28 +139,31 @@ def gate_errors(workflow):
     if gate.get("continue-on-error") or step.get("continue-on-error") or step.get("if"):
         errors.append("gate result check must be unconditional and fatal")
     needs = set(workflow["jobs"]["gate"]["needs"])
-    expected = set.union(*REQUIRED.values(), PR_METADATA) | {"route"}
+    expected = set.union(*REQUIRED.values(), PR_METADATA) | {"route", "release-fast-path"}
     if needs != expected:
         errors.append("gate dependencies changed")
-    for event, required in REQUIRED.items():
-        baseline = {name: "success" if name in required or (event == "pull_request" and name in PR_METADATA)
-                    else "skipped" for name in expected}
-        if not gate_passes(workflow, event, baseline):
-            errors.append(f"{event}: intended skips rejected")
-        for name in expected:
-            for result in RESULTS:
-                accepted = result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
-                if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
-                    errors.append(f"{event}: {name}={result}")
+    for event in REQUIRED:
+        for fast_path in fast_paths(event):
+            required = required_for(event, fast_path)
+            label = f"{event}/{fast_path}" if event == "pull_request" else event
+            ran = required | (PR_METADATA | {"release-fast-path"} if event == "pull_request" else set())
+            baseline = {name: "success" if name in ran else "skipped" for name in expected}
+            if not gate_passes(workflow, event, baseline, fast_path):
+                errors.append(f"{label}: intended skips rejected")
+            for name in expected:
+                for result in RESULTS:
+                    accepted = result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
+                    if gate_passes(workflow, event, {**baseline, name: result}, fast_path) != accepted:
+                        errors.append(f"{label}: {name}={result}")
     return errors
 
 
 def routing_errors(workflow):
     errors = []
     for event in REQUIRED:
-        for fast_path in ("", "false", "true") if event == "pull_request" else ("",):
+        for fast_path in fast_paths(event):
             jobs = scheduled(workflow, event, fast_path=fast_path)
-            expected = REQUIRED[event] | {"route", "gate"}
+            expected = required_for(event, fast_path) | {"route", "gate"}
             if event == "pull_request":
                 expected |= PR_METADATA | {"release-fast-path"}
             actual = {name for name, result in jobs.items() if result == "success"}
@@ -809,6 +834,22 @@ class NativeRoutingTests(unittest.TestCase):
         step["run"] = step["run"].replace('${{ needs.build.result }}', "success")
         self.assertIn("merge_group: build=skipped", gate_errors(workflow))
         self.assertIn("push: build=skipped", gate_errors(workflow))
+
+    def test_release_shaped_prs_skip_linux_checks_and_ordinary_prs_require_them(self):
+        # Release-plz refreshes its PR whenever main advances; requiring the
+        # ~13 min Linux checks there kept the release PR non-CLEAN at every
+        # hourly auto-cut (intentd v0.11.8 stalled ~7 h). The queue reruns both.
+        for fast_path, ran in (("true", False), ("false", True), ("", True)):
+            with self.subTest(fast_path=fast_path):
+                jobs = scheduled(self.workflow, "pull_request", fast_path=fast_path)
+                for name in PR_UNLESS_RELEASE:
+                    self.assertEqual(jobs[name], "success" if ran else "skipped", name)
+                self.assertTrue(gate_passes(self.workflow, "pull_request", jobs, fast_path))
+                skipped = {**jobs, **{name: "skipped" for name in PR_UNLESS_RELEASE}}
+                self.assertEqual(gate_passes(self.workflow, "pull_request", skipped, fast_path), not ran)
+        jobs = scheduled(self.workflow, "merge_group", fast_path="true")
+        for name in PR_UNLESS_RELEASE:
+            self.assertEqual(jobs[name], "success", name)
 
     def test_mutation_cannot_drop_gate_dependency(self):
         workflow = copy.deepcopy(self.workflow)

@@ -200,13 +200,16 @@ jobs:
     secrets: inherit
 
   check:
-    # Runs on same-repo PRs and in the merge queue; skipped on push to main —
-    # a redundant re-test of a tree the queue already checked (see the
-    # `on: push` comment). The expression carries no status function, so the
-    # implicit success() still applies: a route failure — or a route skip, as
-    # on fork PRs — skips this job, and CI Gate rejects that skip.
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-    needs: route
+    # Runs in the merge queue and on same-repo PRs except release-shaped ones
+    # (release-fast-path fast_path == 'true'): release-plz refreshes its PR
+    # whenever main advances, and requiring this ~11 min job there kept the
+    # release PR non-CLEAN at every hourly auto-cut (v0.11.8 stalled ~7 h).
+    # Fail-safe: only an exact 'true' skips, so a failed classifier still runs
+    # it. Skipped on push to main — a redundant re-test of a tree the queue
+    # already checked (see the `on: push` comment). A route failure or skip
+    # (as on fork PRs) skips this job, and CI Gate rejects that skip.
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
+    needs: [route, release-fast-path]
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
@@ -536,8 +539,9 @@ jobs:
 
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
-  # and full coverage are now job-skipped on every PR, independent of this
-  # output; Linux checks and changed coverage still validate release PRs.
+  # and full coverage are job-skipped on every PR, independent of this
+  # output; on PRs, `check` and `coverage-changed` skip when it is exactly
+  # 'true' (CI Gate accepts only that skip), and the queue validates both.
   # This PR-only job is skipped on merge_group / push, leaving its output
   # empty so the retained native step guards never bypass queue validation
   # or main release builds. CI Gate is the only required context; the old
@@ -1403,14 +1407,15 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # Focused coverage of the diff's changed tests, required on same-repo PRs
-  # and in the queue (against the merged tree), retaining the callback fixture
+  # Focused coverage of the diff's changed tests, required in the queue
+  # (against the merged tree) and on same-repo PRs except release-shaped ones
+  # (see the `check` job's comment), retaining the callback fixture
   # composition proof and its evidence alongside the full queue-only
   # instrumented suites. A selection can legitimately be empty (no Rust
   # changes), so a green run does not by itself mean tests executed.
   coverage-changed:
-    needs: route
-    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.route.result == 'success' }}
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
@@ -2280,7 +2285,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    needs: [route, pr-static, cache-smoke, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, release-fast-path, pr-static, cache-smoke, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2290,18 +2295,24 @@ jobs:
           optional() {
             case "$2" in success|skipped) ;; *) echo "$1 failed ($2)"; exit 1 ;; esac
           }
+          # Required on PRs unless release-fast-path classified the diff as
+          # release-only; any other value (including empty) requires success.
+          unless_release() {
+            if [ "${{ needs.release-fast-path.outputs.fast_path }}" = "true" ]; then optional "$1" "$2"; else require "$1" "$2"; fi
+          }
           case "${{ github.event_name }}" in
             pull_request)
               require route "${{ needs.route.result }}"
               require pr-static "${{ needs.pr-static.result }}"
+              optional release-fast-path "${{ needs.release-fast-path.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
-              require check "${{ needs.check.result }}"
+              unless_release check "${{ needs.check.result }}"
               optional build "${{ needs.build.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
-              require coverage-changed "${{ needs.coverage-changed.result }}"
+              unless_release coverage-changed "${{ needs.coverage-changed.result }}"
               require pr-title "${{ needs.pr-title.result }}"
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
@@ -2312,6 +2323,7 @@ jobs:
               ;;
             merge_group)
               require route "${{ needs.route.result }}"
+              optional release-fast-path "${{ needs.release-fast-path.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
               require cache-smoke "${{ needs.cache-smoke.result }}"
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
@@ -2331,6 +2343,7 @@ jobs:
               ;;
             push)
               require route "${{ needs.route.result }}"
+              optional release-fast-path "${{ needs.release-fast-path.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
