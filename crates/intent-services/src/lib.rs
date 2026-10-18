@@ -31099,6 +31099,10 @@ impl WorkspaceApi for Services {
             // (monorepo#3338) — rejected before any state change.
             self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
                 .await?;
+            // A named profile that was removed or whose provider is disabled
+            // refuses the turn here, structured, before anything persists
+            // (PROTOCOL §5.54), rather than as a prose spawn failure later.
+            self.ensure_turn_provider_selectable(&agent_id).await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive

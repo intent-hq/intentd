@@ -550,3 +550,102 @@ async fn explicit_delegation_checks_the_profiles_own_auth_verdict() {
         assert_eq!(fx.provider_of(&child).await.as_deref(), Some(ok));
     }
 }
+
+/// `agent.sendMessage` on a conversation whose next turn would be refused
+/// is rejected at admission with the structured replacement error, before
+/// anything is persisted, so the client's send-refusal path runs. The prose
+/// never names the raw reference (it is only in `data.providerRef`).
+#[intent_test_macros::daemon_test]
+async fn send_message_is_refused_at_admission_when_a_replacement_is_required() {
+    for base in ["codex", "claude-code"] {
+        let fx = Fixture::new().await;
+        let send = |agent: AgentId| {
+            let svc = fx.svc.clone();
+            let ws = fx.ws.clone();
+            async move {
+                svc.agent_send_message(
+                    ws,
+                    agent,
+                    "next turn".into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    intent_core::MessageOrigin::User,
+                )
+                .await
+            }
+        };
+        let transcript_len = |agent: AgentId| {
+            let svc = fx.svc.clone();
+            async move {
+                svc.store()
+                    .get_agent_messages(&agent, None)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+
+        // Removed profile.
+        let gone = fx.profile(base, "Gone").await;
+        let on_gone = agent_id(&fx.create(Some(&gone)).await.unwrap());
+        let profile_id = gone.split('@').nth(1).unwrap().to_string();
+        fx.svc
+            .provider_profiles_delete_impl(profile_id)
+            .await
+            .expect("delete");
+        let before = transcript_len(on_gone.clone()).await;
+        let err = send(on_gone.clone()).await.unwrap_err();
+        assert_eq!(
+            replacement(&err),
+            (gone.clone(), "profile-missing".into()),
+            "{base}"
+        );
+        assert!(!err.to_string().contains(&gone), "{base}: {err}");
+        assert_eq!(
+            transcript_len(on_gone).await,
+            before,
+            "{base}: nothing persisted"
+        );
+
+        // Disabled base provider.
+        let kept = fx.profile(base, "Kept").await;
+        let on_kept = agent_id(&fx.create(Some(&kept)).await.unwrap());
+        fx.set("providers.enabled", json!({ base: false }));
+        let err = send(on_kept.clone()).await.unwrap_err();
+        assert_eq!(
+            replacement(&err),
+            (kept.clone(), "provider-disabled".into()),
+            "{base}"
+        );
+        assert!(!err.to_string().contains(&kept), "{base}: {err}");
+
+        // Legacy bare selection on a disabled provider keeps today's path.
+        fx.set("providers.enabled", json!({ base: true }));
+        let legacy = agent_id(&fx.create(Some(base)).await.unwrap());
+        fx.set("providers.enabled", json!({ base: false }));
+        send(legacy).await.expect("legacy send is admitted");
+        fx.set("providers.enabled", json!({ base: true }));
+
+        // A conversation with no saved provider resolves through the app
+        // default; a missing default reference is refused the same way.
+        let unpinned = agent_id(&fx.create(Some(base)).await.unwrap());
+        fx.svc
+            .store()
+            .set_agent_session_model(&fx.ws, &unpinned, "m", None, &intent_core::now_iso())
+            .await
+            .unwrap();
+        fx.set("model.defaultProvider", json!(format!("{base}@pmissing")));
+        let err = send(unpinned).await.unwrap_err();
+        assert_eq!(
+            replacement(&err),
+            (format!("{base}@pmissing"), "profile-missing".into()),
+            "{base}"
+        );
+    }
+}

@@ -267,7 +267,15 @@ fn profile_not_found(profile_id: &str) -> Error {
 pub(crate) fn replacement_required(reference: &str, reason: &str) -> Error {
     Error::provider_profile(
         false,
-        format!("invalid params: provider profile {reference} needs a replacement ({reason})"),
+        // The reference is in `data.providerRef`; the prose stays readable.
+        format!(
+            "invalid params: {}; choose another model to continue",
+            if reason == "provider-disabled" {
+                "the selected profile's provider is disabled"
+            } else {
+                "the selected provider profile is no longer available"
+            }
+        ),
         json!({
             "code": "provider-profile-replacement-required",
             "providerRef": reference,
@@ -1004,6 +1012,26 @@ impl Services {
             return Err(replacement_required(reference, "provider-disabled"));
         }
         Ok(())
+    }
+
+    /// Turn admission (`agent.sendMessage`): refuse a message whose next turn
+    /// would be refused at spawn, before anything is persisted, with the
+    /// structured `provider-profile-replacement-required` error. Resolves the
+    /// session's selection like the spawn path (saved provider, then the app
+    /// default). Bare legacy selections pass untouched.
+    pub(crate) async fn ensure_turn_provider_selectable(
+        &self,
+        agent_id: &intent_core::AgentId,
+    ) -> Result<()> {
+        let session = self.store.get_agent_session_summary(agent_id).await?;
+        let settings = self.effective_settings();
+        let Some(selection) = crate::agent_session::resolve_provider_id(
+            session.provider.as_deref(),
+            crate::agent_session::derived_default_provider(&settings).as_deref(),
+        ) else {
+            return Ok(());
+        };
+        self.ensure_provider_ref_selectable_in(&selection, &settings.providers)
     }
 
     /// [`Self::ensure_provider_ref_selectable`] then
