@@ -882,7 +882,12 @@ async fn process_captured_frame(
                 })();
                 if let Some((canonical, attachment)) = admitted {
                     let sent = out_tx
-                        .send_priority(client::attachment_result(&req, &canonical, is_local))
+                        .send_priority(client::attachment_result(
+                            &req,
+                            &canonical,
+                            is_local,
+                            hello_version(control),
+                        ))
                         .await
                         .is_ok();
                     if sent {
@@ -912,7 +917,14 @@ async fn process_captured_frame(
             subs.setup = crate::provider_setup::Connection::default();
             let mut bound = None;
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
-                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                let outcome = client::handle(
+                    req,
+                    api.as_ref(),
+                    client_id,
+                    is_local,
+                    hello_version(control),
+                )
+                .await;
                 bound = outcome.bound;
                 if control.and_then(|c| c.startup_status()).is_some() {
                     outcome.frame.map(|frame| {
@@ -1209,6 +1221,15 @@ async fn finish_prepared_rpc(
 /// else is answered inline so the error matrix is unchanged under load.
 /// Delegates to the router's [`check_envelope`] so both paths share one
 /// implementation of the envelope-validity rules.
+/// The `server.version` a `client.hello` advertises: the composition root's
+/// daemon version (intent-hq/intent#7256). Only library-level compositions
+/// without a control surface (no daemon binary) fall back to this crate's.
+fn hello_version(control: Option<&Arc<dyn SystemControl>>) -> &str {
+    control.map_or(env!("CARGO_PKG_VERSION"), |control| {
+        control.daemon_version()
+    })
+}
+
 fn is_dispatchable(parsed: Option<&Value>) -> bool {
     matches!(
         parsed.map(check_envelope),

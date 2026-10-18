@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.7] - 2026-10-18
+
+### 🐛 Bug Fixes
+
+- Realign library crate versions with intentd 0.11.6 ([#2472](https://github.com/intent-hq/intentd/pull/2472))
+
+### 🧪 Testing
+
+- Use one version source for transfer manifests ([#2469](https://github.com/intent-hq/intentd/pull/2469))
+
+
 ## [0.11.6] - 2026-10-17
 
 ### ⚙️ Miscellaneous Tasks

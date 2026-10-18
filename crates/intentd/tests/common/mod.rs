@@ -636,7 +636,11 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 /// Sets no TCP-port env override, preserving explicit pins and listener restarts.
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
+    // A sandbox daemon's shell may export the user-tier relocation; fixtures
+    // own their user tier through HOME.
+    cmd.arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env_remove("INTENTD_USER_SPECIALISTS_DIR");
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }

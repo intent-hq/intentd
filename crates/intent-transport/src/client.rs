@@ -121,7 +121,7 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1 },
+        "capabilities": { "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1 },
     });
     if let Some(build_commit) = build_commit {
         server
@@ -134,12 +134,12 @@ pub(crate) fn server_json(
 
 /// A deliberately compiled test host can exercise the real negotiation path.
 /// This signal supplies compatibility only, never source or recipient authority.
-fn connection_server_json(is_local: bool) -> Value {
+fn connection_server_json(is_local: bool, version: &str) -> Value {
     let server = server_json(
         detect_has_display(),
         std::env::consts::OS,
         std::env::consts::ARCH,
-        env!("CARGO_PKG_VERSION"),
+        version,
         crate::BUILD_COMMIT,
         is_local,
     );
@@ -185,6 +185,7 @@ pub(crate) fn attachment_result(
     req: &ClientRequest,
     client_id: &ClientId,
     is_local: bool,
+    version: &str,
 ) -> String {
     success_frame(
         &req.id_echo,
@@ -192,7 +193,7 @@ pub(crate) fn attachment_result(
             "clientId":client_id.as_str(),
             "connectionRole":"review-monitor",
             "protocolVersion":PROTOCOL_VERSION,
-            "server":connection_server_json(is_local)
+            "server":connection_server_json(is_local, version)
         }),
     )
 }
@@ -232,12 +233,14 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// into the `server` block. A non-string `clientId` is `-32602`; a persistence
 /// failure is `-32603`. Idempotent: re-sending updates name / capabilities /
 /// host identification and re-returns the same `server` block (PROTOCOL
-/// §5.17).
+/// §5.17). `version` is the daemon binary's version
+/// ([`crate::SystemControl::daemon_version`]), never this crate's own.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
+    version: &str,
 ) -> HelloOutcome {
     if req.connection_role != ConnectionRole::Ordinary {
         return HelloOutcome {
@@ -278,7 +281,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let mut server = connection_server_json(is_local);
+    let mut server = connection_server_json(is_local, version);
     if api.supports_note_delete_grace() {
         server["capabilities"]["noteDeleteGrace"] = json!(1);
     }

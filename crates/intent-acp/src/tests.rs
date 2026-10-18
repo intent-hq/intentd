@@ -13977,7 +13977,7 @@ mod workspace_apply_proposal_tests {
     use intent_core::{
         AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, PendingProposal, Result,
         Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-        WorkspaceCreateResult, WorkspaceId, WorkspaceStatus,
+        WorkspaceCreateOrigin, WorkspaceCreateResult, WorkspaceId, WorkspaceStatus,
     };
     use serde_json::{json, Value};
 
@@ -14456,6 +14456,16 @@ mod workspace_apply_proposal_tests {
             Some("Implement the isolated follow-up and test it.")
         );
         assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        // Provenance rides the `workspace:created` event as `data.origin` so
+        // clients can open the new workspace beside its source (§6.5).
+        assert_eq!(
+            input.origin,
+            Some(WorkspaceCreateOrigin::Proposal {
+                proposal_id: PENDING_ID.to_string(),
+                agent_id: AgentId::from(CALLER),
+                source_workspace_id: WorkspaceId::from(WS),
+            })
+        );
         drop(creates);
 
         let resolves = api.resolve_calls.lock().unwrap();

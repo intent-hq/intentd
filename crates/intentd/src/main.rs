@@ -4186,6 +4186,9 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 }
 
 impl SystemControl for DaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
         self.startup.clone()
     }
@@ -4272,7 +4275,7 @@ impl SystemControl for DaemonControl {
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
             max_agents: self.manager.registry().cap(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: self.daemon_version().to_string(),
             build_commit: intent_transport::BUILD_COMMIT.map(str::to_string),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
