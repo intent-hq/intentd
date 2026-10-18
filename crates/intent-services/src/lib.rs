@@ -4997,7 +4997,9 @@ impl Services {
     ///    against its detected repo ([`Services::refresh_git_root_pr`]).
     ///
     /// Fail-soft per root: every per-root error is logged and never aborts
-    /// the sweep, so a bad root never fails the workspace refresh. Each
+    /// the sweep, so a bad root never fails the workspace refresh. A
+    /// request-budget deferral is not a per-root failure: it is counted and
+    /// logged once per repository (intent-hq/intent#7264). Each
     /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// like the workspace refresh itself.
     ///
@@ -5005,12 +5007,17 @@ impl Services {
     /// 1–3 are pure git/store work and still run (so submodule detection,
     /// pruning, and the commit-sha backfill don't require forge
     /// credentials); only the per-root PR refresh (step 4) is skipped.
-    async fn sweep_workspace_git_roots(
+    ///
+    /// Request-budget deferrals are counted into the caller's per-sweep
+    /// `deferrals`, which [`pr_discovery::DeferralTally::log`] reports once
+    /// per repository after the whole sweep.
+    async fn sweep_workspace_git_roots_tallied(
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
         interval_secs: u64,
         local_maintenance: bool,
+        deferrals: &mut pr_discovery::DeferralTally,
     ) {
         if ws.is_remote || ws.archived {
             return;
@@ -5188,6 +5195,7 @@ impl Services {
                 continue;
             };
             let root_id = root.id.clone();
+            let root_repo = root.repo();
             let refreshed = pr_discovery::automatically_refresh(
                 interval_secs,
                 self.refresh_git_root_pr(root, sc),
@@ -5201,6 +5209,16 @@ impl Services {
                     )
                     .await;
                 }
+                // The repository's shared slot hands the same deferral to
+                // every root: summarized once per repository per sweep.
+                Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                    tracing::debug!(
+                        workspace = %ws.id.as_str(),
+                        git_root = %root_id.as_str(),
+                        "git root sweep: root refresh deferred by request budget"
+                    );
+                    deferrals.root(root_repo);
+                }
                 Err(e) => {
                     tracing::warn!(
                         workspace = %ws.id.as_str(),
@@ -5212,6 +5230,28 @@ impl Services {
                 Ok(_) => {}
             }
         }
+    }
+
+    /// One workspace's git-root sweep with its own deferral summary — the
+    /// test entry point for [`Self::sweep_workspace_git_roots_tallied`].
+    #[cfg(test)]
+    async fn sweep_workspace_git_roots(
+        &self,
+        ws: &Workspace,
+        sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
+    ) {
+        let mut deferrals = pr_discovery::DeferralTally::default();
+        self.sweep_workspace_git_roots_tallied(
+            ws,
+            sc,
+            interval_secs,
+            local_maintenance,
+            &mut deferrals,
+        )
+        .await;
+        deferrals.log();
     }
 
     /// True while the global sweep rate-limit pause window is active
@@ -5585,6 +5625,13 @@ impl Services {
                             discovery_rate_limited = Some(detail);
                             None
                         }
+                        Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                            tracing::debug!(
+                                git_root = %root.id.as_str(),
+                                "git root refresh: relink discovery deferred by request budget, persisting status only"
+                            );
+                            None
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 git_root = %root.id.as_str(),
@@ -5899,6 +5946,13 @@ impl Services {
                     // workspaces (monorepo#2961).
                     Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
                         discovery_rate_limited = Some(detail);
+                        None
+                    }
+                    Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                        tracing::debug!(
+                            workspace_id = %ws.id.as_str(),
+                            "pr refresh: relink discovery deferred by request budget, persisting status only"
+                        );
                         None
                     }
                     Err(e) => {
@@ -6279,6 +6333,7 @@ impl Services {
             )
             .await;
         }
+        let mut deferrals = pr_discovery::DeferralTally::default();
         for ws in workspaces {
             if self.settings_tasks.is_closed() {
                 break;
@@ -6316,6 +6371,13 @@ impl Services {
                         )
                         .await;
                     }
+                    Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                        tracing::debug!(
+                            workspace = %ws_id.as_str(),
+                            "pr refresh: workspace refresh deferred by request budget"
+                        );
+                        deferrals.workspace(ws.repo());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             workspace = %ws_id.as_str(),
@@ -6329,17 +6391,19 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(
+            self.sweep_workspace_git_roots_tallied(
                 &ws,
                 sc.as_ref(),
                 interval,
                 pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+                &mut deferrals,
             )
             .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
+        deferrals.log();
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at

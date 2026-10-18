@@ -1709,3 +1709,123 @@ async fn automatic_discovery_saturation(poll_seconds: u64) {
     assert!(idle_requests >= 10, "idle repository must complete a listing within two retry intervals despite active demand: {idle_requests} HTTP requests, configured {poll_seconds}s");
     assert_eq!(idle_requests % 10, 0, "every admitted listing completes");
 }
+
+/// Thread-local capture of every WARN-or-louder event as `message field=value`.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+}
+
+impl Warnings {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        crate::test_tracing::set_capture_default(
+            tracing_subscriber::Registry::default().with(self.clone()),
+        )
+    }
+
+    fn containing(&self, needle: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .cloned()
+            .collect()
+    }
+}
+
+/// intent-hq/intent#7264: one budget deferral is cached in the repository's
+/// shared listing slot, so every root of that repository receives it. One
+/// sweep must log one summary WARN for the repository, not one per root.
+#[tokio::test]
+async fn budget_deferral_logs_one_summary_per_repository_not_per_root() {
+    const ROOTS: usize = 5;
+    let api = Api::new(vec![]).await;
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let mut checkouts = Vec::new();
+    for i in 0..ROOTS {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        svc.pr_discovery.exhaust_budget();
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(
+        counts(&traffic),
+        (0, 0, 0),
+        "a deferred listing sends no HTTP"
+    );
+    assert_eq!(
+        warnings.containing("root refresh failed"),
+        Vec::<String>::new(),
+        "a deferral is not a per-root failure"
+    );
+    assert_eq!(
+        warnings.containing("workspace refresh failed"),
+        Vec::<String>::new(),
+        "a deferral is not a per-workspace failure"
+    );
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "one WARN per repository: {summaries:?}");
+    let summary = &summaries[0];
+    assert!(summary.contains("repo=o/r"), "{summary}");
+    assert!(summary.contains(&format!("roots={ROOTS}")), "{summary}");
+    assert!(summary.contains("workspaces=1"), "{summary}");
+}
+
+/// Coalescing is only for budget deferrals: a real per-root failure keeps
+/// its own WARN for every root it affects.
+#[tokio::test]
+async fn non_deferral_root_failures_still_warn_per_root() {
+    let forge = StubForge {
+        fail_list_prs: true,
+        ..StubForge::default()
+    };
+    let (_t, svc, ws_id) = refresh_setup(forge, "main", None, false).await;
+    let mut checkouts = Vec::new();
+    for i in 0..2 {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let warnings = Warnings::default();
+    let guard = warnings.install();
+    svc.refresh_all_workspace_prs(0).await;
+    drop(guard);
+    assert_eq!(
+        warnings.containing("root refresh failed").len(),
+        2,
+        "{:?}",
+        warnings.0.lock().unwrap()
+    );
+    assert_eq!(warnings.containing("workspace refresh failed").len(), 1);
+    assert!(warnings.containing("deferred by request budget").is_empty());
+}
