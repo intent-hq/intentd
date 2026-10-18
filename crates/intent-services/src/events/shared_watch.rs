@@ -97,11 +97,17 @@
 //! recursion flag, the backend no longer auto-watches directories created
 //! later; the group's event callback feeds `Create(Folder)` / rename-to
 //! events back to the registrar, which walks the new directory the same way.
-//! Nothing is pruned beneath a [`PRUNE_EXEMPT_DIRS`] component — `.intent`,
-//! `.augment`, `.agents`, `.claude` are trees a subscriber reads through the
-//! workspace-root watch and filters itself, and a nested name colliding with
-//! the noise list (`.intent/skills/build/`) must stay watched. The residual is
-//! a root that itself lives under such a component: it is walked unpruned.
+//! The tier heads `.intent`, `.augment`, `.agents`, `.claude` are narrowed to
+//! what a subscriber reads through the workspace-root watch — the project
+//! skills and specialists tiers ([`subscriber_tiers`]): beneath a tier head
+//! only those subtrees are walked, and nothing is pruned inside them (a nested
+//! name colliding with the noise list, `.intent/skills/build/`, must stay
+//! watched). Every other child of a tier head — nested worktrees under
+//! `.intent/worktrees`, `.intent/attachments`, `.claude/projects` — feeds no
+//! subscriber (`file:*` drops these trees) and is pruned; walking them whole
+//! cost ~107k descriptors on one host (intent-hq/intent#7252). The residual
+//! is a root that itself lives under a tier head (a home-tier skills root): it
+//! is walked unpruned.
 //!
 //! A git dir is neither noise nor exempt: what its subscribers consume is
 //! known exactly (intent-hq/intent#5044). The git metadata watcher reads
@@ -133,10 +139,37 @@ use tokio::task::JoinHandle;
 
 use super::root_watch::{canonical_root, find_existing_ancestor};
 
-/// Directory names beneath which the pruned walk never prunes (see the module
-/// header): subscriber-owned trees whose contents are filtered downstream.
+/// The workspace-relative trees the project-tier subscribers read through the
+/// recursive workspace-root watch (module header, intent-hq/intent#7252): the
+/// skills tiers and the specialists tiers, taken from their owners so a new
+/// tier cannot silently go unwatched. Their first components (`.intent`,
+/// `.claude`, `.agents`, `.augment`) are the "tier heads" the pruned walk
+/// narrows to these subtrees.
 #[cfg(target_os = "linux")]
-const PRUNE_EXEMPT_DIRS: &[&str] = &[".intent", ".augment", ".agents", ".claude"];
+fn subscriber_tiers() -> impl Iterator<Item = &'static str> {
+    super::skills_watcher::PROJECT_SKILL_TIERS
+        .iter()
+        .chain(super::specialists_watcher::PROJECT_TIERS)
+        .copied()
+}
+
+/// Whether `name` is the first component of a [`subscriber_tiers`] entry.
+#[cfg(target_os = "linux")]
+fn is_tier_head(name: &str) -> bool {
+    subscriber_tiers().any(|tier| tier.split('/').next() == Some(name))
+}
+
+/// Whether `tail` — the path components from a tier head down — lies on a
+/// subscriber tier: it is a prefix of one (`.intent`, on the way to
+/// `.intent/skills`) or lies beneath one (`.intent/skills/build/x`).
+#[cfg(target_os = "linux")]
+fn on_subscriber_tier(tail: &[Option<&str>]) -> bool {
+    subscriber_tiers().any(|tier| {
+        tier.split('/')
+            .zip(tail)
+            .all(|(want, got)| Some(want) == *got)
+    })
+}
 
 /// The only children of a git dir the pruned walk descends into (module
 /// header, intent-hq/intent#5044): `refs/` for the git metadata watcher and
@@ -1348,39 +1381,79 @@ fn component_name(component: std::path::Component<'_>) -> Option<&str> {
     }
 }
 
-/// Whether the pruned walk of `root` skips `dir`. A [`RootKind::GitDir`] root
-/// is under [`git_dir_prunes`] from its top. For a [`RootKind::Tree`] root
-/// the first noise component on the path from `root` down to `dir` prunes
-/// it, unless a [`PRUNE_EXEMPT_DIRS`] component comes first — or `root`
-/// itself lies under one, in which case the whole root is walked unpruned
-/// (module header) — and a `.git` component met first hands the rest of the
-/// path to [`git_dir_prunes`].
+/// What the path rules alone decide for a directory of a pruned walk.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathRule {
+    /// Skipped: a noise subtree, a git dir's unread children, or a tier
+    /// head's non-tier children.
+    Prune,
+    /// Kept because a subscriber reads it (a git dir's kept part, a
+    /// subscriber tier, a root under a tier head). Ignore rules never prune
+    /// it.
+    Keep,
+    /// An ordinary directory: kept unless the root's ignore rules ignore it.
+    Open,
+}
+
+/// Whether the pruned walk of `root` skips `dir` by path rules alone (see
+/// [`path_rule`]).
 #[cfg(target_os = "linux")]
 fn prunes(root: &Path, kind: RootKind, dir: &Path) -> bool {
-    let is_exempt = |c| component_name(c).is_some_and(|n| PRUNE_EXEMPT_DIRS.contains(&n));
-    let is_git_dir = |c| component_name(c) == Some(GIT_DIR_NAME);
+    path_rule(root, kind, dir) == PathRule::Prune
+}
+
+/// The path rules of the pruned walk of `root` for `dir`. A
+/// [`RootKind::GitDir`] root is under [`git_dir_prunes`] from its top. For a
+/// [`RootKind::Tree`] root the first decisive component on the path from
+/// `root` down to `dir` wins: a noise component prunes; a tier head
+/// ([`is_tier_head`]) keeps only the [`subscriber_tiers`] beneath it and
+/// prunes its other children; a `.git` component hands the rest of the path to
+/// [`git_dir_prunes`]. A `root` that itself lies under a tier head (a
+/// home-tier skills root) is walked unpruned (module header).
+#[cfg(target_os = "linux")]
+fn path_rule(root: &Path, kind: RootKind, dir: &Path) -> PathRule {
+    let git_rule = |below: std::path::Components<'_>| {
+        if git_dir_prunes(below) {
+            PathRule::Prune
+        } else {
+            PathRule::Keep
+        }
+    };
     let Ok(rel) = dir.strip_prefix(root) else {
-        return false;
+        return PathRule::Open;
     };
     if kind == RootKind::GitDir {
-        return git_dir_prunes(rel.components());
+        return git_rule(rel.components());
     }
-    if root.components().any(is_exempt) {
-        return false;
+    if root
+        .components()
+        .any(|c| component_name(c).is_some_and(is_tier_head))
+    {
+        return PathRule::Keep;
     }
     let mut components = rel.components();
     while let Some(component) = components.next() {
-        if is_exempt(component) {
-            return false;
+        let name = component_name(component);
+        if name.is_some_and(is_tier_head) {
+            let tail: Vec<Option<&str>> = std::iter::once(component)
+                .chain(components)
+                .map(component_name)
+                .collect();
+            return if on_subscriber_tier(&tail) {
+                PathRule::Keep
+            } else {
+                PathRule::Prune
+            };
         }
-        if is_git_dir(component) {
-            return git_dir_prunes(components);
+        if name == Some(GIT_DIR_NAME) {
+            return git_rule(components);
         }
-        if component_name(component).is_some_and(|n| super::watcher::NOISE_DIRS.contains(&n)) {
-            return true;
+        if name.is_some_and(|n| super::watcher::NOISE_DIRS.contains(&n)) {
+            return PathRule::Prune;
         }
     }
-    false
+    PathRule::Open
 }
 
 /// The git-dir rule (module header): given the path components below a git
@@ -2338,6 +2411,77 @@ mod tests {
         }
     }
 
+    /// intent-hq/intent#7252: beneath a tier head only the subscriber tiers
+    /// hold descriptors. A nested worktree under `.intent/worktrees` (with its
+    /// own `src/` and `node_modules/`) costs nothing, while the skills tier
+    /// stays watched — including a skill directory created after
+    /// registration, which must deliver.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_watches_only_subscriber_tiers_under_tier_heads() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-tier-heads");
+        let ws = base.path.join("ws");
+        let watched = [
+            ".intent",
+            ".intent/skills/existing",
+            ".intent/specialists",
+            ".claude/agents",
+            ".agents/skills/s/build",
+        ];
+        let pruned = [
+            ".intent/worktrees",
+            ".intent/worktrees/wt/src/components",
+            ".intent/worktrees/wt/node_modules/pkg",
+            ".intent/attachments/a",
+            ".claude/projects/p",
+        ];
+        for rel in watched.iter().chain(pruned.iter()) {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+
+        let inodes = inotify_watched_inodes();
+        for rel in watched {
+            assert!(
+                inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must hold an inotify descriptor"
+            );
+        }
+        for rel in pruned {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must NOT hold an inotify descriptor"
+            );
+        }
+
+        std::fs::create_dir_all(root.join(".intent/skills/late")).expect("mk late skill");
+        assert!(
+            touch_until_seen(&mut rx, &root, ".intent/skills/late/SKILL.md").await,
+            "a skill created after registration must deliver events"
+        );
+        std::fs::create_dir_all(root.join(".intent/worktrees/wt2/src")).expect("mk wt2");
+        assert!(
+            wait_watched(&root.join(".intent/skills/late"), true).await,
+            "the late skill dir must be watched"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let inodes = inotify_watched_inodes();
+        for rel in [".intent/worktrees/wt2", ".intent/worktrees/wt2/src"] {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} created after registration must NOT be watched"
+            );
+        }
+        drop(sub);
+    }
+
     /// A recursive root that does not exist must settle as FAILED, as the
     /// backend's own recursive watch did: the pruned walk yields nothing for
     /// a missing start, and a registration settled live with zero
@@ -2713,7 +2857,7 @@ mod tests {
         }
         // Noise and exempt components met before `.git` keep their own rule.
         assert!(prunes(ws, Tree, &ws.join("node_modules/pkg/.git/refs")));
-        assert!(!prunes(ws, Tree, &ws.join(".intent/x/.git/objects")));
+        assert!(!prunes(ws, Tree, &ws.join(".intent/skills/x/.git/objects")));
         // A root subscribed as a git dir gets the rule from its own top,
         // whatever it is named: the usual `<main>/.git` common dir and its
         // `worktrees/<name>` gitdir, but equally a separate git dir or a bare
@@ -2742,6 +2886,94 @@ mod tests {
         assert!(!prunes(metadata, Tree, &metadata.join("objects/ab")));
         assert!(!prunes(metadata, Tree, &metadata.join("logs")));
         assert!(prunes(metadata, Tree, &metadata.join("hooks/node_modules")));
+    }
+
+    /// The tier-head rule as a pure function (intent-hq/intent#7252): beneath
+    /// `.intent` / `.claude` / `.agents` / `.augment` only the subscriber
+    /// tiers survive — whole, noise-named children included — and every
+    /// other child (nested worktrees, attachments, transcripts) is pruned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tier_head_prune_rules() {
+        use RootKind::Tree;
+        let ws = Path::new("/ws");
+        for rel in [
+            ".intent",
+            ".intent/skills",
+            ".intent/skills/build",
+            ".intent/skills/x/node_modules",
+            ".intent/specialists",
+            ".claude",
+            ".claude/agents",
+            ".claude/skills/s",
+            ".agents/skills/x",
+            ".augment/skills",
+            "packages/app/.intent/skills",
+        ] {
+            assert_eq!(
+                path_rule(ws, Tree, &ws.join(rel)),
+                PathRule::Keep,
+                "{rel} must be kept"
+            );
+        }
+        for rel in [
+            ".intent/worktrees",
+            ".intent/worktrees/wt/src",
+            ".intent/attachments",
+            ".claude/projects/x",
+            ".agents/other",
+            ".augment/rules",
+            "packages/app/.intent/worktrees/wt",
+        ] {
+            assert_eq!(
+                path_rule(ws, Tree, &ws.join(rel)),
+                PathRule::Prune,
+                "{rel} must be pruned"
+            );
+        }
+        // Ordinary and noise paths keep their own rule.
+        assert_eq!(path_rule(ws, Tree, &ws.join("src/a")), PathRule::Open);
+        assert_eq!(path_rule(ws, Tree, ws), PathRule::Open);
+        assert!(prunes(ws, Tree, &ws.join("node_modules/.intent/skills")));
+        // A root under a tier head is walked unpruned.
+        let home_tier = Path::new("/home/u/.intent/skills");
+        assert_eq!(
+            path_rule(home_tier, Tree, &home_tier.join("s/node_modules")),
+            PathRule::Keep
+        );
+    }
+
+    /// Drift guard: every project tier the skills and specialists watchers
+    /// read through the workspace-root watch — and every ancestor on the way
+    /// down to it — must survive the pruned walk, so adding a tier to either
+    /// list can never leave it unwatched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_subscriber_tier_survives_the_pruned_walk() {
+        let ws = Path::new("/ws");
+        let tiers: Vec<&str> = super::super::skills_watcher::PROJECT_SKILL_TIERS
+            .iter()
+            .chain(super::super::specialists_watcher::PROJECT_TIERS)
+            .copied()
+            .collect();
+        assert!(tiers.len() >= 6, "both tier lists must be covered");
+        for tier in tiers {
+            let mut dir = ws.to_path_buf();
+            for part in tier.split('/') {
+                dir.push(part);
+                assert_eq!(
+                    path_rule(ws, RootKind::Tree, &dir),
+                    PathRule::Keep,
+                    "{} (on the way to tier {tier}) must be kept",
+                    dir.display()
+                );
+            }
+            assert_eq!(
+                path_rule(ws, RootKind::Tree, &dir.join("item/build")),
+                PathRule::Keep,
+                "nothing is pruned inside tier {tier}"
+            );
+        }
     }
 
     /// macOS keeps parent-directory grouping: the `FSEvents` stream rebuild on
