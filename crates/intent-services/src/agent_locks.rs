@@ -10,6 +10,7 @@
 //! still reports as changes (intent-hq/intent#7266): a path the worktree
 //! status no longer lists — committed, reverted, ignored, deleted — is not a
 //! file a user could stage, so it neither locks nor makes its agent locked.
+//! Sandboxed (copy-on-write) agents' paths are not judged against the worktree.
 //!
 //! The snapshot is served on demand via `file-tracking.getAgentLocks`
 //! (PROTOCOL §5.19) and pushed as the self-sufficient `changes:agent-locks`
@@ -136,12 +137,6 @@ impl Services {
             };
             paths_by_agent.entry(agent_id).or_default().insert(row.path);
         }
-        if let Some(lockable) = self.lockable_paths(workspace_id, &paths_by_agent).await {
-            for paths in paths_by_agent.values_mut() {
-                paths.retain(|p| lockable.contains(p));
-            }
-            paths_by_agent.retain(|_, paths| !paths.is_empty());
-        }
         if paths_by_agent.is_empty() {
             return empty;
         }
@@ -154,15 +149,37 @@ impl Services {
         };
         let by_id: HashMap<&str, &AgentSession> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-        let mut locked_agent_ids: BTreeSet<String> = BTreeSet::new();
-        let mut locked_file_paths: BTreeSet<String> = BTreeSet::new();
-        for (agent_id, paths) in &paths_by_agent {
+        let mut active: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (agent_id, paths) in paths_by_agent {
             let Some(session) = by_id.get(agent_id.as_str()) else {
                 continue;
             };
             if is_actively_working(self, session).await {
-                locked_agent_ids.insert(agent_id.clone());
-                locked_file_paths.extend(paths.iter().cloned());
+                active.insert(agent_id, paths);
+            }
+        }
+        // Keep only paths git still reports as changes. A sandboxed (copy-on-write)
+        // agent's paths live in its sandbox, not in the workspace worktree,
+        // so the worktree status cannot judge them; they stay as recorded.
+        let judged: BTreeMap<&String, &BTreeSet<String>> = active
+            .iter()
+            .filter(|(id, _)| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|s| s.sandbox_path.is_none())
+            })
+            .collect();
+        let lockable = self.lockable_paths(workspace_id, &judged).await;
+        let judged_ids: HashSet<String> = judged.keys().map(|id| (*id).clone()).collect();
+        let mut locked_agent_ids: BTreeSet<String> = BTreeSet::new();
+        let mut locked_file_paths: BTreeSet<String> = BTreeSet::new();
+        for (agent_id, mut paths) in active {
+            if let Some(lockable) = lockable.as_ref().filter(|_| judged_ids.contains(&agent_id)) {
+                paths.retain(|p| lockable.contains(p));
+            }
+            if !paths.is_empty() {
+                locked_agent_ids.insert(agent_id);
+                locked_file_paths.extend(paths);
             }
         }
         AgentLockSnapshot {
@@ -172,42 +189,36 @@ impl Services {
         }
     }
 
-    /// The subset of the tracked paths in `paths_by_agent` that are still
-    /// changes git would stage: listed in the (cached) worktree status, or
-    /// hidden from it — inside a submodule, or the old side of a rename (see
-    /// [`intent_git::attribution::hidden_from_status`]). `None` (no
-    /// filtering, the pre-#7266 behaviour) when the workspace has no local
+    /// The subset of the given tracked paths that are still changes git would
+    /// stage, judged against the **cached** worktree status (no scan when the
+    /// cache is warm) by [`intent_git::attribution::lockable_paths`]. `None`
+    /// (no filtering, the pre-#7266 behaviour) when the workspace has no local
     /// worktree or its status cannot be read.
     async fn lockable_paths(
         &self,
         workspace_id: &WorkspaceId,
-        paths_by_agent: &BTreeMap<String, BTreeSet<String>>,
+        paths_by_agent: &BTreeMap<&String, &BTreeSet<String>>,
     ) -> Option<HashSet<String>> {
+        if paths_by_agent.is_empty() {
+            return None;
+        }
         let ws = self.store().get_workspace(workspace_id).await.ok()?;
         if ws.is_remote {
             return None;
         }
         let worktree = crate::git_ops::worktree_path(&ws)?;
         let status = self.scan_git_status(&worktree, false).await.ok()?;
-        let dirty: HashSet<&str> = status.files.iter().map(|f| f.path.as_str()).collect();
-        let mut lockable: HashSet<String> = HashSet::new();
-        let mut unlisted: Vec<String> = Vec::new();
-        for path in paths_by_agent.values().flatten() {
-            if dirty.contains(path.as_str()) {
-                lockable.insert(path.clone());
-            } else {
-                unlisted.push(path.clone());
-            }
-        }
-        if !unlisted.is_empty() {
-            let hidden = tokio::task::spawn_blocking(move || {
-                intent_git::attribution::hidden_from_status(&worktree, &unlisted)
-            })
-            .await
-            .ok()?;
-            lockable.extend(hidden);
-        }
-        Some(lockable)
+        let candidates: Vec<String> = paths_by_agent
+            .values()
+            .flat_map(|paths| paths.iter().cloned())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            intent_git::attribution::lockable_paths(&worktree, &status.files, &candidates)
+        })
+        .await
+        .ok()
     }
 
     /// Recompute `workspace_id`'s lock snapshot and publish

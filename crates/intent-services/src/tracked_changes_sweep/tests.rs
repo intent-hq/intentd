@@ -6,6 +6,7 @@ use git2::{Repository, Signature};
 use intent_core::{AgentStatus, WorkspaceId};
 use intent_store::{NewTrackedChange, Store};
 
+use super::CleanRows;
 use crate::tests::{test_tempdir, workspace, TempDb};
 use crate::Services;
 
@@ -124,6 +125,20 @@ async fn paths(svc: &Services, ws: &WorkspaceId) -> Vec<(String, String)> {
     rows
 }
 
+/// Mark then confirm: run two passes and return the rows the confirming pass
+/// deleted (the marking pass never deletes).
+async fn prune_confirmed(svc: &Services, ws: &WorkspaceId) -> u64 {
+    let first = svc
+        .prune_stale_tracked_changes(ws, &CleanRows::new())
+        .await
+        .unwrap();
+    assert_eq!(first.deleted, 0, "the first pass only marks");
+    svc.prune_stale_tracked_changes(ws, &first.clean)
+        .await
+        .unwrap()
+        .deleted
+}
+
 fn owned(v: &[(&str, &str)]) -> Vec<(String, String)> {
     v.iter()
         .map(|(p, s)| ((*p).to_string(), (*s).to_string()))
@@ -179,7 +194,7 @@ async fn prune_drops_clean_paths_and_keeps_dirty_ones() {
     track(&svc, &ws, "staged.rs", "staged").await;
     track(&svc, &ws, "history.rs", "committed").await;
 
-    let deleted = svc.prune_stale_tracked_changes(&ws).await.unwrap();
+    let deleted = prune_confirmed(&svc, &ws).await;
     assert_eq!(deleted, 4);
     assert_eq!(
         paths(&svc, &ws).await,
@@ -205,8 +220,8 @@ async fn prune_drops_clean_paths_and_keeps_dirty_ones() {
             "untracked.rs".to_string(),
         ]
     );
-    // A second pass finds nothing more.
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 0);
+    // Another round finds nothing more.
+    assert_eq!(prune_confirmed(&svc, &ws).await, 0);
 }
 
 /// A path that later becomes git-ignored is pruned too.
@@ -216,9 +231,9 @@ async fn prune_drops_paths_that_became_ignored() {
     write(&repo.dir, "logs/run.log", "x\n");
     let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
     track(&svc, &ws, "logs/run.log", "unstaged").await;
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 0);
+    assert_eq!(prune_confirmed(&svc, &ws).await, 0);
     commit(&repo.dir, &[(".gitignore", "logs/\n")]);
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 1);
+    assert_eq!(prune_confirmed(&svc, &ws).await, 1);
     assert!(paths(&svc, &ws).await.is_empty());
 }
 
@@ -253,7 +268,7 @@ async fn prune_judges_submodule_rows_by_the_submodule() {
     ] {
         track(&svc, &ws, p, "unstaged").await;
     }
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 2);
+    assert_eq!(prune_confirmed(&svc, &ws).await, 2);
     assert_eq!(
         paths(&svc, &ws).await,
         owned(&[
@@ -263,14 +278,20 @@ async fn prune_judges_submodule_rows_by_the_submodule() {
     );
 }
 
-/// Race guard: a row re-recorded after the sweep listed it (an agent write
-/// landing while the scan runs) survives, even though its path looked clean.
+/// Race guard: a row re-recorded after the confirming pass listed it (an
+/// agent write landing while the scan runs) survives, even though its path
+/// looked clean in both passes.
 #[tokio::test]
 async fn prune_keeps_a_row_recorded_after_listing() {
     let repo = init_repo();
     let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
     track(&svc, &ws, "late.rs", "unstaged").await;
     track(&svc, &ws, "gone.rs", "unstaged").await;
+    let first = svc
+        .prune_stale_tracked_changes(&ws, &CleanRows::new())
+        .await
+        .unwrap();
+    assert_eq!(first.clean.len(), 2);
     let hook_svc = svc.clone();
     let hook_ws = ws.clone();
     super::set_before_scan_hook(
@@ -282,8 +303,86 @@ async fn prune_keeps_a_row_recorded_after_listing() {
             })
         }),
     );
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 1);
+    let second = svc
+        .prune_stale_tracked_changes(&ws, &first.clean)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 1);
     assert_eq!(paths(&svc, &ws).await, owned(&[("late.rs", "unstaged")]));
+}
+
+/// A path that is clean only momentarily — `git stash` then `stash pop`
+/// between passes — keeps its row: the confirming pass sees it dirty again.
+#[tokio::test]
+async fn prune_keeps_a_row_whose_path_is_dirty_again_by_the_confirming_pass() {
+    let repo = init_repo();
+    commit(&repo.dir, &[("work.rs", "base\n")]);
+    let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
+    track(&svc, &ws, "work.rs", "unstaged").await;
+    // Stashed: the worktree matches HEAD.
+    let first = svc
+        .prune_stale_tracked_changes(&ws, &CleanRows::new())
+        .await
+        .unwrap();
+    assert_eq!(first.clean.len(), 1, "marked while stashed");
+    // Popped: the agent's edit is back.
+    write(&repo.dir, "work.rs", "agent edit\n");
+    let second = svc
+        .prune_stale_tracked_changes(&ws, &first.clean)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 0);
+    assert!(second.clean.is_empty());
+    assert_eq!(paths(&svc, &ws).await, owned(&[("work.rs", "unstaged")]));
+}
+
+/// A daemon commit advances HEAD before it moves its rows to `committed`; a
+/// pass landing in that gap only marks the row, and the stage move keeps the
+/// confirming pass from deleting it.
+#[tokio::test]
+async fn prune_keeps_a_row_committed_between_passes() {
+    let repo = init_repo();
+    let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
+    commit(&repo.dir, &[("done.rs", "d\n")]);
+    track(&svc, &ws, "done.rs", "unstaged").await;
+    let first = svc
+        .prune_stale_tracked_changes(&ws, &CleanRows::new())
+        .await
+        .unwrap();
+    assert_eq!(first.clean.len(), 1, "marked in the commit gap");
+    svc.store()
+        .set_tracked_change_stage(&ws, "done.rs", "unstaged", "committed")
+        .await
+        .unwrap();
+    let second = svc
+        .prune_stale_tracked_changes(&ws, &first.clean)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 0);
+    assert_eq!(paths(&svc, &ws).await, owned(&[("done.rs", "committed")]));
+}
+
+/// A sandboxed (copy-on-write) agent's rows describe files in its sandbox, which the
+/// workspace worktree cannot judge: the sweep leaves them alone and the lock
+/// filter keeps them.
+#[tokio::test]
+async fn sandboxed_agent_rows_are_left_alone() {
+    let repo = init_repo();
+    let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
+    let mut agent = crate::agent_locks::tests::session("agent-1", &ws, AgentStatus::Active, None);
+    agent.sandbox_path = Some(repo.dir.join("sandbox").to_string_lossy().to_string());
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    track(&svc, &ws, "src/in-sandbox.rs", "unstaged").await;
+
+    assert_eq!(prune_confirmed(&svc, &ws).await, 0);
+    assert_eq!(
+        paths(&svc, &ws).await,
+        owned(&[("src/in-sandbox.rs", "unstaged")])
+    );
+    assert_eq!(
+        svc.compute_agent_locks(&ws).await.locked_file_paths,
+        vec!["src/in-sandbox.rs".to_string()]
+    );
 }
 
 /// A workspace whose worktree cannot be scanned, or that has no local
@@ -314,7 +413,15 @@ async fn sweep_skips_unscannable_workspaces() {
     svc.store().insert_workspace(&live_ws).await.unwrap();
     track(&svc, &live, "d.rs", "unstaged").await;
 
-    assert_eq!(svc.sweep_stale_tracked_changes().await, 1);
+    let mut memory = std::collections::HashMap::new();
+    assert_eq!(svc.sweep_stale_tracked_changes(&mut memory).await, 0);
+    assert_eq!(
+        memory.keys().collect::<Vec<_>>(),
+        vec![&live],
+        "only the scannable workspace marks rows"
+    );
+    assert_eq!(svc.sweep_stale_tracked_changes(&mut memory).await, 1);
+    assert!(memory.is_empty());
     assert_eq!(paths(&svc, &broken).await.len(), 1);
     assert_eq!(paths(&svc, &pathless).await.len(), 1);
     assert_eq!(paths(&svc, &remote_ws.id).await.len(), 1);
@@ -339,7 +446,7 @@ async fn prune_recomputes_and_publishes_metrics() {
         ..Default::default()
     });
 
-    assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 1);
+    assert_eq!(prune_confirmed(&svc, &ws).await, 1);
     let events = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
         .await
         .expect("metrics event")

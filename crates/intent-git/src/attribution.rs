@@ -2,30 +2,93 @@
 //! (`tracked_changes`, intent-hq/intent#7266).
 //!
 //! An attribution row only means something while its path is a change git can
-//! stage or commit. Each check below is answered by the
-//! repository that actually owns the path — a file inside a submodule is
-//! governed by the submodule's own `.gitignore` and index, which the
-//! superproject's status never reports:
+//! stage or commit. Each check below is answered by the repository that
+//! actually owns the path — a file inside a submodule is governed by the
+//! submodule's own `.gitignore` and index, which the superproject's status
+//! never reports:
 //!
 //! - [`is_ignored_untracked`]: should a fresh agent write be recorded at all?
 //!   An untracked path matching ignore rules can never be committed.
 //! - [`classify_paths`]: is an existing row's path still dirty? A row whose
 //!   path is clean (committed, reverted, ignored, deleted-untracked) will never
 //!   be moved out of its working stage by the commit pipeline.
-//! - [`hidden_from_status`]: which paths missing from a cached superproject
-//!   status may still be real changes (inside a submodule, or the old side
-//!   of a rename) — for the agent-lock filter.
+//! - [`lockable_paths`]: which tracked paths are still changes, judged from an
+//!   already-scanned (cached) superproject status — for the agent-lock filter.
+//!
+//! Submodules are located by looking up each path prefix as a gitlink in the
+//! owning repository's index or `HEAD` tree — a few indexed lookups per path,
+//! never a walk of the whole tree.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use git2::Repository;
-use intent_core::Result;
+use git2::{Index, Oid, Repository};
+use intent_core::{FileStatus, Result};
 
 use crate::map_git_err;
-use crate::submodule::{
-    ignores_case, submodule_containing, submodule_paths, MAX_SUBMODULE_NESTING,
-};
+use crate::submodule::{ignores_case, MAX_SUBMODULE_NESTING};
+
+/// Tree-entry / index mode of a gitlink (submodule pin).
+const GITLINK_MODE: u32 = 0o160_000;
+
+/// One opened repository with the state the checks consult.
+struct RepoView {
+    repo: Repository,
+    index: Option<Index>,
+    head_tree: Option<Oid>,
+    ignore_case: bool,
+}
+
+impl RepoView {
+    fn open(workdir: &Path) -> Option<Self> {
+        let repo = Repository::open(workdir).ok()?;
+        let index = repo.index().ok();
+        let head_tree = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_tree().ok())
+            .map(|t| t.id());
+        let ignore_case = ignores_case(&repo);
+        Some(Self {
+            repo,
+            index,
+            head_tree,
+            ignore_case,
+        })
+    }
+
+    /// The index mode and `HEAD` tree mode of `rel`, `None` where absent.
+    fn modes(&self, rel: &str) -> (Option<u32>, Option<u32>) {
+        let path = Path::new(rel);
+        let in_index = self
+            .index
+            .as_ref()
+            .and_then(|i| i.get_path(path, 0))
+            .map(|e| e.mode);
+        let in_head = self
+            .head_tree
+            .and_then(|oid| self.repo.find_tree(oid).ok())
+            .and_then(|t| t.get_path(path).ok())
+            .and_then(|e| u32::try_from(e.filemode()).ok());
+        (in_index, in_head)
+    }
+
+    fn is_gitlink(&self, rel: &str) -> bool {
+        let (index, head) = self.modes(rel);
+        index == Some(GITLINK_MODE) || head == Some(GITLINK_MODE)
+    }
+
+    fn is_tracked(&self, rel: &str) -> bool {
+        let (index, head) = self.modes(rel);
+        index.is_some() || head.is_some()
+    }
+
+    fn is_ignored_untracked(&self, rel: &str) -> bool {
+        !rel.is_empty()
+            && self.repo.is_path_ignored(Path::new(rel)).unwrap_or(false)
+            && !self.is_tracked(rel)
+    }
+}
 
 /// The repository that owns one worktree-relative path.
 struct Owner {
@@ -38,75 +101,91 @@ struct Owner {
     inner: String,
 }
 
-/// One repository's submodule layout, read once per [`Resolver`].
-struct Layout {
-    submodules: BTreeSet<String>,
-    ignore_case: bool,
+/// The `/`-separated components of a normalized relative path, or `None` when
+/// it is empty or escapes (`..`, absolute).
+fn components(rel: &str) -> Option<Vec<&str>> {
+    if rel.starts_with('/') {
+        return None;
+    }
+    let parts: Vec<&str> = rel
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if parts.is_empty() || parts.contains(&"..") {
+        return None;
+    }
+    Some(parts)
 }
 
-/// Resolves worktree-relative paths to their owning repository, caching each
-/// repository's submodule set ([`submodule_paths`] walks the whole `HEAD`
-/// tree, far too costly to repeat per path).
+/// Whether `rel` (inside `workdir`) lies under an untracked nested git
+/// repository — a work tree the owning repository's status reports only as
+/// an opaque `dir/` entry, so its files are never listed individually.
+fn inside_nested_repo(workdir: &Path, rel: &str) -> bool {
+    let Some(parts) = components(rel) else {
+        return false;
+    };
+    let mut dir = workdir.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        dir.push(part);
+        if dir.join(".git").exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves worktree-relative paths to their owning repository, opening each
+/// repository once.
 struct Resolver {
     worktree: PathBuf,
-    layouts: HashMap<PathBuf, Option<Layout>>,
+    views: HashMap<PathBuf, Option<RepoView>>,
 }
 
 impl Resolver {
     fn new(worktree: &Path) -> Self {
         Self {
             worktree: worktree.to_path_buf(),
-            layouts: HashMap::new(),
+            views: HashMap::new(),
         }
     }
 
-    fn layout(&mut self, workdir: &Path) -> Option<&Layout> {
-        self.layouts
+    fn view(&mut self, workdir: &Path) -> Option<&RepoView> {
+        self.views
             .entry(workdir.to_path_buf())
-            .or_insert_with(|| {
-                let repo = Repository::open(workdir).ok()?;
-                Some(Layout {
-                    submodules: submodule_paths(&repo).ok()?,
-                    ignore_case: ignores_case(&repo),
-                })
-            })
+            .or_insert_with(|| RepoView::open(workdir))
             .as_ref()
     }
 
     /// The innermost repository under the worktree that owns `rel_path`,
-    /// descending through populated submodules. `None` when a containing
-    /// submodule cannot be opened (unpopulated, or an unsafe path) — the
-    /// caller cannot judge the path and must leave it alone.
+    /// descending through submodules (a path prefix that is a gitlink in the
+    /// current repository's index or `HEAD`). `None` when the path is unsafe
+    /// or a repository on the way cannot be opened (unpopulated submodule) —
+    /// the caller cannot judge the path and must leave it alone.
     fn owner(&mut self, rel_path: &str) -> Option<Owner> {
         let mut workdir = self.worktree.clone();
         let mut prefix = String::new();
-        let mut inner = rel_path.to_string();
+        let mut inner: Vec<String> = components(rel_path)?
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         for _ in 0..=MAX_SUBMODULE_NESTING {
-            let layout = self.layout(&workdir)?;
-            let Some(sm) = submodule_containing(&layout.submodules, &inner, layout.ignore_case)
-            else {
+            let view = self.view(&workdir)?;
+            let split = (1..inner.len()).find(|&n| view.is_gitlink(&inner[..n].join("/")));
+            let Some(n) = split else {
                 return Some(Owner {
                     prefix,
                     workdir,
-                    inner,
+                    inner: inner.join("/"),
                 });
             };
-            let sm = sm.to_string();
-            let sm_rel = crate::repo_cache::safe_rel_path(&sm)?;
-            let rest = Path::new(&inner)
-                .components()
-                .filter(|c| !matches!(c, std::path::Component::CurDir))
-                .skip(sm_rel.components().count())
-                .collect::<PathBuf>()
-                .to_string_lossy()
-                .replace('\\', "/");
-            workdir = workdir.join(&sm_rel);
+            let sm = inner[..n].join("/");
+            workdir = workdir.join(&sm);
             prefix = if prefix.is_empty() {
                 sm
             } else {
                 format!("{prefix}/{sm}")
             };
-            inner = rest;
+            inner.drain(..n);
         }
         None
     }
@@ -125,32 +204,13 @@ impl Resolver {
 /// — callers then keep recording as they always have.
 #[must_use]
 pub fn is_ignored_untracked(worktree: &Path, rel_path: &str) -> bool {
-    let Some(owner) = Resolver::new(worktree).owner(rel_path) else {
+    let mut resolver = Resolver::new(worktree);
+    let Some(owner) = resolver.owner(rel_path) else {
         return false;
     };
-    if owner.inner.is_empty() {
-        return false;
-    }
-    let Ok(repo) = Repository::open(&owner.workdir) else {
-        return false;
-    };
-    let inner = Path::new(&owner.inner);
-    if !repo.is_path_ignored(inner).unwrap_or(false) {
-        return false;
-    }
-    let in_index = repo
-        .index()
-        .ok()
-        .is_some_and(|index| index.get_path(inner, 0).is_some());
-    if in_index {
-        return false;
-    }
-    let in_head = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_tree().ok())
-        .is_some_and(|tree| tree.get_path(inner).is_ok());
-    !in_head
+    resolver
+        .view(&owner.workdir)
+        .is_some_and(|v| v.is_ignored_untracked(&owner.inner))
 }
 
 /// Git's verdict on one worktree-relative path, from [`classify_paths`].
@@ -163,15 +223,16 @@ pub enum PathState {
     /// absent and untracked.
     Clean,
     /// The owning repository could not be opened or scanned (unpopulated
-    /// submodule, failed submodule scan); the path must be left alone.
+    /// submodule, failed submodule scan), or the path is inside an untracked
+    /// nested repository; the path must be left alone.
     Unknown,
 }
 
 /// Classify each of `rel_paths` (relative to `worktree`) as [`PathState`],
 /// scanning each owning repository's status once (rename detection off, so
 /// both sides of a rename count as dirty). Paths inside a populated submodule
-/// are judged by that submodule's status; a submodule that cannot be opened
-/// or scanned yields [`PathState::Unknown`] for its paths.
+/// are judged by that submodule's status; comparisons fold case when the
+/// owning repository sets `core.ignorecase`.
 ///
 /// # Errors
 ///
@@ -180,8 +241,8 @@ pub enum PathState {
 pub fn classify_paths(worktree: &Path, rel_paths: &[String]) -> Result<Vec<PathState>> {
     // Fail loudly when the superproject itself is unreadable: a sweep must
     // never treat "could not look" as "clean".
-    Repository::open(worktree).map_err(map_git_err)?;
-    let top = dirty_set(worktree)?;
+    let top_ignore_case = ignores_case(&Repository::open(worktree).map_err(map_git_err)?);
+    let top = dirty_set(worktree, top_ignore_case)?;
     let mut scans: HashMap<String, Option<HashSet<String>>> = HashMap::new();
     scans.insert(String::new(), Some(top));
     let mut resolver = Resolver::new(worktree);
@@ -191,63 +252,115 @@ pub fn classify_paths(worktree: &Path, rel_paths: &[String]) -> Result<Vec<PathS
             out.push(PathState::Unknown);
             continue;
         };
+        let Some(view) = resolver.view(&owner.workdir) else {
+            out.push(PathState::Unknown);
+            continue;
+        };
+        let ignore_case = view.ignore_case;
         let set = scans
             .entry(owner.prefix.clone())
-            .or_insert_with(|| dirty_set(&owner.workdir).ok());
-        out.push(match set {
-            Some(set) if set.contains(&owner.inner) => PathState::Dirty,
-            Some(_) => PathState::Clean,
-            None => PathState::Unknown,
+            .or_insert_with(|| dirty_set(&owner.workdir, ignore_case).ok());
+        let Some(set) = set else {
+            out.push(PathState::Unknown);
+            continue;
+        };
+        out.push(if set.contains(&fold(&owner.inner, ignore_case)) {
+            PathState::Dirty
+        } else if view.is_ignored_untracked(&owner.inner) {
+            PathState::Clean
+        } else if inside_nested_repo(&owner.workdir, &owner.inner) {
+            PathState::Unknown
+        } else {
+            PathState::Clean
         });
     }
     Ok(out)
 }
 
+fn fold(path: &str, ignore_case: bool) -> String {
+    if ignore_case {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
 /// Every path git reports as changed in the repository at `workdir`, rename
-/// detection off.
-fn dirty_set(workdir: &Path) -> Result<HashSet<String>> {
+/// detection off, case-folded when `ignore_case`.
+fn dirty_set(workdir: &Path, ignore_case: bool) -> Result<HashSet<String>> {
     Ok(crate::status::files_without_renames(workdir)?
         .into_iter()
-        .map(|f| f.path)
+        .map(|f| fold(&f.path, ignore_case))
         .collect())
 }
 
-/// Of `rel_paths` — paths **absent** from the superproject's rename-detecting
-/// status (`git.status` / the status cache) — the ones that may still be real
-/// changes that status cannot show:
+/// Of `rel_paths` (relative to `worktree`), the ones that are still changes
+/// according to `status` — an already-scanned, rename-detecting superproject
+/// status (the daemon's status cache), so this does no status scan itself:
 ///
-/// - paths strictly inside a submodule (the superproject reports only the
-///   gitlink, never the files inside it);
-/// - tracked paths (in the index or `HEAD`) missing on disk — the old side of
-///   a detected rename, which a rename-detecting status folds into the new
-///   path's entry.
+/// - paths `status` lists (case-folded under `core.ignorecase`);
+/// - paths inside a submodule whose gitlink `status` lists as changed (the
+///   superproject never lists the files inside a submodule);
+/// - tracked paths missing on disk — the old side of a detected rename,
+///   which a rename-detecting status folds into the new path's entry;
+/// - paths inside an untracked nested repository, whose files the status
+///   cannot list.
 ///
-/// When the repository cannot be read every path is returned, so a caller
+/// When the repository cannot be opened every path is returned, so a caller
 /// filtering on the result degrades to keeping everything.
 #[must_use]
-pub fn hidden_from_status(worktree: &Path, rel_paths: &[String]) -> HashSet<String> {
-    let Ok(repo) = Repository::open(worktree) else {
-        return rel_paths.iter().cloned().collect();
+pub fn lockable_paths(
+    worktree: &Path,
+    status: &[FileStatus],
+    rel_paths: &[String],
+) -> HashSet<String> {
+    let listed: HashSet<&str> = status.iter().map(|f| f.path.as_str()).collect();
+    let (mut out, unlisted): (HashSet<String>, Vec<String>) = {
+        let (hit, miss): (Vec<&String>, Vec<&String>) =
+            rel_paths.iter().partition(|p| listed.contains(p.as_str()));
+        (
+            hit.into_iter().cloned().collect(),
+            miss.into_iter().cloned().collect(),
+        )
     };
-    let submodules: BTreeSet<String> = submodule_paths(&repo).unwrap_or_default();
-    let ignore_case = ignores_case(&repo);
-    let index = repo.index().ok();
-    let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-    rel_paths
+    if unlisted.is_empty() {
+        return out;
+    }
+    let Some(view) = RepoView::open(worktree) else {
+        out.extend(unlisted);
+        return out;
+    };
+    let folded: HashSet<String> = if view.ignore_case {
+        listed.iter().map(|p| p.to_lowercase()).collect()
+    } else {
+        HashSet::new()
+    };
+    let dirty_gitlinks: Vec<&str> = status
         .iter()
-        .filter(|p| {
-            if submodule_containing(&submodules, p, ignore_case).is_some() {
-                return true;
-            }
-            if std::fs::symlink_metadata(worktree.join(p.as_str())).is_ok() {
-                return false;
-            }
-            let rel = Path::new(p.as_str());
-            index.as_ref().is_some_and(|i| i.get_path(rel, 0).is_some())
-                || head.as_ref().is_some_and(|t| t.get_path(rel).is_ok())
-        })
-        .cloned()
-        .collect()
+        .filter(|f| f.mode.as_deref() == Some("160000"))
+        .map(|f| f.path.as_str())
+        .collect();
+    for path in unlisted {
+        let submodule = components(&path).and_then(|parts| {
+            (1..parts.len())
+                .map(|n| parts[..n].join("/"))
+                .find(|prefix| view.is_gitlink(prefix))
+        });
+        let keep = if let Some(submodule) = submodule {
+            dirty_gitlinks.contains(&submodule.as_str())
+        } else {
+            (view.ignore_case && folded.contains(&path.to_lowercase()))
+                || if std::fs::symlink_metadata(worktree.join(&path)).is_err() {
+                    view.is_tracked(&path)
+                } else {
+                    !view.is_ignored_untracked(&path) && inside_nested_repo(worktree, &path)
+                }
+        };
+        if keep {
+            out.insert(path);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -262,6 +375,7 @@ mod tests {
         assert!(is_ignored_untracked(dir.path(), ".dev/x.json"));
         assert!(is_ignored_untracked(dir.path(), ".dev/deep/nested/y.json"));
         assert!(is_ignored_untracked(dir.path(), "build.log"));
+        assert!(is_ignored_untracked(dir.path(), "./build.log"));
         write_file(dir.path(), ".dev/x.json", "{}");
         assert!(is_ignored_untracked(dir.path(), ".dev/x.json"));
     }
@@ -269,11 +383,12 @@ mod tests {
     #[test]
     fn non_ignored_paths_are_not_ignored() {
         let dir = init_repo("attr-not-ignored");
-        commit_file(dir.path(), ".gitignore", ".dev/\n");
+        commit_file(dir.path(), ".gitignore", ".dev/\n*.log\n");
         commit_file(dir.path(), "src/a.rs", "a\n");
         assert!(!is_ignored_untracked(dir.path(), "src/a.rs"));
         assert!(!is_ignored_untracked(dir.path(), "src/new.rs"));
         assert!(!is_ignored_untracked(dir.path(), "dev/x.json"));
+        assert!(!is_ignored_untracked(dir.path(), "../escape.log"));
     }
 
     #[test]
@@ -388,33 +503,69 @@ mod tests {
             got,
             vec![PathState::Dirty, PathState::Clean, PathState::Clean]
         );
-        let hidden = hidden_from_status(
-            parent.path(),
-            &paths(&["sub/clean.rs", "README.md", "gone.md"]),
-        );
-        assert_eq!(hidden, HashSet::from(["sub/clean.rs".to_string()]));
     }
 
     #[test]
-    fn hidden_from_status_keeps_the_old_side_of_a_rename() {
-        let dir = init_repo("attr-hidden-rename");
-        commit_file(dir.path(), "old.rs", "fn main() {}\n");
-        std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
-        let hidden = hidden_from_status(
-            dir.path(),
-            &paths(&["old.rs", "new.rs", "never-tracked.rs"]),
-        );
-        assert_eq!(hidden, HashSet::from(["old.rs".to_string()]));
-        let repo_less = init_repo("attr-hidden-norepo");
-        std::fs::remove_dir_all(repo_less.path().join(".git")).unwrap();
+    fn classify_reports_unpopulated_submodule_paths_as_unknown() {
+        let child = init_repo("attr-usub-child");
+        commit_file(child.path(), "lib.rs", "x\n");
+        let parent = init_repo("attr-usub-parent");
+        commit_file(parent.path(), "README.md", "r\n");
+        add_submodule(parent.path(), child.path(), "sub");
+        std::fs::remove_dir_all(parent.path().join("sub")).unwrap();
+        std::fs::create_dir_all(parent.path().join("sub")).unwrap();
+        let got = classify_paths(parent.path(), &paths(&["sub/lib.rs", "README.md"])).unwrap();
+        assert_eq!(got, vec![PathState::Unknown, PathState::Clean]);
+    }
+
+    #[test]
+    fn classify_leaves_paths_in_an_untracked_nested_repo_alone() {
+        let dir = init_repo("attr-nested");
+        commit_file(dir.path(), ".gitignore", "scratch/\n");
+        commit_file(dir.path(), "README.md", "r\n");
+        let nested = dir.path().join("vendor/tool");
+        std::fs::create_dir_all(&nested).unwrap();
+        Repository::init(&nested).unwrap();
+        write_file(dir.path(), "vendor/tool/src/x.rs", "x\n");
+        let ignored_nested = dir.path().join("scratch/clone");
+        std::fs::create_dir_all(&ignored_nested).unwrap();
+        Repository::init(&ignored_nested).unwrap();
+        write_file(dir.path(), "scratch/clone/y.rs", "y\n");
+        let rows = paths(&["vendor/tool/src/x.rs", "scratch/clone/y.rs"]);
+        let got = classify_paths(dir.path(), &rows).unwrap();
+        assert_eq!(got, vec![PathState::Unknown, PathState::Clean]);
+        let status = crate::status::status(dir.path()).unwrap().files;
         assert_eq!(
-            hidden_from_status(repo_less.path(), &paths(&["x"])),
-            HashSet::from(["x".to_string()])
+            lockable_paths(dir.path(), &status, &rows),
+            HashSet::from(["vendor/tool/src/x.rs".to_string()])
         );
     }
 
     #[test]
-    fn resolver_reads_each_repository_layout_once() {
+    fn classify_folds_case_when_the_repo_ignores_case() {
+        let dir = init_repo("attr-case");
+        commit_file(dir.path(), "README.md", "r\n");
+        write_file(dir.path(), "README.md", "changed\n");
+        Repository::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .set_bool("core.ignorecase", true)
+            .unwrap();
+        let rows = paths(&["readme.md"]);
+        assert_eq!(
+            classify_paths(dir.path(), &rows).unwrap(),
+            vec![PathState::Dirty]
+        );
+        let status = crate::status::status(dir.path()).unwrap().files;
+        assert_eq!(
+            lockable_paths(dir.path(), &status, &rows),
+            HashSet::from(["readme.md".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolver_opens_each_repository_once() {
         let child = init_repo("attr-resolver-child");
         commit_file(child.path(), "lib.rs", "x\n");
         let parent = init_repo("attr-resolver-parent");
@@ -431,19 +582,59 @@ mod tests {
             assert_eq!(sub.prefix, "sub");
             assert_eq!(sub.inner, format!("g{i}.rs"));
         }
-        assert_eq!(resolver.layouts.len(), 2, "one layout read per repository");
+        assert_eq!(resolver.views.len(), 2, "one view per repository");
+    }
+
+    fn status_of(dir: &Path) -> Vec<FileStatus> {
+        crate::status::status(dir).unwrap().files
     }
 
     #[test]
-    fn classify_reports_unpopulated_submodule_paths_as_unknown() {
-        let child = init_repo("attr-usub-child");
+    fn lockable_keeps_listed_paths_and_the_old_side_of_a_rename() {
+        let dir = init_repo("attr-lock-rename");
+        commit_file(dir.path(), ".gitignore", ".dev/\n");
+        commit_file(
+            dir.path(),
+            "old.rs",
+            "fn main() { println!(\"unchanged body\"); }\n",
+        );
+        commit_file(dir.path(), "clean.rs", "c\n");
+        std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
+        write_file(dir.path(), ".dev/x.json", "{}");
+        let got = lockable_paths(
+            dir.path(),
+            &status_of(dir.path()),
+            &paths(&["old.rs", "new.rs", "clean.rs", ".dev/x.json", "gone.rs"]),
+        );
+        assert_eq!(
+            got,
+            HashSet::from(["old.rs".to_string(), "new.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn lockable_keeps_submodule_paths_only_while_the_submodule_is_dirty() {
+        let child = init_repo("attr-lock-sub-child");
         commit_file(child.path(), "lib.rs", "x\n");
-        let parent = init_repo("attr-usub-parent");
+        let parent = init_repo("attr-lock-sub-parent");
         commit_file(parent.path(), "README.md", "r\n");
         add_submodule(parent.path(), child.path(), "sub");
-        std::fs::remove_dir_all(parent.path().join("sub")).unwrap();
-        std::fs::create_dir_all(parent.path().join("sub")).unwrap();
-        let got = classify_paths(parent.path(), &paths(&["sub/lib.rs", "README.md"])).unwrap();
-        assert_eq!(got, vec![PathState::Unknown, PathState::Clean]);
+        let rows = paths(&["sub/lib.rs"]);
+        assert!(lockable_paths(parent.path(), &status_of(parent.path()), &rows).is_empty());
+        write_file(parent.path(), "sub/lib.rs", "changed\n");
+        assert_eq!(
+            lockable_paths(parent.path(), &status_of(parent.path()), &rows),
+            HashSet::from(["sub/lib.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn lockable_keeps_everything_when_the_repo_is_unreadable() {
+        let dir = init_repo("attr-lock-norepo");
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+        assert_eq!(
+            lockable_paths(dir.path(), &[], &paths(&["x"])),
+            HashSet::from(["x".to_string()])
+        );
     }
 }

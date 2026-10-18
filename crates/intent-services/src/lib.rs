@@ -37395,11 +37395,13 @@ impl Services {
         Ok(())
     }
 
-    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
-    /// `changes:git-status` after a mutating accept-changes step.
-    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+    /// Recompute the workspace's durable line-change aggregates from its
+    /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
+    /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
+    /// stored aggregates are published as they are.
+    pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
-            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {
@@ -37417,6 +37419,12 @@ impl Services {
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        self.recompute_and_publish_metrics(workspace_id).await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
             // The step just mutated the worktree, so the cached scan is the
