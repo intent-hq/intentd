@@ -834,7 +834,7 @@ async fn oneshot_receiver_drop_is_handled_gracefully() {
 
 // --- Batch-insert retry on transient failure (monorepo#2673) ---------------
 //
-// `flush_prepared` is the insert-retry + resolve/broadcast core of the writer
+// `flush_prepared` is the insert-retry + broadcast/resolve core of the writer
 // task's `flush_batch`, generic over the insert operation so these tests can
 // inject failures without a real contended pool. `start_paused` auto-advances
 // the retry backoff sleeps.

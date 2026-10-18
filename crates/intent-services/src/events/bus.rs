@@ -566,8 +566,9 @@ impl Drop for Subscription {
 }
 
 /// Writer task: drains events from the inbound channel, batch-persists them in
-/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), resolves each
-/// oneshot with the result, and broadcasts each stored event in order. Stops
+/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), then broadcasts
+/// each stored event in order and only afterwards resolves its oneshot (the
+/// order single-publisher delivery depends on — see [`flush_prepared`]). Stops
 /// when the channel closes (all `EventBus` handles dropped).
 ///
 /// **Latency/batching**: after awaiting the first event, the task greedily
@@ -648,8 +649,13 @@ where
     flush_prepared(|| insert(Arc::clone(&events)), pending, broadcast_tx).await;
 }
 
-/// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
+/// Insert-retry + broadcast/resolve core of [`flush_batch`], generic over the
 /// insert operation so tests can inject failures (monorepo#2673).
+///
+/// On success each stored event is broadcast BEFORE its publisher's oneshot
+/// resolves, so `publish().await` returns only once the event is already on
+/// the channel and the publisher's next (possibly transient) event cannot
+/// overtake it (intent-hq/intent#7296).
 ///
 /// Transient insert failures ([`is_transient_insert_error`]) retry with a
 /// capped exponential backoff ([`INSERT_RETRY_BACKOFF`] doubling up to
