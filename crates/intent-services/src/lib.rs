@@ -20852,23 +20852,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let key = intent_core::pull_request_key(&url)
                 .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
-            let rows = this.store.list_pull_request_workspaces(&key).await?;
-            let mut workspaces: Vec<Workspace> = Vec::with_capacity(rows.len());
-            let mut linked_at: HashMap<WorkspaceId, String> = HashMap::with_capacity(rows.len());
-            for (ws, at) in rows {
-                linked_at.insert(ws.id.clone(), at);
-                workspaces.push(ws);
+            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            // Same membership narrowing as `workspace.list` (§5.48).
+            if let Some(visible) = this.visible_workspace_ids().await? {
+                rows.retain(|row| visible.contains(&row.id));
             }
-            this.retain_member_workspaces(&mut workspaces).await?;
-            Ok(workspaces
-                .into_iter()
-                .map(|ws| intent_core::PullRequestWorkspace {
-                    linked_at: linked_at.remove(&ws.id).unwrap_or_default(),
-                    id: ws.id,
-                    title: ws.title,
-                    archived: ws.archived,
-                })
-                .collect())
+            Ok(rows)
         })
     }
 

@@ -66,7 +66,6 @@ pub enum PullRequestStatus {
     Draft,
 }
 
-/// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
 /// One `workspace.findByPullRequest` result row (§5.1 "Pull request workspace
 /// lookup"): a workspace linked to the requested PR. `linked_at` is when the
 /// daemon first linked this workspace to the PR (RFC 3339); results are
@@ -80,6 +79,7 @@ pub struct PullRequestWorkspace {
     pub linked_at: String,
 }
 
+/// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
 /// (§7.6; TS `PullRequestInfo` in `src/shared/types.ts`). A focused subset of
 /// the TS shape populated from the host-agnostic forge `PullRequest`; required
 /// fields match the TS required set, and absent optionals are omitted from the

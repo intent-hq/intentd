@@ -98,6 +98,12 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // before this row insert). `stored_path` is workspace-relative, so no
     // import rewriting is needed.
     ("attachments", "workspace_id = ?1"),
+    // PR <-> workspace links (0161). Shipped because the import-time insert
+    // triggers only see the current PR snapshot: links for PRs that left the
+    // pool, or that came from git roots (not transferred), would be lost and
+    // every `linked_at` reset. Imported with INSERT OR REPLACE so the
+    // archive's rows win over the ones the workspace insert trigger just made.
+    ("pull_request_workspace", "workspace_id = ?1"),
 ];
 
 /// Tables deliberately **excluded** from a transfer, each with the rationale.
@@ -106,7 +112,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
-    ("pull_request_workspace", "derived by insert triggers from the transferred workspace and git-root PR columns; rebuilt on import"),
+    ("pull_request_workspace_candidate", "write-only trigger funnel; its BEFORE INSERT trigger ignores every row, so it never holds data"),
     ("review_context_private_family", "installation-private denial history; never imported or transferred"),
     ("review_context_enrollment", "installation-private native family; never imported or transferred"),
     ("pr_monitor_message_provenance", "local original-message evidence; never transferable or imported authorization"),
@@ -715,8 +721,13 @@ impl Store {
                     continue;
                 }
                 let placeholders = vec!["?"; columns.len()].join(",");
+                let verb = if *table == "pull_request_workspace" {
+                    "INSERT OR REPLACE"
+                } else {
+                    "INSERT"
+                };
                 let sql = format!(
-                    "INSERT INTO \"{table}\" ({}) VALUES ({placeholders})",
+                    "{verb} INTO \"{table}\" ({}) VALUES ({placeholders})",
                     columns.join(",")
                 );
                 let mut query = sqlx::query(&sql);
@@ -1543,6 +1554,7 @@ mod tests {
             format!("INSERT INTO workspace_context_item (workspace_id, id, ordinal, payload) VALUES ('{ws}', 'ci', 0, '{{}}')"),
             format!("INSERT INTO workspace_ui_context (workspace_id, payload) VALUES ('{ws}', '{{}}')"),
             format!("INSERT INTO attachments (id, workspace_id, file_name, size, uploaded_at, stored_path) VALUES ('at-{ws}', '{ws}', 'f.txt', 3, '{t}', '.intent/attachments/at-{ws}')"),
+            format!("INSERT INTO pull_request_workspace (pr_key, workspace_id, source, linked_at) VALUES ('github.com/o/r/pull/1', '{ws}', 'workspace', '{t}')"),
         ] {
             run(store, sql).await;
         }
@@ -2224,7 +2236,8 @@ workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at
 agent_metrics: agent_id, workspace_id, additions, deletions, files_changed, updated_at
 workspace_context_item: workspace_id, id, ordinal, payload
 workspace_ui_context: workspace_id, payload
-attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path";
+attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path
+pull_request_workspace: pr_key, workspace_id, source, linked_at";
 
     /// Column-drift tripwire: the live columns of every transferred table
     /// must match [`TRANSFERRED_COLUMNS`]. Adding/removing a column on a
