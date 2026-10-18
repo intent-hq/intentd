@@ -192,14 +192,16 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
-const EXPECTED_TOTAL_METHODS: usize = 435;
+// PR workspace lookup (`prWorkspaceLookup: 1`): +1 router method.
+const EXPECTED_TOTAL_METHODS: usize = 436;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+/// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
+const EXPECTED_ROUTER_METHODS: usize = 379;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -900,6 +902,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.export.finalize",
     "workspace.export.read",
     "workspace.export.start",
+    "workspace.findByPullRequest",
     "workspace.findRepositories",
     "workspace.generateSetupScript",
     "workspace.get",
