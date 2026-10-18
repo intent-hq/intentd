@@ -185,6 +185,10 @@ jobs:
           toolchain: ${{ steps.rust.outputs.channel }}
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # Also runs on release PRs, so a release that bumps only part of a
+      # release-plz version_group fails before it merges.
+      - name: Check release version groups are in lockstep
+        run: python3 -I -B scripts/test-version-group.py
 
   cache-smoke:
     if: github.event_name == 'merge_group'
