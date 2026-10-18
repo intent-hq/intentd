@@ -64,15 +64,27 @@ impl DeferralTally {
         }
     }
 
-    /// One WARN per deferred repository, in a stable order.
-    pub(crate) fn log(self) {
-        let mut repos: Vec<_> = self.repos.into_iter().collect();
+    /// One WARN per deferred repository, in a stable order. `deferred_reads`
+    /// drains every deferred background read [`Discovery`] answered since the
+    /// previous summary, including follow-ons (relink discovery, stale-pool
+    /// re-fetch) that do not fail their root or workspace.
+    pub(crate) fn log(self, discovery: &Discovery) {
+        let mut repos: HashMap<RepoRef, (usize, usize, usize)> = self
+            .repos
+            .into_iter()
+            .map(|(repo, (workspaces, roots))| (repo, (workspaces, roots, 0)))
+            .collect();
+        for (repo, reads) in discovery.take_deferred_reads() {
+            repos.entry(repo).or_default().2 += reads;
+        }
+        let mut repos: Vec<_> = repos.into_iter().collect();
         repos.sort_by_cached_key(|(repo, _)| repo.identity_key());
-        for (repo, (workspaces, roots)) in repos {
+        for (repo, (workspaces, roots, deferred_reads)) in repos {
             tracing::warn!(
                 repo = %format_args!("{}/{}", repo.owner, repo.name),
                 workspaces,
                 roots,
+                deferred_reads,
                 "pr refresh: background refresh deferred by request budget; retrying next sweep"
             );
         }
@@ -293,6 +305,9 @@ pub(crate) struct Discovery {
     slots: Slots,
     budget: Arc<Mutex<Budget>>,
     concurrent: Arc<tokio::sync::Semaphore>,
+    // Background reads answered with a budget deferral (fresh or shared from
+    // the slot) since the last sweep summary drained them, per repository.
+    deferred_reads: Arc<Mutex<HashMap<RepoRef, usize>>>,
 }
 
 impl Default for Discovery {
@@ -301,6 +316,7 @@ impl Default for Discovery {
             slots: Arc::default(),
             budget: Arc::default(),
             concurrent: Arc::new(tokio::sync::Semaphore::new(4)),
+            deferred_reads: Arc::default(),
         }
     }
 }
@@ -310,6 +326,19 @@ fn unknown(message: &str) -> Error {
 }
 
 impl Discovery {
+    fn note_deferred_read(&self, repo: &RepoRef) {
+        *self
+            .deferred_reads
+            .lock()
+            .unwrap()
+            .entry(repo.clone())
+            .or_default() += 1;
+    }
+
+    fn take_deferred_reads(&self) -> HashMap<RepoRef, usize> {
+        std::mem::take(&mut *self.deferred_reads.lock().unwrap())
+    }
+
     fn newer_listing(&self, key: &Key, started: Instant) -> bool {
         if key.number.is_none() {
             return false;
@@ -477,6 +506,9 @@ impl Discovery {
                     .is_none_or(|at| cached.finished.is_some_and(|finished| finished >= at))
             {
                 record_reuse(operation, Reuse::CacheHit);
+                if cached.background_deferred && cached.result.is_err() {
+                    self.note_deferred_read(&key.repo);
+                }
                 return cached.result.clone();
             }
         }
@@ -588,8 +620,17 @@ impl Discovery {
             result
         }
         .await;
+        // Up-front and mid-lease budget denials are one condition for every
+        // consumer of this slot: report both as BUDGET_DEFERRED.
+        let result = match result {
+            Err(_) if background_deferred => Err(unknown(BUDGET_DEFERRED)),
+            other => other,
+        };
         if !key.scope.is_current() || revision != slot.revision.load(Ordering::SeqCst) {
             return Err(unknown("PR refresh invalidated during fetch"));
+        }
+        if background_deferred && result.is_err() {
+            self.note_deferred_read(&key.repo);
         }
         *entry = Some(Entry {
             started,

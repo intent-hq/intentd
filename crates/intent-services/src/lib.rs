@@ -5251,7 +5251,7 @@ impl Services {
             &mut deferrals,
         )
         .await;
-        deferrals.log();
+        deferrals.log(&self.pr_discovery);
     }
 
     /// True while the global sweep rate-limit pause window is active
@@ -6403,7 +6403,7 @@ impl Services {
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
-        deferrals.log();
+        deferrals.log(&self.pr_discovery);
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at

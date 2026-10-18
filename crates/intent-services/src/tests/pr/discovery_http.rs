@@ -1798,6 +1798,101 @@ async fn budget_deferral_logs_one_summary_per_repository_not_per_root() {
     assert!(summary.contains("repo=o/r"), "{summary}");
     assert!(summary.contains(&format!("roots={ROOTS}")), "{summary}");
     assert!(summary.contains("workspaces=1"), "{summary}");
+    assert!(
+        summary.contains(&format!("deferred_reads={}", ROOTS + 1)),
+        "one fresh denial plus every slot-shared copy: {summary}"
+    );
+}
+
+/// The lease can also run out mid-listing (here: redirect hops spend all 40
+/// reserved attempts before page nine). That transport-side denial is cached
+/// in the same slot and must be summarized like an up-front deferral.
+#[tokio::test]
+async fn mid_listing_lease_denial_is_summarized_like_an_up_front_deferral() {
+    let api = Api::new((1..=801).map(|n| pull(n, "other")).collect()).await;
+    api.listing_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let mut checkouts = Vec::new();
+    for i in 0..3 {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(
+        counts(&traffic),
+        (40, 0, 0),
+        "one listing spends its whole lease"
+    );
+    assert!(warnings.containing("root refresh failed").is_empty());
+    assert!(warnings.containing("workspace refresh failed").is_empty());
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert!(summaries[0].contains("roots=3"), "{}", summaries[0]);
+    assert!(summaries[0].contains("workspaces=1"), "{}", summaries[0]);
+}
+
+/// A deferral that does not fail its root (relink discovery after the linked
+/// PR merged) still reaches the summary through `deferred_reads` instead of
+/// disappearing at DEBUG, and the root's status delta still persists.
+#[tokio::test]
+async fn relink_discovery_deferral_is_counted_in_the_summary() {
+    let mut merged = pull(42, "root-0");
+    merged["state"] = json!("closed");
+    merged["merged"] = json!(true);
+    merged["merged_at"] = json!("2026-01-02T00:00:00Z");
+    let api = Api::new(vec![merged]).await;
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let checkout = SweepRepo::init("root-0", Some("https://github.com/o/r.git"));
+    let mut root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+    root.pr_number = Some(42);
+    svc.store().upsert_workspace_git_root(&root).await.unwrap();
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        // The linked record is fresh in its slot; only listings are deferred.
+        svc.shared_pr_record(sc.as_ref(), &RepoRef::new("o", "r"), 42)
+            .await
+            .unwrap();
+        svc.pr_discovery.exhaust_budget();
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(counts(&traffic), (0, 1, 0), "only the warm-up record read");
+    assert!(warnings.containing("relink discovery failed").is_empty());
+    assert!(warnings.containing("root refresh failed").is_empty());
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    let summary = &summaries[0];
+    assert!(
+        summary.contains("roots=0"),
+        "the root refresh succeeded: {summary}"
+    );
+    assert!(summary.contains("workspaces=1"), "{summary}");
+    assert!(
+        summary.contains("deferred_reads=3"),
+        "workspace listing, linked listing, relink listing: {summary}"
+    );
+    let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+    assert_eq!(
+        roots[0].pr_status,
+        Some(intent_core::PullRequestStatus::Merged),
+        "the status delta persists despite the deferred relink"
+    );
 }
 
 /// Coalescing is only for budget deferrals: a real per-root failure keeps
