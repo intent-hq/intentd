@@ -26,7 +26,7 @@ RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"route"}
 RUNTIME = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks"},
+    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
@@ -786,9 +786,12 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("python3 -I -B scripts/test-ci-native-routing.py", commands)
         self.assertNotRegex(commands, r"cargo (build|check|clippy|test|nextest|llvm-cov)|pnpm install|npm install")
 
+    def changed_test_base_step(self):
+        return next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
+                    if s.get("name") == "Resolve changed-test base from the event")
+
     def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
-        step = next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
-                    if s.get("name") == "Resolve queue base from the event")
+        step = self.changed_test_base_step()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             stub = root / "git"
@@ -804,10 +807,69 @@ class NativeRoutingTests(unittest.TestCase):
                 output.unlink(missing_ok=True)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
                     env={**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"],
+                         "GITHUB_EVENT_NAME": "merge_group",
                          "QUEUE_BASE_SHA": base, "QUEUE_HEAD_SHA": head, "TEST_HEAD": actual,
                          "FETCH_STATUS": fetch_status, "GITHUB_ENV": str(output)}, capture_output=True)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else "", "BASE_SHA=" + base + "\n" if accepted else "")
+
+    def test_pr_coverage_base_is_the_merge_commit_base_parent(self):
+        step = self.changed_test_base_step()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin, work = root / "origin.git", root / "work"
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+            git = lambda *args: subprocess.run(["git", "-C", str(work), *args], env=env, check=True,
+                                               capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], env=env, check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(work)], env=env, check=True)
+            git("remote", "add", "origin", str(origin))
+            git("commit", "-q", "--allow-empty", "-m", "root")
+            git("checkout", "-q", "-b", "feature")
+            git("commit", "-q", "--allow-empty", "-m", "feature work")
+            git("checkout", "-q", "main")
+            git("commit", "-q", "--allow-empty", "-m", "main advances")
+            synced_main = git("rev-parse", "HEAD")
+            git("checkout", "-q", "feature")
+            # The PR branch tip is itself a merge commit ("merge main into feature").
+            git("merge", "-q", "--no-ff", "-m", "merge main into feature", "main")
+            pr_head = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("commit", "-q", "--allow-empty", "-m", "main advances again")
+            base_tip = git("rev-parse", "HEAD")
+            git("push", "-q", "origin", "main")
+            git("merge", "-q", "--no-ff", "-m", "synthetic PR merge", pr_head)
+            synthetic = git("rev-parse", "HEAD")
+
+            def resolve(checkout, *, head=pr_head, base_ref="main"):
+                git("checkout", "-q", "--detach", checkout)
+                output = root / "env"
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=work,
+                    env={**env, "GITHUB_EVENT_NAME": "pull_request", "PR_BASE_REF": base_ref, "PR_HEAD_SHA": head,
+                         "QUEUE_BASE_SHA": "", "QUEUE_HEAD_SHA": "", "GITHUB_ENV": str(output)},
+                    capture_output=True, text=True)
+                return result, output.read_text() if output.exists() else ""
+
+            for name, checkout, kwargs, expected, message in (
+                ("synthetic merge", synthetic, {}, base_tip, None),
+                ("PR head that is itself a merge", pr_head, {}, synced_main, None),
+                ("unrelated checkout", synthetic, {"head": base_tip}, None, "unexpected checkout"),
+                ("empty PR head", synthetic, {"head": ""}, None, "PR head unknown"),
+                ("empty base ref", pr_head, {"base_ref": ""}, None, "PR_BASE_REF is empty"),
+                ("missing base branch", pr_head, {"base_ref": "missing-branch"}, None, None),
+            ):
+                with self.subTest(name):
+                    result, written = resolve(checkout, **kwargs)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assertEqual(written, "")
+                        if message:
+                            self.assertIn(message, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(written, f"BASE_SHA={expected}\n")
 
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]
