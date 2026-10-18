@@ -2,7 +2,7 @@
 //! (`tracked_changes`, intent-hq/intent#7266).
 //!
 //! An attribution row only means something while its path is a change git can
-//! stage or commit. Two questions decide that, and both must be answered by the
+//! stage or commit. Each check below is answered by the
 //! repository that actually owns the path — a file inside a submodule is
 //! governed by the submodule's own `.gitignore` and index, which the
 //! superproject's status never reports:
