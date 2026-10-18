@@ -20609,11 +20609,10 @@ async fn wss_workspace_import_lifecycle() {
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
-    // Manifest must carry the exact intentd version (workspace-synchronized
-    // crate versions make CARGO_PKG_VERSION valid here).
+    // Manifest must carry the exact version the importer checks.
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -20884,7 +20883,8 @@ async fn wss_workspace_import_lifecycle() {
     );
     let msg = rejected["error"]["message"].as_str().expect("message");
     assert!(
-        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        msg.contains("0.0.1-elsewhere")
+            && msg.contains(intent_core::transfer::CREATING_INTENTD_VERSION),
         "error names both versions: {msg}"
     );
 
@@ -21279,7 +21279,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],

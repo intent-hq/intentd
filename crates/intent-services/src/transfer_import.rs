@@ -105,7 +105,7 @@ impl Services {
                 manifest.format_version, TRANSFER_FORMAT_VERSION
             )));
         }
-        let own_version = env!("CARGO_PKG_VERSION");
+        let own_version = intent_core::transfer::CREATING_INTENTD_VERSION;
         if manifest.creating_intentd_version != own_version {
             return Err(Error::InvalidParams(format!(
                 "archive was created by intentd {} but this daemon is {} — versions must match exactly",
@@ -2140,7 +2140,7 @@ mod tests {
     fn manifest(ws: &WorkspaceId) -> TransferManifest {
         TransferManifest {
             format_version: TRANSFER_FORMAT_VERSION,
-            creating_intentd_version: env!("CARGO_PKG_VERSION").to_string(),
+            creating_intentd_version: intent_core::transfer::CREATING_INTENTD_VERSION.to_string(),
             workspace_id: ws.clone(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
             tables: vec![],
@@ -4089,7 +4089,10 @@ mod tests {
             .await
             .expect_err("version");
         let msg = err.to_string();
-        assert!(msg.contains("0.0.1-other") && msg.contains(env!("CARGO_PKG_VERSION")));
+        assert!(
+            msg.contains("0.0.1-other")
+                && msg.contains(intent_core::transfer::CREATING_INTENTD_VERSION)
+        );
 
         let chief = manifest(&WorkspaceId::chief());
         assert!(svc

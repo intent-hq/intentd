@@ -175,7 +175,7 @@ async fn import_case(root: &Path, contract: &Value, case: &Value, fault: &str) -
     let agent = AgentId::from("agent-import-contract");
     let timestamp = "2026-01-01T00:00:00Z";
     let manifest = json!({
-        "formatVersion": 1, "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "formatVersion": 1, "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": workspace.0, "createdAt": timestamp,
         "tables": [], "assets": [], "attachments": [],
         "git": {"hasRepository": false, "dirtyFiles": [], "sandboxBranches": [], "submodules": []}

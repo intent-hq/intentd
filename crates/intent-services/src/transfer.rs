@@ -172,7 +172,7 @@ impl Services {
 
         let manifest = TransferManifest {
             format_version: TRANSFER_FORMAT_VERSION,
-            creating_intentd_version: env!("CARGO_PKG_VERSION").to_string(),
+            creating_intentd_version: intent_core::transfer::CREATING_INTENTD_VERSION.to_string(),
             workspace_id: id,
             created_at: now_iso(),
             tables,
@@ -645,7 +645,10 @@ mod tests {
             m.format_version,
             intent_core::transfer::TRANSFER_FORMAT_VERSION
         );
-        assert_eq!(m.creating_intentd_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            m.creating_intentd_version,
+            intent_core::transfer::CREATING_INTENTD_VERSION
+        );
         assert_eq!(m.workspace_id, ws);
         assert!(m.tables.iter().all(|t| t.name != "event"));
         let table = |n: &str| m.tables.iter().find(|t| t.name == n).expect("table");
