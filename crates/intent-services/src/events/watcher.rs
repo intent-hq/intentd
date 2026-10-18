@@ -322,7 +322,6 @@ pub(super) struct GitignoreMatcher {
     /// [`whitelist_prefixes`]): an ignored directory on the way to (or
     /// beneath) one may still hold a path a negation re-includes, so
     /// [`Self::ignores_dir`] does not report it.
-    #[cfg_attr(not(target_os = "linux"), expect(dead_code))]
     whitelist_prefixes: Vec<PathBuf>,
     dirty: bool,
 }
