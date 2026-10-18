@@ -251,6 +251,18 @@ fn build_uri_single_host() {
 }
 
 #[test]
+fn build_uri_accepts_hostname() {
+    // `intentd pair --host localhost` (intent-hq/intent#7243): a hostname,
+    // not just an IP literal, passes through unchanged.
+    let hosts = vec!["localhost".to_string()];
+    let uri = build_pairing_uri(&hosts, 5181, "AA:BB", "tok", None);
+    assert_eq!(
+        uri,
+        "intent://pair?v=1&host=localhost&port=5181&fp=AA:BB&token=tok"
+    );
+}
+
+#[test]
 fn build_uri_percent_encodes_reserved_characters() {
     // Generated values pass through unchanged (hex, colons, dots), but an
     // env-injected token with reserved characters must not break the query.

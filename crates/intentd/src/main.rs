@@ -203,7 +203,10 @@ enum Command {
     /// multi-select bind-address picker (persisted to `server.bindAddress`:
     /// a single IP as a string, several as a list), or unattended with
     /// `--yes` (keeps the persisted bind address; default loopback);
-    /// non-interactive runs without `--yes` refuse instead.
+    /// non-interactive runs without `--yes` refuse instead. `--host` names
+    /// the address clients dial instead, which also pairs a loopback-only
+    /// daemon (e.g. `--host localhost` for the Windows app and a daemon in
+    /// WSL).
     Pair {
         /// Also write the QR code as a PNG image to this path.
         #[arg(long, value_name = "PATH")]
@@ -221,7 +224,7 @@ enum Command {
         /// effective posture. Never re-pairs (no new token, no QR); requires
         /// a running daemon. Reads the selection from stdin (one line), so
         /// it also works piped.
-        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate"])]
+        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate", "host"])]
         select_endpoints: bool,
         /// Mint and persist a NEW bearer token (replacing the old one) before
         /// printing, via `server.rotateToken` — only after the listener is
@@ -230,6 +233,15 @@ enum Command {
         /// token is fixed by its `INTENTD_AUTH_TOKEN` env var.
         #[arg(long)]
         rotate: bool,
+        /// Host clients should dial — an IP or hostname — used in place of
+        /// the addresses the daemon advertises. Prints the URL, token, and
+        /// fingerprint even when the listener is bound to loopback only, for
+        /// clients that reach this machine through a local forward: e.g.
+        /// `--host localhost` when the Intent Windows app connects to an
+        /// intentd running in WSL, or the local end of an SSH port forward.
+        /// The value is not checked for reachability.
+        #[arg(long, value_name = "HOST", value_parser = parse_pair_host)]
+        host: Option<String>,
     },
     /// Daemon-backed git credential helper (monorepo#884): speaks the
     /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
@@ -422,11 +434,15 @@ async fn async_main(cli: Cli) -> ExitCode {
                 yes,
                 select_endpoints,
                 rotate,
+                host,
             } => {
                 if select_endpoints {
                     to_exit(cmd_pair_select_endpoints().await)
                 } else {
-                    to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+                    to_exit(
+                        cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate, host.as_deref())
+                            .await,
+                    )
                 }
             }
             Command::GitCredential { operation } => cmd_git_credential(&operation).await,
@@ -1090,6 +1106,166 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate an `intentd pair --host` value: a non-empty single host with no
+/// whitespace and no comma — the `intent://pair` `host=` param is a
+/// comma-separated list, so a comma would silently split it into two hosts.
+fn parse_pair_host(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("host must not be empty".to_string());
+    }
+    if value.contains(',') {
+        return Err("host must be a single host (no commas)".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("host must not contain whitespace".to_string());
+    }
+    Ok(value.to_string())
+}
+
+/// The pairing material `intentd pair` prints, from either source:
+/// `pairing.getInfo` (daemon-advertised hosts) or `server.pairingInfo` plus
+/// an operator-chosen `--host`.
+struct PairingPayload {
+    uri: String,
+    token: String,
+    fingerprint: String,
+    tc_address: Option<String>,
+    /// `Some((host, port))` only for `--host`, which prints them as their own
+    /// lines for the desktop app's manual host/port/token form.
+    host_port: Option<(String, u16)>,
+}
+
+/// Enable external connections for pairing when the listener is down:
+/// `--yes` (or an unattended run) keeps the persisted server.bindAddress /
+/// server.tunnel.* (default: loopback, tunnel off); otherwise a consent
+/// prompt, then the listen-target picker.
+async fn enable_listener_for_pairing(socket: &Path, yes: bool) -> anyhow::Result<()> {
+    let changes = if yes {
+        Vec::new()
+    } else {
+        if !confirm_enable_wss()? {
+            anyhow::bail!(
+                "pairing requires external connections to be enabled — enable them \
+                 later with `intentd pair --yes` or via server.wsApi.enabled in \
+                 config.toml"
+            );
+        }
+        // Multi-select pre-checked from the persisted state; an unchanged
+        // selection writes nothing so the stored shapes stay untouched.
+        let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
+        let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
+        let current = current_bind_addresses(socket).await;
+        let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
+        listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
+    };
+    enable_wss_listener(socket, &changes).await
+}
+
+/// Default `intentd pair`: the daemon's `pairing.getInfo` payload, whose
+/// hosts are the daemon-advertised dialable set (loopback never included).
+async fn pairing_payload_from_get_info(
+    socket: &Path,
+    yes: bool,
+    rotate: bool,
+) -> anyhow::Result<PairingPayload> {
+    let mut response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
+    if response.get("error").is_some_and(is_listener_down_error) {
+        enable_listener_for_pairing(socket, yes).await?;
+        response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
+    }
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
+    }
+    if rotate {
+        rotate_pairing_token(socket).await?;
+        // Re-fetch so the printed payload embeds the NEW token.
+        response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
+        }
+    }
+    let result = &response["result"];
+    let field = |name: &str| {
+        result[name]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `{name}`"))
+    };
+    Ok(PairingPayload {
+        uri: field("uri")?,
+        token: field("token")?,
+        fingerprint: field("fingerprint")?,
+        tc_address: result["tcAddress"].as_str().map(str::to_string),
+        host_port: None,
+    })
+}
+
+/// Read `server.pairingInfo` (local-only: same token/fingerprint/port sources
+/// as `pairing.getInfo`, but no dialable-route check), returning the result
+/// object.
+async fn server_pairing_info(socket: &Path) -> anyhow::Result<Value> {
+    let response = rpc_call(socket, "server.pairingInfo", json!({})).await?;
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("server.pairingInfo failed: {}", rpc_error_text(error));
+    }
+    Ok(response["result"].clone())
+}
+
+/// `intentd pair --host <HOST>` (intent-hq/intent#7243): pair through an
+/// operator-chosen host instead of the daemon-advertised set, so a
+/// loopback-only daemon reached through a local forward (Windows → WSL
+/// `localhost`, an SSH tunnel) can be paired. A `null` port is the
+/// listener-down signal and runs the same enable flow as the default path.
+async fn pairing_payload_for_host(
+    socket: &Path,
+    host: &str,
+    yes: bool,
+    rotate: bool,
+) -> anyhow::Result<PairingPayload> {
+    let mut info = server_pairing_info(socket).await?;
+    if info["port"].is_null() {
+        enable_listener_for_pairing(socket, yes).await?;
+        info = server_pairing_info(socket).await?;
+    }
+    if rotate {
+        rotate_pairing_token(socket).await?;
+        // Re-fetch so the printed payload embeds the NEW token.
+        info = server_pairing_info(socket).await?;
+    }
+    let port = info["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the external-connection listener is not running (server.pairingInfo \
+                 reported no port)"
+            )
+        })?;
+    let field = |name: &str| {
+        info[name]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("malformed server.pairingInfo result: missing `{name}`"))
+    };
+    let token = field("token")?;
+    let fingerprint = field("certFingerprint")?;
+    let tc_address = info["tcAddress"].as_str().map(str::to_string);
+    let uri = intent_transport::pairing::build_pairing_uri(
+        &[host.to_string()],
+        port,
+        &fingerprint,
+        &token,
+        tc_address.as_deref(),
+    );
+    Ok(PairingPayload {
+        uri,
+        token,
+        fingerprint,
+        tc_address,
+        host_port: Some((host.to_string(), port)),
+    })
+}
+
 /// Print the full pairing credentials (§5.2/§5.3): the LAN pairing QR code,
 /// then labeled URL / Token / Fingerprint lines, each with a one-line usage
 /// note. Queries `pairing.getInfo` over UDS — so every value comes from the
@@ -1107,65 +1283,28 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
 /// confirmed up (pairing info is obtainable), so a declined enable prompt (or
 /// a non-TTY run without `--yes`) never invalidates existing clients' tokens
 /// while exiting without a usable payload. The token is never logged via
-/// `tracing`; all credential lines go to stdout.
+/// `tracing`; all credential lines go to stdout. With `host`
+/// ([`pairing_payload_for_host`]) the payload names that host instead of the
+/// daemon-advertised set, so a loopback-only daemon can be paired.
 async fn cmd_pair(
     png: Option<&Path>,
     svg: Option<&Path>,
     yes: bool,
     rotate: bool,
+    host: Option<&str>,
 ) -> anyhow::Result<()> {
     let config = resolve_config()?;
-    let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-    if response.get("error").is_some_and(is_listener_down_error) {
-        // Interactive path: consent prompt, then the listen-target picker.
-        // `--yes` (or an unattended run) skips both and keeps the persisted
-        // server.bindAddress / server.tunnel.* (default: loopback, tunnel
-        // off).
-        let changes = if yes {
-            Vec::new()
-        } else {
-            if !confirm_enable_wss()? {
-                anyhow::bail!(
-                    "pairing requires external connections to be enabled — enable them \
-                     later with `intentd pair --yes` or via server.wsApi.enabled in \
-                     config.toml"
-                );
-            }
-            // Multi-select pre-checked from the persisted state; an
-            // unchanged selection writes nothing so the stored shapes stay
-            // untouched.
-            let tunnel_enabled =
-                current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
-            let tunnel_only =
-                current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
-            let current = current_bind_addresses(&config.socket_path).await;
-            let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
-            listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
-        };
-        enable_wss_listener(&config.socket_path, &changes).await?;
-        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-    }
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-    }
-    if rotate {
-        rotate_pairing_token(&config.socket_path).await?;
-        // Re-fetch so the printed payload embeds the NEW token.
-        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-        }
-    }
-    let result = &response["result"];
-    let uri = result["uri"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `uri`"))?;
-    let token = result["token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `token`"))?;
-    let fingerprint = result["fingerprint"].as_str().ok_or_else(|| {
-        anyhow::anyhow!("malformed pairing.getInfo result: missing `fingerprint`")
-    })?;
+    let payload = match host {
+        None => pairing_payload_from_get_info(&config.socket_path, yes, rotate).await?,
+        Some(host) => pairing_payload_for_host(&config.socket_path, host, yes, rotate).await?,
+    };
+    let PairingPayload {
+        uri,
+        token,
+        fingerprint,
+        tc_address,
+        host_port,
+    } = payload;
 
     let code = qrcode::QrCode::new(uri.as_bytes())
         .map_err(|e| anyhow::anyhow!("cannot encode pairing payload as a QR code: {e}"))?;
@@ -1179,11 +1318,18 @@ async fn cmd_pair(
     println!();
     println!("URL:         {uri}");
     println!("             Same payload as the QR code — paste it into a client that can't scan.");
+    if let Some((host, port)) = &host_port {
+        println!("Host:        {host}");
+        println!("Port:        {port}");
+        println!(
+            "             Host and port to enter in the desktop app's remote-connection dialog."
+        );
+    }
     println!("Token:       {token}");
     println!("             Bearer token — enter it (with host + port) in the desktop app's remote-connection dialog.");
     println!("Fingerprint: {fingerprint}");
     println!("             TLS certificate fingerprint — confirm the client shows this exact value before trusting the connection.");
-    if let Some(tc) = result["tcAddress"].as_str() {
+    if let Some(tc) = &tc_address {
         println!("Tunnel:      {tc}");
         println!("             Tailcat tunnel address — reachable from other networks; embedded in the QR payload as tc=.");
     }
@@ -9816,6 +9962,16 @@ for line in sys.stdin:
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
         assert!(should_resume_on_start(false, false, R::Auto, false));
         assert!(!should_resume_on_start(false, false, R::Auto, true));
+    }
+
+    #[test]
+    fn parse_pair_host_accepts_single_hosts_and_rejects_list_breakers() {
+        for ok in ["localhost", "127.0.0.1", "my-box.local", "::1"] {
+            assert_eq!(parse_pair_host(ok).as_deref(), Ok(ok));
+        }
+        for bad in ["", "a,b", "local host", "host\t", "\nhost"] {
+            assert!(parse_pair_host(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]
