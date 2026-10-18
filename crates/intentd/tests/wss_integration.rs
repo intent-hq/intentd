@@ -19364,9 +19364,10 @@ async fn wss_workspace_transfer_plan_round_trip() {
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
     assert_eq!(manifest["formatVersion"], 2, "{resp}");
-    assert!(
-        manifest["creatingIntentdVersion"].is_string(),
-        "manifest records the creating daemon version: {resp}"
+    assert_eq!(
+        manifest["creatingIntentdVersion"],
+        intent_core::transfer::CREATING_INTENTD_VERSION,
+        "export records the version import requires: {resp}"
     );
     assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
     let tables = manifest["tables"].as_array().expect("tables array");

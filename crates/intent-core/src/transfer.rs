@@ -12,12 +12,14 @@ use crate::ids::WorkspaceId;
 /// whose format version it does not understand.
 pub const TRANSFER_FORMAT_VERSION: u32 = 2;
 
-/// The daemon version written to and required in
+/// The version written to and required in
 /// [`TransferManifest::creating_intentd_version`]. Export, the import check and
-/// every test manifest must use this one constant: `env!("CARGO_PKG_VERSION")`
-/// expands to the version of whichever crate it appears in, and the crates'
-/// versions can drift apart in a release (the intentd binary crate once reached
-/// 0.11.6 while the libraries stayed on 0.11.5). Enforced by
+/// every test manifest must use this one constant, because
+/// `env!("CARGO_PKG_VERSION")` expands to the version of whichever crate it
+/// appears in and crate versions can drift apart in a release. Release #2464
+/// left the intentd binary crate at 0.11.6 and the libraries at 0.11.5.
+/// The value is the library crates' shared version, which can differ from the
+/// binary's reported version while such drift lasts. Enforced by
 /// `crates/intent-core/tests/transfer_version_source_lint.rs`.
 pub const CREATING_INTENTD_VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use intent_core::transfer::{
     TransferAsset, TransferAttachment, TransferGitSummary, TransferManifest, TransferPlan,
-    TransferSubmoduleSummary, TransferTableStat, TransferWarning, TRANSFER_FORMAT_VERSION,
+    TransferSubmoduleSummary, TransferTableStat, TransferWarning, CREATING_INTENTD_VERSION,
+    TRANSFER_FORMAT_VERSION,
 };
 use intent_core::{clock::now_iso, Error, Result, Workspace, WorkspaceId};
 use intent_store::SandboxStatus;
@@ -172,7 +173,7 @@ impl Services {
 
         let manifest = TransferManifest {
             format_version: TRANSFER_FORMAT_VERSION,
-            creating_intentd_version: intent_core::transfer::CREATING_INTENTD_VERSION.to_string(),
+            creating_intentd_version: CREATING_INTENTD_VERSION.to_string(),
             workspace_id: id,
             created_at: now_iso(),
             tables,
