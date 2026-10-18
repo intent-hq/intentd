@@ -613,7 +613,8 @@ command fails with guidance.
 The payload only advertises addresses another device can dial, so a daemon listening
 on loopback only (the default `server.bindAddress`, `127.0.0.1`) with no tunnel has
 nothing to advertise and `pair` refuses. When the client reaches this machine through
-a local forward instead, name the host it dials with `--host`: `pair` then prints the
+a local forward on the same port instead, name the host it dials with `--host` (an IP
+address or hostname; the port always comes from the daemon): `pair` then prints the
 URL, a `Host:`/`Port:` pair, the token, and the fingerprint for that host (read via
 `server.pairingInfo`). `--host` works with `--yes`, `--rotate`, `--png`, and `--svg`.
 

@@ -669,6 +669,11 @@ async fn pair_with_host_pairs_loopback_only_daemon() {
         stdout.contains('\u{2588}'),
         "pair --host still renders the QR code: {stdout}"
     );
+    assert!(
+        stdout.contains("localhost only works for clients on this machine")
+            && !stdout.contains("Scan with the Intent iOS app"),
+        "a loopback --host replaces the phone-scan invitation with a local-only note: {stdout}"
+    );
 
     // Without --host the same daemon still refuses (unchanged behavior).
     let plain = run_pair(&data_dir, &[]);
@@ -732,6 +737,8 @@ async fn pair_host_rejects_invalid_values() {
         ("", "must not be empty"),
         ("localhost,10.0.0.5", "no commas"),
         ("local host", "must not contain whitespace"),
+        ("localhost:9000", "without a port"),
+        ("[::1]", "without a port"),
     ] {
         let output = run_pair(&data_dir, &["--host", value]);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -924,29 +931,35 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     await_socket(&mut daemon, &socket).await;
     let before = await_stored_token(&data_dir).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--rotate")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair --rotate without listener");
+    // Both pairing sources share one fetch sequence: the default
+    // (`pairing.getInfo`) and `--host` (`server.pairingInfo`, PR #2486
+    // review) must each refuse before rotating.
+    for extra in [&[][..], &["--host", "localhost"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .arg("--rotate")
+            .args(extra)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd pair --rotate without listener");
 
-    assert!(
-        !output.status.success(),
-        "pair --rotate must fail when the enable path refuses"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("re-run with --yes"),
-        "should point at --yes: {stderr}"
-    );
+        assert!(
+            !output.status.success(),
+            "pair --rotate {extra:?} must fail when the enable path refuses"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("re-run with --yes"),
+            "{extra:?} should point at --yes: {stderr}"
+        );
 
-    let after = stored_token(&data_dir).expect("stored token after declined run");
-    assert_eq!(
-        before, after,
-        "declined enable must not rotate the stored token"
-    );
+        let after = stored_token(&data_dir).expect("stored token after declined run");
+        assert_eq!(
+            before, after,
+            "declined enable must not rotate the stored token ({extra:?})"
+        );
+    }
 }
 
 /// Run `intentd pair --select-endpoints` with `input` piped to stdin (the

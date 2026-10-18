@@ -236,10 +236,11 @@ enum Command {
         /// Host clients should dial — an IP or hostname — used in place of
         /// the addresses the daemon advertises. Prints the URL, token, and
         /// fingerprint even when the listener is bound to loopback only, for
-        /// clients that reach this machine through a local forward: e.g.
-        /// `--host localhost` when the Intent Windows app connects to an
-        /// intentd running in WSL, or the local end of an SSH port forward.
-        /// The value is not checked for reachability.
+        /// clients that reach this machine through a local forward on the
+        /// same port: e.g. `--host localhost` when the Intent Windows app
+        /// connects to an intentd running in WSL. Takes an IP address or a
+        /// hostname only — the port always comes from the daemon. The value
+        /// is not checked for reachability.
         #[arg(long, value_name = "HOST", value_parser = parse_pair_host)]
         host: Option<String>,
     },
@@ -1106,12 +1107,18 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate an `intentd pair --host` value: a non-empty single host with no
-/// whitespace and no comma — the `intent://pair` `host=` param is a
-/// comma-separated list, so a comma would silently split it into two hosts.
+/// Validate an `intentd pair --host` value: a bare IP literal (IPv6 without
+/// brackets, as `pairing.getInfo` advertises it) or a DNS hostname (ASCII
+/// letters, digits, `-`, dot-separated non-empty labels). Everything else is
+/// rejected up front because it would build a payload clients cannot dial: a
+/// comma splits the comma-separated `host=` list, and `host:port`, `[::1]`,
+/// or a URL would be combined with the payload's own `port=`.
 fn parse_pair_host(value: &str) -> Result<String, String> {
     if value.is_empty() {
         return Err("host must not be empty".to_string());
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(value.to_string());
     }
     if value.contains(',') {
         return Err("host must be a single host (no commas)".to_string());
@@ -1119,7 +1126,31 @@ fn parse_pair_host(value: &str) -> Result<String, String> {
     if value.chars().any(char::is_whitespace) {
         return Err("host must not contain whitespace".to_string());
     }
+    let valid_hostname = value.trim_end_matches('.').split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    if !valid_hostname {
+        return Err(
+            "host must be an IP address or a hostname, without a port, brackets, or scheme \
+             (the port comes from the daemon)"
+                .to_string(),
+        );
+    }
     Ok(value.to_string())
+}
+
+/// True for hosts only the pairing machine itself (or its local forwards,
+/// e.g. Windows → WSL) can dial: `localhost` and loopback IP literals.
+fn is_loopback_pair_host(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The pairing material `intentd pair` prints, from either source:
@@ -1161,6 +1192,49 @@ async fn enable_listener_for_pairing(socket: &Path, yes: bool) -> anyhow::Result
     enable_wss_listener(socket, &changes).await
 }
 
+/// The one fetch sequence both `intentd pair` sources share, so their
+/// ordering cannot drift: query `method`; when `listener_down` says the WSS
+/// listener is off, run the enable flow and query again; fail on an error
+/// or a listener that is STILL down; only then rotate (so a failed enable
+/// never invalidates existing clients' tokens) and re-query so the result
+/// carries the new token. Returns the `result` object.
+async fn fetch_pairing_result(
+    socket: &Path,
+    method: &str,
+    yes: bool,
+    rotate: bool,
+    listener_down: fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    let mut response = rpc_call(socket, method, json!({})).await?;
+    if listener_down(&response) {
+        enable_listener_for_pairing(socket, yes).await?;
+        response = rpc_call(socket, method, json!({})).await?;
+    }
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{method} failed: {}", rpc_error_text(error));
+    }
+    if listener_down(&response) {
+        anyhow::bail!("{method} failed: the external-connection listener is not running");
+    }
+    if rotate {
+        rotate_pairing_token(socket).await?;
+        response = rpc_call(socket, method, json!({})).await?;
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("{method} failed: {}", rpc_error_text(error));
+        }
+    }
+    Ok(response["result"].clone())
+}
+
+/// A required string field of a pairing result, or a "malformed" error
+/// naming the method.
+fn pairing_str_field(result: &Value, method: &str, name: &str) -> anyhow::Result<String> {
+    result[name]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("malformed {method} result: missing `{name}`"))
+}
+
 /// Default `intentd pair`: the daemon's `pairing.getInfo` payload, whose
 /// hosts are the daemon-advertised dialable set (loopback never included).
 async fn pairing_payload_from_get_info(
@@ -1168,88 +1242,46 @@ async fn pairing_payload_from_get_info(
     yes: bool,
     rotate: bool,
 ) -> anyhow::Result<PairingPayload> {
-    let mut response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
-    if response.get("error").is_some_and(is_listener_down_error) {
-        enable_listener_for_pairing(socket, yes).await?;
-        response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
-    }
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-    }
-    if rotate {
-        rotate_pairing_token(socket).await?;
-        // Re-fetch so the printed payload embeds the NEW token.
-        response = rpc_call(socket, "pairing.getInfo", json!({})).await?;
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-        }
-    }
-    let result = &response["result"];
-    let field = |name: &str| {
-        result[name]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `{name}`"))
-    };
+    const METHOD: &str = "pairing.getInfo";
+    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+        response.get("error").is_some_and(is_listener_down_error)
+    })
+    .await?;
     Ok(PairingPayload {
-        uri: field("uri")?,
-        token: field("token")?,
-        fingerprint: field("fingerprint")?,
+        uri: pairing_str_field(&result, METHOD, "uri")?,
+        token: pairing_str_field(&result, METHOD, "token")?,
+        fingerprint: pairing_str_field(&result, METHOD, "fingerprint")?,
         tc_address: result["tcAddress"].as_str().map(str::to_string),
         host_port: None,
     })
 }
 
-/// Read `server.pairingInfo` (local-only: same token/fingerprint/port sources
-/// as `pairing.getInfo`, but no dialable-route check), returning the result
-/// object.
-async fn server_pairing_info(socket: &Path) -> anyhow::Result<Value> {
-    let response = rpc_call(socket, "server.pairingInfo", json!({})).await?;
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("server.pairingInfo failed: {}", rpc_error_text(error));
-    }
-    Ok(response["result"].clone())
-}
-
 /// `intentd pair --host <HOST>` (intent-hq/intent#7243): pair through an
 /// operator-chosen host instead of the daemon-advertised set, so a
-/// loopback-only daemon reached through a local forward (Windows → WSL
-/// `localhost`, an SSH tunnel) can be paired. A `null` port is the
-/// listener-down signal and runs the same enable flow as the default path.
+/// loopback-only daemon reached through a local forward (the Windows app →
+/// an intentd in WSL via `localhost`) can be paired. Reads
+/// `server.pairingInfo` — local-only, the same token/fingerprint/port sources
+/// as `pairing.getInfo`, but no dialable-route check — whose `port: null` is
+/// the listener-down signal. The payload is built with the daemon's own
+/// [`intent_transport::pairing::build_pairing_uri`].
 async fn pairing_payload_for_host(
     socket: &Path,
     host: &str,
     yes: bool,
     rotate: bool,
 ) -> anyhow::Result<PairingPayload> {
-    let mut info = server_pairing_info(socket).await?;
-    if info["port"].is_null() {
-        enable_listener_for_pairing(socket, yes).await?;
-        info = server_pairing_info(socket).await?;
-    }
-    if rotate {
-        rotate_pairing_token(socket).await?;
-        // Re-fetch so the printed payload embeds the NEW token.
-        info = server_pairing_info(socket).await?;
-    }
-    let port = info["port"]
+    const METHOD: &str = "server.pairingInfo";
+    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+        response.get("error").is_none() && response["result"]["port"].is_null()
+    })
+    .await?;
+    let port = result["port"]
         .as_u64()
         .and_then(|p| u16::try_from(p).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the external-connection listener is not running (server.pairingInfo \
-                 reported no port)"
-            )
-        })?;
-    let field = |name: &str| {
-        info[name]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("malformed server.pairingInfo result: missing `{name}`"))
-    };
-    let token = field("token")?;
-    let fingerprint = field("certFingerprint")?;
-    let tc_address = info["tcAddress"].as_str().map(str::to_string);
+        .ok_or_else(|| anyhow::anyhow!("malformed {METHOD} result: invalid `port`"))?;
+    let token = pairing_str_field(&result, METHOD, "token")?;
+    let fingerprint = pairing_str_field(&result, METHOD, "certFingerprint")?;
+    let tc_address = result["tcAddress"].as_str().map(str::to_string);
     let uri = intent_transport::pairing::build_pairing_uri(
         &[host.to_string()],
         port,
@@ -1266,26 +1298,27 @@ async fn pairing_payload_for_host(
     })
 }
 
-/// Print the full pairing credentials (§5.2/§5.3): the LAN pairing QR code,
-/// then labeled URL / Token / Fingerprint lines, each with a one-line usage
-/// note. Queries `pairing.getInfo` over UDS — so every value comes from the
-/// exact same hosts/fingerprint/token sources the daemon serves via
-/// `server.pairingInfo` — and renders the `intent://pair?…` payload URI as a
-/// QR code in half-height unicode blocks. When external connections (the WSS
-/// listener) are disabled, offers to enable them (prompt, or unattended via
-/// `yes`) through `settings.update` and retries the query — the interactive
-/// path also asks WHERE to listen ([`prompt_listen_targets`]: a multi-select
-/// over interfaces plus an exclusive all-interfaces 0.0.0.0 entry and the
-/// tailcat tunnel, persisted to `server.bindAddress` / `server.tunnel.*` in
-/// the same batch), while `--yes`/unattended keeps the persisted values
-/// (default: loopback, tunnel off). `rotate` mints a
-/// new token via [`rotate_pairing_token`] — only AFTER the listener is
-/// confirmed up (pairing info is obtainable), so a declined enable prompt (or
-/// a non-TTY run without `--yes`) never invalidates existing clients' tokens
-/// while exiting without a usable payload. The token is never logged via
-/// `tracing`; all credential lines go to stdout. With `host`
-/// ([`pairing_payload_for_host`]) the payload names that host instead of the
-/// daemon-advertised set, so a loopback-only daemon can be paired.
+/// Print the full pairing credentials (§5.2/§5.3): the pairing QR code, then
+/// labeled URL / Token / Fingerprint lines, each with a one-line usage note,
+/// and renders the `intent://pair?…` payload URI as a QR code in half-height
+/// unicode blocks. Without `host` it queries `pairing.getInfo` over UDS, so
+/// the hosts are the daemon-advertised dialable set; with `host` it reads
+/// `server.pairingInfo` and builds the payload for that host
+/// ([`pairing_payload_for_host`]), so a loopback-only daemon can be paired —
+/// either way token/fingerprint/port come from the sources the daemon serves.
+/// Both go through [`fetch_pairing_result`]: when external connections (the
+/// WSS listener) are disabled, it offers to enable them (prompt, or
+/// unattended via `yes`) through `settings.update` and retries the query —
+/// the interactive path also asks WHERE to listen ([`prompt_listen_targets`]:
+/// a multi-select over interfaces plus an exclusive all-interfaces 0.0.0.0
+/// entry and the tailcat tunnel, persisted to `server.bindAddress` /
+/// `server.tunnel.*` in the same batch), while `--yes`/unattended keeps the
+/// persisted values (default: loopback, tunnel off). `rotate` mints a new
+/// token via [`rotate_pairing_token`] — only AFTER the listener is confirmed
+/// up, so a declined enable prompt (or a non-TTY run without `--yes`) never
+/// invalidates existing clients' tokens while exiting without a usable
+/// payload. The token is never logged via `tracing`; all credential lines go
+/// to stdout.
 async fn cmd_pair(
     png: Option<&Path>,
     svg: Option<&Path>,
@@ -1314,7 +1347,15 @@ async fn cmd_pair(
         .build();
     println!("{art}");
     println!();
-    println!("  Scan with the Intent iOS app to pair this device automatically.");
+    match &host_port {
+        // A loopback host is only dialable from this machine and its local
+        // forwards (e.g. the Windows app → WSL), never from a phone.
+        Some((host, _)) if is_loopback_pair_host(host) => println!(
+            "  {host} only works for clients on this machine or reaching it through a \
+             local forward (e.g. Windows → WSL) — not for the Intent iOS app."
+        ),
+        _ => println!("  Scan with the Intent iOS app to pair this device automatically."),
+    }
     println!();
     println!("URL:         {uri}");
     println!("             Same payload as the QR code — paste it into a client that can't scan.");
@@ -9966,11 +10007,54 @@ for line in sys.stdin:
 
     #[test]
     fn parse_pair_host_accepts_single_hosts_and_rejects_list_breakers() {
-        for ok in ["localhost", "127.0.0.1", "my-box.local", "::1"] {
+        for ok in [
+            "localhost",
+            "127.0.0.1",
+            "my-box.local",
+            "my-box.local.",
+            "::1",
+            "fd00::7",
+            "wsl-host-01",
+        ] {
             assert_eq!(parse_pair_host(ok).as_deref(), Ok(ok));
         }
-        for bad in ["", "a,b", "local host", "host\t", "\nhost"] {
+        for bad in [
+            "",
+            "a,b",
+            "local host",
+            "host\t",
+            "\nhost",
+            "localhost:9000",
+            "[::1]",
+            "wss://box",
+            "box/ws",
+            "-box",
+            "box..local",
+            "bad_host",
+        ] {
             assert!(parse_pair_host(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_loopback_pair_host_matches_localhost_and_loopback_ips() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+        ] {
+            assert!(is_loopback_pair_host(host), "{host}");
+        }
+        for host in [
+            "192.168.1.10",
+            "my-box.local",
+            "localhost.example",
+            "fd00::7",
+        ] {
+            assert!(!is_loopback_pair_host(host), "{host}");
         }
     }
 
