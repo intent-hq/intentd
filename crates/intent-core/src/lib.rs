@@ -40,6 +40,8 @@ pub mod note_delete;
 pub mod note_page;
 pub mod path_utils;
 pub mod process_policy;
+pub mod pull_request_key;
+pub use pull_request_key::pull_request_key;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
 pub mod replay_preview;
@@ -141,14 +143,14 @@ pub use model::{
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
-    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
-    Script, ScriptArchiveFilter, ScriptCreateParams, ScriptLastRun, ScriptMode, ScriptPurpose,
-    ScriptRunOutcome, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
-    SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
+    PullRequestWorkspace, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory,
+    RepoScriptMode, SaveAssetResult, Script, ScriptArchiveFilter, ScriptCreateParams,
+    ScriptLastRun, ScriptMode, ScriptPurpose, ScriptRunOutcome, ScriptRuntimeState, ScriptStatus,
+    SessionStats, SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
     WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,

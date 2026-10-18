@@ -106,6 +106,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("pull_request_workspace", "derived by insert triggers from the transferred workspace and git-root PR columns; rebuilt on import"),
     ("review_context_private_family", "installation-private denial history; never imported or transferred"),
     ("review_context_enrollment", "installation-private native family; never imported or transferred"),
     ("pr_monitor_message_provenance", "local original-message evidence; never transferable or imported authorization"),

@@ -1057,6 +1057,7 @@ impl Store {
             "agent_metrics",
             "workspace_context_item",
             "workspace_git_root",
+            "pull_request_workspace",
             "workspace_invite",
             "workspace_mcp_disabled_server",
             "draft",
@@ -1400,6 +1401,40 @@ impl Store {
                 Error::Internal(format!("list workspaces referencing pr url failed: {e}"))
             })?;
         rows.iter().map(map_workspace_row).collect()
+    }
+
+    /// Workspaces linked to the PR whose canonical key is `pr_key`
+    /// (`workspace.findByPullRequest`, §5.1 "Pull request workspace lookup"),
+    /// each paired with its `linked_at`, most recently linked first and ties
+    /// by id ascending. Links are recorded by the
+    /// `pull_request_workspace_from_*` triggers (migration 0161) whenever a
+    /// workspace or git root persists a changed PR snapshot. Archived rows are
+    /// included; remote rows and the seeded virtual [`CHIEF_WORKSPACE_ID`]
+    /// row never are. `pr_key` must already be canonical — see
+    /// `intent_core::pull_request_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_workspaces(
+        &self,
+        pr_key: &str,
+    ) -> Result<Vec<(Workspace, String)>> {
+        let sql = format!(
+            "SELECT {WORKSPACE_COLUMNS}, p.linked_at AS pr_linked_at FROM workspace \
+             JOIN pull_request_workspace AS p ON p.workspace_id = workspace.id \
+             WHERE p.pr_key = ? AND workspace.id <> ? AND workspace.is_remote = 0 \
+             ORDER BY p.linked_at DESC, workspace.id ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(pr_key)
+            .bind(CHIEF_WORKSPACE_ID)
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list pull request workspaces failed: {e}")))?;
+        rows.iter()
+            .map(|row| Ok((map_workspace_row(row)?, col::<String>(row, "pr_linked_at")?)))
+            .collect()
     }
 }
 
