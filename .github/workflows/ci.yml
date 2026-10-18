@@ -165,7 +165,8 @@ jobs:
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
 
-  # No compilation, application dependencies, or native runners before queueing.
+  # Dependency-free PR policy checks; the PR's compiled Linux checks live in
+  # `check` and `coverage-changed`, and native runners stay queue-only.
   pr-static:
     needs: route
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -404,7 +405,8 @@ jobs:
         run: cargo shear --deny-warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
-      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # (coverage-e2e / coverage-all are merge_group-only; PRs run only
+      # coverage-changed — see the trigger comment).
       # Running it plainly here as well would double the critical path. The
       # exception is the tests the coverage scripts skip: they are flaky under
       # llvm-cov instrumentation / heavy parallel load, so they run here
@@ -1381,10 +1383,11 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # Focused coverage of the diff's changed tests, on same-repo PRs (early
-  # feedback) and in the queue (against the merged tree), retaining the
-  # callback fixture composition proof and its evidence alongside the full
-  # queue-only instrumented suites.
+  # Focused coverage of the diff's changed tests, required on same-repo PRs
+  # and in the queue (against the merged tree), retaining the callback fixture
+  # composition proof and its evidence alongside the full queue-only
+  # instrumented suites. A selection can legitimately be empty (no Rust
+  # changes), so a green run does not by itself mean tests executed.
   coverage-changed:
     needs: route
     if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.route.result == 'success' }}
@@ -1412,6 +1415,7 @@ jobs:
       QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
       QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
       PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -1424,23 +1428,37 @@ jobs:
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
         run: python3 scripts/setup-depot-sccache.py
-      # PRs check out GitHub's merge commit, whose first parent is the base
-      # tip it merged against; never pull_request.base.sha, which is not
-      # guaranteed to be that parent (intent-hq/intent#5414). If the checkout
-      # is ever the branch head itself, fall back to its merge-base with the
-      # base branch. Queue entries bind to the event's base/head pair.
+      # PRs check out GitHub's synthetic merge commit: its second parent is
+      # the PR head and its first parent the base tip it merged against —
+      # never pull_request.base.sha, which is not guaranteed to be that
+      # parent (intent-hq/intent#5414). The checkout is identified by the PR
+      # head SHA, not by "HEAD is a merge", because a branch tip can itself be
+      # a merge commit. If the checkout is ever the PR head itself, fall back
+      # to its merge-base with the base branch. Queue entries bind to the
+      # event's base/head pair.
       - name: Resolve changed-test base from the event
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-              base=$(git rev-parse 'HEAD^1')
-              echo "base: HEAD^1 (PR merge-commit parent) = $base"
-            else
-              [ -n "$PR_BASE_REF" ]
+            if ! [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error title=coverage-changed: PR head unknown::PR_HEAD_SHA '$PR_HEAD_SHA' is not a commit SHA"
+              exit 1
+            fi
+            head=$(git rev-parse HEAD)
+            if [ "$head" = "$PR_HEAD_SHA" ]; then
+              if [ -z "$PR_BASE_REF" ]; then
+                echo "::error title=coverage-changed: PR base unknown::PR_BASE_REF is empty; cannot resolve the merge-base for checkout $head"
+                exit 1
+              fi
               git fetch --no-tags origin "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF"
               base=$(git merge-base "refs/remotes/origin/$PR_BASE_REF" HEAD)
-              echo "base: merge-base with origin/$PR_BASE_REF (HEAD is not a merge commit) = $base"
+              echo "base: merge-base with origin/$PR_BASE_REF (checkout is the PR head) = $base"
+            elif [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD_SHA" ]; then
+              base=$(git rev-parse 'HEAD^1')
+              echo "base: HEAD^1 (PR merge-commit base parent) = $base"
+            else
+              echo "::error title=coverage-changed: unexpected checkout::HEAD $head is neither PR head $PR_HEAD_SHA nor a merge of it"
+              exit 1
             fi
             echo "BASE_SHA=$base" >> "$GITHUB_ENV"
             exit 0

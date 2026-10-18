@@ -827,33 +827,49 @@ class NativeRoutingTests(unittest.TestCase):
             git("remote", "add", "origin", str(origin))
             git("commit", "-q", "--allow-empty", "-m", "root")
             git("checkout", "-q", "-b", "feature")
-            git("commit", "-q", "--allow-empty", "-m", "feature")
-            feature = git("rev-parse", "HEAD")
+            git("commit", "-q", "--allow-empty", "-m", "feature work")
             git("checkout", "-q", "main")
             git("commit", "-q", "--allow-empty", "-m", "main advances")
-            main = git("rev-parse", "HEAD")
+            synced_main = git("rev-parse", "HEAD")
+            git("checkout", "-q", "feature")
+            # The PR branch tip is itself a merge commit ("merge main into feature").
+            git("merge", "-q", "--no-ff", "-m", "merge main into feature", "main")
+            pr_head = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("commit", "-q", "--allow-empty", "-m", "main advances again")
+            base_tip = git("rev-parse", "HEAD")
             git("push", "-q", "origin", "main")
-            git("merge", "-q", "--no-ff", "-m", "merge", feature)
+            git("merge", "-q", "--no-ff", "-m", "synthetic PR merge", pr_head)
+            synthetic = git("rev-parse", "HEAD")
 
-            def resolve(base_ref="main"):
+            def resolve(checkout, *, head=pr_head, base_ref="main"):
+                git("checkout", "-q", "--detach", checkout)
                 output = root / "env"
                 output.unlink(missing_ok=True)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=work,
-                    env={**env, "GITHUB_EVENT_NAME": "pull_request", "PR_BASE_REF": base_ref,
+                    env={**env, "GITHUB_EVENT_NAME": "pull_request", "PR_BASE_REF": base_ref, "PR_HEAD_SHA": head,
                          "QUEUE_BASE_SHA": "", "QUEUE_HEAD_SHA": "", "GITHUB_ENV": str(output)},
                     capture_output=True, text=True)
                 return result, output.read_text() if output.exists() else ""
 
-            result, written = resolve()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(written, f"BASE_SHA={main}\n")
-            git("checkout", "-q", feature)
-            result, written = resolve()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(written, f"BASE_SHA={git('merge-base', 'origin/main', 'HEAD')}\n")
-            result, written = resolve("missing-branch")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(written, "")
+            for name, checkout, kwargs, expected, message in (
+                ("synthetic merge", synthetic, {}, base_tip, None),
+                ("PR head that is itself a merge", pr_head, {}, synced_main, None),
+                ("unrelated checkout", synthetic, {"head": base_tip}, None, "unexpected checkout"),
+                ("empty PR head", synthetic, {"head": ""}, None, "PR head unknown"),
+                ("empty base ref", pr_head, {"base_ref": ""}, None, "PR_BASE_REF is empty"),
+                ("missing base branch", pr_head, {"base_ref": "missing-branch"}, None, None),
+            ):
+                with self.subTest(name):
+                    result, written = resolve(checkout, **kwargs)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assertEqual(written, "")
+                        if message:
+                            self.assertIn(message, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(written, f"BASE_SHA={expected}\n")
 
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]
