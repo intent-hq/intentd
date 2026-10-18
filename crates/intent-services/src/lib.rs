@@ -14339,6 +14339,22 @@ fn comment_resolved_event(
 /// (§6.5). Self-sufficient payload `{ workspaceId, workspace }` (§6.7) so a
 /// client can render the new workspace without a follow-up read.
 fn workspace_created_event(ws: &Workspace) -> NewEvent {
+    workspace_created_event_with_origin(ws, None)
+}
+
+/// [`workspace_created_event`] plus the optional `data.origin` provenance
+/// (§6.5, [`WorkspaceCreate::origin`]); `None` keeps the plain payload.
+fn workspace_created_event_with_origin(
+    ws: &Workspace,
+    origin: Option<&intent_core::WorkspaceCreateOrigin>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": ws.id.as_str(),
+        "workspace": ws,
+    });
+    if let Some(origin) = origin {
+        data["origin"] = serde_json::json!(origin);
+    }
     NewEvent {
         workspace_id: ws.id.clone(),
         timestamp: now_iso(),
@@ -14348,10 +14364,7 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({
-            "workspaceId": ws.id.as_str(),
-            "workspace": ws,
-        }),
+        data,
     }
 }
 
@@ -21095,6 +21108,7 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    let create_origin = input.origin.take();
                     // Request-shape `-32602`s run here, BEFORE any state
                     // change (row / metadata file / event / spec note /
                     // initial agent): compound `initialAgent.model` and
@@ -22875,7 +22889,11 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_created_event_with_origin(&ws, create_origin.as_ref()),
+                    )
+                    .await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back

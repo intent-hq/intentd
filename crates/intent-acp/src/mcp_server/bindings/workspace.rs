@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use intent_core::{
     AgentId, AgentStatus, ConversationProjection, Error, GitRemoteUrl, RepoRef, WorkspaceApi,
-    WorkspaceCreate, WorkspaceId, WorkspaceStatus, WorkspaceUpdate, PROPOSAL_OUTCOME_APPLIED,
-    PROPOSAL_OUTCOME_DISMISSED, WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
+    WorkspaceCreate, WorkspaceCreateOrigin, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    PROPOSAL_OUTCOME_APPLIED, PROPOSAL_OUTCOME_DISMISSED, WORKSPACE_STATUS_MESSAGE_MAX_LENGTH,
 };
 use serde_json::{json, Value};
 
@@ -613,8 +613,15 @@ async fn apply_proposal(
                 .to_string(),
         );
     }
-    let input: WorkspaceCreate = serde_json::from_value(Value::Object(params))
+    let mut input: WorkspaceCreate = serde_json::from_value(Value::Object(params))
         .map_err(|e| format!("invalid proposal params: {e}"))?;
+    // Lets clients open the new workspace as a background tab beside the
+    // conversation that proposed it (`workspace:created` `data.origin`).
+    input.origin = Some(WorkspaceCreateOrigin::Proposal {
+        proposal_id: proposal_id.clone(),
+        agent_id: caller.clone(),
+        source_workspace_id: ws.clone(),
+    });
     let created = api
         .create_workspace(input, Some(idempotency_key))
         .await
