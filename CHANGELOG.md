@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.8] - 2026-10-18
+
+### 🚀 Features
+
+- Record PR-to-workspace links and add workspace.findByPullRequest ([#2476](https://github.com/intent-hq/intentd/pull/2476))
+- Stamp workspace:created origin for proposal-created workspaces ([#2470](https://github.com/intent-hq/intentd/pull/2470))
+- *(specialists)* Add INTENTD_USER_SPECIALISTS_DIR user-tier override ([#2457](https://github.com/intent-hq/intentd/pull/2457))
+
+### 🐛 Bug Fixes
+
+- *(intent-services)* Do not resume settled turns after graceful shutdown ([#2458](https://github.com/intent-hq/intentd/pull/2458))
+- *(pr-refresh)* Log one budget-deferral WARN per repository per sweep ([#2474](https://github.com/intent-hq/intentd/pull/2474))
+- *(events)* Stop watching git-ignored and non-tier trees on Linux ([#2471](https://github.com/intent-hq/intentd/pull/2471))
+- Report the intentd binary version in client.hello ([#2473](https://github.com/intent-hq/intentd/pull/2473))
+
+### 🧪 Testing
+
+- *(store)* Make pool-timeout fixture setup and release checks deterministic ([#2456](https://github.com/intent-hq/intentd/pull/2456))
+
+
 ## [0.11.7] - 2026-10-18
 
 ### 🐛 Bug Fixes
