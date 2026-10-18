@@ -177,8 +177,8 @@ version_group = "intentd"
 #
 # A sitter-only release must not bump intentd: release-plz's dependent-package
 # pass ignores version_group, so bumping intentd alone splits it from its
-# library crates (intent-hq/intentd#2461). intentd therefore requires sitter at
-# major.minor precision ("0.1"), which a sitter patch release does not rewrite;
+# library crates (intent-hq/intentd#2461). intentd therefore requires sitter
+# major-only ("0"), which sitter patch and minor releases do not rewrite;
 # scripts/test-version-group.py enforces both the precision and the lockstep.
 #
 # Caveat: only commits touching files under crates/intentd-sitter are
@@ -200,9 +200,9 @@ git_only = true
 # release-plz also synthesizes dependency-update commits with id 0000000.
 # Omit only its sitter-only daemon entry before grouping, avoiding empty headings.
 # Real commits and mixed/library dependency summaries remain visible. This changes
-# rendering only. Sitter patch releases no longer bump the daemon at all (see the
-# intentd-sitter package above); the filter still covers a sitter minor bump,
-# which rewrites the "0.1" requirement.
+# rendering only. Sitter releases no longer bump the daemon at all (see the
+# intentd-sitter package above); the filter still covers a sitter major bump,
+# which rewrites the "0" requirement.
 [changelog]
 header = """
 # Changelog\n

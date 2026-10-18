@@ -29,6 +29,7 @@ PRODUCTION_SITTER_REQUIREMENT = tomllib.loads(
     (ROOT / "crates/intentd/Cargo.toml").read_text())["dependencies"]["intentd-sitter"]["version"]
 SITTER_REQUIREMENT = ".".join(
     SITTER_VERSION.split(".")[:len(PRODUCTION_SITTER_REQUIREMENT.split("."))])
+EXACT_SITTER_PIN_TESTS = {"test_generated_mixed_dependency_summary_remains_visible"}
 
 
 class ReleasePlzChangelogTests(unittest.TestCase):
@@ -83,7 +84,10 @@ class ReleasePlzChangelogTests(unittest.TestCase):
                 'edition = "2021"\nlicense = "MIT"\ndescription = "Fixture"\n'
             )
             (crate / "src/lib.rs").write_text("pub fn value() -> u32 { 0 }\n")
-        self.write_daemon_manifest(SITTER_REQUIREMENT)
+        # A test can opt into an exact sitter pin (as a sitter major bump would
+        # leave) by name, so the baseline is still built and tagged once here.
+        self.write_daemon_manifest(
+            SITTER_VERSION if self._testMethodName in EXACT_SITTER_PIN_TESTS else SITTER_REQUIREMENT)
         daemon = self.repo / "crates/intentd"
         (daemon / "src/main.rs").write_text(
             'fn main() { println!("{}", intentd_sitter::value() + intent_core::value()); }\n'
@@ -153,6 +157,13 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.assertEqual(daemon["dependencies"]["intentd-sitter"]["version"], SITTER_REQUIREMENT)
         self.assertFalse((self.repo / "crates/intentd-sitter/CHANGELOG.md").exists())
 
+    def test_sitter_minor_bump_leaves_daemon_group_unchanged(self):
+        # A breaking change on 0.x is a minor bump; it must not split the group either.
+        self.change(["intentd-sitter"], "fix!: sitter breaking repair")
+        self.update()
+        self.assertEqual(self.version("intentd-sitter"), "0.2.0")
+        self.assert_group_at(DAEMON_VERSION)
+
     def test_daemon_libraries_and_mixed_changes_remain_visible(self):
         self.change(["intentd-sitter"], "fix: sitter exclusive repair")
         # A sitter scope must not hide a daemon change: filtering is by package.
@@ -179,13 +190,8 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.assertEqual(self.version("intentd-sitter"), SITTER_VERSION)
 
     def test_generated_mixed_dependency_summary_remains_visible(self):
-        # An exact pin (as after a future sitter 0.x minor bump rewrites the
-        # requirement) still yields a sitter entry in a generated summary.
-        self.write_daemon_manifest(SITTER_VERSION)
-        self.run_command("git", "add", ".")
-        self.run_command("git", "commit", "-q", "--amend", "--no-edit")
-        self.run_command("git", "tag", "-f", f"v{DAEMON_VERSION}")
-        self.run_command("git", "tag", "-f", f"v{SITTER_VERSION}")
+        # Runs with an exact sitter pin (EXACT_SITTER_PIN_TESTS): the generated
+        # summary then names sitter alongside the independent library.
         self.change(["intentd-sitter", INDEPENDENT_LIBRARY], "fix: independent repairs")
         self.update()
         notes = (self.repo / "CHANGELOG.md").read_text()

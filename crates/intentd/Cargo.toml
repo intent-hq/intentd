@@ -9,14 +9,15 @@ homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 
 [dependencies]
-# Keep this requirement at major.minor ("0.1", not "0.1.N"). release-plz
-# 0.3.162 bumps a dependent package's patch version, outside its
-# version_group, whenever a dependency release rewrites the requirement: an
-# exact pin made each sitter-only release bump intentd alone and split it
-# from its library crates (intent-hq/intentd#2461). Sitter patch releases
-# satisfy "0.1" unchanged, so they leave the intentd group alone;
-# scripts/test-version-group.py enforces this.
-intentd-sitter = { path = "../intentd-sitter", version = "0.1" }
+# Keep this requirement major-only ("0", not "0.1.N"). release-plz 0.3.162
+# bumps a dependent package's patch version, outside its version_group,
+# whenever a dependency release rewrites the requirement: an exact pin made
+# each sitter-only release bump intentd alone and split it from its library
+# crates (intent-hq/intentd#2461). Sitter patch and minor releases leave "0"
+# unchanged, so they leave the intentd group alone. Neither crate is
+# published, so the wide range only affects release planning; the path still
+# selects the in-tree sitter. scripts/test-version-group.py enforces this.
+intentd-sitter = { path = "../intentd-sitter", version = "0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
