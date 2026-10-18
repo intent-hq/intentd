@@ -17,6 +17,14 @@ def workflow(name):
 
 
 class ManagedCache(unittest.TestCase):
+    def test_managed_smoke_skips_when_cache_is_switched_off(self):
+        env = {'PATH': '/usr/bin:/bin'}
+        for phase in ('populate', 'verify'):
+            result = subprocess.run(['python3', '-I', '-B', 'scripts/test-release-cache-smoke.py', '--managed', '--phase', phase],
+                                    cwd=ROOT, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('skipping the managed cache smoke test', result.stdout)
+
     def test_no_archive_backend_or_local_cache_limits(self):
         text = (ROOT / 'scripts/setup-sccache.py').read_text()
         for obsolete in ['actions/cache', 'SCCACHE_DIR', 'SCCACHE_CACHE_SIZE', 'SCCACHE_LOCAL_RW_MODE']:

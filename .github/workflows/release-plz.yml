@@ -11,8 +11,9 @@
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
 #
-# Both jobs run on ephemeral GitHub-hosted runners. Cargo downloads use the Actions
-# cache integration; compiler entries use the self-hosted sccache directly.
+# Both jobs prefer the self-hosted fleet and burst to GitHub-hosted runners. Cargo
+# downloads use the Actions cache integration; compiler entries use the
+# self-hosted sccache directly.
 
 name: Release-plz
 

@@ -18,6 +18,19 @@ class HostedRunners(unittest.TestCase):
         for path in [*(ROOT / '.github').rglob('*.yml'), *(ROOT / '.github').rglob('*.yaml'), ROOT / 'dist-workspace.toml']:
             self.assertEqual(re.findall(r'depot-(?:ubuntu|windows|macos)[\w.-]*', path.read_text()), [], str(path))
 
+    def test_every_fallback_key_is_routed(self):
+        # A key missing from runner-route's hosted list silently skips the
+        # self-hosted fleet and always runs (and bills) on GitHub.
+        route = (ROOT / '.github/workflows/runner-route.yml').read_text()
+        hosted = set(re.findall(r"'([\w.-]+)'", route.split('const hosted = {', 1)[1].split('};', 1)[0]))
+        self.assertIn('gh-linux-16x', hosted)
+        used = set()
+        for path in (ROOT / '.github').rglob('*.yml'):
+            used |= {key for key in re.findall(r"outputs\.runners \|\| '\{\}'\)\['([^']+)'\]", path.read_text())}
+        used |= {v for v in re.findall(r'^(?:global|runner) = "([^"]+)"', (ROOT / 'dist-workspace.toml').read_text(), re.M)}
+        self.assertTrue(used)
+        self.assertEqual(sorted(used - hosted), [])
+
     def test_windows_cleanup_requires_native_tests_and_excludes_pr_deletion(self):
         doc = yaml.safe_load((ROOT / '.github/workflows/windows-prune.yml').read_text())
         events = doc.get('on', doc.get(True))
