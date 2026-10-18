@@ -40,6 +40,11 @@ class ReleaseTests(unittest.TestCase):
             "GITHUB_OUTPUT": str(self.outputs),
             "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_ROOT": str(self.repo),
         }
+        # setup-python's shared-lib builds hard-code a hosted-runner RUNPATH; on
+        # self-hosted runners the interpreter (and the stubs whose shebang is
+        # sys.executable) only start with the loader path setup-python exports.
+        if "LD_LIBRARY_PATH" in os.environ:
+            self.env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
         stub = self.bin / "release-plz"
         stub.write_text(f"#!{sys.executable} -S\n" + '''import json, os, pathlib, sys
 root = pathlib.Path(os.environ["FIXTURE_ROOT"])
@@ -58,13 +63,25 @@ sys.exit(fixture.get("exit", 0))
             guard.write_text(f"#!{sys.executable} -S\nraise SystemExit('unexpected external command: {name}')\n")
             guard.chmod(0o700)
 
+    def test_sandbox_env_can_start_the_test_interpreter(self):
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", "pass"],
+            cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, "The sandboxed env cannot start this interpreter "
+                         "(relocated shared-lib builds need LD_LIBRARY_PATH): " + result.stderr)
+
     def invoke(self, **fixture):
         (self.repo / "fixture").write_text(json.dumps(fixture))
         result = subprocess.run(
             [sys.executable, "-I", "-S", "-B", str(RUNNER)],
             cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
         )
-        self.calls = [json.loads(line) for line in (self.repo / "calls").read_text().splitlines()]
+        calls = self.repo / "calls"
+        if not calls.exists():
+            self.fail(f"release-plz fixture was never invoked (runner exit {result.returncode}):\n"
+                      + result.stdout + result.stderr)
+        self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(self.calls[-1], ["release", "--git-token", self.env["GITHUB_TOKEN"], "--forge", "github", "-o", "json"])
         return result
 
