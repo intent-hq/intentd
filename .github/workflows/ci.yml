@@ -225,6 +225,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
@@ -641,6 +644,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
@@ -878,6 +884,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
         if: contains(matrix.os, 'self-hosted')
@@ -1013,6 +1022,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
@@ -1232,6 +1244,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # Fail-fast disk preflight — see the `check` job's comment for the full
       # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
@@ -1432,6 +1447,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # PRs check out GitHub's synthetic merge commit: its second parent is
       # the PR head and its first parent the base tip it merged against —
@@ -1835,7 +1853,8 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@fad7680163695477075ebe48b6ec1d44954f11d6
+      INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@af04df8ec1ccf0ef46ce236dad12464dfe39397e
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1959,6 +1978,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       - name: Test WebDAV compiler reuse and source invalidation
         run: python3 -B scripts/test-release-cache-smoke.py
@@ -2171,6 +2193,9 @@ jobs:
         shell: bash
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-depot-sccache.py
       # Persistent per-job outputs survive checkout's git clean. Linux uses
       # /raid and a runner-slot key, with the same prune/marker rails as check.
