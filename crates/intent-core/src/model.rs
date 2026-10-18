@@ -1372,6 +1372,28 @@ pub struct WorkspaceCreate {
     pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+    /// Daemon-internal provenance echoed on the `workspace:created` event as
+    /// `data.origin` (PROTOCOL §6.5). Never read from the wire
+    /// (`#[serde(skip)]`) and never persisted: only in-process callers that
+    /// create a workspace on someone's behalf (`ws.workspace.applyProposal`)
+    /// set it, so clients can surface the new workspace next to its source.
+    #[serde(skip)]
+    pub origin: Option<WorkspaceCreateOrigin>,
+}
+
+/// Provenance of a `workspace.create` (see [`WorkspaceCreate::origin`]),
+/// serialized verbatim as the `workspace:created` event's `data.origin`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkspaceCreateOrigin {
+    /// Created by applying a `workspace-create` proposal that the agent
+    /// `agentId` emitted in workspace `sourceWorkspaceId`.
+    #[serde(rename_all = "camelCase")]
+    Proposal {
+        proposal_id: String,
+        agent_id: AgentId,
+        source_workspace_id: WorkspaceId,
+    },
 }
 
 /// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full

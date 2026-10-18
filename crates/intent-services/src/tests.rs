@@ -14404,6 +14404,56 @@ mod change_event_parity {
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
         );
+        assert!(
+            ev["data"].get("origin").is_none(),
+            "a plain create carries no origin: {ev}"
+        );
+    }
+
+    /// An in-process create with `WorkspaceCreate::origin` (set by
+    /// `ws.workspace.applyProposal`) echoes it on `workspace:created` as
+    /// `data.origin` (§6.5) and never persists it on the row.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_created_payload_carries_proposal_origin() {
+        use intent_core::{AgentId, WorkspaceCreate, WorkspaceCreateOrigin, WorkspaceId};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Proposed workspace".to_string()),
+                    branch: Some("feat/proposed".to_string()),
+                    origin: Some(WorkspaceCreateOrigin::Proposal {
+                        proposal_id: "Create workspace: Follow up".to_string(),
+                        agent_id: AgentId::from("agent-source"),
+                        source_workspace_id: WorkspaceId::from("ws-source"),
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        assert_eq!(
+            ev["data"]["origin"],
+            serde_json::json!({
+                "kind": "proposal",
+                "proposalId": "Create workspace: Follow up",
+                "agentId": "agent-source",
+                "sourceWorkspaceId": "ws-source",
+            })
+        );
+        assert!(
+            serde_json::to_value(&created)
+                .expect("workspace json")
+                .get("origin")
+                .is_none(),
+            "origin is event-only, never a workspace field"
+        );
     }
 
     /// `workspace.create` persists a valid `contextLinks` param (§5.1): the
