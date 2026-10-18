@@ -23,6 +23,42 @@ QUOTA = 'Response body:\n' + json.dumps({
 }) + '\nCaused by:\n    HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/intent-hq/intentd/commits/abc/pulls)\n'
 
 
+def sandbox_env(repo, parent):
+    env = {
+        "PATH": str(repo / "bin"), "HOME": str(repo),
+        "GITHUB_TOKEN": "fixture-token-not-a-credential",
+        "GITHUB_REPOSITORY": "intent-hq/intentd", "GITHUB_RUN_ID": "123",
+        "GITHUB_STEP_SUMMARY": str(repo / "summary"),
+        "GITHUB_OUTPUT": str(repo / "outputs"),
+        "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_ROOT": str(repo),
+    }
+    # setup-python's shared-lib builds hard-code a hosted-runner RUNPATH; on
+    # self-hosted runners the interpreter (and the stubs whose shebang is
+    # sys.executable) only start with the loader path setup-python exports.
+    if "LD_LIBRARY_PATH" in parent:
+        env["LD_LIBRARY_PATH"] = parent["LD_LIBRARY_PATH"]
+    return env
+
+
+class SandboxEnvTests(unittest.TestCase):
+    def test_loader_path_is_forwarded_only_when_set(self):
+        repo = Path("/fixture")
+        self.assertEqual(sandbox_env(repo, {"LD_LIBRARY_PATH": "/toolcache/lib"})["LD_LIBRARY_PATH"],
+                         "/toolcache/lib")
+        self.assertNotIn("LD_LIBRARY_PATH", sandbox_env(repo, {}))
+        self.assertNotIn("GH_TOKEN", sandbox_env(repo, {"GH_TOKEN": "real", "LD_LIBRARY_PATH": "/x"}))
+
+    def test_sandbox_env_can_start_the_test_interpreter(self):
+        with tempfile.TemporaryDirectory(prefix="release-quota-env-") as temp:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", "-c", "pass"],
+                cwd=temp, env=sandbox_env(Path(temp), os.environ),
+                capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, "The sandboxed env cannot start this interpreter "
+                         "(relocated shared-lib builds need LD_LIBRARY_PATH): " + result.stderr)
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="release-quota-test-")
@@ -32,19 +68,7 @@ class ReleaseTests(unittest.TestCase):
         self.bin.mkdir()
         self.summary = self.repo / "summary"
         self.outputs = self.repo / "outputs"
-        self.env = {
-            "PATH": str(self.bin), "HOME": str(self.repo),
-            "GITHUB_TOKEN": "fixture-token-not-a-credential",
-            "GITHUB_REPOSITORY": "intent-hq/intentd", "GITHUB_RUN_ID": "123",
-            "GITHUB_STEP_SUMMARY": str(self.summary),
-            "GITHUB_OUTPUT": str(self.outputs),
-            "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_ROOT": str(self.repo),
-        }
-        # setup-python's shared-lib builds hard-code a hosted-runner RUNPATH; on
-        # self-hosted runners the interpreter (and the stubs whose shebang is
-        # sys.executable) only start with the loader path setup-python exports.
-        if "LD_LIBRARY_PATH" in os.environ:
-            self.env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+        self.env = sandbox_env(self.repo, os.environ)
         stub = self.bin / "release-plz"
         stub.write_text(f"#!{sys.executable} -S\n" + '''import json, os, pathlib, sys
 root = pathlib.Path(os.environ["FIXTURE_ROOT"])
@@ -63,14 +87,6 @@ sys.exit(fixture.get("exit", 0))
             guard.write_text(f"#!{sys.executable} -S\nraise SystemExit('unexpected external command: {name}')\n")
             guard.chmod(0o700)
 
-    def test_sandbox_env_can_start_the_test_interpreter(self):
-        result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", "-c", "pass"],
-            cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, "The sandboxed env cannot start this interpreter "
-                         "(relocated shared-lib builds need LD_LIBRARY_PATH): " + result.stderr)
-
     def invoke(self, **fixture):
         (self.repo / "fixture").write_text(json.dumps(fixture))
         result = subprocess.run(
@@ -79,8 +95,8 @@ sys.exit(fixture.get("exit", 0))
         )
         calls = self.repo / "calls"
         if not calls.exists():
-            self.fail(f"release-plz fixture was never invoked (runner exit {result.returncode}):\n"
-                      + result.stdout + result.stderr)
+            self.fail(f"release-plz fixture was never invoked (runner exit {result.returncode})\n"
+                      f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}")
         self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(self.calls[-1], ["release", "--git-token", self.env["GITHUB_TOKEN"], "--forge", "github", "-o", "json"])
         return result
