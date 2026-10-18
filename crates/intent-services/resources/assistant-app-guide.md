@@ -124,7 +124,12 @@ or a different endpoint. In **Settings → Providers**, open Codex or Claude Cod
 choose **Add profile**: enter a name and environment variables (literal values,
 **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR` to choose an account; the user signs in or prepares that
-account outside Intent. Saving does not prove sign-in: the status shows
+account outside Intent. Credentials inherited from the environment can still
+apply: for a Claude Code profile that should use another account (or none), set
+inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
+**Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
+custom base URL from the environment; for a different endpoint, give the profile
+its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
 the original configuration is **Codex · Default**. Delegated agents follow their

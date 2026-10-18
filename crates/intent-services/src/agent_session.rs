@@ -3399,11 +3399,18 @@ impl Services {
             // crosses profiles or a profile and Default (PROTOCOL §5.54).
             let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
                 );
                 return Ok(None);
             }

@@ -694,5 +694,27 @@ async fn provider_profile_selection_surfaces_over_wss() {
         json!({ "providerRef": reference, "reason": "profile-missing" }),
         "{get}"
     );
+    // Sending is refused at admission with the structured error.
+    let sent = rpc(
+        &mut ws,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "next" }),
+    )
+    .await;
+    assert_eq!(sent["error"]["code"], -32602, "{sent}");
+    assert_eq!(
+        sent["error"]["data"],
+        json!({ "code": "provider-profile-replacement-required",
+                "providerRef": reference, "reason": "profile-missing" }),
+        "{sent}"
+    );
+    assert!(
+        !sent["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&reference),
+        "{sent}"
+    );
     drop(daemon);
 }
