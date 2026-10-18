@@ -18,6 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / '.github/workflows/release-cache.yml'
 MAIN_ONLY = "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
 CACHE_RUN = 'python3 scripts/setup-depot-sccache.py'
+# Producers run on main with secrets, so they write the self-hosted cache when
+# INTENT_SCCACHE_ENDPOINT is set (INTENT_SCCACHE_MODE unset means READ_WRITE).
+CACHE_ENV = {'DEPOT_SCCACHE_TOKEN': '${{ secrets.DEPOT_TOKEN }}',
+             'INTENT_SCCACHE_ENDPOINT': '${{ vars.INTENT_SCCACHE_ENDPOINT }}',
+             'INTENT_SCCACHE_TOKEN': '${{ secrets.INTENT_SCCACHE_TOKEN }}',
+             'INTENT_SCCACHE_MODE': '${{ vars.INTENT_SCCACHE_MODE }}'}
 CHECKOUT = {'uses': 'actions/checkout@v7', 'with': {'persist-credentials': False}}
 
 
@@ -44,7 +50,7 @@ def timed_build(step):
 
 def cache_steps(flavor, target, runner, builds):
     return [
-        {'name': 'Configure Depot managed compiler cache', 'shell': 'bash', 'env': {'DEPOT_SCCACHE_TOKEN': '${{ secrets.DEPOT_TOKEN }}'}, 'run': CACHE_RUN},
+        {'name': 'Configure Depot managed compiler cache', 'shell': 'bash', 'env': deepcopy(CACHE_ENV), 'run': CACHE_RUN},
         *[timed_build(step) for step in builds],
         {'name': 'Report compiler cache statistics', 'shell': 'bash',
          'run': 'sccache --show-stats >> "$GITHUB_STEP_SUMMARY"'},
