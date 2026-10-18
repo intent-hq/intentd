@@ -93,6 +93,26 @@ class AutoCutTests(Fixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
+    def finish_ci_after_polls(self, polls=1):
+        # Replace the no-polling sleep stub: each "sleep" records a poll and,
+        # after `polls` of them, turns the Release PR's CI Gate green.
+        sleep = self.bin / 'sleep'
+        sleep.write_text(f"""#!{sys.executable} -S
+import json, os, pathlib
+path = pathlib.Path(os.environ['MOCK_STATE'])
+s = json.loads(path.read_text())
+s['polls'] = s.get('polls', 0) + 1
+if s['polls'] >= {polls}:
+    s['detail']['mergeStateStatus'] = 'CLEAN'
+    s['detail']['statusCheckRollup'] = [{{'name': 'CI Gate', 'conclusion': 'SUCCESS'}}]
+path.write_text(json.dumps(s))
+""")
+        sleep.chmod(0o755)
+
+    def pending_ci(self):
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = [{'name': 'CI Gate', 'status': 'IN_PROGRESS', 'conclusion': None}]
+
     def merge_calls(self):
         return [c for c in self.state['calls'] if c['args'][:2] == ['pr', 'merge']]
 
@@ -105,11 +125,48 @@ class AutoCutTests(Fixture):
         self.assertIn('Directly squash-merged', output)
 
     def test_missing_or_failed_gate_skips(self):
+        # A zero CI wait budget keeps the check-once behavior (the sleep stub
+        # fails the run if anything polls).
         for checks in ([], [{'name': 'CI Gate', 'conclusion': 'FAILURE'}], [{'name': 'CI Gate', 'status': 'IN_PROGRESS', 'conclusion': None}]):
             with self.subTest(checks=checks):
                 self.state['calls'] = []
                 self.state['detail']['statusCheckRollup'] = checks
-                self.run_workflow()
+                self.run_workflow(AUTO_CUT_CI_WAIT_MINUTES='0')
+                self.assertEqual(self.merge_calls(), [])
+
+    def test_failed_gate_never_polls_even_with_ci_budget(self):
+        self.state['detail']['statusCheckRollup'] = [{'name': 'CI Gate', 'conclusion': 'FAILURE'}]
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                self.state['calls'] = []
+                self.run_workflow(EVENT_NAME=event)
+                self.assertEqual(self.merge_calls(), [])
+
+    def test_scheduled_and_dispatched_runs_wait_for_pending_release_ci(self):
+        # Release-PR CI runs the ~13 min Linux checks; a cron run that checked
+        # once kept finding it pending (intentd v0.11.8 stalled ~7 h).
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                self.setUp()
+                self.pending_ci()
+                self.finish_ci_after_polls(2)
+                output = self.run_workflow(EVENT_NAME=event)
+                self.assertEqual(self.state.get('polls'), 2)
+                self.assertEqual(len(self.merge_calls()), 1)
+                self.assertIn('waiting for CI Gate', output)
+
+    def test_pending_ci_wait_is_bounded(self):
+        self.pending_ci()
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.merge_calls(), [])
+
+    def test_review_or_base_blockers_never_wait_for_ci(self):
+        for field, value in (('reviewDecision', 'REVIEW_REQUIRED'), ('reviewDecision', 'CHANGES_REQUESTED'), ('baseRefName', 'other')):
+            with self.subTest(field=field, value=value):
+                self.setUp()
+                self.pending_ci()
+                self.state['detail'][field] = value
+                self.run_workflow(EVENT_NAME='schedule')
                 self.assertEqual(self.merge_calls(), [])
 
     def test_held_draft_conflicted_behind_unknown_or_changes_requested_skips(self):
