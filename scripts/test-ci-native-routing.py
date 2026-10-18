@@ -685,6 +685,14 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertEqual(caller["permissions"].get("contents"), "read")
         self.assertEqual(caller["permissions"].get("actions"), "read")
 
+    def test_consumer_caller_passes_the_self_hosted_cache_token(self):
+        caller = self.workflow["jobs"]["monorepo-consumer-checks"]
+        self.assertEqual(caller["secrets"], {
+            "CI_QUEUE_READ_TOKEN": "${{ secrets.CI_QUEUE_READ_TOKEN }}",
+            "DEPOT_TOKEN": "${{ secrets.DEPOT_TOKEN }}",
+            "INTENT_SCCACHE_TOKEN": "${{ secrets.INTENT_SCCACHE_TOKEN }}",
+        })
+
     @classmethod
     def setUpClass(cls):
         cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
