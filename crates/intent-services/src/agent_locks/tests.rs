@@ -451,17 +451,16 @@ async fn only_git_dirty_paths_lock() {
         (".gitignore", ".dev/\n"),
         ("src/edited.rs", "a\n"),
         ("src/clean.rs", "c\n"),
-        ("src/old.rs", "fn old() { /* body long enough to match */ }\n"),
+        (
+            "src/old.rs",
+            "fn old() { /* body long enough to match */ }\n",
+        ),
     ]);
     std::fs::write(dir.path().join("src/edited.rs"), "b\n").unwrap();
     std::fs::write(dir.path().join("src/untracked.rs"), "u\n").unwrap();
     std::fs::create_dir_all(dir.path().join(".dev")).unwrap();
     std::fs::write(dir.path().join(".dev/scratch.json"), "{}").unwrap();
-    std::fs::rename(
-        dir.path().join("src/old.rs"),
-        dir.path().join("src/new.rs"),
-    )
-    .unwrap();
+    std::fs::rename(dir.path().join("src/old.rs"), dir.path().join("src/new.rs")).unwrap();
     let (_tmp, svc, ws) = setup_with_worktree(dir.path()).await;
     let busy = session("agent-1", &ws, AgentStatus::Active, None);
     let stale_only = session("agent-2", &ws, AgentStatus::Active, None);

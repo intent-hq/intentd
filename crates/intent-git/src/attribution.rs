@@ -23,7 +23,9 @@ use git2::Repository;
 use intent_core::Result;
 
 use crate::map_git_err;
-use crate::submodule::{ignores_case, submodule_containing, submodule_paths, MAX_SUBMODULE_NESTING};
+use crate::submodule::{
+    ignores_case, submodule_containing, submodule_paths, MAX_SUBMODULE_NESTING,
+};
 
 /// The repository that owns one worktree-relative path.
 struct Owner {
@@ -36,42 +38,78 @@ struct Owner {
     inner: String,
 }
 
-/// Resolve the innermost repository under `worktree` that owns `rel_path`,
-/// descending through populated submodules. `None` when a containing
-/// submodule cannot be opened (unpopulated, or an unsafe path) — the caller
-/// cannot judge the path and must leave it alone.
-fn owning_repo(worktree: &Path, rel_path: &str) -> Option<Owner> {
-    let mut workdir = worktree.to_path_buf();
-    let mut prefix = String::new();
-    let mut inner = rel_path.to_string();
-    for _ in 0..=MAX_SUBMODULE_NESTING {
-        let repo = Repository::open(&workdir).ok()?;
-        let submodules = submodule_paths(&repo).ok()?;
-        let Some(sm) = submodule_containing(&submodules, &inner, ignores_case(&repo)) else {
-            return Some(Owner {
-                prefix,
-                workdir,
-                inner,
-            });
-        };
-        let sm_rel = crate::repo_cache::safe_rel_path(sm)?;
-        let rest = Path::new(&inner)
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::CurDir))
-            .skip(sm_rel.components().count())
-            .collect::<PathBuf>()
-            .to_string_lossy()
-            .replace('\\', "/");
-        let sm = sm.to_string();
-        workdir = workdir.join(&sm_rel);
-        prefix = if prefix.is_empty() {
-            sm
-        } else {
-            format!("{prefix}/{sm}")
-        };
-        inner = rest;
+/// One repository's submodule layout, read once per [`Resolver`].
+struct Layout {
+    submodules: BTreeSet<String>,
+    ignore_case: bool,
+}
+
+/// Resolves worktree-relative paths to their owning repository, caching each
+/// repository's submodule set ([`submodule_paths`] walks the whole `HEAD`
+/// tree, far too costly to repeat per path).
+struct Resolver {
+    worktree: PathBuf,
+    layouts: HashMap<PathBuf, Option<Layout>>,
+}
+
+impl Resolver {
+    fn new(worktree: &Path) -> Self {
+        Self {
+            worktree: worktree.to_path_buf(),
+            layouts: HashMap::new(),
+        }
     }
-    None
+
+    fn layout(&mut self, workdir: &Path) -> Option<&Layout> {
+        self.layouts
+            .entry(workdir.to_path_buf())
+            .or_insert_with(|| {
+                let repo = Repository::open(workdir).ok()?;
+                Some(Layout {
+                    submodules: submodule_paths(&repo).ok()?,
+                    ignore_case: ignores_case(&repo),
+                })
+            })
+            .as_ref()
+    }
+
+    /// The innermost repository under the worktree that owns `rel_path`,
+    /// descending through populated submodules. `None` when a containing
+    /// submodule cannot be opened (unpopulated, or an unsafe path) — the
+    /// caller cannot judge the path and must leave it alone.
+    fn owner(&mut self, rel_path: &str) -> Option<Owner> {
+        let mut workdir = self.worktree.clone();
+        let mut prefix = String::new();
+        let mut inner = rel_path.to_string();
+        for _ in 0..=MAX_SUBMODULE_NESTING {
+            let layout = self.layout(&workdir)?;
+            let Some(sm) = submodule_containing(&layout.submodules, &inner, layout.ignore_case)
+            else {
+                return Some(Owner {
+                    prefix,
+                    workdir,
+                    inner,
+                });
+            };
+            let sm = sm.to_string();
+            let sm_rel = crate::repo_cache::safe_rel_path(&sm)?;
+            let rest = Path::new(&inner)
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .skip(sm_rel.components().count())
+                .collect::<PathBuf>()
+                .to_string_lossy()
+                .replace('\\', "/");
+            workdir = workdir.join(&sm_rel);
+            prefix = if prefix.is_empty() {
+                sm
+            } else {
+                format!("{prefix}/{sm}")
+            };
+            inner = rest;
+        }
+        None
+    }
 }
 
 /// Whether `rel_path` (relative to `worktree`) is an **untracked path that git
@@ -87,7 +125,7 @@ fn owning_repo(worktree: &Path, rel_path: &str) -> Option<Owner> {
 /// — callers then keep recording as they always have.
 #[must_use]
 pub fn is_ignored_untracked(worktree: &Path, rel_path: &str) -> bool {
-    let Some(owner) = owning_repo(worktree, rel_path) else {
+    let Some(owner) = Resolver::new(worktree).owner(rel_path) else {
         return false;
     };
     if owner.inner.is_empty() {
@@ -146,9 +184,10 @@ pub fn classify_paths(worktree: &Path, rel_paths: &[String]) -> Result<Vec<PathS
     let top = dirty_set(worktree)?;
     let mut scans: HashMap<String, Option<HashSet<String>>> = HashMap::new();
     scans.insert(String::new(), Some(top));
+    let mut resolver = Resolver::new(worktree);
     let mut out = Vec::with_capacity(rel_paths.len());
     for path in rel_paths {
-        let Some(owner) = owning_repo(worktree, path) else {
+        let Some(owner) = resolver.owner(path) else {
             out.push(PathState::Unknown);
             continue;
         };
@@ -283,6 +322,7 @@ mod tests {
 
     #[test]
     fn classify_separates_dirty_from_clean() {
+        use PathState::{Clean, Dirty};
         let dir = init_repo("attr-classify");
         commit_file(dir.path(), ".gitignore", ".dev/\n");
         commit_file(dir.path(), "kept.rs", "a\n");
@@ -308,7 +348,6 @@ mod tests {
             ]),
         )
         .unwrap();
-        use PathState::{Clean, Dirty};
         assert_eq!(
             got,
             vec![Dirty, Dirty, Dirty, Clean, Clean, Clean, Clean, Clean]
@@ -372,6 +411,27 @@ mod tests {
             hidden_from_status(repo_less.path(), &paths(&["x"])),
             HashSet::from(["x".to_string()])
         );
+    }
+
+    #[test]
+    fn resolver_reads_each_repository_layout_once() {
+        let child = init_repo("attr-resolver-child");
+        commit_file(child.path(), "lib.rs", "x\n");
+        let parent = init_repo("attr-resolver-parent");
+        commit_file(parent.path(), "README.md", "r\n");
+        add_submodule(parent.path(), child.path(), "sub");
+        let mut resolver = Resolver::new(parent.path());
+        for i in 0..500 {
+            let top = resolver.owner(&format!("dir/f{i}.rs")).unwrap();
+            assert_eq!(
+                (top.prefix.as_str(), top.inner.as_str()),
+                ("", &*format!("dir/f{i}.rs"))
+            );
+            let sub = resolver.owner(&format!("sub/g{i}.rs")).unwrap();
+            assert_eq!(sub.prefix, "sub");
+            assert_eq!(sub.inner, format!("g{i}.rs"));
+        }
+        assert_eq!(resolver.layouts.len(), 2, "one layout read per repository");
     }
 
     #[test]

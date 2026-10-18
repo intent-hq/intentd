@@ -74,7 +74,9 @@ fn add_submodule(parent: &Path, child: &Path, sub_rel: &str) {
     index.read(true).unwrap();
     let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
     let sig = Signature::now("Test", "test@example.com").unwrap();
-    let head = repo.find_commit(repo.head().unwrap().target().unwrap()).unwrap();
+    let head = repo
+        .find_commit(repo.head().unwrap().target().unwrap())
+        .unwrap();
     repo.commit(Some("HEAD"), &sig, &sig, "add submodule", &tree, &[&head])
         .unwrap();
 }
@@ -227,7 +229,11 @@ async fn prune_judges_submodule_rows_by_the_submodule() {
     let child = init_repo();
     commit(
         &child.dir,
-        &[(".gitignore", "target/\n"), ("lib.rs", "x\n"), ("clean.rs", "c\n")],
+        &[
+            (".gitignore", "target/\n"),
+            ("lib.rs", "x\n"),
+            ("clean.rs", "c\n"),
+        ],
     );
     let other = init_repo();
     let repo = init_repo();
@@ -250,7 +256,10 @@ async fn prune_judges_submodule_rows_by_the_submodule() {
     assert_eq!(svc.prune_stale_tracked_changes(&ws).await.unwrap(), 2);
     assert_eq!(
         paths(&svc, &ws).await,
-        owned(&[("empty/unknown.rs", "unstaged"), ("pkg/sub/lib.rs", "unstaged")])
+        owned(&[
+            ("empty/unknown.rs", "unstaged"),
+            ("pkg/sub/lib.rs", "unstaged")
+        ])
     );
 }
 
@@ -337,6 +346,11 @@ async fn prune_recomputes_and_publishes_metrics() {
         .expect("subscription open");
     let event = events.first().expect("one event");
     assert_eq!(event.data["metrics"]["filesChanged"], serde_json::json!(1));
-    let stored = svc.store().get_workspace_metrics(&ws).await.unwrap().unwrap();
+    let stored = svc
+        .store()
+        .get_workspace_metrics(&ws)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.files_changed, 1);
 }

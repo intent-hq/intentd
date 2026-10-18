@@ -2329,8 +2329,7 @@ async fn cmd_serve_owned(
     // startup and then periodically, delete working-stage attribution rows
     // whose path git reports clean (ignored, deleted, reverted, committed
     // outside the daemon). Aborted on clean shutdown.
-    let tracked_changes_sweep =
-        startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
+    let tracked_changes_sweep = startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an

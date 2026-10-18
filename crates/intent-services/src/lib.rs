@@ -37747,8 +37747,8 @@ mod accept_changes;
 pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
-mod tracked_changes_sweep;
 pub mod metrics;
+mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;

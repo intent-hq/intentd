@@ -168,9 +168,10 @@ impl Services {
         for workspace_id in workspaces {
             let services = self.clone();
             let id = workspace_id.clone();
-            let Some(prune) = self.store_tasks.spawn_draining(async move {
-                services.prune_stale_tracked_changes(&id).await
-            }) else {
+            let Some(prune) = self
+                .store_tasks
+                .spawn_draining(async move { services.prune_stale_tracked_changes(&id).await })
+            else {
                 break;
             };
             match prune.await {
@@ -190,6 +191,7 @@ impl Services {
     /// (clearing any backlog), then one every [`SWEEP_INTERVAL`]. Stops when
     /// shutdown closes the settings task set (like the token-usage scan) and
     /// is aborted on clean shutdown.
+    #[must_use]
     pub fn spawn_tracked_changes_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         intent_core::spawn_daemon(async move {

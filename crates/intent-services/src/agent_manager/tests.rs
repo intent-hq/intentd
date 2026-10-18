@@ -4737,9 +4737,7 @@ fn file_tracking_workspace(
     ws_id: &intent_core::WorkspaceId,
     worktree: &std::path::Path,
 ) -> intent_core::Workspace {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
     Workspace {
         id: ws_id.clone(),
