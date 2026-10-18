@@ -15,6 +15,7 @@ pub use intent_core::{
 pub use cow::{cow_clone, cow_probe, CowSupport, TEST_COW_CLONE_UNSUPPORTED_PATH_ENV};
 pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
+pub mod attribution;
 pub mod auth;
 pub mod branches;
 pub mod checkpoint;

@@ -25294,6 +25294,77 @@ mod file_tracking {
         );
     }
 
+    /// Regression (intent-hq/intent#7266): an agent `file.write` / `file.delete`
+    /// to an untracked git-ignored path records no `tracked_changes` row — it
+    /// can never be committed, so the row would stay `unstaged` and lock the
+    /// path forever — while a non-ignored write in the same call sequence
+    /// still records.
+    #[intent_test_macros::daemon_test]
+    async fn file_write_to_git_ignored_path_records_no_attribution() {
+        let repo = init_git_repo();
+        commit_file(&repo.dir, ".gitignore", ".dev/\n", "ignore .dev");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        let agent = Some(AgentId::from("agent-ign"));
+
+        svc.file_write(
+            ws.clone(),
+            ".dev/evidence.json".to_string(),
+            "{}\n".to_string(),
+            agent.clone(),
+        )
+        .await
+        .unwrap();
+        svc.file_delete(ws.clone(), ".dev/evidence.json".to_string(), agent.clone())
+            .await
+            .unwrap();
+        svc.file_write(
+            ws.clone(),
+            "real-change.txt".to_string(),
+            "x\n".to_string(),
+            agent,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["real-change.txt"], "ignored path not recorded");
+        let snap = svc.compute_agent_locks(&ws).await;
+        assert!(
+            !snap
+                .locked_file_paths
+                .iter()
+                .any(|p| p.starts_with(".dev/")),
+            "no ignored path is ever locked: {:?}",
+            snap.locked_file_paths
+        );
+    }
+
+    /// A file git already tracks still records attribution even when it
+    /// matches `.gitignore` (force-added): it is a real, committable change
+    /// (intent-hq/intent#7266).
+    #[intent_test_macros::daemon_test]
+    async fn file_write_to_tracked_file_matching_gitignore_records_attribution() {
+        let repo = init_git_repo();
+        commit_file(&repo.dir, ".gitignore", "*.lock\n", "ignore locks");
+        commit_file(&repo.dir, "deps.lock", "v1\n", "force-add lockfile");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "deps.lock".to_string(),
+            "v2\n".to_string(),
+            Some(AgentId::from("agent-lock")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "deps.lock");
+        assert_eq!(rows[0].status, "modified");
+    }
+
     /// An agent-context `file.write` records an attributed `tracked_changes`
     /// row (stage `unstaged`, diff stats populated) — the workspace-api file
     /// tools feed the same attribution pipeline as ACP `fs/write_text_file`

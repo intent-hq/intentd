@@ -37569,6 +37569,7 @@ struct AcExtras {
 /// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
 /// then the metrics / usage-stats recomputes. The status is inferred from the
 /// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Untracked git-ignored paths are not recorded (intent-hq/intent#7266).
 /// Best-effort throughout — a tracking miss never fails the mutation.
 async fn record_agent_file_mutation(
     store: &Store,
@@ -37607,6 +37608,11 @@ async fn record_agent_file_mutation(
             return;
         }
     };
+    // A git-ignored untracked path can never be committed, so a row for it
+    // would sit in `unstaged` forever (intent-hq/intent#7266).
+    if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+        return;
+    }
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =
