@@ -869,6 +869,12 @@ Depot supplies its job-scoped WebDAV endpoint. Self-hosted runners use the
 `DEPOT_TOKEN` Actions secret, or existing `SCCACHE_WEBDAV_*` environment settings.
 Without credentials, compilation proceeds uncached with a notice. Rust caches
 use the managed service, without Rust cache actions or Actions cache archives.
+Setting the organization variable `INTENT_SCCACHE_ENDPOINT` switches every Rust
+CI and release build to the self-hosted sccache WebDAV cache, authenticated by
+the `INTENT_SCCACHE_TOKEN` secret. Every job that receives secrets (main,
+releases, the cache producer and same-repo pull requests) reads and writes it;
+`INTENT_SCCACHE_MODE=READ_ONLY` overrides that. Fork pull requests get no
+token and build uncached. Delete the variable to return to Depot Cache.
 The build-only release-cache workflow warms release inputs; the managed smoke
 workflow verifies compiler hits across jobs and invalidation after source changes.
 
@@ -895,6 +901,7 @@ Once available on main, invoke `windows-prune.yml` directly. After cleanup,
 verify a self-hosted Windows build before removing the maintenance routing
 variable documented above. The optional `verify_build=true` input compiles the
 real daemon with the pinned Rust toolchain after a successful apply; it has no
-effect on dry runs. It uses Depot managed sccache when `DEPOT_TOKEN` is configured.
+effect on dry runs. It uses the same compiler cache as CI (Depot managed sccache when
+`DEPOT_TOKEN` is configured).
 The cleanup log reports actual free bytes before
 and after deletion; a rebuild repopulates any evicted debug cache.

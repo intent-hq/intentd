@@ -209,6 +209,9 @@ jobs:
       shell: bash
       env:
         DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+        INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+        INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
       run: python3 scripts/setup-depot-sccache.py
     - name: Build cache inputs
       shell: bash
@@ -265,6 +268,9 @@ jobs:
       shell: bash
       env:
         DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+        INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+        INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+        INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
       run: python3 scripts/setup-depot-sccache.py
     - name: Build (cargo)
       if: ${{ !matrix.zigbuild }}
