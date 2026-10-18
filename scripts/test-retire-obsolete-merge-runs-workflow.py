@@ -201,7 +201,7 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
             'coverage-changed', 'pr-title', 'conflict-markers', 'monorepo-consumer-checks',
             'deb-packaging', 'release-scripts', 'install-ps1', 'pi-session-paths'})
         commands = '\n'.join(s.get('run', '') for s in ci['jobs']['release-scripts']['steps'])
-        self.assertIn('python3 -B scripts/test-depot-runners.py', commands)
+        self.assertIn('python3 -B scripts/test-hosted-runners.py', commands)
         for test in ('test-retire-obsolete-merge-runs.py', 'test-retire-obsolete-merge-runs-caller.py',
                      'test-retire-obsolete-merge-runs-workflow.py'):
             self.assertIn('python3 -I -B scripts/' + test, commands)

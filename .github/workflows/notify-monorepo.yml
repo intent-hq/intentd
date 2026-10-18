@@ -20,7 +20,7 @@ jobs:
 
   notify:
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     steps:
       - name: Send repository_dispatch to intent-hq/intent
         env:

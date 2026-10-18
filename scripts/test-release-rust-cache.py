@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Depot managed compiler-cache and release warming contracts."""
+"""Self-hosted compiler-cache and release warming contracts."""
 from copy import deepcopy
 from pathlib import Path
 import subprocess
@@ -9,7 +9,7 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE_RUN = 'python3 scripts/setup-depot-sccache.py'
+CACHE_RUN = 'python3 scripts/setup-sccache.py'
 
 
 def workflow(name):
@@ -18,7 +18,7 @@ def workflow(name):
 
 class ManagedCache(unittest.TestCase):
     def test_no_archive_backend_or_local_cache_limits(self):
-        text = (ROOT / 'scripts/setup-depot-sccache.py').read_text()
+        text = (ROOT / 'scripts/setup-sccache.py').read_text()
         for obsolete in ['actions/cache', 'SCCACHE_DIR', 'SCCACHE_CACHE_SIZE', 'SCCACHE_LOCAL_RW_MODE']:
             self.assertNotIn(obsolete, text)
         for name in ['release-cache.yml', 'release-plz.yml']:

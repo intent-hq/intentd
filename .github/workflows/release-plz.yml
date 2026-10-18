@@ -11,8 +11,8 @@
 # release.yml must fire on the tag push. Provisioning the secret is a manual
 # step (repo Settings → Secrets and variables → Actions).
 #
-# Both jobs run on ephemeral Depot runners. Cargo downloads use the Actions
-# cache integration; compiler entries use Depot managed sccache directly.
+# Both jobs run on ephemeral GitHub-hosted runners. Cargo downloads use the Actions
+# cache integration; compiler entries use the self-hosted sccache directly.
 
 name: Release-plz
 
@@ -68,7 +68,7 @@ jobs:
   release-plz-release:
     name: Release-plz release
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['gh-linux-16x'] || fromJSON('["gh-linux-16x"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
     steps:
       - uses: actions/setup-python@v6
@@ -124,7 +124,7 @@ jobs:
   # 16-core runner) than to check's fmt+clippy.
   release-plz-pr:
     name: Release-plz PR
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04-16'] || fromJSON('["depot-ubuntu-24.04-16"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['gh-linux-16x'] || fromJSON('["gh-linux-16x"]') }}
     outputs:
       no_release_needed: ${{ steps.no_release.outputs.no_release_needed }}
       baseline_tag: ${{ steps.no_release.outputs.baseline_tag }}
@@ -185,18 +185,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
-      # Cache Cargo downloads; compiled objects live in Depot managed sccache.
+      # Cache Cargo downloads; compiled objects live in the self-hosted sccache.
       - name: Set shared cargo target dir
         shell: bash
         run: echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target" >> "$GITHUB_ENV"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # Applies to each release-plz package verification build.
       - name: Drop debug info from verify builds
         shell: bash
@@ -256,6 +255,6 @@ jobs:
     name: "Release-plz no release needed: ${{ needs.release-plz-pr.outputs.baseline_tag }}@${{ needs.release-plz-pr.outputs.baseline_sha }}"
     needs: [release-plz-pr, runner-route]
     if: ${{ needs.release-plz-pr.result == 'success' && needs.release-plz-pr.outputs.no_release_needed == 'true' }}
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     steps:
       - run: echo 'Release-plz confirmed no release is needed for this commit.'

@@ -15,13 +15,13 @@ class ConfigureRouting(unittest.TestCase):
 on: push
 jobs:
   plan:
-    runs-on: "depot-ubuntu-24.04"
+    runs-on: "ubuntu-24.04"
   build:
     needs: [plan]
     runs-on: ${{ matrix.runner }}
   announce:
     needs: [plan, build]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-24.04
 '''
         result = routing.configure(source)
         self.assertIn('needs: [plan, runner-route]', result)
@@ -36,7 +36,7 @@ jobs:
         self.assertEqual(result, routing.configure(result))
 
     def test_generated_python_steps_have_a_tomllib_capable_interpreter(self):
-        source = 'name: Release\njobs:\n  plan:\n    runs-on: depot-ubuntu-24.04\n    steps:\n      - run: python3 scripts/optional-intel-release.py\n'
+        source = 'name: Release\njobs:\n  plan:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: python3 scripts/optional-intel-release.py\n'
         result = routing.configure(source)
         self.assertIn("python-version: '3.11'", result)
         self.assertLess(result.index('uses: actions/setup-python@'), result.index('- run: python3'))

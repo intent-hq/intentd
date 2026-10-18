@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compile through a WebDAV sccache backend and prove reuse and invalidation.
 
-By default a local HTTP fixture exercises real sccache without Depot credentials.
---managed uses the runner's Depot backend. --phase populate/verify splits reuse
+By default a local HTTP fixture exercises real sccache without cache credentials.
+--managed uses the configured self-hosted cache backend. --phase populate/verify splits reuse
 across two independent CI jobs, with a unique source per workflow run.
 """
 import argparse
@@ -24,7 +24,7 @@ def main():
     args = parser.parse_args()
     env = dict(os.environ)
     if args.managed and not env.get('SCCACHE_WEBDAV_ENDPOINT'):
-        raise SystemExit('Depot managed cache endpoint is required')
+        raise SystemExit('Managed cache endpoint is required (set INTENT_SCCACHE_ENDPOINT)')
     server = None
     entries = {}
     if not args.managed:
@@ -80,7 +80,7 @@ def main():
     # Stable cwd across the two hosted jobs; source identity is run-specific.
     identity = os.environ.get('GITHUB_RUN_ID', 'local')
     directory = tempfile.TemporaryDirectory(prefix='managed-cache-smoke-') if args.phase == 'all' else None
-    root = Path(directory.name if directory else Path(tempfile.gettempdir()) / ('intent-depot-smoke-' + identity))
+    root = Path(directory.name if directory else Path(tempfile.gettempdir()) / ('intent-cache-smoke-' + identity))
     root.mkdir(exist_ok=True)
     env['SCCACHE_DIR'] = str(root / 'unused-local-cache')
 
@@ -124,7 +124,7 @@ def main():
             print(json.dumps({'managed': args.managed, 'rust_hits': warm['cache_hits']['counts']['Rust'],
                               'changed_source_misses': changed['cache_misses']['counts']['Rust']}))
         else:
-            print('Populated Depot managed cache for verification in a separate job.')
+            print('Populated the managed cache for verification in a separate job.')
         assert not (root / 'unused-local-cache').exists(), 'remote test must not use a disk cache'
     finally:
         subprocess.run([sccache, '--stop-server'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

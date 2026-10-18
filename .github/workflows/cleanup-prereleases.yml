@@ -55,7 +55,7 @@ jobs:
     # Skip noncanonical/manual feature or tag runs before exposing credentials.
     if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 30
     env:
       GH_TOKEN: ${{ secrets.PRERELEASE_CLEANUP_TOKEN }}
