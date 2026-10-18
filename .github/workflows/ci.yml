@@ -158,12 +158,22 @@ jobs:
             mapping['depot-macos-latest'] = burst.macos ? ['depot-macos-latest'] : fleets.macos;
             mapping['macos-latest-large'] = burst.intel ? ['macos-latest-large'] : fleets.intel;
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
+            // The heavy Rust jobs (check, coverage-*, daemon-lifecycle) read
+            // linux_labels/check_labels/linux_burst. In the merge queue they
+            // stay on Depot: one queue run starts ~4 of them at once, each
+            // needing 30+ GiB, and the 8 tinybox slots share one /raid volume,
+            // which hit ENOSPC mid-run (runs 39131949771, 39134737536). PR and
+            // push runs, and the light jobs via `runners`, keep self-hosted.
+            const heavyBurst = burst.linux || context.eventName === 'merge_group';
+            const heavy = label => heavyBurst ? [label] : fleets.linux;
+            if (heavyBurst !== burst.linux) core.info('heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on Depot)');
             core.setOutput('runners', JSON.stringify(mapping));
-            core.setOutput('linux_labels', JSON.stringify(mapping[`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`]));
-            core.setOutput('check_labels', JSON.stringify(mapping['depot-ubuntu-24.04-8']));
+            core.setOutput('linux_labels', JSON.stringify(heavy(`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`)));
+            core.setOutput('check_labels', JSON.stringify(heavy('depot-ubuntu-24.04-8')));
             core.setOutput('windows_labels', JSON.stringify(mapping['depot-windows-2022-16']));
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
-            for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+            core.setOutput('linux_burst', String(heavyBurst));
+            for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
 
   # Dependency-free PR policy checks; the PR's compiled Linux checks live in
   # `check` and `coverage-changed`, and native runners stay queue-only.
@@ -1918,8 +1928,10 @@ jobs:
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    # Runs after queueing and on main pushes.
-    if: github.event_name == 'merge_group' || github.event_name == 'push'
+    # Runs on same-repo PRs (so a change to these scripts is proven before
+    # it queues), after queueing and on main pushes. Like `check`, a route
+    # skip (fork PRs) skips it and CI Gate rejects that skip.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -2307,7 +2319,7 @@ jobs:
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               optional deb-packaging "${{ needs.deb-packaging.result }}"
-              optional release-scripts "${{ needs.release-scripts.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
               optional install-ps1 "${{ needs.install-ps1.result }}"
               optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;

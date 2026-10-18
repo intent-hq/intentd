@@ -169,3 +169,13 @@ test('native busy occupancy is not counted twice, and queued native demand burst
     'true',
   );
 });
+test('the merge queue keeps heavy Linux jobs on Depot and light jobs self-hosted', async () => {
+  const runners = [runner('Linux', 'X64')];
+  const queue = await route({ runners, event: 'merge_group' });
+  assert.equal(queue.outputs.linux_burst, 'true');
+  assert.deepEqual(JSON.parse(queue.outputs.check_labels), ['depot-ubuntu-24.04-8']);
+  assert.deepEqual(JSON.parse(queue.outputs.runners)['depot-ubuntu-24.04'], ['self-hosted', 'Linux', 'X64']);
+  const push = await route({ runners });
+  assert.equal(push.outputs.linux_burst, 'false');
+  assert.deepEqual(JSON.parse(push.outputs.check_labels), ['self-hosted', 'Linux', 'X64']);
+});

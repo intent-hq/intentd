@@ -26,7 +26,7 @@ RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"route"}
 RUNTIME = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed"},
+    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
@@ -293,7 +293,7 @@ const github = {
   },
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
-const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: 'push', payload: {} };
+const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: fixture.eventName || 'push', payload: fixture.payload || {} };
 process.env.THRESHOLD = '8';
 process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
@@ -416,6 +416,37 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
+
+    def test_merge_queue_keeps_heavy_linux_jobs_on_depot(self):
+        # The heavy Rust jobs share one tinybox /raid volume; in the queue
+        # several start at once and ran it out of space (runs 39131949771,
+        # 39134737536). Light jobs, PRs and pushes keep self-hosted Linux.
+        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        for event in ("pull_request", "push", "merge_group"):
+            with self.subTest(event=event):
+                same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+                result = run_route(self.workflow, org=fleet, eventName=event,
+                                   payload=same_repo if event == "pull_request" else {})
+                outputs = result["outputs"]
+                queue = event == "merge_group"
+                self.assertEqual(json.loads(outputs["linux_labels"]),
+                                 ["depot-ubuntu-24.04-16"] if queue else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["check_labels"]),
+                                 ["depot-ubuntu-24.04-8"] if queue else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(outputs["linux_burst"], str(queue).lower())
+                self.assertEqual(json.loads(outputs["runners"])["depot-ubuntu-24.04"], ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+                self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
+                self.assertEqual(any("merge queue keeps heavy" in line for line in result["logs"]), queue)
+        heavy = {"check": "check_labels", "coverage-e2e": "linux_labels",
+                 "coverage-all": "linux_labels", "coverage-changed": "linux_labels"}
+        for job_id, output in heavy.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
+                                 "${{ fromJSON(needs.route.outputs.%s) }}" % output)
+        for job_id in ("release-scripts", "deb-packaging"):
+            with self.subTest(job=job_id):
+                self.assertIn("needs.route.outputs.runners", self.workflow["jobs"][job_id]["runs-on"])
 
     def test_windows_bursts_without_explicit_idle_capacity(self):
         missing_busy = runner("Windows", "X64")
