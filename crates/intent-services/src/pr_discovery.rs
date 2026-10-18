@@ -25,6 +25,71 @@ const RECORDS: usize = 512;
 const ATTEMPTS: usize = 128;
 const LIST_RESERVATION: usize = MAX_PAGES * 4;
 const RECORD_RESERVATION: usize = 4;
+/// The local admission denial: this window's background budget is spent.
+/// Not a forge failure, so sweeps summarize it per repository
+/// ([`DeferralTally`]) instead of logging it once per consumer.
+const BUDGET_DEFERRED: &str = "background PR refresh deferred by request budget";
+
+/// True when a source-control read was deferred by the local request budget.
+pub(crate) fn is_budget_deferral_sc(error: &Error) -> bool {
+    matches!(error, Error::Api(message) if message == BUDGET_DEFERRED)
+}
+
+/// [`is_budget_deferral_sc`] after [`pr_ops::map_sc_err`] flattened it into
+/// the service error (`Internal("source control api error: …")`).
+pub(crate) fn is_budget_deferral(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Internal(message) if *message == unknown(BUDGET_DEFERRED).to_string())
+}
+
+/// Budget deferrals seen by one background sweep, per repository. One
+/// deferral sits in the repository's shared listing slot for the window, so
+/// every root and workspace of that repository receives the same error; the
+/// sweep logs one WARN per repository instead (intent-hq/intent#7264),
+/// mirroring the one-WARN-per-pause rate-limit path (monorepo#2961).
+#[derive(Default)]
+pub(crate) struct DeferralTally {
+    repos: HashMap<RepoRef, (usize, usize)>,
+}
+
+impl DeferralTally {
+    pub(crate) fn workspace(&mut self, repo: Option<RepoRef>) {
+        if let Some(repo) = repo {
+            self.repos.entry(repo).or_default().0 += 1;
+        }
+    }
+
+    pub(crate) fn root(&mut self, repo: Option<RepoRef>) {
+        if let Some(repo) = repo {
+            self.repos.entry(repo).or_default().1 += 1;
+        }
+    }
+
+    /// One WARN per deferred repository, in a stable order. `deferred_reads`
+    /// drains every deferred background read [`Discovery`] answered since the
+    /// previous summary, including follow-ons (relink discovery, stale-pool
+    /// re-fetch) that do not fail their root or workspace.
+    pub(crate) fn log(self, discovery: &Discovery) {
+        let mut repos: HashMap<RepoRef, (usize, usize, usize)> = self
+            .repos
+            .into_iter()
+            .map(|(repo, (workspaces, roots))| (repo, (workspaces, roots, 0)))
+            .collect();
+        for (repo, reads) in discovery.take_deferred_reads() {
+            repos.entry(repo).or_default().2 += reads;
+        }
+        let mut repos: Vec<_> = repos.into_iter().collect();
+        repos.sort_by_cached_key(|(repo, _)| repo.identity_key());
+        for (repo, (workspaces, roots, deferred_reads)) in repos {
+            tracing::warn!(
+                repo = %format_args!("{}/{}", repo.owner, repo.name),
+                workspaces,
+                roots,
+                deferred_reads,
+                "pr refresh: background refresh deferred by request budget; retrying next sweep"
+            );
+        }
+    }
+}
 
 tokio::task_local! { static FORCE_AFTER: Instant; }
 tokio::task_local! { static AUTOMATIC_MAX_AGE: Duration; }
@@ -222,7 +287,7 @@ impl Budget {
                 {
                     state.pending.push_back((key.clone(), cost, expires_at));
                 }
-                return Err(unknown("background PR refresh deferred by request budget"));
+                return Err(unknown(BUDGET_DEFERRED));
             }
         }
         Ok(Arc::new(Lease {
@@ -240,6 +305,9 @@ pub(crate) struct Discovery {
     slots: Slots,
     budget: Arc<Mutex<Budget>>,
     concurrent: Arc<tokio::sync::Semaphore>,
+    // Background reads answered with a budget deferral (fresh or shared from
+    // the slot) since the last sweep summary drained them, per repository.
+    deferred_reads: Arc<Mutex<HashMap<RepoRef, usize>>>,
 }
 
 impl Default for Discovery {
@@ -248,6 +316,7 @@ impl Default for Discovery {
             slots: Arc::default(),
             budget: Arc::default(),
             concurrent: Arc::new(tokio::sync::Semaphore::new(4)),
+            deferred_reads: Arc::default(),
         }
     }
 }
@@ -257,6 +326,19 @@ fn unknown(message: &str) -> Error {
 }
 
 impl Discovery {
+    fn note_deferred_read(&self, repo: &RepoRef) {
+        *self
+            .deferred_reads
+            .lock()
+            .unwrap()
+            .entry(repo.clone())
+            .or_default() += 1;
+    }
+
+    fn take_deferred_reads(&self) -> HashMap<RepoRef, usize> {
+        std::mem::take(&mut *self.deferred_reads.lock().unwrap())
+    }
+
     fn newer_listing(&self, key: &Key, started: Instant) -> bool {
         if key.number.is_none() {
             return false;
@@ -424,6 +506,9 @@ impl Discovery {
                     .is_none_or(|at| cached.finished.is_some_and(|finished| finished >= at))
             {
                 record_reuse(operation, Reuse::CacheHit);
+                if cached.background_deferred && cached.result.is_err() {
+                    self.note_deferred_read(&key.repo);
+                }
                 return cached.result.clone();
             }
         }
@@ -535,8 +620,17 @@ impl Discovery {
             result
         }
         .await;
+        // Up-front and mid-lease budget denials are one condition for every
+        // consumer of this slot: report both as BUDGET_DEFERRED.
+        let result = match result {
+            Err(_) if background_deferred => Err(unknown(BUDGET_DEFERRED)),
+            other => other,
+        };
         if !key.scope.is_current() || revision != slot.revision.load(Ordering::SeqCst) {
             return Err(unknown("PR refresh invalidated during fetch"));
+        }
+        if background_deferred && result.is_err() {
+            self.note_deferred_read(&key.repo);
         }
         *entry = Some(Entry {
             started,
@@ -667,6 +761,25 @@ mod tests {
             repo: RepoRef::new("o", format!("r{repo}")),
             number,
         }
+    }
+
+    /// The sweep classifies a deferral after it crossed the service-error
+    /// boundary; a reworded mapping must not silently restore the per-root
+    /// WARN fan-out (intent-hq/intent#7264).
+    #[test]
+    fn budget_deferral_is_classified_on_both_sides_of_the_error_mapping() {
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        budget.lock().unwrap().available = 0;
+        let denied = Budget::reserve(&budget, &key(&scope(), 0, None), WINDOW)
+            .err()
+            .expect("an exhausted budget defers background work");
+        assert!(is_budget_deferral_sc(&denied), "{denied:?}");
+        let mapped = pr_ops::map_sc_err(denied);
+        assert!(is_budget_deferral(&mapped), "{mapped:?}");
+
+        let other = unknown("PR refresh timed out");
+        assert!(!is_budget_deferral_sc(&other));
+        assert!(!is_budget_deferral(&pr_ops::map_sc_err(other)));
     }
 
     #[test]

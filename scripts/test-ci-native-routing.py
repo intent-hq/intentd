@@ -26,7 +26,7 @@ RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"route"}
 RUNTIME = {"deb-packaging", "release-scripts", "install-ps1", "pi-session-paths"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks"},
+    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | {"build"},
 }
@@ -222,6 +222,53 @@ def gitlab_errors(workflow):
         errors.append("GitLab caller policy must remain armed")
     return errors
 
+
+NODE_TOOLS = r"(?:node|npx|npm|pnpm|corepack)"
+NODE_COMMAND = re.compile(r"(?m)(?:^|[;&|(]|\$\(|\b(?:then|do|exec|time)\s)\s*(?:\w+=\S*\s+)*" + NODE_TOOLS + r"(?=\s+[^=\s]|\s*$)")
+NODE_PYTHON = re.compile(r"""(?:\[\s*|shutil\.which\(\s*)["']""" + NODE_TOOLS + r"""["']""")
+SCRIPT_EXECUTION = re.compile(
+    r"(?m)(?:^|[;&|(]\s*|\$\(\s*|(?:python3?|bash|sh)(?:\s+-X\s+\S+|\s+-\S+)*\s+|\./)(scripts/[\w./-]+\.(?:py|sh))\b")
+
+
+def without_comments(text):
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def executes_node(path):
+    if not path.is_file():
+        return False
+    text = without_comments(path.read_text())
+    if path.suffix == ".py":
+        return bool(NODE_PYTHON.search(text))
+    return bool(NODE_COMMAND.search(text))
+
+
+def node_without_setup(workflow):
+    """Jobs whose steps execute Node before an unconditional actions/setup-node step.
+
+    Depot images preinstall Node, but the self-hosted tinybox runners do not,
+    so routing a job there fails with `node` not found unless it sets Node up.
+    A conditional setup-node step covers only later steps with the identical
+    `if:` expression (a Windows-only setup does not cover Linux). Detected:
+    node/npx/npm/pnpm/corepack at a shell command position (comment lines
+    ignored), and directly executed scripts/*.py that spawn or look up those
+    tools or scripts/*.sh that run them. Not detected: Node spawned by compiled
+    tests (cargo/nextest), by scripts called from other scripts, or by inline
+    heredoc programs; those jobs must keep their setup-node step by review.
+    """
+    errors = []
+    for job_id, job in workflow["jobs"].items():
+        ready = set()
+        for step in job.get("steps", []):
+            if "actions/setup-node@" in step.get("uses", ""):
+                ready.add(step.get("if"))
+            command = without_comments(step.get("run", ""))
+            if not command or None in ready or step.get("if", False) in ready:
+                continue
+            if NODE_COMMAND.search(command) or any(
+                    executes_node(ROOT / reference) for reference in SCRIPT_EXECUTION.findall(command)):
+                errors.append(f"{job_id}: {step.get('name') or command.splitlines()[0]}")
+    return errors
 
 def run_route(workflow, **fixture):
     """Execute the workflow's actual github-script body with offline API fixtures."""
@@ -786,9 +833,50 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertIn("python3 -I -B scripts/test-ci-native-routing.py", commands)
         self.assertNotRegex(commands, r"cargo (build|check|clippy|test|nextest|llvm-cov)|pnpm install|npm install")
 
+    def changed_test_base_step(self):
+        return next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
+                    if s.get("name") == "Resolve changed-test base from the event")
+
+    def test_jobs_that_execute_node_install_it_first(self):
+        self.assertEqual(node_without_setup(self.workflow), [])
+
+        def without_setup(job_id, *, conditional=None):
+            workflow = copy.deepcopy(self.workflow)
+            steps = workflow["jobs"][job_id]["steps"]
+            for step in steps:
+                if "actions/setup-node@" in step.get("uses", ""):
+                    if conditional is None:
+                        steps.remove(step)
+                    else:
+                        step["if"] = conditional
+                    break
+            return [error for error in node_without_setup(workflow) if error.startswith(job_id + ": ")]
+
+        self.assertTrue(without_setup("pr-static"))
+        self.assertTrue(without_setup("release-scripts"))
+        self.assertTrue(without_setup("pr-static", conditional="runner.os == 'Windows'"))
+        # Lookup via shutil.which in a directly executed script, not comment text.
+        for job_id in ("coverage-all", "coverage-changed"):
+            workflow = copy.deepcopy(self.workflow)
+            for step in workflow["jobs"][job_id]["steps"]:
+                if step.get("run"):
+                    step["run"] = without_comments(step["run"])
+            workflow["jobs"][job_id]["steps"] = [step for step in workflow["jobs"][job_id]["steps"]
+                if "actions/setup-node@" not in step.get("uses", "")]
+            self.assertTrue([e for e in node_without_setup(workflow) if e.startswith(job_id + ": ")], job_id)
+
+        def flagged(command):
+            return node_without_setup({"jobs": {"probe": {"steps": [{"run": command}]}}})
+
+        for command in ("node -e 1", "npm ci", "FOO=1 npx tsc", "make && pnpm test", "out=$(node -v)",
+                        "scripts/test-ci-native-routing.py", "python3 -I -B scripts/test-ci-native-routing.py"):
+            self.assertTrue(flagged(command), command)
+        for command in ("# npm is not needed here", "for node in a b; do echo $node; done",
+                        "node=1", "echo checking node version", "git diff -- scripts/test-ci-native-routing.py"):
+            self.assertFalse(flagged(command), command)
+
     def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
-        step = next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
-                    if s.get("name") == "Resolve queue base from the event")
+        step = self.changed_test_base_step()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             stub = root / "git"
@@ -804,10 +892,69 @@ class NativeRoutingTests(unittest.TestCase):
                 output.unlink(missing_ok=True)
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]],
                     env={**os.environ, "PATH": tmp + os.pathsep + os.environ["PATH"],
+                         "GITHUB_EVENT_NAME": "merge_group",
                          "QUEUE_BASE_SHA": base, "QUEUE_HEAD_SHA": head, "TEST_HEAD": actual,
                          "FETCH_STATUS": fetch_status, "GITHUB_ENV": str(output)}, capture_output=True)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual(output.read_text() if output.exists() else "", "BASE_SHA=" + base + "\n" if accepted else "")
+
+    def test_pr_coverage_base_is_the_merge_commit_base_parent(self):
+        step = self.changed_test_base_step()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            origin, work = root / "origin.git", root / "work"
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+            git = lambda *args: subprocess.run(["git", "-C", str(work), *args], env=env, check=True,
+                                               capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], env=env, check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main", str(work)], env=env, check=True)
+            git("remote", "add", "origin", str(origin))
+            git("commit", "-q", "--allow-empty", "-m", "root")
+            git("checkout", "-q", "-b", "feature")
+            git("commit", "-q", "--allow-empty", "-m", "feature work")
+            git("checkout", "-q", "main")
+            git("commit", "-q", "--allow-empty", "-m", "main advances")
+            synced_main = git("rev-parse", "HEAD")
+            git("checkout", "-q", "feature")
+            # The PR branch tip is itself a merge commit ("merge main into feature").
+            git("merge", "-q", "--no-ff", "-m", "merge main into feature", "main")
+            pr_head = git("rev-parse", "HEAD")
+            git("checkout", "-q", "main")
+            git("commit", "-q", "--allow-empty", "-m", "main advances again")
+            base_tip = git("rev-parse", "HEAD")
+            git("push", "-q", "origin", "main")
+            git("merge", "-q", "--no-ff", "-m", "synthetic PR merge", pr_head)
+            synthetic = git("rev-parse", "HEAD")
+
+            def resolve(checkout, *, head=pr_head, base_ref="main"):
+                git("checkout", "-q", "--detach", checkout)
+                output = root / "env"
+                output.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], cwd=work,
+                    env={**env, "GITHUB_EVENT_NAME": "pull_request", "PR_BASE_REF": base_ref, "PR_HEAD_SHA": head,
+                         "QUEUE_BASE_SHA": "", "QUEUE_HEAD_SHA": "", "GITHUB_ENV": str(output)},
+                    capture_output=True, text=True)
+                return result, output.read_text() if output.exists() else ""
+
+            for name, checkout, kwargs, expected, message in (
+                ("synthetic merge", synthetic, {}, base_tip, None),
+                ("PR head that is itself a merge", pr_head, {}, synced_main, None),
+                ("unrelated checkout", synthetic, {"head": base_tip}, None, "unexpected checkout"),
+                ("empty PR head", synthetic, {"head": ""}, None, "PR head unknown"),
+                ("empty base ref", pr_head, {"base_ref": ""}, None, "PR_BASE_REF is empty"),
+                ("missing base branch", pr_head, {"base_ref": "missing-branch"}, None, None),
+            ):
+                with self.subTest(name):
+                    result, written = resolve(checkout, **kwargs)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assertEqual(written, "")
+                        if message:
+                            self.assertIn(message, result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(written, f"BASE_SHA={expected}\n")
 
     def test_lifecycle_matrix_is_required_and_runs_real_proof(self):
         job = self.workflow["jobs"]["daemon-lifecycle"]

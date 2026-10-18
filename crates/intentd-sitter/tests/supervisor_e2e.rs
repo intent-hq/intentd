@@ -3383,6 +3383,53 @@ esac
     );
 }
 
+// The CLI may reject a request before opening the private socket. That must
+// fail the assertion with its output, never leave this fixture blocked in join.
+fn serve_stop_eof(
+    listener: &std::os::unix::net::UnixListener,
+    finished: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                drop(stream); // Crash before the owned daemon has stopped.
+                return true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("stop fixture accept failed: {error}"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || finished.recv_timeout(remaining.min(Duration::from_millis(20)))
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            return false;
+        }
+    }
+}
+
+#[test]
+fn stop_eof_fixture_finishes_when_cli_exits_before_connecting() {
+    for disconnected in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.path().join("stop")).unwrap();
+        let (finished, signal) = std::sync::mpsc::channel();
+        if !disconnected {
+            finished.send(()).unwrap();
+        }
+        drop(finished);
+        let started = Instant::now();
+        assert!(!serve_stop_eof(&listener, &signal));
+        // The 15s deadline also returns false; only the finished signal is prompt.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fixture ignored the CLI-finished signal (disconnected: {disconnected})"
+        );
+    }
+}
+
 #[test]
 fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
     let dir = tempfile::tempdir().unwrap();
@@ -3391,13 +3438,15 @@ fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
         std::os::unix::net::UnixListener::bind(fixture.paths.pid_path.with_extension("stop"))
             .unwrap();
     fs::write(&fixture.paths.pid_path, std::process::id().to_string()).unwrap();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        drop(stream); // Model a crash before the owned daemon has stopped.
-    });
+    let (finished, signal) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || serve_stop_eof(&listener, &signal));
     let out = background_call(dir.path(), &dead_url(), &["stop"]);
+    let _ = finished.send(());
     fs::remove_file(&fixture.paths.pid_path).unwrap();
-    server.join().unwrap();
+    assert!(
+        server.join().unwrap(),
+        "stop never reached private control: {out:?}"
+    );
     assert!(
         !out.status.success(),
         "early EOF is not confirmed shutdown: {out:?}"

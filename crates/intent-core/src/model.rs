@@ -66,6 +66,19 @@ pub enum PullRequestStatus {
     Draft,
 }
 
+/// One `workspace.findByPullRequest` result row (§5.1 "Pull request workspace
+/// lookup"): a workspace linked to the requested PR. `linked_at` is when the
+/// daemon first linked this workspace to the PR (RFC 3339); results are
+/// ordered by it, most recent first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestWorkspace {
+    pub id: WorkspaceId,
+    pub title: String,
+    pub archived: bool,
+    pub linked_at: String,
+}
+
 /// Pull-request metadata persisted on a [`Workspace`] as `activePullRequest`
 /// (§7.6; TS `PullRequestInfo` in `src/shared/types.ts`). A focused subset of
 /// the TS shape populated from the host-agnostic forge `PullRequest`; required
@@ -1372,6 +1385,28 @@ pub struct WorkspaceCreate {
     pub context_links: Option<Vec<ContextLink>>,
     /// Initial agent payload (full shape; `prompt` also seeds the branch slug).
     pub initial_agent: Option<WorkspaceCreateInitialAgent>,
+    /// Daemon-internal provenance echoed on the `workspace:created` event as
+    /// `data.origin` (PROTOCOL §6.5). Never read from the wire
+    /// (`#[serde(skip)]`) and never persisted: only in-process callers that
+    /// create a workspace on someone's behalf (`ws.workspace.applyProposal`)
+    /// set it, so clients can surface the new workspace next to its source.
+    #[serde(skip)]
+    pub origin: Option<WorkspaceCreateOrigin>,
+}
+
+/// Provenance of a `workspace.create` (see [`WorkspaceCreate::origin`]),
+/// serialized verbatim as the `workspace:created` event's `data.origin`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkspaceCreateOrigin {
+    /// Created by applying a `workspace-create` proposal that the agent
+    /// `agentId` emitted in workspace `sourceWorkspaceId`.
+    #[serde(rename_all = "camelCase")]
+    Proposal {
+        proposal_id: String,
+        agent_id: AgentId,
+        source_workspace_id: WorkspaceId,
+    },
 }
 
 /// The `initialAgent` sub-object of `workspace.create` (PROTOCOL §5.1). Full

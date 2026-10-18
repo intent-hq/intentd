@@ -836,9 +836,10 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
 /// pending; turn 2 applies it by proposalId with
 /// `ws.workspace.applyProposal(id, { userRequested: true })`. Asserts the
 /// tool result shape, that the created workspace is served by
-/// `workspace.list` / `workspace.get` under the proposal's title, and that
-/// the proposal moved from `pendingProposals` to `proposalResolutions =
-/// applied` on both the `agent:updated` event and `agent.get`.
+/// `workspace.list` / `workspace.get` under the proposal's title, that its
+/// `workspace:created` event carries the proposal `origin`, and that the
+/// proposal moved from `pendingProposals` to `proposalResolutions = applied`
+/// on both the `agent:updated` event and `agent.get`.
 #[tokio::test]
 async fn workspace_apply_proposal_round_trip_over_wss() {
     let Some(script) = gate("WSS workspace.applyProposal E2E") else {
@@ -937,6 +938,16 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
         1,
         "events.subscribe",
         json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    // Global subscriber: the created workspace mints its own id, so its
+    // `workspace:created` is outside the proposer-scoped subscription above.
+    let mut created_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut created_sub,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:created"] }),
     )
     .await;
     let mut rpc = connect_ws(port, cfg).await;
@@ -1075,7 +1086,31 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
         "{got}"
     );
 
-    // 3. The proposal moved from pending to resolved=applied: live event
+    // 3. `workspace:created` names its provenance (§6.5 `data.origin`) so
+    //    clients can open the new workspace beside the proposing one.
+    let created_event = loop {
+        let frame = wss_event(&mut created_sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == created_ws_id {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        created_event["origin"],
+        json!({
+            "kind": "proposal",
+            "proposalId": proposal_id,
+            "agentId": agent_id,
+            "sourceWorkspaceId": ws_id,
+        }),
+        "{created_event}"
+    );
+    assert!(
+        got["workspace"].get("origin").is_none(),
+        "origin is event-only, never a workspace field: {got}"
+    );
+
+    // 4. The proposal moved from pending to resolved=applied: live event
     //    during turn 2, and the agent.get projection afterwards.
     let update = resolve_update.expect("agent:updated with proposalResolutions during turn 2");
     assert_eq!(update["pendingProposals"], json!([]), "{update}");

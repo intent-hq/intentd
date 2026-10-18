@@ -1585,7 +1585,7 @@ async fn member_import_handles_remain_owned_by_the_authenticated_initiator() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let manifest = json!({"formatVersion":intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion":env!("CARGO_PKG_VERSION"),"workspaceId":"member-import",
+        "creatingIntentdVersion":intent_core::transfer::CREATING_INTENTD_VERSION,"workspaceId":"member-import",
         "createdAt":now_iso(),"tables":[],"assets":[],"attachments":[],
         "git":{"hasRepository":false,"dirtyFiles":[],"sandboxBranches":[]}});
     let started = with_caller(

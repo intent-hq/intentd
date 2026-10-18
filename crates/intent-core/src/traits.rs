@@ -20,8 +20,8 @@ use crate::model::{
     LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
     NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
+    ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
@@ -277,6 +277,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Workspaces linked to the pull request at `url`
+    /// (`workspace.findByPullRequest`, PROTOCOL §5.1 "Pull request workspace
+    /// lookup"): most recently linked first, archived included, narrowed to the
+    /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
+    /// pull-request URL.
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
+        let _ = url;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
             ))
         })
     }

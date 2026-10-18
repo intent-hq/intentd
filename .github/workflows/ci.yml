@@ -17,8 +17,10 @@ on:
   # are completely unaffected.
   pull_request:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
-  # checks only. The queue runs compilation, runtime/platform matrices and
-  # instrumented coverage on the merged tree; CI Gate enforces each tier.
+  # checks plus the Linux `check` job (clippy, source lints) and
+  # `coverage-changed` (the PR's changed tests). The queue reruns both and
+  # adds runtime/platform matrices and full instrumented coverage on the
+  # merged tree; CI Gate enforces each tier.
   merge_group:
 
 permissions:
@@ -163,7 +165,8 @@ jobs:
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
 
-  # No compilation, application dependencies, or native runners before queueing.
+  # Dependency-free PR policy checks; the PR's compiled Linux checks live in
+  # `check` and `coverage-changed`, and native runners stay queue-only.
   pr-static:
     needs: route
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -175,6 +178,11 @@ jobs:
         with:
           python-version: '3.11'
       - run: python3 -m pip install 'PyYAML==6.0.3'
+      # The routing test executes the probe under node. Depot images ship it;
+      # the self-hosted tinybox runners do not.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Resolve formatting toolchain
@@ -192,12 +200,12 @@ jobs:
     secrets: inherit
 
   check:
-    # Skipped on push to main — redundant re-test of a tree the PR CI already
-    # checked (see the `on: push` comment). The expression carries no status
-    # function, so the implicit success() still applies: a route failure —
-    # or a route skip, as on fork PRs — skips this job on pull_request
-    # exactly as before.
-    if: github.event_name == 'merge_group'
+    # Runs on same-repo PRs and in the merge queue; skipped on push to main —
+    # a redundant re-test of a tree the queue already checked (see the
+    # `on: push` comment). The expression carries no status function, so the
+    # implicit success() still applies: a route failure — or a route skip, as
+    # on fork PRs — skips this job, and CI Gate rejects that skip.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
@@ -402,7 +410,8 @@ jobs:
         run: cargo shear --deny-warnings
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
-      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # (coverage-e2e / coverage-all are merge_group-only; PRs run only
+      # coverage-changed — see the trigger comment).
       # Running it plainly here as well would double the critical path. The
       # exception is the tests the coverage scripts skip: they are flaky under
       # llvm-cov instrumentation / heavy parallel load, so they run here
@@ -1379,12 +1388,14 @@ jobs:
         if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
         run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
 
-  # Queue-only focused coverage retains the callback fixture composition proof
-  # and its evidence alongside the full instrumented suites. Local changed-test
-  # commands remain available for earlier feedback; PRs do not compile tests.
+  # Focused coverage of the diff's changed tests, required on same-repo PRs
+  # and in the queue (against the merged tree), retaining the callback fixture
+  # composition proof and its evidence alongside the full queue-only
+  # instrumented suites. A selection can legitimately be empty (no Rust
+  # changes), so a green run does not by itself mean tests executed.
   coverage-changed:
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
@@ -1408,6 +1419,8 @@ jobs:
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
       QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
       QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -1420,9 +1433,41 @@ jobs:
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
         run: python3 scripts/setup-depot-sccache.py
-      - name: Resolve queue base from the event
+      # PRs check out GitHub's synthetic merge commit: its second parent is
+      # the PR head and its first parent the base tip it merged against —
+      # never pull_request.base.sha, which is not guaranteed to be that
+      # parent (intent-hq/intent#5414). The checkout is identified by the PR
+      # head SHA, not by "HEAD is a merge", because a branch tip can itself be
+      # a merge commit. If the checkout is ever the PR head itself, fall back
+      # to its merge-base with the base branch. Queue entries bind to the
+      # event's base/head pair.
+      - name: Resolve changed-test base from the event
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if ! [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error title=coverage-changed: PR head unknown::PR_HEAD_SHA '$PR_HEAD_SHA' is not a commit SHA"
+              exit 1
+            fi
+            head=$(git rev-parse HEAD)
+            if [ "$head" = "$PR_HEAD_SHA" ]; then
+              if [ -z "$PR_BASE_REF" ]; then
+                echo "::error title=coverage-changed: PR base unknown::PR_BASE_REF is empty; cannot resolve the merge-base for checkout $head"
+                exit 1
+              fi
+              git fetch --no-tags origin "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF"
+              base=$(git merge-base "refs/remotes/origin/$PR_BASE_REF" HEAD)
+              echo "base: merge-base with origin/$PR_BASE_REF (checkout is the PR head) = $base"
+            elif [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD_SHA" ]; then
+              base=$(git rev-parse 'HEAD^1')
+              echo "base: HEAD^1 (PR merge-commit base parent) = $base"
+            else
+              echo "::error title=coverage-changed: unexpected checkout::HEAD $head is neither PR head $PR_HEAD_SHA nor a merge of it"
+              exit 1
+            fi
+            echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+            exit 0
+          fi
           [[ "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$QUEUE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$QUEUE_HEAD_SHA"
@@ -1790,7 +1835,7 @@ jobs:
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@0e12255c6207b474a218e633ec61e9b051d3e990
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@fad7680163695477075ebe48b6ec1d44954f11d6
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -2227,12 +2272,12 @@ jobs:
               require pr-static "${{ needs.pr-static.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
-              optional check "${{ needs.check.result }}"
+              require check "${{ needs.check.result }}"
               optional build "${{ needs.build.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
-              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              require coverage-changed "${{ needs.coverage-changed.result }}"
               require pr-title "${{ needs.pr-title.result }}"
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"

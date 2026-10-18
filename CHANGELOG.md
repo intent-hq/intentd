@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.7] - 2026-10-18
+
+### 🐛 Bug Fixes
+
+- Realign library crate versions with intentd 0.11.6 ([#2472](https://github.com/intent-hq/intentd/pull/2472))
+
+### 🧪 Testing
+
+- Use one version source for transfer manifests ([#2469](https://github.com/intent-hq/intentd/pull/2469))
+
+
+## [0.11.6] - 2026-10-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Updated the following local packages: intent-core, intent-core, intent-git, intent-js, intent-providers, intent-providers, intent-acp, intent-acp, intent-context, intent-linear, intent-sentry, intent-sourcecontrol, intent-sourcecontrol, intent-store, intent-store, intent-services, intent-services, intent-transport
+
+
+## [0.11.5] - 2026-10-17
+
+
+## [0.11.4] - 2026-10-17
+
+### 🚀 Features
+
+- *(acp)* Clone sibling proposals from a GitHub origin ([#2452](https://github.com/intent-hq/intentd/pull/2452))
+
+
+## [0.11.3] - 2026-10-17
+
+### 🧪 Testing
+
+- Synchronize retirement fixture progress and ordering ([#2448](https://github.com/intent-hq/intentd/pull/2448))
+
+
+## [0.11.2] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Recover shell credentials for Claude auth checks ([#2445](https://github.com/intent-hq/intentd/pull/2445))
+- Surface generic event loss with ordered recovery fences ([#2404](https://github.com/intent-hq/intentd/pull/2404))
+
+
 ## [0.11.1] - 2026-10-17
 
 ### 🐛 Bug Fixes

@@ -96,6 +96,9 @@ impl FakeControl {
 }
 
 impl SystemControl for FakeControl {
+    fn daemon_version(&self) -> &str {
+        &self.status.version
+    }
     fn exact_update_supported(&self) -> bool {
         self.update_error.is_none()
     }
