@@ -14103,6 +14103,136 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
     let _ = mock.await;
 }
 
+/// Control: input that became ready behind a settled turn is not delivered
+/// by the aborted worker. Rehydration never kicks a drain, so the agent must
+/// stay recoverable; startup recovery's continuation also drains the queue.
+#[tokio::test]
+async fn shutdown_settled_turn_with_ready_queue_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-ready-queue");
+    let id = AgentId::from("settled-ready-queue");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "ready behind the settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    assert!(mgr.services.has_ready_to_send(&id));
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "undelivered ready input must keep the agent recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Window 2 for every `end_turn` caller, not only prompt workers: a turn
+/// whose release completed but whose `RuntimeIdle` write was aborted must
+/// not look like a crash at the next startup.
+#[tokio::test]
+async fn shutdown_finishes_aborted_end_turn_idle_write() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-aborted-end-turn");
+    let id = AgentId::from("aborted-end-turn");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    let active = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(active.status, AgentStatus::Active);
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    let ending = {
+        let mgr = mgr.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.end_turn(&id).await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    ending.abort();
+    assert!(ending.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert_eq!(mgr.services.heal_stale_agent_sessions().await.unwrap(), 0);
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A pending idle write never overwrites a status written after it — a
+/// later stop, failure or delete owns the session row.
+#[tokio::test]
+async fn shutdown_pending_idle_write_preserves_later_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-pending-idle-later");
+    let id = AgentId::from("pending-idle-later");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    let worker = mgr.workers.lock().unwrap().remove(&id).expect("worker");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "shutdown must not overwrite a later status"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
 /// Start one real turn and park its worker after the terminal `agent:idle`,
 /// holding the busy slot at the post-turn drain barrier.
 async fn park_after_settled_turn(
@@ -14210,34 +14340,25 @@ async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
     let _ = mock.await;
 }
 
-/// Control: a mark retained after a release whose idle write did not finish
-/// never carries into a later claim.
+/// Control: the settled mark lives only while its holder owns the slot, and
+/// an unmarked claimed turn stays recoverable.
 #[tokio::test]
-async fn settled_mark_is_cleared_by_the_next_slot_claim() {
+async fn settled_mark_lives_only_with_the_held_slot() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
-    let ws = WorkspaceId::from("ws-settled-reclaim");
-    let id = AgentId::from("settled-reclaim");
+    let ws = WorkspaceId::from("ws-settled-slot");
+    let id = AgentId::from("settled-slot");
     seed_agent(&mgr, &ws, &id).await;
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.mark_turn_settled_if_slot_held(&id);
-    mgr.end_turn(&id).await;
-    assert!(
-        !mgr.turn_settled(&id),
-        "a durable idle write retires the mark"
-    );
+    assert!(mgr.turn_settled(&id));
+    mgr.release_in_flight_slot(&id);
+    assert!(!mgr.turn_settled(&id), "release retires the mark");
     mgr.mark_turn_settled_if_slot_held(&id);
     assert!(!mgr.turn_settled(&id), "only a slot holder can be marked");
 
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.mark_turn_settled_if_slot_held(&id);
-    assert!(mgr.turn_settled(&id));
-    // Release without the end_turn write, as an abort after release would.
-    mgr.release_in_flight_slot(&id);
-    assert!(mgr.turn_settled(&id), "release alone keeps the mark");
-    assert!(mgr.try_begin(&id, &ws).await);
-    assert!(!mgr.turn_settled(&id), "a new claim owns unfinished work");
-
+    assert!(!mgr.turn_settled(&id));
     timeout(Duration::from_secs(10), mgr.shutdown())
         .await
         .expect("shutdown completes");
@@ -14250,6 +14371,43 @@ async fn settled_mark_is_cleared_by_the_next_slot_claim() {
             .is_some(),
         "a claimed, unfinished turn must remain recoverable"
     );
+}
+
+/// A pending idle write belongs to one `end_turn` call: a later claim
+/// supersedes it, and a stale call's completion never retires a newer entry.
+#[tokio::test]
+async fn pending_idle_write_is_owned_by_its_end_turn_call() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-idle-write-token");
+    let id = AgentId::from("idle-write-token");
+    seed_agent(&mgr, &ws, &id).await;
+    let pending = |mgr: &AgentManager| mgr.pending_idle_writes.lock().unwrap().get(&id).cloned();
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.end_turn(&id).await;
+    assert_eq!(pending(&mgr), None, "a completed write retires its entry");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    let (_, older) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let older = older.expect("recorded");
+    assert!(pending(&mgr).is_some());
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(
+        pending(&mgr),
+        None,
+        "a new claim supersedes the pending write"
+    );
+    let (_, newer) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let newer = newer.expect("recorded");
+    mgr.finish_idle_write(&id, older);
+    assert_eq!(
+        pending(&mgr),
+        Some((ws.clone(), newer)),
+        "a stale completion keeps the newer entry"
+    );
+    mgr.finish_idle_write(&id, newer);
+    assert_eq!(pending(&mgr), None);
 }
 
 #[tokio::test]
