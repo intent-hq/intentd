@@ -311,13 +311,35 @@ new AsyncFunction('github', 'core', 'context', script)(github, core, context)
     return json.loads(result.stdout)
 
 
-def route_outputs(workflow, outputs):
-    result = {}
-    for key, expression in workflow["jobs"]["route"]["outputs"].items():
+def run_heavy(workflow, decide, event):
+    """Execute the route job's actual merge-queue override step offline."""
+    job = workflow["jobs"]["route"]
+    step = next(s for s in job["steps"] if s.get("id") == "heavy")
+    env = {"PATH": os.environ["PATH"], "EVENT": event, **{k: str(v) for k, v in job.get("env", {}).items()}}
+    for key, expression in step["env"].items():
         match = re.fullmatch(r"\$\{\{ steps\.decide\.outputs\.(\w+) \}\}", expression)
+        if match:
+            env[key] = decide.get(match[1], "")
+        elif expression != "${{ github.event_name }}":
+            raise ValueError(f"unsupported heavy step input: {expression}")
+    with tempfile.TemporaryDirectory() as directory:
+        env["GITHUB_OUTPUT"] = str(Path(directory) / "output")
+        logs = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], env=env,
+                              capture_output=True, text=True, timeout=10, check=True).stdout
+        outputs = dict(line.split("=", 1) for line in Path(env["GITHUB_OUTPUT"]).read_text().splitlines())
+    return outputs, logs
+
+
+def route_outputs(workflow, outputs, event="push"):
+    result = {}
+    heavy = None
+    for key, expression in workflow["jobs"]["route"]["outputs"].items():
+        match = re.fullmatch(r"\$\{\{ steps\.(decide|heavy)\.outputs\.(\w+) \}\}", expression)
         if not match:
             raise ValueError(f"unsupported job output: {expression}")
-        result[key] = outputs.get(match[1], "")
+        if match[1] == "heavy":
+            heavy = heavy or run_heavy(workflow, outputs, event)[0]
+        result[key] = (heavy if match[1] == "heavy" else outputs).get(match[2], "")
     return result
 
 
@@ -420,30 +442,38 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_merge_queue_keeps_heavy_linux_jobs_on_depot(self):
         # The heavy Rust jobs share one tinybox /raid volume; in the queue
         # several start at once and ran it out of space (runs 39131949771,
-        # 39134737536). Light jobs, PRs and pushes keep self-hosted Linux.
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
-        for event in ("pull_request", "push", "merge_group"):
-            with self.subTest(event=event):
-                same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
-                result = run_route(self.workflow, org=fleet, eventName=event,
-                                   payload=same_repo if event == "pull_request" else {})
-                outputs = result["outputs"]
-                queue = event == "merge_group"
-                self.assertEqual(json.loads(outputs["linux_labels"]),
-                                 ["depot-ubuntu-24.04-16"] if queue else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["check_labels"]),
-                                 ["depot-ubuntu-24.04-8"] if queue else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(outputs["linux_burst"], str(queue).lower())
-                self.assertEqual(json.loads(outputs["runners"])["depot-ubuntu-24.04"], ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
-                self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
-                self.assertEqual(any("merge queue keeps heavy" in line for line in result["logs"]), queue)
+        # 39134737536). Light jobs, PRs and pushes keep the probe's choice.
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        for idle in (True, False):
+            fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()] if idle else []
+            for event in ("pull_request", "push", "merge_group"):
+                with self.subTest(idle=idle, event=event):
+                    result = run_route(self.workflow, org=fleet, eventName=event,
+                                       payload=same_repo if event == "pull_request" else {})
+                    outputs = route_outputs(self.workflow, result["outputs"], event)
+                    hosted = event == "merge_group" or not idle
+                    self.assertEqual(json.loads(outputs["linux_labels"]),
+                                     ["depot-ubuntu-24.04-16"] if hosted else ["self-hosted", "Linux", "X64"])
+                    self.assertEqual(json.loads(outputs["check_labels"]),
+                                     ["depot-ubuntu-24.04-8"] if hosted else ["self-hosted", "Linux", "X64"])
+                    self.assertEqual(outputs["linux_burst"], str(hosted).lower())
+                    self.assertEqual(json.loads(outputs["runners"])["depot-ubuntu-24.04"],
+                                     ["self-hosted", "Linux", "X64"] if idle else ["depot-ubuntu-24.04"])
+                    if idle:
+                        self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+                        self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
+                    logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
+                    self.assertEqual(logged, event == "merge_group")
         heavy = {"check": "check_labels", "coverage-e2e": "linux_labels",
                  "coverage-all": "linux_labels", "coverage-changed": "linux_labels"}
         for job_id, output in heavy.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.%s) }}" % output)
+        lifecycle = self.workflow["jobs"]["daemon-lifecycle"]["strategy"]["matrix"]["include"]
+        linux = next(row for row in lifecycle if row["platform"] == "linux")
+        self.assertEqual(matrix_labels(linux["os"], {"linux_labels": '["depot-ubuntu-24.04-16"]'}), ["depot-ubuntu-24.04-16"])
+        self.assertIn("needs.route.outputs.linux_labels", linux["os"])
         for job_id in ("release-scripts", "deb-packaging"):
             with self.subTest(job=job_id):
                 self.assertIn("needs.route.outputs.runners", self.workflow["jobs"][job_id]["runs-on"])

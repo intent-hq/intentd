@@ -14,6 +14,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +209,12 @@ sys.exit(fixture.get("exit", 0))
             env=self.env, capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        # Guard the forwarding itself on hosts whose interpreter does not need it.
+        for name in LOADER_PATH:
+            self.assertEqual(self.env.get(name), os.environ.get(name), name)
+        with unittest.mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/fixture/lib"}):
+            self.setUp()
+            self.assertEqual(self.env["LD_LIBRARY_PATH"], "/fixture/lib")
         self.assertNotIn("PYTHONPATH", self.env)
         self.assertEqual(self.env["PATH"], str(self.bin))
 

@@ -131,19 +131,9 @@ jobs:
             mapping['depot-macos-latest'] = burst.macos ? ['depot-macos-latest'] : fleets.macos;
             mapping['macos-latest-large'] = burst.intel ? ['macos-latest-large'] : fleets.intel;
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
-            // The heavy Rust jobs (check, coverage-*, daemon-lifecycle) read
-            // linux_labels/check_labels/linux_burst. In the merge queue they
-            // stay on Depot: one queue run starts ~4 of them at once, each
-            // needing 30+ GiB, and the 8 tinybox slots share one /raid volume,
-            // which hit ENOSPC mid-run (runs 39131949771, 39134737536). PR and
-            // push runs, and the light jobs via `runners`, keep self-hosted.
-            const heavyBurst = burst.linux || context.eventName === 'merge_group';
-            const heavy = label => heavyBurst ? [label] : fleets.linux;
-            if (heavyBurst !== burst.linux) core.info('heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on Depot)');
             core.setOutput('runners', JSON.stringify(mapping));
-            core.setOutput('linux_labels', JSON.stringify(heavy(`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`)));
-            core.setOutput('check_labels', JSON.stringify(heavy('depot-ubuntu-24.04-8')));
+            core.setOutput('linux_labels', JSON.stringify(mapping[`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`]));
+            core.setOutput('check_labels', JSON.stringify(mapping['depot-ubuntu-24.04-8']));
             core.setOutput('windows_labels', JSON.stringify(mapping['depot-windows-2022-16']));
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
-            core.setOutput('linux_burst', String(heavyBurst));
-            for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+            for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
