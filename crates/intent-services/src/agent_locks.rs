@@ -6,7 +6,10 @@
 //! enabled, the agent owns at least one tracked change at the `unstaged` or
 //! `staged` stage, and the agent is actively working (running a turn, or its
 //! linked task note is not `complete`/`cancelled`). Locked file paths are the
-//! union of the locked agents' unstaged/staged tracked-change paths.
+//! union of the locked agents' unstaged/staged tracked-change paths that git
+//! still reports as changes (intent-hq/intent#7266): a path the worktree
+//! status no longer lists — committed, reverted, ignored, deleted — is not a
+//! file a user could stage, so it neither locks nor makes its agent locked.
 //!
 //! The snapshot is served on demand via `file-tracking.getAgentLocks`
 //! (PROTOCOL §5.19) and pushed as the self-sufficient `changes:agent-locks`
@@ -14,7 +17,7 @@
 //! status, auto-commit policy, or tracked-change churn events — yields a
 //! snapshot that differs from the last one published for that workspace.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use intent_core::events::{
@@ -133,6 +136,12 @@ impl Services {
             };
             paths_by_agent.entry(agent_id).or_default().insert(row.path);
         }
+        if let Some(lockable) = self.lockable_paths(workspace_id, &paths_by_agent).await {
+            for paths in paths_by_agent.values_mut() {
+                paths.retain(|p| lockable.contains(p));
+            }
+            paths_by_agent.retain(|_, paths| !paths.is_empty());
+        }
         if paths_by_agent.is_empty() {
             return empty;
         }
@@ -161,6 +170,44 @@ impl Services {
             locked_agent_ids: locked_agent_ids.into_iter().collect(),
             locked_file_paths: locked_file_paths.into_iter().collect(),
         }
+    }
+
+    /// The subset of the tracked paths in `paths_by_agent` that are still
+    /// changes git would stage: listed in the (cached) worktree status, or
+    /// hidden from it — inside a submodule, or the old side of a rename (see
+    /// [`intent_git::attribution::hidden_from_status`]). `None` (no
+    /// filtering, the pre-#7266 behaviour) when the workspace has no local
+    /// worktree or its status cannot be read.
+    async fn lockable_paths(
+        &self,
+        workspace_id: &WorkspaceId,
+        paths_by_agent: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Option<HashSet<String>> {
+        let ws = self.store().get_workspace(workspace_id).await.ok()?;
+        if ws.is_remote {
+            return None;
+        }
+        let worktree = crate::git_ops::worktree_path(&ws)?;
+        let status = self.scan_git_status(&worktree, false).await.ok()?;
+        let dirty: HashSet<&str> = status.files.iter().map(|f| f.path.as_str()).collect();
+        let mut lockable: HashSet<String> = HashSet::new();
+        let mut unlisted: Vec<String> = Vec::new();
+        for path in paths_by_agent.values().flatten() {
+            if dirty.contains(path.as_str()) {
+                lockable.insert(path.clone());
+            } else {
+                unlisted.push(path.clone());
+            }
+        }
+        if !unlisted.is_empty() {
+            let hidden = tokio::task::spawn_blocking(move || {
+                intent_git::attribution::hidden_from_status(&worktree, &unlisted)
+            })
+            .await
+            .ok()?;
+            lockable.extend(hidden);
+        }
+        Some(lockable)
     }
 
     /// Recompute `workspace_id`'s lock snapshot and publish

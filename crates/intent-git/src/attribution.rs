@@ -12,6 +12,9 @@
 //! - [`classify_paths`]: is an existing row's path still dirty? A row whose
 //!   path is clean (committed, reverted, ignored, deleted-untracked) will never
 //!   be moved out of its working stage by the commit pipeline.
+//! - [`hidden_from_status`]: which paths missing from a cached superproject
+//!   status may still be real changes (inside a submodule, or the old side
+//!   of a rename) — for the agent-lock filter.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -170,15 +173,42 @@ fn dirty_set(workdir: &Path) -> Result<HashSet<String>> {
         .collect())
 }
 
-/// The registered submodule paths of the repository at `worktree` (top level
-/// only), or an empty set when it cannot be read. For callers that hold a
-/// superproject-only status and must recognise paths it cannot see into.
+/// Of `rel_paths` — paths **absent** from the superproject's rename-detecting
+/// status (`git.status` / the status cache) — the ones that may still be real
+/// changes that status cannot show:
+///
+/// - paths strictly inside a submodule (the superproject reports only the
+///   gitlink, never the files inside it);
+/// - tracked paths (in the index or `HEAD`) missing on disk — the old side of
+///   a detected rename, which a rename-detecting status folds into the new
+///   path's entry.
+///
+/// When the repository cannot be read every path is returned, so a caller
+/// filtering on the result degrades to keeping everything.
 #[must_use]
-pub fn top_level_submodules(worktree: &Path) -> BTreeSet<String> {
-    Repository::open(worktree)
-        .ok()
-        .and_then(|repo| submodule_paths(&repo).ok())
-        .unwrap_or_default()
+pub fn hidden_from_status(worktree: &Path, rel_paths: &[String]) -> HashSet<String> {
+    let Ok(repo) = Repository::open(worktree) else {
+        return rel_paths.iter().cloned().collect();
+    };
+    let submodules: BTreeSet<String> = submodule_paths(&repo).unwrap_or_default();
+    let ignore_case = ignores_case(&repo);
+    let index = repo.index().ok();
+    let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    rel_paths
+        .iter()
+        .filter(|p| {
+            if submodule_containing(&submodules, p, ignore_case).is_some() {
+                return true;
+            }
+            if std::fs::symlink_metadata(worktree.join(p.as_str())).is_ok() {
+                return false;
+            }
+            let rel = Path::new(p.as_str());
+            index.as_ref().is_some_and(|i| i.get_path(rel, 0).is_some())
+                || head.as_ref().is_some_and(|t| t.get_path(rel).is_ok())
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -319,7 +349,29 @@ mod tests {
             got,
             vec![PathState::Dirty, PathState::Clean, PathState::Clean]
         );
-        assert!(top_level_submodules(parent.path()).contains("sub"));
+        let hidden = hidden_from_status(
+            parent.path(),
+            &paths(&["sub/clean.rs", "README.md", "gone.md"]),
+        );
+        assert_eq!(hidden, HashSet::from(["sub/clean.rs".to_string()]));
+    }
+
+    #[test]
+    fn hidden_from_status_keeps_the_old_side_of_a_rename() {
+        let dir = init_repo("attr-hidden-rename");
+        commit_file(dir.path(), "old.rs", "fn main() {}\n");
+        std::fs::rename(dir.path().join("old.rs"), dir.path().join("new.rs")).unwrap();
+        let hidden = hidden_from_status(
+            dir.path(),
+            &paths(&["old.rs", "new.rs", "never-tracked.rs"]),
+        );
+        assert_eq!(hidden, HashSet::from(["old.rs".to_string()]));
+        let repo_less = init_repo("attr-hidden-norepo");
+        std::fs::remove_dir_all(repo_less.path().join(".git")).unwrap();
+        assert_eq!(
+            hidden_from_status(repo_less.path(), &paths(&["x"])),
+            HashSet::from(["x".to_string()])
+        );
     }
 
     #[test]
