@@ -109,6 +109,22 @@
 //! is a root that itself lives under a tier head (a home-tier skills root): it
 //! is walked unpruned.
 //!
+//! An ordinary directory no path rule decides is also pruned when the root's
+//! git ignore rules ignore it — the same [`super::watcher::GitignoreMatcher`]
+//! chain (nested `.gitignore` files, `info/exclude`, global excludes, the
+//! defaults) the `file:*` stream already drops those paths with, so no
+//! subscriber loses anything. Git-ignored scratch trees such as `.dev/` cost
+//! ~560k descriptors on one host before this (intent-hq/intent#7252). The
+//! path rules win over ignore rules: a `.*` pattern never unwatches `.git` or
+//! a skills tier. The registrar holds each root's rules and rebuilds them
+//! when the callback reports a `.gitignore` / `info/exclude` change, then
+//! re-walks the affected directory (once per [`RULES_SETTLE`] burst) so a
+//! newly un-ignored directory is watched without a restart; a newly ignored
+//! one keeps its descriptors until the root is next registered. The hub-side
+//! [`covered_recursively`] check stays path-only, so a root nested under an
+//! ancestor's git-ignored directory is treated as covered by it and keeps its
+//! descriptors until the ancestor retires.
+//!
 //! A git dir is neither noise nor exempt: what its subscribers consume is
 //! known exactly (intent-hq/intent#5044). The git metadata watcher reads
 //! `HEAD`, `index` and `packed-refs` as direct children plus anything under
@@ -314,6 +330,9 @@ enum Cmd {
     AddDir(PathBuf),
     #[cfg(target_os = "linux")]
     Forget(PathBuf),
+    /// A `.gitignore` or `info/exclude` file changed (module header).
+    #[cfg(target_os = "linux")]
+    RulesChanged(PathBuf),
 }
 
 /// Handle to a registrar's command channel. The hub holds the strong count;
@@ -1173,7 +1192,28 @@ fn spawn_registrar(
         // retries creation) before any OS watcher does, and `WatchHealth`
         // must not count a stream that is not there yet.
         watcher_live.store(true, Ordering::Release);
-        while let Ok(cmd) = rx.recv() {
+        loop {
+            #[cfg(target_os = "linux")]
+            let next = match pruned.rules_deadline() {
+                Some(deadline) => {
+                    match rx
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    {
+                        Ok(cmd) => Some(cmd),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            pruned.apply_rule_changes(watcher.as_mut());
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+                None => rx.recv().ok(),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let next = rx.recv().ok();
+            let Some(cmd) = next else {
+                break;
+            };
             match cmd {
                 Cmd::Watch(root, mode, kind, registration) => {
                     register(
@@ -1195,11 +1235,19 @@ fn spawn_registrar(
                 Cmd::AddDir(dir) => pruned.add_dir(watcher.as_mut(), &dir),
                 #[cfg(target_os = "linux")]
                 Cmd::Forget(dir) => pruned.forget(&dir),
+                #[cfg(target_os = "linux")]
+                Cmd::RulesChanged(file) => pruned.note_rules_changed(&file),
             }
         }
     });
     tx
 }
+
+/// How long the registrar gathers ignore-rule edits before acting on them:
+/// one save (or a branch switch touching many `.gitignore` files) emits a
+/// burst, and each root is rebuilt and re-walked once per burst.
+#[cfg(target_os = "linux")]
+const RULES_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Registrar-side descriptor bookkeeping for the pruned recursive
 /// registration (module header, intent-hq/intent#5026). Lives on the registrar
@@ -1218,6 +1266,23 @@ struct PrunedWatches {
     /// is walked.
     #[cfg(target_os = "linux")]
     roots: HashMap<PathBuf, RootKind>,
+    /// The git ignore rules of each pruned [`RootKind::Tree`] root — the
+    /// same rules the `file:*` stream filters with — so the walk skips
+    /// directories no subscriber reads (intent-hq/intent#7252). Absent for
+    /// a root under a tier head, which is walked unpruned. Replaced
+    /// wholesale when the rules change, never mutated in place.
+    #[cfg(target_os = "linux")]
+    rules: HashMap<PathBuf, Arc<super::watcher::GitignoreMatcher>>,
+    /// Ignore-rule edits not yet applied: per root, the directories to
+    /// re-walk once the burst settles at `rules_due`.
+    #[cfg(target_os = "linux")]
+    rules_pending: HashMap<PathBuf, std::collections::BTreeSet<PathBuf>>,
+    #[cfg(target_os = "linux")]
+    rules_due: Option<std::time::Instant>,
+    /// Whether the budget WARN ([`over_watch_budget`]) has fired since the
+    /// held count last dropped below the threshold.
+    #[cfg(target_os = "linux")]
+    budget_warned: bool,
 }
 
 impl PrunedWatches {
@@ -1252,6 +1317,8 @@ impl PrunedWatches {
         #[cfg(target_os = "linux")]
         if self.roots.remove(root).is_some() {
             self.roots.retain(|r, _| !r.starts_with(root));
+            self.rules.retain(|r, _| !r.starts_with(root));
+            self.rules_pending.retain(|r, _| !r.starts_with(root));
             let mut stripped = Vec::new();
             self.dirs.retain(|dir| {
                 let under = dir.starts_with(root);
@@ -1280,19 +1347,48 @@ impl PrunedWatches {
         kind: RootKind,
     ) -> notify::Result<()> {
         self.roots.insert(root.to_path_buf(), kind);
-        let descriptors = self.add_tree(watcher, root, kind, root)?;
+        if kind == RootKind::Tree && path_rule(root, kind, root) != PathRule::Keep {
+            self.rules.insert(
+                root.to_path_buf(),
+                Arc::new(super::watcher::GitignoreMatcher::new(root.to_path_buf())),
+            );
+        }
+        let walked = self.add_tree(watcher, root, kind, root);
+        self.note_budget();
+        let descriptors = walked?;
         tracing::warn!(
             root = %root.display(),
             descriptors,
+            held_total = self.dirs.len(),
             "shared watch registered; inotify descriptors held for this root after pruning noise dirs"
         );
         Ok(())
     }
 
+    /// Warn once when the directories this hub holds descriptors for cross
+    /// [`WATCH_BUDGET_WARN_PERCENT`] of `fs.inotify.max_user_watches`, before
+    /// the OS limit starts dropping new directories (intent-hq/intent#7252);
+    /// re-armed once the count falls back below the threshold.
+    #[cfg(target_os = "linux")]
+    fn note_budget(&mut self) {
+        let over = over_watch_budget(self.dirs.len(), max_user_watches());
+        if over && !self.budget_warned {
+            tracing::warn!(
+                held = self.dirs.len(),
+                os_watch_limits = %os_watch_limits(),
+                "shared watch holds over half of the inotify watch budget; new directories may soon go unwatched"
+            );
+        }
+        self.budget_warned = over;
+    }
+
     /// Walk `start` (which lies under `root`, whose prune rules — for its
     /// `kind` — apply) and register one non-recursive descriptor per
-    /// surviving directory,
-    /// returning how many. `start` itself is registered first and outside the
+    /// surviving directory, returning how many. The walk yields each
+    /// directory once (symlinks are followed only where [`pruned_dirs`]
+    /// allows, and never to a target already covered), so the count is the
+    /// number of distinct directories, not of `watch()` calls landing on
+    /// inodes inotify already watches (intent-hq/intent#7252). `start` itself is registered first and outside the
     /// walk, so a missing or unreadable `start` fails with the backend's own
     /// error (the walk would merely yield nothing for it) and the caller
     /// settles the root as failed, as `notify`'s own watch would. The walk
@@ -1311,7 +1407,8 @@ impl PrunedWatches {
         watcher.watch(start, RecursiveMode::NonRecursive)?;
         self.dirs.insert(start.to_path_buf());
         let mut count = 1;
-        for dir in pruned_dirs(root, kind, start).filter(|dir| dir != start) {
+        let rules = self.rules.get(root).cloned();
+        for dir in pruned_dirs(root, kind, rules, start).filter(|dir| dir != start) {
             match watcher.watch(&dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     self.dirs.insert(dir);
@@ -1339,12 +1436,19 @@ impl PrunedWatches {
         let Some((root, kind)) = self
             .roots
             .iter()
-            .find(|(root, kind)| dir.starts_with(root) && !prunes(root, **kind, dir))
+            .find(|(root, kind)| {
+                dir.starts_with(root) && !walk_skips(root, **kind, self.rules.get(*root), dir)
+            })
             .map(|(root, kind)| (root.clone(), *kind))
         else {
             return;
         };
-        match self.add_tree(watcher, &root, kind, dir) {
+        if !follows_symlink(&root, kind, dir) {
+            return;
+        }
+        let walked = self.add_tree(watcher, &root, kind, dir);
+        self.note_budget();
+        match walked {
             Ok(_) => {}
             Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
                 tracing::warn!(
@@ -1369,6 +1473,150 @@ impl PrunedWatches {
     #[cfg(target_os = "linux")]
     fn forget(&mut self, dir: &Path) {
         self.dirs.remove(dir);
+    }
+
+    /// An ignore-rule file changed: queue a rebuild of every pruned root
+    /// whose rules it feeds — a `.gitignore` in a watched directory of the
+    /// root re-walks that directory, the root's `info/exclude` re-walks the
+    /// whole root — to run once the burst settles ([`RULES_SETTLE`]).
+    #[cfg(target_os = "linux")]
+    fn note_rules_changed(&mut self, file: &Path) {
+        let is_gitignore = file.file_name().is_some_and(|n| n == GITIGNORE_NAME);
+        for (root, rules) in &self.rules {
+            let rescan = if rules.is_exclude_path(file) {
+                root.clone()
+            } else if is_gitignore && file.starts_with(root) {
+                match file.parent() {
+                    Some(dir) if self.dirs.contains(dir) => dir.to_path_buf(),
+                    _ => continue,
+                }
+            } else {
+                continue;
+            };
+            self.rules_pending
+                .entry(root.clone())
+                .or_default()
+                .insert(rescan);
+        }
+        if !self.rules_pending.is_empty() && self.rules_due.is_none() {
+            self.rules_due = Some(std::time::Instant::now() + RULES_SETTLE);
+        }
+    }
+
+    /// When queued ignore-rule edits are due, if any.
+    #[cfg(target_os = "linux")]
+    fn rules_deadline(&self) -> Option<std::time::Instant> {
+        self.rules_due
+    }
+
+    /// Apply the queued ignore-rule edits: rebuild each affected root's rules
+    /// and re-walk the queued directories, so a directory the edit
+    /// un-ignored gains its descriptors (re-watching a directory that already
+    /// holds one is a no-op). A directory the edit newly ignores keeps its
+    /// descriptor until the root is next registered — wasted budget, not
+    /// lost events.
+    #[cfg(target_os = "linux")]
+    fn apply_rule_changes(&mut self, watcher: &mut dyn Watcher) {
+        self.rules_due = None;
+        for (root, dirs) in std::mem::take(&mut self.rules_pending) {
+            let Some(&kind) = self.roots.get(&root) else {
+                continue;
+            };
+            self.rules.insert(
+                root.clone(),
+                Arc::new(super::watcher::GitignoreMatcher::new(root.clone())),
+            );
+            let mut walked: Vec<PathBuf> = Vec::new();
+            for dir in dirs {
+                if walked.iter().any(|done| dir.starts_with(done)) {
+                    continue;
+                }
+                match self.add_tree(watcher, &root, kind, &dir) {
+                    Ok(descriptors) => {
+                        tracing::debug!(
+                            root = %root.display(),
+                            dir = %dir.display(),
+                            descriptors,
+                            "re-walked after an ignore-rule change"
+                        );
+                    }
+                    Err(e) if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) => {
+                        tracing::warn!(
+                            root = %root.display(),
+                            dir = %dir.display(),
+                            error = %e,
+                            os_watch_limits = %os_watch_limits(),
+                            "directory un-ignored by a rule change could not be watched; events under it are lost"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(dir = %dir.display(), error = %e, "re-walk target vanished");
+                    }
+                }
+                walked.push(dir);
+            }
+        }
+        self.note_budget();
+    }
+}
+
+/// Share of `fs.inotify.max_user_watches` past which [`PrunedWatches`] warns.
+#[cfg(target_os = "linux")]
+const WATCH_BUDGET_WARN_PERCENT: u64 = 50;
+
+/// Whether `held` descriptors reach [`WATCH_BUDGET_WARN_PERCENT`] of `limit`;
+/// never with an unknown or zero limit.
+#[cfg(target_os = "linux")]
+fn over_watch_budget(held: usize, limit: Option<u64>) -> bool {
+    limit.is_some_and(|limit| {
+        limit > 0
+            && (held as u64).saturating_mul(100) >= limit.saturating_mul(WATCH_BUDGET_WARN_PERCENT)
+    })
+}
+
+/// The host's `fs.inotify.max_user_watches`, read once per process.
+#[cfg(target_os = "linux")]
+fn max_user_watches() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
+/// Whether the walk may enter `dir` if it is a symlink. Git does not follow
+/// directory symlinks and a target inside the root is watched at its real
+/// path, so an ordinary symlinked directory is not walked: following them
+/// re-walked pnpm link farms and `.svelte-kit` links once per alias
+/// (intent-hq/intent#7252). Inside a kept subscriber tier links are followed
+/// — `.claude/skills -> ../.agents/skills` and per-skill links are how skills
+/// are shared. A non-symlink always qualifies.
+#[cfg(target_os = "linux")]
+fn follows_symlink(root: &Path, kind: RootKind, dir: &Path) -> bool {
+    !std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
+        || path_rule(root, kind, dir) == PathRule::Keep
+}
+
+/// The ignore-rule file name a change of which re-walks its directory.
+#[cfg(target_os = "linux")]
+const GITIGNORE_NAME: &str = ".gitignore";
+
+/// Whether the pruned walk of `root` skips `dir`: its [`path_rule`] prunes
+/// it, or the rule leaves it open and the root's ignore `rules` ignore it.
+/// Directories a subscriber reads ([`PathRule::Keep`]) are never skipped for
+/// ignore rules, so a `.*` pattern cannot unwatch `.git` or a skills tier.
+#[cfg(target_os = "linux")]
+fn walk_skips(
+    root: &Path,
+    kind: RootKind,
+    rules: Option<&Arc<super::watcher::GitignoreMatcher>>,
+    dir: &Path,
+) -> bool {
+    match path_rule(root, kind, dir) {
+        PathRule::Prune => true,
+        PathRule::Keep => false,
+        PathRule::Open => rules.is_some_and(|rules| rules.ignores_dir(dir)),
     }
 }
 
@@ -1467,16 +1715,47 @@ fn git_dir_prunes(mut below_git_dir: std::path::Components<'_>) -> bool {
 }
 
 /// The directories of `start`'s subtree (itself included) that survive
-/// [`prunes`] under `root`'s rules for its `kind`. Symlinked directories are
-/// followed as `notify`'s own walk does; unreadable entries are skipped.
+/// [`walk_skips`] under `root`'s rules for its `kind`; unreadable entries are
+/// skipped. A symlinked directory is entered only where [`follows_symlink`]
+/// allows, and then only when its target is not already covered: a target
+/// the walk keeps inside the root is watched at its real path, and one
+/// outside it is walked once however many links reach it.
 #[cfg(target_os = "linux")]
-fn pruned_dirs(root: &Path, kind: RootKind, start: &Path) -> impl Iterator<Item = PathBuf> {
+fn pruned_dirs(
+    root: &Path,
+    kind: RootKind,
+    rules: Option<Arc<super::watcher::GitignoreMatcher>>,
+    start: &Path,
+) -> impl Iterator<Item = PathBuf> {
     let root = root.to_path_buf();
+    let link_targets = Mutex::new(std::collections::HashSet::<PathBuf>::new());
     ignore::WalkBuilder::new(start)
         .standard_filters(false)
         .follow_links(true)
         .filter_entry(move |entry| {
-            !entry.file_type().is_some_and(|t| t.is_dir()) || !prunes(&root, kind, entry.path())
+            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            let path = entry.path();
+            if walk_skips(&root, kind, rules.as_ref(), path) {
+                return false;
+            }
+            if entry.depth() == 0 || !entry.path_is_symlink() {
+                return true;
+            }
+            if path_rule(&root, kind, path) != PathRule::Keep {
+                return false;
+            }
+            let Ok(target) = std::fs::canonicalize(path) else {
+                return false;
+            };
+            if target.starts_with(&root) && !walk_skips(&root, kind, rules.as_ref(), &target) {
+                return false;
+            }
+            link_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(target)
         })
         .build()
         .flatten()
@@ -1485,13 +1764,34 @@ fn pruned_dirs(root: &Path, kind: RootKind, start: &Path) -> impl Iterator<Item 
 }
 
 /// Group event callback hook: forward directory creations (and moves in) as
-/// [`Cmd::AddDir`] and directory deletions as [`Cmd::Forget`] to the
-/// registrar, which owns the descriptor table. Runs on the backend's event
+/// [`Cmd::AddDir`], directory deletions as [`Cmd::Forget`], and changes to a
+/// file named like an ignore-rule file (`.gitignore`, `exclude`) as
+/// [`Cmd::RulesChanged`] to the registrar, which owns the descriptor table
+/// and decides whether the file feeds a root's rules. Runs on the backend's event
 /// thread, so it only enqueues; the `Weak` upgrade fails once the group is
 /// retired, which is the right time to stop.
 #[cfg(target_os = "linux")]
 fn track_directories(cmd: &std::sync::Weak<std::sync::mpsc::Sender<Cmd>>, event: &notify::Event) {
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
+    if !matches!(event.kind, EventKind::Access(_)) {
+        let rule_files: Vec<Cmd> = event
+            .paths
+            .iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n == GITIGNORE_NAME || n == "exclude")
+            })
+            .cloned()
+            .map(Cmd::RulesChanged)
+            .collect();
+        if !rule_files.is_empty() {
+            if let Some(tx) = cmd.upgrade() {
+                for rule_file in rule_files {
+                    let _ = tx.send(rule_file);
+                }
+            }
+        }
+    }
     let cmds: Vec<Cmd> = match event.kind {
         EventKind::Create(CreateKind::Folder) => {
             event.paths.iter().cloned().map(Cmd::AddDir).collect()
@@ -1579,7 +1879,7 @@ fn build_watcher_serving(
                 Ok(Cmd::Unwatch(root)) => pending.retain(|(r, ..)| r != &root),
                 // No watcher, no descriptors to keep in step.
                 #[cfg(target_os = "linux")]
-                Ok(Cmd::AddDir(_) | Cmd::Forget(_)) => {}
+                Ok(Cmd::AddDir(_) | Cmd::Forget(_) | Cmd::RulesChanged(_)) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
             }
@@ -2482,6 +2782,73 @@ mod tests {
         drop(sub);
     }
 
+    /// intent-hq/intent#7252: a git-ignored tree (`.dev/`) holds no inotify
+    /// descriptors, neither does an ignored directory created after
+    /// registration, and editing `.gitignore` to un-ignore the tree makes the
+    /// registrar re-walk it, after which changes under it deliver.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_recursive_root_skips_git_ignored_dirs_and_follows_rule_edits() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("prune-gitignored");
+        let ws = base.path.join("ws");
+        for rel in [".git/refs/heads", "src/x", ".dev/a/b", ".dev/c"] {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+        std::fs::write(ws.join(".gitignore"), ".dev/\ntest-results/\n").expect("write .gitignore");
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+
+        let inodes = inotify_watched_inodes();
+        for rel in ["src", "src/x", ".git/refs/heads"] {
+            assert!(
+                inodes.contains(&inode_of(&root.join(rel))),
+                "{rel} must hold an inotify descriptor"
+            );
+        }
+        for rel in [".dev", ".dev/a", ".dev/a/b", ".dev/c"] {
+            assert!(
+                !inodes.contains(&inode_of(&root.join(rel))),
+                "git-ignored {rel} must NOT hold an inotify descriptor"
+            );
+        }
+
+        // An ignored directory created later stays unwatched; a sibling that
+        // is not ignored is watched (the ordering witness).
+        std::fs::create_dir_all(root.join("test-results/run-1")).expect("mk test-results");
+        std::fs::create_dir_all(root.join("later")).expect("mk later");
+        assert!(
+            wait_watched(&root.join("later"), true).await,
+            "later/ must be watched"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&root.join("test-results"))),
+            "an ignored directory created after registration must NOT be watched"
+        );
+
+        // Un-ignore `.dev/`: the registrar rebuilds the rules and re-walks.
+        std::fs::write(root.join(".gitignore"), "test-results/\n").expect("rewrite .gitignore");
+        assert!(
+            wait_watched(&root.join(".dev/a/b"), true).await,
+            "an un-ignored tree must be watched after the rule edit"
+        );
+        assert!(
+            touch_until_seen(&mut rx, &root, ".dev/a/b/file.txt").await,
+            "changes under an un-ignored tree must deliver"
+        );
+        assert!(
+            !inotify_watched_inodes().contains(&inode_of(&root.join("test-results"))),
+            "a still-ignored directory stays unwatched after the re-walk"
+        );
+        drop(sub);
+    }
+
     /// A recursive root that does not exist must settle as FAILED, as the
     /// backend's own recursive watch did: the pruned walk yields nothing for
     /// a missing start, and a registration settled live with zero
@@ -2941,6 +3308,158 @@ mod tests {
             path_rule(home_tier, Tree, &home_tier.join("s/node_modules")),
             PathRule::Keep
         );
+    }
+
+    /// The ignore-rule half of the walk (intent-hq/intent#7252): an open
+    /// directory the root's git ignore rules ignore is skipped, a negated one
+    /// is not, and the path rules win — even an ignore-everything-hidden
+    /// `.*` pattern leaves `.git`'s kept part and the skills tiers watched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_ignored_open_dirs_are_skipped_but_path_rules_win() {
+        let base = TempDir::new("walk-skips-rules");
+        let ws = base.path.join("ws");
+        std::fs::create_dir_all(ws.join(".git/refs")).expect("mk .git");
+        std::fs::write(
+            ws.join(".gitignore"),
+            ".dev/\n.*\n!.gitignore\nscratch-*/\n!scratch-keep/\ndist2/\n!dist2/keep.txt\n!.env.example\n",
+        )
+            .expect("write .gitignore");
+        let rules = Arc::new(super::super::watcher::GitignoreMatcher::new(ws.clone()));
+        let skips = |rel: &str| walk_skips(&ws, RootKind::Tree, Some(&rules), &ws.join(rel));
+        for rel in [".dev", ".dev/a", "scratch-1", ".svelte-kit"] {
+            assert!(skips(rel), "{rel} is git-ignored and must be skipped");
+        }
+        for rel in [
+            "src",
+            "scratch-keep",
+            "dist2",
+            ".git",
+            ".git/refs",
+            ".intent/skills",
+            ".claude/agents",
+        ] {
+            assert!(!skips(rel), "{rel} must stay watched");
+        }
+        // Without rules only the path rules apply.
+        assert!(!walk_skips(&ws, RootKind::Tree, None, &ws.join(".dev")));
+    }
+
+    /// The budget threshold (intent-hq/intent#7252) as a pure function.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn watch_budget_threshold() {
+        assert!(!over_watch_budget(499, Some(1000)));
+        assert!(over_watch_budget(500, Some(1000)));
+        assert!(over_watch_budget(922_099, Some(1_001_231)));
+        assert!(!over_watch_budget(10, None), "unknown limit never warns");
+        assert!(!over_watch_budget(10, Some(0)), "zero limit never warns");
+        assert!(!over_watch_budget(usize::MAX, Some(0)));
+    }
+
+    /// intent-hq/intent#7252: the walk visits each directory once and the
+    /// count it reports is the number of distinct directories. Symlinked
+    /// directories outside a subscriber tier are not entered (git does not
+    /// follow them; an in-root target is watched at its real path), a tier
+    /// link to an in-root tier is left to the real path, and a tier link to
+    /// an outside tree is walked once however many links reach it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_pruned_walk_counts_each_directory_once_through_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = TempDir::new("walk-symlinks");
+        let ws = base.path.join("ws");
+        let outside = base.path.join("outside");
+        for rel in [
+            "src/real/a/b",
+            "links",
+            ".agents/skills/s1",
+            ".intent/skills",
+            ".claude",
+        ] {
+            std::fs::create_dir_all(ws.join(rel)).expect("mk tree");
+        }
+        std::fs::create_dir_all(outside.join("ext/x")).expect("mk outside");
+        symlink(ws.join("src/real"), ws.join("links/l1")).expect("link l1");
+        symlink(ws.join("src/real"), ws.join("links/l2")).expect("link l2");
+        symlink(outside.join("ext"), ws.join("links/out")).expect("link out");
+        symlink(ws.join(".agents/skills"), ws.join(".claude/skills")).expect("link claude");
+        symlink(outside.join("ext"), ws.join(".intent/skills/ext")).expect("link ext");
+        symlink(outside.join("ext"), ws.join(".intent/skills/ext2")).expect("link ext2");
+        let ws = std::fs::canonicalize(&ws).expect("canonical ws");
+
+        let mut watcher =
+            notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).expect("watcher");
+        let mut pruned = PrunedWatches::default();
+        pruned.roots.insert(ws.clone(), RootKind::Tree);
+        let count = pruned
+            .add_tree(&mut watcher, &ws, RootKind::Tree, &ws)
+            .expect("walk");
+
+        let mut expected: Vec<PathBuf> = [
+            "",
+            "src",
+            "src/real",
+            "src/real/a",
+            "src/real/a/b",
+            "links",
+            ".agents",
+            ".agents/skills",
+            ".agents/skills/s1",
+            ".claude",
+            ".intent",
+            ".intent/skills",
+        ]
+        .iter()
+        .map(|rel| {
+            if rel.is_empty() {
+                ws.clone()
+            } else {
+                ws.join(rel)
+            }
+        })
+        .collect();
+        // Exactly one of the two links to the outside tree is walked.
+        let ext_link = [".intent/skills/ext", ".intent/skills/ext2"]
+            .iter()
+            .map(|rel| ws.join(rel))
+            .find(|p| pruned.dirs.contains(p))
+            .expect("one link to the outside tree is walked");
+        expected.push(ext_link.clone());
+        expected.push(ext_link.join("x"));
+        expected.sort();
+        let mut held: Vec<PathBuf> = pruned.dirs.iter().cloned().collect();
+        held.sort();
+        assert_eq!(held, expected);
+        assert_eq!(count, expected.len(), "count is distinct directories");
+    }
+
+    /// A skills tier that is itself a link to a tree outside the workspace
+    /// stays watched through the link and delivers under the link path,
+    /// which is what the tier matcher reads.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn a_skills_tier_linked_outside_the_workspace_delivers() {
+        use std::os::unix::fs::symlink;
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = TempDir::new("tier-link-outside");
+        let ws = base.path.join("ws");
+        let shared = base.path.join("shared-skills");
+        std::fs::create_dir_all(ws.join(".claude")).expect("mk .claude");
+        std::fs::create_dir_all(shared.join("s1")).expect("mk shared");
+        symlink(&shared, ws.join(".claude/skills")).expect("link tier");
+
+        let hub = SharedWatchHub::new();
+        let (sub, mut rx, root) = hub.subscribe(&ws);
+        sub.probe().wait_live(LIVENESS).await;
+        assert!(
+            touch_until_seen(&mut rx, &root, ".claude/skills/s1/SKILL.md").await,
+            "a change in a linked skills tier must deliver under the link path"
+        );
+        drop(sub);
     }
 
     /// Drift guard: every project tier the skills and specialists watchers

@@ -299,7 +299,7 @@ fn external_exclude_dir(root: &Path) -> Option<PathBuf> {
 /// are outside the watched root and stay restart-scoped. Failures degrade
 /// gracefully: a source that fails to load simply drops out of the chain, so
 /// legitimate events are never suppressed by an error.
-struct GitignoreMatcher {
+pub(super) struct GitignoreMatcher {
     root: PathBuf,
     /// Resolved `<gitdir>/info/exclude` (worktree-aware), watched for edits.
     /// Detected on the absolute path before the [`is_ignored_dir`] prefilter,
@@ -318,11 +318,17 @@ struct GitignoreMatcher {
     /// rescue a prefiltered path, so ingest skips the match entirely for
     /// [`is_ignored_dir`] paths (the fast path).
     has_whitelists: bool,
+    /// Absolute literal prefixes of the path-shaped `!` negations (see
+    /// [`whitelist_prefixes`]): an ignored directory on the way to (or
+    /// beneath) one may still hold a path a negation re-includes, so
+    /// [`Self::ignores_dir`] does not report it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    whitelist_prefixes: Vec<PathBuf>,
     dirty: bool,
 }
 
 impl GitignoreMatcher {
-    fn new(root: PathBuf) -> Self {
+    pub(super) fn new(root: PathBuf) -> Self {
         let mut matcher = Self {
             root,
             exclude_paths: Vec::new(),
@@ -331,6 +337,7 @@ impl GitignoreMatcher {
             global: None,
             defaults: None,
             has_whitelists: false,
+            whitelist_prefixes: Vec::new(),
             dirty: false,
         };
         matcher.rebuild();
@@ -389,7 +396,50 @@ impl GitignoreMatcher {
         if self.dirty {
             self.rebuild();
         }
-        let is_dir = abs.is_dir();
+        self.match_chain(abs, Path::new(rel), abs.is_dir())
+    }
+
+    /// Whether the directory `abs` under the root is ignored by the rules as
+    /// loaded, with nothing beneath it a path-shaped negation could
+    /// re-include — the shared hub's pruned walk asks this for every
+    /// directory it would otherwise register (intent-hq/intent#7252), and
+    /// [`Self::verdict`] lets such a negation rescue a file under an ignored
+    /// directory (`dist2/` + `!dist2/keep.txt`). A name-only negation
+    /// (`!.env.example`) does not hold a directory back: git itself never
+    /// re-includes a file whose parent directory is excluded. It never
+    /// rebuilds: the hub replaces the whole matcher when rules change, so a
+    /// shared (`Arc`) matcher is never dirty. Paths outside the root are not
+    /// ignored.
+    #[cfg(target_os = "linux")]
+    pub(super) fn ignores_dir(&self, abs: &Path) -> bool {
+        let Ok(rel) = abs.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.match_chain(abs, rel, true) == IgnoreVerdict::Ignore
+            && !self
+                .whitelist_prefixes
+                .iter()
+                .any(|prefix| prefix.starts_with(abs) || abs.starts_with(prefix))
+    }
+
+    /// Record the path-shaped negations of the rule file `file`, whose
+    /// patterns are relative to `base`.
+    fn note_whitelists(&mut self, base: &Path, file: &Path) {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            self.whitelist_prefixes
+                .extend(whitelist_prefixes(&text).into_iter().map(|p| base.join(p)));
+        }
+    }
+
+    /// Whether `abs` is (a spelling of) this root's `info/exclude`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_exclude_path(&self, abs: &Path) -> bool {
+        self.exclude_paths.iter().any(|p| p == abs)
+    }
+
+    /// Consult the source chain for `abs` (`rel` is its root-relative form,
+    /// which the global matcher needs). See [`Self::verdict`].
+    fn match_chain(&self, abs: &Path, rel: &Path, is_dir: bool) -> IgnoreVerdict {
         for (dir, matcher) in &self.gitignores {
             if !abs.starts_with(dir) {
                 continue;
@@ -408,7 +458,7 @@ impl GitignoreMatcher {
         if let Some(matcher) = &self.global {
             // The global matcher is rooted at "" (per `Gitignore::global`), so
             // it must see the relative path, not the absolute one.
-            let v = to_verdict(&matcher.matched_path_or_any_parents(Path::new(rel), is_dir));
+            let v = to_verdict(&matcher.matched_path_or_any_parents(rel, is_dir));
             if v != IgnoreVerdict::None {
                 return v;
             }
@@ -428,6 +478,7 @@ impl GitignoreMatcher {
         self.exclude = None;
         self.global = None;
         self.exclude_paths.clear();
+        self.whitelist_prefixes.clear();
 
         let mut defaults = GitignoreBuilder::new(&self.root);
         for pattern in DEFAULT_IGNORE_PATTERNS {
@@ -445,6 +496,9 @@ impl GitignoreMatcher {
         };
 
         if let Some(git_dir) = resolve_git_dir(&self.root) {
+            if let Some(path) = ignore::gitignore::gitconfig_excludes_path() {
+                self.note_whitelists(&self.root.clone(), &path);
+            }
             let (global, err) = Gitignore::global();
             if let Some(e) = err {
                 tracing::debug!(error = %e, "failed to load global git excludes");
@@ -456,6 +510,7 @@ impl GitignoreMatcher {
             let exclude_path = resolve_exclude_file(&git_dir);
             if exclude_path.is_file() {
                 let mut builder = GitignoreBuilder::new(&self.root);
+                self.note_whitelists(&self.root.clone(), &exclude_path);
                 if let Some(e) = builder.add(&exclude_path) {
                     tracing::debug!(error = %e, "failed to read .git/info/exclude");
                 }
@@ -516,6 +571,7 @@ impl GitignoreMatcher {
                 let Some(dir) = file.parent().map(Path::to_path_buf) else {
                     continue;
                 };
+                self.note_whitelists(&dir, &file);
                 let mut builder = GitignoreBuilder::new(&dir);
                 if let Some(e) = builder.add(&file) {
                     tracing::debug!(error = %e, path = %file.display(), "failed to read .gitignore");
@@ -541,6 +597,31 @@ impl GitignoreMatcher {
             .chain(self.global.iter())
             .any(|m| m.num_whitelists() > 0);
     }
+}
+
+/// The literal leading paths of a rule file's path-shaped negations — `!`
+/// lines whose pattern holds a `/` other than a trailing one, so they name a
+/// location rather than a bare name: `!dist2/keep.txt` → `dist2/keep.txt`,
+/// `!/a/*/keep` → `a`, `!**/keep` → the empty path (everything). Name-only negations
+/// (`!.env.example`, `!keep/`) are left out; see
+/// [`GitignoreMatcher::ignores_dir`]. Over-approximates: a prefix holds back
+/// every ignored directory on the way to it or beneath it.
+fn whitelist_prefixes(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| line.trim_end().strip_prefix('!'))
+        .filter_map(|pattern| {
+            let pattern = pattern.strip_suffix('/').unwrap_or(pattern);
+            if !pattern.contains('/') {
+                return None;
+            }
+            let pattern = pattern.trim_start_matches('/');
+            let literal = match pattern.find(['*', '?', '[', '\\']) {
+                Some(glob) => pattern[..glob].rsplit_once('/').map_or("", |(dir, _)| dir),
+                None => pattern,
+            };
+            Some(PathBuf::from(literal))
+        })
+        .collect()
 }
 
 /// Workspace-relative, forward-slash path for the event payload, or `None` when
@@ -1033,6 +1114,20 @@ mod tests {
         assert!(Action::Delete.rank() > Action::Create.rank());
         assert!(Action::Create.rank() > Action::Rename.rank());
         assert!(Action::Rename.rank() > Action::Modify.rank());
+    }
+
+    #[test]
+    fn whitelist_prefixes_keep_only_path_shaped_negations() {
+        let text = "dist2/\n!dist2/keep.txt\n!/a/*/keep\n!**/deep\n!.env.example\n!keep/\n# !c/d\nplain/\n!x/y/ \n";
+        assert_eq!(
+            whitelist_prefixes(text),
+            vec![
+                PathBuf::from("dist2/keep.txt"),
+                PathBuf::from("a"),
+                PathBuf::from(""),
+                PathBuf::from("x/y"),
+            ]
+        );
     }
 
     #[test]
