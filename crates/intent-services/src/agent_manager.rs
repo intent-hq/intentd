@@ -12793,6 +12793,14 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
+        // Test-only: the `agent_ops::TEST_RUNNABLE_PATH` marker stands in for
+        // a host npx so pure resolution tests do not depend on Node/npx.
+        #[cfg(test)]
+        let npx = npx.or_else(|| {
+            (read_provider_path_setting(settings, provider.id).as_deref()
+                == Some(crate::agent_ops::TEST_RUNNABLE_PATH))
+            .then(|| std::path::PathBuf::from("npx"))
+        });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
             selection: selection.clone(),

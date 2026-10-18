@@ -1112,6 +1112,15 @@ pub(crate) fn resolve_disabled_provider_rehome(
     Some(DisabledProviderRehome { provider, model })
 }
 
+/// Test-only `providers.paths` value marking a base provider installed for
+/// [`ensure_provider_available`]. Codex and Claude Code are npx-only and ignore
+/// path overrides, so without it their availability follows the host's
+/// Node/npx. Being settings data, it reaches every call site (including the
+/// `spawn_blocking` delegate resolver) per `Services` instance, without
+/// mutating process-global `PATH`. The disabled and auth gates still run.
+#[cfg(test)]
+pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
+
 /// Reject a known provider id that is disabled in settings, whose cached
 /// auth verdict is hard-false, or that the daemon's own provider discovery
 /// reports as unrunnable (not installed, or gated off by a missing env
@@ -1137,6 +1146,14 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
+    #[cfg(test)]
+    if providers
+        .paths
+        .get(intent_providers::base_provider_id(provider_id))
+        .is_some_and(|path| path == TEST_RUNNABLE_PATH)
+    {
+        return Ok(());
+    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),

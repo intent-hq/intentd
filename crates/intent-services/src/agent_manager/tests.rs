@@ -28500,7 +28500,15 @@ mod profile_routing_tests {
     #[tokio::test]
     async fn a_profile_runs_on_its_base_installation_under_its_own_selection() {
         let (_tmp, mgr) = manager().await;
-        let settings = intent_core::settings_file::SettingsFile::default();
+        // Codex and Claude Code are npx-only; the test marker keeps this pure
+        // resolution independent of the host's Node/npx.
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        for base in ["codex", "claude-code"] {
+            settings.providers.paths.insert(
+                base.to_string(),
+                crate::agent_ops::TEST_RUNNABLE_PATH.to_string(),
+            );
+        }
         for (provider, base) in [
             ("codex@pwork", "codex"),
             ("claude-code@pwork", "claude-code"),
