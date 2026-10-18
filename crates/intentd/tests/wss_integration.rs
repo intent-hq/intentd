@@ -6352,6 +6352,9 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
 struct BusyDaemonControl;
 
 impl SystemControl for BusyDaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -22494,6 +22497,9 @@ struct WatchHealthControl {
 }
 
 impl SystemControl for WatchHealthControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),

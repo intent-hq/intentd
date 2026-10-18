@@ -721,3 +721,43 @@ async fn e2e_auto_vacuum_activation_on_legacy_db() {
     pool.close().await;
     drop(daemon);
 }
+
+/// intent-hq/intent#7256: a REAL `intentd serve` must report its own crate
+/// version from both `client.hello` (`server.version`) and `system.status`.
+/// The library crates are versioned separately by release-plz and can lag the
+/// daemon (v0.11.6 shipped with intent-transport at 0.11.5), so a library's
+/// `CARGO_PKG_VERSION` is never a valid source for the daemon version.
+#[tokio::test]
+async fn e2e_hello_and_status_report_the_intentd_crate_version() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "uds", &[]),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(
+        await_uds(&socket).await,
+        "daemon did not start (see {}/daemon.log)",
+        data_dir.display()
+    );
+
+    let hello = uds_rpc(
+        &socket,
+        1,
+        "client.hello",
+        json!({"clientId": "version-probe"}),
+    )
+    .await;
+    assert_eq!(
+        hello["result"]["server"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "client.hello: {hello}"
+    );
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    assert_eq!(
+        status["result"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "system.status: {status}"
+    );
+    drop(daemon);
+}
