@@ -223,36 +223,52 @@ def gitlab_errors(workflow):
     return errors
 
 
-NODE_COMMAND = re.compile(r"(^|[\s;&|(])(node|npx|npm|pnpm|corepack)\s")
-NODE_SUBPROCESS = re.compile(r"""\[\s*["']node["']""")
-SCRIPT_EXECUTION = re.compile(r"(?:python3?(?:\s+-\S+)*\s+|bash\s+|\./)(scripts/[\w./-]+\.(?:py|sh))")
+NODE_TOOLS = r"(?:node|npx|npm|pnpm|corepack)"
+NODE_COMMAND = re.compile(r"(?m)(?:^|[;&|(]|\$\(|\b(?:then|do|exec|time)\s)\s*(?:\w+=\S*\s+)*" + NODE_TOOLS + r"(?=\s+[^=\s]|\s*$)")
+NODE_PYTHON = re.compile(r"""(?:\[\s*|shutil\.which\(\s*)["']""" + NODE_TOOLS + r"""["']""")
+SCRIPT_EXECUTION = re.compile(
+    r"(?m)(?:^|[;&|(]\s*|\$\(\s*|(?:python3?|bash|sh)(?:\s+-X\s+\S+|\s+-\S+)*\s+|\./)(scripts/[\w./-]+\.(?:py|sh))\b")
+
+
+def without_comments(text):
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def executes_node(path):
+    if not path.is_file():
+        return False
+    text = without_comments(path.read_text())
+    if path.suffix == ".py":
+        return bool(NODE_PYTHON.search(text))
+    return bool(NODE_COMMAND.search(text))
 
 
 def node_without_setup(workflow):
-    """Jobs whose steps execute Node before an actions/setup-node step.
+    """Jobs whose steps execute Node before an unconditional actions/setup-node step.
 
     Depot images preinstall Node, but the self-hosted tinybox runners do not,
     so routing a job there fails with `node` not found unless it sets Node up.
+    A conditional setup-node step covers only later steps with the identical
+    `if:` expression (a Windows-only setup does not cover Linux). Detected:
+    node/npx/npm/pnpm/corepack at a shell command position (comment lines
+    ignored), and directly executed scripts/*.py that spawn or look up those
+    tools or scripts/*.sh that run them. Not detected: Node spawned by compiled
+    tests (cargo/nextest), by scripts called from other scripts, or by inline
+    heredoc programs; those jobs must keep their setup-node step by review.
     """
     errors = []
     for job_id, job in workflow["jobs"].items():
-        ready = False
+        ready = set()
         for step in job.get("steps", []):
             if "actions/setup-node@" in step.get("uses", ""):
-                ready = True
-            command = step.get("run", "")
-            if not command or ready:
+                ready.add(step.get("if"))
+            command = without_comments(step.get("run", ""))
+            if not command or None in ready or step.get("if", False) in ready:
                 continue
-            uses_node = bool(NODE_COMMAND.search(command))
-            for reference in SCRIPT_EXECUTION.findall(command):
-                path = ROOT / reference
-                if path.is_file() and (NODE_SUBPROCESS.search(path.read_text()) or
-                        (path.suffix == ".sh" and NODE_COMMAND.search(path.read_text()))):
-                    uses_node = True
-            if uses_node:
+            if NODE_COMMAND.search(command) or any(
+                    executes_node(ROOT / reference) for reference in SCRIPT_EXECUTION.findall(command)):
                 errors.append(f"{job_id}: {step.get('name') or command.splitlines()[0]}")
     return errors
-
 
 def run_route(workflow, **fixture):
     """Execute the workflow's actual github-script body with offline API fixtures."""
@@ -823,10 +839,41 @@ class NativeRoutingTests(unittest.TestCase):
 
     def test_jobs_that_execute_node_install_it_first(self):
         self.assertEqual(node_without_setup(self.workflow), [])
-        workflow = copy.deepcopy(self.workflow)
-        workflow["jobs"]["release-scripts"]["steps"] = [step for step in workflow["jobs"]["release-scripts"]["steps"]
-            if "actions/setup-node@" not in step.get("uses", "")]
-        self.assertTrue(any(error.startswith("release-scripts: ") for error in node_without_setup(workflow)))
+
+        def without_setup(job_id, *, conditional=None):
+            workflow = copy.deepcopy(self.workflow)
+            steps = workflow["jobs"][job_id]["steps"]
+            for step in steps:
+                if "actions/setup-node@" in step.get("uses", ""):
+                    if conditional is None:
+                        steps.remove(step)
+                    else:
+                        step["if"] = conditional
+                    break
+            return [error for error in node_without_setup(workflow) if error.startswith(job_id + ": ")]
+
+        self.assertTrue(without_setup("pr-static"))
+        self.assertTrue(without_setup("release-scripts"))
+        self.assertTrue(without_setup("pr-static", conditional="runner.os == 'Windows'"))
+        # Lookup via shutil.which in a directly executed script, not comment text.
+        for job_id in ("coverage-all", "coverage-changed"):
+            workflow = copy.deepcopy(self.workflow)
+            for step in workflow["jobs"][job_id]["steps"]:
+                if step.get("run"):
+                    step["run"] = without_comments(step["run"])
+            workflow["jobs"][job_id]["steps"] = [step for step in workflow["jobs"][job_id]["steps"]
+                if "actions/setup-node@" not in step.get("uses", "")]
+            self.assertTrue([e for e in node_without_setup(workflow) if e.startswith(job_id + ": ")], job_id)
+
+        def flagged(command):
+            return node_without_setup({"jobs": {"probe": {"steps": [{"run": command}]}}})
+
+        for command in ("node -e 1", "npm ci", "FOO=1 npx tsc", "make && pnpm test", "out=$(node -v)",
+                        "scripts/test-ci-native-routing.py", "python3 -I -B scripts/test-ci-native-routing.py"):
+            self.assertTrue(flagged(command), command)
+        for command in ("# npm is not needed here", "for node in a b; do echo $node; done",
+                        "node=1", "echo checking node version", "git diff -- scripts/test-ci-native-routing.py"):
+            self.assertFalse(flagged(command), command)
 
     def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
         step = self.changed_test_base_step()
