@@ -932,6 +932,17 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
         }
+        "workspace.findByPullRequest" => {
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_params("Missing required parameter: url"))?;
+            let workspaces = api
+                .find_workspaces_by_pull_request(url.to_string())
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "workspaces": workspaces }))
+        }
         "workspace.get" => {
             let id = require_workspace_id(params)?;
             let ws = api.get_workspace(id).await.map_err(workspace_err)?;

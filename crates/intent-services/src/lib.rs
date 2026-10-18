@@ -20921,6 +20921,23 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let key = intent_core::pull_request_key(&url)
+                .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
+            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            // Same membership narrowing as `workspace.list` (§5.48).
+            if let Some(visible) = this.visible_workspace_ids().await? {
+                rows.retain(|row| visible.contains(&row.id));
+            }
+            Ok(rows)
+        })
+    }
+
     fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
         self.workspace_setup_states.get(id)
     }

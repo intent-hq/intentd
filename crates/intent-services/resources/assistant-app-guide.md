@@ -310,6 +310,17 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
+
+Clicking a GitHub pull request link opens the link menu (when **GitHub link
+behavior** is **Show choices**, the default). If another workspace worked on that
+PR, the last menu item is **Open in original workspace**, followed by that
+workspace's name; with several such workspaces it opens a submenu of their names,
+most recent first. Archived workspaces are included
+and marked **Archived**. Intent links a PR to a workspace when it discovers the PR on
+that workspace's branch or one of its submodules; PRs seen only before this feature
+shipped are not linked until Intent sees them again.
+
 ## Home Workspaces
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
