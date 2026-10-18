@@ -4774,6 +4774,12 @@ impl Services {
                 // correct if the daemon is killed immediately after the event.
                 self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
                     .await;
+                // Observable idle means this turn is complete. The worker keeps
+                // its slot through the post-turn tail; graceful shutdown must
+                // not record that tail as an interrupted turn.
+                if let Some(manager) = self.agent_manager() {
+                    manager.mark_turn_settled_if_slot_held(agent_id);
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }
