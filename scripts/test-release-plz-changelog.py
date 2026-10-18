@@ -21,6 +21,14 @@ CONFIG = ROOT / "release-plz.toml"
 DAEMON_VERSION = "0.9.0"
 SITTER_VERSION = "0.1.0"
 INDEPENDENT_LIBRARY = "fixture-helper"
+# The fixture mirrors the precision of the production daemon -> sitter
+# requirement. release-plz 0.3.162 bumps a dependent package outside its
+# version_group logic whenever a sitter release rewrites that requirement,
+# which split the intentd group in intent-hq/intentd#2461.
+PRODUCTION_SITTER_REQUIREMENT = tomllib.loads(
+    (ROOT / "crates/intentd/Cargo.toml").read_text())["dependencies"]["intentd-sitter"]["version"]
+SITTER_REQUIREMENT = ".".join(
+    SITTER_VERSION.split(".")[:len(PRODUCTION_SITTER_REQUIREMENT.split("."))])
 
 
 class ReleasePlzChangelogTests(unittest.TestCase):
@@ -51,6 +59,8 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.packages = {p["name"]: p for p in self.config["package"]}
         self.libraries = [name for name in self.packages
                           if name not in ("intentd", "intentd-sitter")]
+        self.group = sorted(name for name, p in self.packages.items()
+                            if p.get("version_group") == "intentd")
         # Production libraries aggregate their commits into daemon notes before
         # dependency propagation. An independent library exercises the generated
         # mixed dependency summaries without changing the production policy.
@@ -73,14 +83,8 @@ class ReleasePlzChangelogTests(unittest.TestCase):
                 'edition = "2021"\nlicense = "MIT"\ndescription = "Fixture"\n'
             )
             (crate / "src/lib.rs").write_text("pub fn value() -> u32 { 0 }\n")
+        self.write_daemon_manifest(SITTER_REQUIREMENT)
         daemon = self.repo / "crates/intentd"
-        with (daemon / "Cargo.toml").open("a") as manifest:
-            manifest.write(
-                '\n[dependencies]\n'
-                f'intentd-sitter = {{ path = "../intentd-sitter", version = "{SITTER_VERSION}" }}\n'
-                f'intent-core = {{ path = "../intent-core", version = "{DAEMON_VERSION}" }}\n'
-                f'{INDEPENDENT_LIBRARY} = {{ path = "../{INDEPENDENT_LIBRARY}", version = "{DAEMON_VERSION}" }}\n'
-            )
         (daemon / "src/main.rs").write_text(
             'fn main() { println!("{}", intentd_sitter::value() + intent_core::value()); }\n'
         )
@@ -88,6 +92,24 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.commit("chore: fixture baseline")
         self.run_command("git", "tag", f"v{DAEMON_VERSION}")
         self.run_command("git", "tag", f"v{SITTER_VERSION}")
+
+    def write_daemon_manifest(self, sitter_requirement):
+        libraries = "".join(
+            f'{name} = {{ path = "../{name}", version = "{DAEMON_VERSION}" }}\n'
+            for name in [*self.libraries, INDEPENDENT_LIBRARY])
+        (self.repo / "crates/intentd/Cargo.toml").write_text(
+            f'[package]\nname = "intentd"\nversion = "{DAEMON_VERSION}"\n'
+            'edition = "2021"\nlicense = "MIT"\ndescription = "Fixture"\n'
+            '\n[dependencies]\n'
+            f'intentd-sitter = {{ path = "../intentd-sitter", version = "{sitter_requirement}" }}\n'
+            + libraries
+        )
+
+    def group_versions(self):
+        return {name: self.version(name) for name in self.group}
+
+    def assert_group_at(self, version):
+        self.assertEqual(self.group_versions(), {name: version for name in self.group})
 
     def run_command(self, *args):
         result = subprocess.run(args, cwd=self.repo, env=self.env, text=True,
@@ -123,11 +145,12 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         self.assertNotIn("Sitter exclusive repair", notes)
         self.assertNotIn("Updated the following local packages: intentd-sitter", notes)
         self.assertNotIn("###", notes)
-        # Dependency propagation still bumps the daemon; this is a notes policy.
-        self.assertEqual(self.version("intentd"), "0.9.1")
+        # A sitter-only release must leave the whole daemon group untouched:
+        # bumping only intentd split the group (intent-hq/intentd#2461).
+        self.assert_group_at(DAEMON_VERSION)
         self.assertEqual(self.version("intentd-sitter"), "0.1.1")
         daemon = tomllib.loads((self.repo / "crates/intentd/Cargo.toml").read_text())
-        self.assertEqual(daemon["dependencies"]["intentd-sitter"]["version"], "0.1.1")
+        self.assertEqual(daemon["dependencies"]["intentd-sitter"]["version"], SITTER_REQUIREMENT)
         self.assertFalse((self.repo / "crates/intentd-sitter/CHANGELOG.md").exists())
 
     def test_daemon_libraries_and_mixed_changes_remain_visible(self):
@@ -145,17 +168,24 @@ class ReleasePlzChangelogTests(unittest.TestCase):
         for name in self.libraries:
             with self.subTest(package=name):
                 self.assertIn(f"{name.capitalize()} library repair", notes)
-        self.assertEqual(self.version("intentd"), "0.9.1")
+        self.assert_group_at("0.9.1")
         self.assertEqual(self.version("intentd-sitter"), "0.1.1")
 
     def test_library_only_change_reaches_daemon_notes(self):
         self.change(["intent-core"], "fix: shared library repair")
         self.update()
         self.assertIn("Shared library repair", (self.repo / "CHANGELOG.md").read_text())
-        self.assertEqual(self.version("intentd"), "0.9.1")
+        self.assert_group_at("0.9.1")
         self.assertEqual(self.version("intentd-sitter"), SITTER_VERSION)
 
     def test_generated_mixed_dependency_summary_remains_visible(self):
+        # An exact pin (as after a future sitter 0.x minor bump rewrites the
+        # requirement) still yields a sitter entry in a generated summary.
+        self.write_daemon_manifest(SITTER_VERSION)
+        self.run_command("git", "add", ".")
+        self.run_command("git", "commit", "-q", "--amend", "--no-edit")
+        self.run_command("git", "tag", "-f", f"v{DAEMON_VERSION}")
+        self.run_command("git", "tag", "-f", f"v{SITTER_VERSION}")
         self.change(["intentd-sitter", INDEPENDENT_LIBRARY], "fix: independent repairs")
         self.update()
         notes = (self.repo / "CHANGELOG.md").read_text()
