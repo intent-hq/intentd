@@ -741,7 +741,13 @@ async fn e2e_hello_and_status_report_the_intentd_crate_version() {
         data_dir.display()
     );
 
-    let hello = uds_rpc(&socket, 1, "client.hello", json!({"clientId": "version-probe"})).await;
+    let hello = uds_rpc(
+        &socket,
+        1,
+        "client.hello",
+        json!({"clientId": "version-probe"}),
+    )
+    .await;
     assert_eq!(
         hello["result"]["server"]["version"],
         env!("CARGO_PKG_VERSION"),

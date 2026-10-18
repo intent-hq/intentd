@@ -52,7 +52,7 @@ pub struct SystemStatus {
     pub has_display: bool,
     /// The `AgentManager` concurrency cap (resolved maxConcurrent incl. auto-detection).
     pub max_agents: usize,
-    /// The daemon crate version (`CARGO_PKG_VERSION`).
+    /// The `intentd` crate version (the binary's `CARGO_PKG_VERSION`).
     pub version: String,
     /// Source commit embedded at build time. `None` when the build environment
     /// cannot identify a commit (for example, a source archive without Git metadata).
@@ -248,6 +248,11 @@ pub trait SystemControl: Send + Sync {
     }
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// The daemon binary's own version, advertised as `server.version` in
+    /// `client.hello` (intent-hq/intent#7256). Required so every composition
+    /// root states it: a library crate's `CARGO_PKG_VERSION` can lag the
+    /// `intentd` crate, because release-plz versions them separately.
+    fn daemon_version(&self) -> &str;
     /// Metadata-only compositions may await their original listener snapshot.
     /// Full providers keep the existing synchronous status dispatch below.
     fn metadata_status(&self) -> Pin<Box<dyn Future<Output = SystemStatus> + Send + '_>> {

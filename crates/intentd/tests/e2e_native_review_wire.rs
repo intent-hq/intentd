@@ -232,6 +232,9 @@ impl FixtureMetadata {
     }
 }
 impl intent_transport::SystemControl for FixtureMetadata {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn services(&self) -> intent_transport::control::SystemServices {
         intent_transport::control::SystemServices::StatusOnly
     }
