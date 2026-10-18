@@ -223,6 +223,37 @@ def gitlab_errors(workflow):
     return errors
 
 
+NODE_COMMAND = re.compile(r"(^|[\s;&|(])(node|npx|npm|pnpm|corepack)\s")
+NODE_SUBPROCESS = re.compile(r"""\[\s*["']node["']""")
+SCRIPT_EXECUTION = re.compile(r"(?:python3?(?:\s+-\S+)*\s+|bash\s+|\./)(scripts/[\w./-]+\.(?:py|sh))")
+
+
+def node_without_setup(workflow):
+    """Jobs whose steps execute Node before an actions/setup-node step.
+
+    Depot images preinstall Node, but the self-hosted tinybox runners do not,
+    so routing a job there fails with `node` not found unless it sets Node up.
+    """
+    errors = []
+    for job_id, job in workflow["jobs"].items():
+        ready = False
+        for step in job.get("steps", []):
+            if "actions/setup-node@" in step.get("uses", ""):
+                ready = True
+            command = step.get("run", "")
+            if not command or ready:
+                continue
+            uses_node = bool(NODE_COMMAND.search(command))
+            for reference in SCRIPT_EXECUTION.findall(command):
+                path = ROOT / reference
+                if path.is_file() and (NODE_SUBPROCESS.search(path.read_text()) or
+                        (path.suffix == ".sh" and NODE_COMMAND.search(path.read_text()))):
+                    uses_node = True
+            if uses_node:
+                errors.append(f"{job_id}: {step.get('name') or command.splitlines()[0]}")
+    return errors
+
+
 def run_route(workflow, **fixture):
     """Execute the workflow's actual github-script body with offline API fixtures."""
     step = next(s for s in workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
@@ -789,6 +820,13 @@ class NativeRoutingTests(unittest.TestCase):
     def changed_test_base_step(self):
         return next(s for s in self.workflow["jobs"]["coverage-changed"]["steps"]
                     if s.get("name") == "Resolve changed-test base from the event")
+
+    def test_jobs_that_execute_node_install_it_first(self):
+        self.assertEqual(node_without_setup(self.workflow), [])
+        workflow = copy.deepcopy(self.workflow)
+        workflow["jobs"]["release-scripts"]["steps"] = [step for step in workflow["jobs"]["release-scripts"]["steps"]
+            if "actions/setup-node@" not in step.get("uses", "")]
+        self.assertTrue(any(error.startswith("release-scripts: ") for error in node_without_setup(workflow)))
 
     def test_queue_coverage_base_is_bound_to_the_actual_checkout(self):
         step = self.changed_test_base_step()

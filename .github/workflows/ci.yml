@@ -178,6 +178,11 @@ jobs:
         with:
           python-version: '3.11'
       - run: python3 -m pip install 'PyYAML==6.0.3'
+      # The routing test executes the probe under node. Depot images ship it;
+      # the self-hosted tinybox runners do not.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Resolve formatting toolchain
