@@ -21,6 +21,9 @@ RUNNER = Path(os.environ.get("RELEASE_PLZ_TEST_RUNNER", ROOT / "scripts/release-
 QUOTA = 'Response body:\n' + json.dumps({
     "message": "API rate limit exceeded for user ID 526899.", "status": "403",
 }) + '\nCaused by:\n    HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/intent-hq/intentd/commits/abc/pulls)\n'
+# setup-python exports the interpreter's library directory through these;
+# its builds hard-code /opt/hostedtoolcache as their RUNPATH.
+LOADER_PATH = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
 
 
 class ReleaseTests(unittest.TestCase):
@@ -40,6 +43,9 @@ class ReleaseTests(unittest.TestCase):
             "GITHUB_OUTPUT": str(self.outputs),
             "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_ROOT": str(self.repo),
         }
+        # Only the dynamic-loader search path survives the scrub: without it
+        # a relocated shared-library interpreter cannot start at all.
+        self.env.update({name: os.environ[name] for name in LOADER_PATH if name in os.environ})
         stub = self.bin / "release-plz"
         stub.write_text(f"#!{sys.executable} -S\n" + '''import json, os, pathlib, sys
 root = pathlib.Path(os.environ["FIXTURE_ROOT"])
@@ -64,7 +70,9 @@ sys.exit(fixture.get("exit", 0))
             [sys.executable, "-I", "-S", "-B", str(RUNNER)],
             cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
         )
-        self.calls = [json.loads(line) for line in (self.repo / "calls").read_text().splitlines()]
+        calls = self.repo / "calls"
+        self.assertTrue(calls.exists(), f"release-plz fixture never ran (exit {result.returncode}):\n{result.stderr}")
+        self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(self.calls[-1], ["release", "--git-token", self.env["GITHUB_TOKEN"], "--forge", "github", "-o", "json"])
         return result
 
@@ -190,6 +198,18 @@ sys.exit(fixture.get("exit", 0))
     def test_logged_token_is_redacted(self):
         result = self.invoke(exit=1, stderr=QUOTA + self.env["GITHUB_TOKEN"])
         self.assert_failure(result, "quota_blocked")
+
+    def test_hermetic_environment_can_start_this_interpreter(self):
+        # A relocated shared-library Python (setup-python's toolcache outside
+        # /opt/hostedtoolcache, as on the self-hosted runners) only loads
+        # libpython through the loader path setup-python exports.
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", "pass"],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("PYTHONPATH", self.env)
+        self.assertEqual(self.env["PATH"], str(self.bin))
 
     def test_diagnostic_write_failure_cannot_replace_original_exit(self):
         self.env["GITHUB_STEP_SUMMARY"] = str(self.repo)
