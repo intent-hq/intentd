@@ -413,14 +413,41 @@ async fn completed_turns(sub: &mut common::TlsWs, agents: &[&str]) -> Vec<Value>
     .expect("addressed agent must complete its real ACP turn")
 }
 
+// Normal queued sends announce their persisted user row, not the stream-start
+// event used by harness-initiated wakes. Provider logs independently count turns.
+fn is_delivered_user_message(event: &Value) -> bool {
+    event["type"] == "agent:message" && event["data"]["role"] == "user"
+}
+
+async fn hydrate_tool_results(rpc: &mut common::TlsWs, agent: &str, conversation: &mut Value) {
+    for message in conversation["messages"].as_array_mut().unwrap() {
+        let message_id = message["id"].clone();
+        for block in message["contentBlocks"].as_array_mut().unwrap() {
+            if block["type"] == "tool_result" && block["outputTruncated"] == true {
+                let full = wss_rpc(
+                    rpc,
+                    90,
+                    "agent.getMessageBlock",
+                    json!({"agentId":agent,"messageId":message_id,"blockId":block["id"]}),
+                )
+                .await;
+                *block = full["block"].clone();
+                assert_ne!(block["outputTruncated"], true, "full tool result: {block}");
+            }
+        }
+    }
+}
+
 /// Bound the negative observation window; do not use a blind sleep as evidence.
 async fn assert_no_turn(sub: &mut common::TlsWs) -> Vec<Value> {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(1));
     let mut seen = Vec::new();
     while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, wss_event_opt(sub, 1)).await {
         let event = frame["params"]["event"].clone();
-        assert_ne!(
-            event["type"], "agent:stream:start",
+        assert!(
+            !is_delivered_user_message(&event)
+                && event["type"] != "agent:queue:processing"
+                && event["type"] != "agent:stream:start",
             "unexpected wake: {event}"
         );
         seen.push(event);
@@ -695,11 +722,10 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     assert!(
         !events
             .iter()
-            .any(|event| event["type"] == "agent:stream:start"
-                && event["data"]["agentId"] == observer),
+            .any(|event| is_delivered_user_message(event) && event["data"]["agentId"] == observer),
         "unaddressed observer woke: {events:?}"
     );
-    let target_history = wss_rpc(
+    let mut target_history = wss_rpc(
         &mut rpc,
         11,
         "agent.getConversation",
@@ -708,6 +734,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         }),
     )
     .await;
+    hydrate_tool_results(&mut rpc, &target, &mut target_history).await;
     let output = tool_result_jsons(&target_history["messages"])
         .into_iter()
         .find(|value| value.get("reply").is_some())
@@ -738,7 +765,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         user_rows[0]["metadata"]["discussionMessageId"],
         sent["message"]["id"]
     );
-    let relay_history = wss_rpc(
+    let mut relay_history = wss_rpc(
         &mut rpc,
         31,
         "agent.getConversation",
@@ -747,6 +774,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         }),
     )
     .await;
+    hydrate_tool_results(&mut rpc, &relay, &mut relay_history).await;
     let relay_output = tool_result_jsons(&relay_history["messages"])
         .into_iter()
         .find(|value| value.get("reply").is_some())
@@ -780,7 +808,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     );
     assert_eq!(relay_rows[0]["metadata"]["fromAgentId"], target);
     for agent in [&target, &relay] {
-        assert_eq!(events.iter().filter(|event| event["type"] == "agent:stream:start"
+        assert_eq!(events.iter().filter(|event| is_delivered_user_message(event)
             && event["data"]["agentId"] == *agent).count(), 1,
             "each explicitly addressed agent runs once; plain replyTo never wakes its author: {events:?}");
     }
@@ -1043,9 +1071,7 @@ async fn restart_and_retry_discussion_delivery(admitted: bool) {
     assert_eq!(
         events
             .iter()
-            .filter(
-                |event| event["type"] == "agent:stream:start" && event["data"]["agentId"] == agent
-            )
+            .filter(|event| is_delivered_user_message(event) && event["data"]["agentId"] == agent)
             .count(),
         1,
         "one recovered turn: {events:?}"
