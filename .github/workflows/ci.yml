@@ -1865,7 +1865,10 @@ jobs:
   # #5489, #5497). Fix order when red: the checks compare this head against
   # monorepo `main` and every checker tolerates docs that lead the pin, so land
   # the monorepo docs PR first (the job summary names the file to update), then
-  # re-run this job; the later submodule bump then lands green.
+  # re-run all jobs or push (re-running only failed jobs keeps the monorepo
+  # commit `@main` resolved to on the first attempt); the later submodule bump
+  # then lands green. Keep `@main`: a SHA pin also pins those docs, so a
+  # docs-first fix needed a hand pin bump (#2476, #2481).
   # check-mcp-bindings is advisory here (its generated index must match the
   # pinned help text line for line, so the docs cannot lead an intentd change
   # to a binding's help line); it stays a hard error in the monorepo.
@@ -1882,7 +1885,7 @@ jobs:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
       DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
       INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
-    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@af04df8ec1ccf0ef46ce236dad12464dfe39397e
+    uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
     with:
       component: intentd
       head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
