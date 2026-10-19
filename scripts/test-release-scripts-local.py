@@ -9,6 +9,7 @@ Run: python3 -I -B scripts/test-release-scripts-local.py   (needs PyYAML)
 import os
 from pathlib import Path
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
@@ -89,15 +90,26 @@ class RunnerTests(unittest.TestCase):
         target.write_text(f'#!/usr/bin/env bash\necho "{version}"\n')
         target.chmod(0o755)
 
-    def run_runner(self, *args, **extra_env):
+    def child_env(self, **extra_env):
         # A minimal PATH isolates the stub tools; the loader path is forwarded so a
-        # toolcache python3 still starts (intentd#2490).
+        # toolcache python3 still starts (intentd#2490). The fixture HOME would
+        # move the user site, so the caller's user base is pinned: a
+        # `pip install --user` PyYAML must stay importable for the runner.
         environ = {key: os.environ[key] for key in LOADER_PATH if key in os.environ}
         environ.update(PATH=str(self.bin), HOME=str(self.temp),
+                       PYTHONUSERBASE=os.environ.get('PYTHONUSERBASE') or site.getuserbase(),
                        RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(self.preload), **extra_env)
-        # No -I: a user-site PyYAML must stay importable for the runner.
+        return environ
+
+    def run_runner(self, *args, **extra_env):
+        # No -I, which would drop the user site the runner may need for PyYAML.
         return subprocess.run([sys.executable, '-B', str(RUNNER), '--root', str(self.root), *args],
-                              env=environ, capture_output=True, text=True, timeout=60)
+                              env=self.child_env(**extra_env), capture_output=True, text=True, timeout=60)
+
+    def test_child_runner_keeps_the_callers_user_site(self):
+        probe = subprocess.run([sys.executable, '-B', '-c', 'import site; print(site.getusersitepackages())'],
+                               env=self.child_env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.stdout.strip(), site.getusersitepackages())
 
     def test_runs_every_test_line_in_ci_order_and_fails_on_a_real_failure(self):
         result = self.run_runner()
