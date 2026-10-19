@@ -255,6 +255,50 @@ async fn create_persists_the_reference_and_missing_or_disabled_requires_replacem
     assert!(legacy.to_string().contains("is not enabled"), "{legacy}");
 }
 
+/// intent-hq/intent#7121: the unknown-model guard reads a profile's own
+/// catalog slot, never the base's Default catalog — a model the base list
+/// lacks still passes for the profile (no profile catalog cached = no
+/// evidence), while the same id on the bare base is rejected.
+#[intent_test_macros::daemon_test]
+async fn unknown_model_guard_uses_the_profile_catalog_not_the_base() {
+    let fx = Fixture::new().await;
+    let work = fx.profile("claude-code", "Work").await;
+    fx.svc.models_catalog.store_for_test(
+        "claude-code",
+        &crate::model_catalog::source_for("claude-code")
+            .map(|s| (s.version_key)())
+            .unwrap_or_default(),
+        vec![json!({ "id": "sonnet", "name": "Sonnet", "provider": "claude-code" })],
+    );
+    let create = |provider: String| {
+        fx.svc.agent_create_op(
+            fx.ws.clone(),
+            None,
+            Some("profile-only-model".into()),
+            None,
+            None,
+            None,
+            false,
+            AgentCreateExtra {
+                provider: Some(provider),
+                ..Default::default()
+            },
+        )
+    };
+    create(work.clone())
+        .await
+        .expect("a profile is not judged by the base catalog");
+    let err = create("claude-code".into())
+        .await
+        .expect_err("the bare base rejects a model its catalog lacks");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("model profile-only-model is not available for provider claude-code"),
+        "{err}"
+    );
+}
+
 #[intent_test_macros::daemon_test]
 async fn default_provider_reference_is_used_and_never_falls_back() {
     let fx = Fixture::new().await;
