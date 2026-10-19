@@ -41,6 +41,10 @@ const REQUIRE_ENV: &str = "INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT";
 const FAKE_CLI: &str = include_str!("../tests/fixtures/fake_claude_cli.mjs");
 const REPLY: &str = "contract-reply-7d1c";
 const TIMEOUT: Duration = Duration::from_secs(60);
+const MISSING: &str = "<missing value>";
+/// Inherited variables the adapter, SDK or CLI read; cleared so the host's
+/// own Claude/Anthropic configuration cannot change what the contract sees.
+const CLEARED_ENV_PREFIXES: &[&str] = &["ANTHROPIC_", "CLAUDE_", "CLAUDECODE", "AWS_", "VERTEX_"];
 
 /// The provisioned adapter package directory, or `None` to skip.
 fn adapter_dir() -> Option<PathBuf> {
@@ -98,19 +102,33 @@ impl Observed {
     }
 
     /// Every value of `--name`, accepting both `--name value` and
-    /// `--name=value` (adapter/SDK releases have used each spelling).
+    /// `--name=value` (adapter/SDK releases have used each spelling). A bare
+    /// `--name` with no value (last argument, or followed by another flag)
+    /// yields [`MISSING`], never an empty value, so it cannot pass for
+    /// `--tools ""`.
     fn flag_values(&self, name: &str) -> Vec<&str> {
         let prefix = format!("{name}=");
         let mut values = Vec::new();
-        let mut args = self.argv.iter();
+        let mut args = self.argv.iter().peekable();
         while let Some(arg) = args.next() {
             if let Some(value) = arg.strip_prefix(&prefix) {
                 values.push(value);
             } else if arg == name {
-                values.push(args.next().map_or("", String::as_str));
+                match args.peek() {
+                    Some(next) if !next.starts_with("--") => {
+                        values.push(args.next().unwrap().as_str());
+                    }
+                    _ => values.push(MISSING),
+                }
             }
         }
         values
+    }
+
+    /// Whether any argument is `--name`, `--name=…`, or a longer flag
+    /// starting with `--name` (`--append-system-prompt-file`, …).
+    fn has_flag_family(&self, name: &str) -> bool {
+        self.argv.iter().any(|a| a.starts_with(name))
     }
 
     fn has_flag(&self, name: &str) -> bool {
@@ -167,9 +185,23 @@ impl Observed {
         found.pop()
     }
 
+    /// Any append-to-preset channel: an `append*SystemPrompt*` field on
+    /// `initialize` or an `--append-system-prompt*` flag.
     fn appends_to_preset(&self) -> bool {
-        !self.initialize()["appendSystemPrompt"].is_null()
-            || self.has_flag("--append-system-prompt")
+        let init = self.initialize().as_object().into_iter().flatten();
+        init.into_iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            key.starts_with("append") && key.contains("systemprompt") && !value.is_null()
+        }) || self.has_flag_family("--append-system-prompt")
+    }
+
+    /// Any MCP server configuration reaching the CLI.
+    fn passes_mcp_config(&self) -> bool {
+        self.has_flag_family("--mcp-config")
+            || self
+                .initialize()
+                .get("sdkMcpServers")
+                .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()))
     }
 
     fn user_turn_text(&self) -> String {
@@ -197,12 +229,14 @@ async fn complete(adapter: &Path, prompt: &str, meta: Option<Value>) -> Observed
     for dir in [&home, &project, &root.join("tmp")] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let fake = root.join("claude");
+    // `.mjs` so Node loads the ESM stand-in without relying on module-type
+    // detection (absent before Node 22.12).
+    let fake = root.join("claude.mjs");
     std::fs::write(&fake, FAKE_CLI).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = root.join("cli.ndjson");
 
-    let cmd = OneShotCommand::binary(
+    let mut cmd = OneShotCommand::binary(
         PathBuf::from("node"),
         vec![adapter.join("dist/index.js").display().to_string()],
     )
@@ -218,11 +252,17 @@ async fn complete(adapter: &Path, prompt: &str, meta: Option<Value>) -> Observed
     .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     .env("DO_NOT_TRACK", "1")
     .env("DD_TRACE_ENABLED", "false")
-    .env("DD_INSTRUMENTATION_TELEMETRY_ENABLED", "false")
-    .env_remove("ANTHROPIC_API_KEY")
-    .env_remove("ANTHROPIC_AUTH_TOKEN")
-    .env_remove("ANTHROPIC_BASE_URL")
-    .env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    .env("DD_INSTRUMENTATION_TELEMETRY_ENABLED", "false");
+    // Removals apply after overrides at spawn, so the sweep skips the
+    // variables set above.
+    let own: Vec<String> = cmd.env_vars().iter().map(|(k, _)| k.clone()).collect();
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else { continue };
+        if CLEARED_ENV_PREFIXES.iter().any(|p| key.starts_with(p)) && !own.iter().any(|k| k == key)
+        {
+            cmd = cmd.env_remove(key);
+        }
+    }
 
     let result = run_one_shot_acp_in(
         None,
@@ -301,7 +341,7 @@ fn assert_utility_contract(seen: &Observed, prompt: &str, system_prompt: &str) {
          --strict-mcp-config\n{cx}"
     );
     assert!(
-        !seen.has_flag("--mcp-config"),
+        !seen.passes_mcp_config(),
         "a utility session sends no MCP servers, so no --mcp-config may be passed\n{cx}"
     );
     assert_eq!(
@@ -360,6 +400,20 @@ async fn without_meta_the_adapter_defaults_are_observed() {
     assert_ne!(seen.flag_values("--setting-sources"), ["user"], "{cx}");
     assert!(!seen.has_flag("--strict-mcp-config"), "{cx}");
     assert_eq!(seen.system_prompt(), None, "{cx}");
+    assert!(!seen.appends_to_preset(), "{cx}");
+}
+
+/// Control: an object `_meta.systemPrompt` asks the adapter to APPEND to the
+/// preset. Proves the append detector (asserted absent above) observes that
+/// channel on this adapter/SDK.
+#[tokio::test]
+async fn object_system_prompt_append_is_observed() {
+    let Some(adapter) = adapter_dir() else { return };
+    let meta = serde_json::json!({ "systemPrompt": { "append": "control append 3c7d" } });
+    let seen = complete(&adapter, "control prompt", Some(meta)).await;
+    let cx = seen.context();
+    assert!(seen.appends_to_preset(), "{cx}");
+    assert_eq!(seen.system_prompt(), None, "{cx}");
 }
 
 #[test]
@@ -382,5 +436,23 @@ fn flag_values_accept_both_spellings() {
     assert_eq!(seen.flag_values("--tools"), ["", ""]);
     assert_eq!(seen.flag_values("--setting-sources"), ["user"]);
     assert!(seen.has_flag("--strict-mcp-config"));
-    assert!(!seen.has_flag("--mcp-config"));
+    assert!(!seen.has_flag_family("--mcp-config"));
+}
+
+#[test]
+fn flag_values_never_read_a_missing_value_as_empty() {
+    let observed = |argv: &[&str]| Observed {
+        adapter: String::new(),
+        reply: String::new(),
+        argv: argv.iter().map(ToString::to_string).collect(),
+        stdin: Vec::new(),
+        log: String::new(),
+    };
+    let last = observed(&["--verbose", "--tools"]);
+    assert_eq!(last.flag_values("--tools"), [MISSING]);
+    let before_flag = observed(&["--tools", "--setting-sources", "user"]);
+    assert_eq!(before_flag.flag_values("--tools"), [MISSING]);
+    assert_eq!(before_flag.flag_values("--setting-sources"), ["user"]);
+    let file = observed(&["--append-system-prompt-file", "x"]);
+    assert!(file.has_flag_family("--append-system-prompt"));
 }

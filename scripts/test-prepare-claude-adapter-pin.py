@@ -4,6 +4,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -110,6 +111,39 @@ class PrepareTests(unittest.TestCase):
         with patch.object(PREP, "run_npm", install):
             PREP.prepare(self.root, self.cache)
         self.assertEqual(len(install.specs), 1)
+
+    def test_concurrent_publish_is_reused(self):
+        write_repo(self.root)
+        install = fake_install()
+
+        def racing(prefix, spec, env):
+            install(prefix, spec, env)
+            # Another run publishes the same verified tree first.
+            with patch.object(PREP, "run_npm", fake_install()):
+                PREP.prepare(self.root, self.cache)
+
+        with patch.object(PREP, "run_npm", racing):
+            path = PREP.prepare(self.root, self.cache)
+        self.assertTrue((path / "dist" / "index.js").is_file())
+
+    def test_npm_is_retried_then_refused(self):
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 1 if len(calls) < 3 else 0)
+
+        env = {"PATH": "/usr/bin"}
+        with patch.object(PREP.shutil, "which", return_value="/usr/bin/npm"), \
+                patch.object(PREP.subprocess, "run", fake_run):
+            PREP.run_npm(Path(self.tmp.name), "pkg@1.0.0", env, pause=lambda _: None)
+            self.assertEqual(len(calls), 3)
+            self.assertIn("--ignore-scripts", calls[0])
+            calls.clear()
+            with patch.object(PREP.subprocess, "run",
+                              lambda args, **kw: subprocess.CompletedProcess(args, 1)):
+                with self.assertRaisesRegex(PREP.Refusal, "failed .* after 3 attempts"):
+                    PREP.run_npm(Path(self.tmp.name), "pkg@1.0.0", env, pause=lambda _: None)
 
     def test_main_reports_refusal(self):
         write_repo(self.root, pin="1.2.4")

@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,17 +120,30 @@ def npm_environment(work):
     }
 
 
-def run_npm(prefix, spec, env):
+NPM_ATTEMPTS = 3
+
+
+def run_npm(prefix, spec, env, attempts=NPM_ATTEMPTS, pause=time.sleep):
+    """Install `spec`, retrying transient registry/network failures.
+
+    A version mismatch is still caught by validate() afterwards, so a retry
+    can never accept a different package.
+    """
     npm = shutil.which("npm", path=env["PATH"])
     if npm is None:
         raise Refusal("npm is required (install Node.js 22+)")
     args = [npm, "install", "--prefix", str(prefix), "--ignore-scripts", "--omit=optional",
-            "--no-audit", "--no-fund", "--no-save", "--no-package-lock", spec]
-    print("+ " + " ".join(args), file=sys.stderr, flush=True)
-    result = subprocess.run(args, cwd=prefix, env=env, stdout=sys.stderr, stderr=sys.stderr,
-                            timeout=600, check=False)
-    if result.returncode != 0:
-        raise Refusal(f"npm install {spec} failed ({result.returncode})")
+            "--no-audit", "--no-fund", "--no-save", "--no-package-lock",
+            "--fetch-retries=4", spec]
+    for attempt in range(1, attempts + 1):
+        print(f"+ (attempt {attempt}/{attempts}) " + " ".join(args), file=sys.stderr, flush=True)
+        result = subprocess.run(args, cwd=prefix, env=env, stdout=sys.stderr, stderr=sys.stderr,
+                                timeout=300, check=False)
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            pause(15 * attempt)
+    raise Refusal(f"npm install {spec} failed ({result.returncode}) after {attempts} attempts")
 
 
 def prepare(root, cache):
@@ -150,7 +164,12 @@ def prepare(root, cache):
         prefix.mkdir()
         run_npm(prefix, f"{ADAPTER}@{adapter_version}", npm_environment(work))
         validate(prefix, adapter_version, sdk_version)
-        prefix.rename(ready)
+        try:
+            prefix.rename(ready)
+        except OSError:
+            # A concurrent run published first; its install is verified below.
+            if not ready.is_dir():
+                raise
     return validate(ready, adapter_version, sdk_version)
 
 
