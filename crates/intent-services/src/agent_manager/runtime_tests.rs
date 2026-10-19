@@ -148,6 +148,7 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "node".into(),
             spawned_selection: crate::agent_manager::test_selection_for_command("node"),
             _activation: None,

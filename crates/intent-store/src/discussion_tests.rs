@@ -221,7 +221,7 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .unwrap();
     sqlx::raw_sql("DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
         .execute(store.write_pool()).await.unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0162_workspace_discussions.sql"))
+    sqlx::raw_sql(include_str!("../migrations/0163_workspace_discussions.sql"))
         .execute(store.write_pool())
         .await
         .unwrap();
@@ -234,13 +234,13 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
     sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES('old-message',?,7,?,'retry','preserved',?,'2026-01-01T00:00:00Z')")
         .bind(ws.as_str()).bind(author.principal_id.as_str()).bind(serde_json::to_string(&author).unwrap()).execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!(
-        "../migrations/0163_discussion_conversations.sql"
+        "../migrations/0164_discussion_conversations.sql"
     ))
     .execute(store.write_pool())
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../migrations/0164_discussion_message_actions.sql"
+        "../migrations/0165_discussion_message_actions.sql"
     ))
     .execute(store.write_pool())
     .await

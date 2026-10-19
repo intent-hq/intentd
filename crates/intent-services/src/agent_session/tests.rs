@@ -8498,7 +8498,13 @@ async fn open_session_resolves_effective_model_for_null_model() {
         .await
         .expect("open session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model, None, "NULL model stays NULL");
+    // The session-open fill never pins the adapter's floating `default`
+    // alias (no concrete model is known), and never the D13 display name,
+    // which stays a stats-only resolution (monorepo#1534).
+    assert_eq!(
+        stored.model, None,
+        "the default alias is not a concrete model"
+    );
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)

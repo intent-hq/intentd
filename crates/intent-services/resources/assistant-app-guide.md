@@ -111,8 +111,9 @@ recover a chat after deletion has completed.
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
 the workspace creation form where offered. Available choices depend on configured
-providers; diagnose a missing provider in **Providers**. Do not promise a default
-change will switch an existing agent. Specialist entries appear
+providers; diagnose a missing provider in **Providers**. Changing a default provider
+or model affects new agents only; each existing agent keeps its own provider, model
+and reasoning level until changed in its own model picker. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
 `/settings?tab=specialists&view=create-specialist#create-specialist`; select an
 existing specialist to edit its behavior. Global defaults and a specialist's
@@ -577,7 +578,9 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 
 ## Daemon lifecycle from the terminal
 

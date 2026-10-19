@@ -1692,10 +1692,14 @@ mod tests {
         assert_eq!(exported, re_exported, "round-trip must be lossless");
         // Archives made before the effort baseline column remain importable;
         // desired reasoning_effort is not evidence of a previously used level.
+        // Archives made before the Auto-pin flag import with it defaulted to 0
+        // (a portable value: transferred as-is, no import-side rewrite).
         for (table, rows) in &mut exported {
             if table == "agent_session" {
                 for row in rows {
-                    row.as_object_mut().unwrap().remove("last_turn_effort");
+                    let row = row.as_object_mut().unwrap();
+                    row.remove("last_turn_effort");
+                    row.remove("reasoning_effort_auto");
                 }
             }
         }
@@ -2226,7 +2230,7 @@ discussion_participant: conversation_id, workspace_id, source_principal_id, prin
 workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version
 discussion_reaction: id, workspace_id, message_id, principal_id, reaction
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto
 script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
 script_notification_job: wake_id, workspace_id, agent_id, script_id, run_id, metadata, body, phase, created_at
 agent_queue_admission: id, agent_id, workspace_id, turn_id, payload, created_at, phase
