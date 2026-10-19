@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.11] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject agent.delegate with a nonexistent task note ([#2501](https://github.com/intent-hq/intentd/pull/2501))
+- *(pr)* Find workspace PRs on repos with >1,000 open PRs ([#2503](https://github.com/intent-hq/intentd/pull/2503))
+- *(serve)* Never panic on a closed stderr pipe ([#7119](https://github.com/intent-hq/intentd/pull/7119)) ([#2504](https://github.com/intent-hq/intentd/pull/2504))
+
+
 ## [0.11.10] - 2026-10-19
 
 ### 📚 Documentation
