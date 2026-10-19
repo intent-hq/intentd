@@ -2,7 +2,6 @@
 use super::setup;
 use crate::note_delete_repo::{NoteDeleteAuthority, NoteDeleteCommitOutcome, NoteDeleteGuard};
 use intent_core::{note_delete::*, Caller, Error, Note, NoteId};
-use std::time::Duration;
 fn authority() -> NoteDeleteAuthority {
     NoteDeleteAuthority {
         caller: Caller::Daemon,
@@ -44,7 +43,7 @@ async fn commit(
             &authority(),
             request,
             guard,
-            tokio::time::Instant::now() + Duration::from_secs(5),
+            tokio::time::Instant::now() + super::wait(),
         )
         .await
         .unwrap()
@@ -319,7 +318,7 @@ async fn grace_revalidates_bearer_and_durable_role_inside_writer() {
                 &auth,
                 &request,
                 &guard,
-                tokio::time::Instant::now() + Duration::from_secs(5),
+                tokio::time::Instant::now() + super::wait(),
             )
             .await
             .unwrap();
@@ -388,10 +387,10 @@ async fn grace_annotation_failure_rolls_back_and_cancelled_writer_is_reusable() 
             &auth,
             &request,
             &guard,
-            tokio::time::Instant::now() + Duration::from_secs(5),
+            tokio::time::Instant::now() + super::wait(),
         ),
     ));
-    tokio::time::timeout(Duration::from_secs(5),async {
+    tokio::time::timeout(super::wait(),async {
         tokio::select! {r=&mut write=>panic!("finalizer did not pause: {r:?}"),()=pause.entered.notified()=>{}}
     }).await.unwrap();
     assert_eq!(
@@ -400,7 +399,7 @@ async fn grace_annotation_failure_rolls_back_and_cancelled_writer_is_reusable() 
     );
     drop(write);
     tokio::time::timeout(
-        Duration::from_secs(5),
+        super::wait(),
         sqlx::query("BEGIN IMMEDIATE; ROLLBACK").execute(store.write_pool()),
     )
     .await
@@ -547,7 +546,7 @@ async fn grace_retired_agent_and_removed_workspace_fail_closed_at_commit() {
                 &auth,
                 &request,
                 &guard,
-                tokio::time::Instant::now() + Duration::from_secs(5)
+                tokio::time::Instant::now() + super::wait()
             )
             .await
             .unwrap(),

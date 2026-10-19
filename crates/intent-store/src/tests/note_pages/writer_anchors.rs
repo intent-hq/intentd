@@ -238,7 +238,7 @@ async fn orphan_flags_and_anchor_readiness_commit_or_roll_back_with_the_source()
 #[tokio::test]
 async fn dropping_note_writer_during_finalizer_rolls_back_mutated_source_and_orphans() {
     use crate::note_annotation_repo::{FinalizerPause, FINALIZER_PAUSE};
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
     let (store, _tmp, mut note) = setup("<!--anchor:x:start-->a<!--anchor:x:end-->").await;
     let comment = sample_comment(&note.id, "x", "x");
     note.rev = store
@@ -273,7 +273,7 @@ async fn dropping_note_writer_during_finalizer_rolls_back_mutated_source_and_orp
     tokio::select! {
         result = &mut write => panic!("writer finished before finalizer: {result:?}"),
         () = pause.entered.notified() => {},
-        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("writer never reached finalizer"),
+        () = tokio::time::sleep(super::wait()) => panic!("writer never reached finalizer"),
     }
     let observed = pause.observed.lock().unwrap().clone().unwrap();
     assert_eq!(observed.source_revision, epochs.source_revision + 1);
@@ -283,7 +283,7 @@ async fn dropping_note_writer_during_finalizer_rolls_back_mutated_source_and_orp
     // Acquire the replacement writer before reading: cancellation must release
     // the old transaction and cannot leak either its source or orphan update.
     tokio::time::timeout(
-        Duration::from_secs(5),
+        super::wait(),
         sqlx::query("BEGIN IMMEDIATE; ROLLBACK").execute(store.write_pool()),
     )
     .await
