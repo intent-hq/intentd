@@ -8,6 +8,7 @@ RELEASE_PLZ_TEST_RUNNER may select the saved pre-fix action command for RED.
 
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -19,11 +20,11 @@ import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = Path(os.environ.get("RELEASE_PLZ_TEST_RUNNER", ROOT / "scripts/release-plz-release.py"))
-# Dynamic-loader variables the interpreter itself may need to start: the
-# self-hosted runners' setup-python CPython finds libpython only through
-# LD_LIBRARY_PATH. They select shared libraries, not behavior, so the
-# otherwise minimal fixture env keeps them.
-LOADER_ENV = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
+# The fixture env is deliberately minimal (no credentials, private PATH),
+# but the interpreters it starts must still load: the self-hosted runners'
+# setup-python CPython finds libpython only through LD_LIBRARY_PATH. The
+# variable selects shared libraries, not behavior, so it is kept verbatim.
+LOADER_ENV = ("LD_LIBRARY_PATH",)
 QUOTA = 'Response body:\n' + json.dumps({
     "message": "API rate limit exceeded for user ID 526899.", "status": "403",
 }) + '\nCaused by:\n    HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/intent-hq/intentd/commits/abc/pulls)\n'
@@ -73,11 +74,13 @@ sys.exit(fixture.get("exit", 0))
             [self.PYTHON, "-I", "-S", "-B", str(RUNNER)],
             cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
         )
-        calls = self.repo / "calls"
-        if not calls.exists():
+        try:
+            self.calls = [json.loads(line) for line in (self.repo / "calls").read_text().splitlines()]
+        except (OSError, ValueError):
+            self.calls = []
+        if not self.calls:
             self.fail(f"the release runner never reached release-plz (exit {result.returncode}):\n"
                       f"{result.stdout}{result.stderr}")
-        self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(self.calls[-1], ["release", "--git-token", self.env["GITHUB_TOKEN"], "--forge", "github", "-o", "json"])
         return result
 
@@ -215,31 +218,35 @@ sys.exit(fixture.get("exit", 0))
         self.assertIn("Could not write release failure output", result.stderr)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux runs a script as another script's interpreter; macOS does not")
 class LoaderDependentInterpreterTests(ReleaseTests):
-    """Rerun every release scenario under an interpreter that, like setup-python's
+    """Run a release scenario under an interpreter that, like setup-python's
     toolcache CPython on the self-hosted runners, cannot start without its
-    dynamic-loader path. The fixture env is otherwise minimal, so a missing
-    pass-through made every scenario fail with no `calls` file (tinybox only)."""
+    exact LD_LIBRARY_PATH. Without the pass-through every release-quota test
+    failed there with no `calls` file (tinybox only)."""
 
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
+    def setUp(self):
+        self.loader_path = os.environ.get("LD_LIBRARY_PATH") or "/fixture-loader-path"
+        patcher = unittest.mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": self.loader_path})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         temp = tempfile.TemporaryDirectory(prefix="release-quota-loader-")
-        cls.addClassCleanup(temp.cleanup)
+        self.addCleanup(temp.cleanup)
         wrapper = Path(temp.name) / "python3"
         wrapper.write_text(
             "#!/bin/sh\n"
-            '[ -n "${LD_LIBRARY_PATH:-}" ] || { echo "error while loading shared libraries: libpython: cannot open shared object file" >&2; exit 127; }\n'
-            f'exec "{sys.executable}" "$@"\n'
+            f'[ "${{LD_LIBRARY_PATH:-}}" = {shlex.quote(self.loader_path)} ] || '
+            '{ echo "error while loading shared libraries: libpython: cannot open shared object file" >&2; exit 127; }\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
         )
         wrapper.chmod(0o700)
-        cls.PYTHON = str(wrapper)
-
-    def setUp(self):
-        patcher = unittest.mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH") or "/fixture-loader-path"})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.PYTHON = str(wrapper)
         super().setUp()
+
+    def test_loader_dependent_interpreter_reaches_release_plz(self):
+        result = self.invoke(stdout='{"releases": []}')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.calls), 1)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -260,6 +267,16 @@ class WorkflowTests(unittest.TestCase):
         for key in ("release_always", "publish", "git_release_enable", "git_tag_enable"):
             self.assertFalse(config["workspace"][key])
         self.assertEqual(config["workspace"]["git_tag_name"], "v{{ version }}")
+
+
+def load_tests(loader, tests, pattern):
+    # LoaderDependentInterpreterTests reuses ReleaseTests' fixture but runs
+    # only its own scenario, not every inherited one a second time.
+    suite = unittest.TestSuite()
+    for case in (ReleaseTests, WorkflowTests):
+        suite.addTests(loader.loadTestsFromTestCase(case))
+    suite.addTest(LoaderDependentInterpreterTests("test_loader_dependent_interpreter_reaches_release_plz"))
+    return suite
 
 
 if __name__ == "__main__":
