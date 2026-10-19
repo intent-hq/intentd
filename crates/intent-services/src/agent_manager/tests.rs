@@ -4731,24 +4731,15 @@ fn seed_repo() -> TempRepo {
     TempRepo { dir, _guard: guard }
 }
 
-/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
-/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
-/// edited file, with the agent's stats and lazy blob SHAs.
-#[tokio::test]
-async fn agent_file_change_records_tracked_change_and_diff() {
-    use intent_acp::SinkEvent;
-    use intent_core::{
-        events::FILE_CHANGED, now_iso, ActorType, EventActor, Workspace, WorkspaceActivity,
-        WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
-
-    let repo = seed_repo();
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-
-    let ws_id = WorkspaceId::from("ws-ft");
+/// A local workspace row whose worktree is `worktree`, for the file-change
+/// sink tests.
+fn file_tracking_workspace(
+    ws_id: &intent_core::WorkspaceId,
+    worktree: &std::path::Path,
+) -> intent_core::Workspace {
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
-    let ws = Workspace {
+    Workspace {
         id: ws_id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
@@ -4768,7 +4759,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         repository_path: None,
         repository_owner: None,
         repository_name: None,
-        worktree_path: Some(repo.dir.display().to_string()),
+        worktree_path: Some(worktree.display().to_string()),
         scope: None,
         skip_worktree: false,
         setup_script: None,
@@ -4795,7 +4786,23 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         disk_usage: None,
         pending_delete_at: None,
         membership: None,
-    };
+    }
+}
+
+/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
+/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
+/// edited file, with the agent's stats and lazy blob SHAs.
+#[tokio::test]
+async fn agent_file_change_records_tracked_change_and_diff() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::from("ws-ft");
+    let ws = file_tracking_workspace(&ws_id, &repo.dir);
     store.insert_workspace(&ws).await.unwrap();
 
     let bus = EventBus::new(store.clone());
@@ -4845,6 +4852,49 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diffs[0].hunks_json.contains("CHANGED"),
         "extracted hunks carry the new line"
     );
+}
+
+/// Regression (intent-hq/intent#7266): an agent `file:changed` for an
+/// untracked git-ignored path records neither an attribution row nor a diff —
+/// it can never be committed, so the row would stay `unstaged` forever.
+#[tokio::test]
+async fn agent_file_change_to_git_ignored_path_records_nothing() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    std::fs::write(repo.dir.join(".gitignore"), ".dev/\n").unwrap();
+    std::fs::create_dir_all(repo.dir.join(".dev")).unwrap();
+    std::fs::write(repo.dir.join(".dev/scratch.json"), "{}\n").unwrap();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::from("ws-ft-ign");
+    store
+        .insert_workspace(&file_tracking_workspace(&ws_id, &repo.dir))
+        .await
+        .unwrap();
+
+    let sink = BusEventSink::new(EventBus::new(store.clone()));
+    sink.publish(SinkEvent {
+        workspace_id: ws_id.clone(),
+        event_type: FILE_CHANGED.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some("agent-1".to_string()),
+            name: Some("Agent".to_string()),
+            ..Default::default()
+        },
+        session_id: Some("agent-1".to_string()),
+        data: serde_json::json!({
+            "path": ".dev/scratch.json",
+            "relativePath": ".dev/scratch.json",
+            "action": "create",
+        }),
+    })
+    .await;
+
+    assert!(store.list_tracked_changes(&ws_id).await.unwrap().is_empty());
+    assert!(store.list_diffs(&ws_id).await.unwrap().is_empty());
 }
 
 const MGR_ACP_SID: &str = "mgr-acp-new";

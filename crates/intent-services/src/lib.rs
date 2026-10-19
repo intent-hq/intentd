@@ -37522,11 +37522,13 @@ impl Services {
         Ok(())
     }
 
-    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
-    /// `changes:git-status` after a mutating accept-changes step.
-    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+    /// Recompute the workspace's durable line-change aggregates from its
+    /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
+    /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
+    /// stored aggregates are published as they are.
+    pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
-            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {
@@ -37544,6 +37546,12 @@ impl Services {
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        self.recompute_and_publish_metrics(workspace_id).await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
             // The step just mutated the worktree, so the cached scan is the
@@ -37696,6 +37704,7 @@ struct AcExtras {
 /// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
 /// then the metrics / usage-stats recomputes. The status is inferred from the
 /// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Untracked git-ignored paths are not recorded (intent-hq/intent#7266).
 /// Best-effort throughout — a tracking miss never fails the mutation.
 async fn record_agent_file_mutation(
     store: &Store,
@@ -37734,6 +37743,11 @@ async fn record_agent_file_mutation(
             return;
         }
     };
+    // A git-ignored untracked path can never be committed, so a row for it
+    // would sit in `unstaged` forever (intent-hq/intent#7266).
+    if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+        return;
+    }
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =
@@ -37869,6 +37883,7 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
