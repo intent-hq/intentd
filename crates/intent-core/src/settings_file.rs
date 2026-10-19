@@ -101,7 +101,10 @@ pub struct ProvidersSettings {
     pub enabled: Option<BTreeMap<String, bool>>,
     /// `providers.paths` — per-provider CLI path overrides.
     pub paths: BTreeMap<String, String>,
-    /// Session-only Fast mode preference; absent providers default to off.
+    /// Session-only Fast mode preference keyed by `claude-code` / `codex` or
+    /// a named-profile reference of either (`<base>@<profileId>`). Each key is
+    /// its own setting: an absent key is off, and a profile never reads its
+    /// base provider's entry.
     pub fast_mode: BTreeMap<String, bool>,
 }
 
@@ -1258,6 +1261,25 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "agents.flushQueuedMessages",
 ];
 
+/// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
+/// base provider id, or a well-formed profile reference of one
+/// (`<base>@<id>`, id matching `^[a-z0-9][a-z0-9-]{0,31}$`). Existence of
+/// the profile is checked by the daemon's `settings.update` front door.
+fn is_fast_mode_key(key: &str) -> bool {
+    const BASES: [&str; 2] = ["claude-code", "codex"];
+    let Some((base, id)) = key.split_once('@') else {
+        return BASES.contains(&key);
+    };
+    let bytes = id.as_bytes();
+    BASES.contains(&base)
+        && !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
 pub type LegacySettings = BTreeMap<String, serde_json::Value>;
@@ -1407,11 +1429,11 @@ impl SettingsFile {
             .providers
             .fast_mode
             .keys()
-            .any(|id| !matches!(id.as_str(), "claude-code" | "codex"))
+            .any(|id| !is_fast_mode_key(id))
         {
             return Err(bad(
                 "providers.fastMode",
-                "only claude-code and codex support Fast mode",
+                "only claude-code and codex (or one of their named profiles) support Fast mode",
             ));
         }
         let v = self.notifications.volume;

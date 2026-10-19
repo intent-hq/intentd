@@ -4754,6 +4754,7 @@ impl AgentManager {
         agent_id: &AgentId,
         session_id: &str,
         provider: &str,
+        selection: &str,
         original: &OriginalTurn,
     ) -> Result<()> {
         let Some((conn, mut options)) = self
@@ -4771,14 +4772,11 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let enabled = self
-            .services
-            .effective_settings()
-            .providers
-            .fast_mode
-            .get(provider)
-            .copied()
-            .unwrap_or(false);
+        // A named profile reads its own entry, never the base provider's.
+        let enabled = crate::fast_mode::preference(
+            &self.services.effective_settings().providers.fast_mode,
+            selection,
+        );
         crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
         if let Some(handle) = self
             .handles
@@ -10069,9 +10067,18 @@ impl AgentManager {
                 )
                 .await;
         if changed && !announced {
-            let label = |provider: &str, model: Option<&str>| match model {
-                Some(m) => format!("{provider}:{m}"),
-                None => format!("{provider} (default model)"),
+            // A profile reads as `<base> (<profile name>)`, never as its
+            // internal reference; the metadata keeps the references.
+            let profiles = self.services.provider_profiles.profiles().ok();
+            let label = |provider: &str, model: Option<&str>| {
+                let provider = crate::provider_profiles::readable_selection(
+                    provider,
+                    profiles.as_deref().map(Vec::as_slice),
+                );
+                match model {
+                    Some(m) => format!("{provider}:{m}"),
+                    None => format!("{provider} (default model)"),
+                }
             };
             let from_label = label(
                 from_provider.as_deref().unwrap_or(""),
@@ -10649,8 +10656,14 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id, &original)
-                        .await?;
+                    self.apply_fast_mode(
+                        agent_id,
+                        &acp,
+                        resolved.provider.id,
+                        &resolved.selection,
+                        &original,
+                    )
+                    .await?;
                     return Ok(StartedSession {
                         session_id: acp,
                         turn: original,
@@ -10899,6 +10912,7 @@ impl AgentManager {
             agent_id,
             &acp_session_id.session_id,
             resolved.provider.id,
+            &resolved.selection,
             &acp_session_id.turn,
         )
         .await?;
