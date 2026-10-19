@@ -75,9 +75,11 @@ fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
 /// well would say it twice. Every other provider keeps the composed prompt
 /// and no `_meta`, exactly as before.
 ///
-/// Verified when introduced against `@agentclientprotocol/claude-agent-acp` 0.81.1
+/// First verified by hand against `@agentclientprotocol/claude-agent-acp` 0.81.1
 /// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
-/// 0.3.280:
+/// 0.3.280; every pinned adapter is now checked mechanically by
+/// `claude_adapter_contract`, which runs the exact pin in CI (`check` job)
+/// against a stand-in Claude CLI and asserts each point below:
 /// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`
 ///   verbatim and REPLACES the `claude_code` preset (an object form would only
 ///   append to it);
