@@ -38,7 +38,9 @@ impl Store {
         // Idempotent upsert, so a write-pool acquire timeout (another writer
         // holding the single connection past `WRITE_ACQUIRE_TIMEOUT`) is
         // retried instead of aborting the `client.hello` handshake
-        // (intent-hq/intent#7070).
+        // (intent-hq/intent#7070). The worst case (~30s+) can outlast a
+        // caller's hello deadline; a late upsert is harmless because it only
+        // refreshes this client's own identity row and timestamps.
         crate::with_write_txn_retry(|| async {
             sqlx::query(
                 "INSERT INTO client (id, name, capabilities, hostname, pretty_hostname, \

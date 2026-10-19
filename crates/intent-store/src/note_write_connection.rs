@@ -18,16 +18,46 @@ impl NoteWriteConnection {
 
     /// Acquire the writer and open `BEGIN IMMEDIATE`. Only the acquire is
     /// retried: a write-pool acquire timeout happens before any statement, so
-    /// waiting it out (the shared busy-retry window) cannot double-apply a
-    /// mutation (intent-hq/intent#7070). Exhaustion still surfaces the
-    /// `PoolTimedOut` text, which callers classify as transient.
+    /// waiting it out cannot double-apply a mutation (intent-hq/intent#7070).
+    ///
+    /// The whole acquire phase, including backoff, has a hard budget of
+    /// twice the pool acquire timeout (20s in production). Every attempt is
+    /// bounded by the budget deadline, so no attempt can end later than the
+    /// deadline. That leaves room for the transaction and the response
+    /// within the 30s desktop/browser RPC default, so a caller that has
+    /// already timed out never sees the edit commit afterwards. When the
+    /// budget runs out, nothing has been applied, and the error is not
+    /// classified as transient, so an outer retry loop cannot stretch the
+    /// wait further.
     pub(crate) async fn begin_pool(pool: &crate::StorePool) -> Result<Self> {
-        let conn = crate::with_write_txn_retry(|| async {
-            pool.acquire()
-                .await
-                .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))
-        })
-        .await?;
+        let budget = pool.options().get_acquire_timeout().saturating_mul(2);
+        let deadline = tokio::time::Instant::now() + budget;
+        let conn = crate::with_busy_retry(
+            || async {
+                match tokio::time::timeout_at(deadline, pool.acquire()).await {
+                    Ok(acquired) => acquired
+                        .map_err(|e| Error::Internal(format!("acquire connection failed: {e}"))),
+                    // Report the cut-short final attempt as an ordinary pool
+                    // timeout; the loop sees the budget spent and stops.
+                    Err(_) => Err(Error::Internal(format!(
+                        "acquire connection failed: {}",
+                        sqlx::Error::PoolTimedOut
+                    ))),
+                }
+            },
+            budget,
+        )
+        .await
+        .map_err(|error| match error {
+            Error::Internal(msg) if crate::is_pool_timeout_message(&msg) => {
+                Error::Internal(format!(
+                    "acquire connection failed: note writer unavailable for {}ms \
+                     (write pool saturated); nothing was applied",
+                    budget.as_millis()
+                ))
+            }
+            other => other,
+        })?;
         let mut guard = Self(Some(conn));
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *guard)
