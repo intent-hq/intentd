@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Propose one reviewed, exact Codex ACP pin update; never merge it.
+"""Propose one exact Codex ACP pin update and arm it for the merge queue.
 
 Run from the intentd root with GH_TOKEN=RELEASE_PLZ_TOKEN, or --dry-run.
 Only git objects and the dedicated remote branch are written; the checkout,
-index, and local branches are untouched. Normal PR CI tests the proposed pin.
+index, and local branches are untouched. Normal PR CI tests the proposed pin;
+the PR is armed for squash auto-merge, never merged directly, so the merge
+queue lands it only after CI passes on the merged tree. `hold-release`
+disables auto-merge, and human edits disable the automation's own arming.
 """
 
 import argparse
@@ -103,18 +106,59 @@ def pr_metadata_hash(pr):
     ).hexdigest()
 
 
-def body(current, target):
+def _body(current, target, policy):
     return (
         "<!-- auto-pin-codex-acp: v1 -->\n"
         f"Update `{PACKAGE}` from `{current}` to `{target}` in "
         "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
         f"[Upstream release v{target}]"
         f"(https://github.com/agentclientprotocol/codex-acp/releases/tag/v{target}).\n\n"
+    ) + policy
+
+
+def body(current, target):
+    return _body(current, target, (
+        "This automation arms squash auto-merge: the merge queue lands the update "
+        "once normal PR CI passes, rerunning CI on the merged tree first.\n\n"
+        "Add `hold-release` to pause automated updates and disable auto-merge. "
+        "Human changes to the branch, title, or description also stop automatic "
+        "updates and disable the automation's auto-merge.\n"
+    ))
+
+
+def legacy_body(current, target):
+    """The generated description before auto-merge; still accepted as ours."""
+    return _body(current, target, (
         "Normal PR CI must pass, and a human must approve the merge. "
         "This automation never merges PRs.\n\n"
         "Add `hold-release` to pause automated updates. Human changes to the "
         "branch, title, or description also stop automatic updates.\n"
-    )
+    ))
+
+
+def arm_auto_merge(number, head):
+    """Queue the PR once CI passes; a failure is retried by the next daily run."""
+    try:
+        run("gh", "pr", "merge", str(number), "--repo", REPO, "--squash", "--auto",
+            "--match-head-commit", head)
+    except Refusal:
+        print(f"::warning::Could not arm auto-merge for #{number}; the next run retries.")
+        return
+    print(f"Armed squash auto-merge for #{number} at {head}.")
+
+
+def disable_auto_merge(pr, reason):
+    try:
+        run("gh", "pr", "merge", str(pr["number"]), "--repo", REPO, "--disable-auto")
+    except Refusal:
+        print(f"::warning::Could not disable auto-merge for #{pr['number']} ({reason}).")
+        return
+    print(f"Disabled auto-merge for #{pr['number']} ({reason}).")
+
+
+def armed_by(pr, login):
+    auto_merge = pr.get("auto_merge")
+    return bool(auto_merge) and (auto_merge.get("enabled_by") or {}).get("login") == login
 
 
 def fetch_main():
@@ -267,14 +311,24 @@ def main():
     viewer = decode_json(run("gh", "api", "user"))["login"]
     pr = find_pr()
     if pr and any(label["name"] == "hold-release" for label in pr["labels"]):
+        if pr.get("auto_merge"):
+            if args.dry_run:
+                print("dry-run: would disable auto-merge for the held rolling PR.")
+            else:
+                disable_auto_merge(pr, "hold-release")
         print("Rolling PR has hold-release; leaving it unchanged.")
         return
     head = branch_head()
     previous, proposed, recorded_metadata_hash = (
         inspect_branch(head, base) if head else (current, None, None)
     )
-    metadata_matches = pr is not None and (
+    metadata_current = pr is not None and (
         pr["title"] == title(proposed) and pr["body"] == body(previous, proposed)
+    )
+    # Descriptions generated before auto-merge are still ours; the edit path
+    # below rewrites them to the current text and then arms the PR.
+    metadata_matches = metadata_current or pr is not None and (
+        pr["title"] == title(proposed) and pr["body"] == legacy_body(previous, proposed)
     )
     # A push may have succeeded before gh pr edit failed. The new bot commit
     # records the exact generated metadata verified before that push. Accept
@@ -285,18 +339,28 @@ def main():
         or not (metadata_matches or recover_metadata)
         or pr["draft"]
     ):
+        # A human now owns the PR; never let the automation's arming merge it.
+        if armed_by(pr, viewer) and not args.dry_run:
+            disable_auto_merge(pr, "human edits")
         raise Refusal("Rolling PR has unexpected ownership or edits; preserving it.")
     if proposed and version(proposed) > version(target):
         print(f"Rolling branch already proposes newer version {proposed}; nothing to do.")
         return
-    if proposed == target and pr and metadata_matches:
+    if proposed == target and pr and metadata_current:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
+        if not pr.get("auto_merge"):
+            if args.dry_run:
+                print(f"dry-run: would arm auto-merge for #{pr['number']}.")
+            else:
+                arm_auto_merge(pr["number"], head)
         return
     if args.dry_run:
-        if proposed == target and recover_metadata:
-            print(f"dry-run: would repair PR metadata for {target}; no publication.")
+        if proposed == target and (recover_metadata or metadata_matches):
+            print(f"dry-run: would repair PR metadata for {target} and arm auto-merge; "
+                  "no publication.")
         else:
-            print(f"dry-run: would propose {current} -> {target} on {BRANCH}; no publication.")
+            print(f"dry-run: would propose {current} -> {target} on {BRANCH} and arm "
+                  "auto-merge; no publication.")
         return
 
     # Re-read metadata and the remote refs before creating or publishing a commit.
@@ -323,11 +387,21 @@ def main():
             run("gh", "pr", "edit", str(pr["number"]), "--repo", REPO,
                 "--title", title(target), "--body-file", str(description))
             print(f"Updated https://github.com/{REPO}/pull/{pr['number']} for {target}.")
+            number = pr["number"]
         else:
             url = run("gh", "pr", "create", "--repo", REPO, "--base", "main",
                       "--head", BRANCH, "--title", title(target),
                       "--body-file", str(description)).strip()
-            print(f"Opened {url} for {target}; human merge approval is required.")
+            print(f"Opened {url} for {target}.")
+            match = re.fullmatch(rf"https://github\.com/{REPO}/pull/([0-9]+)", url)
+            if not match:
+                print("::warning::Unexpected PR URL; the next run arms auto-merge.")
+                return
+            number = int(match.group(1))
+    # Arm with the exact verified head. A new push re-arms; an armed PR whose
+    # head did not move needs no write.
+    if commit != head or not (pr and pr.get("auto_merge")):
+        arm_auto_merge(number, commit)
 
 
 if __name__ == "__main__":

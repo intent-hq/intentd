@@ -1,6 +1,10 @@
 # RELEASE_PLZ_TOKEN already has contents + pull-requests write access (see
 # release-plz.yml). Its pushes/PRs trigger normal CI; GITHUB_TOKEN would not.
-# The rolling PR is reviewed and merged by humans, never by this workflow.
+# The script arms squash auto-merge on the rolling PR (pinned to the head it
+# verified), so the merge queue lands each stable update once CI passes; it
+# never merges directly or with admin rights. `hold-release` on the PR disables
+# auto-merge and pauses updates; human edits disable the automation's arming.
+# Repo-owned merge exemption: intent-hq/intent AGENTS.md (Conventions -> Merging).
 name: Auto-pin Codex ACP
 
 permissions: {}

@@ -101,7 +101,7 @@ elif tool == "gh":
                 "head": {"ref": "auto/codex-acp-pin", "sha": remote_head(),
                          "repo": {"full_name": "intent-hq/intentd"}},
                 "base": {"ref": "main", "repo": {"full_name": "intent-hq/intentd"}},
-                "user": {"login": "pin-bot"}, "labels": [],
+                "user": {"login": "pin-bot"}, "labels": [], "auto_merge": None,
             }
         else:
             assert args[2] == str(state["pr"]["number"])
@@ -109,7 +109,23 @@ elif tool == "gh":
         state["pr"]["body"] = pathlib.Path(flag("--body-file")).read_text()
         state["writes"].append(args[1])
         save()
-        print("https://github.com/intent-hq/intentd/pull/12")
+        print(state.get("pr_url", "https://github.com/intent-hq/intentd/pull/12"))
+    elif args[:2] == ["pr", "merge"]:
+        assert args[2] == str(state["pr"]["number"])
+        assert args[3:5] == ["--repo", "intent-hq/intentd"]
+        if args[5:] == ["--disable-auto"]:
+            if state.get("disarm_error"): fail()
+            state["pr"]["auto_merge"] = None
+            state["writes"].append("disarm")
+        else:
+            assert args[5:8] == ["--squash", "--auto", "--match-head-commit"], args
+            assert len(args) == 9 and args[8] == remote_head(), (args, remote_head())
+            if state.get("arm_error"): fail()
+            state["pr"]["auto_merge"] = {"enabled_by": {"login": "pin-bot"},
+                                         "merge_method": "squash"}
+            state["armed_heads"] = state.get("armed_heads", []) + [args[8]]
+            state["writes"].append("arm")
+        save()
     else:
         raise AssertionError("Unexpected gh operation: " + repr(args))
 else:
@@ -187,12 +203,17 @@ class PinAutomationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0 if ok else 1, output)
         for call in self.state["calls"]:
             if call[0] == "gh":
-                self.assertNotIn("merge", call)
-                self.assertNotIn("--auto", call)
+                self.assertNotIn("--admin", call)
+                if "merge" in call:
+                    self.assertEqual(call[1:3], ["pr", "merge"])
+                    self.assertTrue("--auto" in call or "--disable-auto" in call, call)
         return output
 
     def clear_calls(self):
         self.state.update(calls=[], writes=[], main_fetches=0, pr_lookups=0)
+
+    def assert_no_merge_calls(self):
+        self.assertFalse(any(call[:3] == ["gh", "pr", "merge"] for call in self.state["calls"]))
 
     def assert_no_publication(self):
         self.assertEqual(self.state["writes"], [])
@@ -219,7 +240,8 @@ class PinAutomationTests(unittest.TestCase):
         self.assertEqual(metadata["codex"]["package"]["dependencies"], self.state["manifest"]["dependencies"])
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.state["writes"], ["create"])
+        self.assertEqual(self.state["writes"], ["create", "arm"])
+        self.assertEqual(self.state["armed_heads"], [head])
         self.assertTrue(self.state["pr"]["title"].startswith("fix: "))
         self.assertIn("https://github.com/agentclientprotocol/codex-acp/releases/tag/v1.13.1",
                       self.state["pr"]["body"])
@@ -256,7 +278,8 @@ class PinAutomationTests(unittest.TestCase):
         self.state["manifest"]["version"] = "1.14.0"
         self.invoke()
         self.assertNotEqual(self.head(), old)
-        self.assertEqual(self.state["writes"], ["edit"])
+        self.assertEqual(self.state["writes"], ["edit", "arm"])
+        self.assertEqual(self.state["armed_heads"][-1], self.head())
         self.assertEqual(self.state["pr"]["number"], 12)
         self.assertIn("v1.14.0", self.state["pr"]["title"])
 
@@ -396,6 +419,9 @@ class PinAutomationTests(unittest.TestCase):
                 self.clear_calls()
                 self.state["pr"] = {**original, field: value}
                 self.invoke(ok=field == "labels")
+                self.assertEqual(self.state["writes"], ["disarm"])
+                self.assertIsNone(self.state["pr"]["auto_merge"])
+                self.state["writes"] = []
                 self.assert_no_publication()
 
     def test_closed_unmerged_pr_is_not_reopened(self):
@@ -417,7 +443,7 @@ class PinAutomationTests(unittest.TestCase):
             self.state.setdefault("extra_prs", []).append(other)
         self.clear_calls()
         self.invoke()
-        self.assertEqual(self.state["writes"], ["create"])
+        self.assertEqual(self.state["writes"], ["create", "arm"])
         self.assertEqual(self.state["pr"]["number"], 12)
         self.assertFalse(any("commit-tree" in call for call in self.state["calls"]))
 
@@ -450,7 +476,7 @@ class PinAutomationTests(unittest.TestCase):
         del self.state["pr_write_error"]
         self.invoke()
         self.assertEqual(self.head(), original)
-        self.assertEqual(self.state["writes"], ["create"])
+        self.assertEqual(self.state["writes"], ["create", "arm"])
         self.assertFalse(any("commit-tree" in call or call[:2] == ["git", "push"]
                              for call in self.state["calls"]))
 
@@ -511,6 +537,8 @@ class PinAutomationTests(unittest.TestCase):
                 self.invoke(ok=field == "labels")
                 self.assertEqual(self.head(), pushed_head)
                 self.assertEqual(self.state["pr"][field], value)
+                self.assertEqual(self.state["writes"], ["disarm"])
+                self.state["writes"] = []
                 self.assert_no_publication()
 
     def test_recovery_rejects_unrecorded_generated_older_metadata(self):
@@ -526,6 +554,8 @@ class PinAutomationTests(unittest.TestCase):
         self.state["pr"] = older_metadata
         self.clear_calls()
         self.invoke(ok=False)
+        self.assertEqual(self.state["writes"], ["disarm"])
+        self.state["writes"] = []
         self.assert_no_publication()
         # Positive control: only the immediately recorded generated state
         # remains eligible for automatic repair on this branch commit.
@@ -538,6 +568,163 @@ class PinAutomationTests(unittest.TestCase):
         self.invoke(ok=False)
         self.assertIsNone(self.head())
         self.assertEqual(self.state["writes"], [])
+
+    def legacy_body(self, current, target):
+        return (
+            "<!-- auto-pin-codex-acp: v1 -->\n"
+            f"Update `@agentclientprotocol/codex-acp` from `{current}` to `{target}` in "
+            "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
+            f"[Upstream release v{target}]"
+            f"(https://github.com/agentclientprotocol/codex-acp/releases/tag/v{target}).\n\n"
+            "Normal PR CI must pass, and a human must approve the merge. "
+            "This automation never merges PRs.\n\n"
+            "Add `hold-release` to pause automated updates. Human changes to the "
+            "branch, title, or description also stop automatic updates.\n"
+        )
+
+    def test_body_describes_auto_merge_and_hold(self):
+        self.invoke()
+        body = self.state["pr"]["body"]
+        self.assertIn("auto-merge", body)
+        self.assertIn("hold-release", body)
+        self.assertNotIn("never merges", body)
+        self.assertNotIn("human must approve", body)
+
+    def test_unarmed_current_pr_is_armed_without_publication(self):
+        self.invoke()
+        head = self.head()
+        self.state["pr"]["auto_merge"] = None
+        self.clear_calls()
+        self.assertIn("would arm auto-merge for #12", self.invoke("--dry-run"))
+        self.assert_no_merge_calls()
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["arm"])
+        self.assertEqual(self.state["armed_heads"][-1], head)
+        self.assertEqual(self.head(), head)
+        self.assertFalse(any(call[:2] == ["git", "push"] or "commit-tree" in call
+                             for call in self.state["calls"]))
+
+    def test_already_armed_pr_makes_no_merge_call(self):
+        self.invoke()
+        self.clear_calls()
+        self.invoke()
+        self.assert_no_merge_calls()
+        self.assert_no_publication()
+
+    def test_legacy_generated_description_is_rewritten_and_armed(self):
+        self.invoke()
+        head = self.head()
+        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
+        self.state["pr"]["auto_merge"] = None
+        self.clear_calls()
+        self.assertIn("would repair PR metadata", self.invoke("--dry-run"))
+        self.assert_no_publication()
+        self.assert_no_merge_calls()
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["edit", "arm"])
+        self.assertEqual(self.head(), head)
+        self.assertNotIn("never merges", self.state["pr"]["body"])
+        self.assertFalse(any(call[:2] == ["git", "push"] or "commit-tree" in call
+                             for call in self.state["calls"]))
+
+    def test_legacy_description_with_new_version_updates_and_arms(self):
+        self.invoke()
+        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
+        self.state["pr"]["auto_merge"] = None
+        self.clear_calls()
+        self.state["manifest"]["version"] = "1.14.0"
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["edit", "arm"])
+        self.assertEqual(self.state["armed_heads"][-1], self.head())
+        self.assertIn("v1.14.0", self.state["pr"]["title"])
+
+    def test_hold_release_on_unarmed_pr_makes_no_merge_call(self):
+        self.invoke()
+        self.state["pr"]["auto_merge"] = None
+        self.state["pr"]["labels"] = [{"name": "hold-release"}]
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.assertIn("hold-release", self.invoke())
+        self.assert_no_merge_calls()
+        self.assert_no_publication()
+
+    def test_hold_release_disarms_even_when_a_human_armed_it(self):
+        self.invoke()
+        self.state["pr"]["auto_merge"] = {"enabled_by": {"login": "a-human"}}
+        self.state["pr"]["labels"] = [{"name": "hold-release"}]
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.assertIn("would disable auto-merge", self.invoke("--dry-run"))
+        self.assert_no_merge_calls()
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["disarm"])
+
+    def test_human_edit_keeps_a_humans_own_arming(self):
+        self.invoke()
+        self.state["pr"]["title"] = "My proposal"
+        self.state["pr"]["auto_merge"] = {"enabled_by": {"login": "a-human"}}
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.invoke(ok=False)
+        self.assert_no_merge_calls()
+        self.assert_no_publication()
+
+    def test_human_edit_in_dry_run_does_not_disarm(self):
+        self.invoke()
+        self.state["pr"]["title"] = "My proposal"
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.invoke("--dry-run", ok=False)
+        self.assert_no_merge_calls()
+        self.assertIsNotNone(self.state["pr"]["auto_merge"])
+
+    def test_disarm_failure_still_refuses_and_preserves_the_pr(self):
+        self.invoke()
+        self.state["pr"]["title"] = "My proposal"
+        self.state["disarm_error"] = True
+        self.state["manifest"]["version"] = "1.14.0"
+        old = self.head()
+        self.clear_calls()
+        self.assertIn("Could not disable auto-merge", self.invoke(ok=False))
+        self.assertEqual(self.head(), old)
+        self.assert_no_publication()
+
+    def test_dry_run_reports_arming_without_merge_calls(self):
+        self.assertIn("and arm auto-merge", self.invoke("--dry-run"))
+        self.assert_no_merge_calls()
+
+    def test_arm_failure_warns_and_succeeds_then_next_run_arms(self):
+        self.state["arm_error"] = True
+        output = self.invoke()
+        self.assertIn("Could not arm auto-merge for #12", output)
+        self.assertEqual(self.state["writes"], ["create"])
+        self.assertIsNone(self.state["pr"]["auto_merge"])
+        head = self.head()
+        del self.state["arm_error"]
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["arm"])
+        self.assertEqual(self.state["armed_heads"][-1], head)
+
+    def test_unexpected_pr_url_skips_arming_until_next_run(self):
+        self.state["pr_url"] = "https://example.com/not-a-pr"
+        self.assertIn("Unexpected PR URL", self.invoke())
+        self.assertEqual(self.state["writes"], ["create"])
+        del self.state["pr_url"]
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["arm"])
+
+    def test_failed_push_or_pr_write_never_arms(self):
+        for flag in ("push_error", "pr_write_error"):
+            with self.subTest(flag=flag):
+                self.state[flag] = True
+                self.invoke(ok=False)
+                self.assert_no_merge_calls()
+                del self.state[flag]
 
     def test_checked_out_human_changes_and_index_are_untouched(self):
         self.pin_file.write_text("Uncommitted user work\n")
