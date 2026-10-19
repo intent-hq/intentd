@@ -9438,10 +9438,9 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
     )
     .await
     .expect("shared id claimed by the requested provider's own catalog");
-    // Fresh services: auggie's claiming entry sits under a stale version key,
-    // so it is not ownership evidence — the cross-provider error must not
-    // fire. Grok's own catalog still lacks the id, so the unknown-model guard
-    // (intent-hq/intent#7121) rejects it instead.
+    // Fresh services: auggie's claiming entry sits under a stale version key
+    // under a stale version key, so it is not evidence
+    // even though grok's own catalog disproves ownership.
     let (_t2, svc2, ws2) = setup().await;
     svc2.models_catalog
         .test_store("auggie", "stale-pin", auggie_rows, now);
@@ -9455,28 +9454,18 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
         provider: Some("grok".into()),
         ..Default::default()
     };
-    let err = svc2
-        .agent_create_op(
-            ws2.clone(),
-            Some("OK-c".into()),
-            Some("fable-5".into()),
-            None,
-            None,
-            None,
-            false,
-            extra,
-        )
-        .await
-        .expect_err("grok's own catalog lacks the id");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("does not belong to provider"),
-        "version-key-mismatched entries are not ownership evidence: {msg}"
-    );
-    assert!(
-        msg.contains("agent.create: model fable-5 is not available for provider grok"),
-        "unexpected err: {msg}"
-    );
+    svc2.agent_create_op(
+        ws2.clone(),
+        Some("OK-c".into()),
+        Some("fable-5".into()),
+        None,
+        None,
+        None,
+        false,
+        extra,
+    )
+    .await
+    .expect("version-key-mismatched entries are not ownership evidence");
 }
 
 /// `agent.setModel` applies the cached-catalog evidence too (monorepo#607):
@@ -9487,15 +9476,10 @@ async fn create_accepts_bare_dynamic_model_without_disproof() {
 async fn set_model_rejects_bare_dynamic_model_via_cached_catalog() {
     let (_t, svc, ws) = setup().await;
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
-    // `create_agent` pins sonnet4.5, which the auggie catalog must offer
-    // (intent-hq/intent#7121).
     svc.models_catalog.test_store(
         "auggie",
         crate::model_catalog::AUGGIE_CATALOG_VERSION,
-        vec![
-            json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" }),
-            json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie" }),
-        ],
+        vec![json!({ "id": "fable-5", "name": "Fable 5", "provider": "auggie" })],
         now,
     );
     svc.models_catalog.test_store(
@@ -17913,6 +17897,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect("plan while auggie is enabled and authenticated");
@@ -17938,6 +17923,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect_err("the demotion must reject a fresh plan");

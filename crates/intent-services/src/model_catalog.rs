@@ -409,6 +409,14 @@ pub(crate) struct ModelCatalogCache {
     refresh_permits: tokio::sync::Semaphore,
 }
 
+/// One cached catalog row as a provider picker option: bare `id`, display
+/// `name` (falls back to the id) and `description` (may be empty).
+pub(crate) struct CachedModelRow {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
 /// A probe-free catalog view using a snapshot of the effective provider settings.
 pub(crate) struct ModelCatalogReader<'a> {
     cache: &'a ModelCatalogCache,
@@ -627,15 +635,15 @@ impl ModelCatalogReader<'_> {
             .collect()
     }
 
-    /// The cached catalog row ids for a provider reference
-    /// (intent-hq/intent#7121): `Some(ids)` when the reference holds a
+    /// The cached catalog rows for a provider reference
+    /// (intent-hq/intent#7121): `Some(rows)` when the reference holds a
     /// non-empty last-good entry under its **current** version key, `None`
     /// otherwise (no evidence). A bare id normalizes legacy default aliases
     /// like [`Self::cached_catalog_claims`]. A named profile (`<base>@<id>`)
     /// reads only its own cache slot, versioned by its observed installed
     /// identity — never the base's Default catalog, whose model set may
     /// differ. Synchronous, read-only and probe-free.
-    pub(crate) fn cached_catalog_ids(&self, provider_ref: &str) -> Option<Vec<String>> {
+    pub(crate) fn cached_catalog_rows(&self, provider_ref: &str) -> Option<Vec<CachedModelRow>> {
         let profile = provider_ref.contains(crate::provider_profiles::REF_SEPARATOR);
         let slot = if profile {
             provider_ref
@@ -660,18 +668,26 @@ impl ModelCatalogReader<'_> {
         if entry.version_key != version_key {
             return None;
         }
-        let ids: Vec<String> = entry
+        let text =
+            |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+        let rows: Vec<CachedModelRow> = entry
             .models
             .iter()
-            .filter_map(|row| row.get("id").and_then(Value::as_str))
-            .map(|id| {
-                id.split_once(':')
+            .filter_map(|row| {
+                let id = text(row, "id")?;
+                let id = id
+                    .split_once(':')
                     .filter(|(prefix, _)| *prefix == base)
-                    .map_or(id, |(_, bare)| bare)
-                    .to_string()
+                    .map_or(id.as_str(), |(_, bare)| bare)
+                    .to_string();
+                Some(CachedModelRow {
+                    name: text(row, "name").unwrap_or_else(|| id.clone()),
+                    description: text(row, "description").unwrap_or_default(),
+                    id,
+                })
             })
             .collect();
-        (!ids.is_empty()).then_some(ids)
+        (!rows.is_empty()).then_some(rows)
     }
 }
 

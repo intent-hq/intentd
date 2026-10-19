@@ -200,6 +200,7 @@ mod line_attribution;
 mod linear_ops;
 mod member_removal;
 mod model_catalog;
+mod model_preference;
 mod nested_repos;
 mod note_annotation;
 mod note_merge;
@@ -21428,6 +21429,7 @@ impl WorkspaceApi for Services {
                                     false,
                                     extra,
                                     spec_wp,
+                                    crate::agent_ops::CreateModelSource::Caller,
                                 )
                                 .await?;
                             Some((plan, prompt, image_blocks))
