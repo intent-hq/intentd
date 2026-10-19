@@ -6,8 +6,11 @@
 # auto-merge and pauses updates; human edits disable the automation's arming.
 # The stand-down job applies both at once (on the PR event) rather than at the
 # next daily run, so an armed PR cannot merge after someone holds or edits it.
+# Each adapter has its own rolling branch and PR (auto/codex-acp-pin,
+# auto/claude-agent-acp-pin); the matrix never lets one adapter block another.
+# pi-acp is deliberately manual: PI_CLI_MIN_VERSION needs a human re-check.
 # Repo-owned merge exemption: intent-hq/intent AGENTS.md (Conventions -> Merging).
-name: Auto-pin Codex ACP
+name: Auto-pin ACP adapters
 
 permissions: {}
 
@@ -23,17 +26,23 @@ on:
         description: 'Report the proposed update without pushing or changing a PR'
         type: boolean
         default: false
+      adapter:
+        description: 'Limit the run to one adapter'
+        type: choice
+        options: [all, codex, claude-code]
+        default: all
 
 concurrency:
-  group: auto-pin-codex-acp-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'pin' }}
+  group: auto-pin-acp-adapters-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'pin' }}
   cancel-in-progress: false
 
 jobs:
   runner-route:
-    # PR events only matter for the rolling PR; skip routing for every other PR.
+    # PR events only matter for the rolling PRs; skip routing for every other PR.
     if: >-
       github.event_name != 'pull_request'
       || github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+      || github.event.pull_request.head.ref == 'auto/claude-agent-acp-pin'
     uses: ./.github/workflows/runner-route.yml
     permissions:
       contents: read
@@ -50,6 +59,13 @@ jobs:
     if: >-
       github.event_name != 'pull_request'
       && github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
+    strategy:
+      # One adapter's refusal (for example a changed engines.node) must not
+      # cancel or hide another adapter's update.
+      fail-fast: false
+      matrix:
+        adapter: [codex, claude-code]
+    name: pin (${{ matrix.adapter }})
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -58,11 +74,16 @@ jobs:
         id: token
         env:
           RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          ADAPTER: ${{ matrix.adapter }}
+          SELECTED: ${{ inputs.adapter || 'all' }}
         run: |
-          if [ -n "$RELEASE_PLZ_TOKEN" ]; then
+          if [ "$SELECTED" != all ] && [ "$SELECTED" != "$ADAPTER" ]; then
+            echo "Skipping $ADAPTER; this run is limited to $SELECTED."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$RELEASE_PLZ_TOKEN" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::RELEASE_PLZ_TOKEN is not set; skipping Codex ACP pin publication."
+            echo "::warning::RELEASE_PLZ_TOKEN is not set; skipping $ADAPTER pin publication."
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -74,17 +95,18 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Propose the stable Codex ACP pin
+      - name: Propose the stable ${{ matrix.adapter }} adapter pin
         if: steps.token.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run || false }}
+          ADAPTER: ${{ matrix.adapter }}
         run: |
           args=()
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
-          python3 -S scripts/auto-pin-codex-acp.py "${args[@]}"
+          python3 -S scripts/auto-pin-acp-adapter.py --adapter "$ADAPTER" "${args[@]}"
 
-  # Disable auto-merge as soon as the rolling PR is held (hold-release label)
+  # Disable auto-merge as soon as a rolling PR is held (hold-release label)
   # or changed by anyone other than the PR's bot author. The PR's own script is
   # never run here, and no publication token is used.
   stand-down:
@@ -92,7 +114,8 @@ jobs:
     if: >-
       github.event_name == 'pull_request'
       && github.repository == 'intent-hq/intentd'
-      && github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+      && (github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+          || github.event.pull_request.head.ref == 'auto/claude-agent-acp-pin')
       && github.event.pull_request.head.repo.full_name == github.repository
       && github.event.pull_request.auto_merge != null
       && ((github.event.action == 'labeled' && github.event.label.name == 'hold-release')
@@ -104,7 +127,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Disable auto-merge on the rolling Codex ACP PR
+      - name: Disable auto-merge on the rolling ACP adapter PR
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}

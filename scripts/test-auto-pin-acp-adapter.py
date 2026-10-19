@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Offline functional tests: python3 -S scripts/test-auto-pin-codex-acp.py.
+"""Offline functional tests: python3 -S scripts/test-auto-pin-acp-adapter.py.
 
 Execute the real CLI with mocked curl/gh and real temporary git repositories.
 The git shim only injects races/failures; it forwards operations to real git.
 No credentials, network, Rust builds, or changes to the checked-out pin.
+The full suite runs for Codex; a representative subset plus Claude-only
+guards (engines.node, macro pin, branch isolation) runs for claude-code.
 Use -S to exclude host-installed site hooks (for example test telemetry).
 """
 
@@ -18,17 +20,25 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = ROOT / "scripts/auto-pin-codex-acp.py"
+SCRIPT = ROOT / "scripts/auto-pin-acp-adapter.py"
+WORKFLOW = ROOT / ".github/workflows/auto-pin-acp-adapters.yml"
 CONFIG = "crates/intent-providers/src/config.rs"
 METADATA = "crates/intent-providers/data/adapter-cli-packages.json"
-BRANCH = "auto/codex-acp-pin"
-REF = f"refs/heads/{BRANCH}"
 REPO = "intent-hq/intentd"
 ORIGIN = f"https://github.com/{REPO}.git"
 REAL_GIT = shutil.which("git")
+# Mirrors the real config.rs shapes: the Claude pin is a macro literal.
 FIXTURE = '''// Keep all surrounding text and other provider pins unchanged.
-pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = "claude-acp@0.8.1";
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@VERSION";
+macro_rules! claude_agent_acp_version {
+    () => {
+        "<claude-version>"
+    };
+}
+pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
+    "@agentclientprotocol/claude-agent-acp@",
+    claude_agent_acp_version!()
+);
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@<codex-version>";
 pub const PI_ACP_NPX_PACKAGE: &str = "pi-acp@0.0.33";
 '''
 
@@ -46,7 +56,7 @@ def save():
 def real_git(*argv):
     return subprocess.check_output([os.environ["REAL_GIT"], *argv], text=True).strip()
 def remote_head():
-    return real_git("--git-dir", state["remote"], "rev-parse", "refs/heads/auto/codex-acp-pin")
+    return real_git("--git-dir", state["remote"], "rev-parse", "refs/heads/" + state["branch"])
 def fail():
     save()
     print("mock operation failed", file=sys.stderr)
@@ -54,7 +64,7 @@ def fail():
 save()
 if tool == "curl":
     assert args == ["--fail", "--silent", "--show-error", "--location", "--max-time", "60",
-                    "--retry", "2", "https://registry.npmjs.org/@agentclientprotocol%2fcodex-acp/latest"]
+                    "--retry", "2", state["registry"]], args
     if state.get("registry_error"): fail()
     print(state.get("registry_raw", json.dumps(state["manifest"])))
 elif tool == "git":
@@ -64,12 +74,12 @@ elif tool == "git":
         if state["main_fetches"] == 2 and state.get("live_main"):
             real_git("--git-dir", state["remote"], "update-ref", "refs/heads/main", state["live_main"])
             if state.get("delete_branch_on_merge"):
-                real_git("--git-dir", state["remote"], "update-ref", "-d", "refs/heads/auto/codex-acp-pin")
+                real_git("--git-dir", state["remote"], "update-ref", "-d", "refs/heads/" + state["branch"])
     if args[:1] == ["ls-remote"] and state.get("branch_lookup_error"): fail()
     if args[:1] == ["push"]:
         if state.get("push_error"): fail()
         if state.get("concurrent_head"):
-            real_git("--git-dir", state["remote"], "update-ref", "refs/heads/auto/codex-acp-pin", state["concurrent_head"])
+            real_git("--git-dir", state["remote"], "update-ref", "refs/heads/" + state["branch"], state["concurrent_head"])
     save()
     os.execv(os.environ["REAL_GIT"], [os.environ["REAL_GIT"], *args])
 elif tool == "gh":
@@ -77,7 +87,7 @@ elif tool == "gh":
         if state.get("identity_error"): fail()
         print(json.dumps({"login": "pin-bot"}))
     elif args[:4] == ["api", "--method", "GET", "repos/intent-hq/intentd/pulls"]:
-        assert args[4:] == ["-f", "state=all", "-f", "head=intent-hq:auto/codex-acp-pin",
+        assert args[4:] == ["-f", "state=all", "-f", "head=intent-hq:" + state["branch"],
                            "-f", "base=main", "-f", "per_page=100", "--paginate", "--slurp"]
         state["pr_lookups"] += 1
         if state.get("pr_lookup_error") == state["pr_lookups"]: fail()
@@ -95,10 +105,10 @@ elif tool == "gh":
         if state.get("pr_write_error"): fail()
         if args[1] == "create":
             assert state.get("pr") is None
-            assert flag("--base") == "main" and flag("--head") == "auto/codex-acp-pin"
+            assert flag("--base") == "main" and flag("--head") == state["branch"]
             state["pr"] = {
                 "number": 12, "state": "open", "merged_at": None, "draft": False,
-                "head": {"ref": "auto/codex-acp-pin", "sha": remote_head(),
+                "head": {"ref": state["branch"], "sha": remote_head(),
                          "repo": {"full_name": "intent-hq/intentd"}},
                 "base": {"ref": "main", "repo": {"full_name": "intent-hq/intentd"}},
                 "user": {"login": "pin-bot"}, "labels": [], "auto_merge": None,
@@ -137,8 +147,35 @@ else:
 
 
 class PinAutomationTests(unittest.TestCase):
+    """The full rule suite, run against Codex (the original managed adapter)."""
+
+    ADAPTER = "codex"
+    META_KEY = "codex"
+    PACKAGE = "@agentclientprotocol/codex-acp"
+    BRANCH = "auto/codex-acp-pin"
+    REGISTRY = "https://registry.npmjs.org/@agentclientprotocol%2fcodex-acp/latest"
+    RELEASES = "https://github.com/agentclientprotocol/codex-acp/releases/tag/"
+    PIN_TOKEN = "CODEX_ACP_NPX_PACKAGE"
+    CLI_DEPENDENCY = "@openai/codex"
+    MANIFEST_EXTRA = {}
+    # None runs every test; a subclass may name the subset it repeats.
+    ONLY = None
+
+    @property
+    def REF(self):
+        return f"refs/heads/{self.BRANCH}"
+
+    def fixture(self, version):
+        other = {"codex": "2.2.2", "claude-code": "0.8.1"}
+        text = FIXTURE.replace("<codex-version>",
+                               version if self.ADAPTER == "codex" else other["codex"])
+        return text.replace("<claude-version>",
+                            version if self.ADAPTER == "claude-code" else other["claude-code"])
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="test-codex-pin-")
+        if self.ONLY is not None and self._testMethodName not in self.ONLY:
+            self.skipTest(f"covered by the Codex suite; not repeated for {self.ADAPTER}")
+        self.temp = tempfile.TemporaryDirectory(prefix="test-acp-pin-")
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         self.remote = self.directory / "remote.git"
@@ -169,10 +206,14 @@ class PinAutomationTests(unittest.TestCase):
         self.git("config", f"url.{self.remote}.insteadOf", ORIGIN)
         self.pin_file = self.repo / CONFIG
         self.pin_file.parent.mkdir(parents=True)
-        self.pin_file.write_text(FIXTURE.replace("VERSION", "1.9.0"))
+        self.pin_file.write_text(self.fixture("1.9.0"))
         metadata_path = self.repo / METADATA
         metadata_path.parent.mkdir(parents=True)
-        metadata_path.write_text(json.dumps({"codex": {"cliPackage":"@openai/codex", "cliCommand":"codex", "pinConstant":"CODEX_ACP_NPX_PACKAGE", "package":{"name":"@agentclientprotocol/codex-acp", "version":"1.9.0"}}}))
+        self.metadata = {
+            "codex": {"cliPackage":"@openai/codex", "cliCommand":"codex", "pinConstant":"CODEX_ACP_NPX_PACKAGE", "package":{"name":"@agentclientprotocol/codex-acp", "version":"1.9.0" if self.ADAPTER == "codex" else "2.2.2"}},
+            "claude-code": {"cliPackage":"@anthropic-ai/claude-code", "cliCommand":"claude", "pinConstant":"CLAUDE_AGENT_ACP_NPX_PACKAGE", "package":{"name":"@agentclientprotocol/claude-agent-acp", "version":"1.9.0" if self.ADAPTER == "claude-code" else "0.8.1"}},
+        }
+        metadata_path.write_text(json.dumps(self.metadata))
         (self.repo / "other.txt").write_text("Unrelated content\n")
         self.git("add", ".")
         self.git("commit", "-qm", "chore: fixture")
@@ -184,7 +225,10 @@ class PinAutomationTests(unittest.TestCase):
             executable.chmod(0o755)
         self.env["PATH"] = f"{self.bin}:{os.environ['PATH']}"
         self.state = {
-            "manifest": {"name": "@agentclientprotocol/codex-acp", "version": "1.13.1", "dependencies":{"@openai/codex":"^0.159.1"}},
+            "manifest": {"name": self.PACKAGE, "version": "1.13.1",
+                         "dependencies": {self.CLI_DEPENDENCY: "^0.159.1"},
+                         **json.loads(json.dumps(self.MANIFEST_EXTRA))},
+            "branch": self.BRANCH, "registry": self.REGISTRY,
             "remote": str(self.remote), "calls": [], "writes": [],
             "main_fetches": 0, "pr_lookups": 0, "pr": None,
         }
@@ -194,12 +238,13 @@ class PinAutomationTests(unittest.TestCase):
                                        env=self.env, text=True, stderr=subprocess.PIPE).strip()
 
     def head(self):
-        refs = self.git("ls-remote", "--heads", "origin", REF)
+        refs = self.git("ls-remote", "--heads", "origin", self.REF)
         return refs.split()[0] if refs else None
 
     def invoke(self, *args, ok=True):
         self.state_path.write_text(json.dumps(self.state))
-        result = subprocess.run([sys.executable, "-S", str(SCRIPT), *args], cwd=self.repo,
+        result = subprocess.run([sys.executable, "-S", str(SCRIPT), "--adapter", self.ADAPTER,
+                                 *args], cwd=self.repo,
                                 env=self.env, text=True, capture_output=True, timeout=30)
         self.state = json.loads(self.state_path.read_text())
         output = result.stdout + result.stderr
@@ -225,7 +270,7 @@ class PinAutomationTests(unittest.TestCase):
                              for call in self.state["calls"]))
 
     def main_commit(self, version, other="Unrelated content\n"):
-        self.pin_file.write_text(FIXTURE.replace("VERSION", version))
+        self.pin_file.write_text(self.fixture(version))
         (self.repo / "other.txt").write_text(other)
         self.git("add", ".")
         self.git("commit", "-qm", "fix: another main change")
@@ -237,19 +282,22 @@ class PinAutomationTests(unittest.TestCase):
         self.invoke()
         head = self.head()
         self.assertEqual(self.git("show", f"{head}:{CONFIG}"),
-                         FIXTURE.replace("VERSION", "1.13.1").strip())
+                         self.fixture("1.13.1").strip())
         self.assertEqual(self.git("diff", "--name-only", self.base, head), "\n".join(sorted([CONFIG, METADATA])))
         metadata = json.loads(self.git("show", f"{head}:{METADATA}"))
-        self.assertEqual(metadata["codex"]["package"]["version"], self.state["manifest"]["version"])
-        self.assertEqual(metadata["codex"]["package"]["dependencies"], self.state["manifest"]["dependencies"])
+        self.assertEqual(metadata[self.META_KEY]["package"]["version"], self.state["manifest"]["version"])
+        self.assertEqual(metadata[self.META_KEY]["package"]["dependencies"], self.state["manifest"]["dependencies"])
+        for key, entry in self.metadata.items():
+            if key != self.META_KEY:
+                self.assertEqual(metadata[key], entry)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertEqual(self.state["writes"], ["create", "arm"])
         self.assertEqual(self.state["armed_heads"], [head])
         self.assertTrue(self.state["pr"]["title"].startswith("fix: "))
-        self.assertIn("https://github.com/agentclientprotocol/codex-acp/releases/tag/v1.13.1",
+        self.assertIn(self.RELEASES + "v1.13.1",
                       self.state["pr"]["body"])
-        self.assertIn(f"--force-with-lease={REF}:", next(
+        self.assertIn(f"--force-with-lease={self.REF}:", next(
             call for call in self.state["calls"] if call[:2] == ["git", "push"]))
 
     def test_numeric_version_ordering(self):
@@ -290,10 +338,10 @@ class PinAutomationTests(unittest.TestCase):
     def test_next_pin_refreshes_declared_cli_requirement_automatically(self):
         self.invoke()
         self.state["manifest"]["version"] = "1.14.0"
-        self.state["manifest"]["dependencies"]["@openai/codex"] = "^0.160.0"
+        self.state["manifest"]["dependencies"][self.CLI_DEPENDENCY] = "^0.160.0"
         self.invoke()
         metadata = json.loads(self.git("show", f"{self.head()}:{METADATA}"))
-        self.assertEqual(metadata["codex"]["package"]["dependencies"]["@openai/codex"], "^0.160.0")
+        self.assertEqual(metadata[self.META_KEY]["package"]["dependencies"][self.CLI_DEPENDENCY], "^0.160.0")
 
     def test_repeat_run_does_not_create_commits_push_or_edit_pr(self):
         self.invoke()
@@ -355,9 +403,9 @@ class PinAutomationTests(unittest.TestCase):
         self.assert_no_publication()
 
     def test_invalid_or_duplicate_pin_is_rejected(self):
-        for text in (FIXTURE.replace("VERSION", "latest"),
-                     FIXTURE.replace("CODEX_ACP_NPX_PACKAGE", "REMOVED_PIN"),
-                     FIXTURE.replace("VERSION", "1.9.0") * 2):
+        for text in (self.fixture("latest"),
+                     self.fixture("1.9.0").replace(self.PIN_TOKEN, "REMOVED_PIN"),
+                     self.fixture("1.9.0") * 2):
             with self.subTest(text=text):
                 self.pin_file.write_text(text)
                 self.git("add", CONFIG)
@@ -406,7 +454,7 @@ class PinAutomationTests(unittest.TestCase):
         (self.repo / "other.txt").write_text("Human change\n")
         self.git("add", "other.txt")
         self.git("commit", "-qm", "fix: human work")
-        self.git("push", "-q", "origin", f"HEAD:{REF}")
+        self.git("push", "-q", "origin", f"HEAD:{self.REF}")
         human_head = self.head()
         self.clear_calls()
         self.state["manifest"]["version"] = "1.14.0"
@@ -473,7 +521,7 @@ class PinAutomationTests(unittest.TestCase):
         self.assertEqual(self.head(), self.state["concurrent_head"])
         self.assertEqual(self.state["writes"], [])
         push = next(call for call in self.state["calls"] if call[:2] == ["git", "push"])
-        self.assertIn(f"--force-with-lease={REF}:{original}", push)
+        self.assertIn(f"--force-with-lease={self.REF}:{original}", push)
 
     def test_pr_creation_failure_can_recover_without_another_commit(self):
         self.state["pr_write_error"] = True
@@ -757,7 +805,7 @@ class PinAutomationTests(unittest.TestCase):
         self.git("checkout", "-q", "--detach", self.head())
         (self.repo / "other.txt").write_text("Human change\n")
         self.git("commit", "-qam", "fix: human work")
-        self.git("push", "-q", "origin", f"HEAD:{REF}")
+        self.git("push", "-q", "origin", f"HEAD:{self.REF}")
         self.clear_calls()
         self.assertIn("would disable auto-merge for #12 (human branch changes)",
                       self.invoke("--dry-run", ok=False))
@@ -771,21 +819,6 @@ class PinAutomationTests(unittest.TestCase):
         self.assertIn("would disable auto-merge for #12 (human edits)",
                       self.invoke("--dry-run", ok=False))
 
-    def test_workflow_stands_down_on_hold_or_foreign_change_without_secrets(self):
-        text = (ROOT / ".github/workflows/auto-pin-codex-acp.yml").read_text()
-        self.assertIn("types: [labeled, synchronize, edited]", text)
-        job = text.split("\n  stand-down:\n", 1)[1]
-        for needle in ("github.event.pull_request.head.ref == 'auto/codex-acp-pin'",
-                       "github.event.pull_request.head.repo.full_name == github.repository",
-                       "github.event.label.name == 'hold-release'",
-                       "github.actor != github.event.pull_request.user.login",
-                       "GH_TOKEN: ${{ github.token }}", "--disable-auto"):
-            self.assertIn(needle, job)
-        self.assertNotIn("secrets.", job)
-        self.assertNotIn("scripts/", job)
-        pin = text.split("\n  pin:\n", 1)[1].split("\n  stand-down:\n", 1)[0]
-        self.assertIn("github.event_name != 'pull_request'", pin)
-
     def test_checked_out_human_changes_and_index_are_untouched(self):
         self.pin_file.write_text("Uncommitted user work\n")
         (self.repo / "other.txt").write_text("Staged user work\n")
@@ -795,6 +828,168 @@ class PinAutomationTests(unittest.TestCase):
         self.assertEqual(self.pin_file.read_text(), "Uncommitted user work\n")
         self.assertEqual(self.git("status", "--porcelain"), status)
         self.assertEqual(self.git("show", ":other.txt"), "Staged user work")
+
+
+    def test_codex_generated_text_is_byte_identical_to_the_original_automation(self):
+        # Open rolling PRs and commits from before the generalization must
+        # still verify as the automation's own; any drift would disarm them.
+        if self.ADAPTER != "codex":
+            self.skipTest("Codex-only compatibility golden")
+        self.invoke()
+        head = self.head()
+        self.assertEqual(self.state["pr"]["title"], "fix: bump Codex ACP fallback to v1.13.1")
+        self.assertTrue(self.state["pr"]["body"].startswith(
+            "<!-- auto-pin-codex-acp: v1 -->\n"
+            "Update `@agentclientprotocol/codex-acp` from `1.9.0` to `1.13.1` in "
+            "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
+            "[Upstream release v1.13.1]"
+            "(https://github.com/agentclientprotocol/codex-acp/releases/tag/v1.13.1).\n\n"
+            "This automation arms squash auto-merge"))
+        message = self.git("show", "-s", "--format=%B", head).splitlines()
+        self.assertEqual(message[:4], ["fix: bump Codex ACP fallback to v1.13.1", "",
+                                       "Managed Codex ACP pin: 1.9.0 -> 1.13.1.",
+                                       "Auto-pin-Codex-ACP: v1"])
+        self.assertEqual(self.git("show", "-s", "--format=%an <%ae>", head),
+                         "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>")
+
+
+class ClaudeAgentAcpPinTests(PinAutomationTests):
+    """claude-code: the same rules on its own branch, plus its extra guards."""
+
+    ADAPTER = "claude-code"
+    META_KEY = "claude-code"
+    PACKAGE = "@agentclientprotocol/claude-agent-acp"
+    BRANCH = "auto/claude-agent-acp-pin"
+    REGISTRY = "https://registry.npmjs.org/@agentclientprotocol%2fclaude-agent-acp/latest"
+    RELEASES = "https://github.com/agentclientprotocol/claude-agent-acp/releases/tag/"
+    PIN_TOKEN = "claude_agent_acp_version"
+    CLI_DEPENDENCY = "@anthropic-ai/claude-agent-sdk"
+    MANIFEST_EXTRA = {"engines": {"node": ">=22"}}
+    # The shared rules are adapter-independent code; repeat the ones that
+    # exercise adapter-specific values (pin, metadata key, branch, PR text).
+    ONLY = {
+        "test_stable_upgrade_changes_only_pin_and_adapter_metadata",
+        "test_numeric_version_ordering",
+        "test_equal_older_and_numeric_older_versions_are_noops",
+        "test_existing_pr_updates_on_the_same_branch",
+        "test_next_pin_refreshes_declared_cli_requirement_automatically",
+        "test_repeat_run_does_not_create_commits_push_or_edit_pr",
+        "test_existing_newer_proposal_is_never_downgraded",
+        "test_wrong_package_is_rejected",
+        "test_invalid_or_duplicate_pin_is_rejected",
+        "test_human_branch_commit_is_preserved",
+        "test_human_pr_metadata_and_hold_label_are_preserved",
+        "test_failed_existing_pr_edit_recovers_without_commit_or_push",
+        "test_body_describes_auto_merge_and_hold",
+        "test_npm_latest_not_newer_than_main_disarms_open_pr",
+        "test_checked_out_human_changes_and_index_are_untouched",
+        "test_claude_generated_text_names_its_own_adapter",
+        "test_engines_node_change_refuses_before_lookup_or_publication",
+        "test_engines_node_change_leaves_the_open_proposal_unchanged",
+        "test_codex_rolling_pr_is_never_touched",
+    }
+
+    def test_claude_generated_text_names_its_own_adapter(self):
+        self.invoke()
+        head = self.head()
+        self.assertEqual(self.state["pr"]["title"], "fix: bump claude-agent-acp pin to v1.13.1")
+        body = self.state["pr"]["body"]
+        self.assertTrue(body.startswith("<!-- auto-pin-claude-agent-acp: v1 -->\n"), body)
+        self.assertIn("`@agentclientprotocol/claude-agent-acp` from `1.9.0` to `1.13.1`", body)
+        self.assertIn("`claude_agent_acp_version!`", body)
+        self.assertNotIn("codex", body.lower())
+        message = self.git("show", "-s", "--format=%B", head).splitlines()
+        self.assertEqual(message[:4], ["fix: bump claude-agent-acp pin to v1.13.1", "",
+                                       "Managed claude-agent-acp pin: 1.9.0 -> 1.13.1.",
+                                       "Auto-pin-Claude-Agent-ACP: v1"])
+        # Only the macro literal changes; the concat! spec follows from it.
+        diff = self.git("diff", "-U0", self.base, head, "--", CONFIG)
+        self.assertEqual([line for line in diff.splitlines()
+                          if line[:1] in "+-" and line[:3] not in ("+++", "---")],
+                         ['-        "1.9.0"', '+        "1.13.1"'])
+
+    def test_engines_node_change_refuses_before_lookup_or_publication(self):
+        for engines in ({"node": ">=24"}, {"node": ">=22.5"}, {}, None, "node >=22"):
+            for args in ((), ("--dry-run",)):
+                with self.subTest(engines=engines, args=args):
+                    self.clear_calls()
+                    if engines is None:
+                        self.state["manifest"].pop("engines", None)
+                    else:
+                        self.state["manifest"]["engines"] = engines
+                    self.assertIn("engines.node", self.invoke(*args, ok=False))
+                    self.assert_no_publication()
+                    self.assertFalse(any(call[0] == "gh" for call in self.state["calls"]))
+                    self.assertIsNone(self.head())
+
+    def test_engines_node_change_leaves_the_open_proposal_unchanged(self):
+        self.invoke()
+        head = self.head()
+        self.clear_calls()
+        self.state["manifest"].update(version="1.14.0", engines={"node": ">=24"})
+        self.invoke(ok=False)
+        self.assertEqual(self.head(), head)
+        self.assertIn("v1.13.1", self.state["pr"]["title"])
+        self.assert_no_publication()
+        self.assert_no_merge_calls()
+
+    def test_codex_rolling_pr_is_never_touched(self):
+        codex = {
+            "number": 7, "state": "open", "merged_at": None, "draft": False,
+            "title": "fix: bump Codex ACP fallback to v9.9.9", "body": "codex",
+            "head": {"ref": "auto/codex-acp-pin", "sha": "0" * 40,
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+            "user": {"login": "pin-bot"}, "labels": [{"name": "hold-release"}],
+            "auto_merge": {"enabled_by": {"login": "pin-bot"}},
+        }
+        self.state["extra_prs"] = [codex]
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["create", "arm"])
+        self.assertEqual(self.state["pr"]["number"], 12)
+        self.assertEqual(self.state["extra_prs"], [codex])
+        self.assertIsNone(self.git("ls-remote", "--heads", "origin",
+                                   "refs/heads/auto/codex-acp-pin") or None)
+        for call in self.state["calls"]:
+            self.assertNotIn("auto/codex-acp-pin", " ".join(call))
+
+
+class CliAndWorkflowTests(unittest.TestCase):
+    def test_adapter_is_required_and_restricted(self):
+        for args in ([], ["--adapter", "pi"], ["--adapter", "unknown"]):
+            with self.subTest(args=args):
+                result = subprocess.run([sys.executable, "-S", str(SCRIPT), "--dry-run", *args],
+                                        text=True, capture_output=True, timeout=30,
+                                        env={**os.environ, "PATH": "/nonexistent"})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--adapter", result.stderr)
+
+    def test_workflow_pins_each_adapter_from_trusted_main(self):
+        text = WORKFLOW.read_text()
+        self.assertFalse((ROOT / ".github/workflows/auto-pin-codex-acp.yml").exists())
+        pin = text.split("\n  pin:\n", 1)[1].split("\n  stand-down:\n", 1)[0]
+        for needle in ("github.event_name != 'pull_request'",
+                       "github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'",
+                       "fail-fast: false", "adapter: [codex, claude-code]",
+                       "ref: main", "secrets.RELEASE_PLZ_TOKEN",
+                       'scripts/auto-pin-acp-adapter.py --adapter "$ADAPTER"'):
+            self.assertIn(needle, pin)
+
+    def test_workflow_stands_down_on_hold_or_foreign_change_without_secrets(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("types: [labeled, synchronize, edited]", text)
+        route = text.split("\n  runner-route:\n", 1)[1].split("\n  pin:\n", 1)[0]
+        job = text.split("\n  stand-down:\n", 1)[1]
+        for branch in ("auto/codex-acp-pin", "auto/claude-agent-acp-pin"):
+            self.assertIn(f"github.event.pull_request.head.ref == '{branch}'", route)
+            self.assertIn(f"github.event.pull_request.head.ref == '{branch}'", job)
+        for needle in ("github.event.pull_request.head.repo.full_name == github.repository",
+                       "github.event.label.name == 'hold-release'",
+                       "github.actor != github.event.pull_request.user.login",
+                       "GH_TOKEN: ${{ github.token }}", "--disable-auto"):
+            self.assertIn(needle, job)
+        self.assertNotIn("secrets.", job)
+        self.assertNotIn("scripts/", job)
 
 
 if __name__ == "__main__":
