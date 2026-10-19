@@ -506,7 +506,10 @@ class PinAutomationTests(unittest.TestCase):
         self.git("remote", "set-url", "origin", ORIGIN)
         self.git("config", f"url.{self.remote}.insteadOf", ORIGIN)
         self.clear_calls()
-        self.assertIn("would repair PR metadata", self.invoke("--dry-run"))
+        self.assertIsNotNone(self.state["pr"]["auto_merge"])
+        output = self.invoke("--dry-run")
+        self.assertIn("would repair PR metadata for 1.14.0; no publication", output)
+        self.assertNotIn("arm auto-merge", output)
         self.assert_no_publication()
         self.clear_calls()
         self.invoke(ok=False)
@@ -577,19 +580,6 @@ class PinAutomationTests(unittest.TestCase):
         self.assertIsNone(self.head())
         self.assertEqual(self.state["writes"], [])
 
-    def legacy_body(self, current, target):
-        return (
-            "<!-- auto-pin-codex-acp: v1 -->\n"
-            f"Update `@agentclientprotocol/codex-acp` from `{current}` to `{target}` in "
-            "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
-            f"[Upstream release v{target}]"
-            f"(https://github.com/agentclientprotocol/codex-acp/releases/tag/v{target}).\n\n"
-            "Normal PR CI must pass, and a human must approve the merge. "
-            "This automation never merges PRs.\n\n"
-            "Add `hold-release` to pause automated updates. Human changes to the "
-            "branch, title, or description also stop automatic updates.\n"
-        )
-
     def test_body_describes_auto_merge_and_hold(self):
         self.invoke()
         body = self.state["pr"]["body"]
@@ -620,33 +610,21 @@ class PinAutomationTests(unittest.TestCase):
         self.assert_no_merge_calls()
         self.assert_no_publication()
 
-    def test_legacy_generated_description_is_rewritten_and_armed(self):
+    def test_pre_auto_merge_description_is_treated_as_a_human_edit(self):
         self.invoke()
+        armed = json.loads(json.dumps(self.state["pr"]))
         head = self.head()
-        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
-        self.state["pr"]["auto_merge"] = None
-        self.clear_calls()
-        self.assertIn("would repair PR metadata", self.invoke("--dry-run"))
-        self.assert_no_publication()
-        self.assert_no_merge_calls()
-        self.clear_calls()
-        self.invoke()
-        self.assertEqual(self.state["writes"], ["edit", "arm"])
-        self.assertEqual(self.head(), head)
-        self.assertNotIn("never merges", self.state["pr"]["body"])
-        self.assertFalse(any(call[:2] == ["git", "push"] or "commit-tree" in call
-                             for call in self.state["calls"]))
-
-    def test_legacy_description_with_new_version_updates_and_arms(self):
-        self.invoke()
-        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
-        self.state["pr"]["auto_merge"] = None
-        self.clear_calls()
-        self.state["manifest"]["version"] = "1.14.0"
-        self.invoke()
-        self.assertEqual(self.state["writes"], ["edit", "arm"])
-        self.assertEqual(self.state["armed_heads"][-1], self.head())
-        self.assertIn("v1.14.0", self.state["pr"]["title"])
+        old_policy = ("Normal PR CI must pass, and a human must approve the merge. "
+                      "This automation never merges PRs.\n\n")
+        old_body = armed["body"].split("This automation arms", 1)[0] + old_policy
+        for target in ("1.13.1", "1.14.0"):
+            with self.subTest(target=target):
+                self.state["pr"] = {**armed, "body": old_body}
+                self.state["manifest"]["version"] = target
+                self.clear_calls()
+                self.assertIn("unexpected ownership or edits", self.invoke(ok=False))
+                self.assertEqual(self.state["writes"], ["disarm"])
+                self.assertEqual(self.head(), head)
 
     def test_hold_release_on_unarmed_pr_makes_no_merge_call(self):
         self.invoke()
@@ -792,14 +770,6 @@ class PinAutomationTests(unittest.TestCase):
         self.clear_calls()
         self.assertIn("would disable auto-merge for #12 (human edits)",
                       self.invoke("--dry-run", ok=False))
-
-    def test_dry_run_repair_of_armed_pr_does_not_claim_arming(self):
-        self.invoke()
-        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
-        self.clear_calls()
-        output = self.invoke("--dry-run")
-        self.assertIn("would repair PR metadata for 1.13.1; no publication", output)
-        self.assertNotIn("arm auto-merge", output)
 
     def test_workflow_stands_down_on_hold_or_foreign_change_without_secrets(self):
         text = (ROOT / ".github/workflows/auto-pin-codex-acp.yml").read_text()

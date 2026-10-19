@@ -107,34 +107,19 @@ def pr_metadata_hash(pr):
     ).hexdigest()
 
 
-def _body(current, target, policy):
+def body(current, target):
     return (
         "<!-- auto-pin-codex-acp: v1 -->\n"
         f"Update `{PACKAGE}` from `{current}` to `{target}` in "
         "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
         f"[Upstream release v{target}]"
         f"(https://github.com/agentclientprotocol/codex-acp/releases/tag/v{target}).\n\n"
-    ) + policy
-
-
-def body(current, target):
-    return _body(current, target, (
         "This automation arms squash auto-merge: the merge queue lands the update "
         "once normal PR CI passes, rerunning CI on the merged tree first.\n\n"
         "Add `hold-release` to pause automated updates and disable auto-merge. "
         "Human changes to the branch, title, or description also stop automatic "
         "updates and disable the automation's auto-merge.\n"
-    ))
-
-
-def legacy_body(current, target):
-    """The generated description before auto-merge; still accepted as ours."""
-    return _body(current, target, (
-        "Normal PR CI must pass, and a human must approve the merge. "
-        "This automation never merges PRs.\n\n"
-        "Add `hold-release` to pause automated updates. Human changes to the "
-        "branch, title, or description also stop automatic updates.\n"
-    ))
+    )
 
 
 ARM_ATTEMPTS = 3
@@ -352,14 +337,8 @@ def main():
         if pr and armed_by(pr, viewer):
             disable_auto_merge(pr, "human branch changes", args.dry_run)
         raise
-    metadata_current = pr is not None and (
+    metadata_matches = pr is not None and (
         pr["title"] == title(proposed) and pr["body"] == body(previous, proposed)
-    )
-    # Descriptions generated before auto-merge are still ours (intentd#2382);
-    # the edit path rewrites them to the current text, then arms the PR. Drop
-    # legacy_body once no open rolling PR carries the old text.
-    metadata_matches = pr is not None and pr["title"] == title(proposed) and (
-        pr["body"] in (body(previous, proposed), legacy_body(previous, proposed))
     )
     # A push may have succeeded before gh pr edit failed. The new bot commit
     # records the exact generated metadata verified before that push. Accept
@@ -381,7 +360,7 @@ def main():
             disable_auto_merge(pr, f"npm latest {target} is older than {proposed}",
                                args.dry_run)
         return
-    if proposed == target and pr and metadata_current:
+    if proposed == target and pr and metadata_matches:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
         if not pr.get("auto_merge"):
             if args.dry_run:
@@ -391,7 +370,7 @@ def main():
         return
     if args.dry_run:
         arming = "" if pr and pr.get("auto_merge") else " and arm auto-merge"
-        if proposed == target and (recover_metadata or metadata_matches):
+        if proposed == target and recover_metadata:
             print(f"dry-run: would repair PR metadata for {target}{arming}; no publication.")
         else:
             print(f"dry-run: would propose {current} -> {target} on {BRANCH} and arm "
