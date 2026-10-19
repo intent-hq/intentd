@@ -48,6 +48,7 @@ jobs:
         self.assertIn("    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && matrix.runner || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}\n  host:", result)
         self.assertIn("  host:\n    needs: [runner-route]\n    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}", result)
         self.assertEqual(result, routing.configure(result))
+        self.assertTrue(result.startswith('name: Release\njobs:\n'), result)
         checked_in = (ROOT / '.github/workflows/v-release.yml').read_text()
         self.assertIn("contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')", checked_in)
 

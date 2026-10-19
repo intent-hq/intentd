@@ -12,10 +12,11 @@ ROUTE = '''  runner-route:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
 
 '''
-# cargo-dist's per-target build job runs sudo on Linux (apt configuration and
+# cargo-dist's per-target build job (v-release.yml build-local-artifacts and
+# its release-cache.yml copy, daemon) runs sudo on Linux (apt configuration and
 # cross-build packages), which the unprivileged intent-cache runner containers
 # lack, so its Linux legs keep their hosted label.
-HOSTED_LINUX_JOBS = {'build-local-artifacts'}
+HOSTED_LINUX_JOBS = {'build-local-artifacts', 'daemon'}
 
 
 def hosted_linux(key):
@@ -46,8 +47,8 @@ def configure(text):
             key = "'" + runner + "'"
             fallback = "fromJSON('[\"" + runner + "\"]')"
         job = re.match(r'  ([\w-]+):', block)
-        prefix = hosted_linux(key) if job and job[1] in HOSTED_LINUX_JOBS and runner.startswith('${{') else ''
-        routed = "${{ " + prefix + "fromJSON(needs.runner-route.outputs.runners || '{}')[" + key + "] || " + fallback + " }}"
+        hosted = hosted_linux(key) if job and job[1] in HOSTED_LINUX_JOBS and runner.startswith('${{') else ''
+        routed = "${{ " + hosted + "fromJSON(needs.runner-route.outputs.runners || '{}')[" + key + "] || " + fallback + " }}"
         block = block[:match.start(1)] + routed + block[match.end(1):]
         needs = re.search(r'^    needs: (\[[^\n]+\]|[\w-]+)$', block, re.M)
         if needs:
