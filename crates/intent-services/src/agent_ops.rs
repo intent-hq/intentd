@@ -12278,9 +12278,9 @@ impl Services {
     /// grouped or ungrouped — on the caller, i.e. the target is itself
     /// waiting on the caller to settle. Accepting the registration would arm
     /// an A⇄B pair where each side's settlement is deferred by the other's
-    /// watch; the settlement-time `mutual_idle` break in
+    /// watch; the settlement-time idle-cycle break in
     /// [`Services::classify_agent_waiting`] eventually declassifies such a
-    /// deadlocked 2-cycle, but only once both sides sit idle — refusing to
+    /// deadlocked all-idle cycle, but only once both sides sit idle — refusing to
     /// create the pair up front is strictly better. "Live" means
     /// non-`report_delivered` ([`Services::waiting_watches_for_parent`]): a
     /// `report_delivered` reverse watch has already delivered its
@@ -12291,11 +12291,12 @@ impl Services {
     /// rehydration) pair the watch with a message/wake that settles one side
     /// or must keep rehydrating persisted pairs, and stay covered by the
     /// settlement-time backstop. Direct pair check only — deeper cycles
-    /// (A→B→C→A) are intentionally not detected here. Best-effort under
+    /// (A→B→C→A) are intentionally not detected here; the settlement-time
+    /// idle-cycle backstop declassifies them too. Best-effort under
     /// concurrency (TOCTOU): two agents racing explicit registrations on
     /// each other can both pass this check before either watch lands and
     /// still form the mutual pair — that race is covered by the same
-    /// settlement-time `mutual_idle` backstop.
+    /// settlement-time idle-cycle backstop.
     fn check_no_reverse_watch(
         &self,
         caller_agent_id: &AgentId,
