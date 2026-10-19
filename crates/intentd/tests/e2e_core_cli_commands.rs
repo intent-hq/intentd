@@ -1446,6 +1446,7 @@ async fn serve_survives_closed_stderr_pipe_during_skill_scan() {
             tokio::time::Instant::now() < deadline,
             "daemon never logged the skill collision warning and became ready\n--- daemon log ---\n{log}"
         );
+        // timing-guard: poll interval of a loop bounded by observable log/readiness events.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
