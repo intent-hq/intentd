@@ -71,7 +71,18 @@ impl Api {
                         break;
                     }
                     buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&buf[..end])
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
                         break;
                     }
                 }
@@ -93,16 +104,45 @@ impl Api {
                     .unwrap_or(30);
                 let body = {
                     let items = records.lock().unwrap();
-                    if request.starts_with("POST ") {
+                    if url.path() == "/graphql" {
+                        // `pullRequests(headRefName:)` matches every head owner.
+                        let payload: serde_json::Value = request
+                            .split_once("\r\n\r\n")
+                            .and_then(|(_, body)| serde_json::from_str(body).ok())
+                            .unwrap_or_default();
+                        let head = &payload["variables"]["head"];
+                        let nodes: Vec<_> = items
+                            .iter()
+                            .filter(|p| p["state"] == "open" && p["head"]["ref"] == *head)
+                            .map(|p| {
+                                json!({"number":p["number"],"url":p["html_url"],
+                                    "title":p["title"],"state":"OPEN","isDraft":false,
+                                    "headRefName":p["head"]["ref"],"headRefOid":p["head"]["sha"],
+                                    "baseRefName":p["base"]["ref"],"author":{"login":"a"},
+                                    "createdAt":p["created_at"],"updatedAt":p["updated_at"]})
+                            })
+                            .collect();
+                        json!({"data":{"repository":{"pullRequests":{
+                            "pageInfo":{"hasNextPage":false},"nodes":nodes}}}})
+                    } else if request.starts_with("POST ") {
                         items.last().cloned().unwrap()
                     } else if url.path().ends_with("/pulls") {
                         let filtered: Vec<_> = items
                             .iter()
                             .filter(|p| p["state"] == "open")
                             .filter(|p| {
-                                query
-                                    .get("head")
-                                    .is_none_or(|head| p["head"]["ref"] == *head)
+                                // GitHub filters on `owner:branch`; the bare
+                                // form is kept for the unscoped legacy path.
+                                query.get("head").is_none_or(|head| {
+                                    let owner =
+                                        p["head"]["repo"]["owner"]["login"].as_str().unwrap_or("o");
+                                    let branch = match head.split_once(':') {
+                                        Some((o, branch)) if o == owner => branch,
+                                        Some(_) => return false,
+                                        None => head,
+                                    };
+                                    p["head"]["ref"] == *branch
+                                })
                             })
                             .cloned()
                             .collect();
@@ -207,6 +247,16 @@ impl Api {
                 .unwrap(),
         )
     }
+}
+
+fn graphql_discovery(traffic: &Traffic) -> u64 {
+    traffic
+        .snapshot()
+        .counts
+        .iter()
+        .filter(|((_, o), _)| *o == Operation::Discovery)
+        .map(|(_, v)| v.graphql_requests)
+        .sum()
 }
 
 fn counts(traffic: &Traffic) -> (u64, u64, u64) {
@@ -377,7 +427,8 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
         (0, 0, None, 1, true),
         (100, 0, None, 2, true),
         (101, 2, None, 2, false),
-        (1001, 0, None, 10, false),
+        // Oversized: ten capped pages, then one head query (#7187).
+        (1001, 0, None, 10, true),
         (3, 0, Some("1"), 1, false),
         (3, 0, Some("bad"), 1, false),
         (100, 0, Some("2"), 2, false),
@@ -406,6 +457,7 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
         })
         .await;
         assert_eq!(counts(&traffic), (expected_pages, 0, 0));
+        assert_eq!(graphql_discovery(&traffic), u64::from(size > 1000));
         assert!(api
             .requests
             .lock()
@@ -413,6 +465,98 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
             .iter()
             .all(|p| !p.contains("head=")));
     }
+}
+
+/// intent-hq/intent#7187: a repository with more than 1,000 open PRs
+/// cannot be listed within the page cap. Discovery must still find the
+/// workspace PR, including one opened from a contributor's fork, with one
+/// head query, and must not re-list the whole repository every window.
+#[tokio::test]
+async fn shared_discovery_oversized_repository_uses_head_query() {
+    let mut data: Vec<_> = (1..=1200).map(|n| pull(n, "other")).collect();
+    data.push(pull(1300, "feature"));
+    let mut fork = pull(1301, "fork-feature");
+    fork["head"]["repo"] = json!({"owner":{"login":"contributor"}});
+    data.push(fork);
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let found = svc
+            .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+            .await
+            .expect("an oversized repository is not a discovery failure");
+        assert_eq!(found.map(|pr| pr.number), Some(1300));
+        let fork = svc
+            .discover_shared_pr(sc.as_ref(), &repo, "fork-feature", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fork.map(|pr| pr.number),
+            Some(1301),
+            "fork heads still match"
+        );
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        // Ten capped listing pages once, then one head query per branch.
+        assert_eq!(counts(&traffic), (10, 2, 0));
+        assert_eq!(graphql_discovery(&traffic), 3);
+        for _ in 0..5 {
+            svc.pr_discovery.expire();
+            assert_eq!(
+                svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                    .await
+                    .unwrap()
+                    .map(|pr| pr.number),
+                Some(1300)
+            );
+        }
+        // Later windows re-read only the head, never the full list.
+        assert_eq!(counts(&traffic), (10, 7, 0));
+        assert_eq!(graphql_discovery(&traffic), 8);
+    })
+    .await;
+    assert!(api
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| !p.contains("head=")));
+}
+
+/// A head query that observes a PR open supersedes an older cached record of
+/// it, as the repository-wide listing does (intent-hq/intent#7187).
+#[tokio::test]
+async fn shared_discovery_oversized_head_query_supersedes_older_record() {
+    let mut data: Vec<_> = (1..=1001).map(|n| pull(n, "other")).collect();
+    let mut reopened = pull(1300, "feature");
+    reopened["state"] = json!("closed");
+    data.push(reopened);
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    assert!(svc
+        .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+        .await
+        .unwrap()
+        .is_none());
+    let closed = svc
+        .shared_pr_record(sc.as_ref(), &repo, 1300)
+        .await
+        .unwrap();
+    assert_eq!(closed.state, PrState::Closed);
+    api.pulls.lock().unwrap().last_mut().unwrap()["state"] = json!("open");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|pr| pr.number), Some(1300));
 }
 
 #[tokio::test]
