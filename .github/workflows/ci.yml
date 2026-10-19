@@ -1699,6 +1699,8 @@ jobs:
           python3 -B scripts/test-hosted-runners.py
           python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
+      - name: Test the local release-scripts runner (make test-release-scripts)
+        run: python3 -I -B scripts/test-release-scripts-local.py
       - name: Test optional Intel cargo-dist publication
         shell: bash
         run: |
