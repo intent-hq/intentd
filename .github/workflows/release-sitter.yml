@@ -107,7 +107,7 @@ jobs:
           # under Rosetta 2. Linux musl targets build on the org-hosted
           # gh-linux-16x runner (cross-built with cargo-zigbuild as before)
           # so the release path never queues behind — or deadlocks on — the
-          # self-hosted tinybox fleet.
+          # self-hosted Linux fleet.
           # Windows uses the org-hosted gh-windows-16x runner (16-core/64GB,
           # Windows Server 2022 image) for faster release builds
           # (intent-hq/monorepo#1803).
@@ -123,7 +123,9 @@ jobs:
             zigbuild: true
           - target: x86_64-pc-windows-msvc
             os: gh-windows-16x
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    # Linux legs stay on the hosted label: they run sudo (apt configuration,
+    # cross-build packages), which the intent-cache runner containers lack.
+    runs-on: ${{ (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'linux')) && matrix.os || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 30
     env:
       TARGET: ${{ matrix.target }}

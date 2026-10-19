@@ -13,7 +13,7 @@ on:
   # Every job reachable from pull_request carries a same-repo guard
   # (head.repo.full_name == github.repository) — directly or via the needs
   # chain — so fork PRs consume zero runner time and can never reach the
-  # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
+  # self-hosted runners; close-fork-prs.yml auto-closes them. Same-repo PRs
   # are completely unaffected.
   pull_request:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
@@ -28,18 +28,18 @@ permissions:
   pull-requests: read
 
 env:
-  # Burst the Linux jobs to GitHub-hosted larger runners when more than
-  # this many Linux jobs are queued/running ahead of this run (see the
-  # route job). tinybox runs 8 concurrent runner slots, so the threshold
-  # tolerates one queued/running job per slot before bursting. Note that
-  # jobs still blocked on `needs` are invisible to the jobs API, so only
-  # check/coverage jobs already released to tinybox (queued or running
-  # there) count toward the depth. Bursted jobs don't carry the
-  # self-hosted+Linux labels and stop counting toward the depth, so the
-  # system naturally falls back to tinybox as it frees up.
-  LINUX_BURST_THRESHOLD: 8
+  # Number of intent-cache Linux runner slots: the route job bursts Linux
+  # jobs to GitHub-hosted runners once this many intent-cache jobs are queued or running
+  # ahead of this run. Raise it when slots are added. Jobs still blocked on
+  # `needs` are invisible to the jobs API, so only jobs already released to
+  # the slots count. Bursted jobs don't carry the intent-cache label and
+  # stop counting, so routing returns to the slots as they free up.
+  LINUX_BURST_THRESHOLD: 2
+  # Same for the fast pool (intent-cache-small, one core per slot), which
+  # serves the jobs that ask for a standard ubuntu-* label.
+  LINUX_SMALL_BURST_THRESHOLD: 6
 
-# The heavy jobs share the tinybox's 8 self-hosted runner slots, so cancel
+# The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue (push-to-main
 # runs are never cancelled).
 concurrency:
@@ -72,6 +72,7 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+          SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
@@ -81,7 +82,10 @@ jobs:
             // No checkout: routing never executes code from a pull request.
             // Org runners with these labels must be in groups shared with all three CI repos.
             const fleets = {
-              linux: ['self-hosted', 'Linux', 'X64'],
+              // Heavy jobs (compile Rust or run over ~5 minutes): 8 cores / 48 GB per slot.
+              linux: ['self-hosted', 'linux', 'x64', 'intent-cache'],
+              // Fast jobs: 1 core / 3 GB per slot.
+              small: ['self-hosted', 'linux', 'x64', 'intent-cache-small'],
               arm: ['self-hosted', 'Linux', 'ARM64'],
               windows: ['self-hosted', 'Windows', 'X64'],
               macos: ['self-hosted', 'macOS', 'ARM64'],
@@ -89,6 +93,7 @@ jobs:
             };
             const disabled = {
               linux: process.env.LINUX_RUNNER_DISABLED === 'true',
+              small: process.env.LINUX_RUNNER_DISABLED === 'true',
               arm: process.env.LINUX_RUNNER_DISABLED === 'true',
               windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
               macos: process.env.MACOS_RUNNER_DISABLED === 'true',
@@ -108,7 +113,7 @@ jobs:
                 runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForRepo, {...context.repo, per_page: 100});
               }
               const online = Object.fromEntries(Object.entries(fleets).map(([key, labels]) => [key,
-                runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => ['macos', 'intel'].includes(key) ? x.name?.toLowerCase() === l.toLowerCase() : x.name === l))),
+                runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => x.name?.toLowerCase() === l.toLowerCase()))),
               ]));
               const jobs = [];
               // A missing sibling view is unknown demand, not zero demand. Fail open to GitHub-hosted runners.
@@ -125,16 +130,16 @@ jobs:
                   }
                 }
               }
-              const threshold = Number(process.env.THRESHOLD || '8');
-              if (!Number.isInteger(threshold) || threshold < 0) throw new Error('invalid queue threshold');
+              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), small: Number(process.env.SMALL_THRESHOLD || '6')};
+              if (Object.values(thresholds).some(n => !Number.isInteger(n) || n < 0)) throw new Error('invalid queue threshold');
               for (const [key, labels] of Object.entries(fleets)) {
-                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).includes(l)));
+                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase())));
                 const stale = demand.some(j => j.status === 'queued' && (!Number.isFinite(Date.parse(j.created_at)) || Date.parse(j.created_at) < Date.now() - 15 * 60 * 1000));
-                const native = key !== 'linux';
+                const native = !(key in thresholds);
                 const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
-                const limit = native ? capacity - 1 : Math.min(threshold, capacity);
+                const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
-                burst[key] = disabled[key] || capacity === 0 || stale || depth > limit;
+                burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
                 reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}`;
               }
             } catch (error) {
@@ -143,7 +148,9 @@ jobs:
             // Keys are the GitHub-hosted fallback labels jobs ask for; values are
             // the self-hosted fleet labels, or the key itself when the fleet bursts.
             const hosted = {
-              linux: ['ubuntu-22.04', 'ubuntu-24.04', 'gh-linux-8x', 'gh-linux-16x'],
+              // Larger runners carry the heavy jobs; standard runners the fast ones.
+              linux: ['gh-linux-8x', 'gh-linux-16x'],
+              small: ['ubuntu-22.04', 'ubuntu-24.04'],
               arm: ['ubuntu-24.04-arm', 'gh-linux-arm64-8x'],
               windows: ['windows-2022', 'windows-2025', 'gh-windows-16x'],
               macos: ['macos-26-xlarge'],
@@ -163,8 +170,9 @@ jobs:
       # The heavy Rust jobs (check, coverage-*, daemon-lifecycle) are the only
       # readers of linux_labels / check_labels / linux_burst. In the merge
       # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
-      # each needing 30+ GiB, and the 8 tinybox slots share one /raid volume,
-      # which hit ENOSPC mid-run (runs 39131949771, 39134737536). PR and push
+      # sized for 16 CPUs, and the route decision is made before any of them
+      # is queued, so all would land on the two 8-CPU intent-cache slots and
+      # run one after another past the queue's time budget. PR and push
       # runs, and the light jobs routed through `runners`, keep the probe's
       # choice. This override stays out of the probe script above, which is
       # kept identical to runner-route.yml across intent, intentd and
@@ -201,8 +209,8 @@ jobs:
         with:
           python-version: '3.11'
       - run: python3 -m pip install 'PyYAML==6.0.3'
-      # The routing test executes the probe under node. GitHub images ship it;
-      # the self-hosted tinybox runners do not.
+      # The routing test executes the probe under node; install it explicitly
+      # rather than relying on the runner image.
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -255,76 +263,10 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 10
-          JOB_TARGET_SUBDIR: check
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Candidate selection for both tiers lives in
-          # scripts/ci-target-slot.sh purge-candidates (path allowlist,
-          # own-dir / own-slot skip, `.in-use` marker, recursive activity
-          # check; oldest top-level mtime first — intent-hq/intent#5256);
-          # this loop only deletes until the need is met. The producer runs
-          # ahead of this loop, so a candidate it buffered may have been
-          # marked by a job that started while earlier dirs were being
-          # deleted: is-purgeable repeats the marker + activity check
-          # immediately before each rm. `|| true` on rm tolerates another
-          # slot's preflight racing us to the same candidate, and the
-          # process substitution keeps a producer cut short by `break` from
-          # failing the step.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              # `if`, not `[ ] && break`: a function returns its loop's last
-              # status, and a final unmet check would abort the step here.
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          # Stale tier: nothing inside touched within 2 days (-mmin gives a
-          # strict 48 h window; -mtime rounds to whole days).
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          # Escalation tier: under heavy churn everything on the volume can
-          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
-          # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # until this job's need is met. Ordering key: the dir's own
-          # top-level mtime, matching the emergency purge — not
-          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
-          # touches the top level after creation, so this approximates
-          # creation order and a recently-used-but-idle dir can be evicted
-          # before a colder one; acceptable here, since every candidate is
-          # an idle warm cache and the ordering stays cheap for a per-job
-          # step. Concurrent preflights on other slots are safe: target
-          # dirs are warm caches (eviction costs a rebuild, not
-          # correctness), a live job's dir is shielded by its `.in-use`
-          # marker and, failing that, the recursive 15-minute activity
-          # check, and the own-slot skip covers every dir this slot may use.
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # openssl-sys needs the OpenSSL headers; ubuntu-24.04 images preinstall
-      # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
-      # relies on the runner user's passwordless sudo. Co-tenant jobs on the
-      # shared runner race for the apt locks (monorepo#1515):
+      # openssl-sys needs the OpenSSL headers. GitHub-hosted and intent-cache images
+      # ship libssl-dev, so this is normally a no-op; the install path needs
+      # passwordless sudo, which intent-cache slots do not have. Concurrent
+      # jobs can race for the apt locks (monorepo#1515):
       # DPkg::Lock::Timeout makes `install` wait for the dpkg locks, and the
       # retry loop covers `update`, whose lists lock has no wait option
       # (Debian bug #1069167).
@@ -338,32 +280,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Keep the target dir OUTSIDE the runner work dir: checkout's default
-      # clean (git clean -ffdx) wipes ignored files — including target/ — at
-      # the start of every job, and all jobs on this runner share one work
-      # dir. A per-job CARGO_TARGET_DIR on /raid survives both, which is
-      # what makes builds warm across runs (and why swatinem/rust-cache was
-      # dropped: GH cache save/restore would be pure overhead on top of it).
-      # The path is also keyed on $RUNNER_NAME: the 8 tinybox runner slots
-      # share the box, and without the key concurrent jobs would serialize
-      # on cargo's target-dir lock (and the coverage jobs would clobber each
-      # other — see their comments). The dirs live on the 300G /raid volume,
-      # off the (much smaller) root volume that holds $HOME — the root
-      # volume reached box-level ENOSPC when they lived there (monorepo#1253).
-      # Trade-off: up to 8 per-slot copies of each job's target dir;
-      # tinybox-prune.yml prunes /raid/ci-target on a schedule and the
-      # preflight above is the emergency backstop.
-      # Also marks the dir in use (scripts/ci-target-slot.sh mark;
-      # intent-hq/intent#5256): every cleaner — the preflight above on other
-      # slots, tinybox-prune.yml — skips a dir with a fresh `.in-use`
-      # marker, so a quiet compile phase can no longer make a live dir look
-      # idle. Released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/check"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -382,8 +298,8 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
-      # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
-      # tinybox slots rust-lld has failed to open objects rustc had just
+      # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
+      # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
       # 35200715354 — red in 6 s, queue entry ejected). The wrapper retries
       # exactly once, only on the `rust-lld: error: cannot open ... No such
@@ -415,19 +331,7 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
 
-      # Per-slot HOME for install-action — see the coverage-e2e job's comment
-      # for the full rationale (shared ~/.install-action tmp/bin race across
-      # the 8 tinybox slots; monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-shear
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       # Blocking unused-dependency gate: fails when any crate declares a
       # dependency its code never uses. --deny-warnings promotes warnings
       # (e.g. unused optional dependencies) to errors so they cannot land
@@ -465,23 +369,24 @@ jobs:
       # which let the suite "pass" in ~0.014s without running a single block
       # (intent-hq/monorepo#4054). Provision pwsh 7.x here so the tests
       # actually execute. GitHub-hosted Ubuntu runners (the burst labels)
-      # preinstall pwsh, so this is a no-op there; on tinybox the pinned
-      # tarball is unpacked once into a per-slot dir (keyed on $RUNNER_NAME
-      # like the other per-slot dirs, ~180 MiB, reused across runs — per-slot
-      # so concurrent first-time installs on the 8 shared slots cannot
-      # clobber each other's downloads, the monorepo#1239 failure mode).
+      # preinstall pwsh, so this is a no-op there; elsewhere the pinned
+      # tarball is unpacked into a per-runner dir (keyed on $RUNNER_NAME,
+      # ~180 MiB, reused when the runner's home persists — per-runner so
+      # concurrent first-time installs on a shared home cannot clobber each
+      # other's downloads, the monorepo#1239 failure mode).
       # The cache probe runs the binary, so an executable-but-broken cache
       # self-heals by reinstalling, and the whole slot dir is wiped before a
       # (re)install so a version bump never strands old $version dirs.
       #
       # `pwsh --version` proves only that the binary runs; it never brings up
-      # a runspace. On 2026-09-18 every check run on tinybox went red with 14
+      # a runspace. On 2026-09-18 every check run on a shared self-hosted
+      # Linux host went red with 14
       # opaque driver failures (intent-hq/intent#5367, run 35346259015)
       # because pwsh died with `Stack overflow.` during startup: the
       # multicore-JIT profile it replays on every start
       # (~/.cache/powershell/StartupProfileData-NonInteractive, rewritten
-      # non-atomically at every exit) had been corrupted, and the tinybox
-      # slots share one $HOME, so every slot read the same broken file. Two
+      # non-atomically at every exit) had been corrupted, and the host's
+      # runner slots shared one $HOME, so every slot read the same file. Two
       # guards below: this step and the guard-test step point XDG_CACHE_HOME
       # at a job-private dir under $RUNNER_TEMP (harmless on burst runners),
       # so CI's own pwsh never reads or writes the shared home cache — the
@@ -550,16 +455,6 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
-      # Release the `.in-use` marker the CARGO_TARGET_DIR step wrote
-      # (intent-hq/intent#5256). `always()` so a failed or cancelled job
-      # does not leave a live marker behind; a runner that dies mid-job
-      # leaves one that expires on its own after 4 h (see
-      # scripts/ci-target-slot.sh). Skipped on burst runners, where
-      # CARGO_TARGET_DIR is never set.
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
   # and full coverage are now job-skipped on every PR, independent of this
@@ -675,7 +570,7 @@ jobs:
         run: python3 scripts/setup-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
-      # self-hosted runners are single-slot, so no $RUNNER_NAME key. On the
+      # self-hosted macOS and Windows runners are single-slot, so no $RUNNER_NAME key. On the
       # Windows runner this runs under Git Bash, where $HOME is an MSYS-style
       # path cargo (spawned from the default pwsh shell) can't use —
       # $USERPROFILE carries the native C:\Users\... form, so prefer it when
@@ -1028,14 +923,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
-      # (at 64 threads the latency-bound stress tests — e.g.
-      # e2e_wss_pool_contention_stress's <2s read assert — blew their
-      # wall-clock bounds under llvm-cov load on both nextest tries), but up
-      # to 8 co-tenant jobs now share the box, so halve to 16 to keep those
-      # tests inside their bounds under co-tenancy. This also matches the
-      # 16-core gh-linux-16x burst runner, so the value no longer varies by
-      # route.
+      # 16 matches the 16-core gh-linux-16x runner this merge-queue
+      # job runs on. Higher counts (32 and 64 on a 64-core host) made the
+      # latency-bound stress tests — e.g. e2e_wss_pool_contention_stress's
+      # <2s read assert — blow their wall-clock bounds under llvm-cov load on
+      # both nextest tries.
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/setup-python@v6
@@ -1049,46 +941,7 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-e2e
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
@@ -1099,21 +952,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1127,32 +965,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      # install-action derives every path it touches from $HOME: the bin dir
-      # (~/.install-action/bin here — tinybox's cargo lives at /usr/local/bin,
-      # outside $CARGO_HOME/bin, so the action always takes its fallback) and,
-      # crucially, its download scratch dir (~/.install-action/tmp), which is
-      # shared even when the bin dir isn't — so keying CARGO_HOME per slot
-      # would not help. The 8 tinybox slots share one $HOME, and concurrent
-      # installs clobber each other's downloads (curl error 23; monorepo#1239).
-      # Point the action at a per-slot HOME (keyed on $RUNNER_NAME like the
-      # ci-target dirs) so every path it derives is slot-private; only the
-      # install steps see the override, so rustup/CARGO_TARGET_DIR/registry
-      # caches under the real $HOME are untouched, and the action still adds
-      # its (now per-slot) bin dir to GITHUB_PATH for the later steps. Burst
-      # runners are ephemeral single-job machines, so they keep the real HOME.
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Prepare native startup evidence
         id: native-evidence
         shell: bash
@@ -1224,12 +1038,6 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   coverage-all:
     # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
     # comment and the `merge_group` trigger comment): job-level skipped on
@@ -1249,14 +1057,11 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
-      # (at 64 threads the full workspace suite thrashed SQLite/WAL and
-      # wall-clock-timeout tests hard enough that even the nextest retry
-      # failed: concurrent_writes_no_sqlite_busy hit "database is locked" on
-      # both tries, bridge/auto-commit timing tests timed out), but up to 8
-      # co-tenant jobs now share the box, so halve to 16 to avoid the lock
-      # storms under co-tenancy. This also matches the 16-core gh-linux-16x
-      # burst runner, so the value no longer varies by route.
+      # 16 matches the 16-core gh-linux-16x runner this merge-queue
+      # job runs on. Higher counts (32 and 64 on a 64-core host) thrashed
+      # SQLite/WAL and wall-clock-timeout tests hard enough that even the
+      # nextest retry failed: concurrent_writes_no_sqlite_busy hit "database
+      # is locked" on both tries, bridge/auto-commit timing tests timed out.
       NEXTEST_TEST_THREADS: 16
     steps:
       - uses: actions/setup-python@v6
@@ -1270,46 +1075,7 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-all
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
@@ -1322,28 +1088,13 @@ jobs:
           fi
       # Raise the per-user inotify instance ceiling. The instrumented full
       # suite starts many real notify watchers in parallel (file, .git
-      # metadata, skills, specialists) and up to 8 co-tenant runner slots
-      # share the same user on the tinybox, so the kernel default of 128
+      # metadata, skills, specialists), so the kernel default of 128
       # instances can exhaust mid-run — watcher starts in unrelated tests
       # then fail with EMFILE "Too many open files" (intentd PR #882).
-      # Relies on the runner user's passwordless sudo, like the step above.
+      # Needs passwordless sudo: this merge-queue-only job always runs on
+      # a GitHub-hosted runner (see the route job's `heavy` step), never on intent-cache.
       - name: Raise inotify instance limit
         run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1366,22 +1117,8 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      # Per-slot HOME for install-action — see the coverage-e2e job's comment
-      # for the full rationale (shared ~/.install-action tmp/bin race across
-      # the 8 tinybox slots; monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Verify bounded coverage profile pooling
@@ -1419,12 +1156,6 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   # Focused coverage of the diff's changed tests, required on same-repo PRs
   # and in the queue (against the merged tree), retaining the callback fixture
   # composition proof and its evidence alongside the full queue-only
@@ -1444,8 +1175,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
-      # matches the 16-core burst runner).
+      # Same value and rationale as coverage-e2e (matches the 16-core
+      # burst runner).
       NEXTEST_TEST_THREADS: 16
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
@@ -1555,50 +1286,7 @@ jobs:
             cat "$plan"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB like coverage-e2e: this job shares
-      # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
-      # outside the work dir" below), so the own-dir skip must name it.
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-e2e
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         if: steps.select.outputs.has_selection == 'true'
         run: |
@@ -1610,21 +1298,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Deliberately SHARES coverage-e2e's per-slot target dir instead of
-      # keying its own: a runner slot executes one job at a time, so the two
-      # never overlap on the same dir, both build the same instrumented
-      # profile, and sharing keeps the multi-GiB instrumented dependency
-      # cache warm across PR runs and queue runs alike (a separate dir would
-      # rebuild it from scratch on every slot). This job never runs `cargo
-      # llvm-cov clean`, so it cannot delete coverage-e2e's artifacts.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         if: steps.select.outputs.has_selection == 'true'
@@ -1652,24 +1325,10 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      # Per-slot install-action HOME — see coverage-e2e's comment
-      # (monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        if: steps.select.outputs.has_selection == 'true'
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
         if: steps.select.outputs.has_selection == 'true'
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
         if: steps.select.outputs.has_selection == 'true'
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
@@ -1750,13 +1409,6 @@ jobs:
             ${{ runner.temp }}/callback-fixture-tests.json
           if-no-files-found: warn
           retention-days: 7
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
-      # selection was empty or on burst runners, so this is a no-op there.
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   pr-title:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
@@ -1926,11 +1578,9 @@ jobs:
   # without a marker is left untouched — never collapsed to one section)
   # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
   # issue never earns a release comment; a closed issue with a delivered
-  # linked fix PR does), the tinybox CI helpers
-  # (intent-hq/intent#5256): scripts/ci-lld-retry.sh (the rust-lld
-  # vanished-object signature earns exactly one retry; a genuine lint fails
-  # fast) and scripts/ci-target-slot.sh (a dir with a fresh `.in-use` marker
-  # is never a purge candidate; an unmarked idle one is), plus the
+  # linked fix PR does), scripts/ci-lld-retry.sh (intent-hq/intent#5256:
+  # the rust-lld vanished-object signature earns exactly one retry; a
+  # genuine lint fails fast), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
   # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
@@ -1945,9 +1595,9 @@ jobs:
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job.
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
-    # About 2 min on a hosted runner (measured on Depot); on a busy tinybox slot it ran 5 min next to a
-    # PR's check and coverage-changed (run 39178412485) with every step
-    # passing, so the budget leaves self-hosted headroom.
+    # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
+    # next to a PR's check and coverage-changed (run 39178412485) with every
+    # step passing, so the budget leaves self-hosted headroom.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -1982,8 +1632,8 @@ jobs:
         shell: bash
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("dist-workspace.toml", "rb"))["dist"]["cargo-dist-version"])')
-          # Job-private, unmanaged install: the tinybox slots share one $HOME,
-          # so the default ~/.cargo/bin target races between concurrent jobs.
+          # Job-private, unmanaged install: keeps cargo-dist out of a home
+          # directory that a persistent runner may share between jobs.
           dir="$RUNNER_TEMP/cargo-dist"
           curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" \
             | CARGO_DIST_UNMANAGED_INSTALL="$dir" sh
@@ -2022,8 +1672,6 @@ jobs:
         run: ./scripts/test-mirror-release-assets.sh
       - name: Test ci-lld-retry.sh
         run: ./scripts/test-ci-lld-retry.sh
-      - name: Test ci-target-slot.sh
-        run: ./scripts/test-ci-target-slot.sh
       - name: Test Windows cleanup policy
         run: python3 -I -B scripts/test-windows-ci-cleanup.py
       - name: Test macOS cleanup safety and Cargo lock ownership
@@ -2040,15 +1688,7 @@ jobs:
           python3 -S scripts/test-provider-cli-metadata.py
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
-      # Per-slot HOME for install-action (shared ~/.install-action tmp/bin
-      # race across the 8 tinybox slots; monorepo#1239). This job follows the
-      # shared `runners` route, not linux_burst, so it keys on the slot name
-      # everywhere; on ephemeral GitHub-hosted runners the extra directory is harmless.
-      - name: Key install-action dirs per runner slot
-        run: echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
         with:
           tool: release-plz@0.3.162
       - name: Test Cargo packaging and historical baseline compatibility
@@ -2236,54 +1876,6 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # Persistent per-job outputs survive checkout's git clean. Linux uses
-      # /raid and a runner-slot key, with the same prune/marker rails as check.
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
-        env:
-          NEED_GIB: 15
-          JOB_TARGET_SUBDIR: daemon-lifecycle
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      - name: Point lifecycle target outside checkout (Linux)
-        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
-        shell: bash
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       # These runners have one slot. Prefer the native Windows home path:
       # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
       - name: Point lifecycle target outside checkout (macOS and Windows)
@@ -2308,11 +1900,6 @@ jobs:
         run: |
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
-      - name: Release lifecycle target dir
-        if: ${{ always() && runner.os == 'Linux' && contains(matrix.os, 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
-        shell: bash
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   # Required context for each event: PRs certify only the lightweight tier.
   # Queue entries require all native/runtime/coverage proofs; push keeps its
   # release-build and packaging checks. Missing/failed results never pass.

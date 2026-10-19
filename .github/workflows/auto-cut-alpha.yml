@@ -116,8 +116,8 @@ jobs:
     name: Auto-merge green Release PR
     # Lightweight job (seconds when nothing is pending; up to ~25 min while it
     # waits for the Release PR's CI or, on push runs, for its refresh):
-    # routed with the small ubuntu-24.04 fallback key (same rationale as
-    # ci.yml's pr-title/gate jobs).
+    # pinned to ubuntu-24.04 (same rationale as
+    # ci.yml's pr-title/gate jobs — a self-hosted slot would be wasted on it).
     needs: [runner-route]
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}

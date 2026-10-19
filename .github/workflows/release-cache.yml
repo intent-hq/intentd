@@ -70,7 +70,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
+    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && matrix.runner || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
     timeout-minutes: 60
     steps:
     - uses: actions/setup-python@v6
