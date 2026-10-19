@@ -610,6 +610,28 @@ starts the listener immediately — no restart needed. Interactively this is a `
 prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
 command fails with guidance.
 
+The payload only advertises addresses another device can dial, so a daemon listening
+on loopback only (the default `server.bindAddress`, `127.0.0.1`) with no tunnel has
+nothing to advertise and `pair` refuses. When the client reaches this machine through
+a local forward on the same port instead, name the host it dials with `--host` (an IP
+address or hostname; the port always comes from the daemon): `pair` then prints the
+URL, a `Host:`/`Port:` pair, the token, and the fingerprint for that host (read via
+`server.pairingInfo`). `--host` works with `--yes`, `--rotate`, `--png`, and `--svg`.
+
+#### Windows app with intentd in WSL
+
+WSL forwards Windows `localhost` to loopback listeners inside WSL, so keep the default
+loopback bind and pair through `localhost`:
+
+```bash
+intentd start                              # standalone install; or the systemd user service
+intentd pair --yes --host localhost        # enables external connections if needed
+```
+
+In the Windows app, choose **Add device** and enter host `localhost` with the printed
+port and token (or paste the printed URL into the host field), then confirm the
+fingerprint matches the printed one.
+
 ### Durable evidence for long saved commands (Unix)
 
 Use the opt-in wrapper for noninteractive validation that must retain its actual

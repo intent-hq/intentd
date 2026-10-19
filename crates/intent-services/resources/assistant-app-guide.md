@@ -122,7 +122,7 @@ Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
 
-<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; packages/intentd/crates/intentd/src/main.rs (`intentd pair --host`). -->
 
 ## Find the mobile pairing QR code
 
@@ -152,7 +152,9 @@ with **Test connection** inside its editing panel. Workspaces and agents belong 
 host, so identify the intended device before explaining missing work or changing
 host settings. **Mobile** follows the active connection and its permissions; do not
 describe a remote connection's QR as belonging to the local desktop. To pair the
-local machine, connect to it first. Enabling access, changing listening addresses,
+local machine, connect to it first. For intentd running in WSL on the same Windows
+PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL prints
+the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
