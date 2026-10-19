@@ -2,6 +2,7 @@
 """Self-hosted compiler-cache and release warming contracts."""
 from copy import deepcopy
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import tomllib
@@ -18,7 +19,8 @@ def workflow(name):
 
 class ManagedCache(unittest.TestCase):
     def test_managed_smoke_skips_when_cache_is_switched_off(self):
-        env = {'PATH': '/usr/bin:/bin'}
+        # No cache endpoint; keep the loader path so a setup-python interpreter still starts.
+        env = {'PATH': '/usr/bin:/bin', **{k: v for k, v in os.environ.items() if k == 'LD_LIBRARY_PATH'}}
         for phase in ('populate', 'verify'):
             result = subprocess.run(['python3', '-I', '-B', 'scripts/test-release-cache-smoke.py', '--managed', '--phase', phase],
                                     cwd=ROOT, env=env, capture_output=True, text=True)
