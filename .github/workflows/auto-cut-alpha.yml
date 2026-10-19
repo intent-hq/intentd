@@ -154,6 +154,9 @@ jobs:
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::RELEASE_PLZ_TOKEN secret is not configured; skipping Release PR auto-merge"
+            line="auto-cut-decision: skip no-release-token RELEASE_PLZ_TOKEN secret is not configured"
+            echo "$line"
+            echo "$line" >> "$GITHUB_STEP_SUMMARY"
           fi
       # Load the classifier from this trusted workflow revision, never the PR.
       - uses: actions/checkout@v7
@@ -180,6 +183,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Decision contract: every run prints exactly one line
+          #   auto-cut-decision: <outcome> <reason> <free-text detail>
+          # (also appended to the step summary) and exits through decide().
+          # <outcome> is one of noop, throttle, hold, defer, skip, refuse,
+          # dry-run, merge, queue, error; <reason> is a stable kebab-case
+          # code. Monorepo `make release-status` reads this line instead of
+          # matching the free-text messages, so reword details freely but
+          # keep outcomes and reason codes stable. The EXIT trap reports an
+          # unplanned exit (e.g. a `set -e` failure) as `error unexpected-exit`.
+          # scripts/test-auto-cut-alpha.py asserts one line on every path.
+          decided=""
+          decide() {
+            local line="auto-cut-decision: $1 $2 ${3//$'\n'/ }"
+            decided=1
+            echo "$line"
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then echo "$line" >> "$GITHUB_STEP_SUMMARY"; fi
+            exit "${4:-0}"
+          }
+          trap 'status=$?; [[ -n "$decided" ]] || decide error unexpected-exit "step exited with status $status before reaching a decision" "$status"' EXIT
+
           # Self-retrigger guard: the squash-merge this workflow performs is
           # itself a push to main, which fires the push trigger again. The
           # squash commit keeps the release commit's message (release-plz
@@ -190,8 +213,7 @@ jobs:
             first_line=${HEAD_COMMIT_MSG%%$'\n'*}
             case "$first_line" in
               "chore: release" | "chore: release v"* | "chore(intentd): release v"* | "chore(intentd-sitter): release v"*)
-                echo "Push is the release squash-merge itself ($first_line); nothing to chain into."
-                exit 0
+                decide noop release-commit "Push is the release squash-merge itself ($first_line); nothing to chain into."
                 ;;
             esac
           fi
@@ -228,8 +250,7 @@ jobs:
             fi
             age_min=$(( ($(date +%s) - tag_epoch) / 60 ))
             if (( age_min < 60 )); then
-              echo "Last cut ($tag) was ${age_min} min ago (<60 min); throttled — the next cron tick retries."
-              exit 0
+              decide throttle recent-cut "Last cut ($tag) was ${age_min} min ago (<60 min); throttled — the next cron tick retries."
             fi
             echo "Last cut ($tag) was ${age_min} min ago; throttle passes."
           }
@@ -261,7 +282,7 @@ jobs:
           ci_wait=${AUTO_CUT_CI_WAIT_MINUTES:-25}
           if [[ ! "$ci_wait" =~ ^[0-9]+$ ]] || (( ci_wait > 30 )); then
             echo "::error::AUTO_CUT_CI_WAIT_MINUTES must be whole minutes between 0 and 30 (got '$ci_wait')"
-            exit 1
+            decide error invalid-ci-wait "AUTO_CUT_CI_WAIT_MINUTES must be whole minutes between 0 and 30 (got '$ci_wait')" 1
           fi
           now=$(date +%s)
           ci_deadline=$(( now + ci_wait * 60 ))
@@ -271,33 +292,34 @@ jobs:
           missing_deadline=$(( now + (ci_wait < 5 ? ci_wait : 5) * 60 ))
           (( missing_deadline > deadline )) || missing_deadline=$deadline
 
-          # Transient-condition helper: a push run with budget left returns
-          # so the caller can sleep 30s and retry; every other case logs and
-          # exits 0 — the next scheduled run retries. Hard guardrails below
+          # Transient-condition helper (transient <reason> <message>): a
+          # push run with budget left returns so the caller can sleep 30s and
+          # retry; every other case decides `defer <reason>` and exits 0 —
+          # the next scheduled run retries (no-release-pr decides `noop`). Hard guardrails below
           # (fork/identity, hold-release, draft, conflicts, failed gate,
-          # unresolved human threads) exit directly and are never retried.
+          # unresolved human threads) decide directly and are never retried.
           transient() {
             if [[ "$EVENT_NAME" == "push" ]] && (( $(date +%s) < deadline )); then
-              echo "$1 — retrying in 30s."
+              echo "$2 — retrying in 30s."
               return 0
             fi
-            echo "$1; skipping."
-            exit 0
+            local outcome=defer
+            [[ "$1" != "no-release-pr" ]] || outcome=noop
+            decide "$outcome" "$1" "$2; skipping."
           }
 
           # Bounded re-reads of a transient mergeable=UNKNOWN (see below).
           UNKNOWN_GRACE_SECONDS=120
           unknown_deadline=0
 
-          # CI-pending helper: like transient(), but every event gets the
-          # CI wait budget.
+          # CI-pending helper (ci_pending <reason> <message> [deadline]):
+          # like transient(), but every event gets the CI wait budget.
           ci_pending() {
-            if (( $(date +%s) < ${2:-$ci_deadline} )); then
-              echo "$1 — waiting for CI Gate, retrying in 30s."
+            if (( $(date +%s) < ${3:-$ci_deadline} )); then
+              echo "$2 — waiting for CI Gate, retrying in 30s."
               return 0
             fi
-            echo "$1; CI wait budget exhausted, skipping."
-            exit 0
+            decide defer "$1" "$2; CI wait budget exhausted, skipping."
           }
 
           # The Release PR's CI Gate state: success, running (no gate yet,
@@ -355,19 +377,20 @@ jobs:
                       or (.title | startswith("chore: release v"))
                       or (.title | startswith("chore(intentd): release v"))
                       or (.title | startswith("chore(intentd-sitter): release v"))))]'); then
-              transient "gh pr list failed (transient API error?)"
+              transient api-error "gh pr list failed (transient API error?)"
               sleep 30; continue
             fi
             count=$(jq 'length' <<<"$prs")
             if [[ "$count" -eq 0 ]]; then
-              transient "No open release-plz Release PR — no changes, no release (on push runs: release-plz may still be opening/refreshing it)"
+              transient no-release-pr "No open release-plz Release PR — no changes, no release (on push runs: release-plz may still be opening/refreshing it)"
               sleep 30; continue
             fi
             if [[ "$count" -gt 1 ]]; then
               # Should never happen (release-plz maintains a single Release
               # PR); refuse to guess rather than merge the wrong one.
-              echo "::warning::Found $count open PRs that look like the Release PR ($(jq -r '[.[].number | tostring] | join(", #")' <<<"$prs" | sed 's/^/#/')); refusing to guess"
-              exit 0
+              msg="Found $count open PRs that look like the Release PR ($(jq -r '[.[].number | tostring] | join(", #")' <<<"$prs" | sed 's/^/#/')); refusing to guess"
+              echo "::warning::$msg"
+              decide refuse multiple-release-prs "$msg"
             fi
             number=$(jq -r '.[0].number' <<<"$prs")
             title=$(jq -r '.[0].title' <<<"$prs")
@@ -388,14 +411,15 @@ jobs:
                 -f query='query { viewer { login } }' \
                 --jq '.data.viewer.login'); then
                 viewer=""
-                transient "viewer lookup with the release-plz PAT failed (transient API error?)"
+                transient api-error "viewer lookup with the release-plz PAT failed (transient API error?)"
                 sleep 30; continue
               fi
             fi
             author=$(jq -r '.[0].author.login' <<<"$prs")
             if [[ -z "$viewer" || "$author" != "$viewer" ]]; then
-              echo "::warning::Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
-              exit 0
+              msg="Release PR #$number author ($author) is not the release-plz PAT identity ($viewer); refusing to auto-merge"
+              echo "::warning::$msg"
+              decide refuse untrusted-author "$msg"
             fi
 
             # Pause guardrail (checked before any waiting): a human puts
@@ -404,19 +428,19 @@ jobs:
             # the label to resume. The label is already in $prs, so a held
             # PR exits immediately instead of polling for freshness first.
             if jq -e '.[0].labels | any(.name == "hold-release")' <<<"$prs" >/dev/null; then
-              echo "::notice::Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
-              exit 0
+              msg="Release PR #$number carries the hold-release label; auto-merge paused until it is removed"
+              echo "::notice::$msg"
+              decide hold hold-release "$msg"
             fi
 
             if ! detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
               --json isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,baseRefOid,baseRefName,reviewDecision); then
-              transient "gh pr view failed for Release PR #$number (transient API error?)"
+              transient api-error "gh pr view failed for Release PR #$number (transient API error?)"
               sleep 30; continue
             fi
 
             if [[ $(jq -r '.isDraft' <<<"$detail") != "false" ]]; then
-              echo "Release PR #$number is a draft; skipping."
-              exit 0
+              decide skip draft "Release PR #$number is a draft; skipping."
             fi
 
             # Strict up-to-date is enforced by the ruleset, and release-plz
@@ -425,7 +449,7 @@ jobs:
             # runs a behind head is exactly the refresh being waited for.
             merge_state=$(jq -r '.mergeStateStatus' <<<"$detail")
             if [[ "$merge_state" == "BEHIND" ]]; then
-              transient "Release PR #$number is behind main (release-plz refreshes it)"
+              transient pr-behind "Release PR #$number is behind main (release-plz refreshes it)"
               sleep 30; continue
             fi
 
@@ -448,20 +472,19 @@ jobs:
                 echo "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN) — re-reading in 30s."
                 sleep 30; continue
               fi
-              transient "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN)"
+              transient mergeable-unknown "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN)"
               sleep 30; continue
             fi
             unknown_deadline=0
             if [[ "$mergeable" != "MERGEABLE" ]]; then
-              echo "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
-              exit 0
+              decide skip not-mergeable "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
             fi
 
             # --admin bypasses queue rules, so enforce the clean/review/base
             # guards explicitly before considering the metadata exemption.
             review=$(jq -r '.reviewDecision' <<<"$detail")
             if [[ $(jq -r '.baseRefName' <<<"$detail") != "main" || "$review" == "CHANGES_REQUESTED" || "$review" == "REVIEW_REQUIRED" ]]; then
-              transient "Release PR #$number is not clean on main or still requires review"
+              transient review-or-base "Release PR #$number is not clean on main or still requires review"
               sleep 30; continue
             fi
             # Hard guardrail, checked before any CI wait so a human thread never
@@ -506,12 +529,11 @@ jobs:
                 | select((.comments.totalCount <= 100 and ([.comments.nodes[].author.__typename] | length > 0 and all(. == "Bot"))) | not)]
               | length' \
               | awk '{ sum += $1 } END { print sum + 0 }'); then
-              transient "reviewThreads query failed for Release PR #$number (transient API error?)"
+              transient api-error "reviewThreads query failed for Release PR #$number (transient API error?)"
               sleep 30; continue
             fi
             if [[ "$unresolved" -ne 0 ]]; then
-              echo "Release PR #$number has $unresolved unresolved human review thread(s); skipping."
-              exit 0
+              decide skip review-threads "Release PR #$number has $unresolved unresolved human review thread(s); skipping."
             fi
 
             # Required check "CI Gate" must be green on the current head
@@ -524,29 +546,28 @@ jobs:
             # since CI that never starts must not hold every cron run.
             gate=$(gate_state "$detail")
             if gate_terminal "$gate"; then
-              echo "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
-              exit 0
+              decide skip ci-gate-failed "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
             fi
             if [[ "$gate" == "missing" ]]; then
-              ci_pending "CI Gate has not reported on the current head yet" "$missing_deadline"
+              ci_pending ci-gate-missing "CI Gate has not reported on the current head yet" "$missing_deadline"
               sleep 30; continue
             fi
             if [[ "$gate" == "running" ]]; then
-              ci_pending "CI Gate has not reported on the current head yet, but CI is still running"
+              ci_pending ci-gate-pending "CI Gate has not reported on the current head yet, but CI is still running"
               sleep 30; continue
             fi
             if [[ "$gate" != "success" ]]; then
-              ci_pending "CI Gate is not green on the current head (state: $gate)"
+              ci_pending ci-gate-pending "CI Gate is not green on the current head (state: $gate)"
               sleep 30; continue
             fi
             if [[ "$merge_state" != "CLEAN" ]]; then
-              transient "Release PR #$number is not clean on main or still requires review"
+              transient review-or-base "Release PR #$number is not clean on main or still requires review"
               sleep 30; continue
             fi
             head_sha=$(jq -r '.headRefOid' <<<"$detail")
             base_sha=$(jq -r '.baseRefOid' <<<"$detail")
             if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
-              transient "Release PR #$number has unreadable head/base commits"
+              transient api-error "Release PR #$number has unreadable head/base commits"
               sleep 30; continue
             fi
 
@@ -561,7 +582,7 @@ jobs:
               cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_sha" \
                 --jq '.status' 2>/dev/null) || cmp_status=""
               if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
-                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
+                transient pr-stale "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
                 sleep 30; continue
               fi
             fi
@@ -581,21 +602,22 @@ jobs:
                 | if $r == null then "missing"
                   else [($r.status // "pending"), ($r.conclusion // "none"), ($r.html_url // "no-url")] | join(" ")
                   end'); then
-              transient "main's post-merge CI lookup failed for $base_sha (transient API error?)"
+              transient api-error "main's post-merge CI lookup failed for $base_sha (transient API error?)"
               sleep 30; continue
             fi
             read -r main_status main_conclusion main_url <<<"$main_ci"
             if [[ "$main_status" == "missing" ]]; then
-              ci_pending "main's post-merge CI has not started on $base_sha yet" "$missing_deadline"
+              ci_pending main-ci-pending "main's post-merge CI has not started on $base_sha yet" "$missing_deadline"
               sleep 30; continue
             fi
             if [[ "$main_status" != "completed" ]]; then
-              ci_pending "main's post-merge CI is still $main_status on $base_sha ($main_url)"
+              ci_pending main-ci-pending "main's post-merge CI is still $main_status on $base_sha ($main_url)"
               sleep 30; continue
             fi
             if [[ "$main_conclusion" != "success" ]]; then
-              echo "::notice::main's post-merge CI concluded $main_conclusion on $base_sha ($main_url); not cutting an alpha until it is green — re-run the failed jobs or land a fix."
-              exit 0
+              msg="main's post-merge CI concluded $main_conclusion on $base_sha ($main_url); not cutting an alpha until it is green — re-run the failed jobs or land a fix."
+              echo "::notice::$msg"
+              decide skip main-ci-failed "$msg"
             fi
             echo "main's post-merge CI passed on $base_sha ($main_url)."
 
@@ -619,7 +641,7 @@ jobs:
               # The admin route must not bypass freshness, even if GitHub's
               # cached mergeStateStatus has not caught up with main yet.
               if ! git merge-base --is-ancestor "$base_sha" "$head_sha"; then
-                transient "Release PR #$number does not contain its current main base"
+                transient pr-stale "Release PR #$number does not contain its current main base"
                 sleep 30; continue
               fi
               shape=$(bash scripts/release-pr-fast-path.sh "$base_sha" "$head_sha") || shape="fast_path=false"
@@ -633,8 +655,7 @@ jobs:
             fi
 
             if [[ "$DRY_RUN" == "true" ]]; then
-              echo "DRY RUN: would request $route for Release PR #$number ($title) at $head_sha."
-              exit 0
+              decide dry-run "$([[ "$direct" == "true" ]] && echo direct-merge || echo merge-queue)" "DRY RUN: would request $route for Release PR #$number ($title) at $head_sha."
             fi
 
             # Squash-merge with the PAT so the push to main triggers
@@ -647,12 +668,11 @@ jobs:
             # scheduled run retries.
             if GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr merge "$number" --repo "$GITHUB_REPOSITORY" "${merge_args[@]}"; then
               if [[ "$direct" == "true" ]]; then
-                echo "Directly squash-merged Release PR #$number ($title) at $head_sha; release-plz.yml now cuts the tag."
-              else
-                echo "Submitted Release PR #$number ($title) to the ordinary merge queue; publication waits for the actual merge."
+                decide merge direct-merge "Directly squash-merged Release PR #$number ($title) at $head_sha; release-plz.yml now cuts the tag."
               fi
-            else
-              echo "::warning::gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
+              decide queue merge-queue "Submitted Release PR #$number ($title) to the ordinary merge queue; publication waits for the actual merge."
             fi
-            exit 0
+            msg="gh pr merge failed for Release PR #$number (state changed under us?); the next scheduled run retries"
+            echo "::warning::$msg"
+            decide error merge-failed "$msg"
           done

@@ -2,6 +2,7 @@
 """Execute the actual workflow shell with offline gh fixtures and real git."""
 import json
 import os
+import re
 from pathlib import Path
 import runpy
 import shutil
@@ -11,6 +12,8 @@ import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+OUTCOMES = 'noop|throttle|hold|defer|skip|refuse|dry-run|merge|queue|error'
+DECISION = re.compile(r'^auto-cut-decision: (?P<outcome>%s) (?P<reason>[a-z0-9]+(?:-[a-z0-9]+)*) \S.*$' % OUTCOMES)
 Fixture = runpy.run_path(str(ROOT / 'scripts/test-release-pr-fast-path.py'))['Fixture']
 MOCK = r'''
 import json, os, pathlib, subprocess, sys
@@ -86,17 +89,31 @@ class AutoCutTests(Fixture):
         for source in (ROOT / 'scripts').glob('release-pr-fast-path.*'):
             shutil.copy(source, dest / source.name)
 
-    def run_workflow(self, **env):
+    @staticmethod
+    def merge_step():
+        workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
+        step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
+        return textwrap.dedent(step.split('        run: |\n', 1)[1])
+
+    def run_workflow(self, expect_status=0, **env):
         self.env.update(env)
         state_path = self.repo / 'state'
         state_path.write_text(json.dumps(self.state))
-        workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
-        step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
-        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        summary = self.repo / 'step-summary'
+        summary.write_text('')
+        self.env['GITHUB_STEP_SUMMARY'] = str(summary)
         # Hang guard only; the longest fixture makes ~40 mocked polls.
-        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', self.merge_step()], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
         self.state = json.loads(state_path.read_text())
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, expect_status, result.stdout + result.stderr)
+        # Decision contract (read by monorepo `make release-status`): every
+        # run, on every exit path, prints exactly one decision line and
+        # mirrors it to the step summary.
+        lines = [line for line in result.stdout.splitlines() if line.startswith('auto-cut-decision:')]
+        self.assertEqual(len(lines), 1, result.stdout)
+        self.assertRegex(lines[0], DECISION)
+        self.assertEqual(summary.read_text().splitlines(), lines)
+        self.last_decision = tuple(DECISION.match(lines[0]).group('outcome', 'reason'))
         return result.stdout
 
     def forbid_polling(self):
@@ -314,18 +331,11 @@ path.write_text(json.dumps(s))
         self.assertIn('unresolved human review thread', output)
 
     def test_invalid_ci_wait_budget_fails_loudly(self):
-        self.state_path = self.repo / 'state'
-        self.state_path.write_text(json.dumps(self.state))
-        workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
-        step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
-        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
         for value in ('40m', '31'):
             with self.subTest(value=value):
-                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo,
-                                        env={**self.env, 'EVENT_NAME': 'schedule', 'AUTO_CUT_CI_WAIT_MINUTES': value},
-                                        capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn('AUTO_CUT_CI_WAIT_MINUTES must be whole minutes', result.stdout)
+                output = self.run_workflow(expect_status=1, EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES=value)
+                self.assertIn('AUTO_CUT_CI_WAIT_MINUTES must be whole minutes', output)
+                self.assertEqual(self.last_decision, ('error', 'invalid-ci-wait'))
 
     def test_scheduled_and_dispatched_runs_wait_for_pending_release_ci(self):
         # Release-PR CI runs the ~13 min Linux checks; a cron run that checked
@@ -545,6 +555,102 @@ path.write_text(json.dumps(s))
         self.run_workflow(EVENT_NAME='push', HEAD_COMMIT_MSG='chore: release v0.9.135')
         self.assertEqual(self.state['calls'], [])
 
+    def test_every_exit_path_reports_its_decision(self):
+        # One fixture per exit path of the merge step; run_workflow asserts
+        # the single well-formed decision line, this pins outcome + reason.
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        def detail(**kw):
+            return lambda: self.state['detail'].update(kw)
+        def pr(**kw):
+            return lambda: self.state['pr'].update(kw)
+        def pending():
+            self.pending_ci()
+        def write_main_change():
+            self.write('crates/intentd/src/main.rs', 'fn main() { panic!(); }\n')
+            self.state['detail']['headRefOid'] = self.commit()
+        def main_base_moved():
+            self.git('checkout', '-q', self.base)
+            self.write('unreleased', 'main advanced')
+            self.state['detail']['baseRefOid'] = self.commit()
+        def no_release_pr():
+            self.state['pr']['headRefName'] = 'ordinary'
+        def two_release_prs():
+            mock = (self.bin / 'gh').read_text().replace("emit([s['pr']])", "emit([s['pr'], {**s['pr'], 'number': 43}])")
+            (self.bin / 'gh').write_text(mock)
+        cases = [
+            ('release-commit', {'EVENT_NAME': 'push', 'HEAD_COMMIT_MSG': 'chore: release v0.9.135'}, None, ('noop', 'release-commit')),
+            ('throttled', {'EVENT_NAME': 'schedule'}, lambda: self.state.update(last_cut=now), ('throttle', 'recent-cut')),
+            ('no release PR', {}, no_release_pr, ('noop', 'no-release-pr')),
+            ('two release PRs', {}, two_release_prs, ('refuse', 'multiple-release-prs')),
+            ('untrusted author', {}, pr(author={'login': 'outsider'}), ('refuse', 'untrusted-author')),
+            ('hold-release', {}, pr(labels=[{'name': 'hold-release'}]), ('hold', 'hold-release')),
+            ('draft', {}, detail(isDraft=True), ('skip', 'draft')),
+            ('behind', {}, detail(mergeStateStatus='BEHIND'), ('defer', 'pr-behind')),
+            ('unknown mergeability', {'EVENT_NAME': 'schedule'}, lambda: (detail(mergeable='UNKNOWN')(), self.update_after_polls(99, {})), ('defer', 'mergeable-unknown')),
+            ('conflict', {}, detail(mergeable='CONFLICTING'), ('skip', 'not-mergeable')),
+            ('review required', {}, detail(reviewDecision='REVIEW_REQUIRED'), ('defer', 'review-or-base')),
+            ('human thread', {}, lambda: self.state.update(unresolved=1), ('skip', 'review-threads')),
+            ('thread read error', {}, lambda: self.state.update(thread_error=True), ('defer', 'api-error')),
+            ('failed gate', {}, detail(statusCheckRollup=[{'name': 'CI Gate', 'conclusion': 'FAILURE'}]), ('skip', 'ci-gate-failed')),
+            ('missing gate', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, detail(mergeStateStatus='BLOCKED', statusCheckRollup=[]), ('defer', 'ci-gate-missing')),
+            ('pending gate', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, pending, ('defer', 'ci-gate-pending')),
+            ('green but blocked', {}, detail(mergeStateStatus='BLOCKED'), ('defer', 'review-or-base')),
+            ('unreadable head', {}, detail(headRefOid='nope'), ('defer', 'api-error')),
+            ('stale push head', {'EVENT_NAME': 'push', 'AUTO_CUT_CI_WAIT_MINUTES': '0'}, lambda: (self.state.update(compare='behind'), self.update_after_polls(99, {}, seconds_per_poll=16 * 60)), ('defer', 'pr-stale')),
+            ('main CI lookup error', {}, lambda: self.state.update(main_runs_error=True), ('defer', 'api-error')),
+            ('main CI missing', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, lambda: self.state.update(main_runs=[]), ('defer', 'main-ci-pending')),
+            ('main CI running', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, lambda: self.state.update(main_runs=[self.main_run(5, 'in_progress', None)]), ('defer', 'main-ci-pending')),
+            ('main CI red', {}, lambda: self.state.update(main_runs=[self.main_run(7, 'completed', 'failure')]), ('skip', 'main-ci-failed')),
+            ('base not contained', {}, main_base_moved, ('defer', 'pr-stale')),
+            ('dry run direct', {'DRY_RUN': 'true'}, None, ('dry-run', 'direct-merge')),
+            ('dry run queue', {'DRY_RUN': 'true'}, write_main_change, ('dry-run', 'merge-queue')),
+            ('direct merge', {}, None, ('merge', 'direct-merge')),
+            ('queued merge', {}, write_main_change, ('queue', 'merge-queue')),
+            ('merge failed', {}, lambda: self.state.update(changed_head=True), ('error', 'merge-failed')),
+        ]
+        mock = (self.bin / 'gh').read_text()
+        for name, env, setup, expected in cases:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                (self.bin / 'gh').write_text(mock)
+                if setup:
+                    setup()
+                self.run_workflow(**env)
+                self.assertEqual(self.last_decision, expected)
+
+    def test_unplanned_failure_still_reports_a_decision(self):
+        # A `set -e` failure outside every guard (here: the clock read that
+        # arms the CI wait budget) must still leave one decision line, via
+        # the EXIT trap, and keep the failing status.
+        date = self.bin / 'date'
+        date.write_text('#!/bin/sh\nexit 5\n')
+        date.chmod(0o755)
+        output = self.run_workflow(expect_status=5, EVENT_NAME='workflow_dispatch')
+        self.assertEqual(self.last_decision, ('error', 'unexpected-exit'))
+        self.assertIn('status 5', output)
+
+    def test_merge_step_never_exits_around_decide(self):
+        # Every exit goes through decide(); a new bare `exit` would bypass
+        # the decision contract on a path no fixture covers yet.
+        code = [line.split('#', 1)[0] for line in self.merge_step().splitlines()]
+        exits = [line.strip() for line in code if re.search(r'(?<![-\w])exit\b', line)]
+        self.assertEqual(exits, ['exit "${4:-0}"'])
+
+    def test_missing_release_token_reports_a_decision(self):
+        workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
+        step = workflow.split('      - name: Check release token\n', 1)[1].split('      - uses:', 1)[0]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        out, summary = self.repo / 'out', self.repo / 'summary'
+        result = subprocess.run(['bash', '-e', '-c', script], env={**self.env, 'RELEASE_PLZ_TOKEN': '', 'GITHUB_OUTPUT': str(out), 'GITHUB_STEP_SUMMARY': str(summary)},
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith('auto-cut-decision:')]
+        self.assertEqual(len(lines), 1)
+        self.assertRegex(lines[0], DECISION)
+        self.assertTrue(lines[0].startswith('auto-cut-decision: skip no-release-token '))
+        self.assertEqual(summary.read_text().splitlines(), lines)
 
 if __name__ == '__main__':
     unittest.main()
