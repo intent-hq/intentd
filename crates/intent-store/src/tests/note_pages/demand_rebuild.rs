@@ -103,7 +103,7 @@ async fn start_paused(
     let demand = store.clone();
     let request =
         tokio::spawn(async move { demand.ensure_note_index("pages", "spec", true).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+    tokio::time::timeout(super::wait(), pause.entered.notified())
         .await
         .unwrap();
     (pause, request)
@@ -112,7 +112,7 @@ async fn start_paused(
 pub(super) async fn settled(store: &Store) -> intent_core::Result<()> {
     // Renew the demand lease until the physical job settles. A timeout is not a
     // successful empty page and must not allocate a page snapshot.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(super::wait(), async {
         loop {
             let result = store.ensure_note_index("pages", "spec", true).await;
             if !matches!(
@@ -282,7 +282,7 @@ async fn demand_shutdown_discards_staging_and_restart_needs_fresh_demand() {
     let closing = store.clone();
     let close = tokio::spawn(async move { closing.close().await });
     // close must retain physical job ownership until the paused write settles.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(super::wait(), async {
         while !store
             .note_index_owner
             .closing
@@ -295,7 +295,7 @@ async fn demand_shutdown_discards_staging_and_restart_needs_fresh_demand() {
     .unwrap();
     assert!(!close.is_finished());
     pause.release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(5), close)
+    tokio::time::timeout(super::wait(), close)
         .await
         .unwrap()
         .unwrap();
@@ -519,7 +519,7 @@ async fn demand_queue_limit_never_hydrates_waiting_notes() {
                 .await
         }));
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(super::wait(), async {
         while store.note_index_jobs.queued_identities() < 32 {
             tokio::task::yield_now().await;
         }
