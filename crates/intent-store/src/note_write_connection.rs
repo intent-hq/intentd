@@ -16,11 +16,18 @@ impl NoteWriteConnection {
         Self::begin_pool(store.write_pool()).await
     }
 
+    /// Acquire the writer and open `BEGIN IMMEDIATE`. Only the acquire is
+    /// retried: a write-pool acquire timeout happens before any statement, so
+    /// waiting it out (the shared busy-retry window) cannot double-apply a
+    /// mutation (intent-hq/intent#7070). Exhaustion still surfaces the
+    /// `PoolTimedOut` text, which callers classify as transient.
     pub(crate) async fn begin_pool(pool: &crate::StorePool) -> Result<Self> {
-        let conn = pool
-            .acquire()
-            .await
-            .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))?;
+        let conn = crate::with_write_txn_retry(|| async {
+            pool.acquire()
+                .await
+                .map_err(|e| Error::Internal(format!("acquire connection failed: {e}")))
+        })
+        .await?;
         let mut guard = Self(Some(conn));
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *guard)

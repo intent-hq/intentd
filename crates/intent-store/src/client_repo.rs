@@ -19,7 +19,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Internal` if the database operation fails.
+    /// Returns `Error::Internal` if the database operation fails, or if the
+    /// single write connection stays unavailable for the whole busy-retry
+    /// window.
     pub async fn upsert_client(
         &self,
         id: &ClientId,
@@ -33,28 +35,35 @@ impl Store {
                 .map_err(|e| Error::Internal(format!("encode capabilities failed: {e}")))?,
             None => "{}".to_string(),
         };
-        sqlx::query(
-            "INSERT INTO client (id, name, capabilities, hostname, pretty_hostname, \
-             device_kind, first_seen, last_seen, last_hello_at) \
-             VALUES (?,?,?,?,?,?,?,?,?) \
-             ON CONFLICT(id) DO UPDATE SET \
-             name = excluded.name, capabilities = excluded.capabilities, \
-             hostname = excluded.hostname, pretty_hostname = excluded.pretty_hostname, \
-             device_kind = excluded.device_kind, last_seen = excluded.last_seen, \
-             last_hello_at = excluded.last_hello_at",
-        )
-        .bind(&id.0)
-        .bind(name)
-        .bind(&caps)
-        .bind(host.hostname.as_deref())
-        .bind(host.pretty_hostname.as_deref())
-        .bind(host.device_kind.as_deref())
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("upsert client failed: {e}")))?;
+        // Idempotent upsert, so a write-pool acquire timeout (another writer
+        // holding the single connection past `WRITE_ACQUIRE_TIMEOUT`) is
+        // retried instead of aborting the `client.hello` handshake
+        // (intent-hq/intent#7070).
+        crate::with_write_txn_retry(|| async {
+            sqlx::query(
+                "INSERT INTO client (id, name, capabilities, hostname, pretty_hostname, \
+                 device_kind, first_seen, last_seen, last_hello_at) \
+                 VALUES (?,?,?,?,?,?,?,?,?) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                 name = excluded.name, capabilities = excluded.capabilities, \
+                 hostname = excluded.hostname, pretty_hostname = excluded.pretty_hostname, \
+                 device_kind = excluded.device_kind, last_seen = excluded.last_seen, \
+                 last_hello_at = excluded.last_hello_at",
+            )
+            .bind(&id.0)
+            .bind(name)
+            .bind(&caps)
+            .bind(host.hostname.as_deref())
+            .bind(host.pretty_hostname.as_deref())
+            .bind(host.device_kind.as_deref())
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("upsert client failed: {e}")))
+        })
+        .await?;
         Ok(())
     }
 
