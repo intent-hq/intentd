@@ -157,6 +157,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
         },
+        // Provider profile failure (§5.54): -32602 (or -32603 for an
+        // unreadable profile file) with the service-built `data` verbatim —
+        // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
+        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message.clone(),
+            data: Some(failure.data.clone()),
+        },
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
         // category so clients stop showing a bare "Internal error"
@@ -4304,6 +4312,29 @@ async fn dispatch_other(
             // workspaceId — the registry is compiled-in daemon data.
             let r = api.providers_catalog().await.map_err(domain_to_rpc)?;
             Ok(r)
+        }
+        "providers.profiles.list" => {
+            // Administrator-only, daemon-global (§5.54).
+            let base = opt_str(params, "baseProviderId");
+            api.provider_profiles_list(base)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.create" => api
+            .provider_profiles_create(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "providers.profiles.update" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_update(profile_id, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.delete" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_delete(profile_id)
+                .await
+                .map_err(domain_to_rpc)
         }
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server

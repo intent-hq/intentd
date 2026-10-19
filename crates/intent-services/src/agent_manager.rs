@@ -1139,6 +1139,11 @@ impl BusEventSink {
         let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
             return;
         };
+        // A git-ignored untracked path can never be committed, so a row for
+        // it would sit in `unstaged` forever (intent-hq/intent#7266).
+        if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+            return;
+        }
 
         // Diff compute is best-effort: a missing repo / clean worktree still
         // records the attribution row (with zero stats) so provenance is kept.

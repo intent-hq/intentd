@@ -746,6 +746,13 @@ class NativeRoutingTests(unittest.TestCase):
         self.assertEqual(caller["permissions"].get("contents"), "read")
         self.assertEqual(caller["permissions"].get("actions"), "read")
 
+    def test_consumer_caller_tracks_monorepo_main(self):
+        # A SHA pin also pins the protocol docs the checks read, so docs merged
+        # first (the documented fix order) stay invisible until a hand bump
+        # (intentd#2476, #2481). @main resolves the monorepo tip per run.
+        caller = self.workflow["jobs"]["monorepo-consumer-checks"]
+        self.assertEqual(caller["uses"], "intent-hq/intent/.github/workflows/consumer-checks.yml@main")
+
     def test_consumer_caller_passes_the_self_hosted_cache_token(self):
         caller = self.workflow["jobs"]["monorepo-consumer-checks"]
         self.assertEqual(caller["secrets"], {

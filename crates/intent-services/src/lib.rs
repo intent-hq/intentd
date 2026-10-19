@@ -227,6 +227,7 @@ pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
+mod provider_profiles;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -1017,6 +1018,10 @@ pub struct Services {
     /// finishes before acquiring this gate to commit the ordinary subset.
     settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
     settings_secret_gates: Arc<settings::SecretSettingsGates>,
+    /// Named provider profile metadata (`<data_dir>/provider-profiles.json`),
+    /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
+    /// the composition root calls [`Services::with_provider_profiles_dir`].
+    provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1715,6 +1720,7 @@ impl Services {
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
+            provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -4697,6 +4703,17 @@ impl Services {
     #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Load named provider profile metadata from
+    /// `<data_dir>/provider-profiles.json` (PROTOCOL §5.54). A malformed file
+    /// is left untouched and `providers.profiles.*` report it unreadable.
+    /// Composition-root only — call before the surface is shared/cloned,
+    /// then run [`Services::sweep_provider_profile_secrets`] once.
+    #[must_use]
+    pub fn with_provider_profiles_dir(mut self, data_dir: &Path) -> Self {
+        self.provider_profiles = Arc::new(provider_profiles::ProviderProfileStore::load(data_dir));
         self
     }
 
@@ -18627,7 +18644,7 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(changes, None))
+        Box::pin(self.settings_update_checking_profiles(changes))
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -18668,6 +18685,35 @@ impl WorkspaceApi for Services {
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
+    }
+
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_list_impl(base_provider_id))
+    }
+
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_create_impl(params))
+    }
+
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_update_impl(profile_id, params))
+    }
+
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_delete_impl(profile_id))
     }
 
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -37476,11 +37522,13 @@ impl Services {
         Ok(())
     }
 
-    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
-    /// `changes:git-status` after a mutating accept-changes step.
-    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+    /// Recompute the workspace's durable line-change aggregates from its
+    /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
+    /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
+    /// stored aggregates are published as they are.
+    pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
-            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {
@@ -37498,6 +37546,12 @@ impl Services {
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        self.recompute_and_publish_metrics(workspace_id).await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
             // The step just mutated the worktree, so the cached scan is the
@@ -37650,6 +37704,7 @@ struct AcExtras {
 /// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
 /// then the metrics / usage-stats recomputes. The status is inferred from the
 /// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Untracked git-ignored paths are not recorded (intent-hq/intent#7266).
 /// Best-effort throughout — a tracking miss never fails the mutation.
 async fn record_agent_file_mutation(
     store: &Store,
@@ -37688,6 +37743,11 @@ async fn record_agent_file_mutation(
             return;
         }
     };
+    // A git-ignored untracked path can never be committed, so a row for it
+    // would sit in `unstaged` forever (intent-hq/intent#7266).
+    if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+        return;
+    }
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =
@@ -37823,6 +37883,7 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
