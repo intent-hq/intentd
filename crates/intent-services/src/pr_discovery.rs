@@ -3,6 +3,9 @@
 //! A list is authoritative only after every page succeeds. Single-flight slots
 //! also remember failures for a window: a broken repository never falls back
 //! to a request per branch. Lists never enter the richer PR-detail cache.
+//! A repository whose open PRs exceed the page cap is remembered as
+//! oversized; its workspaces then query their own heads instead
+//! (intent-hq/intent#7187).
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,9 @@ use crate::{pr_ops, Services};
 
 pub(crate) const WINDOW: Duration = Duration::from_secs(180);
 const MAX_PAGES: usize = 10;
+/// How long an oversized repository skips the capped repository-wide list
+/// before checking again whether it now fits.
+const OVERSIZED_RECHECK: Duration = Duration::from_secs(3600);
 const REPOSITORIES: usize = 128;
 const RECORDS: usize = 512;
 /// Actual HTTP attempts, including retry and redirect hops, per window.
@@ -133,6 +139,16 @@ struct Key {
     scope: CacheScope,
     repo: RepoRef,
     number: Option<u64>,
+    /// Open PRs of one same-repository head branch: the oversized-repository
+    /// path. Costed and capped like a single record read.
+    head: Option<String>,
+}
+
+impl Key {
+    /// The repository-wide open-PR listing.
+    fn is_listing(&self) -> bool {
+        self.number.is_none() && self.head.is_none()
+    }
 }
 
 #[derive(Default)]
@@ -171,6 +187,8 @@ impl Index {
 #[derive(Clone)]
 enum Value {
     Listing(Arc<Index>),
+    /// The repository has more open PRs than the page cap can list.
+    Oversized,
     Record(Arc<PullRequest>),
 }
 
@@ -235,7 +253,7 @@ impl Budget {
         // Allow at least one scheduled retry even with a slower user setting.
         // Default cadence retains the existing thirty-minute abandonment limit.
         let expires_at = now + (WINDOW * 10).max(retry_interval.saturating_mul(2));
-        let cost = if key.number.is_none() {
+        let cost = if key.is_listing() {
             LIST_RESERVATION
         } else {
             RECORD_RESERVATION
@@ -346,6 +364,7 @@ impl Discovery {
         let slots = self.slots.lock().unwrap();
         let Some((_, slot)) = slots.get(&Key {
             number: None,
+            head: None,
             ..key.clone()
         }) else {
             return false;
@@ -369,6 +388,7 @@ impl Discovery {
             scope,
             repo: repo.clone(),
             number: Some(number),
+            head: None,
         })?;
         let Ok(entry) = slot.entry.try_lock() else {
             return Some(Instant::now());
@@ -411,17 +431,12 @@ impl Discovery {
             *at = now;
             return Ok(slot.clone());
         }
-        let is_list = key.number.is_none();
+        let is_list = key.is_listing();
         let cap = if is_list { REPOSITORIES } else { RECORDS };
-        if slots
-            .keys()
-            .filter(|k| k.number.is_none() == is_list)
-            .count()
-            >= cap
-        {
+        if slots.keys().filter(|k| k.is_listing() == is_list).count() >= cap {
             let oldest = slots
                 .iter()
-                .filter(|(k, (_, s))| k.number.is_none() == is_list && Arc::strong_count(s) == 1)
+                .filter(|(k, (_, s))| k.is_listing() == is_list && Arc::strong_count(s) == 1)
                 .min_by_key(|(_, (at, _))| *at)
                 .map(|(k, _)| k.clone());
             let Some(oldest) = oldest else {
@@ -493,6 +508,18 @@ impl Discovery {
                         return Ok(value);
                     }
                 }
+            }
+        }
+        // An oversized marker carries no PR data, so neither invalidation nor
+        // an explicit refresh needs the capped list again; the per-head reads
+        // that replace it refresh normally.
+        if let Some(cached) = entry.as_ref() {
+            if matches!(cached.result, Ok(Value::Oversized))
+                && key.scope.is_current()
+                && cached.started.elapsed() < OVERSIZED_RECHECK
+            {
+                record_reuse(operation, Reuse::CacheHit);
+                return Ok(Value::Oversized);
             }
         }
         if let Some(cached) = entry.as_ref() {
@@ -569,6 +596,30 @@ impl Discovery {
                         .await
                         .map(|pr| Value::Record(Arc::new(pr)));
                 }
+                if let Some(head) = &key.head {
+                    // GitHub ignores a head filter without the owner prefix.
+                    let page = sc
+                        .list_prs(
+                            &key.repo,
+                            PrQuery {
+                                state: Some(PrState::Open),
+                                head: Some(format!("{}:{head}", key.repo.owner)),
+                                limit: Some(100),
+                                ..PrQuery::default()
+                            },
+                        )
+                        .await?;
+                    if page.next_cursor.is_some() || page.items.len() > 100 {
+                        return Err(unknown("oversized head-filtered PR page"));
+                    }
+                    let mut index = Index::default();
+                    for pr in page.items {
+                        if pr.state == PrState::Open && pr.source_branch == *head {
+                            index.branches.entry(head.clone()).or_default().push(pr);
+                        }
+                    }
+                    return Ok(Value::Listing(Arc::new(index)));
+                }
                 let mut index = Index::default();
                 let mut cursor = None;
                 let mut seen = HashSet::new();
@@ -611,7 +662,7 @@ impl Discovery {
                     }
                     cursor = Some(next);
                 }
-                Err(unknown("open PR pagination budget exhausted"))
+                Ok(Value::Oversized)
             })
             .await;
             // A refused retry can still return a real 429/500 response. Only
@@ -666,6 +717,7 @@ impl Services {
                         scope: scope.clone(),
                         repo: repo.clone(),
                         number: None,
+                        head: None,
                     },
                 )
                 .await
@@ -690,22 +742,45 @@ impl Services {
         let Some(scope) = sc.cache_scope() else {
             return pr_ops::discover_matching_open_pr(sc, repo, branch, base, exclude).await;
         };
-        let Value::Listing(index) = self
-            .pr_discovery
-            .read(
-                self,
-                sc,
-                Key {
-                    scope,
-                    repo: repo.clone(),
-                    number: None,
-                },
-            )
-            .await?
-        else {
-            unreachable!()
+        let key = |head: Option<String>| Key {
+            scope: scope.clone(),
+            repo: repo.clone(),
+            number: None,
+            head,
         };
-        let Some(pr) = index.matching(branch, base, exclude) else {
+        let pr = match self.pr_discovery.read(self, sc, key(None)).await? {
+            Value::Listing(index) => index.matching(branch, base, exclude),
+            Value::Oversized => {
+                // Same precedence as the full list: the workspace branch
+                // first, then its baseRef candidates.
+                let mut index = Index::default();
+                let mut heads = pr_ops::base_ref_match_candidates(base);
+                if !branch.is_empty() {
+                    heads.retain(|head| head != branch);
+                    heads.insert(0, branch.to_string());
+                }
+                for head in heads {
+                    let Value::Listing(page) =
+                        self.pr_discovery.read(self, sc, key(Some(head))).await?
+                    else {
+                        unreachable!()
+                    };
+                    for (name, prs) in &page.branches {
+                        index
+                            .branches
+                            .entry(name.clone())
+                            .or_default()
+                            .extend(prs.iter().cloned());
+                    }
+                    if index.matching(branch, None, exclude).is_some() {
+                        break;
+                    }
+                }
+                index.matching(branch, base, exclude)
+            }
+            Value::Record(_) => unreachable!(),
+        };
+        let Some(pr) = pr else {
             return Ok(None);
         };
         // A detail read, shared per number, supplies mergeability and confirms
@@ -735,6 +810,7 @@ impl Services {
                     scope,
                     repo: repo.clone(),
                     number: Some(number),
+                    head: None,
                 },
             )
             .await?
@@ -760,6 +836,7 @@ mod tests {
             scope: scope.clone(),
             repo: RepoRef::new("o", format!("r{repo}")),
             number,
+            head: None,
         }
     }
 

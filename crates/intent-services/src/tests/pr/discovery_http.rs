@@ -100,9 +100,16 @@ impl Api {
                             .iter()
                             .filter(|p| p["state"] == "open")
                             .filter(|p| {
-                                query
-                                    .get("head")
-                                    .is_none_or(|head| p["head"]["ref"] == *head)
+                                // GitHub filters on `owner:branch`; the bare
+                                // form is kept for the unscoped legacy path.
+                                query.get("head").is_none_or(|head| {
+                                    let branch = match head.split_once(':') {
+                                        Some(("o", branch)) => branch,
+                                        Some(_) => return false,
+                                        None => head,
+                                    };
+                                    p["head"]["ref"] == *branch
+                                })
                             })
                             .cloned()
                             .collect();
@@ -377,7 +384,8 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
         (0, 0, None, 1, true),
         (100, 0, None, 2, true),
         (101, 2, None, 2, false),
-        (1001, 0, None, 10, false),
+        // Oversized: ten capped pages, then one head-filtered read (#7187).
+        (1001, 0, None, 11, true),
         (3, 0, Some("1"), 1, false),
         (3, 0, Some("bad"), 1, false),
         (100, 0, Some("2"), 2, false),
@@ -406,13 +414,64 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
         })
         .await;
         assert_eq!(counts(&traffic), (expected_pages, 0, 0));
-        assert!(api
+        let filtered = api
             .requests
             .lock()
             .unwrap()
             .iter()
-            .all(|p| !p.contains("head=")));
+            .filter(|p| p.contains("head="))
+            .count();
+        assert_eq!(filtered, usize::from(size > 1000));
     }
+}
+
+/// intent-hq/intent#7187: a repository with more than 1,000 open PRs
+/// cannot be listed within the page cap. Discovery must still find the
+/// workspace PR with one head-filtered request, and must not re-list the
+/// whole repository on every refresh window.
+#[tokio::test]
+async fn shared_discovery_oversized_repository_uses_head_filtered_query() {
+    let mut data: Vec<_> = (1..=1200).map(|n| pull(n, "other")).collect();
+    data.push(pull(1300, "feature"));
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let found = svc
+            .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+            .await
+            .expect("an oversized repository is not a discovery failure");
+        assert_eq!(found.map(|pr| pr.number), Some(1300));
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        // Ten capped listing pages once, then one filtered request per head.
+        assert_eq!(counts(&traffic), (12, 1, 0));
+        for _ in 0..5 {
+            svc.pr_discovery.expire();
+            assert_eq!(
+                svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                    .await
+                    .unwrap()
+                    .map(|pr| pr.number),
+                Some(1300)
+            );
+        }
+        // Later windows re-read only the filtered head, never the full list.
+        assert_eq!(counts(&traffic), (17, 6, 0));
+    })
+    .await;
+    let requests = api.requests.lock().unwrap();
+    let filtered: Vec<_> = requests.iter().filter(|p| p.contains("head=")).collect();
+    assert_eq!(filtered.len(), 7, "{filtered:?}");
+    assert!(
+        filtered.iter().all(|p| p.contains("head=o%3A")),
+        "GitHub ignores a head filter without the owner: {filtered:?}"
+    );
 }
 
 #[tokio::test]
