@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.9] - 2026-10-19
+
+### 🚀 Features
+
+- *(providers)* Profile-aware execution context ([#2460](https://github.com/intent-hq/intentd/pull/2460))
+- *(agent)* Flag list-row previews the list cap shortened ([#2480](https://github.com/intent-hq/intentd/pull/2480))
+- *(cli)* Add intentd pair --host for loopback-only daemons ([#2486](https://github.com/intent-hq/intentd/pull/2486))
+- *(providers)* Store named provider profiles and add providers.profiles.* RPCs ([#2459](https://github.com/intent-hq/intentd/pull/2459))
+- *(providers)* Route named profile selections through every selection path ([#2462](https://github.com/intent-hq/intentd/pull/2462))
+- *(providers)* Profile switches, native-session ownership and settings activation ([#2465](https://github.com/intent-hq/intentd/pull/2465))
+
+### 🐛 Bug Fixes
+
+- *(events)* Broadcast persisted events before waking the publisher ([#2487](https://github.com/intent-hq/intentd/pull/2487))
+- Bump Codex ACP fallback to v2.2.2 ([#2382](https://github.com/intent-hq/intentd/pull/2382))
+- *(file-tracking)* Stop keeping attribution rows for git-ignored and clean paths ([#2479](https://github.com/intent-hq/intentd/pull/2479))
+- *(release)* Keep the intentd version group in lockstep on sitter-only releases ([#2485](https://github.com/intent-hq/intentd/pull/2485))
+
+### 📚 Documentation
+
+- *(guide)* Single Open in original workspace item shows only its label ([#2494](https://github.com/intent-hq/intentd/pull/2494))
+
+
 ## [0.11.8] - 2026-10-18
 
 ### 🚀 Features
