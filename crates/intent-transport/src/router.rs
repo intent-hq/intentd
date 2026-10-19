@@ -1241,12 +1241,22 @@ async fn dispatch_other(
                         .collect::<std::result::Result<Vec<_>, _>>()
                 })
                 .transpose()?;
+            let recipient_agent_ids = params
+                .get("recipientAgentIds")
+                .map(|value| {
+                    serde_json::from_value::<Vec<intent_core::AgentId>>(value.clone()).map_err(
+                        |_| invalid_params("recipientAgentIds must be an array of strings"),
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
             let result = api
                 .discussion_send(
                     id,
                     message_id,
                     body,
                     intent_core::discussion::DiscussionTarget {
+                        recipient_agent_ids,
                         conversation_id,
                         recipient_principal_ids,
                         reply_to_message_id: discussion_optional_id(params, "replyToMessageId")?,

@@ -235,16 +235,16 @@ async fn discussion_requires_humans_and_current_membership() {
     ] {
         assert!(matches!(
             with_caller(caller.clone(), svc.discussion_send_op(&ws, "id", "hello")).await,
-            Err(Error::Forbidden(_))
+            Err(Error::Forbidden(_) | Error::NotFound(_))
         ));
         assert!(matches!(
             with_caller(caller, svc.discussion_list_op(&ws, None, None, 50)).await,
-            Err(Error::Forbidden(_))
+            Err(Error::Forbidden(_) | Error::NotFound(_))
         ));
     }
     assert!(matches!(
         svc.discussion_send_op(&ws, "id", "hello").await,
-        Err(Error::Forbidden(_))
+        Err(Error::Forbidden(_) | Error::NotFound(_))
     ));
     assert!(matches!(
         with_caller(
@@ -264,7 +264,7 @@ async fn discussion_requires_humans_and_current_membership() {
     )
     .await
     .unwrap();
-    assert_eq!(first.author.principal_id, guest.id);
+    assert_eq!(first.author.principal_id, Some(guest.id.clone()));
     assert_eq!(first.author.login.as_deref(), Some("member"));
     assert_eq!(first.body, " hello\nthere ");
     for (id, body) in [
@@ -566,9 +566,23 @@ async fn discussion_conversations_authorize_participants_even_for_owner_and_offl
         )
         .await
         .is_err());
+        let expected = match &caller {
+            Caller::Agent { .. } => Some(0),
+            Caller::Wire { principal_id, .. }
+                if principal_id == &p[0].id || principal_id == &p[3].id =>
+            {
+                Some(1)
+            }
+            _ => None,
+        };
         let list = with_caller(caller, svc.discussion_conversations_op(&ws, None, 100)).await;
-        if let Ok(list) = list {
-            assert_eq!(list["conversations"].as_array().unwrap().len(), 1);
+        if let Some(expected) = expected {
+            assert_eq!(
+                list.unwrap()["conversations"].as_array().unwrap().len(),
+                expected
+            );
+        } else {
+            assert!(list.is_err());
         }
     }
     svc.store
@@ -1136,3 +1150,5 @@ async fn discussion_reaction_concurrency_and_send_retry_keep_viewer_state() {
         assert_eq!(history["messages"][0]["sequence"], 1);
     }
 }
+
+mod agents;

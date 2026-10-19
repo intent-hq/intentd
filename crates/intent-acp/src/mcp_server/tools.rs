@@ -144,6 +144,7 @@ Namespaces (index — full signatures in API below):
   ws.workspace.* — workspace info, title, status message
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
+  ws.discussion.* — explicitly addressed workspace discussion history and replies (Multiplayer Labs)
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks
@@ -191,6 +192,10 @@ API:
   ws.note.editLines(id, { start, end, content }) → { ... }  // Line-based replace/delete/insert. `start` and `end` are 1-based and INCLUSIVE. To delete lines, pass `content: ""`. To insert after a line, set `start` and `end` to the same line and include both the original line and new lines in `content`.
   ws.note.updateMetadata(id, { title?, tags? }) → { ... }  // Safest way to change only title/tags; content is untouched. The spec note title is always `Spec` and cannot be changed.
   ws.note.delete(id) → { ok, noteId, deleted }  // Permanently removes a note.
+
+  ws.discussion.conversations({ beforeId?, limit? }?) → { conversations, hasMore }  // Lists only discussions that explicitly addressed this agent. Multiplayer Labs; currently workspace-wide only. No implicit access or subscriptions.
+  ws.discussion.list(conversationId, { beforeSequence?, afterSequence?, limit? }?) → { messages, hasMore, conversation }  // Read context only after being explicitly addressed. Pages contain at most 100 messages (default 50); before/after are exclusive and mutually exclusive. Private discussions remain unavailable to agents.
+  ws.discussion.send(conversationId, body, { messageId, recipientAgentIds?, replyToMessageId? }) → { message, conversation }  // Explicitly post a reply to a granted discussion. messageId is a required unique retry key (keep it and all fields unchanged on retry). Only recipientAgentIds wakes agents; ordinary text or links never do. Up to 31 distinct same-workspace, nonretired agents, excluding yourself. Omit recipients to reply to humans without waking agents. Identity is stamped from this session. Your final turn output never automatically posts here.
 
   ws.comment.add(noteId, { searchContext, commentTarget, comment, type?, author?, authorType? }) → { ... }  // Anchor a comment by text search. Use enough `searchContext` to be unique; `commentTarget` must be a substring inside it. `authorType` is `"user"` or `"agent"` (default `"agent"`).
     Search is case- and whitespace-sensitive. You can use the same text for both fields to comment on an entire phrase, and anchor errors explain how to fix mismatches.

@@ -1,4 +1,4 @@
-//! Human-only workspace discussion operations; all transports share these gates.
+//! Explicitly addressed workspace discussions; all transports share these gates.
 use intent_core::discussion::{
     DiscussionAuthor, DiscussionSendResult, DiscussionTarget, DEFAULT_CONVERSATION,
     DISCUSSION_BODY_MAX_BYTES, DISCUSSION_RECIPIENT_MAX,
@@ -76,10 +76,15 @@ impl Services {
         after: Option<i64>,
         limit: u32,
     ) -> Result<Value> {
-        let principal = self.discussion_access(ws, id).await?;
+        let principal = if let Some(Caller::Agent { agent_id }) = current_caller() {
+            self.discussion_agent_access(ws, id, &agent_id).await?;
+            None
+        } else {
+            Some(self.discussion_access(ws, id).await?)
+        };
         let page = self
             .store
-            .list_discussion_messages_for(ws, id, before, after, limit, Some(&principal))
+            .list_discussion_messages_for(ws, id, before, after, limit, principal.as_ref())
             .await?;
         let conversation = self.store.discussion_conversation(ws, id).await?;
         Ok(json!({"messages":page.messages,"hasMore":page.has_more,"conversation":conversation}))
@@ -91,6 +96,28 @@ impl Services {
         before: Option<&str>,
         limit: u32,
     ) -> Result<Value> {
+        if let Some(Caller::Agent { agent_id }) = current_caller() {
+            if !(1..=100).contains(&limit) || before == Some("") {
+                return Err(Error::InvalidParams(
+                    "invalid conversation page bounds".into(),
+                ));
+            }
+            let visible = before.is_none()
+                && self
+                    .store
+                    .discussion_agent_access(ws, DEFAULT_CONVERSATION, &agent_id)
+                    .await?;
+            let conversations = if visible {
+                vec![
+                    self.store
+                        .discussion_conversation(ws, DEFAULT_CONVERSATION)
+                        .await?,
+                ]
+            } else {
+                vec![]
+            };
+            return Ok(json!({"conversations":conversations,"hasMore":false}));
+        }
         let principal = self.discussion_human(ws).await?;
         self.store
             .discussion_conversations(ws, &principal, before, limit)
@@ -117,7 +144,29 @@ impl Services {
         body: &str,
         target: &DiscussionTarget,
     ) -> Result<DiscussionSendResult> {
-        let principal_id = self.discussion_human(workspace_id).await?;
+        let agent_id = match current_caller() {
+            Some(Caller::Agent { agent_id }) => Some(agent_id),
+            _ => None,
+        };
+        let principal_id = if let Some(agent) = &agent_id {
+            if target.recipient_principal_ids.is_some() {
+                return Err(Error::Forbidden(
+                    "agents cannot create private discussions".into(),
+                ));
+            }
+            self.discussion_agent_access(
+                workspace_id,
+                target
+                    .conversation_id
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CONVERSATION),
+                agent,
+            )
+            .await?;
+            None
+        } else {
+            Some(self.discussion_human(workspace_id).await?)
+        };
         if message_id.trim().is_empty() || message_id.len() > 128 {
             return Err(Error::InvalidParams(
                 "messageId must be nonblank and at most 128 UTF-8 bytes".into(),
@@ -147,7 +196,9 @@ impl Services {
             if recipients.is_empty()
                 || recipients.len() > DISCUSSION_RECIPIENT_MAX
                 || unique.len() != recipients.len()
-                || recipients.contains(&principal_id)
+                || principal_id
+                    .as_ref()
+                    .is_some_and(|id| recipients.contains(id))
                 || recipients.iter().any(|p| p.as_str().is_empty())
             {
                 return Err(Error::InvalidParams(
@@ -155,7 +206,7 @@ impl Services {
                         .into(),
                 ));
             }
-        } else {
+        } else if agent_id.is_none() {
             self.discussion_access(
                 workspace_id,
                 target
@@ -165,13 +216,45 @@ impl Services {
             )
             .await?;
         }
-        let principal = self.store.get_principal(&principal_id).await?;
-        let actor_name = crate::principal_ops::principal_attribution_name(&principal);
-        let author = DiscussionAuthor {
-            principal_id,
-            login: principal.login,
-            display_name: principal.display_name,
-            avatar_url: principal.avatar_url,
+        let (author, actor) = if let Some(agent) = agent_id {
+            let session = self.store.get_agent_session_summary(&agent).await?;
+            (
+                DiscussionAuthor {
+                    principal_id: None,
+                    agent_id: Some(agent.clone()),
+                    login: None,
+                    display_name: Some(session.name.clone()),
+                    avatar_url: None,
+                },
+                EventActor {
+                    actor_type: ActorType::Agent,
+                    id: Some(agent.0),
+                    name: Some(session.name),
+                    ..EventActor::default()
+                },
+            )
+        } else {
+            let principal = self
+                .store
+                .get_principal(principal_id.as_ref().expect("human caller"))
+                .await?;
+            let name = crate::principal_ops::principal_attribution_name(&principal);
+            let actor = EventActor {
+                actor_type: ActorType::User,
+                id: Some(principal.id.0.clone()),
+                name: Some(name),
+                ..EventActor::default()
+            };
+            (
+                DiscussionAuthor {
+                    principal_id: Some(principal.id),
+                    agent_id: None,
+                    login: principal.login,
+                    display_name: principal.display_name,
+                    avatar_url: principal.avatar_url,
+                },
+                actor,
+            )
         };
         let (mut result, inserted) = self
             .store
@@ -186,12 +269,7 @@ impl Services {
                     workspace_id: workspace_id.clone(),
                     timestamp: result.message.created_at.clone(),
                     event_type: DISCUSSION_MESSAGE.into(),
-                    actor: EventActor {
-                        actor_type: ActorType::User,
-                        id: Some(author.principal_id.0.clone()),
-                        name: Some(actor_name),
-                        ..EventActor::default()
-                    },
+                    actor,
                     session_id: None,
                     correlation_id: None,
                     parent_event_id: None,
@@ -200,18 +278,43 @@ impl Services {
                 },
             );
         }
-        let state = self
-            .store
-            .discussion_reaction_state(
-                workspace_id,
-                &result.message.conversation_id,
-                &result.message.id,
-                &author.principal_id,
-            )
-            .await?;
-        result.message.reactions = state.reactions;
-        result.message.reaction_version = state.reaction_version;
+        // Retry also resumes any committed handoff that did not finish.
+        if !result.message.recipient_agent_ids.is_empty() {
+            self.dispatch_discussion_deliveries(Some(result.message.id.clone()), true)
+                .await?;
+            self.retry_pending_discussion_message(&result.message)
+                .await?;
+        }
+        if let Some(principal) = author.principal_id.as_ref() {
+            let state = self
+                .store
+                .discussion_reaction_state(
+                    workspace_id,
+                    &result.message.conversation_id,
+                    &result.message.id,
+                    principal,
+                )
+                .await?;
+            result.message.reactions = state.reactions;
+            result.message.reaction_version = state.reaction_version;
+        }
         Ok(result)
+    }
+
+    async fn discussion_agent_access(
+        &self,
+        ws: &WorkspaceId,
+        conversation: &str,
+        agent: &intent_core::AgentId,
+    ) -> Result<()> {
+        if !self
+            .store
+            .discussion_agent_access(ws, conversation, agent)
+            .await?
+        {
+            return Err(Error::NotFound("Discussion not found".into()));
+        }
+        Ok(())
     }
 
     pub(crate) async fn discussion_react_op(

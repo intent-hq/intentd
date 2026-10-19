@@ -16,7 +16,8 @@ fn missing() -> Error {
 }
 fn profile(r: &SqliteRow) -> DiscussionAuthor {
     DiscussionAuthor {
-        principal_id: PrincipalId(r.get("id")),
+        principal_id: Some(PrincipalId(r.get("id"))),
+        agent_id: None,
         login: r.get("login"),
         display_name: r.get("display_name"),
         avatar_url: r.get("avatar_url"),
@@ -185,19 +186,59 @@ impl Store {
         let mut tx = self.write_pool().begin().await.map_err(|e| db(&e))?;
         // Recheck after acquiring the serialized writer: a removal that won
         // the write race must revoke appends and retries, including default.
-        let membership_sql = format!("SELECT EXISTS(SELECT 1 FROM principal p JOIN workspace w ON w.id=? WHERE p.id=? AND {ELIGIBLE})");
-        let member: bool = sqlx::query_scalar(&membership_sql)
-            .bind(ws.as_str())
-            .bind(author.principal_id.as_str())
-            .bind(ws.as_str())
-            .bind(ws.as_str())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| db(&e))?;
-        if !member {
-            return Err(missing());
+        let principal_id = author.principal_id.as_ref();
+        let agent_id = author.agent_id.as_ref();
+        if principal_id.is_some() == agent_id.is_some() {
+            return Err(Error::InvalidParams(
+                "discussion requires exactly one author identity".into(),
+            ));
         }
-        let old=sqlx::query("SELECT * FROM workspace_discussion_message WHERE workspace_id=? AND principal_id=? AND client_message_id=?").bind(ws.as_str()).bind(author.principal_id.as_str()).bind(key).fetch_optional(&mut *tx).await.map_err(|e|db(&e))?;
+        let conversation_id = target
+            .conversation_id
+            .as_deref()
+            .unwrap_or(DEFAULT_CONVERSATION);
+        // Ordinary agent transcripts are workspace-visible. Private discussion
+        // content must never enter that wider surface.
+        if (agent_id.is_some() || !target.recipient_agent_ids.is_empty())
+            && (conversation_id != DEFAULT_CONVERSATION || target.recipient_principal_ids.is_some())
+        {
+            return Err(Error::Forbidden(
+                "agent messaging is available only in the workspace discussion".into(),
+            ));
+        }
+        let mut recipients = target.recipient_agent_ids.clone();
+        recipients.sort();
+        if recipients.len() > intent_core::discussion::DISCUSSION_RECIPIENT_MAX
+            || recipients.windows(2).any(|w| w[0] == w[1])
+            || recipients
+                .iter()
+                .any(|id| id.as_str().trim().is_empty() || Some(id) == agent_id)
+        {
+            return Err(Error::InvalidParams(
+                "recipientAgentIds must contain at most 31 distinct other agents".into(),
+            ));
+        }
+        if let Some(agent) = agent_id {
+            if !super::discussion_agent_repo::agent_access_in(&mut tx, ws, conversation_id, agent)
+                .await?
+            {
+                return Err(missing());
+            }
+        } else {
+            let membership_sql = format!("SELECT EXISTS(SELECT 1 FROM principal p JOIN workspace w ON w.id=? WHERE p.id=? AND {ELIGIBLE})");
+            let member: bool = sqlx::query_scalar(&membership_sql)
+                .bind(ws.as_str())
+                .bind(principal_id.map(PrincipalId::as_str))
+                .bind(ws.as_str())
+                .bind(ws.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| db(&e))?;
+            if !member {
+                return Err(missing());
+            }
+        }
+        let old=sqlx::query("SELECT * FROM workspace_discussion_message WHERE workspace_id=? AND principal_id IS ? AND agent_id IS ? AND client_message_id=?").bind(ws.as_str()).bind(principal_id.map(PrincipalId::as_str)).bind(agent_id.map(intent_core::AgentId::as_str)).bind(key).fetch_optional(&mut *tx).await.map_err(|e|db(&e))?;
         if let Some(row) = old {
             let message = super::discussion_repo::message(&row)?;
             let conversation = read_conversation(&mut tx, ws, &message.conversation_id).await?;
@@ -205,11 +246,11 @@ impl Store {
                 let mut ids: Vec<_> = conversation
                     .participants
                     .iter()
-                    .map(|p| p.principal_id.clone())
+                    .filter_map(|p| p.principal_id.clone())
                     .collect();
                 ids.sort();
                 let mut wanted = recipients.clone();
-                wanted.push(author.principal_id.clone());
+                wanted.push(principal_id.ok_or_else(missing)?.clone());
                 wanted.sort();
                 ids == wanted && conversation.kind != "workspace"
             } else {
@@ -219,7 +260,8 @@ impl Store {
                     .unwrap_or(DEFAULT_CONVERSATION)
                     == message.conversation_id
             };
-            if message.body != body
+            if message.recipient_agent_ids != recipients
+                || message.body != body
                 || !same_target
                 || message.reply_to_message_id != target.reply_to_message_id
             {
@@ -228,7 +270,7 @@ impl Store {
                 ));
             }
             if message.conversation_id != DEFAULT_CONVERSATION {
-                let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE conversation_id=? AND principal_id=?)").bind(&message.conversation_id).bind(author.principal_id.as_str()).fetch_one(&mut *tx).await.map_err(|e|db(&e))?;
+                let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE conversation_id=? AND principal_id=?)").bind(&message.conversation_id).bind(principal_id.map(PrincipalId::as_str)).fetch_one(&mut *tx).await.map_err(|e|db(&e))?;
                 if !allowed {
                     return Err(missing());
                 }
@@ -242,9 +284,14 @@ impl Store {
                 false,
             ));
         }
+        for recipient in &recipients {
+            if !super::discussion_agent_repo::agent_eligible_in(&mut tx, ws, recipient).await? {
+                return Err(missing());
+            }
+        }
         let conversation = if let Some(recipients) = &target.recipient_principal_ids {
             let mut ids = recipients.clone();
-            ids.push(author.principal_id.clone());
+            ids.push(principal_id.ok_or_else(missing)?.clone());
             ids.sort();
             let sql=format!("SELECT p.id,p.login,p.display_name,p.avatar_url FROM principal p WHERE p.id IN (SELECT value FROM json_each(?)) AND {ELIGIBLE} ORDER BY p.id");
             let rows = sqlx::query(&sql)
@@ -275,7 +322,7 @@ impl Store {
                 .as_deref()
                 .unwrap_or(DEFAULT_CONVERSATION);
             if id != DEFAULT_CONVERSATION {
-                let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE workspace_id=? AND conversation_id=? AND principal_id=?)").bind(ws.as_str()).bind(id).bind(author.principal_id.as_str()).fetch_one(&mut *tx).await.map_err(|e|db(&e))?;
+                let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_participant WHERE workspace_id=? AND conversation_id=? AND principal_id=?)").bind(ws.as_str()).bind(id).bind(principal_id.map(PrincipalId::as_str)).fetch_one(&mut *tx).await.map_err(|e|db(&e))?;
                 if !allowed {
                     return Err(missing());
                 }
@@ -298,7 +345,19 @@ impl Store {
             None
         };
         let id = uuid::Uuid::now_v7().to_string();
-        sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at,reply_to_message_id,reply_to_json) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(author.principal_id.as_str()).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).bind(&target.reply_to_message_id).bind(reply).execute(&mut *tx).await.map_err(|e|db(&e))?;
+        sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at,reply_to_message_id,reply_to_json) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(principal_id.map(PrincipalId::as_str)).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).bind(&target.reply_to_message_id).bind(reply).execute(&mut *tx).await.map_err(|e|db(&e))?;
+        sqlx::query("UPDATE workspace_discussion_message SET agent_id=?,recipient_agent_ids_json=? WHERE id=?")
+            .bind(agent_id.map(intent_core::AgentId::as_str))
+            .bind(serde_json::to_string(&recipients).map_err(|e| Error::Internal(e.to_string()))?)
+            .bind(&id).execute(&mut *tx).await.map_err(|e| db(&e))?;
+        for recipient in &recipients {
+            sqlx::query("INSERT OR IGNORE INTO discussion_agent_grant(workspace_id,conversation_id,agent_id) VALUES(?,?,?)")
+                .bind(ws.as_str()).bind(&conversation.id).bind(recipient.as_str())
+                .execute(&mut *tx).await.map_err(|e| db(&e))?;
+            sqlx::query("INSERT INTO discussion_agent_delivery(message_id,agent_id,workspace_id) VALUES(?,?,?)")
+                .bind(&id).bind(recipient.as_str()).bind(ws.as_str())
+                .execute(&mut *tx).await.map_err(|e| db(&e))?;
+        }
         let row = sqlx::query("SELECT * FROM workspace_discussion_message WHERE id=?")
             .bind(&id)
             .fetch_one(&mut *tx)

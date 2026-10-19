@@ -1,5 +1,5 @@
 use super::*;
-use intent_core::WorkspaceRole;
+use intent_core::{AgentId, WorkspaceRole};
 use serde_json::json;
 
 #[tokio::test]
@@ -112,7 +112,8 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     let first = sent["result"]["message"].clone();
     assert!(first["id"].is_string(), "{sent}");
     assert_ne!(first["id"], "same-client-id");
-    assert_eq!(first.as_object().unwrap().len(), 11);
+    assert_eq!(first.as_object().unwrap().len(), 12);
+    assert_eq!(first["recipientAgentIds"], json!([]));
     assert_eq!(first["replyToMessageId"], Value::Null);
     assert_eq!(first["replyTo"], Value::Null);
     assert_eq!(first["reactions"], json!([]));
@@ -1003,6 +1004,109 @@ async fn discussion_reactions_and_replies_are_durable_private_and_projected_over
     reconnected.close().await;
     alice.close().await;
     bob.close().await;
+    owner.close().await;
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn discussion_explicit_agent_delivery_grants_replies_and_retry_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    let a = AgentId::from("agent-discussion-wss-a");
+    let b = AgentId::from("agent-discussion-wss-b");
+    for id in [&a, &b] {
+        sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES(?,?,'WSS helper','idle',?,?)")
+            .bind(id.as_str()).bind(ws.as_str()).bind(intent_core::now_iso()).bind(intent_core::now_iso())
+            .execute(srv.store.write_pool()).await.unwrap();
+    }
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    let hello = owner
+        .call(1, "client.hello", json!({"name":"Discussion agents test"}))
+        .await;
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["discussionAgentMessaging"],
+        1
+    );
+    let caps = owner.call(2, "system.capabilities", json!({})).await;
+    assert_eq!(caps["result"]["discussionAgentMessaging"], 1);
+    let ordinary = owner
+        .call(
+            3,
+            "discussion.send",
+            json!({"workspaceId":ws,"messageId":"ordinary","body":"human conversation"}),
+        )
+        .await;
+    assert!(
+        ordinary["result"]["message"]["id"].is_string(),
+        "{ordinary}"
+    );
+    assert!(srv.store.load_all_agent_queues().await.unwrap().is_empty());
+    let params = json!({"workspaceId":ws,"messageId":"addressed","body":"please review","recipientAgentIds":[a],"author":{"agentId":b}});
+    let sent = owner.call(4, "discussion.send", params.clone()).await;
+    assert_eq!(sent["jsonrpc"], "2.0");
+    assert_eq!(sent["id"], 4);
+    assert!(
+        sent["result"]["message"]["author"]["principalId"].is_string(),
+        "{sent}"
+    );
+    assert!(sent["result"]["message"]["author"].get("agentId").is_none());
+    assert_eq!(sent["result"]["message"]["recipientAgentIds"], json!([a]));
+    let retry = owner.call(5, "discussion.send", params).await;
+    assert_eq!(retry["result"], sent["result"]);
+    let rows = srv.store.load_all_agent_queues().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].agent_id, a);
+    assert!(rows[0].payload["content"]
+        .as_str()
+        .unwrap()
+        .contains("please review"));
+    let changed = owner.call(6, "discussion.send", json!({"workspaceId":ws,"messageId":"addressed","body":"please review","recipientAgentIds":[b]})).await;
+    assert_eq!(changed["error"]["code"], -32602);
+    // The same shared services are called by the bound agent MCP bridge.
+    let caller = intent_core::Caller::Agent {
+        agent_id: a.clone(),
+    };
+    let history = intent_core::with_caller(
+        caller.clone(),
+        srv.api
+            .discussion_list(ws.clone(), "default".into(), None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history["messages"].as_array().unwrap().len(), 2);
+    let reply = intent_core::with_caller(
+        caller,
+        srv.api.discussion_send(
+            ws.clone(),
+            "agent-reply".into(),
+            "reviewed".into(),
+            intent_core::discussion::DiscussionTarget::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply.message.author.agent_id, Some(a.clone()));
+    assert_eq!(reply.message.author.principal_id, None);
+    let history = owner
+        .call(7, "discussion.list", json!({"workspaceId":ws}))
+        .await;
+    assert_eq!(
+        history["result"]["messages"][2]["author"]["agentId"],
+        a.as_str()
+    );
+    assert_eq!(
+        history["result"]["messages"][2]["author"]["principalId"],
+        Value::Null
+    );
+    assert_eq!(srv.store.load_all_agent_queues().await.unwrap().len(), 1);
+    for recipients in [json!(null), json!([a, a]), json!(["unknown"])] {
+        let denied = owner.call(8, "discussion.send", json!({"workspaceId":ws,"messageId":"invalid","body":"no","recipientAgentIds":recipients})).await;
+        assert!(denied.get("error").is_some(), "{denied}");
+    }
     owner.close().await;
     srv.ws.stop().await;
 }

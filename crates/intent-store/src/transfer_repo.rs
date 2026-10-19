@@ -76,7 +76,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ),
     (
         "agent_queue",
-        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed')",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed') AND NOT EXISTS (SELECT 1 FROM json_tree(payload) ref WHERE ref.key='discussionMessageId')",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
     ("agent_flipped_completion", "workspace_id = ?1"),
@@ -118,6 +118,8 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("discussion_agent_grant", "local explicit addressing authority is never restored on import"),
+    ("discussion_agent_delivery", "pending addressed messages must not replay on a destination"),
     ("pull_request_workspace_candidate", "write-only trigger funnel; its BEFORE INSERT trigger ignores every row, so it never holds data"),
     ("review_context_private_family", "installation-private denial history; never imported or transferred"),
     ("review_context_enrollment", "installation-private native family; never imported or transferred"),
@@ -2227,7 +2229,7 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 discussion_conversation: id, workspace_id, kind, participants_json, created_at
 discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
-workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version
+workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json
 discussion_reaction: id, workspace_id, message_id, principal_id, reaction
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto

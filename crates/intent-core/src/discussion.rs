@@ -1,7 +1,7 @@
-//! Human workspace discussions, separate from agent conversations.
+//! Workspace discussions, separate from agent sessions; agent access requires explicit addressing.
 use serde::{Deserialize, Serialize};
 
-use crate::{PrincipalId, WorkspaceId};
+use crate::{AgentId, PrincipalId, WorkspaceId};
 
 pub const DEFAULT_CONVERSATION: &str = "default";
 pub const DISCUSSION_RECIPIENT_MAX: usize = 31;
@@ -11,13 +11,15 @@ pub const DISCUSSION_PAGE_MAX: u32 = 100;
 pub const DISCUSSION_PAGE_DEFAULT: u32 = 50;
 pub const DISCUSSION_REACTIONS: [&str; 2] = ["👍", "🙂"];
 
-/// Profile snapshot captured from the authenticated human at send time.
+/// Profile snapshot captured from the authenticated human or bound agent at send time.
 /// After workspace transfer the principal id is inert source attribution;
 /// never resolve it against the destination registry or use it as authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussionAuthor {
-    pub principal_id: PrincipalId,
+    pub principal_id: Option<PrincipalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
     pub login: Option<String>,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
@@ -32,6 +34,8 @@ pub struct DiscussionMessage {
     pub conversation_id: String,
     pub sequence: i64,
     pub body: String,
+    #[serde(default)]
+    pub recipient_agent_ids: Vec<AgentId>,
     pub author: DiscussionAuthor,
     pub created_at: String,
     #[serde(default)]
@@ -99,6 +103,7 @@ pub struct DiscussionSendResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscussionTarget {
+    pub recipient_agent_ids: Vec<AgentId>,
     pub conversation_id: Option<String>,
     pub recipient_principal_ids: Option<Vec<PrincipalId>>,
     pub reply_to_message_id: Option<String>,

@@ -82,6 +82,7 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_delivery;
 mod discussion_ops;
 mod disk_usage;
 mod drafts;
@@ -18757,6 +18758,7 @@ impl WorkspaceApi for Services {
             let mut caps = serde_json::Map::new();
             caps.insert("discussionConversations".into(), serde_json::json!(1));
             caps.insert("discussionMessageActions".into(), serde_json::json!(1));
+            caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }

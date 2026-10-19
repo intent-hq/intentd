@@ -1293,6 +1293,16 @@ pub(crate) struct TransformOutcome {
     pub interrupted_agent_ids: Vec<String>,
 }
 
+fn has_discussion_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key("discussionMessageId") || map.values().any(has_discussion_reference)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_discussion_reference),
+        _ => false,
+    }
+}
+
 /// Agent statuses that count as in-flight at export time — the same set
 /// [`crate::is_stale_in_flight_status`] heals after a daemon restart, in
 /// their persisted DB spellings (serde wire forms of `Active` / `Processing`
@@ -1346,11 +1356,24 @@ fn transform_rows(
 
     for (table, mut objects) in rows {
         match table.as_str() {
-            "draft" => continue,
+            "draft" | "discussion_agent_grant" | "discussion_agent_delivery" => continue,
+            "agent_queue" => {
+                // Also fence archives produced before the source-side filter,
+                // including discussion references nested in combined retry groups.
+                objects.retain(|row| {
+                    !row.get("payload")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                        .is_some_and(|payload| has_discussion_reference(&payload))
+                });
+            }
             "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
                 for object in &mut objects {
-                    expect_object(&table, object)?
-                        .insert("principal_id".into(), serde_json::Value::Null);
+                    let map = expect_object(&table, object)?;
+                    map.insert("principal_id".into(), serde_json::Value::Null);
+                    if table == "workspace_discussion_message" {
+                        map.insert("agent_id".into(), serde_json::Value::Null);
+                    }
                 }
             }
             "interrupted_agent" => {
@@ -1690,6 +1713,56 @@ mod tests {
         assert!(row.get("legacy_author_principal_id").is_none());
     }
 
+    #[test]
+    fn discussion_agent_import_clears_retry_identity_grants_and_nested_queue_references() {
+        let author = serde_json::json!({"principalId":null,"agentId":"source-agent","displayName":"Source helper","login":null,"avatarUrl":null});
+        let rows = vec![
+            (
+                "workspace_discussion_message".into(),
+                vec![
+                    serde_json::json!({"principal_id":null,"agent_id":"source-agent","author_json":author.to_string()}),
+                ],
+            ),
+            (
+                "discussion_agent_grant".into(),
+                vec![serde_json::json!({"agent_id":"source-agent"})],
+            ),
+            (
+                "discussion_agent_delivery".into(),
+                vec![serde_json::json!({"agent_id":"source-agent"})],
+            ),
+            (
+                "agent_queue".into(),
+                vec![
+                    serde_json::json!({"payload":serde_json::json!({"deliveryGroups":[{"messageMetadata":{"discussionMessageId":"source-message"}}]}).to_string()}),
+                    serde_json::json!({"payload":"{}"}),
+                ],
+            ),
+        ];
+        let transformed = transform_rows(rows, &ws(), &root(), "now").unwrap();
+        assert!(!transformed.rows.iter().any(
+            |(name, _)| name == "discussion_agent_grant" || name == "discussion_agent_delivery"
+        ));
+        let message = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "workspace_discussion_message")
+            .unwrap()
+            .1[0];
+        assert!(message["agent_id"].is_null());
+        assert_eq!(message["author_json"], author.to_string());
+        assert_eq!(
+            transformed
+                .rows
+                .iter()
+                .find(|(name, _)| name == "agent_queue")
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn discussion_transfer_does_not_rebind_colliding_human_or_retry_identity() {
         use crate::tests::{workspace, TempDb};
@@ -1709,7 +1782,8 @@ mod tests {
         // The source author deliberately collides with a different destination
         // profile; historic labels must remain a snapshot, never a live lookup.
         let author = DiscussionAuthor {
-            principal_id: local.id.clone(),
+            agent_id: None,
+            principal_id: Some(local.id.clone()),
             login: Some("source-human".into()),
             display_name: Some("Source Human".into()),
             avatar_url: Some("https://example.test/source.png".into()),
@@ -1854,7 +1928,7 @@ mod tests {
         assert_ne!(next.id, original.id);
         assert_eq!(next.sequence, 3);
         assert_eq!(next.body, "destination message");
-        assert_eq!(next.author.principal_id, local.id);
+        assert_eq!(next.author.principal_id, Some(local.id));
         assert_eq!(next.author.login, local.login);
         assert_eq!(next.author.display_name, local.display_name);
         assert_eq!(next.author.avatar_url, local.avatar_url);

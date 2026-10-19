@@ -15,7 +15,8 @@ async fn discussion_atomic_retries_page_boundaries_and_reopen() {
             .unwrap();
     }
     let author = DiscussionAuthor {
-        principal_id: store.get_primary_principal().await.unwrap().id,
+        agent_id: None,
+        principal_id: Some(store.get_primary_principal().await.unwrap().id),
         login: Some("original".into()),
         display_name: None,
         avatar_url: None,
@@ -55,7 +56,7 @@ async fn discussion_atomic_retries_page_boundaries_and_reopen() {
         )
         .await
         .unwrap();
-    renamed.principal_id = second_person.id;
+    renamed.principal_id = Some(second_person.id);
     let (second, _) = store
         .insert_discussion_message(&ws, "retry", "other human", &renamed)
         .await
@@ -124,7 +125,8 @@ async fn discussion_forward_pages_follow_sequences_and_skip_gaps() {
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: store.get_primary_principal().await.unwrap().id,
+        agent_id: None,
+        principal_id: Some(store.get_primary_principal().await.unwrap().id),
         login: None,
         display_name: None,
         avatar_url: None,
@@ -185,7 +187,8 @@ async fn discussion_concurrent_mismatched_retries_insert_exactly_once() {
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: store.get_primary_principal().await.unwrap().id,
+        agent_id: None,
+        principal_id: Some(store.get_primary_principal().await.unwrap().id),
         login: None,
         display_name: None,
         avatar_url: None,
@@ -219,20 +222,21 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .insert_workspace(&sample_workspace(&ws, "Existing discussion", false))
         .await
         .unwrap();
-    sqlx::raw_sql("DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
+    sqlx::raw_sql("DROP TABLE discussion_agent_delivery; DROP TABLE discussion_agent_grant; DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
         .execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../migrations/0163_workspace_discussions.sql"))
         .execute(store.write_pool())
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: store.get_primary_principal().await.unwrap().id,
+        agent_id: None,
+        principal_id: Some(store.get_primary_principal().await.unwrap().id),
         login: Some("original".into()),
         display_name: None,
         avatar_url: None,
     };
     sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES('old-message',?,7,?,'retry','preserved',?,'2026-01-01T00:00:00Z')")
-        .bind(ws.as_str()).bind(author.principal_id.as_str()).bind(serde_json::to_string(&author).unwrap()).execute(store.write_pool()).await.unwrap();
+        .bind(ws.as_str()).bind(author.principal_id.as_ref().unwrap().as_str()).bind(serde_json::to_string(&author).unwrap()).execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!(
         "../migrations/0164_discussion_conversations.sql"
     ))
@@ -245,6 +249,10 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
     .execute(store.write_pool())
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0166_discussion_agents.sql"))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
     let page = store
         .list_discussion_messages(&ws, None, None, 50)
         .await
@@ -288,7 +296,8 @@ async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer()
         .await
         .unwrap();
     let author = DiscussionAuthor {
-        principal_id: person.id.clone(),
+        agent_id: None,
+        principal_id: Some(person.id.clone()),
         login: None,
         display_name: None,
         avatar_url: None,
@@ -384,6 +393,92 @@ async fn discussion_sender_removal_wins_while_append_or_retry_waits_for_writer()
             .await
             .unwrap()
             .messages
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn discussion_agent_grants_and_outbox_rollback_with_message_and_identity_is_distinct() {
+    use intent_core::discussion::DiscussionTarget;
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Agents", false))
+        .await
+        .unwrap();
+    let owner = store.get_primary_principal().await.unwrap();
+    // Even equal string IDs belong to different identity domains.
+    let agent = AgentId::from(owner.id.as_str());
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &ws))
+        .await
+        .unwrap();
+    let human = DiscussionAuthor {
+        principal_id: Some(owner.id),
+        agent_id: None,
+        login: None,
+        display_name: None,
+        avatar_url: None,
+    };
+    let target = DiscussionTarget {
+        recipient_agent_ids: vec![agent.clone()],
+        ..Default::default()
+    };
+    sqlx::query("CREATE TRIGGER fail_discussion_outbox BEFORE INSERT ON discussion_agent_delivery BEGIN SELECT RAISE(ABORT,'outbox unavailable'); END").execute(store.write_pool()).await.unwrap();
+    assert!(store
+        .send_discussion_message(&ws, "shared-key", "human", &human, &target)
+        .await
+        .is_err());
+    assert!(!store
+        .discussion_agent_access(&ws, "default", &agent)
+        .await
+        .unwrap());
+    assert!(store
+        .list_discussion_messages(&ws, None, None, 50)
+        .await
+        .unwrap()
+        .messages
+        .is_empty());
+    sqlx::query("DROP TRIGGER fail_discussion_outbox")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let (original, _) = store
+        .send_discussion_message(&ws, "shared-key", "human", &human, &target)
+        .await
+        .unwrap();
+    let author = DiscussionAuthor {
+        principal_id: None,
+        agent_id: Some(agent.clone()),
+        login: None,
+        display_name: Some("Agent".into()),
+        avatar_url: None,
+    };
+    let (reply, inserted) = store
+        .send_discussion_message(
+            &ws,
+            "shared-key",
+            "agent",
+            &author,
+            &DiscussionTarget::default(),
+        )
+        .await
+        .unwrap();
+    assert!(inserted);
+    assert_ne!(reply.message.id, original.message.id);
+    drop(store);
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    assert!(reopened
+        .discussion_agent_access(&ws, "default", &agent)
+        .await
+        .unwrap());
+    assert_eq!(
+        reopened
+            .discussion_pending_deliveries(None)
+            .await
+            .unwrap()
             .len(),
         1
     );

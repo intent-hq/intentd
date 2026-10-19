@@ -17512,6 +17512,7 @@ impl Services {
         for (agent_id, message_id, hold_until) in held {
             self.arm_hold_release_timer(&agent_id, &message_id, &hold_until);
         }
+        count += self.dispatch_discussion_deliveries(None, false).await?;
         Ok(count)
     }
 

@@ -27,6 +27,8 @@ pub(super) fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
         conversation_id: row.get("conversation_id"),
         sequence: row.get("sequence"),
         body: row.get("body"),
+        recipient_agent_ids: serde_json::from_str(row.get("recipient_agent_ids_json"))
+            .map_err(|e| Error::Internal(e.to_string()))?,
         author: serde_json::from_str(row.get("author_json"))
             .map_err(|e| Error::Internal(format!("discussion author: {e}")))?,
         created_at: row.get("created_at"),
