@@ -50,12 +50,31 @@ elif a[:2] == ['pr', 'merge']:
 elif a[:1] == ['api'] and '/actions/workflows/ci.yml/runs' in ' '.join(a):
     if s.get('main_runs_error'): sys.exit(1)
     emit({'total_count': len(s['main_runs']), 'workflow_runs': s['main_runs']})
+elif a[:1] == ['api'] and a[1].endswith('/git/ref/heads/main'):
+    if s.get('main_error'): sys.exit(1)
+    emit({'object': {'sha': s['main_tip']}})
 elif a[:1] == ['api'] and 'matching-refs' in ' '.join(a):
     print('v0.9.134')
 elif a[:1] == ['api'] and '/commits/' in ' '.join(a):
     print(s.get('last_cut', '2000-01-01T00:00:00Z'))
 elif a[:1] == ['api'] and '/compare/' in ' '.join(a):
-    print(s.get('compare', 'ahead'))
+    if s.get('compare_error'): sys.exit(1)
+    if 'compare' in s:
+        status = s['compare']
+    else:
+        # Answer like GitHub's compare API, from the fixture repository.
+        base, head = a[1].rsplit('/', 1)[1].split('...')
+        def contains(old, new):
+            return subprocess.run(['git', 'merge-base', '--is-ancestor', old, new], capture_output=True).returncode == 0
+        if base == head:
+            status = 'identical'
+        elif contains(base, head):
+            status = 'ahead'
+        elif contains(head, base):
+            status = 'behind'
+        else:
+            status = 'diverged'
+    emit({'status': status})
 else:
     raise SystemExit('unexpected gh call: ' + repr(a))
 '''
@@ -75,13 +94,14 @@ class AutoCutTests(Fixture):
         self.forbid_polling()
         self.state = {
             'calls': [], 'pr': {'number': 42, 'title': 'chore: release', 'headRefName': 'release-plz-test', 'isDraft': False, 'labels': [], 'isCrossRepository': False, 'author': {'login': 'release-bot'}},
-            'detail': {'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}], 'headRefOid': self.head, 'baseRefOid': self.base, 'baseRefName': 'main', 'reviewDecision': ''},
-            # The push-event ci.yml run on the Release PR's base (the main
-            # tip): carries the post-merge Windows validation.
+            'main_tip': self.base,
+            'detail': {'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}], 'headRefOid': self.head, 'baseRefName': 'main', 'reviewDecision': ''},
+            # The push-event ci.yml run on main's live tip (the commit being
+            # released): carries the post-merge Windows validation.
             'main_runs': [self.main_run(1, 'completed', 'success')],
         }
         self.initial_state = json.loads(json.dumps(self.state))
-        self.env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'MOCK_STATE': str(self.repo / 'state'), 'GH_TOKEN': 'read-token', 'RELEASE_PLZ_TOKEN': 'merge-token', 'GITHUB_REPOSITORY': 'intent-hq/intentd', 'EVENT_NAME': 'workflow_dispatch', 'DRY_RUN': 'false', 'PUSH_SHA': self.base, 'HEAD_COMMIT_MSG': 'fix: example'}
+        self.env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'MOCK_STATE': str(self.repo / 'state'), 'GH_TOKEN': 'read-token', 'RELEASE_PLZ_TOKEN': 'merge-token', 'GITHUB_REPOSITORY': 'intent-hq/intentd', 'EVENT_NAME': 'workflow_dispatch', 'DRY_RUN': 'false', 'HEAD_COMMIT_MSG': 'fix: example'}
         self.env.pop('GITHUB_TOKEN', None)
         # Execute trusted helpers from the workflow checkout, never PR blobs.
         dest = self.repo / 'scripts'
@@ -523,7 +543,9 @@ path.write_text(json.dumps(s))
         self.assertNotIn('--admin', self.merge_calls()[0]['args'])
 
     def test_missing_objects_fall_back_to_queue(self):
+        # GitHub knows the head (compare passes); only the local fetch fails.
         self.state['detail']['headRefOid'] = 'f' * 40
+        self.state['compare'] = 'ahead'
         output = self.run_workflow()
         self.assertNotIn('--admin', self.merge_calls()[0]['args'])
         self.assertIn('queue', output.lower())
@@ -533,17 +555,110 @@ path.write_text(json.dumps(s))
         self.run_workflow()
         self.assertNotIn('--admin', self.merge_calls()[0]['args'])
 
-    def test_main_not_contained_in_tested_head_skips(self):
+    def advance_main(self):
+        # A commit lands on main that the Release PR head does not contain.
         self.git('checkout', '-q', self.base)
         self.write('unreleased', 'main advanced')
-        self.state['detail']['baseRefOid'] = self.commit()
-        self.run_workflow()
-        self.assertEqual(self.merge_calls(), [])
+        self.git('add', 'unreleased')
+        self.git('commit', '-qm', 'ci: main advanced')
+        return self.git('rev-parse', 'HEAD')
 
-    def test_push_freshness_queries_the_tested_sha(self):
-        self.run_workflow(EVENT_NAME='push')
-        comparisons = [c['args'] for c in self.state['calls'] if '/compare/' in ' '.join(c['args'])]
-        self.assertEqual(comparisons[0][1], f'repos/intent-hq/intentd/compare/{self.base}...{self.head}')
+    def refresh_head(self, tip):
+        # release-plz rebuilds the release commit on top of main's tip.
+        self.git('checkout', '-q', tip)
+        self.git('cherry-pick', self.head)
+        return self.git('rev-parse', 'HEAD')
+
+    def test_stale_github_base_never_merges_behind_live_main(self):
+        # v0.11.10 (cron run 39234998462, intentd#2506): GitHub reported the
+        # PR's last-synced base (b4349bb0) as baseRefOid with CLEAN state
+        # while main was already at 2d7c7bb0; the run merged one commit
+        # behind main. Every event must compare against main's live tip.
+        tip = self.advance_main()
+        for event in ('schedule', 'workflow_dispatch', 'push'):
+            with self.subTest(event=event):
+                self.reset()
+                self.state['main_tip'] = tip
+                if event == 'push':
+                    # Push runs retry within their 15-min budget, then skip.
+                    self.update_after_polls(99, {}, seconds_per_poll=8 * 60)
+                output = self.run_workflow(EVENT_NAME=event)
+                self.assertEqual(self.merge_calls(), [])
+                self.assertIn("behind main's live tip", output)
+                self.assertEqual(self.state.get('polls', 0), 2 if event == 'push' else 0)
+
+    def test_refreshed_head_on_live_main_merges_directly(self):
+        # The classifier diffs against main's live tip, not the stale base:
+        # against the stale base the main-only file would look like a
+        # non-metadata change and force the queue path.
+        tip = self.advance_main()
+        refreshed = self.refresh_head(tip)
+        for event in ('schedule', 'workflow_dispatch', 'push'):
+            with self.subTest(event=event):
+                self.reset()
+                self.state['main_tip'] = tip
+                self.state['detail']['headRefOid'] = refreshed
+                self.run_workflow(EVENT_NAME=event)
+                calls = self.merge_calls()
+                self.assertEqual(len(calls), 1)
+                self.assertIn('--admin', calls[0]['args'])
+                self.assertIn(refreshed, calls[0]['args'])
+                # Main's post-merge CI is read on the live tip being released.
+                self.assertEqual([c[1] for c in self.main_ci_calls()], [f'repos/intent-hq/intentd/actions/workflows/ci.yml/runs?head_sha={tip}&event=push&per_page=100'])
+
+    def test_unreadable_live_main_never_merges(self):
+        for fixture in ({'main_error': True}, {'main_tip': 'not-a-sha'}, {'compare_error': True}):
+            for event in ('schedule', 'workflow_dispatch', 'push'):
+                with self.subTest(fixture=fixture, event=event):
+                    self.reset()
+                    self.state.update(fixture)
+                    if event == 'push':
+                        self.update_after_polls(99, {}, seconds_per_poll=8 * 60)
+                    output = self.run_workflow(EVENT_NAME=event)
+                    self.assertEqual(self.merge_calls(), [])
+                    self.assertTrue("Could not read main's live tip" in output or "compare: unreadable" in output, output)
+
+    def test_push_run_waits_for_refresh_past_live_main(self):
+        tip = self.advance_main()
+        refreshed = self.refresh_head(tip)
+        self.state['main_tip'] = tip
+        self.update_after_polls(2, {'headRefOid': refreshed})
+        output = self.run_workflow(EVENT_NAME='push')
+        self.assertEqual(self.state.get('polls'), 2)
+        calls = self.merge_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn(refreshed, calls[0]['args'])
+        self.assertIn("behind main's live tip", output)
+
+    def test_freshness_compares_live_main_with_the_tested_head(self):
+        # One comparison per run, on every event: main's live tip against the
+        # head that will be merged (on push runs this subsumes PUSH_SHA).
+        for event in ('schedule', 'workflow_dispatch', 'push'):
+            with self.subTest(event=event):
+                self.reset()
+                self.run_workflow(EVENT_NAME=event)
+                comparisons = [c['args'][1] for c in self.state['calls'] if '/compare/' in ' '.join(c['args'])]
+                self.assertEqual(comparisons, [f'repos/intent-hq/intentd/compare/{self.base}...{self.head}'])
+                self.assertEqual(len(self.merge_calls()), 1)
+
+    def test_identical_or_diverged_head_never_merges(self):
+        for status in ('identical', 'diverged'):
+            with self.subTest(status=status):
+                self.reset()
+                self.state['compare'] = status
+                output = self.run_workflow(EVENT_NAME='schedule')
+                self.assertEqual(self.merge_calls(), [])
+                self.assertIn("behind main's live tip", output)
+                self.assertEqual('::warning::' in output, status == 'diverged')
+
+    def test_local_check_rejects_head_without_live_main_despite_compare(self):
+        # A compare API answer that disagrees with the fetched objects must
+        # not reach the --admin route (nor the queue).
+        self.state['main_tip'] = self.advance_main()
+        self.state['compare'] = 'ahead'
+        output = self.run_workflow(EVENT_NAME='schedule')
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn("does not contain main's live tip", output)
 
     def test_recent_release_throttles(self):
         import datetime
@@ -569,10 +684,11 @@ path.write_text(json.dumps(s))
         def write_main_change():
             self.write('crates/intentd/src/main.rs', 'fn main() { panic!(); }\n')
             self.state['detail']['headRefOid'] = self.commit()
-        def main_base_moved():
-            self.git('checkout', '-q', self.base)
-            self.write('unreleased', 'main advanced')
-            self.state['detail']['baseRefOid'] = self.commit()
+        def main_tip_moved():
+            self.state['main_tip'] = self.advance_main()
+        def main_tip_moved_compare_disagrees():
+            main_tip_moved()
+            self.state['compare'] = 'ahead'
         def no_release_pr():
             self.state['pr']['headRefName'] = 'ordinary'
         def two_release_prs():
@@ -602,7 +718,9 @@ path.write_text(json.dumps(s))
             ('main CI missing', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, lambda: self.state.update(main_runs=[]), ('defer', 'main-ci-pending')),
             ('main CI running', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, lambda: self.state.update(main_runs=[self.main_run(5, 'in_progress', None)]), ('defer', 'main-ci-pending')),
             ('main CI red', {}, lambda: self.state.update(main_runs=[self.main_run(7, 'completed', 'failure')]), ('skip', 'main-ci-failed')),
-            ('base not contained', {}, main_base_moved, ('defer', 'pr-stale')),
+            ('behind live main', {}, main_tip_moved, ('defer', 'pr-stale')),
+            ('live main not contained locally', {}, main_tip_moved_compare_disagrees, ('defer', 'pr-stale')),
+            ('live main unreadable', {}, lambda: self.state.update(main_error=True), ('defer', 'api-error')),
             ('dry run direct', {'DRY_RUN': 'true'}, None, ('dry-run', 'direct-merge')),
             ('dry run queue', {'DRY_RUN': 'true'}, write_main_change, ('dry-run', 'merge-queue')),
             ('direct merge', {}, None, ('merge', 'direct-merge')),
