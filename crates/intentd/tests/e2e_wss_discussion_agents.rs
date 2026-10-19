@@ -460,7 +460,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     let (workspace, member) = seed_workspace(data_dir.path()).await;
     let log = data_dir.path().join("mock-prompts.jsonl");
     let history_and_reply = format!(
-        r#"
+        r"
         const page = await ws.discussion.list('default', {{ limit: 1 }});
         const addressed = page.messages[0];
         const older = await ws.discussion.list('default', {{ beforeSequence: addressed.sequence, limit: 1 }});
@@ -471,28 +471,28 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
             author: {{ principalId: 'forged-human', agentId: 'forged-agent', displayName: 'Forged' }}
         }});
         return {{ page, older, reply }};
-    "#,
+    ",
         reply = json!(REPLY)
     );
     let relay_history_and_reply = format!(
-        r#"
+        r"
         const page = await ws.discussion.list('default', {{ limit: 1 }});
         const addressed = page.messages[0];
         const reply = await ws.discussion.send('default', {reply}, {{
             messageId: 'relay-reply', replyToMessageId: addressed.id
         }});
         return {{ page, reply }};
-    "#,
+    ",
         reply = json!(RELAY_REPLY)
     );
-    let denied_probe = r#"
+    let denied_probe = r"
         const out = {};
         try { out.history = await ws.discussion.list('default', {limit: 1}); }
         catch (e) { out.historyError = e.message; }
         try { out.sent = await ws.discussion.send('default', 'unauthorized reply', {messageId: 'unaddressed-send'}); }
         catch (e) { out.sendError = e.message; }
         return out;
-    "#;
+    ";
     let behavior = json!({
         "response": "Unexpected automatic discussion wake",
         "rules": [
