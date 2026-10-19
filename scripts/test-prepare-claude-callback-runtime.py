@@ -37,7 +37,7 @@ def inert_env(home):
     """A minimal child env that can still start sys.executable on self-hosted runners.
 
     setup-python's shared-lib builds find libpython through LD_LIBRARY_PATH when
-    the tool cache is not /opt/hostedtoolcache (intentd#2488).
+    the tool cache is not /opt/hostedtoolcache (intentd#2490).
     """
     env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
     if "LD_LIBRARY_PATH" in os.environ:

@@ -7,7 +7,7 @@ tool cache lives elsewhere (tinybox: _work/_tool), the interpreter only starts
 because setup-python exports LD_LIBRARY_PATH. A harness that runs
 sys.executable (directly or through a ``#!{sys.executable}`` stub) with an
 allowlisted ``env={...}`` that drops LD_LIBRARY_PATH then fails with exit 127
-only on those runners (intentd#2488). This policy flags such environments
+only on those runners (intentd#2490). This policy flags such environments
 unless the file forwards LD_LIBRARY_PATH or the call carries
 ``# env-policy: no-python-child: <reason>`` because the child is not Python.
 """
@@ -86,7 +86,7 @@ class SubprocessEnvPolicy(unittest.TestCase):
         found = []
         for path in sorted((ROOT / "scripts").rglob("*.py")):
             found += violations(path.read_text(), str(path.relative_to(ROOT)))
-        self.assertEqual(found, [], "\nForward LD_LIBRARY_PATH when it is set (see intentd#2488), "
+        self.assertEqual(found, [], "\nForward LD_LIBRARY_PATH when it is set (see intentd#2490), "
                          "or mark a non-Python child with '# env-policy: no-python-child: <reason>'.")
 
     def test_flags_direct_literal_env(self):
