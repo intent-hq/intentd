@@ -44,6 +44,9 @@ elif a[:2] == ['pr', 'merge']:
     s['merged'] = '--admin' in a
     s['submitted'] = True
     path.write_text(json.dumps(s))
+elif a[:1] == ['api'] and '/actions/workflows/ci.yml/runs' in ' '.join(a):
+    if s.get('main_runs_error'): sys.exit(1)
+    emit({'total_count': len(s['main_runs']), 'workflow_runs': s['main_runs']})
 elif a[:1] == ['api'] and 'matching-refs' in ' '.join(a):
     print('v0.9.134')
 elif a[:1] == ['api'] and '/commits/' in ' '.join(a):
@@ -70,6 +73,9 @@ class AutoCutTests(Fixture):
         self.state = {
             'calls': [], 'pr': {'number': 42, 'title': 'chore: release', 'headRefName': 'release-plz-test', 'isDraft': False, 'labels': [], 'isCrossRepository': False, 'author': {'login': 'release-bot'}},
             'detail': {'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}], 'headRefOid': self.head, 'baseRefOid': self.base, 'baseRefName': 'main', 'reviewDecision': ''},
+            # The push-event ci.yml run on the Release PR's base (the main
+            # tip): carries the post-merge Windows validation.
+            'main_runs': [self.main_run(1, 'completed', 'success')],
         }
         self.initial_state = json.loads(json.dumps(self.state))
         self.env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'MOCK_STATE': str(self.repo / 'state'), 'GH_TOKEN': 'read-token', 'RELEASE_PLZ_TOKEN': 'merge-token', 'GITHUB_REPOSITORY': 'intent-hq/intentd', 'EVENT_NAME': 'workflow_dispatch', 'DRY_RUN': 'false', 'PUSH_SHA': self.base, 'HEAD_COMMIT_MSG': 'fix: example'}
@@ -147,6 +153,30 @@ else:
         (self.bin / 'date').unlink(missing_ok=True)
         super().tearDown()
 
+    @staticmethod
+    def main_run(run_id, status, conclusion):
+        return {'id': run_id, 'status': status, 'conclusion': conclusion,
+                'html_url': f'https://github.com/intent-hq/intentd/actions/runs/{run_id}'}
+
+    def finish_main_ci_after_polls(self, polls=1):
+        # Each "sleep" records a poll; after `polls` of them main's
+        # post-merge CI run turns green.
+        sleep = self.bin / 'sleep'
+        sleep.write_text(f"""#!{sys.executable} -S
+import json, os, pathlib
+path = pathlib.Path(os.environ['MOCK_STATE'])
+s = json.loads(path.read_text())
+s['polls'] = s.get('polls', 0) + 1
+if s['polls'] >= {polls}:
+    for run in s['main_runs']:
+        run['status'], run['conclusion'] = 'completed', 'success'
+path.write_text(json.dumps(s))
+""")
+        sleep.chmod(0o755)
+
+    def main_ci_calls(self):
+        return [c['args'] for c in self.state['calls'] if '/actions/workflows/ci.yml/runs' in ' '.join(c['args'])]
+
     def pending_ci(self):
         self.state['detail']['mergeStateStatus'] = 'BLOCKED'
         self.state['detail']['statusCheckRollup'] = [{'name': 'CI Gate', 'status': 'IN_PROGRESS', 'conclusion': None}]
@@ -161,6 +191,79 @@ else:
         self.assertEqual(calls[0]['token'], 'merge-token')
         self.assertEqual(calls[0]['args'], ['pr', 'merge', '42', '--repo', 'intent-hq/intentd', '--squash', '--match-head-commit', self.head, '--admin'])
         self.assertIn('Directly squash-merged', output)
+
+    def test_green_main_post_merge_ci_on_the_release_base_allows_the_cut(self):
+        output = self.run_workflow()
+        calls = self.main_ci_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn(f'repos/intent-hq/intentd/actions/workflows/ci.yml/runs?head_sha={self.base}&event=push&per_page=100', calls[0])
+        self.assertEqual(len(self.merge_calls()), 1)
+        self.assertIn("main's post-merge CI passed", output)
+
+    def test_red_main_post_merge_ci_blocks_the_cut_without_waiting(self):
+        # Windows validation runs only after merge; a red run on main must
+        # hold the alpha until a fix or re-run turns it green.
+        for event in ('push', 'schedule', 'workflow_dispatch'):
+            for conclusion in ('failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'neutral', 'skipped', 'stale'):
+                with self.subTest(event=event, conclusion=conclusion):
+                    self.reset()
+                    self.state['main_runs'] = [self.main_run(7, 'completed', conclusion)]
+                    output = self.run_workflow(EVENT_NAME=event)
+                    self.assertEqual(self.merge_calls(), [])
+                    self.assertIn(f"main's post-merge CI concluded {conclusion}", output)
+                    self.assertIn('actions/runs/7', output)
+
+    def test_latest_main_run_decides(self):
+        for runs, merged in (([self.main_run(1, 'completed', 'failure'), self.main_run(2, 'completed', 'success')], True),
+                             ([self.main_run(3, 'completed', 'failure'), self.main_run(2, 'completed', 'success')], False)):
+            with self.subTest(runs=runs):
+                self.reset()
+                self.state['main_runs'] = runs
+                self.run_workflow(EVENT_NAME='schedule')
+                self.assertEqual(len(self.merge_calls()), int(merged))
+
+    def test_pending_main_post_merge_ci_waits_then_cuts(self):
+        for event in ('push', 'schedule', 'workflow_dispatch'):
+            for status in ('queued', 'in_progress', 'pending', 'waiting', 'requested'):
+                with self.subTest(event=event, status=status):
+                    self.reset()
+                    self.state['main_runs'] = [self.main_run(5, status, None)]
+                    self.finish_main_ci_after_polls(2)
+                    output = self.run_workflow(EVENT_NAME=event)
+                    self.assertEqual(self.state.get('polls'), 2)
+                    self.assertEqual(len(self.merge_calls()), 1)
+                    self.assertIn(f"main's post-merge CI is still {status} on {self.base} (https://github.com/intent-hq/intentd/actions/runs/5)", output)
+
+    def test_pending_or_missing_main_ci_wait_is_bounded(self):
+        for runs in ([self.main_run(5, 'in_progress', None)], []):
+            with self.subTest(runs=runs):
+                self.reset()
+                self.state['main_runs'] = runs
+                output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+                self.assertEqual(self.merge_calls(), [])
+                self.assertIn('budget exhausted', output)
+
+    def test_missing_main_ci_gets_only_the_short_grace(self):
+        self.state['main_runs'] = []
+        self.finish_main_ci_after_polls(1)
+        sleep = self.bin / 'sleep'
+        sleep.write_text(sleep.read_text().replace("for run in s['main_runs']:", "s['main_runs'] = [{'id': 9, 'html_url': 'u'}]\n    for run in s['main_runs']:"))
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 1)
+        self.assertEqual(len(self.merge_calls()), 1)
+        self.assertIn("main's post-merge CI has not started", output)
+
+    def test_unreadable_main_ci_never_merges(self):
+        self.state['main_runs_error'] = True
+        output = self.run_workflow(EVENT_NAME='schedule')
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn('post-merge CI lookup failed', output)
+
+    def test_dry_run_still_reports_a_red_main(self):
+        self.state['main_runs'] = [self.main_run(4, 'completed', 'failure')]
+        output = self.run_workflow(DRY_RUN='true')
+        self.assertNotIn('DRY RUN: would', output)
+        self.assertIn("main's post-merge CI concluded failure", output)
 
     def test_missing_or_failed_gate_skips(self):
         # A zero CI wait budget keeps the check-once behavior (the sleep stub
