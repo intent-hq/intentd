@@ -28602,6 +28602,71 @@ mod profile_routing_tests {
         assert_eq!(md["toProvider"], "codex@pwork");
     }
 
+    /// The notice text names a profile by its saved name, never by its
+    /// internal reference; a profile that no longer exists reads as removed.
+    /// The metadata keeps the references for routing.
+    #[intent_test_macros::daemon_test]
+    async fn a_profile_switch_notice_text_uses_readable_profile_labels() {
+        let root = crate::test_support::test_tempdir("profile-switch-notice-");
+        let store = Store::open(&root.path().join("a.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+        let (ws, id) = (WorkspaceId::from("ws-pr3"), AgentId::from("a-pr3"));
+        seed_agent(&mgr, &ws, &id).await;
+        let work = services
+            .provider_profiles_create_impl(
+                json!({ "baseProviderId": "claude-code", "name": "Work" }),
+            )
+            .await
+            .unwrap()["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("opus".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        for selection in ["claude-code", work.as_str(), "claude-code@pgone"] {
+            mgr.maybe_persist_model_change_notice(&id, &ws, &resolved(selection))
+                .await;
+        }
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        let texts: Vec<String> = messages
+            .iter()
+            .map(|m| m.content[0]["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Model changed from claude-code:opus to claude-code (Work):opus.".to_string(),
+                "Model changed from claude-code (Work):opus to claude-code (removed profile):opus."
+                    .to_string(),
+            ]
+        );
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["toProvider"], work);
+        assert_eq!(
+            messages[1].metadata.as_ref().unwrap()["toProvider"],
+            "claude-code@pgone"
+        );
+    }
+
     #[intent_test_macros::daemon_test]
     async fn missing_or_disabled_profiles_require_replacement_instead_of_rehoming() {
         let (_tmp, mgr) = manager().await;

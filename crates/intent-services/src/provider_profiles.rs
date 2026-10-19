@@ -107,6 +107,30 @@ pub(crate) fn canonical_selection(provider_id: &str) -> String {
     }
 }
 
+/// A human-readable label for a selection in daemon-written text: a bare id
+/// unchanged, a saved profile as `<base> (<name>)`, a reference whose
+/// profile no longer exists as `<base> (removed profile)`, and any reference
+/// as just `<base>` when the profile list is unreadable (`None`), since the
+/// profile may still exist. Never the internal reference.
+pub(crate) fn readable_selection(selection: &str, profiles: Option<&[ProfileMeta]>) -> String {
+    if !is_qualified_ref(selection) {
+        return selection.to_owned();
+    }
+    let (base, id) = selection
+        .split_once(REF_SEPARATOR)
+        .unwrap_or((selection, ""));
+    let Some(profiles) = profiles else {
+        return base.to_owned();
+    };
+    profiles
+        .iter()
+        .find(|p| p.id == id && p.base_provider == base)
+        .map_or_else(
+            || format!("{base} (removed profile)"),
+            |p| format!("{base} ({})", p.name),
+        )
+}
+
 fn provider_ref(base: &str, id: &str) -> String {
     format!("{base}{REF_SEPARATOR}{id}")
 }
@@ -412,6 +436,41 @@ fn is_valid_key(key: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Account-directory variables whose leading `~` the daemon expands.
+const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+/// Expand a leading `~` in an account-directory value at resolution time:
+/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
+/// ASCII case), a value of exactly `~` or
+/// one starting with `~/` is joined onto `home` (the daemon user's home).
+/// `~user`, variables and every other key stay literal, and without a home
+/// the value is used as typed. The saved value is never rewritten.
+pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.and_then(Path::to_str) else {
+        return value.to_owned();
+    };
+    if !TILDE_EXPANDED_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
+    {
+        return value.to_owned();
+    }
+    match value.strip_prefix('~') {
+        Some("") => home.to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.trim_end_matches('/')),
+        _ => value.to_owned(),
+    }
+}
+
+/// The daemon user's home directory, as the installed-CLI context resolves
+/// it for the Default configuration (`HOME`, else `USERPROFILE`).
+fn daemon_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Case-insensitive name comparison key (per-char lowercase, an approximation
@@ -850,12 +909,14 @@ pub(crate) fn in_use_reasons(
 }
 
 /// Reject `settings.update` references to missing profiles (§5.54
-/// "References in settings"): `model.defaultProvider`, and `model.providerDefaults`
-/// keys that are new or whose value changed versus `stored_defaults`.
+/// "References in settings"): `model.defaultProvider`, and
+/// `model.providerDefaults` / `providers.fastMode` keys that are new or whose
+/// value changed versus `stored_defaults` / `stored_fast_mode`.
 pub(crate) fn validate_settings_references(
     store: &ProviderProfileStore,
     changes: &Value,
     stored_defaults: &std::collections::BTreeMap<String, String>,
+    stored_fast_mode: &std::collections::BTreeMap<String, bool>,
 ) -> Result<()> {
     let Some(entries) = changes.as_array() else {
         return Ok(());
@@ -885,6 +946,22 @@ pub(crate) fn validate_settings_references(
                     }
                 }
             }
+            Some(path @ "providers.fastMode") => {
+                let Some(map) = entry.get("value").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (key, value) in map {
+                    if !is_qualified_ref(key) {
+                        continue;
+                    }
+                    let unchanged = stored_fast_mode
+                        .get(key)
+                        .is_some_and(|stored| Some(*stored) == value.as_bool());
+                    if !unchanged && !store.has_reference(key) {
+                        return Err(reference_not_found(path, key));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -900,7 +977,7 @@ pub(crate) fn batch_has_references(changes: &Value) -> bool {
                 .get("value")
                 .and_then(Value::as_str)
                 .is_some_and(is_qualified_ref),
-            Some("model.providerDefaults") => entry
+            Some("model.providerDefaults" | "providers.fastMode") => entry
                 .get("value")
                 .and_then(Value::as_object)
                 .is_some_and(|m| m.keys().any(|k| is_qualified_ref(k))),
@@ -971,12 +1048,18 @@ impl Services {
                 "provider profile {reference} environment is unavailable"
             ))
         })?;
+        // `~` in an account directory expands here, before account-home
+        // lookup, isolation and fingerprinting, so every path agrees.
+        let home = daemon_home();
         let entries = doc
             .entries
             .into_iter()
             .filter(|e| reserved_key_reason(e.key(), base).is_none())
             .map(|e| match e {
-                StoredEnv::Set { key, value } => (key, Some(value)),
+                StoredEnv::Set { key, value } => {
+                    let value = expand_account_dir(&key, &value, home.as_deref());
+                    (key, Some(value))
+                }
                 StoredEnv::Unset { key } => (key, None),
             })
             .collect();
@@ -1665,17 +1748,27 @@ impl Services {
         let changes = self.profile_activation.saved_changed(&profile_id, None);
         self.publish_activation_changes(changes).await;
 
-        // Prune the profile's `model.providerDefaults` key (emits
-        // `settings:changed`). A failure leaves an inert key behind.
-        // Re-read now: the snapshot above predates the secret I/O, and a
-        // concurrent writer may have replaced the map since.
-        let current = self.effective_settings().model.provider_defaults;
-        if current.contains_key(&reference) {
-            let mut map = current;
-            map.remove(&reference);
-            let changes = json!([{ "path": "model.providerDefaults", "value": map }]);
-            if let Err(e) = self.owned_settings_mutation(changes, None).await {
-                tracing::warn!(profile_id = %profile_id, error = %e, "pruning the deleted profile's providerDefaults key failed");
+        // Prune the profile's `model.providerDefaults` and
+        // `providers.fastMode` keys in one batch (emits `settings:changed`).
+        // A failure leaves inert keys behind. Re-read now: the snapshot above
+        // predates the secret I/O, and a concurrent writer may have replaced
+        // the maps since.
+        let current = self.effective_settings();
+        let mut changes = Vec::new();
+        let mut defaults = current.model.provider_defaults;
+        if defaults.remove(&reference).is_some() {
+            changes.push(json!({ "path": "model.providerDefaults", "value": defaults }));
+        }
+        let mut fast_mode = current.providers.fast_mode;
+        if fast_mode.remove(&reference).is_some() {
+            changes.push(json!({ "path": "providers.fastMode", "value": fast_mode }));
+        }
+        if !changes.is_empty() {
+            if let Err(e) = self
+                .owned_settings_mutation(Value::Array(changes), None)
+                .await
+            {
+                tracing::warn!(profile_id = %profile_id, error = %e, "pruning the deleted profile's settings keys failed");
             }
         }
         Ok(json!({ "profileId": profile_id, "revision": revision }))
@@ -1690,8 +1783,13 @@ impl Services {
         }
         Self::require_administrator("settings.update")?;
         let _guard = self.provider_profiles.lock().await;
-        let stored = self.effective_settings().model.provider_defaults;
-        validate_settings_references(&self.provider_profiles, &changes, &stored)?;
+        let settings = self.effective_settings();
+        validate_settings_references(
+            &self.provider_profiles,
+            &changes,
+            &settings.model.provider_defaults,
+            &settings.providers.fast_mode,
+        )?;
         self.owned_settings_mutation(changes, None).await
     }
 }

@@ -128,8 +128,9 @@ CLI with its own environment variables, for example a work and a personal accoun
 or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
 choose **Add profile**: enter a name and environment variables (literal values,
 **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; the user signs in or prepares that
-account outside Intent. Credentials inherited from the environment can still
+`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
+the provider host user's home folder (`~user` stays literal). The user signs in or
+prepares that account outside Intent. Credentials inherited from the environment can still
 apply: for a Claude Code profile that should use another account (or none), set
 inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
 **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
@@ -137,7 +138,9 @@ custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
-the original configuration is **Codex · Default**. Delegated agents follow their
+the original configuration is **Codex · Default**. Each profile has its own **Fast
+mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
+never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
 
 Switching a conversation to another profile, even with the same model, applies on
