@@ -434,13 +434,15 @@ process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
+process.env.SLOT_JOBS = fixture.slotJobs || '';
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
   .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
   .catch(error => { console.error(error); process.exitCode = 1; });
 """
     result = subprocess.run(["node", "-e", harness],
-                            input=json.dumps({"script": step["with"]["script"], "fixture": fixture}),
+                            input=json.dumps({"script": step["with"]["script"],
+                                              "fixture": {"slotJobs": step["env"].get("SLOT_JOBS", ""), **fixture}}),
                             env={k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"},
                             capture_output=True, text=True, timeout=10, check=True)
     return json.loads(result.stdout)
@@ -603,32 +605,58 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                        payload=same_repo if event == "pull_request" else {})
                     outputs = route_outputs(self.workflow, result["outputs"], event)
                     hosted = event == "merge_group" or not idle
+                    slots = json.loads(outputs["slots"])
+                    # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
+                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-8x"])
+                    self.assertEqual(slots["coverage-changed"], ["gh-linux-16x"])
+                    self.assertEqual(slots["release-scripts"], SMALL if idle else ["ubuntu-24.04"])
+                    # Unlisted heavy jobs only get a slot that is still free after the listed ones.
+                    unlisted = hosted or event == "pull_request"
                     self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["gh-linux-16x"] if hosted else CACHE)
+                                     ["gh-linux-16x"] if unlisted else CACHE)
                     self.assertEqual(json.loads(outputs["check_labels"]),
-                                     ["gh-linux-8x"] if hosted else CACHE)
-                    self.assertEqual(outputs["linux_burst"], str(hosted).lower())
-                    # Light jobs ask for the standard label, which the fast pool serves.
-                    self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"],
-                                     SMALL if idle else ["ubuntu-24.04"])
+                                     ["gh-linux-8x"] if unlisted else CACHE)
+                    self.assertEqual(outputs["linux_burst"], str(unlisted).lower())
+                    # The fixture's one fast slot went to release-scripts, so unlisted light jobs go hosted.
+                    self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                     logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
-        heavy = {"check": "check_labels", "coverage-e2e": "linux_labels",
-                 "coverage-all": "linux_labels", "coverage-changed": "linux_labels"}
+        heavy = {"coverage-e2e": "linux_labels", "coverage-all": "linux_labels"}
         for job_id, output in heavy.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.%s) }}" % output)
+        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x"}.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
+                                 "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
         lifecycle = self.workflow["jobs"]["daemon-lifecycle"]["strategy"]["matrix"]["include"]
         linux = next(row for row in lifecycle if row["platform"] == "linux")
         self.assertEqual(matrix_labels(linux["os"], {"linux_labels": '["gh-linux-16x"]'}), ["gh-linux-16x"])
         self.assertIn("needs.route.outputs.linux_labels", linux["os"])
         for job_id in ("release-scripts", "deb-packaging"):
             with self.subTest(job=job_id):
-                self.assertIn("needs.route.outputs.runners", self.workflow["jobs"][job_id]["runs-on"])
+                self.assertIn("needs.route.outputs.slots", self.workflow["jobs"][job_id]["runs-on"])
+
+    def test_pr_fits_heavy_rust_jobs_to_free_slots(self):
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        busy = {"status": "in_progress", "labels": CACHE, "created_at": "2099-01-01T00:00:00Z"}
+        for free, expected in ((2, ["check", "coverage-changed"]), (1, ["check"]), (0, [])):
+            with self.subTest(free=free):
+                result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
+                                   payload=same_repo, jobs=[busy] * (2 - free))
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual(sorted(k for k, v in slots.items() if v == CACHE), expected)
+        result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
+                           payload=same_repo, linuxDisabled="true")
+        # The kill switch sends every listed job to its hosted label.
+        slots = json.loads(result["outputs"]["slots"])
+        self.assertEqual(slots["check"], ["gh-linux-8x"])
+        self.assertNotIn(CACHE, slots.values())
+        self.assertNotIn(SMALL, slots.values())
 
     def test_windows_bursts_without_explicit_idle_capacity(self):
         missing_busy = runner("Windows", "X64")
