@@ -651,6 +651,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: std::collections::BTreeMap::new(),
         last_scan_at: Some(now_iso()),
     };
 
@@ -932,6 +933,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         totals: totals(9),
         by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
         by_agent_model: None,
+        agent_names: std::collections::BTreeMap::new(),
         last_scan_at: Some(now_iso()),
     });
     row.cow_supported = Some(true);
@@ -1576,6 +1578,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
                 ("gpt-5".to_string(), totals(3)),
             ]),
             by_agent_model: None,
+            agent_names: std::collections::BTreeMap::new(),
             last_scan_at: Some(now_iso()),
         });
         if i >= ACTIVE {
@@ -46080,6 +46083,177 @@ mod turn_token_usage {
                 .await
                 .is_none(),
             "no _meta at all"
+        );
+    }
+
+    async fn set_session_name(h: &Harness, agent: &AgentId, name: &str) {
+        sqlx::query("UPDATE agent_session SET name=? WHERE id=?")
+            .bind(name)
+            .bind(&agent.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("rename session");
+    }
+
+    async fn stored_usage(h: &Harness) -> intent_core::TokenUsage {
+        h.store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage")
+    }
+
+    #[tokio::test]
+    async fn token_usage_carries_names_for_retired_and_named_agents() {
+        let h = harness().await;
+        let live = AgentId::new();
+        let retired = AgentId::new();
+        for agent in [&live, &retired] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &live, "Coordinator").await;
+        set_session_name(&h, &retired, "PR reviewer").await;
+        sqlx::query("UPDATE agent_session SET retired_at=? WHERE id=?")
+            .bind(now_iso())
+            .bind(&retired.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("retire session");
+        h.services
+            .persist_turn_token_usage(&live, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(&retired, &h.ws, Some(&acp_usage(20, 0, 0, 0)), None)
+            .await;
+
+        let usage = stored_usage(&h).await;
+        assert_eq!(usage.agent_names.len(), 2);
+        assert_eq!(usage.agent_names[&live.0], "Coordinator");
+        assert_eq!(usage.agent_names[&retired.0], "PR reviewer");
+        let wire = serde_json::to_value(&usage).expect("serialize usage");
+        assert_eq!(wire["agentNames"][&retired.0], "PR reviewer");
+    }
+
+    #[tokio::test]
+    async fn token_usage_omits_blank_names_and_agents_without_usage_rows() {
+        let h = harness().await;
+        let blank = AgentId::new();
+        let idle = AgentId::new();
+        for agent in [&blank, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &blank, "   ").await;
+        set_session_name(&h, &idle, "Idle helper").await;
+        h.services
+            .persist_turn_token_usage(&blank, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+
+        let usage = stored_usage(&h).await;
+        assert!(usage.by_agent_id.contains_key(&blank.0));
+        assert!(
+            usage.by_agent_id.contains_key(&idle.0),
+            "the recompute seeds a bucket for the usage-less session"
+        );
+        assert!(
+            usage.agent_names.is_empty(),
+            "blank name and usage-less named session are both omitted: {:?}",
+            usage.agent_names
+        );
+        let wire = serde_json::to_value(&usage).expect("serialize usage");
+        assert!(
+            wire.get("agentNames").is_none(),
+            "empty map omitted from the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_rename_refreshes_token_usage_agent_names() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let idle = AgentId::new();
+        for id in [&agent, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(id, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &agent, "Builder").await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+
+        let mut sub = subscribe_usage(&h);
+        h.services
+            .agent_rename_op(agent.clone(), "Release builder".into(), false)
+            .await
+            .expect("rename");
+        assert_eq!(
+            stored_usage(&h).await.agent_names[&agent.0],
+            "Release builder"
+        );
+        let event = recv_usage_event(&mut sub).await;
+        assert_eq!(
+            event["data"]["tokenUsage"]["agentNames"][&agent.0],
+            "Release builder"
+        );
+
+        let before = stored_usage(&h).await;
+        h.services
+            .agent_rename_op(idle.clone(), "Idle helper".into(), false)
+            .await
+            .expect("rename usage-less agent");
+        let after = stored_usage(&h).await;
+        assert_eq!(
+            after.last_scan_at, before.last_scan_at,
+            "renaming a usage-less agent writes nothing"
+        );
+        assert!(!after.agent_names.contains_key(&idle.0));
+    }
+
+    #[tokio::test]
+    async fn token_usage_name_trimmed_and_rename_alone_commits_on_recompute() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+        set_session_name(&h, &agent, "  Builder  ").await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+        assert_eq!(stored_usage(&h).await.agent_names[&agent.0], "Builder");
+
+        let unchanged = h
+            .services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        assert!(!unchanged, "no counter or name change writes nothing");
+
+        set_session_name(&h, &agent, "Renamed builder").await;
+        let mut sub = subscribe_usage(&h);
+        let changed = h
+            .services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute after rename");
+        assert!(changed, "a name change alone is a snapshot change");
+        assert_eq!(
+            stored_usage(&h).await.agent_names[&agent.0],
+            "Renamed builder"
+        );
+        let event = recv_usage_event(&mut sub).await;
+        assert_eq!(
+            event["data"]["tokenUsage"]["agentNames"][&agent.0],
+            "Renamed builder"
         );
     }
 }

@@ -962,6 +962,13 @@ pub struct TokenUsage {
     /// always write `Some`, including `Some([])` for an empty workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_agent_model: Option<Vec<TokenUsageCrossFilterRow>>,
+    /// Display name per `byAgentId` key (§5.23), so clients can label usage
+    /// rows for agents they have not loaded (retired, unloaded delegated,
+    /// pending delete). Keys are a subset of `by_agent_id`; sessions whose
+    /// trimmed name is empty are omitted, and an empty map is omitted from
+    /// the wire. Snapshots persisted before this field deserialize to empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_names: BTreeMap<String, String>,
     pub last_scan_at: Option<String>,
 }
 
@@ -7709,6 +7716,7 @@ mod tests {
             totals: by_model["opus-4.8"].clone(),
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7725,6 +7733,29 @@ mod tests {
         assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_agent_names_are_additive_and_omitted_when_empty() {
+        let legacy: TokenUsage = serde_json::from_value(serde_json::json!({
+            "byAgentId": {},
+            "totals": { "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0 },
+            "byModel": {},
+            "lastScanAt": null
+        }))
+        .expect("pre-agentNames snapshot deserializes");
+        assert!(legacy.agent_names.is_empty());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("agentNames").is_none(), "empty map omitted");
+
+        let mut named = legacy;
+        named
+            .agent_names
+            .insert("agent-123".to_string(), "Coordinator".to_string());
+        let v = serde_json::to_value(&named).unwrap();
+        assert_eq!(v["agentNames"]["agent-123"], "Coordinator");
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, named);
     }
 
     #[test]
@@ -7771,6 +7802,7 @@ mod tests {
             totals,
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7816,6 +7848,7 @@ mod tests {
             totals,
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
