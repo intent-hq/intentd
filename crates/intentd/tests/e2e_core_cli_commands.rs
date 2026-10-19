@@ -1375,9 +1375,10 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
 fn read_rotating_daemon_log(data_dir: &Path) -> String {
     let mut text = String::new();
     for entry in std::fs::read_dir(data_dir).into_iter().flatten().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("intentd.") && name.ends_with(".log") {
-            text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        let path = entry.path();
+        let is_log = path.extension().is_some_and(|ext| ext == "log");
+        if is_log && entry.file_name().to_string_lossy().starts_with("intentd.") {
+            text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
         }
     }
     text
