@@ -2,6 +2,87 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.14] - 2026-10-19
+
+### 🚀 Features
+
+- *(provider-profiles)* Expand ~ in account dirs and per-profile fast mode ([#2518](https://github.com/intent-hq/intentd/pull/2518))
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts for client hello and note writes ([#2512](https://github.com/intent-hq/intentd/pull/2512))
+
+
+## [0.11.13] - 2026-10-19
+
+### 🚀 Features
+
+- *(token-usage)* Include agentNames in the TokenUsage snapshot ([#2508](https://github.com/intent-hq/intentd/pull/2508))
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject unknown model ids at agent creation ([#7121](https://github.com/intent-hq/intentd/pull/7121)) ([#2510](https://github.com/intent-hq/intentd/pull/2510))
+
+### 📚 Documentation
+
+- *(guide)* Note relative image paths in Markdown file previews ([#2500](https://github.com/intent-hq/intentd/pull/2500))
+
+### 🧪 Testing
+
+- *(store)* Scale note-page test waits with the timeout multiplier ([#2514](https://github.com/intent-hq/intentd/pull/2514))
+
+### ⚙️ Miscellaneous Tasks
+
+- Auto-pin claude-agent-acp alongside codex-acp (merge on green) ([#2502](https://github.com/intent-hq/intentd/pull/2502))
+
+
+## [0.11.12] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agents)* Declassify all-idle completion-watch cycles of any length ([#2509](https://github.com/intent-hq/intentd/pull/2509))
+- Match visible text around comment anchors in note.edit ([#2507](https://github.com/intent-hq/intentd/pull/2507))
+
+
+## [0.11.11] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject agent.delegate with a nonexistent task note ([#2501](https://github.com/intent-hq/intentd/pull/2501))
+- *(pr)* Find workspace PRs on repos with >1,000 open PRs ([#2503](https://github.com/intent-hq/intentd/pull/2503))
+- *(serve)* Never panic on a closed stderr pipe ([#7119](https://github.com/intent-hq/intentd/pull/7119)) ([#2504](https://github.com/intent-hq/intentd/pull/2504))
+
+
+## [0.11.10] - 2026-10-19
+
+### 📚 Documentation
+
+- *(app-guide)* Remembered agent setup per repository ([#2498](https://github.com/intent-hq/intentd/pull/2498))
+
+
+## [0.11.9] - 2026-10-19
+
+### 🚀 Features
+
+- *(providers)* Profile-aware execution context ([#2460](https://github.com/intent-hq/intentd/pull/2460))
+- *(agent)* Flag list-row previews the list cap shortened ([#2480](https://github.com/intent-hq/intentd/pull/2480))
+- *(cli)* Add intentd pair --host for loopback-only daemons ([#2486](https://github.com/intent-hq/intentd/pull/2486))
+- *(providers)* Store named provider profiles and add providers.profiles.* RPCs ([#2459](https://github.com/intent-hq/intentd/pull/2459))
+- *(providers)* Route named profile selections through every selection path ([#2462](https://github.com/intent-hq/intentd/pull/2462))
+- *(providers)* Profile switches, native-session ownership and settings activation ([#2465](https://github.com/intent-hq/intentd/pull/2465))
+
+### 🐛 Bug Fixes
+
+- *(events)* Broadcast persisted events before waking the publisher ([#2487](https://github.com/intent-hq/intentd/pull/2487))
+- Bump Codex ACP fallback to v2.2.2 ([#2382](https://github.com/intent-hq/intentd/pull/2382))
+- *(file-tracking)* Stop keeping attribution rows for git-ignored and clean paths ([#2479](https://github.com/intent-hq/intentd/pull/2479))
+- *(release)* Keep the intentd version group in lockstep on sitter-only releases ([#2485](https://github.com/intent-hq/intentd/pull/2485))
+
+### 📚 Documentation
+
+- *(guide)* Single Open in original workspace item shows only its label ([#2494](https://github.com/intent-hq/intentd/pull/2494))
+
+
 ## [0.11.8] - 2026-10-18
 
 ### 🚀 Features

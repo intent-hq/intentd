@@ -962,6 +962,13 @@ pub struct TokenUsage {
     /// always write `Some`, including `Some([])` for an empty workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_agent_model: Option<Vec<TokenUsageCrossFilterRow>>,
+    /// Display name per `byAgentId` key (§5.23), so clients can label usage
+    /// rows for agents they have not loaded (retired, unloaded delegated,
+    /// pending delete). Keys are a subset of `by_agent_id`; sessions whose
+    /// trimmed name is empty are omitted, and an empty map is omitted from
+    /// the wire. Snapshots persisted before this field deserialize to empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_names: BTreeMap<String, String>,
     pub last_scan_at: Option<String>,
 }
 
@@ -3373,7 +3380,11 @@ pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
 /// the sandbox id (≈ 40 B), and the boolean/enum flags. This budget is
 /// that measurement rounded up to the next half KiB (6 KiB, ≈ 5%
 /// margin); a row that regrows past it fails the golden with the
-/// per-field table. Typical rows are far smaller (the issue's 404-row
+/// per-field table. The five preview truncation flags
+/// (`lastAgentResponseTruncated` …
+/// `metadata.attentionRequestReasonTruncated`, all set on the worst-case
+/// row) add ≈ 190 B, putting the measured row at ≈ 6,030 B — inside the
+/// budget with ≈ 2% margin left. Typical rows are far smaller (the issue's 404-row
 /// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
 /// attention request, sandbox fields, hooks AND monitors at once, and
 /// previews rarely all hit the cap), and the per-key allowlist
@@ -3460,11 +3471,12 @@ fn agent_list_rows_bytes(rows: &[AgentLite]) -> usize {
 /// already-capped row only shortens it) until the array fits or the budget
 /// reaches [`AGENT_LIST_PREVIEW_FLOOR_BYTES`], whichever comes first. Row
 /// shape is unchanged and no key outside the documented row contract is
-/// introduced: the one presence effect stays inside the `lastToolUse` contract
-/// `{ name, input?, inputTruncated?, inputBytes? }` — an `input` that passed
-/// the 400-byte list cap unflagged and is truncated by a tighter re-cap gains
-/// `inputTruncated: true` + `inputBytes` (original serialized size), exactly
-/// as the normal cap stamps them — so no client sees a new wire shape.
+/// introduced: the one presence effect stays inside the documented truncation
+/// flags — an `input` that passed the 400-byte list cap unflagged and is
+/// truncated by a tighter re-cap gains `inputTruncated: true` + `inputBytes`
+/// (original serialized size), and a preview string that passed it unflagged
+/// gains its `…Truncated: true` flag, exactly as the normal cap stamps them —
+/// so no client sees a new wire shape.
 /// O(rows) work: at most four serialization passes over the rows.
 pub fn fit_agent_list_frame(rows: &mut [AgentLite]) -> Option<AgentListFrameFit> {
     let bytes_before = agent_list_rows_bytes(rows);
@@ -3529,11 +3541,14 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "lastActivity",
     "messageCount",
     "lastAgentResponse",
+    "lastAgentResponseTruncated",
     "lastUserMessage",
+    "lastUserMessageTruncated",
     "lastMessageRole",
     "lastMessageId",
     "lastToolUse",
     "digest",
+    "digestTruncated",
     "stopReason",
     "stopReasonTimestamp",
     "sessionCorrupted",
@@ -3555,9 +3570,11 @@ pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
     "createdByAgentId",
     "taskNoteId",
     "completionReport",
+    "completionReportTruncated",
     "completionReportTimestamp",
     "attentionRequestKind",
     "attentionRequestReason",
+    "attentionRequestReasonTruncated",
     "attentionRequestTimestamp",
     "delegationDepth",
     "sandboxId",
@@ -4251,6 +4268,12 @@ pub struct AgentMetadata {
     pub task_note_id: Option<NoteId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report: Option<String>,
+    /// `true` only when the list-row preview cap
+    /// ([`AgentLite::cap_list_previews_to`]) shortened `completionReport`;
+    /// omitted otherwise (never `false`). List-shaped rows only — the detail
+    /// reads skip the list cap (they serve the stored report) and never set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completion_report_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_report_timestamp: Option<String>,
     /// Pending attention request (`"discussion"` / `"blocker"`); omitted when
@@ -4259,6 +4282,13 @@ pub struct AgentMetadata {
     pub attention_request_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_request_reason: Option<String>,
+    /// `true` only when the list-row preview cap
+    /// ([`AgentLite::cap_list_previews_to`]) shortened
+    /// `attentionRequestReason`; omitted otherwise (never `false`). A client
+    /// seeing it renders the reason as a prefix and reads `agent.get` for the
+    /// full text (intent-hq/intent#7250 follow-up).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attention_request_reason_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4453,8 +4483,20 @@ pub struct AgentLite {
     pub message_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_agent_response: Option<String>,
+    /// `true` only when the list-row preview cap
+    /// ([`AgentLite::cap_list_previews_to`]) shortened `lastAgentResponse`; omitted
+    /// otherwise (never `false`). List-shaped rows only. Reports the list
+    /// cap alone: `agent.get` skips it but serves its own bounded preview.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_agent_response_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_message: Option<String>,
+    /// `true` only when the list-row preview cap
+    /// ([`AgentLite::cap_list_previews_to`]) shortened `lastUserMessage`; omitted
+    /// otherwise (never `false`). List-shaped rows only. Reports the list
+    /// cap alone: `agent.get` skips it but serves its own bounded preview.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub last_user_message_truncated: bool,
     /// Role (`"user"` / `"assistant"`) of the session's newest
     /// user/assistant transcript message — system (and any other) rows are
     /// transparent. Additive wire field; omitted when the session has no
@@ -4483,6 +4525,12 @@ pub struct AgentLite {
     pub last_tool_use: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// `true` only when the list-row preview cap
+    /// ([`AgentLite::cap_list_previews_to`]) shortened `digest`; omitted
+    /// otherwise (never `false`). List-shaped rows only. Reports the list
+    /// cap alone: `agent.get` skips it but serves its own bounded preview.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub digest_truncated: bool,
     /// Session-level context references persisted at spawn (P3-1.2b); omitted
     /// when absent so pre-gap wire shapes are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4514,6 +4562,18 @@ pub struct AgentLite {
     /// (not `null`) when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// `true` while the agent's live provider process started with a named
+    /// profile's earlier saved settings (PROTOCOL §5.54 activation). Omitted
+    /// once they match or no process is live. Overlaid by the service
+    /// projection (no runtime context in [`AgentLite::from_session`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub using_earlier_profile_settings: bool,
+    /// `{ providerRef, reason: "profile-missing" | "provider-disabled" }`
+    /// when the session's named profile selection would refuse the next
+    /// turn (PROTOCOL §5.54). Overlaid by the service projection; omitted
+    /// otherwise and always for bare provider ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replacement_required: Option<serde_json::Value>,
     /// ISO timestamp the session was soft-retired at; mirrors
     /// [`AgentSession::retired_at`]. Omitted for active sessions. Rows
     /// carrying it appear in `agent.list` only with `includeRetired: true`
@@ -4567,6 +4627,8 @@ impl AgentLite {
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
         let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
         let metadata = AgentMetadata {
+            attention_request_reason_truncated: false,
+            completion_report_truncated: false,
             is_background: session.is_background,
             specialist: session.specialist,
             created_by_agent_id: session.parent_agent_id.clone(),
@@ -4590,6 +4652,9 @@ impl AgentLite {
             chief_prompt_version,
         };
         Self {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             id: session.id,
             workspace_id: session.workspace_id,
             parent_agent_id: session.parent_agent_id,
@@ -4634,6 +4699,8 @@ impl AgentLite {
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: session.retired_at,
             notifications_muted: session.notifications_muted,
             harness_version: session.harness_version,
@@ -4671,7 +4738,7 @@ impl AgentLite {
     /// truncated char-boundary safe against their JSON-SERIALIZED size
     /// (escaping-heavy content cannot defeat the wire-frame goal by
     /// expanding 6x on serialization). The remaining free-text strings a
-    /// list row carries get the same silent truncation at a cap sized for
+    /// list row carries get the same truncation at a cap sized for
     /// the field — `metadata.attentionRequestReason` (a long reason blew
     /// the row budget in production, intent-hq/intent#5383) at the preview
     /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
@@ -4686,7 +4753,14 @@ impl AgentLite {
     /// structurally and `inputBytes` recording the input's serialized size —
     /// a write-time `inputBytes` (already-flagged persisted preview) is kept,
     /// so it always names the ORIGINAL block's size, mirroring
-    /// [`last_tool_use_preview`]. `name` is never touched, so the FE's tool
+    /// [`last_tool_use_preview`]. Each of the five preview strings that is
+    /// actually shortened gets its sibling flag (`lastAgentResponseTruncated`,
+    /// `lastUserMessageTruncated`, `digestTruncated`,
+    /// `metadata.completionReportTruncated`,
+    /// `metadata.attentionRequestReasonTruncated`; intent-hq/intent#7250
+    /// follow-up) so clients never mistake a prefix for the full value; the
+    /// identifier-sized `name` / `model` / sandbox caps stay unflagged.
+    /// `name` is never touched, so the FE's tool
     /// classification keeps working. These fields exist to render a one-line
     /// summary in list contexts, so `agent.list` applies this to every row;
     /// the detail reads (`agent.get` / `agent.getSession`) never call it and
@@ -4727,7 +4801,7 @@ impl AgentLite {
             let mut sink = CountingSink(0);
             serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
         }
-        fn cap_str(s: &mut String, budget: usize) {
+        fn cap_str(s: &mut String, budget: usize) -> bool {
             let mut end = s.len().min(budget);
             loop {
                 while end > 0 && !s.is_char_boundary(end) {
@@ -4744,18 +4818,44 @@ impl AgentLite {
             }
             if end < s.len() {
                 s.truncate(end);
+                true
+            } else {
+                false
             }
         }
-        fn cap_string(field: &mut Option<String>, budget: usize) {
-            if let Some(s) = field {
-                cap_str(s, budget);
-            }
+        /// Caps `field` and returns whether it was shortened.
+        fn cap_string(field: &mut Option<String>, budget: usize) -> bool {
+            field.as_mut().is_some_and(|s| cap_str(s, budget))
         }
-        cap_string(&mut self.last_agent_response, preview_budget);
-        cap_string(&mut self.last_user_message, preview_budget);
-        cap_string(&mut self.digest, preview_budget);
-        cap_string(&mut self.metadata.completion_report, preview_budget);
-        cap_string(&mut self.metadata.attention_request_reason, preview_budget);
+        /// Caps a flagged preview: `|=` so a re-cap (frame fit) never clears
+        /// a flag an earlier pass stamped (intent-hq/intent#7250 follow-up).
+        fn cap_flagged(field: &mut Option<String>, truncated: &mut bool, budget: usize) {
+            *truncated |= cap_string(field, budget);
+        }
+        let budget = preview_budget;
+        cap_flagged(
+            &mut self.last_agent_response,
+            &mut self.last_agent_response_truncated,
+            budget,
+        );
+        cap_flagged(
+            &mut self.last_user_message,
+            &mut self.last_user_message_truncated,
+            budget,
+        );
+        cap_flagged(&mut self.digest, &mut self.digest_truncated, budget);
+        let meta = &mut self.metadata;
+        cap_flagged(
+            &mut meta.completion_report,
+            &mut meta.completion_report_truncated,
+            budget,
+        );
+        cap_flagged(
+            &mut meta.attention_request_reason,
+            &mut meta.attention_request_reason_truncated,
+            budget,
+        );
+        // Identifier-sized caps stay unflagged: realistic values never reach them.
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
@@ -7616,6 +7716,7 @@ mod tests {
             totals: by_model["opus-4.8"].clone(),
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7632,6 +7733,29 @@ mod tests {
         assert!(v["totals"].get("thoughtTokens").is_none());
         let back: TokenUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_agent_names_are_additive_and_omitted_when_empty() {
+        let legacy: TokenUsage = serde_json::from_value(serde_json::json!({
+            "byAgentId": {},
+            "totals": { "inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0 },
+            "byModel": {},
+            "lastScanAt": null
+        }))
+        .expect("pre-agentNames snapshot deserializes");
+        assert!(legacy.agent_names.is_empty());
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v.get("agentNames").is_none(), "empty map omitted");
+
+        let mut named = legacy;
+        named
+            .agent_names
+            .insert("agent-123".to_string(), "Coordinator".to_string());
+        let v = serde_json::to_value(&named).unwrap();
+        assert_eq!(v["agentNames"]["agent-123"], "Coordinator");
+        let back: TokenUsage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, named);
     }
 
     #[test]
@@ -7678,6 +7802,7 @@ mod tests {
             totals,
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -7723,6 +7848,7 @@ mod tests {
             totals,
             by_model,
             by_agent_model: None,
+            agent_names: BTreeMap::new(),
             last_scan_at: None,
         };
         let v = serde_json::to_value(&usage).unwrap();
@@ -8128,6 +8254,8 @@ mod tests {
                 "content": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 8),
             },
         }));
+        let long_reason = format!("blocked on {}", "q".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES));
+        lite.metadata.attention_request_reason = Some(long_reason.clone());
 
         lite.cap_list_previews();
 
@@ -8135,6 +8263,30 @@ mod tests {
             lite.last_agent_response.as_deref().map(str::len),
             Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
         );
+        // Truncation flags (intent-hq/intent#7250 follow-up): every shortened
+        // preview string is flagged, an untouched one is not, and the wire
+        // omits an unset flag rather than serving `false`.
+        assert!(lite.last_agent_response_truncated);
+        assert!(lite.digest_truncated);
+        assert!(lite.metadata.completion_report_truncated);
+        assert!(lite.metadata.attention_request_reason_truncated);
+        assert!(!lite.last_user_message_truncated);
+        let reason = lite.metadata.attention_request_reason.as_deref().unwrap();
+        assert_eq!(reason.len(), AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        assert!(long_reason.starts_with(reason));
+        let wire = serde_json::to_value(&lite).unwrap();
+        assert_eq!(wire["lastAgentResponseTruncated"], json!(true));
+        assert_eq!(wire["digestTruncated"], json!(true));
+        assert_eq!(wire["metadata"]["completionReportTruncated"], json!(true));
+        assert_eq!(
+            wire["metadata"]["attentionRequestReasonTruncated"],
+            json!(true)
+        );
+        assert!(wire.get("lastUserMessageTruncated").is_none());
+        // Re-capping an already-capped row keeps the flags (idempotent).
+        lite.cap_list_previews();
+        assert!(lite.metadata.attention_request_reason_truncated);
+        assert!(!lite.last_user_message_truncated);
         assert_eq!(
             lite.digest.as_deref().map(str::len),
             Some(AGENT_LIST_PREVIEW_BUDGET_BYTES)
@@ -8426,6 +8578,9 @@ mod tests {
                 "name": "launch-process",
                 "input": { "command": "x".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 2) },
             }));
+            // Under the default cap, over any tightened one: the frame fit
+            // must stamp its truncation flag.
+            lite.digest = Some("g".repeat(AGENT_LIST_PREVIEW_BUDGET_BYTES * 3 / 4));
             lite.strip_detail_only_fields();
             lite.cap_list_previews();
             lite
@@ -8436,6 +8591,8 @@ mod tests {
         let before = serde_json::to_string(&few).unwrap();
         assert_eq!(fit_agent_list_frame(&mut few), None);
         assert_eq!(serde_json::to_string(&few).unwrap(), before);
+        assert!(!few[0].digest_truncated, "digest fits the default cap");
+        assert!(few[0].last_user_message_truncated);
 
         // 460 rows at the default cap encode past the frame budget (each row
         // is inside the row budget); the fit tightens until they fit.
@@ -8477,6 +8634,14 @@ mod tests {
             served.metadata.completion_report.as_deref().map(str::len),
             Some(fit.preview_budget)
         );
+        // A preview that passed the default cap unflagged gains its flag when
+        // the frame fit shortens it.
+        assert_eq!(
+            served.digest.as_deref().map(str::len),
+            Some(fit.preview_budget)
+        );
+        assert!(served.digest_truncated);
+        assert!(served.last_user_message_truncated);
         let tool_use = served.last_tool_use.as_ref().unwrap();
         assert_eq!(tool_use["name"], "launch-process");
         assert_eq!(tool_use["inputTruncated"], json!(true));

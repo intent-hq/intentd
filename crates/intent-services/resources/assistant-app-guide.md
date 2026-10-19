@@ -19,7 +19,8 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, and personal device pairing are currently experimental.
+Multiplayer, Collaboration, personal device pairing, and provider profiles are
+currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
@@ -105,7 +106,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/SettingsSidebarNav.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -117,6 +118,43 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+**Provider profiles (experimental; Codex and Claude Code only).** Describe them
+only when the user asks. To turn them on, use the command menu action **Enable
+experimental provider profiles** (**Disable experimental provider profiles** turns
+them off), or, if asked, propose `labs.providerProfiles` with `ws.app.settings.propose`.
+A profile runs the installed
+CLI with its own environment variables, for example a work and a personal account
+or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
+choose **Add profile**: enter a name and environment variables (literal values,
+**Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
+the provider host user's home folder (`~user` stays literal). The user signs in or
+prepares that account outside Intent. Credentials inherited from the environment can still
+apply: for a Claude Code profile that should use another account (or none), set
+inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
+**Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
+custom base URL from the environment; for a different endpoint, give the profile
+its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
+**Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
+appears as its own model-picker group, such as **Codex · Work**; with profiles,
+the original configuration is **Codex · Default**. Each profile has its own **Fast
+mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
+never follows the Default setting. Delegated agents follow their
+explicit, specialist, or default selection, never the parent's profile.
+
+Switching a conversation to another profile, even with the same model, applies on
+the next message: a turn in progress finishes first, then a fresh provider session
+starts with the conversation history. Editing a profile's environment never
+interrupts or restarts anything. Running sessions keep their settings and show
+**Using earlier settings**; new provider processes, including ones restarted after
+idling or a crash, use the saved settings. To refresh existing conversations,
+restart Intent when the app runs the daemon on this computer, otherwise restart
+intentd on the provider host; reconnecting alone does not apply the edit. Remove a
+profile from the same view, after changing any default, specialist, or quick-action
+setting that selects it. Conversations keep their history, and their next message
+asks for another model (**Choose another model to continue**), as does a profile
+whose provider is disabled. Intent never switches them to another account.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
@@ -202,18 +240,25 @@ state, it shows the most recently updated available PR. Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
 agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
+Selecting a repository restores the agent setup last used to create a workspace
+there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
+reasoning effort. A repository with no saved setup uses the most recent setup.
+Changes you make in the form are kept when you switch repositories.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
-it and choose **Create workspace** on the card, or ask the agent to apply it. The
+it and choose **Create workspace** on the card, or ask the agent to apply it.
+Unless the agent named one, the card starts with the agent last used in New
+workspace for that repository, and shows the model and reasoning effort it will use
+while that agent stays selected. The
 new workspace opens as a tab at the end of the top tab strip, and the current
 workspace stays selected.
 
@@ -316,12 +361,12 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
 behavior** is **Show choices**, the default). If another workspace worked on that
-PR, the last menu item is **Open in original workspace**, followed by that
-workspace's name; with several such workspaces it opens a submenu of their names,
-most recent first. Archived workspaces are included
-and marked **Archived**. Intent links a PR to a workspace when it discovers the PR on
-that workspace's branch or one of its submodules; PRs seen only before this feature
-shipped are not linked until Intent sees them again.
+PR, the last menu item is **Open in original workspace**, which opens it; with
+several such workspaces it opens a submenu of their names, most recent first.
+Archived workspaces are included, and the submenu marks them **Archived**. Intent
+links a PR to a workspace when it discovers the PR on that workspace's branch or
+one of its submodules; PRs seen only before this feature shipped are not linked
+until Intent sees them again.
 
 ## Home Workspaces
 
@@ -519,7 +564,10 @@ available actions. Never construct links from guessed IDs or claim completion fr
 this static guide.
 
 Workspace file links open a file panel. Markdown files open in a read-only preview
-that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+that renders Mermaid diagrams. For files in the main workspace checkout, relative image paths such as
+`charts/chart.png` resolve from the Markdown file's folder and cannot reach
+outside the workspace; files from other registered repositories do not resolve them.
+Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel

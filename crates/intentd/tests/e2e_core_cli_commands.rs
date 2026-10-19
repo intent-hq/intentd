@@ -1371,6 +1371,90 @@ async fn status_exits_quietly_when_stdout_pipe_closes_early() {
     );
 }
 
+/// Concatenated contents of the daemon's rotating `intentd.*.log` files.
+fn read_rotating_daemon_log(data_dir: &Path) -> String {
+    let mut text = String::new();
+    for entry in std::fs::read_dir(data_dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let is_log = path.extension().is_some_and(|ext| ext == "log");
+        if is_log && entry.file_name().to_string_lossy().starts_with("intentd.") {
+            text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+    text
+}
+
+/// Regression test for intent-hq/intent#7119: `intentd serve` must survive
+/// its stderr pipe being closed by the parent. Two user-tier skills share a
+/// name, so the startup skills scan emits a collision warning; that warning
+/// used to be an `eprintln!`, which panics on EPIPE and aborted the daemon.
+/// The read end is closed before spawn so every stderr write fails
+/// deterministically. Expected: the warning reaches the rotating log via
+/// tracing and the daemon keeps running.
+#[tokio::test]
+async fn serve_survives_closed_stderr_pipe_during_skill_scan() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let home = data_dir.join("home");
+    for tier in [".agents/skills/dupskill", ".claude/skills/dupskill"] {
+        let dir = home.join(tier);
+        std::fs::create_dir_all(&dir).expect("mkdir duplicate skill dir");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: dupskill\ndescription: duplicate skill fixture\n---\nbody\n",
+        )
+        .expect("write duplicate skill");
+    }
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+
+    let (pipe_read, pipe_write) = nix::unistd::pipe().expect("pipe(2)");
+    drop(pipe_read);
+
+    let mut cmd = common::hermetic_serve_command(&data_dir);
+    cmd.env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("INTENTD_AUTH_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(pipe_write));
+    let mut child = GuardedChild::spawn(&mut cmd).expect("spawn intentd serve");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut warned_at = None;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "intentd serve exited ({status:?}) after its stderr pipe closed\n--- daemon log ---\n{}",
+                read_rotating_daemon_log(&data_dir)
+            );
+        }
+        let log = read_rotating_daemon_log(&data_dir);
+        if warned_at.is_none() && log.contains("Skill name collision") {
+            warned_at = Some(tokio::time::Instant::now());
+        }
+        if let Some(at) = warned_at {
+            if at.elapsed() >= Duration::from_secs(1) && common::daemon_is_ready(&socket).await {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon never logged the skill collision warning and became ready\n--- daemon log ---\n{log}"
+        );
+        // timing-guard: poll interval of a loop bounded by observable log/readiness events.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        child.try_wait().expect("poll intentd serve").is_none(),
+        "intentd serve must still be running"
+    );
+}
+
 /// Run `intentd settings <args…>` against the daemon in `data_dir`. With
 /// `stdin: Some(bytes)` the bytes are piped in and stdin closes at EOF; with
 /// `None` stdin is `/dev/null` (a non-TTY with immediate EOF), so prompt

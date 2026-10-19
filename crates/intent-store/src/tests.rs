@@ -31,6 +31,7 @@ mod note_line_attribution;
 mod note_pages;
 mod note_search;
 mod pull_request_workspace;
+mod write_acquire_retry;
 
 #[tokio::test]
 async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {

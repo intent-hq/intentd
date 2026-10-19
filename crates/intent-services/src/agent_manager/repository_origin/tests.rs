@@ -111,6 +111,8 @@ pub(super) fn handle(
             session_mcp_servers: vec![],
             spawned_model: None,
             spawned_provider: "claude-agent-acp".into(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("claude-agent-acp"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,

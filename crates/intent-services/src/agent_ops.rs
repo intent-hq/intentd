@@ -421,12 +421,16 @@ mod tests_settings_default_effort;
 #[cfg(test)]
 mod tests_catalog_default_model;
 
+#[cfg(test)]
+mod tests_unknown_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
 /// monorepo#1729 — the renamed `quickActions.*` keys scope to single-shot
 /// quick actions and never to agent sessions, delegated ones included):
-/// 1. `model.providerDefaults[resolved provider]`
+/// 1. `model.providerDefaults[resolved provider]` (for a profile reference,
+///    then `model.providerDefaults[base provider]`)
 /// 2. `model.default`
 /// 3. None → CLI default (current behavior, last resort)
 ///
@@ -450,9 +454,17 @@ fn resolve_default_model_from_settings(
         derived = crate::agent_session::derived_default_provider(&settings);
         derived.as_deref()
     };
-    if let Some(model) = provider_key.and_then(|k| settings.model.provider_defaults.get(k)) {
-        if !model.is_empty() {
-            return Some(model.clone());
+    // A profile reference walks its own key, then its base provider's
+    // (PROTOCOL §5.54); a bare id has a single key.
+    let keys = provider_key.into_iter().flat_map(|k| {
+        let base = intent_providers::base_provider_id(k);
+        std::iter::once(k).chain((base != k).then_some(base))
+    });
+    for key in keys {
+        if let Some(model) = settings.model.provider_defaults.get(key) {
+            if !model.is_empty() {
+                return Some(model.clone());
+            }
         }
     }
 
@@ -487,6 +499,17 @@ pub(crate) enum DefaultModelSource {
     CatalogDefault,
     /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
+}
+
+/// Where an agent create's `model` argument came from (intent-hq/intent#7121):
+/// only a model the caller supplied in this request is checked against the
+/// provider's catalog; one inherited from stored state is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreateModelSource {
+    /// Supplied by the caller of this request (or absent).
+    Caller,
+    /// Carried over from a stored session (`agent.wakeOrCreate` inheritance).
+    Inherited,
 }
 
 /// Output of [`Services::resolve_create_model_and_effort`]: the model and
@@ -741,6 +764,22 @@ pub(crate) fn ensure_known_provider(method: &str, provider_id: &str) -> Result<(
     Ok(())
 }
 
+impl Services {
+    /// Front-door provider validation for every selection path (create,
+    /// setModel, delegate, specialist pins, the settings default): a bare id
+    /// must be registered ([`ensure_known_provider`]); a profile reference
+    /// must name a saved, enabled profile
+    /// ([`Services::ensure_provider_ref_selectable`]) and fails with
+    /// `provider-profile-replacement-required` otherwise — never falling back
+    /// to the bare base (PROTOCOL §5.54).
+    pub(crate) fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
+        if crate::provider_profiles::is_qualified_ref(provider_id) {
+            return self.ensure_provider_ref_selectable(provider_id);
+        }
+        ensure_known_provider(method, provider_id)
+    }
+}
+
 /// Reject a bare model id that provably belongs to a different provider with
 /// `-32602` (`InvalidParams`). Persisting the mismatch would make the spawn
 /// path feed another provider's model id to `provider_id`'s binary
@@ -789,6 +828,53 @@ pub(crate) fn ensure_bare_model_matches_provider(
         )));
     }
     Ok(())
+}
+
+/// Reject a caller-supplied model id the provider provably cannot resolve
+/// with `-32602` (`InvalidParams`), naming the valid models
+/// (intent-hq/intent#7121). Without it an unknown id was persisted and the
+/// provider silently ran its default model.
+///
+/// "Provably" needs both a warm cached catalog
+/// ([`crate::model_catalog::ModelCatalogReader::cached_catalog_rows`],
+/// profile-aware) and known resolution rules. Catalogs are picker lists, not
+/// every id a provider accepts, so a model is judged the way the provider
+/// itself resolves it: Claude Code's adapter matches aliases, full model ids
+/// and family names against its picker rows
+/// ([`crate::model_preference::resolve_model_preference`]). Providers whose
+/// rules are not mirrored, and any cold / empty / stale catalog, pass
+/// through — absence of evidence is never a rejection, so creation never
+/// blocks on model discovery. The `"default"` sentinel always passes.
+pub(crate) fn ensure_model_offered_by_provider(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
+    provider_ref: &str,
+    model_id: &str,
+) -> Result<()> {
+    if model_id == "default" || intent_providers::provider_config(provider_ref).id != "claude-code"
+    {
+        return Ok(());
+    }
+    let Some(rows) = cache.cached_catalog_rows(provider_ref) else {
+        return Ok(());
+    };
+    let options: Vec<crate::model_preference::ModelOption<'_>> = rows
+        .iter()
+        .map(|row| crate::model_preference::ModelOption {
+            value: &row.id,
+            display_name: &row.name,
+            description: &row.description,
+        })
+        .collect();
+    if crate::model_preference::resolve_model_preference(&options, model_id).is_some() {
+        return Ok(());
+    }
+    let valid: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    Err(Error::InvalidParams(format!(
+        "{method}: model {model_id} is not available for provider {provider_ref} \
+         (valid models: {})",
+        valid.join(", ")
+    )))
 }
 
 /// Reject a `reasoningEffort` level the resolved model provably does not
@@ -936,7 +1022,7 @@ fn resolve_delegate_provider(
 
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
-            ensure_known_provider("agent.delegate", &derived)?;
+            services.ensure_selectable_provider("agent.delegate", &derived)?;
             ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
             Ok(Some(derived))
         }
@@ -962,7 +1048,7 @@ fn resolve_specialist_provider(
             .resolve_coding_agent(id, workspace_path)
     });
     if let Some(provider) = provider.as_deref() {
-        ensure_known_provider(method, provider)?;
+        services.ensure_selectable_provider(method, provider)?;
         ensure_provider_available(method, provider, &services.effective_settings().providers)?;
     }
     Ok(provider)
@@ -984,7 +1070,9 @@ pub(crate) fn resolve_delegate_provider_preview(
     definition: &serde_json::Value,
 ) -> Option<String> {
     if let Some(provider_id) = crate::specialists::config_scalar(definition, "codingAgent") {
-        if intent_providers::find_provider(provider_id).is_some() {
+        if intent_providers::find_provider(provider_id).is_some()
+            || intent_providers::split_profile_ref(provider_id).is_some()
+        {
             return Some(provider_id.to_string());
         }
     }
@@ -1022,7 +1110,7 @@ pub(crate) fn provider_is_disabled(
     provider_id: &str,
     enabled: Option<&std::collections::BTreeMap<String, bool>>,
 ) -> bool {
-    intent_providers::find_provider(provider_id)
+    intent_providers::find_provider(intent_providers::base_provider_id(provider_id))
         .is_some_and(|provider| provider_config_is_disabled(provider, enabled))
 }
 
@@ -1085,6 +1173,15 @@ pub(crate) fn resolve_disabled_provider_rehome(
     Some(DisabledProviderRehome { provider, model })
 }
 
+/// Test-only `providers.paths` value marking a base provider installed for
+/// [`ensure_provider_available`]. Codex and Claude Code are npx-only and ignore
+/// path overrides, so without it their availability follows the host's
+/// Node/npx. Being settings data, it reaches every call site (including the
+/// `spawn_blocking` delegate resolver) per `Services` instance, without
+/// mutating process-global `PATH`. The disabled and auth gates still run.
+#[cfg(test)]
+pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
+
 /// Reject a known provider id that is disabled in settings, whose cached
 /// auth verdict is hard-false, or that the daemon's own provider discovery
 /// reports as unrunnable (not installed, or gated off by a missing env
@@ -1110,9 +1207,19 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    let availability = intent_providers::provider_availability_for(provider_id, &|key| {
-        providers.paths.get(key).cloned()
-    });
+    #[cfg(test)]
+    if providers
+        .paths
+        .get(intent_providers::base_provider_id(provider_id))
+        .is_some_and(|path| path == TEST_RUNNABLE_PATH)
+    {
+        return Ok(());
+    }
+    // A profile shares its base provider's installation and paths.
+    let availability = intent_providers::provider_availability_for(
+        intent_providers::base_provider_id(provider_id),
+        &|key| providers.paths.get(key).cloned(),
+    );
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
@@ -3835,7 +3942,15 @@ impl Services {
             tracing::warn!(%error, agent = %session.id, "pending delete display projection unavailable");
             None
         });
+        // Profile activation overlays (PROTOCOL §5.54): the live process's
+        // earlier-settings flag and a refused next turn's replacement need.
+        let using_earlier_profile_settings =
+            self.profile_activation().uses_earlier_settings(&session.id);
+        let provider_replacement_required =
+            self.provider_replacement_required(session.provider.as_deref());
         let mut lite = project(session);
+        lite.using_earlier_profile_settings = using_earlier_profile_settings;
+        lite.provider_replacement_required = provider_replacement_required;
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
         lite.is_waiting_for_other_agents = is_waiting_for_other_agents;
@@ -4692,6 +4807,7 @@ impl Services {
     ///
     /// `method` labels the errors (`agent.create` / `workspace.create`);
     /// `spec_wp` is the project-tier hint for the specialist lookups.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn resolve_create_model_and_effort(
         &self,
         method: &'static str,
@@ -4700,6 +4816,7 @@ impl Services {
         provider: Option<&str>,
         reasoning_effort: Option<String>,
         spec_wp: Option<&Path>,
+        model_origin: CreateModelSource,
     ) -> Result<CreateModelAndEffort> {
         // A present value — even blank — means the effort was decided by the
         // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
@@ -4737,7 +4854,7 @@ impl Services {
         // silently spawn the default binary. Absent provider (defaulting)
         // remains valid.
         if let Some(p) = provider {
-            ensure_known_provider(method, p)?;
+            self.ensure_selectable_provider(method, p)?;
         }
         // monorepo#3044: with no explicit provider and no settings-derived
         // default, no spawn provider could ever resolve for this session.
@@ -4766,16 +4883,25 @@ impl Services {
         if let Some(p) =
             crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
         {
+            // A profile default (or explicit reference) must still name a
+            // saved, enabled profile: never persist a session that would run
+            // the base's Default account (PROTOCOL §5.54).
+            self.ensure_provider_ref_selectable(&p)?;
             ensure_provider_enabled(
                 method,
                 &p,
                 self.effective_settings().providers.enabled.as_ref(),
             )?;
-            ensure_provider_authenticated(
-                method,
-                &p,
-                crate::provider_auth::cached_auth_verdict(&p),
-            )?;
+            // A profile is gated on its own saved settings' verdict, never
+            // the base provider's Default verdict.
+            let verdict = if crate::provider_profiles::is_qualified_ref(&p) {
+                Box::pin(self.resolve_profile_env(&p))
+                    .await?
+                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
+            } else {
+                crate::provider_auth::cached_auth_verdict(&p)
+            };
+            ensure_provider_authenticated(method, &p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
         // dynamic catalogs) must not be persisted: the spawn would feed the
@@ -4797,6 +4923,12 @@ impl Services {
                 .or(derived_default.as_deref())
                 .expect("guarded above: provider or derived default present");
             match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
+                // A caller-supplied id must also be one the provider can
+                // resolve (intent-hq/intent#7121); derived defaults and models
+                // inherited from stored state keep the ownership-only check.
+                Ok(()) if model_explicit && model_origin == CreateModelSource::Caller => {
+                    ensure_model_offered_by_provider(method, &self.cached_models(), effective, m)?;
+                }
                 Ok(()) => {}
                 Err(e) if model_explicit => return Err(e),
                 Err(e) => {
@@ -4920,6 +5052,37 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        self.agent_create_with_model_source_op(
+            workspace_id,
+            name,
+            model,
+            specialist,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            extra,
+            CreateModelSource::Caller,
+        )
+        .await
+    }
+
+    /// [`Self::agent_create_op`] with the provenance of `model` spelled out:
+    /// a model inherited from stored state ([`CreateModelSource::Inherited`])
+    /// skips the unknown-model guard (intent-hq/intent#7121), so a later
+    /// catalog change never blocks re-creating an agent for existing work.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn agent_create_with_model_source_op(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        specialist: Option<String>,
+        parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
+        extra: AgentCreateExtra,
+        model_origin: CreateModelSource,
+    ) -> Result<Value> {
         // SECURITY: the project tier resolves against the stored workspace
         // record's path, never a client-supplied one (review thread
         // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed
@@ -4948,6 +5111,7 @@ impl Services {
                 skip_auto_commit,
                 extra,
                 spec_wp.clone(),
+                model_origin,
             )
             .await?;
         Ok(self
@@ -4983,6 +5147,7 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
         spec_wp: Option<PathBuf>,
+        model_origin: CreateModelSource,
     ) -> Result<AgentCreatePlan> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
         // front-door check so every path that spawns a child for a parent
@@ -5175,6 +5340,7 @@ impl Services {
                 provider.as_deref(),
                 reasoning_effort,
                 spec_wp.as_deref(),
+                model_origin,
             )
             .await?;
         let remember_specialist = remember_specialist
@@ -5486,6 +5652,8 @@ impl Services {
             json!({ "agentId": agent_id.0, "name": name }),
         )
         .await;
+        self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
+            .await;
         Ok(json!({ "success": true, "name": name }))
     }
 
@@ -5511,7 +5679,7 @@ impl Services {
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).
         if let Some(pid) = provider_id.as_deref() {
-            ensure_known_provider("agent.setModel", pid)?;
+            self.ensure_selectable_provider("agent.setModel", pid)?;
         }
         let model_provider = if let Some(pid) = provider_id {
             // Explicit providerId: ownership is validated against the GIVEN
@@ -5561,7 +5729,7 @@ impl Services {
                 .provider
                 .as_deref()
                 .filter(|p| !p.is_empty())
-                .map(|p| intent_providers::provider_config(p).id.to_string())
+                .map(crate::provider_profiles::canonical_selection)
                 .or_else(|| {
                     crate::agent_session::derived_default_provider(&self.effective_settings())
                 });
@@ -6706,6 +6874,10 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
+        if obj.contains_key("name") {
+            self.refresh_token_usage_after_rename(&session.workspace_id, &agent_id)
+                .await;
+        }
         // `status` / `isBackground` / `notificationsMuted` feed the
         // needs_attention derivation (a deleted, background, or muted
         // session's pending request/question/error no longer counts):
@@ -7120,6 +7292,11 @@ impl Services {
             response["providerId"] = Value::String(provider_id);
             return Ok(response);
         }
+        if crate::provider_profiles::is_qualified_ref(&provider_id) {
+            return self
+                .models_list_profile_op(provider_id, force_refresh)
+                .await;
+        }
         let Some(source) = crate::model_catalog::source_for(&provider_id) else {
             return Ok(static_provider_response(
                 &provider_id,
@@ -7187,6 +7364,50 @@ impl Services {
                     .unwrap_or_else(|| format!("model discovery for '{provider_id}' failed")),
             )),
         }
+    }
+
+    /// `models.list { providerId: providerRef }` (PROTOCOL §5.54): the
+    /// profile's own catalog, probed with the profile's saved overlay on the
+    /// base provider's installation and cached under the reference plus the
+    /// profile's settings fingerprint, so catalogs never cross profiles, the
+    /// Default configuration or saved edits. Rows report
+    /// `provider = providerRef`. A missing profile or disabled base provider
+    /// needs a replacement.
+    async fn models_list_profile_op(
+        &self,
+        reference: String,
+        force_refresh: bool,
+    ) -> Result<Value> {
+        let profile = self.resolve_selected_profile(&reference).await?;
+        let resolved = self
+            .models_catalog
+            .resolve_installed_for(&reference, profile, force_refresh)
+            .await;
+        let Some(models) = resolved.models else {
+            return Ok(static_provider_response(
+                &reference,
+                &resolved
+                    .warning
+                    .unwrap_or_else(|| format!("model discovery for '{reference}' failed")),
+            ));
+        };
+        let models: Vec<Value> = models
+            .into_iter()
+            .map(|mut row| {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("provider".into(), Value::String(reference.clone()));
+                }
+                row
+            })
+            .collect();
+        let mut out = json!({ "providerId": reference, "models": models, "source": reference });
+        if resolved.stale {
+            out["stale"] = Value::Bool(true);
+        }
+        if let Some(w) = resolved.warning {
+            out["warning"] = Value::String(w);
+        }
+        Ok(out)
     }
 
     /// The legacy no-`providerId` `models.list` path, routed through the same
@@ -10657,10 +10878,24 @@ impl Services {
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
         // child's first message when a task is linked.
+        //
+        // A named note that does not exist in THIS workspace (a typo, a stale
+        // id, or another workspace's note — `fetch_note` is workspace-scoped)
+        // rejects with `-32602` here, before any side effect, so the caller
+        // gets an error instead of an idle child bound to a missing note
+        // (intent-hq/intent#7120). The message deliberately names only the
+        // caller-supplied id, never the foreign note's content.
         let task_note = match session_task_note_id.as_ref() {
-            Some(note_id) => crate::fetch_note(&self.store, &workspace_id, note_id)
-                .await
-                .ok(),
+            Some(note_id) => match crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                Ok(note) => Some(note),
+                Err(Error::NotFound(_)) => {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.delegate: task note not found in this workspace: {}",
+                        note_id.0
+                    )));
+                }
+                Err(e) => return Err(e),
+            },
             None => None,
         };
         if message.is_none() {
@@ -10805,7 +11040,7 @@ impl Services {
                         .canonical_id_or_err(spec_id, ws_path.as_deref())?;
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
-                    ensure_known_provider("agent.delegate", provider_param)?;
+                    services.ensure_selectable_provider("agent.delegate", provider_param)?;
                     ensure_provider_available(
                         "agent.delegate",
                         provider_param,
@@ -11320,7 +11555,7 @@ impl Services {
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
-            ensure_known_provider("agent.delegate", provider_param)?;
+            self.ensure_selectable_provider("agent.delegate", provider_param)?;
             ensure_provider_available(
                 "agent.delegate",
                 provider_param,
@@ -12166,9 +12401,9 @@ impl Services {
     /// grouped or ungrouped — on the caller, i.e. the target is itself
     /// waiting on the caller to settle. Accepting the registration would arm
     /// an A⇄B pair where each side's settlement is deferred by the other's
-    /// watch; the settlement-time `mutual_idle` break in
+    /// watch; the settlement-time idle-cycle break in
     /// [`Services::classify_agent_waiting`] eventually declassifies such a
-    /// deadlocked 2-cycle, but only once both sides sit idle — refusing to
+    /// deadlocked all-idle cycle, but only once both sides sit idle — refusing to
     /// create the pair up front is strictly better. "Live" means
     /// non-`report_delivered` ([`Services::waiting_watches_for_parent`]): a
     /// `report_delivered` reverse watch has already delivered its
@@ -12179,11 +12414,12 @@ impl Services {
     /// rehydration) pair the watch with a message/wake that settles one side
     /// or must keep rehydrating persisted pairs, and stay covered by the
     /// settlement-time backstop. Direct pair check only — deeper cycles
-    /// (A→B→C→A) are intentionally not detected here. Best-effort under
+    /// (A→B→C→A) are intentionally not detected here; the settlement-time
+    /// idle-cycle backstop declassifies them too. Best-effort under
     /// concurrency (TOCTOU): two agents racing explicit registrations on
     /// each other can both pass this check before either watch lands and
     /// still form the mutual pair — that race is covered by the same
-    /// settlement-time `mutual_idle` backstop.
+    /// settlement-time idle-cycle backstop.
     fn check_no_reverse_watch(
         &self,
         caller_agent_id: &AgentId,
@@ -14555,10 +14791,19 @@ impl Services {
             None => None,
         };
         let specialist = inherited_specialist.or(create_opts.specialist.clone());
+        let inherited_model = inheritance_source.as_ref().and_then(|s| s.model.clone());
+        // Only a model the caller passed in this request is validated against
+        // the provider catalog (intent-hq/intent#7121); an inherited one is
+        // carried over as-is so a later catalog change cannot block the wake.
+        let model_origin = if input.model.is_none() && inherited_model.is_some() {
+            CreateModelSource::Inherited
+        } else {
+            CreateModelSource::Caller
+        };
         let model = input
             .model
             .clone()
-            .or_else(|| inheritance_source.as_ref().and_then(|s| s.model.clone()))
+            .or(inherited_model)
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
@@ -14628,7 +14873,7 @@ impl Services {
         // B3 but is rejected by LC-1. That pass-then-reject is intentional
         // fail-closed behavior: the wire value cannot bypass the stored cap.
         let created = self
-            .agent_create_op(
+            .agent_create_with_model_source_op(
                 workspace_id.clone(),
                 name,
                 model,
@@ -14637,6 +14882,7 @@ impl Services {
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,
+                model_origin,
             )
             .await?;
         let agent_lite = &created["agent"];

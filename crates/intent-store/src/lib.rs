@@ -235,6 +235,19 @@ where
                 if !transient || start.elapsed() >= deadline {
                     return Err(e);
                 }
+                // Waiter-side attribution for single-writer saturation
+                // (intent-hq/intent#7070): the message carries the waiting
+                // operation's context. Error path only, so no hot-path cost.
+                if let Error::Internal(msg) = &e {
+                    if is_pool_timeout_message(msg) {
+                        tracing::warn!(
+                            error = %msg,
+                            attempt,
+                            waited_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            "store pool acquire timed out; retrying"
+                        );
+                    }
+                }
 
                 // Exponential backoff with symmetric ±25% jitter: 50ms,
                 // 100ms, 200ms, ..., capped at MAX_DELAY_MS per sleep and

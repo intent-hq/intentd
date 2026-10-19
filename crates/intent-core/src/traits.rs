@@ -6557,6 +6557,43 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
+    /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
+    /// with that profile's saved environment. `Some(ref)` checks one profile
+    /// (a missing one fails with `provider-profile-replacement-required`);
+    /// `None` sweeps every saved profile (`includeProfiles: true`). Returns a
+    /// JSON array.
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerTestPrompt` for a named profile reference (PROTOCOL
+    /// §5.54): the live probe runs with that profile's saved environment and
+    /// promotes or demotes only its verdict. A missing profile fails with
+    /// `provider-profile-replacement-required`.
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, model, node_max_old_space_mb);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_test_prompt not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
     /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
     /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:

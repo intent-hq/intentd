@@ -1139,6 +1139,11 @@ impl BusEventSink {
         let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
             return;
         };
+        // A git-ignored untracked path can never be committed, so a row for
+        // it would sit in `unstaged` forever (intent-hq/intent#7266).
+        if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+            return;
+        }
 
         // Diff compute is best-effort: a missing repo / clean worktree still
         // records the attribution row (with zero stats) so provenance is kept.
@@ -2568,6 +2573,14 @@ struct AgentHandle {
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
     spawned_provider: String,
+    /// The selection identity the child was spawned under: the canonical
+    /// provider id, or the named profile reference whose overlay it carries.
+    /// A different selection never reuses this child (PROTOCOL §5.54).
+    spawned_selection: String,
+    /// Activation registration of a child started under a named profile
+    /// (the saved settings fingerprint it read at start); dropping the
+    /// handle unregisters it (PROTOCOL §5.54 activation).
+    _activation: Option<crate::profile_activation::ActivationLease>,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
     /// the adapter is believed to be on — updated on every successful
@@ -2588,6 +2601,16 @@ struct AgentHandle {
     /// The per-agent idle-notification listener (monorepo#855), installed by
     /// `create_agent` after the handle lands; aborted when the handle drops.
     wake_listener: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl AgentHandle {
+    /// Test seam: mark a tracked mock child as spawned for the `mock`
+    /// provider (executable `node`, selection `mock`).
+    fn align_with_mock_for_test(&mut self) {
+        "node".clone_into(&mut self.spawned_provider);
+        "mock".clone_into(&mut self.spawned_selection);
+    }
 }
 
 impl Drop for AgentHandle {
@@ -3679,12 +3702,15 @@ impl AgentManager {
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
-            let context = crate::installed_cli::InstalledContext::discover(cli)
-                .await
-                .map_err(Error::InvalidInput)?;
-            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
-                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
-            context.apply(&mut prepared.command);
+            // A named profile resolves before account lookup; the spawn layer
+            // applies the same overlay to the prepared command.
+            let context = crate::installed_cli::InstalledContext::discover_for(
+                cli,
+                spawn_opts.profile_env.cloned().map(Arc::new),
+            )
+            .await
+            .map_err(Error::InvalidInput)?;
+            let prepared = prepare_installed_launch(&context, &spawn_opts)?;
             let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
@@ -3742,6 +3768,19 @@ impl AgentManager {
             }
         });
 
+        // The child read the profile's saved settings now; track it until
+        // it is torn down so earlier-settings state stays accurate.
+        let activation = match opts.profile_env {
+            // Boxed: keeps the spawn future's stack frame unchanged.
+            Some(profile) => {
+                Box::pin(
+                    self.services
+                        .register_profile_process(&workspace_id, &agent_id, profile),
+                )
+                .await
+            }
+            None => None,
+        };
         let handle = AgentHandle {
             repository_origin: repository_origin.clone(),
             execution: RuntimeHandle::local(LocalResources {
@@ -3764,6 +3803,11 @@ impl AgentManager {
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
+            spawned_selection: opts
+                .profile_env
+                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref)
+                .to_string(),
+            _activation: activation,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -4710,6 +4754,7 @@ impl AgentManager {
         agent_id: &AgentId,
         session_id: &str,
         provider: &str,
+        selection: &str,
         original: &OriginalTurn,
     ) -> Result<()> {
         let Some((conn, mut options)) = self
@@ -4727,14 +4772,11 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let enabled = self
-            .services
-            .effective_settings()
-            .providers
-            .fast_mode
-            .get(provider)
-            .copied()
-            .unwrap_or(false);
+        // A named profile reads its own entry, never the base provider's.
+        let enabled = crate::fast_mode::preference(
+            &self.services.effective_settings().providers.fast_mode,
+            selection,
+        );
         crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
         if let Some(handle) = self
             .handles
@@ -5284,7 +5326,8 @@ impl AgentManager {
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let provider_id = match &session {
-            Ok(s) => session_provider_id(s, configured_default.as_deref()),
+            Ok(s) => session_provider_id(s, configured_default.as_deref())
+                .map(|id| intent_providers::base_provider_id(&id).to_owned()),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -6325,6 +6368,7 @@ impl AgentManager {
         });
         let provider_kills_on_interrupt = session_provider
             .as_deref()
+            .map(intent_providers::base_provider_id)
             .and_then(intent_providers::find_provider)
             .is_some_and(|p| p.kills_child_on_interrupt)
             // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
@@ -9992,7 +10036,9 @@ impl AgentManager {
         resolved: &ResolvedSpawn,
     ) {
         let to_model = resolved.model.as_deref();
-        let to_provider = resolved.provider.id;
+        // The selection, not the base id: a profile switch is a provider
+        // change, and `last_turn_provider` names the native session's owner.
+        let to_provider = resolved.selection.as_str();
         let (from_model, from_provider) = match self
             .services
             .store
@@ -10021,9 +10067,18 @@ impl AgentManager {
                 )
                 .await;
         if changed && !announced {
-            let label = |provider: &str, model: Option<&str>| match model {
-                Some(m) => format!("{provider}:{m}"),
-                None => format!("{provider} (default model)"),
+            // A profile reads as `<base> (<profile name>)`, never as its
+            // internal reference; the metadata keeps the references.
+            let profiles = self.services.provider_profiles.profiles().ok();
+            let label = |provider: &str, model: Option<&str>| {
+                let provider = crate::provider_profiles::readable_selection(
+                    provider,
+                    profiles.as_deref().map(Vec::as_slice),
+                );
+                match model {
+                    Some(m) => format!("{provider}:{m}"),
+                    None => format!("{provider} (default model)"),
+                }
             };
             let from_label = label(
                 from_provider.as_deref().unwrap_or(""),
@@ -10307,6 +10362,15 @@ impl AgentManager {
         ) else {
             return Ok((session, false));
         };
+        // A named profile is never re-homed: a missing profile or a disabled
+        // base provider needs an explicit replacement before this turn, and
+        // never moves the conversation to the app default or the base's
+        // Default account (PROTOCOL §5.54). Bare selections keep the re-home.
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            self.services
+                .ensure_provider_ref_selectable_in(&raw, &settings.providers)?;
+            return Ok((session, false));
+        }
         let current = intent_providers::provider_config(&raw).id;
         if !crate::agent_ops::provider_is_disabled(current, settings.providers.enabled.as_ref()) {
             return Ok((session, false));
@@ -10536,10 +10600,12 @@ impl AgentManager {
                     // Compare the session's currently-resolved model/provider against
                     // the values the child was spawned with. A mismatch means
                     // agent.setModel was called while the child was live.
-                    let model_changed =
-                        handle.spawned_model.as_deref() != resolved.model.as_deref();
-                    let provider_changed = handle.spawned_provider != resolved.provider.command;
-                    model_changed || provider_changed
+                    spawn_identity_changed(
+                        handle.spawned_model.as_deref(),
+                        &handle.spawned_provider,
+                        &handle.spawned_selection,
+                        &resolved,
+                    )
                 } else {
                     false
                 }
@@ -10590,8 +10656,14 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id, &original)
-                        .await?;
+                    self.apply_fast_mode(
+                        agent_id,
+                        &acp,
+                        resolved.provider.id,
+                        &resolved.selection,
+                        &original,
+                    )
+                    .await?;
                     return Ok(StartedSession {
                         session_id: acp,
                         turn: original,
@@ -10722,7 +10794,16 @@ impl AgentManager {
                 "no provider binary resolved; launching the bare command from the daemon PATH"
             );
         }
+        // A named profile's saved overlay, read fresh for this new process
+        // (it re-checks the profile still exists and its base is enabled).
+        // Boxed: keeps this turn-start future's stack frame unchanged.
+        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+            Box::pin(self.services.resolve_selected_profile(&resolved.selection)).await?
+        } else {
+            None
+        };
         let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.profile_env = profile_env.as_deref();
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
         opts.reasoning_effort = resolved.reasoning_effort.as_deref();
@@ -10831,6 +10912,7 @@ impl AgentManager {
             agent_id,
             &acp_session_id.session_id,
             resolved.provider.id,
+            &resolved.selection,
             &acp_session_id.turn,
         )
         .await?;
@@ -12348,6 +12430,13 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
 /// [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
     provider: ProviderConfig,
+    /// The selection identity the session runs under
+    /// ([`crate::provider_profiles::canonical_selection`]): the canonical
+    /// provider id, or the profile reference `<base>@<profileId>` whose
+    /// overlay the spawn applies. Process reuse, the model-change notice and
+    /// native-session ownership compare this, so a switch between profiles
+    /// (or a profile and Default) always starts a fresh process.
+    selection: String,
     model: Option<String>,
     /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
     /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
@@ -12512,6 +12601,10 @@ fn resolve_spawn(
         crate::agent_session::derived_default_provider(settings).as_deref(),
     )
     .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
+    let selection = crate::provider_profiles::canonical_selection(&provider_id);
+    // A profile shares its base provider's installation, paths and launch
+    // configuration; only the environment overlay differs.
+    let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
     // Whitespace-bearing ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
     // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
@@ -12639,6 +12732,7 @@ fn resolve_spawn(
             ..*base
         };
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             // Config-option E2E providers must track the selected model so
             // live switches exercise the same respawn path as real providers.
@@ -12682,6 +12776,7 @@ fn resolve_spawn(
                 ));
             }
             return Ok(ResolvedSpawn {
+                selection: selection.clone(),
                 provider,
                 model,
                 reasoning_effort,
@@ -12713,6 +12808,7 @@ fn resolve_spawn(
                 "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
             return Ok(ResolvedSpawn {
+                selection: selection.clone(),
                 provider,
                 model,
                 reasoning_effort,
@@ -12729,8 +12825,17 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
+        // Test-only: the `agent_ops::TEST_RUNNABLE_PATH` marker stands in for
+        // a host npx so pure resolution tests do not depend on Node/npx.
+        #[cfg(test)]
+        let npx = npx.or_else(|| {
+            (read_provider_path_setting(settings, provider.id).as_deref()
+                == Some(crate::agent_ops::TEST_RUNNABLE_PATH))
+            .then(|| std::path::PathBuf::from("npx"))
+        });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             model,
             reasoning_effort,
@@ -12770,6 +12875,7 @@ fn resolve_spawn(
 
     Ok(ResolvedSpawn {
         provider,
+        selection,
         model,
         reasoning_effort,
         cwd,
@@ -12818,6 +12924,48 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
+/// Whether a live child no longer matches the session's resolved spawn
+/// identity and must be replaced before the next turn: a different model, a
+/// different provider executable, or a different selection — a switch
+/// between named profiles, or a profile and Default, is never served by the
+/// other configuration's process even when the model and executable match
+/// (PROTOCOL §5.54).
+fn spawn_identity_changed(
+    spawned_model: Option<&str>,
+    spawned_provider: &str,
+    spawned_selection: &str,
+    resolved: &ResolvedSpawn,
+) -> bool {
+    spawned_model != resolved.model.as_deref()
+        || spawned_provider != resolved.provider.command
+        || spawned_selection != resolved.selection
+}
+
+/// Test seam: the canonical selection of a handle spawned with `command`.
+#[cfg(test)]
+pub(crate) fn test_selection_for_command(command: &str) -> String {
+    intent_providers::ACP_PROVIDERS
+        .iter()
+        .rev()
+        .find(|p| p.command == command)
+        .map_or(command, |p| p.id)
+        .to_string()
+}
+
+/// Build a persistent installed-CLI launch: the spawn layer's command (provider
+/// env, Intent wiring, the profile overlay over captured credentials), frozen
+/// to the installed context, which re-asserts the selected executable and
+/// enforced policy.
+fn prepare_installed_launch(
+    context: &crate::installed_cli::InstalledContext,
+    spawn_opts: &SpawnOptions<'_>,
+) -> Result<intent_acp::spawn::PreparedProvider> {
+    let mut prepared = intent_acp::spawn::prepare_provider(spawn_opts)
+        .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+    context.apply(&mut prepared.command);
+    Ok(prepared)
+}
+
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
@@ -12846,6 +12994,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
+    spawn_opts.profile_env = opts.profile_env;
     spawn_opts
 }
 
@@ -18858,6 +19007,8 @@ mod dead_child_respawn_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -23190,3 +23341,188 @@ mod effort_notice_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+/// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
+/// command carries the profile over inherited and captured values, never over
+/// Intent's wiring, executable selection or enforced policy.
+#[cfg(all(test, unix))]
+mod profile_launch_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    #[test]
+    fn persistent_launch_applies_profile_but_never_over_intent_wiring() {
+        for (base, cli, account_var) in [
+            ("codex", InstalledCli::Codex, "CODEX_HOME"),
+            ("claude-code", InstalledCli::Claude, "CLAUDE_CONFIG_DIR"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                vec![
+                    ("PROFILE_LAUNCH_TOKEN".into(), Some("work".into())),
+                    (
+                        account_var.into(),
+                        Some(work.to_string_lossy().into_owned()),
+                    ),
+                    ("LOGNAME".into(), None),
+                    ("INTENT_TEST_WIRING".into(), Some("profile".into())),
+                ],
+            );
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.profile_env = Some(&profile);
+            opts.extra_env
+                .insert("INTENT_TEST_WIRING".into(), "intent".into());
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let command = &prepared.command;
+            assert_eq!(
+                env(command, "PROFILE_LAUNCH_TOKEN"),
+                Some("work".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, account_var),
+                Some(work.into_os_string()),
+                "{base}"
+            );
+            assert!(env(command, "LOGNAME").is_none(), "{base}");
+            assert_eq!(
+                env(command, "INTENT_TEST_WIRING"),
+                Some("intent".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, cli.path_env()),
+                Some(context.runtime.path().as_os_str().to_owned()),
+                "{base}"
+            );
+            if cli == InstalledCli::Codex {
+                assert_eq!(
+                    env(command, "CODEX_CONFIG"),
+                    Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+                );
+            }
+            assert!(std::env::var_os("PROFILE_LAUNCH_TOKEN").is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_spawn_options_keep_the_profile() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let profile = intent_acp::ProfileEnv::new("codex@work", "f1", Vec::new());
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let rebuilt = rebuild_spawn_opts(&opts, None, None, None);
+        assert_eq!(rebuilt.profile_env, Some(&profile));
+    }
+}
+
+/// Every key a profile may save reaches the persistent launch and the probe
+/// paths unchanged, even when Intent injects its own git wiring.
+#[cfg(all(test, unix))]
+mod profile_reach_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+        "INITIAL_AGENT_MODE",
+        "CORP_GATEWAY_TOKEN",
+        "LANG",
+    ];
+
+    #[test]
+    fn every_non_reserved_profile_key_reaches_launch_and_probes_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(repo.path()).unwrap();
+        let mut config = git.config().unwrap();
+        config.set_str("user.name", "Intent Wiring").unwrap();
+        config
+            .set_str("user.email", "wiring@example.invalid")
+            .unwrap();
+        for (base, cli) in [
+            ("codex", InstalledCli::Codex),
+            ("claude-code", InstalledCli::Claude),
+        ] {
+            let allowed: Vec<&str> = CANDIDATES
+                .iter()
+                .copied()
+                .filter(|k| crate::provider_profiles::reserved_key_reason(k, base).is_none())
+                .collect();
+            assert_eq!(
+                allowed.contains(&"INITIAL_AGENT_MODE"),
+                base == "claude-code"
+            );
+            let value = |k: &str| format!("profile-{k}");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                allowed
+                    .iter()
+                    .map(|k| ((*k).to_owned(), Some(value(k))))
+                    .collect(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.cwd = Some(repo.path());
+            opts.profile_env = Some(&profile);
+            inject_git_identity_env(&mut opts.extra_env, Some(repo.path()));
+            inject_git_credential_env(&mut opts.extra_env, Some(repo.path()), true);
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let mut auth_probe = tokio::process::Command::new(context.runtime.path());
+            context.apply(&mut auth_probe);
+            let mut model_probe = tokio::process::Command::new("unused");
+            context.apply_isolated(&mut model_probe);
+            for key in &allowed {
+                let expected = Some(OsString::from(value(key)));
+                assert_eq!(env(&prepared.command, key), expected, "{base} launch {key}");
+                assert_eq!(env(&auth_probe, key), expected, "{base} auth {key}");
+                assert_eq!(env(&model_probe, key), expected, "{base} model {key}");
+            }
+        }
+    }
+}

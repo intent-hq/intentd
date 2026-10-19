@@ -1445,3 +1445,343 @@ async fn codex_real_old_runtime_is_rejected_before_adapter_start() {
     assert!(error.contains(&requirement.minimum.to_string()), "{error}");
     println!("{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Named provider profiles (PROTOCOL §5.54): the overlay resolves before
+// account/home lookup, isolation and catalog fingerprinting.
+// ---------------------------------------------------------------------------
+
+fn profile(
+    reference: &str,
+    fingerprint: &str,
+    entries: &[(&str, Option<&str>)],
+) -> std::sync::Arc<intent_acp::ProfileEnv> {
+    std::sync::Arc::new(intent_acp::ProfileEnv::new(
+        reference,
+        fingerprint,
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+            .collect(),
+    ))
+}
+
+/// A context whose inherited env and captured shell credentials name the
+/// "personal" account, conflicting with every profile below.
+fn conflicting_context(cli: InstalledCli, root: &Path, body: &str) -> InstalledContext {
+    executable(&root.join(cli.command()), body);
+    let runtime = cli.resolve_in_dirs(&[root.to_owned()], false).unwrap();
+    let personal = root.join("personal");
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CODEX_HOME".into(), personal.as_os_str().to_owned()),
+        ("CLAUDE_CONFIG_DIR".into(), personal.as_os_str().to_owned()),
+        ("OPENAI_BASE_URL".into(), "https://personal.invalid".into()),
+    ]);
+    let captured = BTreeMap::from([
+        ("OPENAI_API_KEY".to_owned(), "personal-captured".to_owned()),
+        (
+            "ANTHROPIC_API_KEY".to_owned(),
+            "personal-captured".to_owned(),
+        ),
+    ]);
+    InstalledContext::from_inputs(
+        runtime,
+        &captured,
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn profile_overlay_beats_inherited_and_captured_before_home_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    assert_eq!(base.codex_home(), Some(root.path().join("personal")));
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+            ("OPENAI_BASE_URL", None),
+            ("EMPTY_SETTING", Some("")),
+        ],
+    )));
+    assert_eq!(context.codex_home(), Some(work.clone()));
+    let command = launch(&context, root.path());
+    assert_eq!(env(&command, "CODEX_HOME"), Some(work.into_os_string()));
+    assert_eq!(env(&command, "OPENAI_API_KEY"), Some("work-key".into()));
+    assert_eq!(env(&command, "EMPTY_SETTING"), Some(OsString::new()));
+    assert!(env(&command, "OPENAI_BASE_URL").is_none());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+    assert!(context.secret_values().contains(&"work-key".to_owned()));
+    assert!(std::env::var_os("EMPTY_SETTING").is_none());
+}
+
+#[test]
+fn profile_cannot_override_enforced_executable_or_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[
+                ("CODEX_PATH", Some("/profile/codex")),
+                ("CODEX_CONFIG", Some("profile-policy")),
+            ],
+        )));
+    let command = launch(&context, root.path());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+}
+
+#[test]
+fn profile_custom_keys_survive_isolated_application() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[("WORK_GATEWAY_TOKEN", Some("gateway"))],
+        )));
+    let mut command = Command::new("unused");
+    context.apply_isolated(&mut command);
+    assert_eq!(env(&command, "WORK_GATEWAY_TOKEN"), Some("gateway".into()));
+}
+
+#[tokio::test]
+async fn profile_catalog_keys_never_cross_profiles_or_settings_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let identity = {
+        let (_dir, fixture) = fixture(InstalledCli::Codex, "#!/bin/sh\nprintf '1.2.3\\n'\n");
+        let command = launch(&fixture, root.path());
+        fixture.observe(&command).await.unwrap().0
+    };
+    let key = |p: Option<std::sync::Arc<intent_acp::ProfileEnv>>| {
+        let context = base.clone().with_profile(p);
+        let identity = identity.clone();
+        async move {
+            context
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(&identity)
+                .unwrap()
+        }
+    };
+    let entries = [("OPENAI_API_KEY", Some("same"))];
+    let default = key(None).await;
+    let work = key(Some(profile("codex@work", "f1", &entries))).await;
+    let work_edited = key(Some(profile("codex@work", "f2", &entries))).await;
+    let personal = key(Some(profile("codex@personal", "f1", &entries))).await;
+    let all = [&default, &work, &work_edited, &personal];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    assert_eq!(work, key(Some(profile("codex@work", "f1", &entries))).await);
+}
+
+#[tokio::test]
+async fn claude_profile_config_dir_selects_fingerprinted_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(root.path().join("personal")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(work.to_str().unwrap())),
+            ("ANTHROPIC_API_KEY", None),
+        ],
+    )));
+    let command = launch(&context, root.path());
+    assert!(env(&command, "ANTHROPIC_API_KEY").is_none());
+    assert_eq!(
+        env(&command, "CLAUDE_CONFIG_DIR"),
+        Some(work.clone().into())
+    );
+    let fingerprint = |c: InstalledContext| async move {
+        c.with_catalog_fingerprint().await.unwrap().context_key
+    };
+    let before = fingerprint(context.clone()).await;
+    std::fs::write(root.path().join("personal/.credentials.json"), "{}").unwrap();
+    assert_eq!(before, fingerprint(context.clone()).await);
+    std::fs::write(work.join(".credentials.json"), "{}").unwrap();
+    assert_ne!(before, fingerprint(context).await);
+}
+
+#[tokio::test]
+async fn profile_isolated_codex_home_is_seeded_from_the_profile_account() {
+    let root = tempfile::tempdir().unwrap();
+    for (account, auth) in [("personal", "personal-auth"), ("work", "work-auth")] {
+        std::fs::create_dir_all(root.path().join(account)).unwrap();
+        std::fs::write(root.path().join(account).join("auth.json"), auth).unwrap();
+    }
+    let work = root.path().join("work");
+    let context = conflicting_context(
+        InstalledCli::Codex,
+        root.path(),
+        "#!/bin/sh\ncat \"$CODEX_HOME/auth.json\" > \"$HOME/seeded\"\nprintf '%s' \"$OPENAI_API_KEY\" > \"$HOME/key\"\nprintf '1.2.3\\n'\n",
+    )
+    .with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+        ],
+    )));
+    let _cmd = crate::acp_adapter::AcpAdapterCommand::binary("/bin/true".into(), vec![])
+        .prepare_with_context(context)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("seeded")).unwrap(),
+        "work-auth"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("key")).unwrap(),
+        "work-key"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_profiles_launch_with_their_own_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let var = format!(
+        "PROFILE_TEST_{}",
+        uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+    );
+    let body =
+        format!("#!/bin/sh\nprintf '%s' \"${var}\" > \"$HOME/seen-${var}\"\nprintf '1.2.3\\n'\n");
+    let base = conflicting_context(InstalledCli::Codex, root.path(), &body);
+    let run = |who: &'static str| {
+        let context = base.clone().with_profile(Some(profile(
+            &format!("codex@{who}"),
+            "f1",
+            &[(var.as_str(), Some(who))],
+        )));
+        let root = root.path().to_owned();
+        async move {
+            let command = launch(&context, &root);
+            context.observe(&command).await.unwrap();
+        }
+    };
+    tokio::join!(run("work"), run("personal"));
+    for who in ["work", "personal"] {
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("seen-{who}"))).unwrap(),
+            who
+        );
+    }
+    assert!(std::env::var_os(&var).is_none());
+}
+
+#[test]
+fn profile_codex_home_config_names_select_inherited_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    executable(&root.path().join("codex"), "#!/bin/sh\n");
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.toml"),
+        "[model_providers.corp]\nenv_key='CORP_API_KEY'\n",
+    )
+    .unwrap();
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CORP_API_KEY".into(), "corp-secret".into()),
+    ]);
+    let base = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    // The Default home declares nothing: its isolated probe drops the key.
+    let mut default_probe = Command::new("unused");
+    base.apply_isolated(&mut default_probe);
+    assert!(env(&default_probe, "CORP_API_KEY").is_none());
+    assert!(!base.secret_values().contains(&"corp-secret".to_owned()));
+
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(env(&probe, "CORP_API_KEY"), Some("corp-secret".into()));
+    assert!(context.secret_values().contains(&"corp-secret".to_owned()));
+    // Runs keep it too, so checks and runs agree.
+    assert_eq!(
+        env(&launch(&context, root.path()), "CORP_API_KEY"),
+        Some("corp-secret".into())
+    );
+}
+
+#[test]
+fn profile_codex_home_with_unreadable_config_keeps_existing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(work.join("config.toml")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(context.codex_home(), Some(work));
+}
+
+#[test]
+fn profile_path_consumes_captured_shell_credentials_like_default() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let context = base.clone().with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[("ANTHROPIC_BASE_URL", Some("https://work.invalid"))],
+    )));
+    // ANTHROPIC_API_KEY exists only in the captured login shell: the profile
+    // leaves it alone, so launches and probes see it exactly as Default does.
+    for command in [launch(&base, root.path()), launch(&context, root.path())] {
+        assert_eq!(
+            env(&command, "ANTHROPIC_API_KEY"),
+            Some("personal-captured".into())
+        );
+    }
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(
+        env(&probe, "ANTHROPIC_API_KEY"),
+        Some("personal-captured".into())
+    );
+}

@@ -20,6 +20,34 @@ mod plain_markdown;
 mod profile_reopen;
 mod writer_anchors;
 
+/// Hang guard for note-page test waits, scaled by
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER` like the other intentd test budgets
+/// (coverage CI exports 3). The bound only catches hangs; no assertion
+/// depends on it, so it never drops below the 5s base and is capped at 20x.
+fn wait() -> std::time::Duration {
+    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER").ok();
+    scaled_wait(multiplier.as_deref())
+}
+
+fn scaled_wait(multiplier: Option<&str>) -> std::time::Duration {
+    let multiplier = multiplier
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0);
+    std::time::Duration::from_secs(5).mul_f64(multiplier.clamp(1.0, 20.0))
+}
+
+#[test]
+fn wait_honors_coverage_multiplier_without_shortening_default() {
+    use std::time::Duration;
+    assert_eq!(scaled_wait(None), Duration::from_secs(5));
+    assert_eq!(scaled_wait(Some("3")), Duration::from_secs(15));
+    assert_eq!(scaled_wait(Some("0.1")), Duration::from_secs(5));
+    assert_eq!(scaled_wait(Some("bogus")), Duration::from_secs(5));
+    assert_eq!(scaled_wait(Some("NaN")), Duration::from_secs(5));
+    assert_eq!(scaled_wait(Some("1e300")), Duration::from_secs(100));
+}
+
 fn request(value: Value) -> NotePageRequest {
     serde_json::from_value(value).unwrap()
 }

@@ -365,6 +365,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(
         keys,
         vec![
+            "activation",
             "baseProviderId",
             "createdAt",
             "env",
@@ -375,6 +376,8 @@ async fn provider_profiles_crud_contract_over_wss() {
             "updatedAt"
         ]
     );
+    // No provider process runs this profile yet.
+    assert_eq!(profile["activation"], json!({ "runningProcesses": 0 }));
     let ev = next_event(&mut sub, "providers:profiles-changed").await;
     assert_eq!(ev["workspaceId"], "");
     assert_eq!(
@@ -554,6 +557,164 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert!(
         !log.contains(SECRET),
         "a profile value reached the daemon log"
+    );
+    drop(daemon);
+}
+
+/// Selection surfaces over the wire (PROTOCOL §5.54): the catalog offers
+/// profiles beside one row per provider type, a profile's auth status is
+/// keyed by its reference, and a missing reference needs a replacement on
+/// every account-check surface instead of reporting the Default account.
+#[tokio::test]
+async fn provider_profile_selection_surfaces_over_wss() {
+    let root = scratch_dir("select");
+    let (daemon, _port, _cfg) = boot(root.path()).await;
+    let data_dir = daemon.data_dir.clone();
+    let (mut ws, _sub) = connect(&data_dir).await;
+
+    let created = ok(
+        &mut ws,
+        1,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "Work", "env": [
+            { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+        ] }),
+    )
+    .await;
+    let profile = &created["profile"];
+    let reference = profile["providerRef"].as_str().unwrap().to_string();
+
+    let catalog = rpc(&mut ws, 2, "providers.catalog", json!({})).await;
+    assert!(!catalog.to_string().contains(SECRET), "{catalog}");
+    let catalog = &catalog["result"];
+    let rows = catalog["providers"].as_array().unwrap();
+    let supports =
+        |id: &str| rows.iter().find(|r| r["id"] == id).unwrap()["supportsProfiles"].clone();
+    assert_eq!(supports("codex"), json!(true));
+    assert_eq!(supports("claude-code"), json!(true));
+    assert_eq!(supports("auggie"), json!(false));
+    assert_eq!(
+        rows.iter().filter(|r| r["id"] == "codex").count(),
+        1,
+        "providers stays one row per type"
+    );
+    assert_eq!(
+        catalog["profiles"],
+        json!([{
+            "id": profile["id"],
+            "providerRef": reference,
+            "baseProviderId": "codex",
+            "name": "Work",
+        }])
+    );
+
+    let status = rpc(
+        &mut ws,
+        3,
+        "host.providerAuthStatus",
+        json!({ "providerId": reference }),
+    )
+    .await;
+    assert!(!status.to_string().contains(SECRET), "{status}");
+    let entries = status["result"]["providers"].as_array().expect("{status}");
+    assert_eq!(entries.len(), 1, "{status}");
+    assert_eq!(entries[0]["id"], reference.as_str());
+
+    for (id, method) in [
+        (4, "host.providerAuthStatus"),
+        (5, "host.providerTestPrompt"),
+    ] {
+        let missing = rpc(&mut ws, id, method, json!({ "providerId": "codex@pgone" })).await;
+        assert_eq!(missing["error"]["code"], -32602, "{method}: {missing}");
+        assert_eq!(
+            missing["error"]["data"]["code"], "provider-profile-replacement-required",
+            "{method}: {missing}"
+        );
+        assert_eq!(missing["error"]["data"]["providerRef"], "codex@pgone");
+        assert_eq!(missing["error"]["data"]["reason"], "profile-missing");
+    }
+
+    let models = rpc(
+        &mut ws,
+        6,
+        "models.list",
+        json!({ "providerId": "codex@pgone" }),
+    )
+    .await;
+    assert_eq!(
+        models["error"]["data"]["code"], "provider-profile-replacement-required",
+        "{models}"
+    );
+
+    // An agent on the profile: no activation state while nothing runs, and
+    // after removal its next turn needs an explicit replacement.
+    ok(
+        &mut ws,
+        7,
+        "settings.update",
+        json!({ "changes": [{ "path": "providers.paths", "value": { "codex": "/bin/sh" } }] }),
+    )
+    .await;
+    let workspace = ok(
+        &mut ws,
+        8,
+        "workspace.create",
+        json!({ "title": "Profiles WSS E2E", "noPrompt": true }),
+    )
+    .await;
+    let ws_id = workspace["workspace"]["id"].as_str().unwrap().to_string();
+    let agent = ok(
+        &mut ws,
+        9,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "provider": reference }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().unwrap().to_string();
+    assert_eq!(agent["agent"]["provider"], reference.as_str());
+    let get = ok(&mut ws, 10, "agent.get", json!({ "agentId": agent_id })).await;
+    assert!(
+        get["agent"].get("usingEarlierProfileSettings").is_none(),
+        "{get}"
+    );
+    assert!(
+        get["agent"].get("providerReplacementRequired").is_none(),
+        "{get}"
+    );
+    ok(
+        &mut ws,
+        11,
+        "providers.profiles.delete",
+        json!({ "profileId": profile["id"] }),
+    )
+    .await;
+    let get = ok(&mut ws, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    assert_eq!(
+        get["agent"]["providerReplacementRequired"],
+        json!({ "providerRef": reference, "reason": "profile-missing" }),
+        "{get}"
+    );
+    // Sending is refused at admission with the structured error.
+    let sent = rpc(
+        &mut ws,
+        13,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "next" }),
+    )
+    .await;
+    assert_eq!(sent["error"]["code"], -32602, "{sent}");
+    assert_eq!(
+        sent["error"]["data"],
+        json!({ "code": "provider-profile-replacement-required",
+                "providerRef": reference, "reason": "profile-missing" }),
+        "{sent}"
+    );
+    assert!(
+        !sent["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&reference),
+        "{sent}"
     );
     drop(daemon);
 }

@@ -75,7 +75,7 @@ fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
 /// well would say it twice. Every other provider keeps the composed prompt
 /// and no `_meta`, exactly as before.
 ///
-/// Verified against the pinned `@agentclientprotocol/claude-agent-acp` 0.81.1
+/// Verified when introduced against `@agentclientprotocol/claude-agent-acp` 0.81.1
 /// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
 /// 0.3.280:
 /// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`
@@ -486,15 +486,20 @@ impl Services {
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         if run_provider != "auggie" {
+            // A named profile default runs the one-shot with that profile's
+            // saved overlay on its base provider's installation; a missing
+            // profile or disabled base needs a replacement (PROTOCOL §5.54).
+            let profile = Box::pin(self.resolve_selected_profile(&run_provider)).await?;
             return self
                 .complete_once_via_acp(
-                    &run_provider,
+                    intent_providers::base_provider_id(&run_provider),
                     &prompt,
                     system_prompt,
                     model.as_deref(),
                     cwd,
                     timeout,
                     &effort,
+                    profile,
                 )
                 .await;
         }
@@ -570,6 +575,7 @@ impl Services {
         cwd: Option<PathBuf>,
         timeout_ms: u64,
         effort: &OneShotEffort,
+        profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
     ) -> Result<Value> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
@@ -604,10 +610,16 @@ impl Services {
         if let Err(err) = cmd.check_npx_version().await {
             return Ok(unavailable(err.to_string()));
         }
+        // Fast mode follows the selection: a named profile reads its own
+        // `providers.fastMode` entry, never the base provider's.
+        let fast_mode_selection = profile
+            .as_ref()
+            .map_or_else(|| provider_id.to_owned(), |p| p.provider_ref().to_owned());
         let cmd = match cwd {
             Some(dir) => cmd.cwd(dir),
             None => cmd,
-        };
+        }
+        .with_profile(profile);
         // Unit tests that pin a fake npx also use an isolated installed CLI.
         // Production and WSS tests always use canonical host discovery.
         #[cfg(all(test, unix))]
@@ -641,12 +653,10 @@ impl Services {
             Some((
                 provider_id,
                 Box::pin(async {
-                    self.effective_settings()
-                        .providers
-                        .fast_mode
-                        .get(provider_id)
-                        .copied()
-                        .unwrap_or(false)
+                    crate::fast_mode::preference(
+                        &self.effective_settings().providers.fast_mode,
+                        &fast_mode_selection,
+                    )
                 }),
             )),
             cmd,
@@ -717,6 +727,55 @@ mod tests {
                 assert_eq!(state["fastMode"], enabled);
                 assert_eq!(state["model"], "supported");
                 assert_eq!(state["effort"], "high");
+            }
+        }
+    }
+
+    /// A one-shot under a named profile reads that profile's own
+    /// `providers.fastMode` entry, never the base provider's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_mode_complete_once_reads_the_profile_entry_only() {
+        use std::os::unix::fs::PermissionsExt;
+        for provider in ["claude-code", "codex"] {
+            let dir = crate::test_support::test_tempdir("fast-mode-complete-profile-");
+            let bin = dir.path().join("adapter.mjs");
+            std::fs::write(&bin, format!("#!/usr/bin/env node\nif(process.argv.includes('--version')){{console.log('11.0.0');process.exit(0);}}\nconst provider = {provider:?}; const failOff = false; const logPath = {};\n{}", json!(dir.path().join("calls.jsonl")), include_str!("../tests/fixtures/fast-mode.mjs"))).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (_tmp, services) =
+                services_with_settings(&[("providers.paths", json!({provider:bin}))]).await;
+            let services = services.with_one_shot_npx(Some(bin));
+            let reference = format!("{provider}@work");
+            for (map, expected) in [
+                (json!({ provider: true }), false),
+                (json!({ provider: false, reference.clone(): true }), true),
+                (json!({ provider: true, reference.clone(): false }), false),
+            ] {
+                services
+                    .settings_registry()
+                    .unwrap()
+                    .apply(&[("providers.fastMode".into(), map.clone())])
+                    .unwrap();
+                let profile = std::sync::Arc::new(intent_acp::ProfileEnv::new(
+                    reference.as_str(),
+                    "f1",
+                    Vec::new(),
+                ));
+                let result = services
+                    .complete_once_via_acp(
+                        provider,
+                        "inspect",
+                        None,
+                        Some("supported"),
+                        None,
+                        30_000,
+                        &OneShotEffort::default(),
+                        Some(profile),
+                    )
+                    .await
+                    .unwrap();
+                let state: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+                assert_eq!(state["fastMode"], expected, "{provider}: {map}");
             }
         }
     }
@@ -1212,6 +1271,96 @@ rl.on('line', (line) => {
             child_home.contains("intentd-codex-home-"),
             "the one-shot child must see the isolated throwaway CODEX_HOME, got: {child_home}"
         );
+    }
+
+    /// A one-shot for a named profile runs with the profile's overlay, and its
+    /// isolated `CODEX_HOME` is seeded from the profile's account home rather
+    /// than the inherited one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_once_codex_profile_runs_with_profile_env_and_account_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tests::test_tempdir("intentd-complete-acp-profile-");
+        let work = dir.path().join("work-home");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("auth.json"), "work-auth").unwrap();
+        let script = dir.path().join("adapter.mjs");
+        std::fs::write(
+            &script,
+            r"import readline from 'node:readline';
+import fs from 'node:fs';
+const send = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') return send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } });
+  if (msg.method === 'session/new') return send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1' } });
+  if (msg.method === 'session/prompt') {
+    const titleControl = msg.params.prompt?.[0]?.text;
+    if (titleControl?.startsWith('/rename ')) {
+      send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'session_info_update', title: titleControl.slice(8).trim() } } });
+      return send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    }
+    let auth = null;
+    try { auth = fs.readFileSync(process.env.CODEX_HOME + '/auth.json', 'utf8'); } catch {}
+    const text = JSON.stringify({ token: process.env.PROFILE_ONE_SHOT_TOKEN ?? null, unset: process.env.OPENAI_BASE_URL ?? null, home: process.env.CODEX_HOME, auth });
+    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } } });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+",
+        )
+        .expect("write mock adapter");
+        let bin = dir.path().join("codex-acp");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nexec node {:?} \"$@\"\n",
+                script.to_string_lossy()
+            ),
+        )
+        .expect("write adapter wrapper");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_tmp, services) = services_with_settings(&[(
+            "providers.paths",
+            serde_json::json!({ "codex": bin.to_string_lossy() }),
+        )])
+        .await;
+        let profile = std::sync::Arc::new(intent_acp::ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![
+                (
+                    "CODEX_HOME".into(),
+                    Some(work.to_string_lossy().into_owned()),
+                ),
+                ("PROFILE_ONE_SHOT_TOKEN".into(), Some("work-token".into())),
+                ("OPENAI_BASE_URL".into(), None),
+            ],
+        ));
+        let v = services
+            .with_one_shot_npx(Some(bin))
+            .complete_once_via_acp(
+                "codex",
+                "echo",
+                None,
+                None,
+                None,
+                30_000,
+                &OneShotEffort::default(),
+                Some(profile),
+            )
+            .await
+            .unwrap();
+        let child: serde_json::Value =
+            serde_json::from_str(v["text"].as_str().expect("adapter echoed environment")).unwrap();
+        assert_eq!(child["token"], "work-token");
+        assert_eq!(child["unset"], serde_json::Value::Null);
+        assert_eq!(child["auth"], "work-auth");
+        let home = child["home"].as_str().unwrap();
+        assert!(home.contains("intentd-codex-home-"), "{home}");
+        assert!(std::env::var_os("PROFILE_ONE_SHOT_TOKEN").is_none());
     }
 
     #[test]

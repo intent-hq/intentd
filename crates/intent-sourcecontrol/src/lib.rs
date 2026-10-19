@@ -203,6 +203,38 @@ pub trait SourceControl: Send + Sync {
     /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>>;
 
+    /// Open PRs whose head branch is `head_ref`, from any head repository
+    /// (forks included), in one bounded read. More matches than one page is
+    /// an error rather than a truncated answer. The default suits forges
+    /// whose `head` filter is the bare source branch (GitLab).
+    async fn list_open_prs_by_head(
+        &self,
+        repo: &RepoRef,
+        head_ref: &str,
+    ) -> Result<Vec<PullRequest>> {
+        let page = self
+            .list_prs(
+                repo,
+                PrQuery {
+                    state: Some(PrState::Open),
+                    head: Some(head_ref.to_string()),
+                    limit: Some(100),
+                    ..PrQuery::default()
+                },
+            )
+            .await?;
+        if page.next_cursor.is_some() {
+            return Err(Error::Api(
+                "more than one page of open PRs for one head".into(),
+            ));
+        }
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|pr| pr.state == PrState::Open && pr.source_branch == head_ref)
+            .collect())
+    }
+
     /// Search PRs across token-visible repositories owned by an organization or user.
     /// Providers must opt in; never silently substitute a repository listing.
     async fn list_org_prs(&self, _org: &str, _query: PrQuery) -> Result<Page<PullRequest>> {

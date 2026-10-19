@@ -24,9 +24,14 @@
 //! (omitted when empty, so the steady-state file is exactly the documented
 //! shape); startup removes the secrets of journaled ids that have no metadata.
 //!
-//! Profiles are not yet selectable for execution: routing, catalog groups and
-//! environment application land separately, so `activation.runningProcesses`
-//! is always `0` here.
+//! [`Services::resolve_profile_env`] turns a qualified reference into the
+//! overlay every execution path applies (see `intent_acp::ProfileEnv`).
+//! [`Services::ensure_provider_ref_selectable`] gates every selection front
+//! door and turn start: a qualified reference whose profile is missing or
+//! whose base provider is disabled needs an explicit replacement and never
+//! falls back to another account. `activation.runningProcesses` and an
+//! agent's `usingEarlierProfileSettings` come from the live-process registry
+//! in [`crate::profile_activation`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,9 +50,13 @@ pub(crate) const PROFILES_FILE: &str = "provider-profiles.json";
 /// The only metadata file version this daemon reads or writes.
 const FILE_VERSION: u32 = 1;
 /// Canonical base provider ids that advertise `supportsProfiles: true`.
-pub(crate) const PROFILE_BASE_PROVIDERS: &[&str] = &["codex", "claude-code"];
+pub(crate) const PROFILE_BASE_PROVIDERS: &[&str] = intent_providers::PROFILE_BASE_PROVIDERS;
 /// Separator between a base provider id and a profile id in a reference.
-pub(crate) const REF_SEPARATOR: char = '@';
+pub(crate) const REF_SEPARATOR: char = intent_providers::PROFILE_REF_SEPARATOR;
+/// `agent_session.metadata` key holding the profile `settingsFingerprint`
+/// the stored native session was opened under (an opaque token, never env
+/// keys or values; not part of the `AgentLite` metadata projection).
+pub(crate) const NATIVE_SESSION_SETTINGS_KEY: &str = "nativeSessionSettings";
 /// Masked read value of a saved non-empty `set` entry.
 pub(crate) const MASK: &str = "********";
 
@@ -79,14 +88,47 @@ pub(crate) fn is_valid_profile_id(id: &str) -> bool {
 /// `None` for a bare id or any malformed reference (non-profile base, case
 /// variants, whitespace, extra `@`, invalid id).
 pub(crate) fn parse_profile_ref(reference: &str) -> Option<(&'static str, &str)> {
-    let (base, id) = reference.split_once(REF_SEPARATOR)?;
-    let base = PROFILE_BASE_PROVIDERS.iter().find(|b| **b == base)?;
-    is_valid_profile_id(id).then_some((*base, id))
+    intent_providers::split_profile_ref(reference)
 }
 
 /// Whether `reference` is meant as a profile reference (contains `@`).
 pub(crate) fn is_qualified_ref(reference: &str) -> bool {
     reference.contains(REF_SEPARATOR)
+}
+
+/// The selection identity of a provider id: a qualified reference is its own
+/// identity (two profiles, or a profile and Default, never compare equal);
+/// a bare id or legacy alias canonicalizes through the registry.
+pub(crate) fn canonical_selection(provider_id: &str) -> String {
+    if is_qualified_ref(provider_id) {
+        provider_id.to_owned()
+    } else {
+        intent_providers::provider_config(provider_id).id.to_owned()
+    }
+}
+
+/// A human-readable label for a selection in daemon-written text: a bare id
+/// unchanged, a saved profile as `<base> (<name>)`, a reference whose
+/// profile no longer exists as `<base> (removed profile)`, and any reference
+/// as just `<base>` when the profile list is unreadable (`None`), since the
+/// profile may still exist. Never the internal reference.
+pub(crate) fn readable_selection(selection: &str, profiles: Option<&[ProfileMeta]>) -> String {
+    if !is_qualified_ref(selection) {
+        return selection.to_owned();
+    }
+    let (base, id) = selection
+        .split_once(REF_SEPARATOR)
+        .unwrap_or((selection, ""));
+    let Some(profiles) = profiles else {
+        return base.to_owned();
+    };
+    profiles
+        .iter()
+        .find(|p| p.id == id && p.base_provider == base)
+        .map_or_else(
+            || format!("{base} (removed profile)"),
+            |p| format!("{base} ({})", p.name),
+        )
 }
 
 fn provider_ref(base: &str, id: &str) -> String {
@@ -249,6 +291,28 @@ fn profile_not_found(profile_id: &str) -> Error {
     )
 }
 
+/// A qualified reference names no usable saved profile. Execution never falls
+/// back to the base provider's Default configuration.
+pub(crate) fn replacement_required(reference: &str, reason: &str) -> Error {
+    Error::provider_profile(
+        false,
+        // The reference is in `data.providerRef`; the prose stays readable.
+        format!(
+            "invalid params: {}; choose another model to continue",
+            if reason == "provider-disabled" {
+                "the selected profile's provider is disabled"
+            } else {
+                "the selected provider profile is no longer available"
+            }
+        ),
+        json!({
+            "code": "provider-profile-replacement-required",
+            "providerRef": reference,
+            "reason": reason,
+        }),
+    )
+}
+
 /// `settings.update` named a profile reference with no saved profile.
 pub(crate) fn reference_not_found(path: &str, reference: &str) -> Error {
     Error::provider_profile(
@@ -372,6 +436,41 @@ fn is_valid_key(key: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Account-directory variables whose leading `~` the daemon expands.
+const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+/// Expand a leading `~` in an account-directory value at resolution time:
+/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
+/// ASCII case), a value of exactly `~` or
+/// one starting with `~/` is joined onto `home` (the daemon user's home).
+/// `~user`, variables and every other key stay literal, and without a home
+/// the value is used as typed. The saved value is never rewritten.
+pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.and_then(Path::to_str) else {
+        return value.to_owned();
+    };
+    if !TILDE_EXPANDED_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
+    {
+        return value.to_owned();
+    }
+    match value.strip_prefix('~') {
+        Some("") => home.to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.trim_end_matches('/')),
+        _ => value.to_owned(),
+    }
+}
+
+/// The daemon user's home directory, as the installed-CLI context resolves
+/// it for the Default configuration (`HOME`, else `USERPROFILE`).
+fn daemon_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Case-insensitive name comparison key (per-char lowercase, an approximation
@@ -597,7 +696,7 @@ impl ProviderProfileStore {
         self.revision.load(Ordering::SeqCst)
     }
 
-    fn bump_revision(&self) -> u64 {
+    pub(crate) fn bump_revision(&self) -> u64 {
         self.revision.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -706,7 +805,7 @@ async fn load_env(secrets: &AsyncSecretStore, profile_id: &str) -> Result<Option
     }
 }
 
-fn profile_json(meta: &ProfileMeta, env: &EnvDoc) -> Value {
+fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> Value {
     json!({
         "id": meta.id,
         "providerRef": meta.provider_ref(),
@@ -716,6 +815,7 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc) -> Value {
         "settingsFingerprint": env.fingerprint,
         "createdAt": meta.created_at,
         "updatedAt": meta.updated_at,
+        "activation": { "runningProcesses": running_processes },
     })
 }
 
@@ -809,12 +909,14 @@ pub(crate) fn in_use_reasons(
 }
 
 /// Reject `settings.update` references to missing profiles (§5.54
-/// "References in settings"): `model.defaultProvider`, and `model.providerDefaults`
-/// keys that are new or whose value changed versus `stored_defaults`.
+/// "References in settings"): `model.defaultProvider`, and
+/// `model.providerDefaults` / `providers.fastMode` keys that are new or whose
+/// value changed versus `stored_defaults` / `stored_fast_mode`.
 pub(crate) fn validate_settings_references(
     store: &ProviderProfileStore,
     changes: &Value,
     stored_defaults: &std::collections::BTreeMap<String, String>,
+    stored_fast_mode: &std::collections::BTreeMap<String, bool>,
 ) -> Result<()> {
     let Some(entries) = changes.as_array() else {
         return Ok(());
@@ -844,6 +946,22 @@ pub(crate) fn validate_settings_references(
                     }
                 }
             }
+            Some(path @ "providers.fastMode") => {
+                let Some(map) = entry.get("value").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (key, value) in map {
+                    if !is_qualified_ref(key) {
+                        continue;
+                    }
+                    let unchanged = stored_fast_mode
+                        .get(key)
+                        .is_some_and(|stored| Some(*stored) == value.as_bool());
+                    if !unchanged && !store.has_reference(key) {
+                        return Err(reference_not_found(path, key));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -859,7 +977,7 @@ pub(crate) fn batch_has_references(changes: &Value) -> bool {
                 .get("value")
                 .and_then(Value::as_str)
                 .is_some_and(is_qualified_ref),
-            Some("model.providerDefaults") => entry
+            Some("model.providerDefaults" | "providers.fastMode") => entry
                 .get("value")
                 .and_then(Value::as_object)
                 .is_some_and(|m| m.keys().any(|k| is_qualified_ref(k))),
@@ -900,6 +1018,389 @@ impl Services {
         }
     }
 
+    /// Resolve the provider reference a process or probe is about to use into
+    /// its saved overlay. A bare id is the Default configuration (`None`). A
+    /// qualified reference that is malformed, unknown, deleted or unreadable
+    /// fails with `provider-profile-replacement-required`; an unreadable
+    /// environment document fails closed. Reserved keys are dropped even if
+    /// the stored document was edited outside the daemon. Values are read
+    /// fresh, so a newly started process always uses the saved settings.
+    pub(crate) async fn resolve_profile_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        if !is_qualified_ref(reference) {
+            return Ok(None);
+        }
+        let missing = || replacement_required(reference, "profile-missing");
+        let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
+        let known = self
+            .provider_profiles
+            .profiles()
+            .map_err(|_| missing())?
+            .iter()
+            .any(|p| p.id == id && p.base_provider == base);
+        if !known {
+            return Err(missing());
+        }
+        let doc = load_env(&self.secrets, id).await?.ok_or_else(|| {
+            Error::Internal(format!(
+                "provider profile {reference} environment is unavailable"
+            ))
+        })?;
+        // `~` in an account directory expands here, before account-home
+        // lookup, isolation and fingerprinting, so every path agrees.
+        let home = daemon_home();
+        let entries = doc
+            .entries
+            .into_iter()
+            .filter(|e| reserved_key_reason(e.key(), base).is_none())
+            .map(|e| match e {
+                StoredEnv::Set { key, value } => {
+                    let value = expand_account_dir(&key, &value, home.as_deref());
+                    (key, Some(value))
+                }
+                StoredEnv::Unset { key } => (key, None),
+            })
+            .collect();
+        Ok(Some(intent_acp::ProfileEnv::new(
+            reference,
+            doc.fingerprint,
+            entries,
+        )))
+    }
+
+    /// Selection gate for a provider reference about to be persisted or
+    /// started (create, setModel, delegate, quick actions, turn start). A
+    /// bare id passes untouched — legacy selections keep today's behavior,
+    /// including the disabled-provider re-home. A qualified reference must
+    /// name a saved profile (`profile-missing`) whose base provider is
+    /// enabled (`provider-disabled`); either failure is
+    /// `provider-profile-replacement-required` and never falls back to the
+    /// base's Default configuration or the app default.
+    pub(crate) fn ensure_provider_ref_selectable(&self, reference: &str) -> Result<()> {
+        self.ensure_provider_ref_selectable_in(reference, &self.effective_settings().providers)
+    }
+
+    /// [`Self::ensure_provider_ref_selectable`] against an already-read
+    /// providers snapshot (turn start gates on the settings it spawns with).
+    pub(crate) fn ensure_provider_ref_selectable_in(
+        &self,
+        reference: &str,
+        providers: &intent_core::settings_file::ProvidersSettings,
+    ) -> Result<()> {
+        match self.provider_replacement_reason_in(reference, providers) {
+            Some(reason) => Err(replacement_required(reference, reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Why the next turn on `reference` would be refused
+    /// (`profile-missing` / `provider-disabled`), or `None` when it may run.
+    /// Always `None` for a bare id.
+    fn provider_replacement_reason_in(
+        &self,
+        reference: &str,
+        providers: &intent_core::settings_file::ProvidersSettings,
+    ) -> Option<&'static str> {
+        if !is_qualified_ref(reference) {
+            return None;
+        }
+        let Some((base, _)) = parse_profile_ref(reference) else {
+            return Some("profile-missing");
+        };
+        if !self.provider_profiles.has_reference(reference) {
+            return Some("profile-missing");
+        }
+        if crate::agent_ops::provider_is_disabled(base, providers.enabled.as_ref()) {
+            return Some("provider-disabled");
+        }
+        None
+    }
+
+    /// `AgentLite` `providerReplacementRequired` for a session's saved
+    /// provider: `{ providerRef, reason }` when its next turn would be
+    /// refused. Bare (legacy) selections never carry it.
+    pub(crate) fn provider_replacement_required(&self, provider: Option<&str>) -> Option<Value> {
+        let reference = provider.filter(|p| is_qualified_ref(p))?;
+        let reason =
+            self.provider_replacement_reason_in(reference, &self.effective_settings().providers)?;
+        Some(json!({ "providerRef": reference, "reason": reason }))
+    }
+
+    /// The live-process activation registry (PROTOCOL §5.54 activation).
+    pub(crate) fn profile_activation(&self) -> &crate::profile_activation::ProfileActivation {
+        &self.profile_activation
+    }
+
+    /// Record a newly started provider process for `agent_id` running
+    /// `profile`'s saved overlay. The returned lease lives with the process
+    /// and unregisters it when the process is torn down.
+    pub(crate) async fn register_profile_process(
+        &self,
+        workspace_id: &intent_core::WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        profile: &intent_acp::ProfileEnv,
+    ) -> Option<crate::profile_activation::ActivationLease> {
+        let (token, changes) = self.profile_activation.register(
+            workspace_id,
+            agent_id,
+            profile.provider_ref(),
+            profile.fingerprint(),
+        )?;
+        self.publish_activation_changes(changes).await;
+        Some(crate::profile_activation::ActivationLease::new(
+            self.clone(),
+            agent_id.clone(),
+            token,
+        ))
+    }
+
+    /// Emit the events an activation change calls for: one
+    /// `providers:profiles-changed` (`change: "activation"`, no count) per
+    /// saved profile whose `runningProcesses` moved, and one `agent:updated`
+    /// per agent whose `usingEarlierProfileSettings` flipped.
+    pub(crate) async fn publish_activation_changes(
+        &self,
+        changes: crate::profile_activation::ActivationChanges,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        let saved = self.provider_profiles.profiles().ok();
+        for profile_id in &changes.profiles {
+            if !saved
+                .as_ref()
+                .is_some_and(|all| all.iter().any(|p| p.id == *profile_id))
+            {
+                continue;
+            }
+            let revision = self.provider_profiles.bump_revision();
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                profiles_changed_event(revision, "activation", profile_id, None, None),
+            )
+            .await;
+        }
+        for (workspace_id, agent_id, using_earlier) in changes.agents {
+            self.publish_agent_mutation_event(
+                &workspace_id,
+                &agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": agent_id.0, "usingEarlierProfileSettings": using_earlier }),
+            )
+            .await;
+        }
+    }
+
+    /// The settings fingerprint the process serving `agent_id` under
+    /// `selection` runs with: the live registration when present, else the
+    /// saved one (the fingerprint a process started now would read). `None`
+    /// for a bare selection or an unresolvable profile.
+    pub(crate) async fn profile_process_fingerprint(
+        &self,
+        agent_id: &intent_core::AgentId,
+        selection: &str,
+    ) -> Option<String> {
+        if !is_qualified_ref(selection) {
+            return None;
+        }
+        if let Some(live) = self
+            .profile_activation
+            .live_fingerprint(agent_id, selection)
+        {
+            return Some(live);
+        }
+        Box::pin(self.resolve_profile_env(selection))
+            .await
+            .ok()
+            .flatten()
+            .map(|profile| profile.fingerprint().to_owned())
+    }
+
+    /// Whether the stored native session of `stored` was opened under the
+    /// settings `fingerprint` (PROTOCOL §5.54: a native session id never
+    /// crosses an account-relevant settings change). A session with no
+    /// recorded binding is treated as foreign, so it is recreated with
+    /// Intent history rather than loaded on possibly another account.
+    pub(crate) fn native_session_bound_to(
+        stored: &intent_core::AgentSession,
+        fingerprint: &str,
+    ) -> bool {
+        stored
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(NATIVE_SESSION_SETTINGS_KEY))
+            .and_then(Value::as_str)
+            == Some(fingerprint)
+    }
+
+    /// Record that `agent_id`'s current native session was opened under the
+    /// profile settings `fingerprint`. Best-effort: a failed write only
+    /// costs a recreate (with history) on the next resume.
+    pub(crate) async fn bind_native_session_settings(
+        &self,
+        workspace_id: &intent_core::WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        fingerprint: &str,
+    ) {
+        if let Err(e) = self
+            .store
+            .set_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                NATIVE_SESSION_SETTINGS_KEY,
+                fingerprint,
+                None,
+                None,
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "recording the native session's profile settings failed");
+        }
+    }
+
+    /// Turn admission (`agent.sendMessage`): refuse a message whose next turn
+    /// would be refused at spawn, before anything is persisted, with the
+    /// structured `provider-profile-replacement-required` error. Resolves the
+    /// session's selection like the spawn path (saved provider, then the app
+    /// default). Bare legacy selections pass untouched.
+    pub(crate) async fn ensure_turn_provider_selectable(
+        &self,
+        agent_id: &intent_core::AgentId,
+    ) -> Result<()> {
+        let session = self.store.get_agent_session_summary(agent_id).await?;
+        let settings = self.effective_settings();
+        let Some(selection) = crate::agent_session::resolve_provider_id(
+            session.provider.as_deref(),
+            crate::agent_session::derived_default_provider(&settings).as_deref(),
+        ) else {
+            return Ok(());
+        };
+        self.ensure_provider_ref_selectable_in(&selection, &settings.providers)
+    }
+
+    /// [`Self::ensure_provider_ref_selectable`] then
+    /// [`Self::resolve_profile_env`]: the overlay a new process for
+    /// `reference` must run with (`None` = Default configuration).
+    pub(crate) async fn resolve_selected_profile(
+        &self,
+        reference: &str,
+    ) -> Result<Option<Arc<intent_acp::ProfileEnv>>> {
+        self.ensure_provider_ref_selectable(reference)?;
+        Ok(self.resolve_profile_env(reference).await?.map(Arc::new))
+    }
+
+    /// `providers.catalog` `profiles`: one summary per saved profile, no env
+    /// and no counts. An unreadable profile file yields an empty list.
+    pub(crate) fn provider_profile_summaries(&self) -> Vec<Value> {
+        self.provider_profiles
+            .profiles()
+            .map(|profiles| profiles.iter().map(ProfileMeta::summary_json).collect())
+            .unwrap_or_default()
+    }
+
+    /// `host.providerAuthStatus` for profile references (PROTOCOL §5.54).
+    /// Each profile is probed with its own saved overlay and cached under
+    /// its reference plus settings fingerprint, so a verdict never crosses
+    /// profiles, the Default configuration or a saved edit. One profile:
+    /// a missing reference fails with `provider-profile-replacement-required`
+    /// (a disabled base still reports its saved profile's status). Sweep: an
+    /// unresolvable profile reports `authenticated: null`.
+    pub(crate) async fn provider_profiles_auth_status_impl(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> Result<Value> {
+        let single = provider_ref.is_some();
+        let refs = provider_ref.map_or_else(|| self.provider_profile_refs(), |r| vec![r]);
+        let paths = self.effective_settings().providers.paths;
+        // Unknown until its probe reports; a panicked probe stays unknown.
+        let mut entries: Vec<Value> = refs
+            .iter()
+            .map(|r| json!({ "id": r, "authenticated": null }))
+            .collect();
+        // Probes run in parallel and abort with this future (JoinSet), like
+        // the base sweep; response order follows the saved profile order.
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, reference) in refs.into_iter().enumerate() {
+            let profile = match self.resolve_profile_env(&reference).await {
+                Ok(Some(profile)) => profile,
+                Ok(None) => {
+                    return Err(Error::InvalidParams(format!(
+                        "invalid params: not a provider profile reference: {reference}"
+                    )))
+                }
+                Err(e) if single => return Err(e),
+                Err(e) => {
+                    tracing::warn!(provider_ref = %reference, error = %e, "provider profile auth check skipped");
+                    continue;
+                }
+            };
+            let override_path = paths
+                .get(intent_providers::base_provider_id(&reference))
+                .cloned();
+            probes.spawn(async move {
+                let entry = crate::provider_auth::profile_auth_status(
+                    Arc::new(profile),
+                    force,
+                    override_path,
+                )
+                .await;
+                (index, entry)
+            });
+        }
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, entry)) = joined {
+                entries[index] = entry;
+            }
+        }
+        Ok(Value::Array(entries))
+    }
+
+    /// `host.providerTestPrompt { providerId: providerRef }` (PROTOCOL
+    /// §5.54): the live probe on the base installation under the profile's
+    /// saved overlay. A missing profile needs a replacement.
+    pub(crate) async fn provider_profiles_test_prompt_impl(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> Result<Value> {
+        let profile = self
+            .resolve_profile_env(&provider_ref)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "invalid params: not a provider profile reference: {provider_ref}"
+                ))
+            })?;
+        let paths: std::collections::HashMap<String, String> = self
+            .effective_settings()
+            .providers
+            .paths
+            .into_iter()
+            .collect();
+        crate::provider_test_prompt::provider_test_prompt_for(
+            Some(self),
+            intent_providers::base_provider_id(&provider_ref),
+            model.as_deref(),
+            &paths,
+            node_max_old_space_mb,
+            Some(Arc::new(profile)),
+        )
+        .await
+        .map_err(Error::InvalidParams)
+    }
+
+    /// Saved profile references, for the opt-in auth sweep.
+    pub(crate) fn provider_profile_refs(&self) -> Vec<String> {
+        self.provider_profiles
+            .profiles()
+            .map(|profiles| profiles.iter().map(ProfileMeta::provider_ref).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn provider_profiles_list_impl(
         &self,
         base_provider_id: Option<String>,
@@ -915,7 +1416,8 @@ impl Services {
                 .is_none_or(|base| p.base_provider == base)
         }) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
-            rows.push(profile_json(meta, &env));
+            let running = self.profile_activation.running_processes(&meta.id);
+            rows.push(profile_json(meta, &env, running));
         }
         Ok(json!({ "profiles": rows, "revision": store.revision() }))
     }
@@ -1060,7 +1562,8 @@ impl Services {
             profiles_changed_event(revision, "created", &id, Some(meta.summary_json()), None),
         )
         .await;
-        Ok(json!({ "profile": profile_json(&meta, &env), "revision": revision }))
+        let running = self.profile_activation.running_processes(&meta.id);
+        Ok(json!({ "profile": profile_json(&meta, &env, running), "revision": revision }))
     }
 
     async fn provider_profiles_update_owned(
@@ -1109,10 +1612,11 @@ impl Services {
             .is_some_and(|entries| *entries != saved_doc.entries || saved.is_none());
         let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
         if !env_changed && !name_changed {
+            let running = self.profile_activation.running_processes(&profile_id);
             return Ok(json!({
-                "profile": profile_json(&current, &saved_doc),
+                "profile": profile_json(&current, &saved_doc, running),
                 "revision": store.revision(),
-                "activation": { "envChanged": false, "runningProcesses": 0 },
+                "activation": { "envChanged": false, "runningProcesses": running },
             }));
         }
 
@@ -1159,10 +1663,19 @@ impl Services {
             ),
         )
         .await;
+        // Running processes keep the settings they started with; only the
+        // saved fingerprint moves. Nothing is interrupted or restarted.
+        if env_changed {
+            let changes = self
+                .profile_activation
+                .saved_changed(&profile_id, Some(&env.fingerprint));
+            self.publish_activation_changes(changes).await;
+        }
+        let running = self.profile_activation.running_processes(&profile_id);
         Ok(json!({
-            "profile": profile_json(&meta, &env),
+            "profile": profile_json(&meta, &env, running),
             "revision": revision,
-            "activation": { "envChanged": env_changed, "runningProcesses": 0 },
+            "activation": { "envChanged": env_changed, "runningProcesses": running },
         }))
     }
 
@@ -1230,18 +1743,32 @@ impl Services {
             profiles_changed_event(revision, "deleted", &profile_id, None, None),
         )
         .await;
+        // An in-progress turn finishes on its process; later turns need a
+        // replacement (`providerReplacementRequired`), not earlier settings.
+        let changes = self.profile_activation.saved_changed(&profile_id, None);
+        self.publish_activation_changes(changes).await;
 
-        // Prune the profile's `model.providerDefaults` key (emits
-        // `settings:changed`). A failure leaves an inert key behind.
-        // Re-read now: the snapshot above predates the secret I/O, and a
-        // concurrent writer may have replaced the map since.
-        let current = self.effective_settings().model.provider_defaults;
-        if current.contains_key(&reference) {
-            let mut map = current;
-            map.remove(&reference);
-            let changes = json!([{ "path": "model.providerDefaults", "value": map }]);
-            if let Err(e) = self.owned_settings_mutation(changes, None).await {
-                tracing::warn!(profile_id = %profile_id, error = %e, "pruning the deleted profile's providerDefaults key failed");
+        // Prune the profile's `model.providerDefaults` and
+        // `providers.fastMode` keys in one batch (emits `settings:changed`).
+        // A failure leaves inert keys behind. Re-read now: the snapshot above
+        // predates the secret I/O, and a concurrent writer may have replaced
+        // the maps since.
+        let current = self.effective_settings();
+        let mut changes = Vec::new();
+        let mut defaults = current.model.provider_defaults;
+        if defaults.remove(&reference).is_some() {
+            changes.push(json!({ "path": "model.providerDefaults", "value": defaults }));
+        }
+        let mut fast_mode = current.providers.fast_mode;
+        if fast_mode.remove(&reference).is_some() {
+            changes.push(json!({ "path": "providers.fastMode", "value": fast_mode }));
+        }
+        if !changes.is_empty() {
+            if let Err(e) = self
+                .owned_settings_mutation(Value::Array(changes), None)
+                .await
+            {
+                tracing::warn!(profile_id = %profile_id, error = %e, "pruning the deleted profile's settings keys failed");
             }
         }
         Ok(json!({ "profileId": profile_id, "revision": revision }))
@@ -1256,8 +1783,13 @@ impl Services {
         }
         Self::require_administrator("settings.update")?;
         let _guard = self.provider_profiles.lock().await;
-        let stored = self.effective_settings().model.provider_defaults;
-        validate_settings_references(&self.provider_profiles, &changes, &stored)?;
+        let settings = self.effective_settings();
+        validate_settings_references(
+            &self.provider_profiles,
+            &changes,
+            &settings.model.provider_defaults,
+            &settings.providers.fast_mode,
+        )?;
         self.owned_settings_mutation(changes, None).await
     }
 }
@@ -1265,3 +1797,11 @@ impl Services {
 #[cfg(test)]
 #[path = "provider_profiles_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "provider_profiles_routing_tests.rs"]
+mod routing_tests;
+
+#[cfg(test)]
+#[path = "provider_profiles_activation_tests.rs"]
+mod activation_tests;

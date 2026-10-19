@@ -1186,3 +1186,403 @@ async fn profile_values_never_reach_config_toml() {
         "{config}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Execution context: resolving a reference into its saved overlay.
+// ---------------------------------------------------------------------------
+
+fn entries_of(profile: &intent_acp::ProfileEnv) -> Vec<(String, Option<String>)> {
+    profile
+        .entries()
+        .map(|(k, v)| (k.to_owned(), v.map(str::to_owned)))
+        .collect()
+}
+
+#[intent_test_macros::daemon_test]
+async fn bare_references_resolve_to_the_default_configuration() {
+    let fx = Fixture::new().await;
+    for bare in ["codex", "claude-code", "auggie"] {
+        assert!(fx.svc.resolve_profile_env(bare).await.unwrap().is_none());
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn qualified_reference_resolves_saved_set_empty_and_unset_entries() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "codex",
+            "Work",
+            json!([
+                { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+                { "key": "EMPTY", "kind": "set", "value": "" },
+                { "key": "OPENAI_BASE_URL", "kind": "unset" },
+            ]),
+        )
+        .await;
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let fingerprint = created["profile"]["settingsFingerprint"].as_str().unwrap();
+    let profile = fx
+        .svc
+        .resolve_profile_env(reference)
+        .await
+        .unwrap()
+        .expect("qualified reference resolves");
+    assert_eq!(profile.provider_ref(), reference);
+    assert_eq!(profile.fingerprint(), fingerprint);
+    assert_eq!(
+        entries_of(&profile),
+        vec![
+            ("OPENAI_API_KEY".into(), Some(SECRET.into())),
+            ("EMPTY".into(), Some(String::new())),
+            ("OPENAI_BASE_URL".into(), None),
+        ]
+    );
+    assert!(!format!("{profile:?}").contains(SECRET));
+}
+
+#[intent_test_macros::daemon_test]
+async fn saved_edits_change_the_resolved_fingerprint_and_values() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "claude-code",
+            "Team",
+            json!([{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "first" }]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    let reference = format!("claude-code@{id}");
+    let before = fx
+        .svc
+        .resolve_profile_env(&reference)
+        .await
+        .unwrap()
+        .unwrap();
+    fx.svc
+        .provider_profiles_update_impl(
+            id.clone(),
+            json!({ "env": [{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "second" }] }),
+        )
+        .await
+        .unwrap();
+    let after = fx
+        .svc
+        .resolve_profile_env(&reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(before.fingerprint(), after.fingerprint());
+    assert_ne!(before.cache_key(), after.cache_key());
+    assert_eq!(
+        entries_of(&after),
+        vec![("ANTHROPIC_API_KEY".into(), Some("second".into()))]
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn missing_or_malformed_references_require_replacement_never_default() {
+    let fx = Fixture::new().await;
+    for reference in ["codex@p0000000000000", "codex@", "codex@Bad", "auggie@p1"] {
+        let err = fx.svc.resolve_profile_env(reference).await.unwrap_err();
+        assert_eq!(
+            data_code(&err),
+            "provider-profile-replacement-required",
+            "{reference}"
+        );
+        let Error::ProviderProfile(failure) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(failure.data["providerRef"], reference);
+        assert_eq!(failure.data["reason"], "profile-missing");
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn deleted_profile_reference_requires_replacement() {
+    let fx = Fixture::new().await;
+    let created = fx.create("codex", "Gone", json!([])).await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    fx.svc
+        .provider_profiles_delete_impl(id.clone())
+        .await
+        .unwrap();
+    let err = fx
+        .svc
+        .resolve_profile_env(&format!("codex@{id}"))
+        .await
+        .unwrap_err();
+    assert_eq!(data_code(&err), "provider-profile-replacement-required");
+}
+
+#[intent_test_macros::daemon_test]
+async fn tampered_reserved_entries_are_never_resolved() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "codex",
+            "Work",
+            json!([{ "key": "OPENAI_API_KEY", "kind": "set", "value": "kept" }]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_string();
+    // Simulate an edited secret-store document carrying reserved keys.
+    let doc = json!({
+        "fingerprint": "ftampered",
+        "entries": [
+            { "kind": "set", "key": "PATH", "value": "/evil" },
+            { "kind": "set", "key": "codex_path", "value": "/evil/codex" },
+            { "kind": "unset", "key": "HOME" },
+            { "kind": "set", "key": "INTENT_SESSION", "value": "evil" },
+            { "kind": "set", "key": "OPENAI_API_KEY", "value": "kept" },
+        ],
+    });
+    SecretStore::store(&*fx.secrets, &env_account(&id), &doc.to_string()).unwrap();
+    let profile = fx
+        .svc
+        .resolve_profile_env(&format!("codex@{id}"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entries_of(&profile),
+        vec![("OPENAI_API_KEY".into(), Some("kept".into()))]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `~` expansion of account directories and per-profile Fast mode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn account_dir_tilde_expands_only_bare_and_slash_forms_of_account_keys() {
+    let home = Path::new("/home/me");
+    let expand = |key: &str, value: &str| expand_account_dir(key, value, Some(home));
+    for key in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "codex_home",
+        "Claude_Config_Dir",
+    ] {
+        assert_eq!(expand(key, "~"), "/home/me", "{key}");
+        assert_eq!(expand(key, "~/"), "/home/me/", "{key}");
+        assert_eq!(expand(key, "~/.claude-work"), "/home/me/.claude-work");
+        assert_eq!(expand(key, "~/a/b"), "/home/me/a/b");
+        for literal in [
+            "~user",
+            "~user/x",
+            "~~/x",
+            "$HOME/x",
+            "${HOME}/x",
+            "/abs/~/x",
+            "rel/~",
+            " ~/x",
+            "",
+        ] {
+            assert_eq!(expand(key, literal), literal, "{key}={literal:?}");
+        }
+    }
+    for other in ["HOME", "OPENAI_API_KEY", "CODEX_HOMES", "XDG_CONFIG_HOME"] {
+        assert_eq!(expand(other, "~/x"), "~/x", "{other}");
+    }
+    assert_eq!(
+        expand_account_dir("CODEX_HOME", "~/x", None),
+        "~/x",
+        "no home: literal"
+    );
+}
+
+fn daemon_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .expect("test host has a home directory")
+}
+
+/// The resolved overlay — the single input of the auth probe, the model
+/// probe, one-shot calls and persistent launches — carries the expanded
+/// account directory, so checks and runs agree; the saved value is kept.
+#[intent_test_macros::daemon_test]
+async fn resolved_account_dirs_expand_tilde_for_both_clis_and_keep_the_stored_value() {
+    let fx = Fixture::new().await;
+    let home = daemon_home();
+    for (base, key) in [
+        ("claude-code", "CLAUDE_CONFIG_DIR"),
+        ("codex", "CODEX_HOME"),
+    ] {
+        let created = fx
+            .create(
+                base,
+                "Work",
+                json!([
+                    { "key": key, "kind": "set", "value": "~/.account-work" },
+                    { "key": "OTHER_DIR", "kind": "set", "value": "~/kept" },
+                ]),
+            )
+            .await;
+        let id = created["profile"]["id"].as_str().unwrap().to_string();
+        let reference = created["profile"]["providerRef"].as_str().unwrap();
+        let profile = fx
+            .svc
+            .resolve_profile_env(reference)
+            .await
+            .unwrap()
+            .unwrap();
+        let expanded = home.join(".account-work").to_string_lossy().into_owned();
+        assert_eq!(
+            entries_of(&profile),
+            vec![
+                (key.into(), Some(expanded.clone())),
+                ("OTHER_DIR".into(), Some("~/kept".into())),
+            ],
+            "{base}"
+        );
+        let mut env = std::collections::BTreeMap::new();
+        profile.apply_to_map(&mut env);
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(key)),
+            Some(&std::ffi::OsString::from(&expanded))
+        );
+        let stored = SecretStore::load(&*fx.secrets, &env_account(&id))
+            .unwrap()
+            .unwrap();
+        assert!(stored.contains("~/.account-work"), "{base}: saved as typed");
+        assert!(!stored.contains(&expanded), "{base}: saved as typed");
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn resolved_account_dirs_keep_tilde_user_literal() {
+    let fx = Fixture::new().await;
+    let created = fx
+        .create(
+            "codex",
+            "Other",
+            json!([{ "key": "CODEX_HOME", "kind": "set", "value": "~other/.codex" }]),
+        )
+        .await;
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let profile = fx
+        .svc
+        .resolve_profile_env(reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entries_of(&profile),
+        vec![("CODEX_HOME".into(), Some("~other/.codex".into()))]
+    );
+}
+
+#[test]
+fn fast_mode_preference_reads_only_the_selected_entry() {
+    let map = std::collections::BTreeMap::from([
+        ("claude-code".to_string(), true),
+        ("codex@work".to_string(), true),
+    ]);
+    assert!(crate::fast_mode::preference(&map, "claude-code"));
+    assert!(!crate::fast_mode::preference(&map, "claude-code@work"));
+    assert!(crate::fast_mode::preference(&map, "codex@work"));
+    assert!(!crate::fast_mode::preference(&map, "codex"));
+    assert!(!crate::fast_mode::preference(&map, "codex@other"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn settings_update_rejects_fast_mode_keys_for_missing_profiles() {
+    let fx = Fixture::new().await;
+    let created = fx.create("claude-code", "Work", json!([])).await;
+    let reference = created["profile"]["providerRef"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let err = fx
+        .svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.fastMode", "value": { "claude-code": true, "codex@pmissing": true } },
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), -32602);
+    assert_eq!(data_code(&err), "provider-profile-not-found");
+    fx.svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.fastMode", "value": { "claude-code": false, reference.clone(): true } },
+        ]))
+        .await
+        .expect("an existing profile reference is a valid key");
+    assert_eq!(
+        fx.svc.effective_settings().providers.fast_mode,
+        std::collections::BTreeMap::from([
+            ("claude-code".to_string(), false),
+            (reference.clone(), true),
+        ])
+    );
+    // The profile is lost outside the daemon: the unchanged stored key
+    // round-trips with other edits, a changed value is rejected.
+    std::fs::write(
+        fx.profiles_file(),
+        json!({ "version": 1, "profiles": [] }).to_string(),
+    )
+    .unwrap();
+    let fx = fx.restart().await;
+    fx.svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.fastMode", "value": { "claude-code": true, reference.clone(): true } },
+        ]))
+        .await
+        .expect("unchanged key round-trips");
+    let err = fx
+        .svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.fastMode", "value": { reference.clone(): false } },
+        ]))
+        .await
+        .unwrap_err();
+    assert_eq!(data_code(&err), "provider-profile-not-found");
+}
+
+#[intent_test_macros::daemon_test]
+async fn delete_prunes_the_profile_fast_mode_entry_only() {
+    let fx = Fixture::new().await;
+    let work = fx.create("codex", "Work", json!([])).await;
+    let kept = fx.create("codex", "Kept", json!([])).await;
+    let id = work["profile"]["id"].as_str().unwrap().to_string();
+    let reference = work["profile"]["providerRef"].as_str().unwrap().to_string();
+    let kept_ref = kept["profile"]["providerRef"].as_str().unwrap().to_string();
+    fx.svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.fastMode", "value": { "codex": true, reference.clone(): true, kept_ref.clone(): false } },
+            { "path": "model.providerDefaults", "value": { reference.clone(): "m1" } },
+        ]))
+        .await
+        .unwrap();
+    fx.svc.provider_profiles_delete_impl(id).await.unwrap();
+    let settings = fx.svc.effective_settings();
+    assert_eq!(
+        settings.providers.fast_mode,
+        std::collections::BTreeMap::from([("codex".to_string(), true), (kept_ref, false)])
+    );
+    assert!(settings.model.provider_defaults.is_empty());
+}
+
+#[test]
+fn readable_selection_never_calls_a_profile_removed_when_the_list_is_unreadable() {
+    let work = ProfileMeta {
+        id: "pwork".into(),
+        base_provider: "codex".into(),
+        name: "Work".into(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let saved = [work];
+    assert_eq!(readable_selection("codex", Some(&saved)), "codex");
+    assert_eq!(
+        readable_selection("codex@pwork", Some(&saved)),
+        "codex (Work)"
+    );
+    assert_eq!(
+        readable_selection("codex@pgone", Some(&saved)),
+        "codex (removed profile)"
+    );
+    assert_eq!(readable_selection("codex@pwork", None), "codex");
+}
