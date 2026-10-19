@@ -7,9 +7,19 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
+#[path = "wss_integration/annotation_comment_writers.rs"]
+mod annotation_comment_writers;
+#[path = "wss_integration/annotation_pages.rs"]
+mod annotation_pages;
+#[path = "wss_integration/annotation_reads.rs"]
+mod annotation_reads;
+#[path = "wss_integration/annotation_writer_anchors.rs"]
+mod annotation_writer_anchors;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/demand_note_indexes.rs"]
+mod demand_note_indexes;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
 #[path = "wss_integration/git_commit_removal.rs"]
@@ -40,6 +50,9 @@ mod script_lifecycle;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[cfg(all(unix, debug_assertions))]
+#[path = "wss_integration/startup.rs"]
+mod startup;
 #[path = "wss_integration/task_list_latency.rs"]
 mod task_list_latency;
 #[cfg(unix)]
@@ -3369,6 +3382,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: BTreeMap::default(),
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
@@ -6339,6 +6353,9 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
 struct BusyDaemonControl;
 
 impl SystemControl for BusyDaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -6396,14 +6413,6 @@ impl SystemControl for BusyDaemonControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Ok(())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,
@@ -15382,6 +15391,11 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     .await;
     let result = &resp["result"];
     assert_eq!(result["branch"], "feature/wss");
+    assert!(result["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(result["gitStatus"]["branch"], "feature/wss");
+    assert_eq!(result["gitStatus"]["files"], serde_json::json!([]));
     assert_eq!(result["trunkBranch"], "main");
     assert_eq!(result["hasRemote"], false);
     assert_eq!(result["aheadOfTrunk"], 1);
@@ -15398,6 +15412,63 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
     // Metadata-only walk: no per-commit tree diffs in getStatus.
     assert!(c.get("files").is_none());
     assert!(c.get("filesChanged").is_none());
+
+    // A real WSS subscriber receives the same additive snapshot after a
+    // mutation. Adding a remote is network-free and does not change history.
+    let mut subscriber = connect_ws(srv.port, srv.cfg.clone()).await;
+    subscriber
+        .send(Message::Text(
+            serde_json::json!({
+                "jsonrpc":"2.0", "id":10, "method":"events.subscribe",
+                "params":{"workspaceId":ws_id,"eventTypes":["changes:git-status"]}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == 10 {
+                    assert!(response["result"]["subscriptionId"].is_string());
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let added = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":11, "method":"accept-changes.addRemote",
+            "params":{"workspaceId":ws_id,"remoteUrl":"https://github.com/example/history.git"}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        added["result"]["historyIdentity"],
+        result["historyIdentity"]
+    );
+    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                let event: Value = serde_json::from_str(&text).unwrap();
+                if event["method"] == "events.event"
+                    && event["params"]["event"]["type"] == "changes:git-status"
+                {
+                    break event["params"]["event"]["data"]["status"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(pushed, added["result"]);
 
     srv.ws.stop().await;
 }
@@ -15467,6 +15538,23 @@ async fn wss_file_tracking_load_commits_bounded() {
         ),
     )
     .await;
+    assert!(resp["result"]["historyIdentity"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    let status = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &serde_json::json!({
+            "jsonrpc":"2.0", "id":20, "method":"accept-changes.getStatus",
+            "params":{"workspaceId":ws_id}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["historyIdentity"],
+        status["result"]["historyIdentity"]
+    );
     assert!(
         resp["result"]["commits"].is_array(),
         "commits field: {resp}"
@@ -19280,9 +19368,10 @@ async fn wss_workspace_transfer_plan_round_trip() {
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
     assert_eq!(manifest["formatVersion"], 2, "{resp}");
-    assert!(
-        manifest["creatingIntentdVersion"].is_string(),
-        "manifest records the creating daemon version: {resp}"
+    assert_eq!(
+        manifest["creatingIntentdVersion"],
+        intent_core::transfer::CREATING_INTENTD_VERSION,
+        "export records the version import requires: {resp}"
     );
     assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
     let tables = manifest["tables"].as_array().expect("tables array");
@@ -20525,11 +20614,10 @@ async fn wss_workspace_import_lifecycle() {
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
-    // Manifest must carry the exact intentd version (workspace-synchronized
-    // crate versions make CARGO_PKG_VERSION valid here).
+    // Manifest must carry the exact version the importer checks.
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -20800,7 +20888,8 @@ async fn wss_workspace_import_lifecycle() {
     );
     let msg = rejected["error"]["message"].as_str().expect("message");
     assert!(
-        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        msg.contains("0.0.1-elsewhere")
+            && msg.contains(intent_core::transfer::CREATING_INTENTD_VERSION),
         "error names both versions: {msg}"
     );
 
@@ -21195,7 +21284,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -22409,6 +22498,9 @@ struct WatchHealthControl {
 }
 
 impl SystemControl for WatchHealthControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -22466,14 +22558,6 @@ impl SystemControl for WatchHealthControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Err("not supported in this test".to_string())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,

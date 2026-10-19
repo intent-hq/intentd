@@ -22,6 +22,7 @@ fn disable_node_compile_cache() {
     std::env::set_var("NODE_DISABLE_COMPILE_CACHE", "1");
 }
 
+pub mod adapter_cli;
 pub mod antigravity;
 pub mod args;
 pub mod checkpoint;
@@ -36,14 +37,15 @@ pub use args::{
     build_provider_env_with_unsloth, enhanced_path, ArgInputs, UnslothEndpoint, UnslothModelLimit,
 };
 pub use config::{
-    all_provider_ids, auth_error_message, find_provider, find_provider_or_legacy_alias,
-    first_provider_id, is_provider_authentication_error, legacy_aliases_for_provider,
-    login_command, provider_config, InjectionMechanism, ProviderAccessToken,
-    ProviderAccessTokenKind, ProviderConfig, ToolRemovalStyle, ACP_PROVIDERS,
-    AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT, CLAUDE_AGENT_ACP_NODE_REQUIREMENT,
-    CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_NPX_PACKAGE,
-    CODEX_ACP_PREREQUISITE_ERROR, CODEX_SUBAGENT_POLICY_CONFIG, NPX_MIN_NPM_VERSION,
-    NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE, PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT,
+    all_provider_ids, auth_error_message, base_provider_id, find_provider,
+    find_provider_or_legacy_alias, first_provider_id, is_provider_authentication_error,
+    legacy_aliases_for_provider, login_command, provider_config, split_profile_ref,
+    InjectionMechanism, ProviderAccessToken, ProviderAccessTokenKind, ProviderConfig,
+    ToolRemovalStyle, ACP_PROVIDERS, AUGGIE_CLI_MIN_VERSION, AUGGIE_CLI_REQUIREMENT,
+    CLAUDE_AGENT_ACP_NODE_REQUIREMENT, CLAUDE_AGENT_ACP_NPX_PACKAGE, CLAUDE_AGENT_ACP_VERSION,
+    CODEX_ACP_NPX_PACKAGE, CODEX_ACP_PREREQUISITE_ERROR, CODEX_INITIAL_AGENT_MODE_ENV,
+    CODEX_SUBAGENT_POLICY_CONFIG, NPX_MIN_NPM_VERSION, NPX_NPM_REQUIREMENT, PI_ACP_NPX_PACKAGE,
+    PI_CLI_MIN_VERSION, PI_CLI_REQUIREMENT, PROFILE_BASE_PROVIDERS, PROFILE_REF_SEPARATOR,
 };
 #[cfg(test)]
 pub(crate) use config::{

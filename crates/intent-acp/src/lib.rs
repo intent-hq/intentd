@@ -16,6 +16,7 @@
 //! denylist ([`tool_restrictions`]).
 
 pub mod callback_registration;
+pub mod codex_sandbox;
 #[cfg(unix)]
 pub mod descendant_sweep;
 pub mod error;
@@ -27,6 +28,8 @@ pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
 pub mod permission;
+pub mod profile_env;
+pub mod review_monitoring;
 pub mod session;
 pub mod spawn;
 pub mod terminal;
@@ -51,6 +54,7 @@ pub use mcp_config::{
 };
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
+pub use mcp_server::bindings_prelude_for_workspace;
 pub use mcp_server::{
     make_workspace_host_for_bridge, SpecialistModelOption, SpecialistModelOptions,
     WorkspaceMcpServer, MCP_PROTOCOL_VERSION, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
@@ -58,6 +62,7 @@ pub use mcp_server::{
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
+pub use profile_env::ProfileEnv;
 pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};

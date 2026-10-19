@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use super::*;
 use crate::context::{with_request_context, Caller};
 
+/// The daemon version the composition root injects; deliberately not this
+/// crate's `CARGO_PKG_VERSION`, which can lag `intentd` (intent-hq/intent#7256).
+const TEST_DAEMON_VERSION: &str = "9.9.9-daemon";
+
 /// One recorded `upsert_client` call: `(clientId, name, capabilities, host)`.
 type UpsertCall = (String, Option<String>, Option<Value>, ClientHostInfo);
 
@@ -35,6 +39,59 @@ fn parsed(outcome: HelloOutcome) -> Value {
 }
 
 #[tokio::test]
+async fn monitor_attachment_cannot_fall_through_to_profile_upsert_without_source_admission() {
+    let api = RecordingApi::default();
+    let mut binding = Some(ClientId::from_string("original-desktop"));
+    let req = classify(&json!({
+        "jsonrpc":"2.0", "id":1, "method":"client.hello",
+        "params": {
+            "clientId":"original-desktop", "connectionRole":"review-monitor",
+            "name":"replacement", "hostname":"replacement-host",
+            "capabilities":{"reviewMonitoring":1,"browserExec":true}
+        }
+    }))
+    .unwrap();
+    let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
+    assert!(
+        outcome.bound.is_none(),
+        "attachment requires admitted physical source"
+    );
+    assert!(parsed(outcome).get("error").is_some());
+    assert!(
+        api.last.lock().unwrap().is_none(),
+        "attachment cannot overwrite desktop profile"
+    );
+    assert_eq!(binding.unwrap().as_str(), "original-desktop");
+}
+
+#[tokio::test]
+async fn unknown_or_malformed_connection_role_cannot_mutate_client_profile() {
+    for role in [
+        json!("unknown"),
+        Value::Null,
+        json!(false),
+        json!(1),
+        json!({}),
+    ] {
+        let api = RecordingApi::default();
+        let mut binding = None;
+        let req = classify(&json!({
+            "jsonrpc":"2.0", "id":1, "method":"client.hello",
+            "params":{"clientId":"desktop", "connectionRole":role}
+        }))
+        .unwrap();
+        let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
+        assert!(
+            outcome.bound.is_none(),
+            "unknown role cannot become ordinary hello"
+        );
+        assert_eq!(parsed(outcome)["error"]["code"], -32602);
+        assert!(api.last.lock().unwrap().is_none());
+        assert!(binding.is_none());
+    }
+}
+
+#[tokio::test]
 async fn mints_client_id_when_omitted() {
     let api = RecordingApi::default();
     let mut binding: Option<ClientId> = None;
@@ -42,7 +99,7 @@ async fn mints_client_id_when_omitted() {
         "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": { "name": "Intent" }
     }))
     .unwrap();
-    let outcome = handle(req, &api, &mut binding, true).await;
+    let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     let bound = outcome
         .bound
         .clone()
@@ -75,7 +132,11 @@ async fn mints_client_id_when_omitted() {
     );
     let server = &resp["result"]["server"];
     assert_eq!(server["locality"], json!("local"));
-    assert_eq!(server["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        server["version"],
+        json!(TEST_DAEMON_VERSION),
+        "server.version is the injected daemon version, not this crate's"
+    );
     match crate::BUILD_COMMIT {
         Some(build_commit) => assert_eq!(server["buildCommit"], json!(build_commit)),
         None => assert!(server.get("buildCommit").is_none()),
@@ -101,11 +162,19 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
     for local in [true, false] {
         let server = server_json(false, "linux", "x86_64", "test", None, local);
         assert_eq!(server["capabilities"]["hostMembership"], 1);
+        assert_eq!(server["capabilities"]["eventStreamRecovery"], 1);
+        assert_eq!(
+            server["capabilities"]["workspaceMembershipEvents"],
+            json!(1)
+        );
         assert_eq!(server["capabilities"]["invitationAccountSearch"], 1);
         assert_eq!(server["capabilities"]["personalPairing"], 1);
         assert_eq!(server["capabilities"]["authenticatedDevices"], 1);
         assert_eq!(server["capabilities"]["agentRetire"], 1);
+        assert_eq!(server["capabilities"]["scriptMonitors"], 2);
+        assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
         assert_eq!(server["capabilities"]["submissionCorrelation"], json!(1));
+        assert_eq!(server["capabilities"]["prWorkspaceLookup"], json!(1));
         for capability in [
             "repositoryContext",
             "repositorySelection",
@@ -136,7 +205,7 @@ async fn re_presents_persisted_id_and_is_idempotent() {
         }))
         .unwrap()
     };
-    let r1 = parsed(handle(req(1), &api, &mut binding, false).await);
+    let r1 = parsed(handle(req(1), &api, &mut binding, false, TEST_DAEMON_VERSION).await);
     assert_eq!(r1["result"]["clientId"], json!("cli-7f3a"));
     assert_eq!(binding.as_ref().unwrap().0, "cli-7f3a");
     assert_eq!(
@@ -145,7 +214,7 @@ async fn re_presents_persisted_id_and_is_idempotent() {
     );
     assert_eq!(r1["result"]["server"]["locality"], json!("remote"));
     // Re-sending updates name/capabilities and re-returns the same server block.
-    let r2 = parsed(handle(req(2), &api, &mut binding, false).await);
+    let r2 = parsed(handle(req(2), &api, &mut binding, false, TEST_DAEMON_VERSION).await);
     assert_eq!(r2["result"]["clientId"], json!("cli-7f3a"));
     assert_eq!(r1["result"]["server"], r2["result"]["server"]);
     let last = api.last.lock().unwrap().clone().unwrap();
@@ -177,7 +246,7 @@ async fn host_identification_is_parsed_persisted_and_bound() {
         pretty_hostname: Some("Clement's MacBook Pro".to_string()),
         device_kind: Some("laptop".to_string()),
     };
-    let outcome = handle(req, &api, &mut binding, true).await;
+    let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     let bound = outcome.bound.clone().expect("bound identity");
     assert_eq!(bound.host, expected);
     let last = api.last.lock().unwrap().clone().unwrap();
@@ -191,7 +260,7 @@ async fn host_identification_is_parsed_persisted_and_bound() {
         "params": { "clientId": "cli-host", "hostname": 42, "deviceKind": "desktop" }
     }))
     .unwrap();
-    let outcome = handle(partial, &api, &mut binding, true).await;
+    let outcome = handle(partial, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     let bound = outcome.bound.clone().expect("bound identity");
     assert_eq!(
         bound.host,
@@ -213,7 +282,7 @@ async fn non_string_client_id_is_invalid_params() {
         "jsonrpc": "2.0", "id": 1, "method": "client.hello", "params": { "clientId": 42 }
     }))
     .unwrap();
-    let outcome = handle(req, &api, &mut binding, true).await;
+    let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     assert!(
         outcome.bound.is_none(),
         "an invalid hello binds no reverse identity"
@@ -236,7 +305,7 @@ async fn notification_has_no_response_but_sets_binding() {
         "params": { "clientId": "cli-9b21", "capabilities": { "browserExec": true } }
     }))
     .unwrap();
-    let outcome = handle(req, &api, &mut binding, true).await;
+    let outcome = handle(req, &api, &mut binding, true, TEST_DAEMON_VERSION).await;
     assert!(outcome.frame.is_none());
     assert_eq!(binding.as_ref().unwrap().0, "cli-9b21");
     let bound = outcome.bound.expect("notification hello still binds");
@@ -274,7 +343,13 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
         with_request_context(
             true,
             Some(wire("p-owner", true)),
-            handle(hello(1, "cli-owner"), &api, &mut owner_binding, true),
+            handle(
+                hello(1, "cli-owner"),
+                &api,
+                &mut owner_binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
         )
         .await,
     );
@@ -286,7 +361,13 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
     let guest = with_request_context(
         true,
         Some(wire("p-guest", false)),
-        handle(hello(2, "cli-owner"), &api, &mut guest_binding, true),
+        handle(
+            hello(2, "cli-owner"),
+            &api,
+            &mut guest_binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
     )
     .await;
     let bound = guest.bound.clone().expect("a successful hello binds");
@@ -313,6 +394,7 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
                 &api,
                 &mut guest_binding,
                 true,
+                TEST_DAEMON_VERSION,
             ),
         )
         .await,
@@ -330,6 +412,7 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
                 &api,
                 &mut other_binding,
                 true,
+                TEST_DAEMON_VERSION,
             ),
         )
         .await,
@@ -350,6 +433,7 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
                 &api,
                 &mut minted_binding,
                 true,
+                TEST_DAEMON_VERSION,
             ),
         )
         .await,
@@ -362,7 +446,16 @@ async fn non_administrator_client_ids_are_scoped_to_their_principal() {
     // Unbound (legacy administrator token without a principal store) keeps
     // the raw id.
     let mut unbound_binding: Option<ClientId> = None;
-    let unbound = parsed(handle(hello(6, "cli-owner"), &api, &mut unbound_binding, true).await);
+    let unbound = parsed(
+        handle(
+            hello(6, "cli-owner"),
+            &api,
+            &mut unbound_binding,
+            true,
+            TEST_DAEMON_VERSION,
+        )
+        .await,
+    );
     assert_eq!(unbound["result"]["clientId"], json!("cli-owner"));
 }
 
@@ -403,7 +496,7 @@ async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
                     principal_id: PrincipalId::from_string(principal),
                     host_role: intent_core::HostRole::Guest,
                 }),
-                handle(req, &api, &mut binding, false),
+                handle(req, &api, &mut binding, false, TEST_DAEMON_VERSION),
             )
             .await,
         );
@@ -414,4 +507,54 @@ async fn identity_drift_cross_principal_round_trip_keeps_foreign_namespaces() {
         // input takes the same path; there is no connection-local namespace map.
         binding = None;
     }
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+#[test]
+fn monitor_test_host_support_requires_explicit_opt_in() {
+    let ordinary = server_json(false, "linux", "x86_64", "test", None, true);
+    assert!(ordinary["capabilities"].get("reviewMonitoring").is_none());
+    let mut disabled = ordinary.clone();
+    apply_monitor_test_support(&mut disabled, false);
+    assert_eq!(disabled, ordinary);
+    let mut enabled = ordinary.clone();
+    apply_monitor_test_support(&mut enabled, true);
+    assert_eq!(enabled["capabilities"]["reviewMonitoring"], 1);
+    enabled["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("reviewMonitoring");
+    assert_eq!(
+        enabled, ordinary,
+        "test support changes no other host claims"
+    );
+}
+
+#[tokio::test]
+async fn paging_only_api_does_not_advertise_delete_grace() {
+    struct PagingOnly;
+    impl WorkspaceApi for PagingOnly {
+        fn note_paging_backend_id(&self) -> Option<String> {
+            Some("paging-only".into())
+        }
+        fn upsert_client(
+            &self,
+            _id: ClientId,
+            _name: Option<String>,
+            _capabilities: Option<Value>,
+            _host: ClientHostInfo,
+        ) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let req =
+        classify(&json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{}})).unwrap();
+    let result = parsed(handle(req, &PagingOnly, &mut None, true, TEST_DAEMON_VERSION).await);
+    assert_eq!(
+        result["result"]["server"]["capabilities"]["notePagingRead"],
+        1
+    );
+    assert!(result["result"]["server"]["capabilities"]
+        .get("noteDeleteGrace")
+        .is_none());
 }

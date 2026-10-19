@@ -18,6 +18,16 @@ use uuid::Uuid;
 
 use crate::{enum_from_db, enum_to_db, Store};
 
+mod review_context_enrollment;
+pub use review_context_enrollment::{
+    ReviewContextEnrollment, ReviewContextEnrollmentIntent, ReviewContextOwnerKey,
+};
+
+mod prepared_monitor_message;
+pub use prepared_monitor_message::PreparedMonitorMessage;
+mod monitor_message_provenance;
+pub use monitor_message_provenance::MonitorMessageProvenance;
+
 /// Last confirmed turn selection and the provider default to restore after a
 /// resume. A missing record is an unobserved baseline; `effort: None` is Auto.
 /// Kept outside [`AgentSession`] projections so picker updates cannot overwrite it.
@@ -329,7 +339,8 @@ pub(crate) fn unread_workspaces_batch_sql() -> String {
 }
 
 /// One agent session's usage inputs for the workspace token-usage tally
-/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage, cells, name)`,
+/// where `name` is the raw session display name.
 /// `message_usage` is non-empty only for sessions whose decoded snapshot and
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
@@ -341,6 +352,7 @@ pub(crate) type AgentUsageRow = (
     Option<TokenUsageTotals>,
     Vec<serde_json::Value>,
     Vec<AgentUsageCellRow>,
+    String,
 );
 
 /// Indexed aggregate counts for delegated children of one parent agent.
@@ -464,7 +476,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Vec<AgentUsageRow>> {
-    let session_sql = "SELECT id, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
+    let session_sql = "SELECT id, name, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
         FROM agent_session WHERE workspace_id = ?";
     let session_rows = sqlx::query(session_sql)
         .bind(&workspace_id.0)
@@ -488,7 +500,21 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        result.push((agent_id, model, snapshot, baseline, Vec::new(), Vec::new()));
+        // Display name for `TokenUsage::agent_names` (§5.23); the services
+        // helper owns trimming and the empty-name rule.
+        let name = session_row
+            .get::<Option<String>, _>("name")
+            .unwrap_or_default();
+
+        result.push((
+            agent_id,
+            model,
+            snapshot,
+            baseline,
+            Vec::new(),
+            Vec::new(),
+            name,
+        ));
     }
 
     let mut by_agent = std::collections::HashMap::new();
@@ -1072,7 +1098,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -1214,7 +1240,7 @@ impl Store {
             Ok(())
         })
         .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
@@ -2985,7 +3011,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3084,7 +3110,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3141,7 +3167,7 @@ impl Store {
         .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
         .rows_affected();
         if rows > 0 {
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             return Ok(true);
         }
         let exists = sqlx::query_scalar::<_, i64>(
@@ -3155,7 +3181,7 @@ impl Store {
         if exists == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(false)
     }
 
@@ -3523,7 +3549,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3629,7 +3655,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("set agent session retired_at failed: {e}")))?
         .rows_affected();
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(rows > 0)
     }
 
@@ -3911,7 +3937,7 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -4027,7 +4053,7 @@ impl Store {
             "replace acp session id commit failed",
         )
         .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Shared transaction body; the caller owns serialization and commit/rollback.
@@ -4220,7 +4246,7 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -5007,6 +5033,15 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload begin failed: {e}")))?;
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::MonitorHistory(
+            agent_id.clone(),
+        )])?;
         sqlx::query(PAYLOAD_UPSERT_SQL)
             .bind(message_id)
             .bind(&agent_id.0)
@@ -5014,9 +5049,13 @@ impl Store {
             .bind(row.kind)
             .bind(row.encoding)
             .bind(&row.body)
-            .execute(self.write_pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("prestage message payload failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload commit failed: {e}")))?;
+        lifecycle.settle_after_retirement().await?;
         Ok(Some(slim))
     }
 
@@ -5662,9 +5701,20 @@ impl Store {
             .map_err(|e| Error::Internal(format!("payload compaction task failed: {e}")))?;
 
             let compacted = crate::with_write_txn_retry(|| async {
-                let mut tx = pool.begin().await.map_err(|e| {
+                let mut lifecycle = self.repository_lifecycle_write().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                     Error::Internal(format!("compact tool payloads begin failed: {e}"))
                 })?;
+                lifecycle.begin(
+                    &converted
+                        .iter()
+                        .map(|row| {
+                            crate::RepositoryLifecycleKey::MonitorHistory(AgentId(
+                                row.agent_id.clone(),
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
                 let mut n: u64 = 0;
                 for row in &converted {
                     let deleted = sqlx::query(
@@ -5700,6 +5750,7 @@ impl Store {
                 tx.commit().await.map_err(|e| {
                     Error::Internal(format!("compact tool payloads commit failed: {e}"))
                 })?;
+                lifecycle.settle_after_retirement().await?;
                 Ok(n)
             })
             .await?;
@@ -6180,7 +6231,16 @@ impl Store {
     ) -> Result<Vec<UserMessageIndexItem>> {
         let sql = format!(
             "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
-                    m.metadata, m.created_at \
+                    m.metadata, m.created_at, \
+                    (COALESCE(json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
+                      AND (json_type(m.metadata, '$.resource') IS NOT NULL \
+                        OR json_type(m.metadata, '$.availability') IS NOT NULL), 0) \
+                     OR CASE WHEN json_valid(m.content) AND json_type(m.content) = 'array' THEN EXISTS(\
+                       SELECT 1 FROM json_each(m.content) block \
+                       WHERE json_extract(m.content, block.fullkey || '.messageMetadata.type') = 'pr_monitor_wake' \
+                         AND (json_type(m.content, block.fullkey || '.messageMetadata.resource') IS NOT NULL \
+                           OR json_type(m.content, block.fullkey || '.messageMetadata.availability') IS NOT NULL)\
+                     ) ELSE 0 END) AS qualified_monitor \
              FROM agent_message m \
              WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
         );
@@ -6200,6 +6260,7 @@ impl Store {
                         None => None,
                     };
                 Ok(UserMessageIndexItem {
+                    qualified_monitor: col(row, "qualified_monitor")?,
                     id: col(row, "id")?,
                     preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
                     metadata,
@@ -6327,9 +6388,19 @@ impl Store {
         let prepared = batch_content_cols_and_payload_rows(&owned_messages).await?;
 
         crate::with_write_txn_retry(|| async {
-            let mut tx = pool.begin().await.map_err(|e| {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                 Error::Internal(format!("replace agent messages begin failed: {e}"))
             })?;
+            lifecycle.begin(&[
+                crate::RepositoryLifecycleKey::MonitorHistory(agent_id.clone()),
+                crate::RepositoryLifecycleKey::Agent(agent_id.clone()),
+            ])?;
+            // A transcript replacement cannot inherit its prior native family,
+            // even when the replacement's public message bytes are identical.
+            sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                .bind(&agent_id.0).execute(&mut *tx).await
+                .map_err(|_| Error::Internal("private native enrollment invalidation failed".into()))?;
             // Cascade sweeps the old rows' agent_message_payload side rows;
             // the 0108 AFTER DELETE trigger resolves the session through the
             // denormalized agent_id, so conversation_bytes stays balanced.
@@ -6539,6 +6610,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("replace agent messages commit failed: {e}"))
             })?;
+            lifecycle.settle_after_retirement().await?;
             Ok(inserted)
         })
         .await
@@ -6578,9 +6650,13 @@ impl Store {
              WHERE agent_id = ? AND role = ? ORDER BY seq DESC LIMIT 1"
         );
         crate::with_write_txn_retry(|| async {
-            let mut tx = pool.begin().await.map_err(|e| {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                 Error::Internal(format!("truncate agent messages begin failed: {e}"))
             })?;
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::MonitorHistory(
+                agent_id.clone(),
+            )])?;
             // Count only the suffix being deleted, using the same persisted
             // provenance as append/replacement. Historical token spend and
             // costs survive transcript edits, including cells reduced to zero
@@ -6668,6 +6744,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("truncate agent messages commit failed: {e}"))
             })?;
+            lifecycle.settle_after_retirement().await?;
             Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
         })
         .await
@@ -6863,6 +6940,9 @@ pub struct ReplaceMessage<'a> {
 /// creation timestamp — never the full content blob.
 #[derive(Debug, Clone)]
 pub struct UserMessageIndexItem {
+    /// Whole-envelope classification only, never authorization. Kept internal
+    /// to Store consumers; public index DTOs must not serialize this field.
+    pub qualified_monitor: bool,
     pub id: String,
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
@@ -12283,9 +12363,9 @@ mod tests {
             .get_workspace_agent_usage_data(&ws_id)
             .await
             .expect("usage rollup");
-        let (_, rollup_model, _, _, _, _) = rows
+        let (_, rollup_model, _, _, _, _, _) = rows
             .into_iter()
-            .find(|(id, _, _, _, _, _)| *id == agent_id.0)
+            .find(|(id, _, _, _, _, _, _)| *id == agent_id.0)
             .expect("rollup row");
         assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
     }
@@ -14304,6 +14384,73 @@ mod tests {
     /// the requested char count and metadata passed through verbatim; other
     /// roles are excluded in SQL and an empty/unknown agent yields an empty
     /// index.
+    #[tokio::test]
+    async fn get_agent_user_message_index_classifies_whole_monitor_envelopes() {
+        let tmp = TempDb::new("monitor-index-classification");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-monitor-index".into());
+        let agent = AgentId("agent-monitor-index".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let cases = [
+            (serde_json::json!([{"text":"ordinary αβ"}]), None, false),
+            (
+                serde_json::json!([{"text":"legacy"}]),
+                Some(
+                    serde_json::json!({"type":"pr_monitor_wake","repo":"owner/repo","prNumber":4}),
+                ),
+                false,
+            ),
+            (
+                serde_json::json!([{"text":"private"}]),
+                Some(serde_json::json!({"type":"pr_monitor_wake","resource":null})),
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"private"}]),
+                Some(serde_json::json!({"type":"pr_monitor_wake","availability":{}})),
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"private","messageMetadata":{"type":"pr_monitor_wake","resource":{}}},{"text":"sibling"}]),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!(["string block",{"text":"private","messageMetadata":{"type":"pr_monitor_wake","availability":null}}]),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"ordinary","messageMetadata":{"type":"other","resource":{}}}]),
+                None,
+                false,
+            ),
+        ];
+        for (body, metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(&agent, "user", body, metadata.as_ref(), &ts)
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (_, _, qualified)) in index.iter().zip(&cases) {
+            assert_eq!(item.qualified_monitor, *qualified);
+            assert!(item.preview.chars().count() <= 10);
+        }
+    }
+
     #[tokio::test]
     async fn get_agent_user_message_index_filters_roles_and_bounds_previews() {
         use intent_core::now_iso;

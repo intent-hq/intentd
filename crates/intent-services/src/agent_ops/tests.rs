@@ -10415,6 +10415,13 @@ async fn agent_list_row_stays_within_row_budget() {
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
+    // Every shortened preview string carries its truncation flag, and the
+    // flags are measured inside the row budget below.
+    assert!(row.last_agent_response_truncated);
+    assert!(row.last_user_message_truncated);
+    assert!(row.digest_truncated);
+    assert!(row.metadata.completion_report_truncated);
+    assert!(row.metadata.attention_request_reason_truncated);
     assert_eq!(row.waiting_on_hooks.len(), 2);
     assert_eq!(row.waiting_on_pr_monitors.len(), 2);
     assert_eq!(row.waiting_for_agent_ids.len(), 1);
@@ -11145,10 +11152,10 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
 
 /// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRJ` on PR #104):
 /// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
-/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
-/// workspace must NOT leak the foreign note's title/content into the TASK-C
-/// preamble injected as the child's first message; the preamble is skipped and
-/// the message falls back to the caller-supplied `agentInstructions`.
+/// is workspace-scoped. A `taskNoteId` that belongs to another workspace is
+/// "not found" from this workspace's point of view, so the delegation is
+/// rejected (intent-hq/intent#7120) before any child is created — and the
+/// rejection must not leak the foreign note's title/content.
 #[intent_test_macros::daemon_test]
 async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     let (_t, svc, ws_a) = setup().await;
@@ -11179,28 +11186,82 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
         agent_instructions: Some("do the work".into()),
         ..Default::default()
     };
-    let resp = svc
+    let err = svc
         .agent_delegate_op(ws_a.clone(), input, None)
         .await
-        .expect("delegate");
-    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("a task note from another workspace must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "out-of-workspace taskNoteId rejects with -32602: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("CROSS-WORKSPACE-SECRET"),
+        "the rejection must not leak the foreign note: {msg}"
+    );
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_a)
+        .await
+        .expect("list ws_a sessions");
+    assert!(
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
+    );
+}
 
-    let body = child_session_messages_json(&svc, &child).await;
+/// intent-hq/intent#7120: `agent.delegate` with a `taskNoteId` (or `noteId`)
+/// that does not exist must fail with `-32602` and create no agent, instead
+/// of returning `ok` and spawning an idle child bound to the missing id.
+#[intent_test_macros::daemon_test]
+async fn delegate_nonexistent_task_note_id_is_rejected_without_spawning() {
+    let (_t, svc, ws) = setup().await;
+
+    for input in [
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            agent_instructions: Some("do the work".into()),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            note_id: Some(intent_core::NoteId::from("no-such-note-456")),
+            task_text: Some("tick the box".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = svc
+            .agent_delegate_op(ws.clone(), input.clone(), None)
+            .await
+            .expect_err("a nonexistent task note must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "nonexistent note id rejects with -32602: {err:?}"
+        );
+        let missing = input
+            .task_note_id
+            .as_ref()
+            .or(input.note_id.as_ref())
+            .expect("id")
+            .0
+            .clone();
+        assert!(
+            err.to_string().contains(&missing),
+            "the rejection names the missing id: {err}"
+        );
+    }
+
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
     assert!(
-        body.contains("do the work"),
-        "explicit instructions must still reach the child: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
-        "foreign note title must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
-        "foreign note body must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("**Your Task Note:**"),
-        "preamble must be skipped when the linked note is out of workspace: {body}"
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
     );
 }
 
@@ -17836,6 +17897,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect("plan while auggie is enabled and authenticated");
@@ -17861,6 +17923,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect_err("the demotion must reject a fresh plan");
@@ -21297,6 +21360,96 @@ async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
     assert_eq!(row["waitingOnPrMonitors"][0]["prNumber"], 42);
 }
 
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_withholds_nonlegacy_monitor_provenance() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Private monitor owner").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+    for (provider, instance, project, kind, provenance, reason) in [
+        (
+            None,
+            None,
+            None,
+            None,
+            "unresolved",
+            Some("missing-provenance"),
+        ),
+        (
+            Some("gitlab"),
+            Some("https://gitlab.com"),
+            Some("acme/widgets"),
+            Some("merge-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "validated-transfer",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("different/project"),
+            Some("pull-request"),
+            "legacy-github-writer",
+            None,
+        ),
+    ] {
+        sqlx::query("UPDATE pr_monitor SET target_provider=?,target_instance_base_url=?,target_project_path=?,target_kind=?,target_provenance=?,target_unresolved_reason=? WHERE monitor_id=?")
+            .bind(provider).bind(instance).bind(project).bind(kind).bind(provenance).bind(reason)
+            .bind(&monitor.monitor_id.0).execute(svc.store().write_pool()).await.unwrap();
+        let before = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let subscriptions = svc
+            .agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+            .unwrap();
+        let row = subscriptions["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == child.0)
+            .unwrap();
+        assert!(
+            row.get("waitingOnPrMonitors").is_none(),
+            "{provenance}/{project:?}: {row}"
+        );
+        assert_eq!(svc.active_pr_monitors_for_agent(&child).await.len(), 1);
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
 /// SQL events are attributed to this read's span (the production profiler's
 /// signal). Transcript bodies are deliberately malformed so hydration fails;
 /// both small and large reads must still use the persisted previews only.
@@ -24339,7 +24492,7 @@ async fn seed_active_hook(
     hook
 }
 
-/// Seed one ACTIVE PR-monitor row owned by `agent` directly in the store —
+/// Seed one ACTIVE legacy GitHub producer row owned by `agent` —
 /// the idle-visibility lookups read persisted monitor rows, so no poll loop
 /// is needed. Mirrors [`seed_active_hook`] for the pr-monitor-waiting
 /// classification.
@@ -24369,7 +24522,19 @@ async fn seed_active_pr_monitor(
         updated_at: now,
     };
     svc.store()
-        .insert_pr_monitor(&monitor)
+        .insert_qualified_pr_monitor(
+            &monitor,
+            &intent_core::ReviewTarget {
+                repository: intent_core::RepositoryTarget {
+                    provider: intent_core::RepositoryProvider::Github,
+                    instance_base_url: "https://github.com".into(),
+                    project_path: format!("{}/{}", monitor.repo_owner, monitor.repo_name),
+                },
+                kind: intent_core::RepositoryResourceKind::PullRequest,
+                number: u64::try_from(pr_number).unwrap(),
+            },
+            intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+        )
         .await
         .expect("insert pr monitor");
     monitor
@@ -26869,6 +27034,122 @@ async fn mutual_idle_two_cycle_does_not_defer() {
         "mutual-idle 2-cycle delivers as before (no deadlock)"
     );
     assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// N-cycle deadlock guard (issue intent-hq/intent#7205): A→B→C→A watch each
+/// other and all three are idle. Before the fix only direct 2-cycles were
+/// declassified, so every member counted its outgoing edge as a waiting
+/// reason, every idle deferred, and the closed cycle stayed unsettled
+/// forever. The last idle in the cycle must deliver, and the cycle must then
+/// unwind with each watch firing exactly once.
+#[tokio::test]
+async fn idle_three_cycle_does_not_defer() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+
+    for id in [&a, &b, &c] {
+        assert!(
+            !svc.agent_is_waiting_on_agents(id),
+            "an all-idle 3-cycle is not a waiting reason for {}",
+            id.0
+        );
+        assert!(
+            !svc.agent_is_waiting_on_agents_durable(id).await,
+            "durable (rehydration) classification agrees for {}",
+            id.0
+        );
+    }
+
+    // C idles last: not deferred — B's watch on C fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B woken by C");
+    assert!(svc.find_watches_for_child(&c).is_empty());
+
+    // B (now watchless) idles: A's watch on B fires; then A idles: C's
+    // watch on A fires. The cycle unwinds with exactly one wake per edge.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &a,
+        json!({ "agentId": a.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1, "A woken once");
+    assert_eq!(parent_message_count(&svc, &c).await, 1, "C woken once");
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B not re-woken");
+    for id in [&a, &b, &c] {
+        assert!(svc.find_watches_for_child(id).is_empty());
+        assert!(svc.waiting_watches_for_parent(id).is_empty());
+    }
+}
+
+/// Control for the N-cycle guard (issue intent-hq/intent#7205): a cycle
+/// with one BUSY member is a genuine wait — the busy agent will complete and
+/// wake its watcher — so every member still defers. An acyclic idle chain
+/// ending in a busy agent defers too.
+#[tokio::test]
+async fn three_cycle_with_busy_member_still_defers() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let d = create_agent(&svc, &ws, "D").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+    svc.register_completion_watch(&ws, &ws, d.clone(), "D".into(), a.clone(), None)
+        .expect("D watches A (acyclic tail)");
+
+    svc.set_test_busy(&b, true);
+    assert!(
+        svc.agent_is_waiting_on_agents(&c),
+        "C's cycle passes through busy B: genuine wait"
+    );
+    assert!(
+        svc.agent_is_waiting_on_agents(&d),
+        "D waits on A, which waits on busy B"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &b).await,
+        0,
+        "C's idle deferred while the cycle has a busy member"
+    );
+    assert_eq!(svc.find_watches_for_child(&c).len(), 1);
+    svc.set_test_busy(&b, false);
 }
 
 /// Agent-waiting deferral (grouped): a parent P delegates child B in an
@@ -30167,6 +30448,65 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     assert_eq!(session.stop_reason, None);
 }
 
+/// List-row truncation flag (intent-hq/intent#7250 follow-up): a reason over
+/// the 400-byte list cap is served shortened on `agent.list` with
+/// `metadata.attentionRequestReasonTruncated: true`; a short reason carries
+/// no flag; `agent.get` serves the full reason and never the flag.
+#[tokio::test]
+async fn agent_list_flags_shortened_attention_reason() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let long = create_agent(&svc, &ws, "Long").await;
+    let short = create_agent(&svc, &ws, "Short").await;
+    let reason = format!("blocked: {}", "r".repeat(BUDGET * 2));
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        reason.clone(),
+        Some(long.clone()),
+    )
+    .await
+    .expect("long request");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "short reason".into(),
+        Some(short.clone()),
+    )
+    .await
+    .expect("short request");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let wire = |id: &AgentId| {
+        serde_json::to_value(rows.iter().find(|a| a.id == *id).expect("listed")).unwrap()
+    };
+    let long_row = wire(&long);
+    assert_eq!(
+        long_row["metadata"]["attentionRequestReasonTruncated"],
+        json!(true)
+    );
+    let served = long_row["metadata"]["attentionRequestReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(served.len(), BUDGET);
+    assert!(reason.starts_with(served));
+    let short_row = wire(&short);
+    assert_eq!(
+        short_row["metadata"]["attentionRequestReason"],
+        "short reason"
+    );
+    assert!(short_row["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+
+    let got =
+        serde_json::to_value(svc.agent_get_op(long.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(got["metadata"]["attentionRequestReason"], json!(reason));
+    assert!(got["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+}
+
 /// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
 /// linked task to the new `blocked` status; `kind: "discussion"` moves it to
 /// `discussion_needed`.
@@ -32536,7 +32876,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
 
 use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
 
-async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+pub(super) async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
     let note = svc
         .create_note(
             ws.clone(),
@@ -34349,6 +34689,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     // persisted=true (matching persist_error_and_requeue's behavior).
     let message_id = new_message_id();
     let queued = QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         turn_id: message_id.clone(),
@@ -34938,6 +35279,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     svc.requeue_front(
         &id,
         crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: requeue_id.clone(),
@@ -35399,6 +35741,7 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 /// resets and preservations are both observable.
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: id.to_string(),
@@ -46385,6 +46728,30 @@ mod resume_tail_recap {
         }
     }
 
+    #[test]
+    fn qualified_monitor_recap_withholds_whole_private_envelope() {
+        for embedded in [false, true] {
+            let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}});
+            let mut private = user("private monitor update");
+            if embedded {
+                private.content[0]["messageMetadata"] = metadata;
+            } else {
+                private.metadata = Some(metadata);
+            }
+            assert!(build_resume_tail_recap(&[private.clone()]).is_none());
+            let recap = build_resume_tail_recap(&[user("ordinary request"), private])
+                .expect("ordinary recap remains available");
+            assert!(recap.text.contains("ordinary request"));
+            assert!(!recap.text.contains("private monitor update"));
+        }
+        let mut github = user("GitHub monitor update");
+        github.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
+        assert!(build_resume_tail_recap(&[github])
+            .unwrap()
+            .text
+            .contains("GitHub monitor update"));
+    }
+
     fn user(text: &str) -> AgentMessage {
         message("user", json!([{ "type": "text", "text": text }]), None)
     }
@@ -48409,4 +48776,35 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             .await
             .is_empty());
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn task_push_assignment_cleanup_publishes_complete_metadata() {
+    let (_tmp, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Cleanup").await;
+    let stale = AgentId::from("stale-assignment");
+    let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
+    note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
+    svc.store().update_note_metadata(&note).await.unwrap();
+    let bus = EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus.clone());
+    svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])
+        .await
+        .unwrap();
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec![intent_core::events::NOTE_UPDATED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["note"]["id"], note_id.as_str());
+    assert!(events[0].data["note"]["metadata"]["task"]
+        .get("assignedAgentIds")
+        .is_none());
+    assert!(events[0].data["note"].get("content").is_none());
+    bus.shutdown().await.unwrap();
 }

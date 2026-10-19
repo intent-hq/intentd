@@ -56,6 +56,7 @@ tokio::task_local! {
     /// (UDS sets `false`, WSS sets `true`) before spawning the request handler.
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
+    static MONITOR_HISTORY: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
     static CHECKOUT_FRAME: Option<intent_core::repository_checkout::CheckoutFrame>;
     static RESOURCE_FRAME: Option<intent_core::repository_request::RepositoryResourceFrame>;
@@ -212,6 +213,63 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
 #[derive(Clone)]
 pub(crate) struct ReadConnectionGuard(Option<Arc<dyn RepositoryReadConnection>>);
 
+pub(crate) fn review_monitoring_hello(
+    support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.review_monitoring_hello(support))
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn capture_monitor_events(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_events())
+        .ok()
+        .flatten()
+}
+
+/// Capture the acknowledged physical recipient before spawning the forwarder.
+pub(crate) fn capture_monitor_history(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_history())
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn with_monitor_history(
+    owner: Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>>,
+    body: impl Future<Output = ()> + Send,
+) {
+    struct Retire(Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>);
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            self.0.retire();
+        }
+    }
+    let Some(owner) = owner else {
+        return body.await;
+    };
+    // Natural forwarder exit and cancellation have the same retirement rule.
+    let _retire = Retire(owner.clone());
+    owner
+        .scope(Box::pin(MONITOR_HISTORY.scope(owner.clone(), body)))
+        .await;
+}
+
+pub(crate) fn chat_frame(frame: String) -> crate::OutboundFrame {
+    match MONITOR_HISTORY.try_with(Clone::clone) {
+        Ok(owner) => crate::OutboundFrame::private(owner.bind_output(frame)),
+        Err(_) => frame.into(),
+    }
+}
+
+pub(crate) fn begin_chat_history_generation() {
+    let _ = MONITOR_HISTORY.try_with(|owner| owner.begin_generation());
+}
+
 impl ReadConnectionGuard {
     pub(crate) fn bind(api: &dyn intent_core::WorkspaceApi, entry: RepositoryWireEntry) -> Self {
         Self(api.repository_read_connection(entry))
@@ -220,7 +278,7 @@ impl ReadConnectionGuard {
     /// Consume the original owner's bounded control feed on this socket only.
     pub(crate) fn forward_retirements(
         &self,
-        output: tokio::sync::mpsc::Sender<String>,
+        output: tokio::sync::mpsc::Sender<crate::OutboundFrame>,
     ) -> RetirementForwarder {
         let resource_output = output.clone();
         let review_output = output.clone();
@@ -233,7 +291,7 @@ impl ReadConnectionGuard {
                         "jsonrpc": "2.0", "method": "workspace.repositoryContext.retired", "params": notice,
                     }).to_string();
                     // Receiver loss closes this original feed and all its leases.
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -242,7 +300,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"workspace.repositorySelection.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -251,7 +309,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"accept-changes.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -260,7 +318,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });

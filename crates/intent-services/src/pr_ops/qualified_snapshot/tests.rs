@@ -455,7 +455,7 @@ fn observed_conflicts_behind_and_draft_use_the_existing_reason_words() {
     o.details.confirmed_draft = Some(true);
     assert_eq!(
         project(&o)["mergeBlockedReason"],
-        "draft PRs cannot be merged"
+        "draft MRs cannot be merged"
     );
 }
 

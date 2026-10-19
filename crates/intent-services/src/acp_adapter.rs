@@ -184,6 +184,9 @@ pub fn live_adapters() -> usize {
 pub(crate) struct AcpAdapterCommand {
     installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
     installed: Option<Arc<PreparedInstalled>>,
+    /// The selected named profile, resolved into the installed context
+    /// before account lookup and source-home isolation (PROTOCOL §5.54).
+    profile: Option<Arc<intent_acp::ProfileEnv>>,
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
@@ -200,6 +203,10 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    pub(crate) fn is_codex(&self) -> bool {
+        self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Codex)
+    }
+
     fn command_in(&self, process_cwd: &std::path::Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
         command
@@ -239,7 +246,8 @@ impl AcpAdapterCommand {
         if self.installed.is_some() {
             return Ok(self);
         }
-        let context = crate::installed_cli::InstalledContext::discover(cli).await?;
+        let context =
+            crate::installed_cli::InstalledContext::discover_for(cli, self.profile.clone()).await?;
         self.prepare_with_context(context).await
     }
 
@@ -247,10 +255,11 @@ impl AcpAdapterCommand {
         let cli = self
             .installed_cli
             .ok_or("catalog requires an installed CLI")?;
-        let context = crate::installed_cli::InstalledContext::discover(cli)
-            .await?
-            .with_catalog_fingerprint()
-            .await?;
+        let context =
+            crate::installed_cli::InstalledContext::discover_for(cli, self.profile.clone())
+                .await?
+                .with_catalog_fingerprint()
+                .await?;
         self.prepare_with_context(context).await
     }
 
@@ -258,6 +267,16 @@ impl AcpAdapterCommand {
         mut self,
         context: crate::installed_cli::InstalledContext,
     ) -> Result<Self, String> {
+        // A context discovered without this command's profile gets it here,
+        // before the account home is read for isolation.
+        let context = match (context.profile(), self.profile.clone()) {
+            (None, Some(profile)) => {
+                tokio::task::spawn_blocking(move || context.with_profile(Some(profile)))
+                    .await
+                    .map_err(|_| "installed CLI profile task failed")?
+            }
+            _ => context,
+        };
         let cli = context.runtime.cli();
         self.installed_cli = Some(cli);
         let context_for_home = context.clone();
@@ -297,9 +316,10 @@ impl AcpAdapterCommand {
                     npx_dir.clone(),
                     codex_home.clone(),
                 ));
-                let (identity, _version) = context
+                let (identity, version) = context
                     .observe_with_dependency(&command, Some(dependency))
                     .await?;
+                context.validate_launch_version(&version)?;
                 let env = command
                     .as_std()
                     .get_envs()
@@ -376,6 +396,7 @@ impl AcpAdapterCommand {
                 _ => None,
             },
             installed: None,
+            profile: None,
             program: npx,
             args: vec![
                 NPX_NO_WORKSPACES_ARG.to_string(),
@@ -396,6 +417,7 @@ impl AcpAdapterCommand {
         Self {
             installed_cli: None,
             installed: None,
+            profile: None,
             program: bin,
             args,
             envs: Vec::new(),
@@ -447,6 +469,13 @@ impl AcpAdapterCommand {
     /// Remove an environment variable from the adapter child's inherited env.
     pub(crate) fn env_remove(mut self, key: impl Into<String>) -> Self {
         self.envs_removed.push(key.into());
+        self
+    }
+
+    /// Run this launch under a named profile's overlay (`None` = Default).
+    /// Must be set before installed preparation.
+    pub(crate) fn with_profile(mut self, profile: Option<Arc<intent_acp::ProfileEnv>>) -> Self {
+        self.profile = profile;
         self
     }
 

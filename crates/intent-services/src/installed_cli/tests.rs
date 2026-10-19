@@ -540,6 +540,15 @@ impl DetachedCleanup {
         root: &Path,
         read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
     ) -> Result<Self, String> {
+        Self::capture_with_poll(pid, root, read_identity, Self::poll_pidfd)
+    }
+
+    fn capture_with_poll(
+        pid: i32,
+        root: &Path,
+        read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
+        mut poll: impl FnMut(&std::os::fd::OwnedFd, i32) -> Result<bool, String>,
+    ) -> Result<Self, String> {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
         if pid <= 1 {
@@ -566,7 +575,14 @@ impl DetachedCleanup {
         // EACCES, ENOENT and an empty environment alone prove nothing. Check
         // after reading so an exit/PID reuse during that read cannot grant
         // signal authority from another process's environment.
-        let retired = Self::pidfd_retired(&fd)?;
+        let retired = poll(&fd, 0)?
+            || (identity
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                // Exit can deny environ access before the pidfd becomes readable.
+                // Bound that observation on this same handle; a timeout grants
+                // no identity or signal authority. Other read errors do not wait.
+                && poll(&fd, 100)?);
         match identity {
             Err(error)
                 if !matches!(
@@ -594,14 +610,18 @@ impl DetachedCleanup {
     }
 
     fn pidfd_retired(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
+        Self::poll_pidfd(fd, 0)
+    }
+
+    fn poll_pidfd(fd: &std::os::fd::OwnedFd, timeout_ms: i32) -> Result<bool, String> {
         use std::os::fd::AsRawFd;
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: poll points to one initialized descriptor and never blocks.
-        let result = if unsafe { libc::poll(&raw mut poll, 1, 0) } < 0 {
+        // SAFETY: poll points to one initialized descriptor; the caller bounds its wait.
+        let result = if unsafe { libc::poll(&raw mut poll, 1, timeout_ms) } < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(poll.revents)
@@ -643,13 +663,105 @@ impl Drop for DetachedCleanup {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_detached_identity_ready(
+    root: &Path,
+    timeout: Duration,
+    mut observe: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut home = b"HOME=".to_vec();
+    home.extend_from_slice(root.as_os_str().as_bytes());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let bytes = observe()?.ok_or("owned fixture child exited before identity readiness")?;
+        if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
+            return Ok(());
+        }
+        if !bytes.is_empty() {
+            return Err("owned fixture child has an unexpected HOME".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("owned fixture child identity readiness timed out".into());
+        }
+        // timing-guard: bounded fixture readiness polling, not capture retries.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
-    intentd_test_support::GuardedChild::spawn(
+    let mut child = intentd_test_support::GuardedChild::spawn(
         std::process::Command::new("/bin/sleep")
             .arg("120")
             .env("HOME", root),
     )
-    .unwrap()
+    .unwrap();
+    // A live, newly spawned fixture can transiently expose an empty environ.
+    // Establish fixture readiness before testing the strict capture operation.
+    let ready = wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(format!("/proc/{}/environ", child.id()))
+            .map_err(|e| format!("read owned fixture identity: {e}"))?;
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(bytes))
+        }
+    });
+    if let Err(error) = ready {
+        let kill = child.kill();
+        let wait = child.wait();
+        panic!("fixture identity not ready: {error}; cleanup kill={kill:?}, wait={wait:?}");
+    }
+    child
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
+    let root = Path::new("/owned-fixture");
+    let mut observations = [Some(Vec::new()), Some(b"HOME=/owned-fixture\0".to_vec())].into_iter();
+    wait_detached_identity_ready(root, Duration::from_secs(3), || {
+        Ok(observations.next().unwrap())
+    })
+    .unwrap();
+    assert!(observations.next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_times_out_when_empty() {
+    let mut calls = 0;
+    let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+        calls += 1;
+        Ok(Some(Vec::new()))
+    })
+    .unwrap_err();
+    assert!(error.contains("timed out"));
+    assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors() {
+    for observation in [
+        Ok(None),
+        Ok(Some(b"HOME=/other-fixture\0".to_vec())),
+        Ok(Some(b"NOT_HOME=/owned-fixture\0".to_vec())),
+        Err("permission denied".to_owned()),
+    ] {
+        let mut calls = 0;
+        assert!(
+            wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+                calls += 1;
+                observation.clone()
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -708,6 +820,154 @@ fn installed_cli_detached_identity_observes_exit_during_inspection() {
     });
     child.wait().unwrap();
     assert!(retired.unwrap().0.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observes_exit_after_nonterminal_poll() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            if timeout > 0 {
+                // Deterministically complete the owned child's exit only after
+                // the initial nonterminal observation, without reusing its PID.
+                detached_identity_zombie(&mut child);
+            }
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        captured.unwrap().0.is_none(),
+        "retired child became a signal target"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(
+        polls[0].0, polls[1].0,
+        "exit observation must pin the same process"
+    );
+    assert_eq!(polls[0].1, 0);
+    assert_eq!(polls[1].1, 100);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_bounds_denied_exit_observation() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut unrelated = detached_identity_child(other.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    let rejected = captured.is_err();
+    drop(captured);
+    let child_alive = child.try_wait().unwrap().is_none();
+    let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(rejected, "unverified live child acquired signal authority");
+    assert!(
+        child_alive && unrelated_alive,
+        "observation signaled a live child"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0].0, polls[1].0);
+    assert_eq!([polls[0].1, polls[1].1], [0, 100]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_propagates_exit_observation_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for result in [
+        Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok(libc::POLLERR),
+        Ok(libc::POLLNVAL),
+        Ok(libc::POLLIN | libc::POLLERR),
+    ] {
+        let mut result = Some(result);
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            |_, timeout| {
+                timeouts.push(timeout);
+                if timeout == 0 {
+                    Ok(false)
+                } else {
+                    DetachedCleanup::polled_retirement(result.take().unwrap())
+                }
+            },
+        );
+        outcomes.push((captured.is_err(), timeouts));
+        drop(captured);
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive, "poll errors must not grant signal authority");
+    for (rejected, timeouts) in outcomes {
+        assert!(rejected, "terminal observation hid a poll error");
+        assert_eq!(timeouts, [0, 100]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_does_not_wait_on_other_read_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for errno in [libc::EIO, libc::ENOENT] {
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(errno)),
+            |fd, timeout| {
+                timeouts.push(timeout);
+                DetachedCleanup::poll_pidfd(fd, timeout)
+            },
+        );
+        outcomes.push((captured.err(), timeouts));
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive);
+    for (error, timeouts) in outcomes {
+        assert!(error
+            .unwrap()
+            .starts_with("inspect detached child identity:"));
+        assert_eq!(timeouts, [0]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1125,4 +1385,403 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
         .await;
     });
     cancel_version_owner(operation, root.path()).await;
+}
+
+#[tokio::test]
+async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_other_cli() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    for (cli, version, rejected) in [
+        (InstalledCli::Codex, "codex-cli 0.114.0", true),
+        (InstalledCli::Codex, minimum.as_str(), false),
+        (InstalledCli::Codex, "codex-cli 99.0.0", false),
+        (InstalledCli::Codex, "unknown", false),
+        (InstalledCli::Claude, "0.0.1", false),
+    ] {
+        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let prepared = crate::acp_adapter::AcpAdapterCommand::binary(
+            "/must-not-launch-adapter".into(),
+            vec![],
+        )
+        .cwd(root.path().to_owned())
+        .prepare_with_context(context)
+        .await;
+        if rejected {
+            let Err(error) = prepared else {
+                panic!("old Codex was accepted");
+            };
+            assert!(error.contains("0.114.0"), "{error}");
+            assert!(error.contains(&minimum), "{error}");
+            assert!(error.contains("Upgrade"), "{error}");
+        } else {
+            assert!(
+                prepared.is_ok(),
+                "{version}: {}",
+                prepared.err().unwrap_or_default()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires INTENT_CODEX_OLD_TEST_BINARY pointing to a real below-minimum Codex CLI"]
+async fn codex_real_old_runtime_is_rejected_before_adapter_start() {
+    let binary = std::env::var_os("INTENT_CODEX_OLD_TEST_BINARY").expect("set old Codex path");
+    let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nexit 99\n");
+    std::fs::remove_file(root.path().join("codex")).unwrap();
+    std::os::unix::fs::symlink(binary, root.path().join("codex")).unwrap();
+    let result =
+        crate::acp_adapter::AcpAdapterCommand::binary("/must-not-launch-adapter".into(), vec![])
+            .cwd(root.path().to_owned())
+            .prepare_with_context(context)
+            .await;
+    let Err(error) = result else {
+        panic!("old runtime reached adapter preparation");
+    };
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    assert!(error.contains("0.114.0"), "{error}");
+    assert!(error.contains(&requirement.minimum.to_string()), "{error}");
+    println!("{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Named provider profiles (PROTOCOL §5.54): the overlay resolves before
+// account/home lookup, isolation and catalog fingerprinting.
+// ---------------------------------------------------------------------------
+
+fn profile(
+    reference: &str,
+    fingerprint: &str,
+    entries: &[(&str, Option<&str>)],
+) -> std::sync::Arc<intent_acp::ProfileEnv> {
+    std::sync::Arc::new(intent_acp::ProfileEnv::new(
+        reference,
+        fingerprint,
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+            .collect(),
+    ))
+}
+
+/// A context whose inherited env and captured shell credentials name the
+/// "personal" account, conflicting with every profile below.
+fn conflicting_context(cli: InstalledCli, root: &Path, body: &str) -> InstalledContext {
+    executable(&root.join(cli.command()), body);
+    let runtime = cli.resolve_in_dirs(&[root.to_owned()], false).unwrap();
+    let personal = root.join("personal");
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CODEX_HOME".into(), personal.as_os_str().to_owned()),
+        ("CLAUDE_CONFIG_DIR".into(), personal.as_os_str().to_owned()),
+        ("OPENAI_BASE_URL".into(), "https://personal.invalid".into()),
+    ]);
+    let captured = BTreeMap::from([
+        ("OPENAI_API_KEY".to_owned(), "personal-captured".to_owned()),
+        (
+            "ANTHROPIC_API_KEY".to_owned(),
+            "personal-captured".to_owned(),
+        ),
+    ]);
+    InstalledContext::from_inputs(
+        runtime,
+        &captured,
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn profile_overlay_beats_inherited_and_captured_before_home_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    assert_eq!(base.codex_home(), Some(root.path().join("personal")));
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+            ("OPENAI_BASE_URL", None),
+            ("EMPTY_SETTING", Some("")),
+        ],
+    )));
+    assert_eq!(context.codex_home(), Some(work.clone()));
+    let command = launch(&context, root.path());
+    assert_eq!(env(&command, "CODEX_HOME"), Some(work.into_os_string()));
+    assert_eq!(env(&command, "OPENAI_API_KEY"), Some("work-key".into()));
+    assert_eq!(env(&command, "EMPTY_SETTING"), Some(OsString::new()));
+    assert!(env(&command, "OPENAI_BASE_URL").is_none());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+    assert!(context.secret_values().contains(&"work-key".to_owned()));
+    assert!(std::env::var_os("EMPTY_SETTING").is_none());
+}
+
+#[test]
+fn profile_cannot_override_enforced_executable_or_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[
+                ("CODEX_PATH", Some("/profile/codex")),
+                ("CODEX_CONFIG", Some("profile-policy")),
+            ],
+        )));
+    let command = launch(&context, root.path());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+}
+
+#[test]
+fn profile_custom_keys_survive_isolated_application() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[("WORK_GATEWAY_TOKEN", Some("gateway"))],
+        )));
+    let mut command = Command::new("unused");
+    context.apply_isolated(&mut command);
+    assert_eq!(env(&command, "WORK_GATEWAY_TOKEN"), Some("gateway".into()));
+}
+
+#[tokio::test]
+async fn profile_catalog_keys_never_cross_profiles_or_settings_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let identity = {
+        let (_dir, fixture) = fixture(InstalledCli::Codex, "#!/bin/sh\nprintf '1.2.3\\n'\n");
+        let command = launch(&fixture, root.path());
+        fixture.observe(&command).await.unwrap().0
+    };
+    let key = |p: Option<std::sync::Arc<intent_acp::ProfileEnv>>| {
+        let context = base.clone().with_profile(p);
+        let identity = identity.clone();
+        async move {
+            context
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(&identity)
+                .unwrap()
+        }
+    };
+    let entries = [("OPENAI_API_KEY", Some("same"))];
+    let default = key(None).await;
+    let work = key(Some(profile("codex@work", "f1", &entries))).await;
+    let work_edited = key(Some(profile("codex@work", "f2", &entries))).await;
+    let personal = key(Some(profile("codex@personal", "f1", &entries))).await;
+    let all = [&default, &work, &work_edited, &personal];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    assert_eq!(work, key(Some(profile("codex@work", "f1", &entries))).await);
+}
+
+#[tokio::test]
+async fn claude_profile_config_dir_selects_fingerprinted_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(root.path().join("personal")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(work.to_str().unwrap())),
+            ("ANTHROPIC_API_KEY", None),
+        ],
+    )));
+    let command = launch(&context, root.path());
+    assert!(env(&command, "ANTHROPIC_API_KEY").is_none());
+    assert_eq!(
+        env(&command, "CLAUDE_CONFIG_DIR"),
+        Some(work.clone().into())
+    );
+    let fingerprint = |c: InstalledContext| async move {
+        c.with_catalog_fingerprint().await.unwrap().context_key
+    };
+    let before = fingerprint(context.clone()).await;
+    std::fs::write(root.path().join("personal/.credentials.json"), "{}").unwrap();
+    assert_eq!(before, fingerprint(context.clone()).await);
+    std::fs::write(work.join(".credentials.json"), "{}").unwrap();
+    assert_ne!(before, fingerprint(context).await);
+}
+
+#[tokio::test]
+async fn profile_isolated_codex_home_is_seeded_from_the_profile_account() {
+    let root = tempfile::tempdir().unwrap();
+    for (account, auth) in [("personal", "personal-auth"), ("work", "work-auth")] {
+        std::fs::create_dir_all(root.path().join(account)).unwrap();
+        std::fs::write(root.path().join(account).join("auth.json"), auth).unwrap();
+    }
+    let work = root.path().join("work");
+    let context = conflicting_context(
+        InstalledCli::Codex,
+        root.path(),
+        "#!/bin/sh\ncat \"$CODEX_HOME/auth.json\" > \"$HOME/seeded\"\nprintf '%s' \"$OPENAI_API_KEY\" > \"$HOME/key\"\nprintf '1.2.3\\n'\n",
+    )
+    .with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+        ],
+    )));
+    let _cmd = crate::acp_adapter::AcpAdapterCommand::binary("/bin/true".into(), vec![])
+        .prepare_with_context(context)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("seeded")).unwrap(),
+        "work-auth"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("key")).unwrap(),
+        "work-key"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_profiles_launch_with_their_own_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let var = format!(
+        "PROFILE_TEST_{}",
+        uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+    );
+    let body =
+        format!("#!/bin/sh\nprintf '%s' \"${var}\" > \"$HOME/seen-${var}\"\nprintf '1.2.3\\n'\n");
+    let base = conflicting_context(InstalledCli::Codex, root.path(), &body);
+    let run = |who: &'static str| {
+        let context = base.clone().with_profile(Some(profile(
+            &format!("codex@{who}"),
+            "f1",
+            &[(var.as_str(), Some(who))],
+        )));
+        let root = root.path().to_owned();
+        async move {
+            let command = launch(&context, &root);
+            context.observe(&command).await.unwrap();
+        }
+    };
+    tokio::join!(run("work"), run("personal"));
+    for who in ["work", "personal"] {
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("seen-{who}"))).unwrap(),
+            who
+        );
+    }
+    assert!(std::env::var_os(&var).is_none());
+}
+
+#[test]
+fn profile_codex_home_config_names_select_inherited_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    executable(&root.path().join("codex"), "#!/bin/sh\n");
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.toml"),
+        "[model_providers.corp]\nenv_key='CORP_API_KEY'\n",
+    )
+    .unwrap();
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CORP_API_KEY".into(), "corp-secret".into()),
+    ]);
+    let base = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    // The Default home declares nothing: its isolated probe drops the key.
+    let mut default_probe = Command::new("unused");
+    base.apply_isolated(&mut default_probe);
+    assert!(env(&default_probe, "CORP_API_KEY").is_none());
+    assert!(!base.secret_values().contains(&"corp-secret".to_owned()));
+
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(env(&probe, "CORP_API_KEY"), Some("corp-secret".into()));
+    assert!(context.secret_values().contains(&"corp-secret".to_owned()));
+    // Runs keep it too, so checks and runs agree.
+    assert_eq!(
+        env(&launch(&context, root.path()), "CORP_API_KEY"),
+        Some("corp-secret".into())
+    );
+}
+
+#[test]
+fn profile_codex_home_with_unreadable_config_keeps_existing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(work.join("config.toml")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(context.codex_home(), Some(work));
+}
+
+#[test]
+fn profile_path_consumes_captured_shell_credentials_like_default() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let context = base.clone().with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[("ANTHROPIC_BASE_URL", Some("https://work.invalid"))],
+    )));
+    // ANTHROPIC_API_KEY exists only in the captured login shell: the profile
+    // leaves it alone, so launches and probes see it exactly as Default does.
+    for command in [launch(&base, root.path()), launch(&context, root.path())] {
+        assert_eq!(
+            env(&command, "ANTHROPIC_API_KEY"),
+            Some("personal-captured".into())
+        );
+    }
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(
+        env(&probe, "ANTHROPIC_API_KEY"),
+        Some("personal-captured".into())
+    );
 }

@@ -592,6 +592,8 @@ async fn assistant_app_guide_reaches_every_turn_over_wss() {
     )
     .await;
     let agent = created["agent"]["id"].as_str().unwrap();
+    // This attachment reaches provider preparation, so use a genuine 1x1 PNG.
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     let sent = wss_rpc(
         &mut rpc,
         3,
@@ -599,7 +601,7 @@ async fn assistant_app_guide_reaches_every_turn_over_wss() {
         json!({
             "workspaceId": chief_ws, "agentId": agent, "content": "GUIDE_FIRST_USER",
             "stdinContext": "GUIDE_REQUEST_CONTEXT",
-            "imageBlocks": [{ "type": "image", "mimeType": "image/png", "data": "aGVsbG8=" }],
+            "imageBlocks": [{ "type": "image", "mimeType": "image/png", "data": image_data }],
         }),
     )
     .await;
@@ -846,7 +848,7 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     assert!(!system.contains("WORKSPACE_ONLY_MARKER"));
     assert!(!system.contains("## Commit Policy"));
     assert!(!system.contains("## Delegating Tasks"));
-    assert_eq!(before["session"]["harnessVersion"], "3.1");
+    assert_eq!(before["session"]["harnessVersion"], "3.2");
     wss_rpc(&mut rpc, 5, "agent.stop", json!({"agentId": agent})).await;
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();

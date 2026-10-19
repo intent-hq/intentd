@@ -2463,7 +2463,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
     mgr.send_message(
@@ -2713,6 +2713,8 @@ fn mock_handle() -> AgentHandle {
         session_mcp_servers: Vec::new(),
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
+        spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+        _activation: None,
         thought_level: None,
         config_options: None,
         confirmed_effort: None,
@@ -3307,7 +3309,8 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     // THIS turn's outbound prompt carries the trailing notice block…
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
     assert_eq!(last["text"], json!(super::AUTO_UNARCHIVE_PROMPT_NOTICE));
     mgr.end_turn(&id).await;
@@ -3316,7 +3319,8 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
     let next = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&next)
             .unwrap()
@@ -3345,7 +3349,8 @@ async fn winning_try_begin_in_active_workspace_persists_no_notice() {
     assert!(messages.is_empty(), "no notice row on an active workspace");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3391,7 +3396,8 @@ async fn suppressed_reclaim_persists_no_notice() {
     );
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3424,7 +3430,8 @@ async fn auto_unarchive_prompt_flag_cleared_on_slot_release() {
     assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -3474,7 +3481,8 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
     assert!(mgr.try_begin(&id, &ws).await, "next claim wins");
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(&prompt)
             .unwrap()
@@ -4725,24 +4733,15 @@ fn seed_repo() -> TempRepo {
     TempRepo { dir, _guard: guard }
 }
 
-/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
-/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
-/// edited file, with the agent's stats and lazy blob SHAs.
-#[tokio::test]
-async fn agent_file_change_records_tracked_change_and_diff() {
-    use intent_acp::SinkEvent;
-    use intent_core::{
-        events::FILE_CHANGED, now_iso, ActorType, EventActor, Workspace, WorkspaceActivity,
-        WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
-
-    let repo = seed_repo();
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-
-    let ws_id = WorkspaceId::from("ws-ft");
+/// A local workspace row whose worktree is `worktree`, for the file-change
+/// sink tests.
+fn file_tracking_workspace(
+    ws_id: &intent_core::WorkspaceId,
+    worktree: &std::path::Path,
+) -> intent_core::Workspace {
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
-    let ws = Workspace {
+    Workspace {
         id: ws_id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
@@ -4762,7 +4761,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         repository_path: None,
         repository_owner: None,
         repository_name: None,
-        worktree_path: Some(repo.dir.display().to_string()),
+        worktree_path: Some(worktree.display().to_string()),
         scope: None,
         skip_worktree: false,
         setup_script: None,
@@ -4789,7 +4788,23 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         disk_usage: None,
         pending_delete_at: None,
         membership: None,
-    };
+    }
+}
+
+/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
+/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
+/// edited file, with the agent's stats and lazy blob SHAs.
+#[tokio::test]
+async fn agent_file_change_records_tracked_change_and_diff() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::from("ws-ft");
+    let ws = file_tracking_workspace(&ws_id, &repo.dir);
     store.insert_workspace(&ws).await.unwrap();
 
     let bus = EventBus::new(store.clone());
@@ -4839,6 +4854,49 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diffs[0].hunks_json.contains("CHANGED"),
         "extracted hunks carry the new line"
     );
+}
+
+/// Regression (intent-hq/intent#7266): an agent `file:changed` for an
+/// untracked git-ignored path records neither an attribution row nor a diff —
+/// it can never be committed, so the row would stay `unstaged` forever.
+#[tokio::test]
+async fn agent_file_change_to_git_ignored_path_records_nothing() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    std::fs::write(repo.dir.join(".gitignore"), ".dev/\n").unwrap();
+    std::fs::create_dir_all(repo.dir.join(".dev")).unwrap();
+    std::fs::write(repo.dir.join(".dev/scratch.json"), "{}\n").unwrap();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::from("ws-ft-ign");
+    store
+        .insert_workspace(&file_tracking_workspace(&ws_id, &repo.dir))
+        .await
+        .unwrap();
+
+    let sink = BusEventSink::new(EventBus::new(store.clone()));
+    sink.publish(SinkEvent {
+        workspace_id: ws_id.clone(),
+        event_type: FILE_CHANGED.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some("agent-1".to_string()),
+            name: Some("Agent".to_string()),
+            ..Default::default()
+        },
+        session_id: Some("agent-1".to_string()),
+        data: serde_json::json!({
+            "path": ".dev/scratch.json",
+            "relativePath": ".dev/scratch.json",
+            "action": "create",
+        }),
+    })
+    .await;
+
+    assert!(store.list_tracked_changes(&ws_id).await.unwrap().is_empty());
+    assert!(store.list_diffs(&ws_id).await.unwrap().is_empty());
 }
 
 const MGR_ACP_SID: &str = "mgr-acp-new";
@@ -5031,6 +5089,8 @@ fn track_mock_agent_inner(
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -5189,6 +5249,8 @@ fn track_mock_agent_prompt_rpc_error_inner(
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: spawned_provider.to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command(spawned_provider),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -5793,7 +5855,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             );
             let prompt = mgr
                 .build_turn_prompt(&id, &ws, "Current request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             let text = serde_json::to_value(prompt).unwrap()[0]["text"]
                 .as_str()
                 .unwrap()
@@ -5809,7 +5872,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
             );
             let next = mgr
                 .build_turn_prompt(&id, &ws, "Next request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 serde_json::to_value(next).unwrap()[0]["text"],
                 "Next request"
@@ -5839,7 +5903,8 @@ async fn antigravity_failed_setup_survives_restart_without_losing_first_turn_con
                 .any(|(method, _)| method == "session/new"));
             let resumed = mgr
                 .build_turn_prompt(&id, &ws, "Resumed request", &super::TurnOptions::default())
-                .await;
+                .await
+                .unwrap();
             assert_eq!(
                 serde_json::to_value(resumed).unwrap()[0]["text"],
                 "Resumed request"
@@ -5979,6 +6044,63 @@ async fn start_session_recreates_and_flags_when_load_unsupported() {
     // The recreate flag is set so the next turn resends history; take() clears it.
     assert!(mgr.take_recreated(&id), "recreate flags a history resend");
     assert!(!mgr.take_recreated(&id), "flag is cleared once taken");
+}
+
+#[tokio::test]
+async fn start_session_private_family_never_uses_ordinary_recreate() {
+    for (load_cap, forced, missing) in [
+        (true, false, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("private-resume"));
+        seed_agent(&mgr, &ws, &id).await;
+        mgr.services
+            .store
+            .set_acp_session_id(&ws, &id, "original-private")
+            .await
+            .unwrap();
+        // Disposable fixture enrollment only; production startup owns this write.
+        sqlx::query("INSERT INTO review_context_enrollment(agent_id,workspace_id,acp_session_id,owner_key,version) VALUES(?,?,?,?,1)")
+            .bind(id.as_str()).bind(ws.as_str()).bind("original-private")
+            .bind("1aa11111-1111-4111-8111-111111111111")
+            .execute(mgr.services.store.write_pool()).await.unwrap();
+        if missing {
+            sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                .bind(id.as_str())
+                .execute(mgr.services.store.write_pool())
+                .await
+                .unwrap();
+        }
+        if forced {
+            mgr.force_recreate.lock().unwrap().insert(id.clone());
+        }
+        let (peer, calls) = track_mock_agent_with_log(&mgr, &id, load_cap);
+        assert!(mgr
+            .start_session(&id, PathBuf::from("/tmp/ws"), &test_provider())
+            .await
+            .is_err());
+        assert_eq!(
+            mgr.services
+                .store
+                .get_agent_session(&id)
+                .await
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("original-private")
+        );
+        assert!(!mgr.take_recreated(&id));
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| method == "session/new" || method == "session/load"));
+        peer.abort();
+        let _ = peer.await;
+    }
 }
 
 /// The typed workspace-MCP bridge entry stashed on the handle (STAB-156):
@@ -6293,7 +6415,8 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "current message", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -6313,7 +6436,8 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
     // The flag is consumed: a follow-up turn sends only the message text.
     let plain = mgr
         .build_turn_prompt(&id, &ws, "next message", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let plain_text = serde_json::to_value(&plain).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -6322,6 +6446,16 @@ async fn build_turn_prompt_prepends_history_once_after_recreate() {
 }
 
 // --- Attachment blocks (image + file) ----------------------------------------
+
+/// Provider-reaching lifecycle tests need real image bytes, not text with an image MIME.
+fn tiny_png_base64() -> String {
+    use base64::Engine as _;
+
+    let image = image::RgbImage::from_pixel(2, 1, image::Rgb([23, 67, 91]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+}
 
 /// FE-supplied `imageBlocks` become ACP `image` content blocks appended after
 /// the text prompt (reference-parity `acp-provider.ts`), preserving `data`
@@ -6339,7 +6473,10 @@ async fn build_turn_prompt_appends_image_blocks_after_text() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 3, "text + 2 image blocks");
@@ -6370,7 +6507,10 @@ async fn build_turn_prompt_appends_file_blocks_after_text_and_images() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(arr.len(), 4, "text + 1 image + 2 file notices");
@@ -6418,7 +6558,10 @@ async fn build_turn_prompt_skips_malformed_attachments() {
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "hi", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hi", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     // text + 1 well-formed image + 1 well-formed file reference.
@@ -6455,7 +6598,8 @@ async fn build_turn_prompt_prepends_preempted_content_and_attachments_first() {
     };
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "urgent update", &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     assert_eq!(
@@ -6522,7 +6666,8 @@ async fn build_turn_prompt_skips_prepend_text_when_session_recreated() {
     };
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "urgent update", &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     let text = arr[0]["text"].as_str().unwrap();
@@ -6762,7 +6907,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
 
     let options = super::TurnOptions {
         prepend_content: Some("original ask".to_string()),
-        prepend_image_blocks: Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}])),
+        prepend_image_blocks: Some(json!([{"data": tiny_png_base64(), "mimeType": "image/png"}])),
         prepend_file_blocks: Some(json!([
             {"attachmentId": "att-orig", "data": "b3JpZw==", "mimeType": "text/plain", "fileName": "orig.txt"},
         ])),
@@ -6820,7 +6965,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     assert_eq!(queued.prepend_content.as_deref(), Some("original ask"));
     assert_eq!(
         queued.prepend_image_blocks,
-        Some(json!([{"data": "ORIG_IMG", "mimeType": "image/png"}]))
+        Some(json!([{"data": tiny_png_base64(), "mimeType": "image/png"}]))
     );
     assert_eq!(
         queued.prepend_file_blocks,
@@ -6895,7 +7040,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         "original text, image and file precede interrupt: {blocks:?}"
     );
     assert_eq!(blocks[original + 1]["type"], "image");
-    assert_eq!(blocks[original + 1]["data"], "ORIG_IMG");
+    assert_eq!(blocks[original + 1]["data"], tiny_png_base64());
     assert_eq!(blocks[original + 1]["mimeType"], "image/png");
     let file = blocks[original + 2]["text"]
         .as_str()
@@ -6918,7 +7063,7 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
     assert_eq!(
         blocks
             .iter()
-            .filter(|block| block["data"] == "ORIG_IMG")
+            .filter(|block| block["data"] == tiny_png_base64())
             .count(),
         1
     );
@@ -7316,6 +7461,7 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
 /// A system-origin queue entry for the combined-flush requeue tests.
 fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: format!("qm-413-{suffix}"),
@@ -7673,7 +7819,7 @@ async fn stop_redelivery_flush_413_retry(
             "user",
             &json!([
                 { "type": "text", "text": stopped_text },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -7853,7 +7999,7 @@ async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
         tail.prepend_image_blocks
             .as_ref()
             .and_then(Value::as_array)
-            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
+            .is_some_and(|b| b.iter().any(|b| b["data"] == json!(tiny_png_base64()))),
         "the redelivered image rides along: {:?}",
         tail.prepend_image_blocks
     );
@@ -8033,7 +8179,7 @@ async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
         "second own prepend\n\nstopped before output"
     );
     assert_eq!(first_prepends[2]["type"], "image");
-    assert_eq!(first_prepends[2]["data"], "aGVsbG8=");
+    assert_eq!(first_prepends[2]["data"], tiny_png_base64());
     assert_eq!(first_prepends[2]["mimeType"], "image/png");
     assert_eq!(
         prepend_section(&retry_content),
@@ -8623,7 +8769,8 @@ async fn build_turn_prompt_injects_naming_instruction_for_slug_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8666,7 +8813,8 @@ async fn build_turn_prompt_injects_naming_instruction_for_empty_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8700,7 +8848,8 @@ async fn build_turn_prompt_naming_instruction_uses_opencode_tool_name() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8750,7 +8899,8 @@ async fn build_turn_prompt_naming_instruction_ignores_model_string() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8788,7 +8938,8 @@ async fn build_turn_prompt_naming_instruction_generic_for_unknown_provider() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8825,7 +8976,8 @@ async fn build_turn_prompt_skips_naming_instruction_for_custom_title() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "hi", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -8860,7 +9012,8 @@ async fn build_turn_prompt_skips_naming_instruction_after_first_turn() {
 
     let prompt = mgr
         .build_turn_prompt(&id, &ws, "follow-up", &super::TurnOptions::default())
-        .await;
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -9099,6 +9252,8 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9194,7 +9349,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → `interrupt` would fall back to the kill path).
     mgr.services
@@ -10297,7 +10452,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
     mgr.services
         .store
@@ -10314,7 +10469,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
             "user",
             &json!([
                 { "type": "text", "text": "first with screenshot" },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -10387,7 +10542,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
     assert!(
         blocks
             .iter()
-            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+            .any(|b| b["type"] == json!("image") && b["data"] == json!(tiny_png_base64())),
         "follow-up prompt redelivers the stopped message's image attachment: {blocks:?}"
     );
 
@@ -10430,7 +10585,7 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-stop-progress")
@@ -10569,7 +10724,7 @@ async fn arm_redelivery_via_fallback_stop(mgr: &AgentManager, ws: &WorkspaceId, 
             "user",
             &json!([
                 { "type": "text", "text": "first with screenshot" },
-                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+                { "type": "image", "data": tiny_png_base64(), "mimeType": "image/png" },
             ]),
             &now_iso(),
         )
@@ -10631,9 +10786,13 @@ async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
     let armed = mgr2.stop_redelivery.lock().unwrap().get(&id).cloned();
     let armed = armed.expect("rehydrated payload lands in the in-memory map");
     assert_eq!(armed.content.as_deref(), Some("first with screenshot"));
+    // The transcript write stamps intrinsic dimensions onto real image blocks.
     assert_eq!(
         armed.image_blocks,
-        Some(json!([{ "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" }]))
+        Some(json!([{
+            "type": "image", "data": tiny_png_base64(), "mimeType": "image/png",
+            "width": 2, "height": 1,
+        }]))
     );
 
     // Follow-up send on the restarted manager: the prompt redelivers the
@@ -10689,7 +10848,7 @@ async fn stop_redelivery_survives_daemon_restart_and_redelivers_once() {
     assert!(
         blocks
             .iter()
-            .any(|b| b["type"] == json!("image") && b["data"] == json!("aGVsbG8=")),
+            .any(|b| b["type"] == json!("image") && b["data"] == json!(tiny_png_base64())),
         "restarted follow-up redelivers the stopped message's image attachment: {blocks:?}"
     );
 
@@ -11006,7 +11165,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → the preemption would be skipped).
     mgr.services
@@ -11205,7 +11364,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let sent = intent_core::with_caller(
         caller,
         mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
@@ -11377,7 +11536,7 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-zero")
@@ -11651,7 +11810,7 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // Keep the preemption on the keep-alive interrupt path (no session →
     // `interrupt` would fall back to the kill path).
     mgr.services
@@ -11803,7 +11962,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-dup")
@@ -13876,6 +14035,439 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     let _ = mock.await;
 }
 
+/// A completed turn published `agent:idle` and persisted its response, but
+/// its worker still holds the busy slot in the post-turn tail. A graceful
+/// shutdown in that window must not record the finished turn as interrupted:
+/// the next startup sweep would deliver a second automatic continuation.
+/// Reproduces the compaction-restart schedule with explicit barriers.
+#[tokio::test]
+async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-idle-shutdown");
+    let id = AgentId::from("idle-shutdown");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1,
+        "the completed turn's request is durable before shutdown"
+    );
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a settled turn must not be recorded for startup recovery"
+    );
+    // The aborted worker never ran `end_turn`; shutdown must persist the
+    // settled status, or the next startup heal treats it as a crashed turn.
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert!(!stored.is_active);
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// The later half of the same window: `end_turn` has released the slot but
+/// its `RuntimeIdle` write is blocked when shutdown aborts the worker. The
+/// agent is outside the shutdown snapshot, yet its persisted `Active` status
+/// would make the next startup heal record and resume the finished turn.
+#[tokio::test]
+async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-release-shutdown");
+    let id = AgentId::from("release-shutdown");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    // Take the only writer, so end_turn stops after its synchronous release.
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases the slot before awaiting the writer");
+    assert_eq!(
+        mgr.workers.lock().unwrap().len(),
+        1,
+        "worker is still registered while its idle write waits"
+    );
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while !mgr.workers.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown takes the aborted worker");
+    writer.rollback().await.unwrap();
+    timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown completes")
+        .unwrap();
+
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::RuntimeIdle,
+        "shutdown persists the settled turn's idle status"
+    );
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Control: input that became ready behind a settled turn is not delivered
+/// by the aborted worker. Rehydration never kicks a drain, so the agent must
+/// stay recoverable; startup recovery's continuation also drains the queue.
+#[tokio::test]
+async fn shutdown_settled_turn_with_ready_queue_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-ready-queue");
+    let id = AgentId::from("settled-ready-queue");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "ready behind the settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    assert!(mgr.services.has_ready_to_send(&id));
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "undelivered ready input must keep the agent recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Window 2 for every `end_turn` caller, not only prompt workers: a turn
+/// whose release completed but whose `RuntimeIdle` write was aborted must
+/// not look like a crash at the next startup.
+#[tokio::test]
+async fn shutdown_finishes_aborted_end_turn_idle_write() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-aborted-end-turn");
+    let id = AgentId::from("aborted-end-turn");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    let active = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(active.status, AgentStatus::Active);
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    let ending = {
+        let mgr = mgr.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.end_turn(&id).await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    ending.abort();
+    assert!(ending.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert_eq!(mgr.services.heal_stale_agent_sessions().await.unwrap(), 0);
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A pending idle write never overwrites a status written after it — a
+/// later stop, failure or delete owns the session row.
+#[tokio::test]
+async fn shutdown_pending_idle_write_preserves_later_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-pending-idle-later");
+    let id = AgentId::from("pending-idle-later");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    let worker = mgr.workers.lock().unwrap().remove(&id).expect("worker");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "shutdown must not overwrite a later status"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Start one real turn and park its worker after the terminal `agent:idle`,
+/// holding the busy slot at the post-turn drain barrier.
+async fn park_after_settled_turn(
+    mgr: &Arc<AgentManager>,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> (JoinHandle<()>, tokio::sync::oneshot::Sender<()>) {
+    use intent_core::events::AGENT_IDLE;
+
+    seed_agent(mgr, ws, id).await;
+    let mock = track_mock_agent(mgr, id, true);
+    mgr.start_session(id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_IDLE.into()],
+        batch_window: None,
+        ..Default::default()
+    });
+    let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false);
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("worker reached post-turn drain barrier")
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch
+                .iter()
+                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("completed turn published idle");
+    assert!(mgr.is_busy(id));
+    assert!(mgr.turn_settled(id), "terminal idle marks the held slot");
+    (mock, release)
+}
+
+/// Control: the settled mark covers only the finished turn. Once the same
+/// worker drains new input, a shutdown before that work completes must still
+/// leave the agent recoverable.
+#[tokio::test]
+async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-new-work");
+    let id = AgentId::from("settled-new-work");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "drained follow-up".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true, "held slot queues the follow-up");
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .expect("worker drains the follow-up into a new turn");
+    assert!(mgr.is_busy(&id));
+    assert!(!mgr.turn_settled(&id), "new work clears the settled mark");
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the draining worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "unfinished drained work must remain recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Control: the settled mark lives only while its holder owns the slot, and
+/// an unmarked claimed turn stays recoverable.
+#[tokio::test]
+async fn settled_mark_lives_only_with_the_held_slot() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-settled-slot");
+    let id = AgentId::from("settled-slot");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(mgr.turn_settled(&id));
+    mgr.release_in_flight_slot(&id);
+    assert!(!mgr.turn_settled(&id), "release retires the mark");
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(!mgr.turn_settled(&id), "only a slot holder can be marked");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.turn_settled(&id));
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "a claimed, unfinished turn must remain recoverable"
+    );
+}
+
+/// A pending idle write belongs to one `end_turn` call: a later claim
+/// supersedes it, and a stale call's completion never retires a newer entry.
+#[tokio::test]
+async fn pending_idle_write_is_owned_by_its_end_turn_call() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-idle-write-token");
+    let id = AgentId::from("idle-write-token");
+    seed_agent(&mgr, &ws, &id).await;
+    let pending = |mgr: &AgentManager| mgr.pending_idle_writes.lock().unwrap().get(&id).cloned();
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.end_turn(&id).await;
+    assert_eq!(pending(&mgr), None, "a completed write retires its entry");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    let (_, older) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let older = older.expect("recorded");
+    assert!(pending(&mgr).is_some());
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(
+        pending(&mgr),
+        None,
+        "a new claim supersedes the pending write"
+    );
+    let (_, newer) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let newer = newer.expect("recorded");
+    mgr.finish_idle_write(&id, older);
+    assert_eq!(
+        pending(&mgr),
+        Some((ws.clone(), newer)),
+        "a stale completion keeps the newer entry"
+    );
+    mgr.finish_idle_write(&id, newer);
+    assert_eq!(pending(&mgr), None);
+}
+
 #[tokio::test]
 async fn interrupt_returns_false_for_unknown_agent() {
     let (_tmp, mgr) = manager().await;
@@ -15418,6 +16010,7 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
     // requeue), second entry needs the row append — which fails NotFound
     // against the deleted session.
     let entry = |suffix: &str, persisted: bool| crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: format!("qm-2762-{suffix}"),
@@ -16433,9 +17026,33 @@ async fn pre_output_transport_failure_redrives_silently_once() {
 /// not re-emit).
 #[tokio::test]
 async fn auth_required_prompt_failure_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": 401, "message": "Unauthorized"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn claude_expired_oauth_prompt_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": -32603,
+        "message": "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "data": {"errorKind": "authentication_failed"},
+    }))
+    .await;
+}
+
+async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json::Value) {
+    struct ClearMockAuth;
+    impl Drop for ClearMockAuth {
+        fn drop(&mut self) {
+            crate::provider_auth::seed_auth_verdict_for_tests("mock", None);
+        }
+    }
+    let _cleanup = ClearMockAuth;
     let script = mock_agent_script();
     let behavior = json!({
-        "promptRpcError": { "code": 401, "message": "Unauthorized" },
+        "promptRpcError": rpc_error,
         "response": "unreached",
     })
     .to_string();
@@ -18010,7 +18627,7 @@ async fn validate_image_block_refs_enforces_aggregate_cap() {
 /// `resolve_image_block_refs` (monorepo#3338): a reference entry resolves to
 /// inline base64 bytes read from the attachment's workspace root (MIME from
 /// the block, else the registry row); inline entries pass through untouched;
-/// a reference whose file vanished is skipped fail-soft.
+/// unavailable or over-cap references fail the whole turn without changing originals.
 #[tokio::test]
 async fn resolve_image_block_refs_inlines_attachment_bytes() {
     use base64::Engine as _;
@@ -18089,11 +18706,11 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         })
         .await
         .unwrap();
-    // Registered row whose file was deleted out-of-band → skipped fail-soft.
+    // Registered row whose file was deleted out-of-band must fail closed.
     store
         .insert_attachment(&intent_store::AttachmentRecord {
             id: "att-gone".into(),
-            workspace_id: ws_id,
+            workspace_id: ws_id.clone(),
             file_name: "gone.png".into(),
             mime_type: None,
             size: 1,
@@ -18103,31 +18720,323 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         .await
         .unwrap();
 
-    let services = Services::new(store);
+    let services = Services::new(store.clone());
     let input = json!([
         { "type": "image", "attachmentId": "att-r" },
-        { "type": "image", "attachmentId": "att-gone" },
         { "type": "image", "data": "inline", "mimeType": "image/jpeg" },
     ]);
     let out = services
         .resolve_image_block_refs(Some(input))
         .await
+        .expect("resolve references")
         .expect("resolved array");
     let arr = out.as_array().expect("array");
-    assert_eq!(arr.len(), 2, "vanished reference skipped: {arr:?}");
+    assert_eq!(arr.len(), 2);
     let expected = base64::engine::general_purpose::STANDARD.encode(b"png-bytes");
     assert_eq!(arr[0]["data"], json!(expected));
     assert_eq!(arr[0]["mimeType"], json!("image/png"));
     assert!(arr[0].get("attachmentId").is_none());
     assert_eq!(arr[1]["data"], json!("inline"));
     assert_eq!(arr[1]["mimeType"], json!("image/jpeg"));
+    assert_eq!(std::fs::read(&full).unwrap(), b"png-bytes");
 
     // No references → input returned unchanged (no clone/rebuild).
     let inline_only = json!([{ "type": "image", "data": "x", "mimeType": "image/png" }]);
     let out = services
         .resolve_image_block_refs(Some(inline_only.clone()))
-        .await;
+        .await
+        .unwrap();
     assert_eq!(out, Some(inline_only));
+
+    for (id, reason) in [
+        ("att-missing", "cannot load attachment record"),
+        ("att-gone", "cannot access attachment file"),
+    ] {
+        let err = services
+            .resolve_image_block_refs(Some(json!([
+                { "type": "image", "attachmentId": "att-r" },
+                { "type": "image", "attachmentId": id },
+            ])))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("imageBlocks[1]") && text.contains(id),
+            "{text}"
+        );
+        assert!(text.contains(reason) && text.contains("Reattach"), "{text}");
+    }
+
+    for (id, path, reason) in [
+        ("att-escape", "../escape.png", "stored path is unsafe"),
+        ("att-directory", ".intent/attachments", "regular file"),
+    ] {
+        store
+            .insert_attachment(&intent_store::AttachmentRecord {
+                id: id.into(),
+                workspace_id: ws_id.clone(),
+                file_name: "pic.png".into(),
+                mime_type: Some("image/png".into()),
+                size: 1,
+                uploaded_at: now_iso(),
+                stored_path: path.into(),
+            })
+            .await
+            .unwrap();
+        let err = services
+            .resolve_image_block_refs(Some(json!([{ "attachmentId": id }])))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("imageBlocks[0]") && text.contains(id),
+            "{text}"
+        );
+        assert!(text.contains(reason), "{text}");
+    }
+
+    // The file grew after ingress validated the recorded size (still 9).
+    let cap = crate::agent_ops::IMAGE_REF_MAX_BYTES;
+    let file = std::fs::OpenOptions::new().write(true).open(&full).unwrap();
+    file.set_len(cap + 1).unwrap();
+    let err = services
+        .resolve_image_block_refs(Some(json!([{ "attachmentId": "att-r" }])))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("imageBlocks[0]") && text.contains("att-r"),
+        "{text}"
+    );
+    assert!(text.contains("byte cap"), "{text}");
+    assert_eq!(file.metadata().unwrap().len(), cap + 1);
+
+    file.set_len(cap / 2 + 1).unwrap();
+    let err = services
+        .resolve_image_block_refs(Some(json!([
+            { "attachmentId": "att-r" }, { "attachmentId": "att-r" },
+        ])))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("imageBlocks[1]") && text.contains("att-r"),
+        "{text}"
+    );
+    assert!(text.contains("aggregate cap"), "{text}");
+}
+
+/// An image lost after ingress must park the real worker in Error without
+/// delivering a partial prompt, losing retry attachments, or leaking its slot.
+#[tokio::test]
+async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() {
+    let (tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-img-failure"),
+        AgentId::from("a-img-failure"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", script.as_str())]);
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+    let (_agent, log) = track_mock_agent_with_log(&mgr, &id, false);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .align_with_mock_for_test();
+    mgr.services
+        .store
+        .set_acp_session_id(&ws, &id, "acp-img-failure")
+        .await
+        .unwrap();
+
+    let images = json!([{ "type": "image", "attachmentId": "att-lost-after-ingress" }]);
+    let files = json!([{ "type": "file", "attachmentId": "att-file", "fileName": "context.txt" }]);
+    let prepend_images = json!([{ "type": "image", "data": "b3JpZw==", "mimeType": "image/png" }]);
+    let metadata = json!({ "type": "image-reference-test" });
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.system_prompt = Some("Undelivered system instructions".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "Earlier conversation context" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    // Model the first prompt after session/new recreated a lost session.
+    mgr.recreated.lock().unwrap().insert(id.clone());
+    mgr.arm_first_turn_prepend(&id, intent_providers::find_provider("mock").unwrap());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The manager receives already-validated blocks from ingress. A missing
+    // row here models an attachment removed while the accepted turn waited.
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "inspect the image".into(),
+        Some("msg-img-failure".into()),
+        super::TurnOptions {
+            turn_id: Some("turn-img-failure".into()),
+            image_blocks: Some(images.clone()),
+            file_blocks: Some(files.clone()),
+            message_metadata: Some(metadata.clone()),
+            prepend_content: Some("earlier instruction".into()),
+            prepend_image_blocks: Some(prepend_images.clone()),
+            prepend_file_blocks: Some(files.clone()),
+            interrupt_priority: true,
+            ..super::TurnOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if !mgr.is_busy(&id) && !mgr.workers.lock().unwrap().contains_key(&id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failed worker releases its slot and exits");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, AgentStatus::Error);
+    assert!(!session.is_active);
+    let reason = session.stop_reason.unwrap();
+    assert!(reason.contains("att-lost-after-ingress"), "{reason}");
+    assert!(reason.contains("imageBlocks[0]"), "{reason}");
+    assert!(!mgr.active_delivery_groups.lock().unwrap().contains_key(&id));
+    assert!(log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(method, _)| method != "session/prompt"));
+
+    let queued = mgr.services.dequeue_message(&id).expect("retry payload");
+    assert!(
+        mgr.services.queue_snapshot(&id).is_empty(),
+        "requeued exactly once"
+    );
+    assert_eq!(queued.content, "inspect the image");
+    assert_eq!(queued.turn_id, "turn-img-failure");
+    assert_eq!(queued.image_blocks, Some(images.clone()));
+    assert_eq!(queued.file_blocks, Some(files.clone()));
+    // Retry correlation retains the submitted id and adds the retry queue id.
+    let mut expected_metadata = metadata;
+    expected_metadata["submissionIds"] = json!(["msg-img-failure", queued.id]);
+    assert_eq!(queued.message_metadata, Some(expected_metadata));
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some("earlier instruction")
+    );
+    assert_eq!(queued.prepend_image_blocks, Some(prepend_images));
+    assert_eq!(queued.prepend_file_blocks, Some(files));
+    assert!(queued.interrupt_priority && queued.persisted && queued.requeued_after_failure);
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    let users: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+    assert_eq!(
+        users.len(),
+        2,
+        "history and original user row retained exactly once"
+    );
+    assert_eq!(
+        users[1].content[1], images[0],
+        "transcript retains reference"
+    );
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+        events.extend(batch);
+    }
+    for kind in ["agent:failed", "agent:stream:end"] {
+        let terminal: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == kind)
+            .collect();
+        assert_eq!(terminal.len(), 1, "one {kind} event");
+        assert_eq!(terminal[0].data["turnId"], json!("turn-img-failure"));
+    }
+
+    // A successful session/load does not re-arm first-turn context. It must
+    // still arrive on the next delivered prompt because the failed one never
+    // reached the provider. The broken retry payload was dequeued above.
+    let (_resumed_agent, resumed_log) = track_mock_agent_with_log(&mgr, &id, true);
+    mgr.handles
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .align_with_mock_for_test();
+    mgr.start_session(
+        &id,
+        tmp.path.parent().unwrap().to_path_buf(),
+        intent_providers::find_provider("mock").unwrap(),
+    )
+    .await
+    .unwrap();
+    for (text, expects_context) in [("valid follow-up", true), ("later turn", false)] {
+        mgr.send_message(
+            id.clone(),
+            ws.clone(),
+            text.into(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(10), async {
+            while mgr.is_busy(&id) || mgr.workers.lock().unwrap().contains_key(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follow-up worker settles");
+        let calls = resumed_log.lock().unwrap();
+        assert!(calls.iter().any(|(method, _)| method == "session/load"));
+        let prompt = calls
+            .iter()
+            .rev()
+            .find(|(method, _)| method == "session/prompt")
+            .expect("follow-up reaches provider");
+        let delivered = prompt.1["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>();
+        assert!(delivered.contains(text), "current user message delivered");
+        assert_eq!(
+            delivered.contains("Undelivered system instructions"),
+            expects_context,
+            "system context delivered exactly once after pre-delivery failure"
+        );
+        assert_eq!(
+            delivered.contains("Earlier conversation context"),
+            expects_context,
+            "recreated history delivered exactly once after pre-delivery failure"
+        );
+    }
+    mgr.stop(&id).await;
 }
 
 /// Prompt rendering (PROTOCOL §5.5): an attachment-reference file block
@@ -18554,7 +19463,10 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "do it", &options)
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -18575,7 +19487,10 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
         ])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "do it", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "do it", &options)
+        .await
+        .unwrap();
     let text = serde_json::to_value(&prompt).unwrap()[0]["text"]
         .as_str()
         .unwrap()
@@ -18645,7 +19560,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         note_ids: Some(json!([note_id.to_string()])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
     // Expect: original text prompt, image block, system notice.
@@ -18673,7 +19591,10 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         note_ids: Some(json!([stray_id.to_string()])),
         ..super::TurnOptions::default()
     };
-    let prompt = mgr.build_turn_prompt(&id, &ws, "look", &options).await;
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
     let arr_json = serde_json::to_value(&prompt).unwrap();
     let arr = arr_json.as_array().unwrap();
     assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
@@ -19159,6 +20080,7 @@ mod stale_redrive_tests {
 
     fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-stale-test".to_string(),
@@ -19619,6 +20541,7 @@ mod dequeue_wait_tests {
 
     pub(super) fn queued_msg(content: &str, queued_at: &str, persisted: bool) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-wait-test".to_string(),
@@ -21058,6 +21981,8 @@ mod harness_wake_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -22519,6 +23444,7 @@ mod model_change_notice_tests {
     fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
         ResolvedSpawn {
             provider: *intent_providers::provider_config(provider_id),
+            selection: crate::provider_profiles::canonical_selection(provider_id),
             model: model.map(str::to_string),
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
@@ -24216,6 +25142,7 @@ mod flush_queued_messages_tests {
 
     fn queued_msg(content: &str) -> QueuedMessage {
         QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: "qm-flush-test".to_string(),
@@ -27236,7 +28163,10 @@ async fn flush_prompt_keeps_prepend_and_entry_attachment_groups_on_recreate() {
         if recreated {
             mgr.recreated.lock().unwrap().insert(id.clone());
         }
-        let prompt = mgr.build_turn_prompt(&id, &ws, &content, &options).await;
+        let prompt = mgr
+            .build_turn_prompt(&id, &ws, &content, &options)
+            .await
+            .unwrap();
         let wire = serde_json::to_value(prompt).unwrap();
         let blocks = wire.as_array().unwrap();
         let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
@@ -27361,7 +28291,8 @@ async fn grouped_retry_keeps_legacy_prepend_and_cleans_up_on_stop() {
     let options = super::turn_options_for_entry(&entry, false);
     let prompt = mgr
         .build_turn_prompt(&id, &ws, &entry.content, &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(prompt).unwrap();
     let blocks = wire.as_array().unwrap();
     let earlier = blocks
@@ -27452,7 +28383,8 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
     );
     let prompt = mgr
         .build_turn_prompt(&id, &ws, &retry.content, &options)
-        .await;
+        .await
+        .unwrap();
     let wire = serde_json::to_value(prompt).unwrap();
     let blocks = wire.as_array().unwrap();
     for (text, data) in [
@@ -27468,5 +28400,412 @@ async fn grouped_retry_normalizes_mirrors_and_successive_carry_over() {
             1
         );
         assert_eq!(blocks.iter().filter(|b| b["data"] == data).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn qualified_monitor_recreated_replay_withholds_private_envelope() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-monitor-replay"),
+        AgentId::from("a-monitor-replay"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    for (text, metadata) in [
+        ("ordinary request", None),
+        (
+            "private monitor update",
+            Some(json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}})),
+        ),
+        (
+            "GitHub monitor update",
+            Some(json!({"type":"pr_monitor_wake","prNumber":4})),
+        ),
+        ("current request", None),
+    ] {
+        mgr.services
+            .store
+            .append_agent_message_with_metadata(
+                &id,
+                "user",
+                &json!([{"type":"text","text":text}]),
+                metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+    mgr.recreated.lock().unwrap().insert(id.clone());
+    let body = mgr.build_turn_body(&id, "current request", None).await;
+    assert!(!body.contains("private monitor update"), "{body}");
+    assert!(body.contains("ordinary request"));
+    assert!(body.contains("GitHub monitor update"));
+    assert_eq!(body.matches("current request").count(), 1);
+}
+
+#[test]
+fn qualified_monitor_redelivery_withholds_private_envelope() {
+    for embedded in [false, true] {
+        let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}});
+        let mut message = intent_core::AgentMessage {
+            id: "private-wake".into(),
+            agent_id: AgentId::from("monitor-agent"),
+            seq: 0,
+            role: "user".into(),
+            content: json!([{"type":"text","text":"private monitor update"}]),
+            metadata: None,
+            app_message_id: None,
+            author: None,
+            created_at: now_iso(),
+        };
+        if embedded {
+            message.content[0]["messageMetadata"] = metadata;
+        } else {
+            message.metadata = Some(metadata);
+        }
+        assert!(super::redelivery_prepend(&[message.clone()], None, None).is_none());
+        message.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
+        message.content = json!([{"type":"text","text":"GitHub monitor update"}]);
+        assert!(super::redelivery_prepend(&[message], None, None).is_some());
+    }
+}
+
+/// Turn-start routing for named provider profiles (PROTOCOL §5.54): a profile
+/// runs on its base installation under its own selection identity, a switch
+/// between profiles (or a profile and Default) never reuses the other's
+/// process or native session, and a missing profile or disabled base needs an
+/// explicit replacement instead of the disabled-provider re-home.
+mod profile_routing_tests {
+    use super::*;
+
+    /// Seed `id` in its own workspace (`seed_agent` inserts the workspace).
+    async fn session_on(mgr: &AgentManager, id: &AgentId, provider: &str) -> WorkspaceId {
+        let ws = WorkspaceId::from(format!("ws-{}", id.0).as_str());
+        let ws = &ws;
+        seed_agent(mgr, ws, id).await;
+        mgr.services
+            .store
+            .set_agent_session_model(ws, id, "same-model", Some(provider), &now_iso())
+            .await
+            .unwrap();
+        ws.clone()
+    }
+
+    fn replacement_reason(err: &Error) -> String {
+        let Error::ProviderProfile(failure) = err else {
+            panic!("expected provider-profile-replacement-required, got {err:?}");
+        };
+        assert_eq!(
+            failure.data["code"], "provider-profile-replacement-required",
+            "{err:?}"
+        );
+        failure.data["reason"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_profile_runs_on_its_base_installation_under_its_own_selection() {
+        let (_tmp, mgr) = manager().await;
+        // Codex and Claude Code are npx-only; the test marker keeps this pure
+        // resolution independent of the host's Node/npx.
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        for base in ["codex", "claude-code"] {
+            settings.providers.paths.insert(
+                base.to_string(),
+                crate::agent_ops::TEST_RUNNABLE_PATH.to_string(),
+            );
+        }
+        for (provider, base) in [
+            ("codex@pwork", "codex"),
+            ("claude-code@pwork", "claude-code"),
+            ("codex", "codex"),
+        ] {
+            let id = AgentId::from(format!("a-pr1-{base}-{}", provider.len()).as_str());
+            session_on(&mgr, &id, provider).await;
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+            assert_eq!(resolved.provider.id, base, "{provider}");
+            assert_eq!(resolved.selection, provider, "{provider}");
+            assert_eq!(resolved.model.as_deref(), Some("same-model"));
+        }
+    }
+
+    #[test]
+    fn a_profile_switch_never_reuses_the_live_process() {
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        for base in ["codex", "claude-code"] {
+            let command = intent_providers::provider_config(base).command;
+            let live = |selection: &str, target: &str| {
+                super::super::spawn_identity_changed(
+                    Some("same-model"),
+                    command,
+                    selection,
+                    &resolved(target),
+                )
+            };
+            let (work, personal) = (format!("{base}@pwork"), format!("{base}@ppersonal"));
+            assert!(!live(base, base), "{base}");
+            assert!(!live(&work, &work), "{base}");
+            assert!(live(base, &work), "{base}: Default → Work");
+            assert!(live(&work, base), "{base}: Work → Default");
+            assert!(live(&work, &personal), "{base}: Work → Personal");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_switch_commits_the_reference_as_the_native_session_owner() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-pr2"), AgentId::from("a-pr2"));
+        seed_agent(&mgr, &ws, &id).await;
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex"))
+            .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex@pwork"))
+            .await;
+        let (_, owner) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some("codex@pwork"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "same model, new profile is a switch");
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["fromProvider"], "codex");
+        assert_eq!(md["toProvider"], "codex@pwork");
+    }
+
+    /// The notice text names a profile by its saved name, never by its
+    /// internal reference; a profile that no longer exists reads as removed.
+    /// The metadata keeps the references for routing.
+    #[intent_test_macros::daemon_test]
+    async fn a_profile_switch_notice_text_uses_readable_profile_labels() {
+        let root = crate::test_support::test_tempdir("profile-switch-notice-");
+        let store = Store::open(&root.path().join("a.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+        let (ws, id) = (WorkspaceId::from("ws-pr3"), AgentId::from("a-pr3"));
+        seed_agent(&mgr, &ws, &id).await;
+        let work = services
+            .provider_profiles_create_impl(
+                json!({ "baseProviderId": "claude-code", "name": "Work" }),
+            )
+            .await
+            .unwrap()["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("opus".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        for selection in ["claude-code", work.as_str(), "claude-code@pgone"] {
+            mgr.maybe_persist_model_change_notice(&id, &ws, &resolved(selection))
+                .await;
+        }
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        let texts: Vec<String> = messages
+            .iter()
+            .map(|m| m.content[0]["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Model changed from claude-code:opus to claude-code (Work):opus.".to_string(),
+                "Model changed from claude-code (Work):opus to claude-code (removed profile):opus."
+                    .to_string(),
+            ]
+        );
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["toProvider"], work);
+        assert_eq!(
+            messages[1].metadata.as_ref().unwrap()["toProvider"],
+            "claude-code@pgone"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn missing_or_disabled_profiles_require_replacement_instead_of_rehoming() {
+        let (_tmp, mgr) = manager().await;
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.model.default_provider = Some("auggie".into());
+
+        let gone = AgentId::from("a-pr3-gone");
+        let ws = session_on(&mgr, &gone, "codex@pgone").await;
+        let session = mgr.services.store.get_agent_session(&gone).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&gone, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "profile-missing");
+
+        let created = mgr
+            .services
+            .provider_profiles_create_impl(json!({ "baseProviderId": "codex", "name": "Work" }))
+            .await
+            .unwrap();
+        let reference = created["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let work = AgentId::from("a-pr3-work");
+        let ws = session_on(&mgr, &work, &reference).await;
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let (kept, rehomed) = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap();
+        assert!(!rehomed);
+        assert_eq!(kept.provider.as_deref(), Some(reference.as_str()));
+
+        settings.providers.enabled = Some(std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            false,
+        )]));
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "provider-disabled");
+        let after = mgr.services.store.get_agent_session(&work).await.unwrap();
+        assert_eq!(
+            after.provider.as_deref(),
+            Some(reference.as_str()),
+            "never moved to the app default"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&work, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no provider_rehomed notice");
+    }
+    /// The real spawn path registers a profile child with the settings it
+    /// read, an edit marks it as running on earlier settings without
+    /// touching it, and tearing the child down (idle reap / crash cleanup /
+    /// respawn all drop the handle) unregisters it.
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn a_spawned_profile_child_is_tracked_until_teardown() {
+        use std::os::unix::fs::PermissionsExt;
+        for base in ["codex", "claude-code"] {
+            let root = crate::test_support::test_tempdir("profile-activation-spawn-");
+            let store = Store::open(&root.path().join("a.db")).await.unwrap();
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store)
+                .with_event_bus(bus.clone())
+                .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+            let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+            let ws = WorkspaceId::from("ws-activation");
+            let id = AgentId::from("a-activation");
+            seed_agent(&mgr, &ws, &id).await;
+            let created = services
+                .provider_profiles_create_impl(json!({
+                    "baseProviderId": base, "name": "Work",
+                    "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "one" }],
+                }))
+                .await
+                .unwrap();
+            let (profile_id, reference) = (
+                created["profile"]["id"].as_str().unwrap().to_string(),
+                created["profile"]["providerRef"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let profile = services
+                .resolve_profile_env(&reference)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // A stand-in adapter that just stays alive until killed.
+            let adapter = root.path().join("adapter");
+            std::fs::write(&adapter, "#!/bin/sh\nread -r request\nsleep 60\n").unwrap();
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut provider = *intent_providers::find_provider("pi").unwrap();
+            provider.mcp_via_pi_extension = false;
+            let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+            opts.npx_fallback_binary = Some(&adapter);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.profile_env = Some(&profile);
+            mgr.create_agent(
+                id.clone(),
+                ws.clone(),
+                "Work",
+                "implementor",
+                root.path().to_owned(),
+                &opts,
+            )
+            .await
+            .unwrap();
+            let activation = services.profile_activation();
+            assert_eq!(
+                activation.live_fingerprint(&id, &reference).as_deref(),
+                Some(profile.fingerprint()),
+                "{base}"
+            );
+
+            services
+                .provider_profiles_update_impl(
+                    profile_id.clone(),
+                    json!({ "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "two" }] }),
+                )
+                .await
+                .unwrap();
+            assert!(mgr.handle_is_live(&id), "{base}: Save restarts nothing");
+            assert!(activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 1);
+
+            mgr.kill_child_only(&id).await;
+            assert!(!activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 0, "{base}");
+            assert_eq!(activation.live_fingerprint(&id, &reference), None);
+        }
     }
 }

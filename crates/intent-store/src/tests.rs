@@ -25,8 +25,13 @@ mod sharing;
 mod workspace_delete;
 
 mod metadata_key_json;
+mod note_annotations;
+mod note_index_profile;
 mod note_line_attribution;
+mod note_pages;
 mod note_search;
+mod pull_request_workspace;
+mod write_acquire_retry;
 
 #[tokio::test]
 async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {
@@ -7298,6 +7303,11 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
+        task_event_baselines: std::sync::Arc::default(),
+        task_events_enabled: std::sync::Arc::default(),
+        note_pages: std::sync::Arc::default(),
+        note_index_jobs: std::sync::Arc::default(),
+        note_index_owner: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -11033,7 +11043,7 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         "SELECT record_json FROM node_lease WHERE id='upgrade-lease'",
         "SELECT record_json FROM node_assignment WHERE agent_id='upgrade-agent'",
         "SELECT json_array(purpose,latest_run_id,latest_run_result,command) FROM script WHERE id='upgrade-script'",
-        "SELECT json_array(state,row_json,run_id,wake_state) FROM script_monitor WHERE id='upgrade-monitor'",
+        "SELECT json_array(state,row_json,run_id) FROM script_monitor WHERE id='upgrade-monitor'",
         "SELECT json_array(title,branch,repository_path,repository_owner,repository_name,created_at,updated_at) FROM workspace WHERE id='upgrade-workspace'",
         "SELECT json_array(repo_owner,repo_name,pr_number,state,created_at,updated_at) FROM pr_monitor WHERE monitor_id='upgrade-pr'",
         "SELECT json_array(principal_id,revoked_at,created_at) FROM principal_credential WHERE token_hash='upgrade-credential'",

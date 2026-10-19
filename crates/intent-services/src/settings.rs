@@ -438,6 +438,13 @@ impl AsyncSecretStore {
         wrapper
     }
 
+    pub(crate) fn paired_gitlab_source(&self) -> Result<intent_core::FileSecretStore> {
+        self.paired_gitlab
+            .as_ref()
+            .map(intent_core::FileSecretStore::with_path)
+            .ok_or_else(|| Error::Internal("original paired GitLab source unavailable".into()))
+    }
+
     pub(crate) fn is_paired_gitlab_store(&self, store: &intent_core::FileSecretStore) -> bool {
         self.paired_gitlab.as_deref() == Some(store.path())
     }
@@ -3319,6 +3326,33 @@ impl<'a> SettingsService<'a> {
             "value": value,
             "definition": def.definition_json(),
         });
+        if let Some(origin) = self.origin_for(def.path) {
+            out["origin"] = json!(origin);
+        }
+        Ok(out)
+    }
+
+    /// Completion must distinguish confirmed absence from a failed read. Public
+    /// display getters keep their separate best-effort behavior.
+    pub(crate) async fn completion_value(&self, path: &str) -> Result<Value> {
+        let def = find_definition(path)
+            .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
+        let value = if def.sensitive {
+            match self.secrets().load_fresh(def.path).await? {
+                Some(_) => json!(REDACTED_PLACEHOLDER),
+                None => Value::Null,
+            }
+        } else if let Some(registry) = self.registry_for(def.path) {
+            wire_value(&def, registry.get(def.path).unwrap_or(Value::Null))
+        } else {
+            match self.store.get_setting(def.path).await? {
+                Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                    Error::Internal("stored setting cannot be projected for completion".into())
+                })?,
+                None => def.default_value.clone().unwrap_or(Value::Null),
+            }
+        };
+        let mut out = json!({"path": def.path, "value": value});
         if let Some(origin) = self.origin_for(def.path) {
             out["origin"] = json!(origin);
         }
@@ -9886,5 +9920,146 @@ mod port_assignment_publication_tests {
         let mut next = Box::pin(sub.recv());
         assert!(poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
         assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod completion_read_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    struct FailedBatch {
+        original: Arc<dyn SecretStore>,
+        compensation: bool,
+        failures: Arc<AtomicU8>,
+    }
+    impl SecretStore for FailedBatch {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.original.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            if account == "linear.token" && value == "failed-batch-write" {
+                self.failures.fetch_or(1, Ordering::SeqCst);
+                return Err(Error::Internal(
+                    "injected original batch persistence failure".into(),
+                ));
+            }
+            if self.compensation
+                && account == "sourceControl.gitlab.token"
+                && value == "pat-original"
+                && self.failures.load(Ordering::SeqCst) != 0
+            {
+                self.failures.fetch_or(2, Ordering::SeqCst);
+                return Err(Error::Internal(
+                    "injected credential compensation failure".into(),
+                ));
+            }
+            self.original.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.original.delete(account)
+        }
+    }
+    pub(crate) fn failed_batch(
+        original: &AsyncSecretStore,
+        compensation: bool,
+    ) -> (AsyncSecretStore, Arc<AtomicU8>) {
+        let mut store = original.clone();
+        let failures = Arc::new(AtomicU8::new(0));
+        store.inner = Arc::new(FailedBatch {
+            original: original.inner.clone(),
+            compensation,
+            failures: failures.clone(),
+        });
+        (store, failures)
+    }
+
+    struct ControlledRead {
+        original: Arc<dyn SecretStore>,
+        failure: Arc<AtomicU8>,
+    }
+    impl SecretStore for ControlledRead {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            if account == "linear.token" {
+                match self.failure.load(Ordering::SeqCst) {
+                    1 => return Err(Error::Internal("completion backing read failed".into())),
+                    2 => std::thread::sleep(Duration::from_millis(200)),
+                    _ => {}
+                }
+            }
+            self.original.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.original.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.original.delete(account)
+        }
+    }
+    pub(crate) fn controlled(original: &AsyncSecretStore) -> (AsyncSecretStore, Arc<AtomicU8>) {
+        let failure = Arc::new(AtomicU8::new(0));
+        let mut store = original.clone();
+        store.inner = Arc::new(ControlledRead {
+            original: original.inner.clone(),
+            failure: failure.clone(),
+        });
+        store.load_timeout = Duration::from_millis(40);
+        store.cache_ttl = Duration::ZERO;
+        (store, failure)
+    }
+    #[intent_test_macros::daemon_test]
+    async fn completion_value_sqlite_failure_is_not_a_default() {
+        let dir = crate::test_support::test_tempdir("completion-read-sqlite");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        store.set_setting("git.autoCommit", "false").await.unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, None);
+        assert_eq!(
+            service.completion_value("git.autoCommit").await.unwrap()["value"],
+            false
+        );
+        store.read_pool().close().await;
+        assert!(
+            service.completion_value("git.autoCommit").await.is_err(),
+            "SQLite failure became a completion default"
+        );
+        // The public display getter remains intentionally best-effort.
+        assert_eq!(service.get("git.autoCommit").await.unwrap()["value"], true);
+        let raw: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'git.autoCommit'")
+                .fetch_one(store.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(raw, "false");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn completion_value_redaction_absence_and_public_display_compatibility() {
+        let dir = crate::test_support::test_tempdir("completion-read-redaction");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let raw = InMemorySecretStore::default();
+        raw.store("linear.token", "private-token").unwrap();
+        let (secrets, failure) = controlled(&AsyncSecretStore::new(Arc::new(raw.clone())));
+        let service = SettingsService::new(&store, &secrets, None);
+        assert_eq!(
+            service.completion_value("linear.token").await.unwrap(),
+            json!({"path":"linear.token", "value":REDACTED_PLACEHOLDER})
+        );
+        failure.store(1, Ordering::SeqCst);
+        assert!(service.completion_value("linear.token").await.is_err());
+        assert_eq!(
+            service.get("linear.token").await.unwrap()["value"],
+            Value::Null
+        );
+        assert_eq!(
+            raw.load("linear.token").unwrap().as_deref(),
+            Some("private-token")
+        );
+        failure.store(0, Ordering::SeqCst);
+        raw.delete("linear.token").unwrap();
+        assert_eq!(
+            service.completion_value("linear.token").await.unwrap(),
+            json!({"path":"linear.token", "value":Value::Null})
+        );
     }
 }

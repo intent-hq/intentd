@@ -1524,9 +1524,17 @@ pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
+        let id = id.trim();
+        // A profile reference is kept verbatim, even when it is malformed or
+        // its profile is gone: the selection gate then fails it with
+        // `provider-profile-replacement-required` instead of reading it as
+        // unset or running the base's Default account (PROTOCOL §5.54).
+        if crate::provider_profiles::is_qualified_ref(id) {
+            return Some(id.to_string());
+        }
         // Accept the candidate only when it names a registered provider
         // (whitespace-trimmed, so padded settings values still resolve).
-        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
     })
 }
 
@@ -1556,6 +1564,19 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// [`resolve_provider_id`] reduced to the base provider id: a named profile
+/// reference (`<base>@<profileId>`, PROTOCOL §5.54) runs its base provider's
+/// adapter, so provider-keyed protocol shaping (session `_meta`, usage
+/// semantics, orchestrator tooling) keys on the base. Selection identity and
+/// native-session ownership keep the full reference.
+pub(crate) fn resolve_base_provider_id(
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> Option<String> {
+    resolve_provider_id(provider, configured_default)
+        .map(|id| intent_providers::base_provider_id(&id).to_owned())
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -1658,6 +1679,32 @@ fn is_acp_auth_required(e: &AcpError) -> bool {
     }
 }
 
+/// Providers own the complete HTTP body, including retained image history.
+/// New-image preparation cannot bound that history, so surface a recovery path
+/// for upstream size failures without changing the terminal/requeue semantics.
+fn prompt_size_error(e: &AcpError) -> Option<Error> {
+    let AcpError::Rpc(rpc) = e else {
+        return None;
+    };
+    let rendered = rpc.to_string();
+    let lower = rendered.to_ascii_lowercase();
+    let too_large = rpc.code == 413
+        || crate::is_context_size_error(&rendered)
+        || lower.contains("augmenttoolarge")
+        || lower.contains("413 payload too large")
+        || lower.contains("413 content too large");
+    too_large.then(|| {
+        Error::Internal(
+            "session/prompt failed: HTTP 413 Request Entity Too Large. The provider rejected \
+             the total request size, which can include images from earlier turns. \
+             Send fewer images or crop them to the relevant detail. If the conversation \
+             already contains large images, start a new agent conversation with only the \
+             images it needs. Original attachments are unchanged."
+                .to_string(),
+        )
+    })
+}
+
 /// Map an ACP session-setup/prompt failure to the surfaced [`Error`]. An
 /// auth-required failure becomes the same actionable
 /// [`Error::InvalidParams`] login message as the create/delegate gate
@@ -1668,9 +1715,61 @@ fn is_acp_auth_required(e: &AcpError) -> bool {
 /// turn. Everything else keeps the existing opaque
 /// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
 /// method name, e.g. `session/new`).
+#[cfg(test)]
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    map_acp_session_error_for(context, e, &AuthOwner::bare(provider_id))
+}
+
+/// Whose auth verdict a runtime failure belongs to (PROTOCOL §5.54): the
+/// session's selection — a bare provider id, or a named profile reference
+/// with the saved settings it runs under. A profile failure demotes only that
+/// profile's verdict, never the base provider's Default verdict or another
+/// profile's.
+pub(crate) struct AuthOwner {
+    selection: String,
+    profile: Option<intent_acp::ProfileEnv>,
+}
+
+impl AuthOwner {
+    #[cfg(test)]
+    fn bare(provider_id: &str) -> Self {
+        Self {
+            selection: provider_id.to_owned(),
+            profile: None,
+        }
+    }
+
+    fn demote(&self) {
+        match &self.profile {
+            Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+            None => crate::provider_auth::demote_auth_verdict(&self.selection),
+        }
+    }
+}
+
+impl Services {
+    /// The [`AuthOwner`] of a resolved selection. A profile whose saved
+    /// settings cannot be read demotes nothing (and never the Default).
+    pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
+        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
+            Box::pin(self.resolve_profile_env(selection))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        AuthOwner {
+            selection: selection.to_owned(),
+            profile,
+        }
+    }
+}
+
+fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> Error {
+    let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
-        crate::provider_auth::demote_auth_verdict(provider_id);
+        owner.demote();
         return crate::host_execution::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
@@ -1893,6 +1992,7 @@ fn build_session_meta(
 pub(crate) struct LocalPromptInput<'a> {
     pub(crate) connection: &'a Connection,
     pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    pub(crate) required: Option<Box<crate::repository_read_source::MonitorPromptAdmission>>,
 }
 
 impl Services {
@@ -2782,6 +2882,31 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_review_context(
+            conn,
+            callbacks,
+            agent_id,
+            cwd,
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_acp_session_with_review_context(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        native: Option<
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        >,
+    ) -> Result<PreparedAcpSession> {
+        let context = native.map(
+            crate::repository_admission::lifecycle::native_allocation::NativeAllocation::context,
+        );
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2793,20 +2918,32 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
+        let selection = resolve_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        // Protocol shaping keys on the base; auth failures belong to the
+        // selection (a profile never demotes the Default verdict).
+        let provider_id = intent_providers::base_provider_id(&selection).to_owned();
+        let owner = self.auth_owner(&selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
             is_orchestrator,
         );
+        if let Some(context) = context {
+            if !callbacks.is_some_and(CallbackClient::supports_review_monitoring) {
+                return Err(Error::Unsupported(
+                    "Private native startup unavailable".into(),
+                ));
+            }
+            context.insert_into(meta.get_or_insert_with(Default::default));
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2827,7 +2964,48 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/new", &e, &owner))?;
+        if let Some(native) = native {
+            native
+                .bind_response(&opened.response.session_id.0)
+                .map_err(|_| Error::Forbidden("Private native startup unavailable".into()))?;
+        }
+        if let Some(context) = context {
+            let exact = opened
+                .query
+                .as_ref()
+                .and_then(
+                    intent_acp::callback_registration::CallbackQuery::pending_review_monitoring,
+                )
+                .is_some_and(|pending| pending.matches_context(context));
+            if !exact {
+                // A response is not permission to persist or use a mismatched
+                // allocation. Join only the original requested startup attempt.
+                if let Some(callbacks) = callbacks {
+                    callbacks
+                        .retire_review_context(&opened.response.session_id.0, context)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("Private native retirement unconfirmed".into())
+                        })?;
+                }
+                return Err(if native.is_some_and(crate::repository_admission::lifecycle::native_allocation::NativeAllocation::is_retired) {
+                    Error::Forbidden("Private native startup unavailable".into())
+                } else {
+                    Error::Unsupported("Private native startup unavailable".into())
+                });
+            }
+        }
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                opened.response.session_id.0.as_ref(),
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
+        }
         Ok(PreparedAcpSession {
             response: opened.response,
             query: opened.query,
@@ -2940,6 +3118,20 @@ impl Services {
         replacing: bool,
     ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
         let (conn, callbacks) = conn;
+        if let Some(callbacks) =
+            callbacks.filter(|callbacks| callbacks.supports_review_monitoring())
+        {
+            return self
+                .create_owned_review_session(
+                    callbacks.clone(),
+                    agent_id.clone(),
+                    cwd.into(),
+                    mcp_servers,
+                    creation,
+                    replacing,
+                )
+                .await;
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -2961,6 +3153,24 @@ impl Services {
         })
     }
 
+    /// Record the profile settings a just-opened native session belongs to
+    /// (no-op for a bare selection).
+    async fn bind_profile_native_session(&self, stored: &AgentSession) {
+        let Some(selection) = resolve_provider_id(
+            stored.provider.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
+        ) else {
+            return;
+        };
+        if let Some(fingerprint) = self
+            .profile_process_fingerprint(&stored.id, &selection)
+            .await
+        {
+            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                .await;
+        }
+    }
+
     async fn finish_created_acp_session(
         &self,
         prepared: PreparedAcpSession,
@@ -2978,6 +3188,7 @@ impl Services {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3037,6 +3248,34 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
+        let stored = self.store.get_agent_session(agent_id).await?;
+        if let Some(session_id) = &stored.acp_session_id {
+            if self
+                .store
+                .get_review_context_enrollment(&stored.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+            {
+                let callbacks = callbacks
+                    .filter(|client| client.supports_review_monitoring())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "Private native history requires original admission".into(),
+                        )
+                    })?;
+                return self
+                    .load_owned_review_session(
+                        callbacks.clone(),
+                        init.clone(),
+                        agent_id.clone(),
+                        cwd.into(),
+                        mcp_servers,
+                        creation,
+                    )
+                    .await
+                    .map(Some);
+            }
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -3072,11 +3311,51 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<PreparedAcpLoad>> {
+        self.prepare_acp_load_with_review(
+            conn,
+            callbacks,
+            init,
+            agent_id,
+            cwd.into(),
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original startup owners and admission inputs remain explicit"
+    )]
+    async fn prepare_acp_load_with_review(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        review: Option<(
+            &crate::repository_admission::lifecycle::physical_owner::RepositoryReviewBootstrap,
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        )>,
+    ) -> Result<Option<PreparedAcpLoad>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
+        if review.is_none()
+            && self
+                .store
+                .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
+                .await?
+                .is_some()
+        {
+            return Err(Error::Unsupported(
+                "Private native history requires original admission".into(),
+            ));
+        }
         if !session::supports_load_session(init) {
             return Ok(None);
         }
@@ -3116,17 +3395,43 @@ impl Services {
             .get_agent_session_last_turn_model(&workspace_id, agent_id)
             .await?;
         if let Some(owner) = last_turn_provider {
-            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            // A profile reference is its own owner: a native session never
+            // crosses profiles or a profile and Default (PROTOCOL §5.54).
+            let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
                 );
                 return Ok(None);
             }
         }
+        // A profile's native session also belongs to the settings it was
+        // opened under: after an edit takes effect (account or home may
+        // differ) recreate with Intent history instead of loading it.
+        if let Some(fingerprint) =
+            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
+        {
+            if !Self::native_session_bound_to(&stored, &fingerprint) {
+                tracing::info!(
+                    agent = %agent_id,
+                    provider = %provider_id,
+                    "profile settings changed: skipping session/load of the earlier settings' session"
+                );
+                return Ok(None);
+            }
+        }
+        let owner = self.auth_owner(&provider_id).await;
+        let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
         let is_orchestrator = self
@@ -3146,7 +3451,61 @@ impl Services {
             "info",
         )
         .await;
-        let opened = if let Some(callbacks) = callbacks {
+        let opened = if let Some((bootstrap, native)) = review {
+            let unavailable =
+                || Error::Forbidden("Private native history requires original admission".into());
+            let callbacks = callbacks.ok_or_else(unavailable)?;
+            if bootstrap.loaded_session().map_err(|_| unavailable())? != acp_session_id
+                || native.is_retired()
+            {
+                return Err(unavailable());
+            }
+            bootstrap
+                .with_current(|| Ok(()))
+                .map_err(|_| unavailable())?;
+            let prepared = callbacks
+                .prepare_review_history(&acp_session_id, native.context().clone())
+                .await
+                .map_err(|_| unavailable())?;
+            let target = prepared
+                .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
+                .map_err(|_| unavailable())?;
+            let verified = bootstrap
+                .verify_history(prepared.messages())
+                .await
+                .map_err(|_| unavailable())?;
+            let admitted = verified
+                .admit(Arc::new(self.clone()))
+                .await
+                .map_err(|_| unavailable())?;
+            admitted
+                .retain_native_context()
+                .map_err(|_| unavailable())?;
+            let opened = prepared
+                .load(
+                    callbacks,
+                    cwd,
+                    mcp_servers,
+                    meta,
+                    admitted.bind_load(target),
+                )
+                .await;
+            if let Ok(opened) = &opened {
+                if native.is_retired()
+                    || !opened
+                        .query
+                        .as_ref()
+                        .and_then(intent_acp::callback_registration::CallbackQuery::pending_review_monitoring)
+                        .is_some_and(|receipt| receipt.matches_context(native.context()))
+                {
+                    native.join().await.map_err(|_| {
+                        Error::Internal("Private native retirement unconfirmed".into())
+                    })?;
+                    return Err(unavailable());
+                }
+            }
+            opened
+        } else if let Some(callbacks) = callbacks {
             callbacks
                 .load_session(&acp_session_id, cwd, mcp_servers, meta)
                 .await
@@ -3160,7 +3519,17 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
+        if provider_id == "codex" {
+            crate::codex_session_title::confirm(
+                conn,
+                &acp_session_id,
+                &stored.name,
+                std::time::Duration::from_secs(20),
+            )
+            .await
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
+        }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
             query: opened.query,
@@ -3276,6 +3645,7 @@ impl Services {
         prompt: Vec<ContentBlock>,
         turn_id: Option<&str>,
     ) -> Result<StopReason> {
+        let prompt = crate::provider_images::PreparedPrompt::new(prompt).await?;
         self.run_prompt_turn_captured(
             conn,
             notifications,
@@ -3300,10 +3670,14 @@ impl Services {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         acp_session_id: &str,
-        prompt: Vec<ContentBlock>,
+        prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
     ) -> Result<StopReason> {
+        // The worker prepares this outbound copy before committing its
+        // first-turn context. Persisted originals and local capture are untouched.
+        let prompt = prompt.into_blocks();
+        let required = local.as_ref().is_some_and(|input| input.required.is_some());
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3457,6 +3831,21 @@ impl Services {
             let attempt_result = {
                 let prompt_fut = async {
                     if let Some(input) = local.as_mut() {
+                        if required {
+                            let admission = input.required.take().ok_or_else(|| {
+                                AcpError::Transport(
+                                    "required monitor prompt already consumed".into(),
+                                )
+                            })?;
+                            return Box::pin(session::prompt_with_required_admission(
+                                input.connection,
+                                acp_session_id,
+                                prompt.clone(),
+                                &activity,
+                                admission,
+                            ))
+                            .await;
+                        }
                         let guidance = match input.captured.as_mut() {
                             Some(original) => original.prepare().await,
                             None => None,
@@ -3550,9 +3939,69 @@ impl Services {
                         .await;
                 }
             }
+            // Codex validates its sandbox override at turn/start, not set_mode.
+            // Only a recognized pre-start policy rejection may change modes and
+            // replay the untouched prompt. Reuse the output/client-work guards
+            // above, and recheck after the asynchronous mode change.
+            if !required
+                && !closed
+                && !any_update_received
+                && conn.client_request_seq() == client_request_watermark
+            {
+                if let (Err(error), Some(input)) = (&attempt_result, local.as_ref()) {
+                    match intent_acp::codex_sandbox::fallback(
+                        input.connection,
+                        acp_session_id,
+                        error,
+                    )
+                    .await
+                    {
+                        Ok(Some(mode)) => {
+                            while let Ok(note) = notifications.try_recv() {
+                                activity.touch();
+                                any_update_received = true;
+                                updates_applied |= self
+                                    .route_notification(
+                                        &note,
+                                        agent_id,
+                                        workspace_id,
+                                        &mut transcript,
+                                    )
+                                    .await;
+                            }
+                            if any_update_received
+                                || notifications.is_closed()
+                                || conn.client_request_seq() != client_request_watermark
+                            {
+                                break attempt_result;
+                            }
+                            tracing::warn!(agent = %agent_id, mode, "Codex sandbox rejected by policy; retrying with a stricter mode");
+                            self.publish_status_event(
+                                workspace_id,
+                                agent_id,
+                                "prompt",
+                                &format!(
+                                    "Codex policy requires {mode}; retrying before work started."
+                                ),
+                                "info",
+                            )
+                            .await;
+                            if let Some(original) =
+                                local.as_mut().and_then(|input| input.captured.as_mut())
+                            {
+                                original.recapture();
+                            }
+                            continue;
+                        }
+                        Err(error) => break Err(error),
+                        Ok(None) => {}
+                    }
+                }
+            }
             match &attempt_result {
                 Err(e)
-                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                    if !required
+                        && fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
                         && conn.client_request_seq() == client_request_watermark
@@ -4201,12 +4650,17 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((_, _, provider, _)) => resolve_provider_id(
+                    Ok((_, _, provider, _)) => match resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
-                    )
+                    ) {
+                        Some(provider_id) => {
+                            self.auth_owner(&provider_id).await.demote();
+                            Some(provider_id)
+                        }
+                        None => None,
+                    }
                     .map(|provider_id| {
-                        crate::provider_auth::demote_auth_verdict(&provider_id);
                         crate::host_execution::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
@@ -4224,6 +4678,8 @@ impl Services {
             }
             _ => None,
         };
+        let prompt_actionable_error =
+            prompt_auth_error.or_else(|| result.as_ref().err().and_then(prompt_size_error));
         // Quota-exhaustion observation: resolved in the SAME pre-persist seam
         // as the auth mapping above, for the same reason — this is the last
         // place the structured `AcpError` still exists, before the final
@@ -4255,7 +4711,7 @@ impl Services {
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
-                let wrapped = prompt_auth_error.as_ref().unwrap_or(&fallback);
+                let wrapped = prompt_actionable_error.as_ref().unwrap_or(&fallback);
                 if !crate::agent_manager::prompt_cancellation_error(wrapped) {
                     let persist = crate::agent_manager::persist_terminal_error_status_via_services(
                         self,
@@ -4445,6 +4901,12 @@ impl Services {
                 // correct if the daemon is killed immediately after the event.
                 self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
                     .await;
+                // Observable idle means this turn is complete. The worker keeps
+                // its slot through the post-turn tail; graceful shutdown must
+                // not record that tail as an interrupted turn.
+                if let Some(manager) = self.agent_manager() {
+                    manager.mark_turn_settled_if_slot_held(agent_id);
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }
@@ -4496,7 +4958,7 @@ impl Services {
                 // Auth-required mapping (intent-hq/intent#3941): the event
                 // carries the same actionable message as the persisted
                 // stop_reason and returned error, not the raw adapter error.
-                let error_text = prompt_auth_error.as_ref().map_or_else(
+                let error_text = prompt_actionable_error.as_ref().map_or_else(
                     || e.to_string(),
                     |error| match error {
                         Error::InvalidParams(message) => message.clone(),
@@ -4504,7 +4966,7 @@ impl Services {
                     },
                 );
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
-                if let Some(auth) = prompt_auth_error
+                if let Some(auth) = prompt_actionable_error
                     .as_ref()
                     .and_then(Error::execution_authorization)
                 {
@@ -4539,9 +5001,8 @@ impl Services {
                 Error::Internal(format!(
                     "session/prompt failed: {e} {PROMPT_IDLE_TIMEOUT_STREAMED_SUFFIX}"
                 ))
-            } else if let Some(error) = prompt_auth_error {
-                // Auth-required failure: identical message to the persisted
-                // stop_reason above (intent-hq/intent#3941).
+            } else if let Some(error) = prompt_actionable_error {
+                // Identical actionable message to the persisted stop_reason.
                 error
             } else {
                 Error::Internal(format!("session/prompt failed: {e}"))
@@ -5267,7 +5728,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((_, _, provider, _)) => resolve_provider_id(
+            Ok((_, _, provider, _)) => resolve_base_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -5328,7 +5789,7 @@ impl Services {
             .await
         {
             Ok((_, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(
+                let provider_id = resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -5467,7 +5928,7 @@ impl Services {
         // below).
         let provider_id = prev_readable
             .then(|| {
-                resolve_provider_id(
+                resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )
@@ -6112,3 +6573,6 @@ impl Services {
         .await
     }
 }
+
+#[path = "agent_session/review_startup.rs"]
+mod review_startup;

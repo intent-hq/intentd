@@ -35,12 +35,19 @@ pub mod ids;
 pub mod model;
 pub mod native_review;
 pub mod nodes;
+pub mod note_annotation;
+pub mod note_delete;
+pub mod note_page;
 pub mod path_utils;
 pub mod process_policy;
+pub mod pull_request_key;
+pub use pull_request_key::pull_request_key;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
 pub mod replay_preview;
 pub mod repo_ref;
+pub mod review_monitor;
+pub mod script_lists;
 pub mod script_monitor;
 pub mod script_output;
 pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
@@ -52,6 +59,7 @@ pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
 pub mod slug;
+pub mod startup;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
@@ -78,7 +86,10 @@ pub use clock::{
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
+pub use error::{
+    CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, ProviderProfileFailure,
+    Result,
+};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use host_membership::{
@@ -135,19 +146,19 @@ pub use model::{
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
-    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
-    Script, ScriptArchiveFilter, ScriptCreateParams, ScriptLastRun, ScriptMode, ScriptPurpose,
-    ScriptRunOutcome, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
-    SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
-    TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
+    PullRequestWorkspace, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory,
+    RepoScriptMode, SaveAssetResult, Script, ScriptArchiveFilter, ScriptCreateParams,
+    ScriptLastRun, ScriptMode, ScriptPurpose, ScriptRunOutcome, ScriptRuntimeState, ScriptStatus,
+    SessionStats, SetupScript, SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult,
+    TaskConvertBlocksResult, TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult,
+    TaskMarkAsTaskResult, TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult,
+    TaskStatus, TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
+    TokenUsage, TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
-    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
-    WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin, WorkspaceCreateResult,
+    WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
+    WorkspaceGitRootSource, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
+    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{

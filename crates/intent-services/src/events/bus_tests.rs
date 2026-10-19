@@ -442,6 +442,7 @@ async fn store_close_preserves_an_admitted_event_after_publisher_cancellation() 
 async fn idle_publish_resolves_without_batch_window_delay() {
     const PUBLISHES: usize = 20;
     let (btx, mut brx) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+    let btx = super::bus::RawBus::from(btx);
     let (wtx, wrx) = tokio::sync::mpsc::channel::<super::bus::WriterRequest>(16);
 
     let inserted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -833,7 +834,7 @@ async fn oneshot_receiver_drop_is_handled_gracefully() {
 
 // --- Batch-insert retry on transient failure (monorepo#2673) ---------------
 //
-// `flush_prepared` is the insert-retry + resolve/broadcast core of the writer
+// `flush_prepared` is the insert-retry + broadcast/resolve core of the writer
 // task's `flush_batch`, generic over the insert operation so these tests can
 // inject failures without a real contended pool. `start_paused` auto-advances
 // the retry backoff sleeps.
@@ -899,6 +900,7 @@ fn transient_classification_matches_insert_events_wording() {
 #[tokio::test(start_paused = true)]
 async fn transient_batch_insert_failure_retries_and_delivers() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let stored = stored_event("evt-1", &ev);
@@ -939,6 +941,7 @@ async fn transient_batch_insert_failure_retries_and_delivers() {
 #[tokio::test(start_paused = true)]
 async fn permanent_batch_insert_failure_does_not_retry() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
@@ -993,6 +996,7 @@ const WRITE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
     const STARVED_FOR: std::time::Duration = std::time::Duration::from_secs(45);
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let stored = stored_event("evt-1", &ev);
@@ -1041,6 +1045,7 @@ async fn sustained_pool_starvation_beyond_three_attempts_still_delivers() {
 #[tokio::test(start_paused = true)]
 async fn transient_batch_insert_failure_exhausts_retries() {
     let (btx, mut brx) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
     let (otx, orx) = tokio::sync::oneshot::channel();
     let ev = new_event("note:created", Some("agent-1"), ActorType::Agent);
     let mut pending: Vec<super::bus::WriterRequest> = vec![(ev, otx)];
@@ -1231,7 +1236,12 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             n, OVERFLOW as u64,
             "marker carries the ring's exact skipped count"
         ),
-        Delivery::Batch(_) => panic!("expected the lag marker before any surviving event"),
+        Delivery::Batch(_)
+        | Delivery::Fence(_)
+        | Delivery::Monitor(_)
+        | Delivery::HistoryChanged => {
+            panic!("expected the lag marker before any surviving event")
+        }
     }
     let second = timeout(Duration::from_secs(5), sub.recv_delivery())
         .await
@@ -1264,4 +1274,272 @@ async fn recv_skips_lag_markers_transparently() {
         !batch.is_empty(),
         "recv yields the surviving events, never a marker"
     );
+}
+
+/// A fence covers the finite raw tail, including transient/filtered entries,
+/// and flushes batching without waiting for another matching event.
+#[tokio::test]
+async fn recovery_fence_flushes_filtered_quiet_tail() {
+    let (_tmp, bus) = bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        batch_window: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let _ = bus.publish_transient(&new_event("file:changed", None, ActorType::System));
+    let _ = bus.publish_transient(&new_event("note:updated", None, ActorType::System));
+    let mut receipt = sub.fence_handle().request().expect("capture tail");
+    assert!(receipt.try_recv().is_err());
+    assert!(matches!(sub.recv_delivery().await, Some(Delivery::Batch(ref b)) if b.len() == 1));
+    let Some(Delivery::Fence(ack)) = sub.recv_delivery().await else {
+        panic!("ordered fence")
+    };
+    ack.send(()).unwrap();
+    receipt.await.unwrap();
+    assert!(
+        sub.try_recv_delivery().is_none(),
+        "no domain frame for control/filtered items"
+    );
+}
+
+#[tokio::test]
+async fn recovery_fence_cannot_skip_lost_filtered_tail() {
+    let (_tmp, bus) = bus().await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        ..Default::default()
+    });
+    for _ in 0..(BROADCAST_CAPACITY + 8) {
+        let _ = bus.publish_transient(&new_event("note:updated", None, ActorType::System));
+    }
+    let receipt = sub.fence_handle().request().unwrap();
+    assert!(matches!(
+        sub.recv_delivery().await,
+        Some(Delivery::Lagged(8))
+    ));
+    let Some(Delivery::Fence(ack)) = sub.recv_delivery().await else {
+        panic!("loss before fence")
+    };
+    ack.send(()).unwrap();
+    receipt.await.unwrap();
+}
+
+#[tokio::test]
+async fn private_history_change_only_notifies_matching_opted_in_chat() {
+    use intent_core::repository_request::{
+        RepositoryMonitorHistoryRecipient, RepositoryPrivateOutput,
+    };
+    use std::sync::Arc;
+    struct History;
+    impl RepositoryMonitorHistoryRecipient for History {
+        fn scope<'a>(
+            &'a self,
+            body: intent_core::BoxFuture<'a, ()>,
+        ) -> intent_core::BoxFuture<'a, ()> {
+            body
+        }
+        fn bind_output(&self, _: String) -> Arc<dyn RepositoryPrivateOutput> {
+            panic!("a history invalidation must not bind or expose any private output")
+        }
+        fn begin_generation(&self) {
+            panic!("the bus does not read history")
+        }
+        fn retire(&self) {}
+    }
+    let (_tmp, bus) = bus().await;
+    let mut ordinary = bus.subscribe(SubscriptionFilter::default());
+    let mut matching = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    let mut other = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-other".into(),
+        Arc::new(History),
+    );
+    let mut generic = bus.subscribe_history(
+        SubscriptionFilter::default(),
+        "agent-original".into(),
+        Arc::new(History),
+    );
+    bus.notify_monitor_history("agent-original");
+    let barrier = bus.publish_transient(&new_event("workspace:updated", None, ActorType::System));
+    assert!(matches!(
+        matching.recv_delivery().await,
+        Some(Delivery::HistoryChanged)
+    ));
+    for sub in [&mut ordinary, &mut matching, &mut other] {
+        let Some(Delivery::Batch(events)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("only the matching opted-in subscriber may receive the private notification")
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, barrier.id);
+        assert!(sub.try_recv_delivery().is_none());
+    }
+    // Generic consumers cannot accidentally flatten a private notification.
+    assert_eq!(generic.recv().await.unwrap()[0].id, barrier.id);
+}
+
+/// A quiet raw tail includes private envelopes, but gives a generic subscriber
+/// neither their payload nor a public marker carrying their routing identity.
+#[tokio::test]
+async fn recovery_fence_covers_private_quiet_tail_without_projection() {
+    use intent_core::repository_request::RepositoryMonitorEventSource;
+    use std::sync::Arc;
+    struct Source;
+    impl RepositoryMonitorEventSource for Source {
+        fn with_current(
+            &self,
+            action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+        ) -> intent_core::Result<()> {
+            action()
+        }
+    }
+    let (_tmp, bus) = bus().await;
+    let mut ordinary = bus.subscribe(SubscriptionFilter::default());
+    let mut filtered = bus.subscribe(SubscriptionFilter {
+        event_types: vec!["file:*".into()],
+        batch_window: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let public = bus.publish_transient(&new_event("file:changed", None, ActorType::System));
+    let mut private = stored_event(
+        "private-id",
+        &new_event("note:updated", None, ActorType::System),
+    );
+    private.workspace_id = WorkspaceId::from("private-workspace");
+    private.data = json!({"secret":"withheld"});
+    bus.publish_monitor(private, None, Arc::new(Source))
+        .unwrap();
+    bus.notify_monitor_history("private-agent");
+    for sub in [&mut ordinary, &mut filtered] {
+        let receipt = sub.fence_handle().request().unwrap();
+        let delivery = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap();
+        assert!(
+            matches!(delivery, Some(Delivery::Batch(ref batch)) if batch.len() == 1 && batch[0].id == public.id)
+        );
+        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("private quiet tail must reach its fence without a public projection");
+        };
+        ack.send(()).unwrap();
+        receipt.await.unwrap();
+        assert!(sub.try_recv_delivery().is_none());
+    }
+    // Registration after a nonzero tail starts at that cursor. A following
+    // private-only tail must not need a public event to release any receipt.
+    let mut late = bus.subscribe(SubscriptionFilter::default());
+    bus.notify_monitor_history("private-agent-only");
+    for sub in [&mut ordinary, &mut filtered, &mut late] {
+        let receipt = sub.fence_handle().request().unwrap();
+        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
+            .await
+            .unwrap()
+        else {
+            panic!("private-only tail has no public marker");
+        };
+        ack.send(()).unwrap();
+        receipt.await.unwrap();
+        assert!(sub.try_recv_delivery().is_none());
+    }
+}
+
+/// What one publisher could already see on the broadcast channel at the
+/// instant its oneshot woke it: the waker runs synchronously inside the
+/// writer's `oneshot::Sender::send`, so the ids drained here are exactly the
+/// events broadcast BEFORE the publisher was released.
+struct WakeProbe {
+    brx: std::sync::Mutex<
+        tokio::sync::broadcast::Receiver<std::sync::Arc<super::monitor_delivery::BroadcastEvent>>,
+    >,
+    visible_at_wake: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+impl std::task::Wake for WakeProbe {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        let mut brx = self.brx.lock().unwrap();
+        let mut ids = Vec::new();
+        while let Ok(event) = brx.try_recv() {
+            ids.push(event.id.clone());
+        }
+        self.visible_at_wake
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Vec::new)
+            .extend(ids);
+    }
+}
+
+/// Regression (intent-hq/intent#7296): a persisted event must be broadcast
+/// BEFORE its publisher's oneshot resolves. On the multi-threaded runtime a
+/// woken publisher resumes immediately on another worker; if the broadcast
+/// still trailed the wake, the publisher's NEXT event — a transient
+/// `chat:stream:delta` that skips the writer — could overtake it. That let an
+/// agent's closing text reach `chat.subscribe` ahead of the parallel
+/// `tool_result` it follows in the durable transcript, breaking the bus's
+/// single-publisher ordering guarantee. Each publisher here records what was
+/// broadcast at the exact moment it was woken (no timing involved).
+#[tokio::test]
+async fn persisted_event_is_broadcast_before_its_publisher_wakes() {
+    use std::future::Future;
+
+    let (btx, _keep) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
+    let mut pending: Vec<super::bus::WriterRequest> = Vec::new();
+    let mut stored = Vec::new();
+    let mut publishers = Vec::new();
+    for id in ["evt-1", "evt-2"] {
+        let ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
+        stored.push(stored_event(id, &ev));
+        let (otx, mut orx) = tokio::sync::oneshot::channel::<intent_core::Result<Event>>();
+        let probe = std::sync::Arc::new(WakeProbe {
+            brx: std::sync::Mutex::new(btx.subscribe()),
+            visible_at_wake: std::sync::Mutex::new(None),
+        });
+        let waker = std::task::Waker::from(probe.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            std::pin::Pin::new(&mut orx).poll(&mut cx).is_pending(),
+            "publisher parks on its oneshot before the flush"
+        );
+        pending.push((ev, otx));
+        publishers.push((id, orx, probe));
+    }
+
+    super::bus::flush_prepared(
+        || {
+            let stored = stored.clone();
+            async move { Ok(stored) }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    for (id, orx, probe) in publishers {
+        let visible = probe
+            .visible_at_wake
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| panic!("{id}'s publisher was woken"));
+        assert!(
+            visible.iter().any(|v| v == id),
+            "{id} must already be broadcast when its publisher wakes (saw {visible:?}); \
+             otherwise the publisher's next transient event can overtake it"
+        );
+        assert_eq!(orx.await.expect("resolved").expect("ok").id, id);
+    }
 }

@@ -17,6 +17,7 @@
 //! service authorizes its actual owner. In particular, source export follow-ups
 //! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
+use futures_util::future::BoxFuture;
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
@@ -24,7 +25,7 @@ use intent_core::{
     ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
     WorkspaceUpdate,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 use tracing::Instrument;
@@ -97,6 +98,22 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
+        Error::NoteDelete(kind) => RpcErr {
+            code: kind.rpc_code(),
+            message: "Note deletion unavailable".into(),
+            data: Some(json!({"code":kind.wire_code()})),
+        },
+        Error::NotePage(kind) => {
+            let mut data = json!({"code":kind.wire_code()});
+            if kind == intent_core::note_page::NotePageError::Preparing {
+                data["retryAfterMs"] = json!(1000);
+            }
+            RpcErr {
+                code: Error::NotePage(kind).code(),
+                message: "Note page unavailable".into(),
+                data: Some(data),
+            }
+        }
         Error::ExecutionAuthorization {
             source,
             authorization,
@@ -139,6 +156,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
+        // Provider profile failure (§5.54): -32602 (or -32603 for an
+        // unreadable profile file) with the service-built `data` verbatim —
+        // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
+        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message.clone(),
+            data: Some(failure.data.clone()),
         },
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
@@ -425,6 +450,28 @@ pub(crate) async fn prepare_message(
         }
     };
 
+    // Receipt lookup has a stricter envelope budget, including malformed
+    // requests. Validate before cloning params or echoing a caller-controlled ID.
+    let annotation = value
+        .get("params")
+        .and_then(Value::as_object)
+        .and_then(|params| annotation_method(value.get("method").and_then(Value::as_str)?, params));
+    if annotation.is_some() {
+        if value.get("id").is_some_and(|id| !valid_note_page_id(id)) {
+            return Some(invalid_note_page_id());
+        }
+        if message.len() > 65_536 {
+            return value.get("id").map(|id| {
+                prepared_error(
+                    id,
+                    INVALID_PARAMS,
+                    "Note page unavailable",
+                    Some(json!({"code":"note-page-budget"})),
+                )
+            });
+        }
+    }
+
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
@@ -485,6 +532,11 @@ pub(crate) async fn prepare_message(
         }
     };
 
+    // Never echo an unbounded ID from an opt-in page request.
+    if method == "note.get" && params.contains_key("page") && !valid_note_page_id(&echo_id) {
+        return Some(invalid_note_page_id());
+    }
+
     // Keep one span alive through dispatch AND response encoding. The writer
     // queue consumes the returned frame later, so queue latency is deliberately
     // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
@@ -503,7 +555,13 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        let result = dispatch(api, method, &params).await;
+        let result = if let Some(annotation) = annotation {
+            Box::pin(dispatch_annotation_page(api, annotation, &params, &echo_id)).await
+        } else if method == "note.get" && params.contains_key("page") {
+            Box::pin(dispatch_note_page(api, &params, &echo_id, message.len())).await
+        } else {
+            dispatch(api, method, &params).await
+        };
         let kind = if result.is_ok() {
             intent_core::repository_request::RepositoryReadReplyKind::Result
         } else {
@@ -515,7 +573,17 @@ pub(crate) async fn prepare_message(
             method,
             is_notification,
             result,
-            crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            if annotation.is_some() {
+                params
+                    .get("page")
+                    .and_then(|page| page.get("maxWireBytes"))
+                    .and_then(Value::as_u64)
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .unwrap_or(65_536)
+                    .clamp(4096, 65_536)
+            } else {
+                crate::MAX_OUTBOUND_MESSAGE_BYTES
+            },
         );
         let encode_elapsed_ms = if is_notification {
             0
@@ -599,8 +667,165 @@ fn encode_dispatch_result(
     }
 }
 
+fn valid_note_page_id(id: &Value) -> bool {
+    match id {
+        Value::String(s) => s.len() <= 64,
+        Value::Number(n) => n
+            .as_i64()
+            .is_some_and(|v| v.unsigned_abs() <= 9_007_199_254_740_991),
+        _ => false,
+    }
+}
+
+fn invalid_note_page_id() -> PreparedReply {
+    prepared_error(
+        &Value::Null,
+        INVALID_PARAMS,
+        "Invalid note page request",
+        Some(json!({"code":"invalid-params"})),
+    )
+}
+
+// Select the opt-in variant before decoding. Malformed annotation requests
+// must not fall through to the legacy full-comment or source-context paths.
+fn annotation_method(
+    method: &str,
+    params: &Map<String, Value>,
+) -> Option<intent_core::note_annotation::AnnotationMethod> {
+    use intent_core::note_annotation::AnnotationMethod;
+    match method {
+        "note.lineAttribution.load" if params.contains_key("page") => {
+            Some(AnnotationMethod::Attribution)
+        }
+        "comment.list" if params.contains_key("page") => Some(AnnotationMethod::Comments),
+        "comment.getThread" if params.contains_key("page") => Some(AnnotationMethod::Replies),
+        "note.get"
+            if params.contains_key("commentRevision")
+                || params.contains_key("attributionGeneration")
+                || params
+                    .get("page")
+                    .and_then(|page| page.get("contextRef"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|reference| reference.starts_with("na1")) =>
+        {
+            Some(AnnotationMethod::Context)
+        }
+        _ => None,
+    }
+}
+
+async fn dispatch_annotation_page(
+    api: &dyn WorkspaceApi,
+    method: intent_core::note_annotation::AnnotationMethod,
+    params: &Map<String, Value>,
+    id: &Value,
+) -> std::result::Result<Value, RpcErr> {
+    if !valid_note_page_id(id)
+        || params.values().any(Value::is_null)
+        || params
+            .get("page")
+            .and_then(Value::as_object)
+            .is_none_or(|page| page.values().any(Value::is_null))
+    {
+        return Err(invalid_params("Invalid annotation page request"));
+    }
+    let request: intent_core::note_annotation::AnnotationReadRequest =
+        serde_json::from_value(Value::Object(params.clone()))
+            .map_err(|_| invalid_params("Invalid annotation page request"))?;
+    request
+        .validate(method)
+        .map_err(|_| invalid_params("Invalid annotation page request"))?;
+    api.get_note_annotation_page(method, request, id.clone())
+        .await
+        .map_err(|error| match error {
+            Error::NotePage(_) => domain_to_rpc(error),
+            Error::InvalidParams(_) => invalid_params("Invalid annotation page request"),
+            Error::NotFound(_) => not_found("Annotation page not found"),
+            Error::Forbidden(_) => {
+                domain_to_rpc(Error::Forbidden("Annotation page unavailable".into()))
+            }
+            Error::Unsupported(_) => {
+                domain_to_rpc(Error::Unsupported("Annotation page unavailable".into()))
+            }
+            _ => rpc(-32603, "Annotation page unavailable"),
+        })
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
-async fn dispatch(
+async fn dispatch_note_page(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+    id: &Value,
+    request_bytes: usize,
+) -> std::result::Result<Value, RpcErr> {
+    if request_bytes > 65_536 || !valid_note_page_id(id) {
+        return Err(domain_to_rpc(Error::NotePage(
+            intent_core::note_page::NotePageError::Budget,
+        )));
+    }
+    let page = params.get("page").expect("page present");
+    if page
+        .as_object()
+        .is_none_or(|m| m.values().any(Value::is_null))
+    {
+        return Err(invalid_params("Invalid note page request"));
+    }
+    let request = intent_core::note_page::NotePageRequest::deserialize(page)
+        .map_err(|_| invalid_params("Invalid note page request"))?;
+    let ws = require_ws_note(params)?;
+    let note = require_note_id(params)?;
+    if ws.0.len() > 256 || note.0.len() > 256 {
+        return Err(invalid_params("Invalid note page request"));
+    }
+    api.get_note_page(ws, note, request, id.clone())
+        .await
+        .map_err(domain_to_rpc)
+}
+
+// Keep workspace provisioning off the large general dispatch poll frame. Its
+// service call may perform TLS before the first note write; paging must not
+// exhaust the default thread stack on that legacy path.
+fn dispatch<'a>(
+    api: &'a dyn WorkspaceApi,
+    method: &'a str,
+    params: &'a Map<String, Value>,
+) -> BoxFuture<'a, Result<Value, RpcErr>> {
+    match method {
+        "workspace.create" => Box::pin(dispatch_workspace_create(api, params)),
+        _ => Box::pin(dispatch_other(api, method, params)),
+    }
+}
+
+async fn dispatch_workspace_create(
+    api: &dyn WorkspaceApi,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    // Agent ids are server-assigned: reject stale clients that still
+    // send `initialAgent.agentId` before any provisioning runs.
+    if params
+        .get("initialAgent")
+        .and_then(|a| a.get("agentId"))
+        .is_some_and(|v| !v.is_null())
+    {
+        return Err(invalid_params(
+            "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
+        ));
+    }
+    let idempotency_key = opt_str(params, "idempotencyKey");
+    let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
+        .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+    let res = api
+        .create_workspace(input, idempotency_key)
+        .await
+        .map_err(workspace_err)?;
+    let mut result = json!({ "workspace": res.workspace });
+    if let Some(agent) = res.initial_agent {
+        result["initialAgent"] = agent;
+    }
+    Ok(result)
+}
+
+async fn dispatch_other(
     api: &dyn WorkspaceApi,
     method: &str,
     params: &Map<String, Value>,
@@ -715,35 +940,21 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
         }
+        "workspace.findByPullRequest" => {
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_params("Missing required parameter: url"))?;
+            let workspaces = api
+                .find_workspaces_by_pull_request(url.to_string())
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "workspaces": workspaces }))
+        }
         "workspace.get" => {
             let id = require_workspace_id(params)?;
             let ws = api.get_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
-        }
-        "workspace.create" => {
-            // Agent ids are server-assigned: reject stale clients that still
-            // send `initialAgent.agentId` before any provisioning runs.
-            if params
-                .get("initialAgent")
-                .and_then(|a| a.get("agentId"))
-                .is_some_and(|v| !v.is_null())
-            {
-                return Err(invalid_params(
-                    "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
-                ));
-            }
-            let idempotency_key = opt_str(params, "idempotencyKey");
-            let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
-                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-            let res = api
-                .create_workspace(input, idempotency_key)
-                .await
-                .map_err(workspace_err)?;
-            let mut result = json!({ "workspace": res.workspace });
-            if let Some(agent) = res.initial_agent {
-                result["initialAgent"] = agent;
-            }
-            Ok(result)
         }
         "workspace.update" => {
             let id = require_workspace_id(params)?;
@@ -1313,6 +1524,87 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
+        }
+        "note.deleteSchedule" => {
+            let request: intent_core::note_delete::NoteDeleteSchedule =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .schedule_note_delete(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
+        }
+        "note.deleteCancel" => {
+            let request: intent_core::note_delete::NoteDeleteCancel =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .cancel_note_delete(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
+        }
+        "note.deleteStatus" => {
+            let request: intent_core::note_delete::NoteDeleteStatus =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Invalid,
+                    ))
+                })?;
+            let response = api
+                .note_delete_status(request)
+                .await
+                .map_err(domain_to_rpc)?;
+            let value = to_result_value(&response)?;
+            if serde_json::to_vec(&value)
+                .map_err(|_| {
+                    domain_to_rpc(Error::NoteDelete(
+                        intent_core::note_delete::NoteDeleteError::Unavailable,
+                    ))
+                })?
+                .len()
+                > intent_core::note_delete::MAX_RESULT_BYTES
+            {
+                return Err(domain_to_rpc(Error::NoteDelete(
+                    intent_core::note_delete::NoteDeleteError::Unavailable,
+                )));
+            }
+            Ok(value)
         }
         "note.delete" => {
             let ws = require_ws_note(params)?;
@@ -4021,6 +4313,29 @@ async fn dispatch(
             let r = api.providers_catalog().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "providers.profiles.list" => {
+            // Administrator-only, daemon-global (§5.54).
+            let base = opt_str(params, "baseProviderId");
+            api.provider_profiles_list(base)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.create" => api
+            .provider_profiles_create(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "providers.profiles.update" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_update(profile_id, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.delete" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_delete(profile_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
@@ -4502,15 +4817,13 @@ async fn dispatch(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            let archive = params
-                .get("archive")
-                .map(|value| {
-                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
-                })
-                .transpose()
-                .map_err(|e| invalid_params(e.to_string()))?
-                .unwrap_or_default();
-            api.script_list_filtered(ws, archive)
+            api.script_list_view(ws, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "script.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_get(ws, require_str_param(params, "scriptId")?)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4544,8 +4857,17 @@ async fn dispatch(
         }
         "scriptMonitor.list" => {
             let ws = require_ws_note(params)?;
-            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
-            api.script_monitor_list(ws, agent)
+            let agent = params
+                .get("agentId")
+                .map(|_| require_str_param(params, "agentId").map(intent_core::AgentId::from))
+                .transpose()?;
+            api.script_monitor_list_view(ws, agent, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_monitor_get(ws, require_str_param(params, "monitorId")?, None)
                 .await
                 .map_err(domain_to_rpc)
         }

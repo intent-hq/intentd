@@ -1942,7 +1942,9 @@ fn codex_probe_launch_enforces_both_subagent_settings() {
     });
     assert_eq!(
         value,
-        Some(json!({"agents": {"enabled": false}, "features": {"multi_agent_v2": false}}))
+        Some(
+            json!({"agents": {"enabled": false}, "features": {"multi_agent": false, "multi_agent_v2": false}})
+        )
     );
 }
 
@@ -2464,6 +2466,30 @@ fn auth_required_detection() {
     assert!(is_auth_required_error(-32000, "please sign in first"));
     assert!(!is_auth_required_error(-32000, "internal error"));
     assert!(!is_auth_required_error(0, "model not found"));
+}
+
+#[test]
+fn auth_required_detection_recognizes_claude_expired_oauth() {
+    for message in [
+        "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "FAILED TO AUTHENTICATE: OAUTH SESSION EXPIRED AND COULD NOT BE REFRESHED",
+    ] {
+        assert!(is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
+fn auth_required_detection_rejects_unrelated_expiry() {
+    for message in [
+        "Internal error",
+        "session expired",
+        "tool execution deadline expired",
+        "Failed to refresh model catalog",
+        "OAuth callback listener failed to start",
+    ] {
+        assert!(!is_auth_required_error(-32603, message), "{message}");
+    }
 }
 
 #[test]

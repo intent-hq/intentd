@@ -7,6 +7,10 @@
 # GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=...) reach the root make through
 # MAKEFLAGS. In a standalone clone the same targets exit 2 and name the
 # monorepo command. Unknown targets keep make's ordinary "No rule" failure.
+#
+# The one local target, test-release-scripts, needs neither cargo nor the
+# monorepo: it runs the scripts/test-* commands of ci.yml's release-scripts job,
+# skipping suites that need CI-only tooling (scripts/release-scripts-local.py).
 
 MONOREPO_ROOT := ../..
 FORWARDED_TARGETS := check test test-changed gate list-tests coverage-changed fmt clippy lint-sources
@@ -16,7 +20,7 @@ FORWARDED_TARGETS := check test test-changed gate list-tests coverage-changed fm
 MONOREPO_PRESENT := $(and $(wildcard $(MONOREPO_ROOT)/Makefile),$(shell grep -Eqs '^[[:space:]]*path[[:space:]]*=[[:space:]]*packages/intentd[[:space:]]*$$' $(MONOREPO_ROOT)/.gitmodules && echo yes))
 
 .DEFAULT_GOAL := help
-.PHONY: help $(FORWARDED_TARGETS)
+.PHONY: help test-release-scripts $(FORWARDED_TARGETS)
 
 help:
 	@echo "intentd Makefile: forwards the Rust gate targets to the intent monorepo root Makefile."
@@ -27,6 +31,12 @@ help:
 	@echo "packages/intentd submodule ($(MONOREPO_ROOT)/Makefile exists and $(MONOREPO_ROOT)/.gitmodules"
 	@echo "names packages/intentd); RESUME=1, GATE_FORCE=1, BASE=<ref>, DRY_RUN=1 and ARGS=..."
 	@echo "pass through. In a standalone clone the targets exit 2 and name the monorepo command."
+	@echo ""
+	@echo "Local target: test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"
+	@echo "that need CI-only tooling (exit 1 only on a real failure)."
+
+test-release-scripts:
+	python3 scripts/release-scripts-local.py
 
 ifneq ($(MONOREPO_PRESENT),)
 # One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,

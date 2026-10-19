@@ -13,7 +13,7 @@ set -euo pipefail
 # BASE=HEAD or DRY_RUN=1 exported would change every expected argv).
 unset BASE DRY_RUN BUILD_JOBS TEST_THREADS NEXTEST_SHOW_PROGRESS CARGO_TERM_PROGRESS_WHEN
 unset NEXTEST_RUNNER INTENTD_TEST_TIMEOUT_MULTIPLIER
-unset RUN_STDIN INTENTD_ASSERT_BOUND_CALLER
+unset RUN_STDIN INTENTD_ASSERT_BOUND_CALLER COVERAGE_STORAGE_DIR
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 script="$here/changed-tests.sh"
@@ -28,6 +28,7 @@ bin_dir="$temp_dir/bin"
 repo="$temp_dir/repo"
 mkdir -p "$bin_dir" "$repo/scripts"
 cp "$script" "$repo/scripts/changed-tests.sh"
+cp "$here/coverage-storage.py" "$repo/scripts/"
 if [[ -f "$here/with-test-policy.sh" ]]; then
   cp "$here/with-test-policy.sh" "$repo/scripts/"
 fi
@@ -39,7 +40,7 @@ fail() {
   exit 1
 }
 
-for command in bash dirname mktemp rm sort; do
+for command in bash dirname mktemp rm sort python3; do
   ln -s "$(command -v "$command")" "$bin_dir/$command"
 done
 
@@ -702,6 +703,39 @@ CARGO_STUB_EXIT=100 run_script --instrumented
 [[ "$status" -eq 100 ]] || fail "$case_name exited $status (expected 100): $stderr"
 [[ "$stderr" == "[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p alpha --test one -E 'not binary(auggie_context_e2e)' exited 100" ]] || fail "$case_name stderr: $stderr"
 
+case_name="instrumented storage observer preserves scopes, stdin, policy and failure"
+reset_repo
+edit crates/alpha/tests/one.rs
+edit crates/gamma/tests/smoke.rs
+storage_dir="$temp_dir/storage"
+mkdir -p "$storage_dir"
+python3 - "$storage_dir" "$repo" <<'PYTHON'
+import json, pathlib, sys
+out, root = map(pathlib.Path, sys.argv[1:])
+(out / 'paths.json').write_text(json.dumps({name: str(root) for name in
+    ['workspace', 'target', 'profiles', 'temporary', 'home']}))
+PYTHON
+printf 'payload\n' > "$temp_dir/storage-input"
+COVERAGE_STORAGE_DIR="$storage_dir" RUN_STDIN="$temp_dir/storage-input" run_script --instrumented
+expect_ok
+expect_cov "-p alpha --test one" "-p gamma --test smoke"
+[[ "$(cat "$temp_dir/cargo-stdin.log")" == payload ]] || fail "$case_name: caller input was changed"
+python3 - "$storage_dir/resources.jsonl" <<'PYTHON'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert [(r['stage'], r['event']) for r in rows] == [
+    ('scope-1', 'start'), ('scope-1', 'exit'), ('scope-2', 'start'), ('scope-2', 'exit')], rows
+assert all(r['exit_code'] == 0 for r in rows if r['event'] == 'exit')
+PYTHON
+: > "$storage_dir/resources.jsonl"
+COVERAGE_STORAGE_DIR="$storage_dir" CARGO_STUB_EXIT=23 run_script --instrumented
+[[ "$status" -eq 23 ]] || fail "$case_name: observer changed failure to $status"
+python3 - "$storage_dir/resources.jsonl" <<'PYTHON'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert len(rows) == 2 and rows[-1]['exit_code'] == 23 and rows[-1]['stage'] == 'scope-1', rows
+PYTHON
+
 # A build-wide change never exits 3 under --instrumented: the merge queue's
 # coverage jobs already run the full instrumented suite, so the script prints
 # a notice and still runs the mapped crates/ selection.
@@ -760,6 +794,31 @@ expect_cov "-p intentd --test e2e_wss_agent_lifecycle"
 run_script
 expect_ok
 expect_cargo "-p intentd --test auggie_context_e2e --test e2e_wss_agent_lifecycle"
+
+# Structured export must describe the same argv without changing execution.
+case_name="structured plan export preserves execution and empty selections"
+reset_repo
+edit crates/alpha/src/lib.rs
+edit crates/beta/src/main.rs
+run_script --instrumented --plan-json "$temp_dir/plans.json"
+[[ "$status" -eq 0 ]] || fail "$case_name: $stderr"
+expect_cov "-p alpha --lib --bins --tests" "-p beta --bins --tests"
+python3 -I -B -S - "$temp_dir/plans.json" "$(g rev-parse HEAD)" <<'PYTHON'
+import json, sys
+p = json.load(open(sys.argv[1]))
+assert p == {"version": 1, "head": sys.argv[2], "mergeBase": sys.argv[2],
+             "plans": [["-p", "alpha", "--lib", "--bins", "--tests"],
+                       ["-p", "beta", "--bins", "--tests"]]}, p
+PYTHON
+reset_repo
+run_script --instrumented --dry-run --plan-json "$temp_dir/plans.json"
+[[ "$status" -eq 0 && -z "$cargo_log" ]] || fail "$case_name empty: $stderr"
+python3 -I -B -S - "$temp_dir/plans.json" <<'PYTHON'
+import json, sys
+assert json.load(open(sys.argv[1]))["plans"] == []
+PYTHON
+run_script --instrumented --plan-json "$temp_dir/absent/plans.json"
+[[ "$status" -ne 0 && -z "$cargo_log" ]] || fail "$case_name ignored export failure"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

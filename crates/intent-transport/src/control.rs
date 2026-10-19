@@ -1,9 +1,9 @@
 //! System control fast-path: `system.status`, `system.shutdown`,
-//! `system.importLegacy` (§5.7), `system.gitCredential` (monorepo#884), and
+//! `system.gitCredential` (monorepo#884), and
 //! `system.requestUpdate` (§5.7).
 //!
-//! These control methods surface live daemon state, request graceful shutdown,
-//! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
+//! These control methods surface live daemon state and request graceful
+//! shutdown. They sit above the domain [`WorkspaceApi`] router because
 //! the data they expose (bound port, connected clients, active agents, the TLS
 //! fingerprint) and the action they take (tear down the listener) are
 //! transport/process concerns, not domain operations. The composition root
@@ -52,7 +52,7 @@ pub struct SystemStatus {
     pub has_display: bool,
     /// The `AgentManager` concurrency cap (resolved maxConcurrent incl. auto-detection).
     pub max_agents: usize,
-    /// The daemon crate version (`CARGO_PKG_VERSION`).
+    /// The `intentd` crate version (the binary's `CARGO_PKG_VERSION`).
     pub version: String,
     /// Source commit embedded at build time. `None` when the build environment
     /// cannot identify a commit (for example, a source archive without Git metadata).
@@ -237,12 +237,22 @@ impl SystemServices {
 /// Lets a listener answer `system.status` from real state and trigger a
 /// graceful shutdown for `system.shutdown` without reaching into domain code.
 pub trait SystemControl: Send + Sync {
+    /// In-memory startup status, available only in the full daemon composition.
+    fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
+        None
+    }
+
     /// Select the installed services. Existing providers retain their full surface.
     fn services(&self) -> SystemServices {
         SystemServices::Full
     }
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// The daemon binary's own version, advertised as `server.version` in
+    /// `client.hello` (intent-hq/intent#7256). Required so every composition
+    /// root states it: a library crate's `CARGO_PKG_VERSION` can lag the
+    /// `intentd` crate, because release-plz versions them separately.
+    fn daemon_version(&self) -> &str;
     /// Metadata-only compositions may await their original listener snapshot.
     /// Full providers keep the existing synchronous status dispatch below.
     fn metadata_status(&self) -> Pin<Box<dyn Future<Output = SystemStatus> + Send + '_>> {
@@ -283,11 +293,6 @@ pub trait SystemControl: Send + Sync {
     fn request_exact_update(&self, _target: &str) -> Result<(), String> {
         Err("exact-version updates are not supported".into())
     }
-    /// Import legacy workspaces into the daemon's live store.
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
     /// Resolve the daemon-managed GitHub credential for the git-credential
     /// helper (monorepo#884): `Some((username, password))` when the
     /// `exposeGitCredentialToChildren` setting is on and a usable token
@@ -305,9 +310,6 @@ pub(crate) enum SystemMethod {
     Shutdown,
     RequestUpdate {
         target: Result<Option<String>, ()>,
-    },
-    ImportLegacy {
-        force: Result<bool, ()>,
     },
     GitCredential {
         pid: Option<u64>,
@@ -355,18 +357,6 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 _ => Err(()),
             };
             SystemMethod::RequestUpdate { target }
-        }
-        "system.importLegacy" => {
-            let force = match obj.get("params") {
-                None | Some(Value::Null) => Ok(false),
-                Some(Value::Object(params)) => match params.get("force") {
-                    None | Some(Value::Null) => Ok(false),
-                    Some(Value::Bool(force)) => Ok(*force),
-                    Some(_) => Err(()),
-                },
-                Some(_) => Err(()),
-            };
-            SystemMethod::ImportLegacy { force }
         }
         "system.gitCredential" => {
             // Lenient pid extraction: it is audit-only metadata, so a missing
@@ -558,7 +548,7 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging; like `system.importLegacy` and
+/// graceful teardown before acknowledging; like
 /// `system.gitCredential` it is UDS-only, so remote (TCP/WSS) callers get
 /// -32001 and remote shutdown notifications are ignored. `system.gitCredential`
 /// returns `{ credential: { username, password } }` when a credential is
@@ -637,17 +627,6 @@ pub(crate) async fn handle(
             .request_update()
             .map(|()| json!({ "ok": true }))
             .map_err(|message| (-32603, message)),
-        SystemMethod::ImportLegacy { .. } if !is_uds => Err((
-            -32001,
-            "system.importLegacy is available over UDS only".to_string(),
-        )),
-        SystemMethod::ImportLegacy { force: Err(()) } => {
-            Err((-32602, "force must be a boolean".to_string()))
-        }
-        SystemMethod::ImportLegacy { force: Ok(force) } => control
-            .import_legacy(force)
-            .await
-            .map_err(|message| (-32603, message)),
         SystemMethod::GitCredential { .. } if !is_uds => Err((
             -32001,
             "system.gitCredential is available over UDS only".to_string(),
@@ -701,7 +680,6 @@ mod registration_tests {
             "system.status",
             "system.shutdown",
             "system.requestUpdate",
-            "system.importLegacy",
             "system.gitCredential",
         ] {
             for id in [Some(json!(7)), None] {

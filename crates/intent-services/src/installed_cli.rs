@@ -7,9 +7,10 @@ use std::collections::{hash_map::RandomState, BTreeMap};
 use std::ffi::OsString;
 use std::hash::{BuildHasher, Hash};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use intent_acp::ProfileEnv;
 use intent_providers::installed_cli::{InstalledCli, InstalledCliIdentity, InstalledCliRuntime};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -22,6 +23,9 @@ pub(crate) struct InstalledContext {
     // launches must not inherit the catalog's bounded inspection restrictions.
     context_key: Option<u64>,
     names: intent_core::cli_env::CodexEnvNames,
+    /// The selected named profile, already applied to `env`. Kept so catalog
+    /// keys, redaction and re-discovery use the same profile.
+    profile: Option<Arc<ProfileEnv>>,
 }
 
 fn private_hash(value: &impl Hash) -> u64 {
@@ -68,11 +72,77 @@ impl InstalledContext {
             env,
             context_key: None,
             names: names.clone(),
+            profile: None,
         })
     }
 
+    /// Resolve a named profile's overlay into this context. It replaces
+    /// inherited and captured values and removes unset ones, so the account
+    /// home, source-home isolation and catalog fingerprint all see the
+    /// profile. The selected executable and enforced Codex policy are
+    /// re-asserted afterwards: a profile can never override them. `None`
+    /// keeps the Default configuration. Call before
+    /// [`Self::with_catalog_fingerprint`].
+    #[must_use]
+    pub fn with_profile(mut self, profile: Option<Arc<ProfileEnv>>) -> Self {
+        let Some(profile) = profile else {
+            return self;
+        };
+        profile.apply_to_map(&mut self.env);
+        let cli = self.runtime.cli();
+        // A profile that selects its own Codex home also selects the custom
+        // credential names that home's config declares, so the isolated model
+        // probe, fingerprint and redaction use the same names as runs. Bounded
+        // read; callers run this off the executor. An unreadable config keeps
+        // the existing names, as the login-shell capture does.
+        if cli == InstalledCli::Codex && profile.controls("CODEX_HOME") {
+            if let Some(home) = self.codex_home() {
+                if let Ok(names) = intent_core::cli_env::CodexEnvNames::from_home(&home) {
+                    self.names.extend_from(&names);
+                } else {
+                    tracing::warn!(
+                        "could not read Codex config credential references for a provider profile home; using the default names"
+                    );
+                }
+            }
+        }
+        self.env.retain(|key, _| {
+            let key = key.to_string_lossy();
+            !(key.eq_ignore_ascii_case("CODEX_PATH")
+                || key.eq_ignore_ascii_case("CLAUDE_CODE_EXECUTABLE")
+                || cli == InstalledCli::Codex && key.eq_ignore_ascii_case("CODEX_CONFIG"))
+        });
+        self.env.insert(
+            cli.path_env().into(),
+            self.runtime.path().as_os_str().to_owned(),
+        );
+        if cli == InstalledCli::Codex {
+            self.env.insert(
+                "CODEX_CONFIG".into(),
+                intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into(),
+            );
+        }
+        self.context_key = None;
+        self.profile = Some(profile);
+        self
+    }
+
+    /// The applied profile, if any.
+    pub fn profile(&self) -> Option<&Arc<ProfileEnv>> {
+        self.profile.as_ref()
+    }
+
     pub async fn discover(cli: InstalledCli) -> Result<Self, String> {
-        tokio::task::spawn_blocking(move || Self::resolve(cli))
+        Self::discover_for(cli, None).await
+    }
+
+    /// [`Self::discover`] with a named profile's overlay resolved before any
+    /// account lookup.
+    pub async fn discover_for(
+        cli: InstalledCli,
+        profile: Option<Arc<ProfileEnv>>,
+    ) -> Result<Self, String> {
+        tokio::task::spawn_blocking(move || Self::resolve(cli).map(|c| c.with_profile(profile)))
             .await
             .map_err(|_| "installed CLI discovery failed".to_owned())?
     }
@@ -91,7 +161,10 @@ impl InstalledContext {
         let names = &self.names;
         selected.env.retain(|k, _| {
             k.to_str().is_some_and(|k| {
-                self.runtime.cli().accepts_env(k) || names.contains(k) || k == "SystemRoot"
+                self.runtime.cli().accepts_env(k)
+                    || names.contains(k)
+                    || k == "SystemRoot"
+                    || self.profile.as_ref().is_some_and(|p| p.controls(k))
             })
         });
         selected.apply(command);
@@ -99,25 +172,28 @@ impl InstalledContext {
 
     pub fn secret_values(&self) -> Vec<String> {
         let names = &self.names;
-        self.env
-            .iter()
-            .filter_map(|(k, v)| {
-                let key = k.to_str()?;
-                ((self.runtime.cli().accepts_env(key) || names.contains(key))
-                    && !matches!(
-                        key,
-                        "PATH"
-                            | "HOME"
-                            | "USERPROFILE"
-                            | "CODEX_HOME"
-                            | "CLAUDE_CONFIG_DIR"
-                            | "CODEX_PATH"
-                            | "CODEX_CONFIG"
-                            | "CLAUDE_CODE_EXECUTABLE"
-                    ))
-                .then(|| v.to_string_lossy().into_owned())
-            })
-            .collect()
+        let mut values = self
+            .profile
+            .as_ref()
+            .map(|p| p.secret_values())
+            .unwrap_or_default();
+        values.extend(self.env.iter().filter_map(|(k, v)| {
+            let key = k.to_str()?;
+            ((self.runtime.cli().accepts_env(key) || names.contains(key))
+                && !matches!(
+                    key,
+                    "PATH"
+                        | "HOME"
+                        | "USERPROFILE"
+                        | "CODEX_HOME"
+                        | "CLAUDE_CONFIG_DIR"
+                        | "CODEX_PATH"
+                        | "CODEX_CONFIG"
+                        | "CLAUDE_CODE_EXECUTABLE"
+                ))
+            .then(|| v.to_string_lossy().into_owned())
+        }));
+        values
     }
 
     pub fn codex_home(&self) -> Option<PathBuf> {
@@ -172,15 +248,24 @@ impl InstalledContext {
         }
     }
 
+    pub fn validate_launch_version(&self, version: &str) -> Result<(), String> {
+        let provider = match self.runtime.cli() {
+            InstalledCli::Codex => "codex",
+            InstalledCli::Claude => "claude-code",
+        };
+        intent_providers::adapter_cli::validate_launch_version(provider, version)
+    }
+
     pub fn key(&self, identity: &InstalledCliIdentity) -> Option<String> {
         let context_key = self.context_key?;
         let adapter = match self.runtime.cli() {
             InstalledCli::Codex => intent_providers::CODEX_ACP_NPX_PACKAGE,
             InstalledCli::Claude => intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
         };
+        let profile = self.profile.as_ref().map(|p| p.cache_key());
         Some(format!(
             "installed-v1:{:016x}",
-            private_hash(&(adapter, identity, context_key))
+            private_hash(&(adapter, identity, context_key, profile))
         ))
     }
 
@@ -191,7 +276,7 @@ impl InstalledContext {
         command: &Command,
         dependency: ProbeDependency,
     ) -> bool {
-        let Ok(current) = Self::discover(self.runtime.cli()).await else {
+        let Ok(current) = Self::discover_for(self.runtime.cli(), self.profile.clone()).await else {
             return false;
         };
         let Ok(current) = current.with_catalog_fingerprint().await else {

@@ -458,13 +458,14 @@ pub(crate) async fn handle_with_host_environment(
             // resolve (monorepo#1065). resolvedPath/secondaryResolvedPath
             // stay auto-detected.
             let provider_paths = read_provider_paths(api).await;
-            let result = tokio::task::spawn_blocking(move || {
+            let mut result = tokio::task::spawn_blocking(move || {
                 host_ops::provider_discovery_op(&provider_paths)
             })
             .await
             .unwrap_or_else(|_| {
                 json!({ "providers": [], "npx": { "resolvedPath": null, "version": null, "versionOk": false } })
             });
+            intent_services::provider_cli::add_installed_cli_versions(&mut result).await;
             // Default-provider self-heal (monorepo#3044): with the discovery
             // verdicts in hand, backfill unset default provider/model
             // settings from the installed set. Idempotent and no-overwrite;
@@ -520,6 +521,34 @@ pub(crate) async fn handle_with_host_environment(
             // (monorepo#1086). auggie follows the `host.checkAuggie`
             // precedence: `context.auggiePath` wins over
             // `providers.paths.auggie`.
+            let include_profiles = match params.get("includeProfiles") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    if !id_present {
+                        return None;
+                    }
+                    return Some(error_frame(
+                        &id_echo,
+                        -32602,
+                        "Invalid parameter: includeProfiles must be a boolean",
+                    ));
+                }
+            };
+            // A named profile reference (PROTOCOL §5.54) is probed with that
+            // profile's saved environment and never touches the base
+            // provider's Default verdict or readiness.
+            if let Some(reference) = provider_id.as_deref().filter(|p| p.contains('@')) {
+                return Some(
+                    match api
+                        .provider_profiles_auth_status(Some(reference.to_string()), force)
+                        .await
+                    {
+                        Ok(entries) => success_frame(&id_echo, &json!({ "providers": entries })),
+                        Err(e) => crate::router::delivery_error(&id_echo, e),
+                    },
+                );
+            }
             let provider_paths = read_provider_paths(api).await;
             match intent_services::provider_auth::provider_auth_status(
                 provider_id.as_deref(),
@@ -528,8 +557,21 @@ pub(crate) async fn handle_with_host_environment(
             )
             .await
             {
-                Ok(result) => {
+                Ok(mut result) => {
                     let _ = api.observe_execution_readiness(result.clone()).await;
+                    if include_profiles && provider_id.is_none() {
+                        match api.provider_profiles_auth_status(None, force).await {
+                            Ok(Value::Array(entries)) => {
+                                if let Some(rows) = result["providers"].as_array_mut() {
+                                    rows.extend(entries);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "provider profile auth sweep failed");
+                            }
+                        }
+                    }
                     success_frame(&id_echo, &result)
                 }
                 Err(msg) => error_frame(&id_echo, -32602, &msg),
@@ -573,6 +615,19 @@ pub(crate) async fn handle_with_host_environment(
             // Live `agents.acpNodeMaxOldSpaceMb` so the probe child carries the
             // same V8 heap cap a real ACP spawn gets (intent-hq/intent#4330).
             let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
+            // A named profile reference (PROTOCOL §5.54) runs under that
+            // profile's saved environment and touches only its verdict.
+            if provider_id.contains('@') {
+                return Some(
+                    match api
+                        .provider_profiles_test_prompt(provider_id, model, node_max_old_space_mb)
+                        .await
+                    {
+                        Ok(result) => success_frame(&id_echo, &result),
+                        Err(e) => crate::router::delivery_error(&id_echo, e),
+                    },
+                );
+            }
             match intent_services::provider_test_prompt::provider_test_prompt(
                 Some(api),
                 &provider_id,

@@ -135,6 +135,9 @@ const TARGET: &str = "a-2";
 
 fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
     poison_typed(AgentLite {
+        digest_truncated: false,
+        last_agent_response_truncated: false,
+        last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
         id: AgentId::from(id),
@@ -179,9 +182,13 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        using_earlier_profile_settings: false,
+        provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
         metadata: AgentMetadata {
+            attention_request_reason_truncated: false,
+            completion_report_truncated: false,
             is_background: false,
             specialist: None,
             created_by_agent_id: None,
@@ -386,8 +393,8 @@ impl WorkspaceApi for FakeApi {
 
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
-            if id.as_str() == WS {
-                Ok(stub_workspace(WS))
+            if id.as_str() == WS || id.is_chief() {
+                Ok(stub_workspace(id.as_str()))
             } else {
                 Err(Error::NotFound(format!(
                     "Workspace not found: {}",
@@ -474,6 +481,35 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move {
             let messages = conversation_messages();
             Ok(json!({ "messages": messages, "totalMessages": messages.len() }))
+        })
+    }
+
+    fn agent_get_message_block(
+        &self,
+        _agent_id: AgentId,
+        message_id: String,
+        block_id: String,
+        _workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let mut block = json!({ "id": block_id, "type": "text", "text": "full body" });
+            poison(&mut block);
+            let mut out = json!({ "messageId": message_id, "block": block });
+            poison(&mut out);
+            Ok(out)
+        })
+    }
+
+    fn agent_rename(
+        &self,
+        _agent_id: AgentId,
+        name: String,
+        _skip_if_explicitly_set: bool,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let mut out = json!({ "success": true, "name": name });
+            poison(&mut out);
+            Ok(out)
         })
     }
 
@@ -701,6 +737,34 @@ const EGRESS_REGISTRY: &[(&str, Producer)] = &[
             &h.chief,
             "ws.app.agents.readConversation",
             "return await ws.app.agents.readConversation('amber-forest', 'a-2', { lastN: 10 });",
+        ))
+    }),
+    ("ws.app.chats.list", |h| {
+        Box::pin(Harness::mcp(
+            &h.chief,
+            "ws.app.chats.list",
+            "return await ws.app.chats.list();",
+        ))
+    }),
+    ("ws.app.chats.readConversation", |h| {
+        Box::pin(Harness::mcp(
+            &h.chief,
+            "ws.app.chats.readConversation",
+            "return await ws.app.chats.readConversation('a-2', { lastN: 10 });",
+        ))
+    }),
+    ("ws.app.chats.getMessageBlock", |h| {
+        Box::pin(Harness::mcp(
+            &h.chief,
+            "ws.app.chats.getMessageBlock",
+            "return await ws.app.chats.getMessageBlock('a-2', 'm-1', 'b-1');",
+        ))
+    }),
+    ("ws.app.chats.rename", |h| {
+        Box::pin(Harness::mcp(
+            &h.chief,
+            "ws.app.chats.rename",
+            "return await ws.app.chats.rename('a-2', 'Renamed chat');",
         ))
     }),
 ];

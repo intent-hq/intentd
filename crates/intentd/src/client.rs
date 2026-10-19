@@ -10,6 +10,70 @@ use std::path::Path;
 
 use serde_json::Value;
 
+/// Compatibility for already-installed sitters: their frozen readiness probes
+/// invoke the NEW daemon CLI and require successful JSON with a version. Keep
+/// the wire error intact and project only this read-only CLI liveness call.
+/// Ordinary clients still need a fresh hello; this result explicitly is not ready.
+pub(crate) fn startup_liveness_result(
+    method: &str,
+    params: &Value,
+    error: &Value,
+) -> Option<Value> {
+    if method != "system.status"
+        || !params.as_object().is_some_and(serde_json::Map::is_empty)
+        || error["code"] != -32012
+        || error["data"]["code"] != "daemon-not-ready"
+        || error["data"]["retryable"] != true
+    {
+        return None;
+    }
+    let snapshot = &error["data"]["startup"];
+    let version = snapshot["daemonVersion"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())?;
+    let phase = snapshot["phase"].as_str()?;
+    if snapshot["startupStatus"].as_u64() != Some(1)
+        || snapshot["attemptId"].as_str().is_none_or(str::is_empty)
+        || !matches!(phase, "preparing" | "indexing" | "finalizing")
+        || snapshot.get("failure").is_some()
+    {
+        return None;
+    }
+    let safe_number = |value: &Value| value.as_u64().filter(|n| *n <= 9_007_199_254_740_991);
+    for key in ["elapsedMs", "phaseElapsedMs", "progressAgeMs"] {
+        safe_number(&snapshot[key])?;
+    }
+    let retry = snapshot["retryAfterMs"].as_u64()?;
+    if !(1000..=30000).contains(&retry) || error["data"]["retryAfterMs"] != retry {
+        return None;
+    }
+    if let Some(progress) = snapshot.get("progress") {
+        if safe_number(&progress["completedNotes"])? > safe_number(&progress["totalNotes"])?
+            || safe_number(&progress["processedSourceBytes"])?
+                > safe_number(&progress["totalSourceBytes"])?
+        {
+            return None;
+        }
+    }
+    if let Some(estimate) = snapshot.get("estimatedRemainingMs") {
+        safe_number(estimate)?;
+        if phase != "indexing" {
+            return None;
+        }
+    }
+    if phase == "finalizing" {
+        if !matches!(
+            snapshot["finalizingStep"].as_str(),
+            Some("anchors" | "committing" | "services")
+        ) {
+            return None;
+        }
+    } else if snapshot.get("finalizingStep").is_some() {
+        return None;
+    }
+    Some(serde_json::json!({"version":version,"ready":false,"startup":snapshot}))
+}
+
 /// Send one JSON-RPC request over an established local-transport stream and
 /// return the parsed response envelope. The request `id` is fixed at `1`
 /// (one request per connection).
@@ -68,6 +132,23 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
 
     const ERROR_PIPE_BUSY: i32 = 231;
 
+    // Sitter cleanup must never send shutdown to a different launch. Retain
+    // the expected process while checking the peer on the very connection used
+    // for the request; a separate probe/reconnect would reintroduce the race.
+    let expected = if method == "system.shutdown" {
+        std::env::var_os("INTENTD_SHUTDOWN_EXPECTED_PID")
+            .map(|value| -> anyhow::Result<_> {
+                let pid = value
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|pid| *pid != 0)
+                    .ok_or_else(|| anyhow::anyhow!("invalid expected shutdown process identity"))?;
+                Ok((pid, intentd_sitter::windows::Process::open(pid, false)?))
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let pipe = intent_transport::pipe_name_for_socket_path(socket)
         .map_err(|e| anyhow::anyhow!("cannot derive pipe name for {}: {e}", socket.display()))?;
     let mut attempts = 0u32;
@@ -84,6 +165,20 @@ pub async fn rpc_call(socket: &Path, method: &str, params: Value) -> anyhow::Res
             ),
         }
     };
+    if let Some((pid, process)) = &expected {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetNamedPipeServerProcessId(pipe: *mut std::ffi::c_void, pid: *mut u32) -> i32;
+        }
+        let mut peer = 0;
+        // SAFETY: the connected pipe handle is retained and peer is writable.
+        let found = unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &raw mut peer) };
+        anyhow::ensure!(
+            found != 0 && peer == *pid && !process.exited()?,
+            "refusing shutdown of an endpoint not owned by the expected child"
+        );
+    }
     exchange(stream, method, params).await
 }
 
@@ -188,5 +283,97 @@ mod tests {
             response,
             json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_liveness_tests {
+    use super::*;
+    use intent_core::startup::StartupStatus;
+    use serde_json::json;
+
+    fn error() -> Value {
+        json!({"code":-32012,"message":"Daemon not ready","data":{
+            "code":"daemon-not-ready","retryable":true,"retryAfterMs":1000,
+            "startup":StartupStatus::with_daemon_version("0.0.7").snapshot()}})
+    }
+
+    #[test]
+    fn compatibility_uses_server_version_never_the_cli_build_version() {
+        assert_ne!(env!("CARGO_PKG_VERSION"), "0.0.7");
+        let error = error();
+        let result = startup_liveness_result("system.status", &json!({}), &error).unwrap();
+        assert_eq!(
+            result,
+            json!({"version":"0.0.7","ready":false,"startup":error["data"]["startup"]})
+        );
+    }
+
+    #[test]
+    fn malformed_optional_fields_never_allow_cli_liveness() {
+        for field in ["progress", "finalizingStep", "estimatedRemainingMs"] {
+            for value in [Value::Null, json!(false), json!(0), json!(""), json!({})] {
+                for phase in ["preparing", "finalizing"] {
+                    let mut invalid = error();
+                    invalid["data"]["startup"]["phase"] = json!(phase);
+                    if phase == "finalizing" {
+                        invalid["data"]["startup"]["finalizingStep"] = json!("anchors");
+                    }
+                    invalid["data"]["startup"][field] = value.clone();
+                    assert!(
+                        startup_liveness_result("system.status", &json!({}), &invalid).is_none(),
+                        "{phase} {field}={value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_well_formed_live_status_errors_allow_cli_liveness() {
+        let error = error();
+        for method in [
+            "client.hello",
+            "system.startupStatus",
+            "note.add",
+            "system.shutdown",
+        ] {
+            assert!(startup_liveness_result(method, &json!({}), &error).is_none());
+        }
+        for params in [Value::Null, json!([]), json!({"extra":true})] {
+            assert!(startup_liveness_result("system.status", &params, &error).is_none());
+        }
+        for pointer in [
+            "/code",
+            "/data/code",
+            "/data/retryable",
+            "/data/retryAfterMs",
+            "/data/startup/startupStatus",
+            "/data/startup/daemonVersion",
+            "/data/startup/attemptId",
+            "/data/startup/phase",
+            "/data/startup/elapsedMs",
+            "/data/startup/phaseElapsedMs",
+            "/data/startup/progressAgeMs",
+            "/data/startup/retryAfterMs",
+        ] {
+            let mut invalid = error.clone();
+            *invalid.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(
+                startup_liveness_result("system.status", &json!({}), &invalid).is_none(),
+                "{pointer}"
+            );
+        }
+        for phase in ["ready", "failed", "unknown"] {
+            let mut invalid = error.clone();
+            invalid["data"]["startup"]["phase"] = json!(phase);
+            assert!(startup_liveness_result("system.status", &json!({}), &invalid).is_none());
+        }
+        let mut invalid = error.clone();
+        invalid["data"]["startup"]["daemonVersion"] = json!("");
+        assert!(startup_liveness_result("system.status", &json!({}), &invalid).is_none());
+        let mut invalid = error.clone();
+        invalid["data"]["startup"]["progress"] = json!({"completedNotes":2,"totalNotes":1,"processedSourceBytes":0,"totalSourceBytes":1});
+        assert!(startup_liveness_result("system.status", &json!({}), &invalid).is_none());
     }
 }

@@ -54,6 +54,11 @@ use crate::Services;
 #[cfg(test)]
 mod host_role_tests;
 
+#[cfg(test)]
+pub(crate) fn reran_unarmed(test: &str) -> bool {
+    tests::reran_unarmed(test)
+}
+
 /// The log line an unbound gate evaluation emits (once per gate per process).
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
 
@@ -1566,6 +1571,60 @@ mod tests {
             .await
             .expect("visible ids")
             .is_none());
+    }
+
+    /// `workspace.findByPullRequest` is narrowed exactly like `workspace.list`:
+    /// with both fixture workspaces linked to one PR, a collaborator sees
+    /// only its member workspace and a non-member nothing; administrators,
+    /// agents and the daemon see both, most recently linked first. A non-PR
+    /// URL is `InvalidParams` for every caller.
+    #[tokio::test]
+    async fn find_by_pull_request_visibility_by_role() {
+        const PR: &str = "https://github.com/intent-hq/intentd/pull/7";
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        for ws in [&f.other_ws, &f.ws] {
+            sqlx::query("UPDATE workspace SET pr_url = ? WHERE id = ?")
+                .bind(PR)
+                .bind(ws.as_str())
+                .execute(f.services.store().write_pool())
+                .await
+                .expect("link workspace");
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        for role in ROLES {
+            let found: Vec<WorkspaceId> = f
+                .run(
+                    role,
+                    f.services
+                        .find_workspaces_by_pull_request(format!("{PR}/files")),
+                )
+                .await
+                .expect("workspace.findByPullRequest")
+                .into_iter()
+                .map(|w| w.id)
+                .collect();
+            match role {
+                Role::Owner | Role::Collaborator => {
+                    assert_eq!(found, std::slice::from_ref(&f.ws), "{role:?}");
+                }
+                Role::NonMember => assert!(found.is_empty(), "{role:?}: {found:?}"),
+                Role::Administrator | Role::Agent | Role::Daemon => {
+                    assert_eq!(found, [f.ws.clone(), f.other_ws.clone()], "{role:?}");
+                }
+            }
+            let bad = f
+                .run(
+                    role,
+                    f.services
+                        .find_workspaces_by_pull_request("https://github.com/o/r/issues/7".into()),
+                )
+                .await;
+            assert!(
+                matches!(bad, Err(Error::InvalidParams(_))),
+                "{role:?}: {bad:?}"
+            );
+        }
     }
 
     /// `workspace.members.list` by the primary user whose cached row has no

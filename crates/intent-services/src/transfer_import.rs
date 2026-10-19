@@ -26,7 +26,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use intent_core::transfer::{TransferManifest, TRANSFER_FORMAT_VERSION};
+use intent_core::transfer::{TransferManifest, CREATING_INTENTD_VERSION, TRANSFER_FORMAT_VERSION};
 use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId};
 use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
@@ -105,7 +105,7 @@ impl Services {
                 manifest.format_version, TRANSFER_FORMAT_VERSION
             )));
         }
-        let own_version = env!("CARGO_PKG_VERSION");
+        let own_version = CREATING_INTENTD_VERSION;
         if manifest.creating_intentd_version != own_version {
             return Err(Error::InvalidParams(format!(
                 "archive was created by intentd {} but this daemon is {} — versions must match exactly",
@@ -1227,8 +1227,39 @@ fn validate_row_scope(
                         && monitor.script_id == field(row, "script_id")
                         && monitor.run_id == field(row, "run_id")
                         && monitor.state == field(row, "state")
-                        && (session_ids.contains(monitor.agent_id.as_str())
-                            || (monitor.state != "active" && row["wake_state"] == "suppressed"))
+                        && monitor.state == "active"
+                        && session_ids.contains(monitor.agent_id.as_str())
+                }
+                "script_notification_job" | "agent_queue_admission" => {
+                    let encoded = if table == "script_notification_job" {
+                        "metadata"
+                    } else {
+                        "payload"
+                    };
+                    let value: serde_json::Value =
+                        serde_json::from_str(row[encoded].as_str().unwrap_or_default()).map_err(
+                            |e| Error::InvalidParams(format!("invalid imported notification: {e}")),
+                        )?;
+                    let metadata = if table == "script_notification_job" {
+                        &value
+                    } else {
+                        &value["messageMetadata"]
+                    };
+                    let key = if table == "script_notification_job" {
+                        "wake_id"
+                    } else {
+                        "id"
+                    };
+                    field(row, "workspace_id") == workspace_id.0
+                        && session_ids.contains(field(row, "agent_id").as_str())
+                        && metadata["type"] == "script_monitor_wake"
+                        && metadata["workspaceId"].as_str() == Some(workspace_id.as_str())
+                        && metadata["agentId"]
+                            .as_str()
+                            .is_none_or(|id| id == field(row, "agent_id"))
+                        && metadata["monitorId"]
+                            .as_str()
+                            .is_some_and(|id| field(row, key) == format!("script-monitor:{id}"))
                 }
                 "agent_message" | "agent_usage_cell" | "agent_queue" => {
                     session_ids.contains(field(row, "agent_id").as_str())
@@ -1565,7 +1596,29 @@ mod tests {
         rows[1].1[0]["state"] = serde_json::json!("cancelled");
         rows[1].1[0]["row_json"] = serde_json::json!(cancelled.to_string());
         rows[1].1[0]["wake_state"] = serde_json::json!("suppressed");
-        validate_row_scope(&rows, &ws()).unwrap();
+        assert!(validate_row_scope(&rows, &ws()).is_err());
+    }
+
+    #[test]
+    fn imported_script_delivery_is_scoped_by_owner_and_embedded_identity() {
+        for table in ["script_notification_job", "agent_queue_admission"] {
+            let metadata = serde_json::json!({"type":"script_monitor_wake","monitorId":"m","workspaceId":ws(),"agentId":"a"});
+            let mut row = serde_json::json!({"id":"script-monitor:m","wake_id":"script-monitor:m","workspace_id":ws(),"agent_id":"a",
+                "metadata":metadata.to_string(),"payload":serde_json::json!({"messageMetadata":metadata}).to_string()});
+            let mut rows = vec![
+                (
+                    "agent_session".into(),
+                    vec![serde_json::json!({"id":"a","workspace_id":ws()})],
+                ),
+                (table.into(), vec![row.clone()]),
+            ];
+            validate_row_scope(&rows, &ws()).unwrap();
+            rows[1].1[0]["agent_id"] = serde_json::json!("foreign");
+            assert!(validate_row_scope(&rows, &ws()).is_err());
+            row["workspace_id"] = serde_json::json!("foreign");
+            rows[1].1[0] = row;
+            assert!(validate_row_scope(&rows, &ws()).is_err());
+        }
     }
 
     /// Workspace paths are re-rooted under `<target_root>/<workspaceId>/`,
@@ -2087,7 +2140,7 @@ mod tests {
     fn manifest(ws: &WorkspaceId) -> TransferManifest {
         TransferManifest {
             format_version: TRANSFER_FORMAT_VERSION,
-            creating_intentd_version: env!("CARGO_PKG_VERSION").to_string(),
+            creating_intentd_version: CREATING_INTENTD_VERSION.to_string(),
             workspace_id: ws.clone(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
             tables: vec![],
@@ -4036,7 +4089,7 @@ mod tests {
             .await
             .expect_err("version");
         let msg = err.to_string();
-        assert!(msg.contains("0.0.1-other") && msg.contains(env!("CARGO_PKG_VERSION")));
+        assert!(msg.contains("0.0.1-other") && msg.contains(CREATING_INTENTD_VERSION));
 
         let chief = manifest(&WorkspaceId::chief());
         assert!(svc

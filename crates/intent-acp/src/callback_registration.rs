@@ -54,21 +54,56 @@ struct Receipt {
 }
 
 /// A negotiated client bound privately to its original connection.
+#[derive(Clone)]
 pub struct CallbackClient {
-    connection: Arc<Connection>,
+    pub(crate) connection: Arc<Connection>,
+    pub(crate) monitoring: Option<Arc<crate::review_monitoring::Generation>>,
 }
 
 impl CallbackClient {
+    /// Retain the exact negotiated connection for an independently owned
+    /// original startup operation. This does not negotiate or grant support.
+    #[must_use]
+    pub fn original_connection(&self) -> &Connection {
+        &self.connection
+    }
+
     pub(crate) fn negotiated(
         connection: Arc<Connection>,
         offer: CallbackOffer,
         meta: Option<&Meta>,
+        monitoring: Option<Arc<crate::review_monitoring::Generation>>,
     ) -> Option<Self> {
         if offer != CallbackOffer::V1 {
             return None;
         }
         let capability: Capability = serde_json::from_value(meta?.get(META_KEY)?.clone()).ok()?;
-        (capability.version == 1 && capability.method == METHOD).then_some(Self { connection })
+        (capability.version == 1 && capability.method == METHOD).then_some(Self {
+            connection,
+            monitoring,
+        })
+    }
+
+    /// Close an original startup attempt before its session ID is known. This
+    /// only fences local eligibility; it does not establish remote retirement.
+    pub fn retire_review_attempt(
+        &self,
+        context: &crate::review_monitoring::ReviewMonitoringContext,
+    ) {
+        if let Some(generation) = &self.monitoring {
+            generation.retire_attempt(context);
+        }
+    }
+
+    /// Only the actual still-current explicitly negotiated original generation.
+    /// This is consumer support, never account authority or a callback ACK.
+    #[must_use]
+    pub fn supports_review_monitoring(&self) -> bool {
+        self.connection.is_alive()
+            && self
+                .monitoring
+                .as_ref()
+                .is_some_and(|generation| generation.current())
     }
 
     /// Execute the original `session/new` once and retain its optional receipt.
@@ -81,9 +116,23 @@ impl CallbackClient {
         mcp_servers: Vec<McpServer>,
         meta: Option<Meta>,
     ) -> AcpResult<CallbackSession<NewSessionResponse>> {
+        let attempt = self
+            .monitoring
+            .as_ref()
+            .map(|generation| generation.attempt(None, meta.as_ref()));
         let response =
             crate::session::new_session(&self.connection, cwd, mcp_servers, meta).await?;
-        let query = self.capture(response.session_id.to_string(), response.meta.as_ref());
+        let mut query = self.capture(response.session_id.to_string(), response.meta.as_ref());
+        let monitoring = attempt.and_then(|attempt| {
+            attempt.capture(
+                &self.connection,
+                &response.session_id.to_string(),
+                response.meta.as_ref(),
+            )
+        });
+        if let Some(query) = &mut query {
+            query.monitoring = monitoring;
+        }
         Ok(CallbackSession { response, query })
     }
 
@@ -98,10 +147,47 @@ impl CallbackClient {
         mcp_servers: Vec<McpServer>,
         meta: Option<Meta>,
     ) -> AcpResult<CallbackSession<LoadSessionResponse>> {
+        let attempt = self
+            .monitoring
+            .as_ref()
+            .map(|generation| generation.attempt(Some(session_id), meta.as_ref()));
         let response =
             crate::session::load_session(&self.connection, session_id, cwd, mcp_servers, meta)
                 .await?;
-        let query = self.capture(session_id.to_owned(), response.meta.as_ref());
+        let mut query = self.capture(session_id.to_owned(), response.meta.as_ref());
+        let monitoring = attempt.and_then(|attempt| {
+            attempt.capture(&self.connection, session_id, response.meta.as_ref())
+        });
+        if let Some(query) = &mut query {
+            query.monitoring = monitoring;
+        }
+        Ok(CallbackSession { response, query })
+    }
+
+    pub(crate) async fn load_prepared_review_history(
+        &self,
+        request: agent_client_protocol::schema::v1::LoadSessionRequest,
+        generation: &Arc<crate::review_monitoring::Generation>,
+        deadline: std::time::Instant,
+        admission: Box<dyn crate::review_monitoring::history::ReviewHistoryLoadAdmission>,
+    ) -> AcpResult<CallbackSession<LoadSessionResponse>> {
+        let session_id = request.session_id.0.to_string();
+        let attempt = generation.attempt(Some(&session_id), request.meta.as_ref());
+        let response: LoadSessionResponse = serde_json::from_value(
+            self.connection
+                .request_review_history_load(
+                    serde_json::to_value(request)?,
+                    generation,
+                    deadline,
+                    admission,
+                )
+                .await?,
+        )?;
+        let mut query = self.capture(session_id.clone(), response.meta.as_ref());
+        let monitoring = attempt.capture(&self.connection, &session_id, response.meta.as_ref());
+        if let Some(query) = &mut query {
+            query.monitoring = monitoring;
+        }
         Ok(CallbackSession { response, query })
     }
 
@@ -112,6 +198,7 @@ impl CallbackClient {
                 connection: Arc::clone(&self.connection),
                 session_id,
                 receipt: receipt.query_receipt,
+                monitoring: None,
             })
     }
 }
@@ -129,6 +216,7 @@ pub struct CallbackQuery {
     connection: Arc<Connection>,
     session_id: String,
     receipt: String,
+    monitoring: Option<crate::review_monitoring::PendingReviewMonitoring>,
 }
 
 /// Known tools at the offered endpoint. This list only controls attribution.
@@ -170,6 +258,15 @@ impl CallbackStdioServer {
 }
 
 impl CallbackQuery {
+    /// Retain only pending peer evidence. It yields no recipient receipt until
+    /// this exact registration acknowledges, and never grants account access.
+    #[must_use]
+    pub fn pending_review_monitoring(
+        &self,
+    ) -> Option<crate::review_monitoring::PendingReviewMonitoring> {
+        self.monitoring.clone()
+    }
+
     /// Consume this sidecar and synchronously capture one registration identity.
     #[must_use]
     pub fn registration(self, server: CallbackStdioServer) -> CallbackRegistration {
@@ -349,6 +446,11 @@ impl CallbackRegistration {
             || raw.get("reason").is_some_and(Value::is_null)
         {
             return CallbackDeliveryOutcome::Malformed(raw);
+        }
+        if outcome.status == CallbackStatus::Acknowledged {
+            if let Some(monitoring) = &self.query.monitoring {
+                monitoring.acknowledge();
+            }
         }
         self.query
             .connection
