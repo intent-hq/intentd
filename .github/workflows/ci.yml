@@ -308,6 +308,27 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
+      # Real claude-agent-acp contract (claude_adapter_contract): the pinned
+      # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
+      # so every PR and merge-queue run installs the exact pin and checks that
+      # it still applies the utility-session settings Intent sends. Offline
+      # beyond the npm install: a stand-in replaces the Claude CLI, no account.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+      - name: Verify the Claude adapter pin provisioner offline
+        run: python3 -I -B -S scripts/test-prepare-claude-adapter-pin.py
+      - name: Install the pinned Claude adapter
+        run: |
+          set -euo pipefail
+          adapter=$(python3 -I -B -S scripts/prepare-claude-adapter-pin.py \
+            --cache-dir "$RUNNER_TEMP/claude-adapter-pin")
+          echo "INTENT_CLAUDE_ADAPTER_PIN_FIXTURE=$adapter" >> "$GITHUB_ENV"
+      - name: Real Claude adapter utility-session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
+        run: "cargo test -p intent-services --lib claude_adapter_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
       # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
