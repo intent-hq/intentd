@@ -118,21 +118,25 @@ class RunnerTests(unittest.TestCase):
                               env=child_env(self.bin, self.temp, self.preload, **extra_env),
                               capture_output=True, text=True, timeout=60)
 
-    def test_child_runner_imports_from_the_callers_user_site(self):
-        # Same interpreter flags and env as run_runner; the user site must be live
-        # on sys.path, not merely computed.
-        expected = site.getusersitepackages()
-        probe = subprocess.run(
-            [sys.executable, *self.RUNNER_FLAGS, '-c',
-             'import site, sys; print(site.ENABLE_USER_SITE, site.getusersitepackages() in sys.path, '
-             'site.getusersitepackages())'],
-            env=child_env(self.bin, self.temp, self.preload), capture_output=True, text=True, timeout=60)
+    USER_SITE_PROBE = ('import site, sys; print(bool(site.ENABLE_USER_SITE), '
+                       'site.getusersitepackages() in sys.path, site.getusersitepackages())')
+
+    def probe_user_site(self, flags, env):
+        probe = subprocess.run([sys.executable, *flags, '-c', self.USER_SITE_PROBE],
+                               env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(probe.returncode, 0, probe.stderr)
         enabled, on_path, path = probe.stdout.split(maxsplit=2)
-        self.assertEqual(path.strip(), expected, probe.stderr)
-        self.assertEqual(enabled, 'True', 'the child runner disables the user site')
-        if os.path.isdir(expected):
-            self.assertEqual(on_path, 'True', f'{expected} is not on the child sys.path')
+        return enabled, on_path, path.strip()
+
+    def test_child_runner_sees_the_same_user_site_as_a_plain_run(self):
+        # Reference: this interpreter run plainly in the caller's environment, as
+        # `make test-release-scripts` runs the runner. A virtual environment
+        # disables the user site there too, so only a difference is a failure.
+        plain_env = dict(os.environ)
+        plain_env.pop('PYTHONNOUSERSITE', None)
+        expected = self.probe_user_site((), plain_env)
+        actual = self.probe_user_site(self.RUNNER_FLAGS, child_env(self.bin, self.temp, self.preload))
+        self.assertEqual(actual, expected, 'the fixture env changes where the runner finds user-site packages')
 
     def test_child_env_forwards_import_path_and_accepts_overrides(self):
         with unittest.mock.patch.dict(os.environ, {'PYTHONPATH': '/fixture/py', 'LD_LIBRARY_PATH': '/fixture/lib'}):
