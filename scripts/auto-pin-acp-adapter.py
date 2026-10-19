@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Propose one exact Codex ACP pin update and arm it for the merge queue.
+"""Propose one exact ACP adapter pin update and arm it for the merge queue.
 
-Run from the intentd root with GH_TOKEN=RELEASE_PLZ_TOKEN, or --dry-run.
+Run from the intentd root with --adapter codex|claude-code and
+GH_TOKEN=RELEASE_PLZ_TOKEN, or --dry-run. Each adapter has its own rolling
+branch and PR, so one adapter's refusal or hold never blocks another.
 Only git objects and the dedicated remote branch are written; the checkout,
 index, and local branches are untouched. Normal PR CI tests the proposed pin;
 the PR is armed for squash auto-merge, never merged directly, so the merge
@@ -24,17 +26,76 @@ from provider_cli_metadata import METADATA, package_snapshot, replace_package
 
 
 REPO = "intent-hq/intentd"
-BRANCH = "auto/codex-acp-pin"
-REF = f"refs/heads/{BRANCH}"
 CONFIG = "crates/intent-providers/src/config.rs"
-PACKAGE = "@agentclientprotocol/codex-acp"
-REGISTRY = "https://registry.npmjs.org/@agentclientprotocol%2fcodex-acp/latest"
 BOT_NAME = "github-actions[bot]"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
-PIN = re.compile(
-    r'^(pub const CODEX_ACP_NPX_PACKAGE: &str = "'
-    r'@agentclientprotocol/codex-acp@)([^"\r\n]+)(";)$', re.MULTILINE
-)
+
+
+class Adapter:
+    """Everything that differs between managed adapters; the rules do not."""
+
+    def __init__(self, *, key, label, package, branch, pin, pin_name, title, trailer,
+                 marker, release_repo, purpose, engines_node=None):
+        self.key = key  # --adapter value and adapter-cli-packages.json key
+        self.label = label  # commit-message name
+        self.package = package
+        self.branch = branch
+        self.ref = f"refs/heads/{branch}"
+        self.pin = pin  # groups: prefix, version, suffix
+        self.pin_name = pin_name
+        self.title = title
+        self.trailer = trailer
+        self.marker = marker
+        self.release_repo = release_repo
+        self.purpose = purpose
+        # Exact npm engines.node the daemon's user-facing requirement matches;
+        # any other declaration needs a human to update that requirement.
+        self.engines_node = engines_node
+        self.registry = ("https://registry.npmjs.org/"
+                         + package.replace("/", "%2f") + "/latest")
+
+
+# Codex names, titles, trailers, and markers predate the generalization; keep
+# them byte-identical so open and historical rolling PRs remain recognized.
+ADAPTERS = {
+    "codex": Adapter(
+        key="codex",
+        label="Codex ACP",
+        package="@agentclientprotocol/codex-acp",
+        branch="auto/codex-acp-pin",
+        pin=re.compile(
+            r'^(pub const CODEX_ACP_NPX_PACKAGE: &str = "'
+            r'@agentclientprotocol/codex-acp@)([^"\r\n]+)(";)$', re.MULTILINE
+        ),
+        pin_name="CODEX_ACP_NPX_PACKAGE",
+        title="fix: bump Codex ACP fallback to v{}",
+        trailer="Auto-pin-Codex-ACP: v1",
+        marker="<!-- auto-pin-codex-acp: v1 -->",
+        release_repo="agentclientprotocol/codex-acp",
+        purpose="The fallback stays pinned to an exact version.",
+    ),
+    "claude-code": Adapter(
+        key="claude-code",
+        label="claude-agent-acp",
+        package="@agentclientprotocol/claude-agent-acp",
+        branch="auto/claude-agent-acp-pin",
+        pin=re.compile(
+            r'^(macro_rules! claude_agent_acp_version \{\s*\(\) => \{\s*")'
+            r'([^"\r\n]+)("\s*\};?\s*\})', re.MULTILINE
+        ),
+        pin_name="claude_agent_acp_version!",
+        title="fix: bump claude-agent-acp pin to v{}",
+        trailer="Auto-pin-Claude-Agent-ACP: v1",
+        marker="<!-- auto-pin-claude-agent-acp: v1 -->",
+        release_repo="agentclientprotocol/claude-agent-acp",
+        purpose="The adapter stays pinned to an exact version.",
+        # CLAUDE_AGENT_ACP_NODE_REQUIREMENT ("Node.js 22+") in config.rs.
+        engines_node=">=22",
+    ),
+}
+# Set by main() from --adapter before any other helper runs; there is no
+# default, so a helper used without an adapter fails instead of acting on one.
+ADAPTER = None
 
 
 class Refusal(Exception):
@@ -73,9 +134,9 @@ def version(value):
 
 
 def read_pin(content):
-    matches = list(PIN.finditer(content))
+    matches = list(ADAPTER.pin.finditer(content))
     if len(matches) != 1:
-        raise Refusal("Expected exactly one CODEX_ACP_NPX_PACKAGE literal.")
+        raise Refusal(f"Expected exactly one {ADAPTER.pin_name} literal.")
     value = matches[0][2]
     version(value)
     return value
@@ -83,18 +144,18 @@ def read_pin(content):
 
 def replace_pin(content, target):
     read_pin(content)
-    return PIN.sub(lambda match: match[1] + target + match[3], content)
+    return ADAPTER.pin.sub(lambda match: match[1] + target + match[3], content)
 
 
 def title(target):
-    return f"fix: bump Codex ACP fallback to v{target}"
+    return ADAPTER.title.format(target)
 
 
 def message(current, target, previous_metadata_hash=None, package_metadata_hash=None):
     return (
         f"{title(target)}\n\n"
-        f"Managed Codex ACP pin: {current} -> {target}.\n"
-        "Auto-pin-Codex-ACP: v1\n"
+        f"Managed {ADAPTER.label} pin: {current} -> {target}.\n"
+        f"{ADAPTER.trailer}\n"
     ) + (f"Previous-PR-Metadata-SHA256: {previous_metadata_hash}\n"
          if previous_metadata_hash else "") + (
         f"Adapter-Package-Metadata-SHA256: {package_metadata_hash}\n"
@@ -109,11 +170,11 @@ def pr_metadata_hash(pr):
 
 def body(current, target):
     return (
-        "<!-- auto-pin-codex-acp: v1 -->\n"
-        f"Update `{PACKAGE}` from `{current}` to `{target}` in "
-        "`CODEX_ACP_NPX_PACKAGE`. The fallback stays pinned to an exact version.\n\n"
+        f"{ADAPTER.marker}\n"
+        f"Update `{ADAPTER.package}` from `{current}` to `{target}` in "
+        f"`{ADAPTER.pin_name}`. {ADAPTER.purpose}\n\n"
         f"[Upstream release v{target}]"
-        f"(https://github.com/agentclientprotocol/codex-acp/releases/tag/v{target}).\n\n"
+        f"(https://github.com/{ADAPTER.release_repo}/releases/tag/v{target}).\n\n"
         "This automation arms squash auto-merge: the merge queue lands the update "
         "once normal PR CI passes, rerunning CI on the merged tree first.\n\n"
         "Add `hold-release` to pause automated updates and disable auto-merge. "
@@ -173,10 +234,10 @@ def config_at(commit):
 
 
 def branch_head():
-    result = git("ls-remote", "--heads", "origin", REF).splitlines()
+    result = git("ls-remote", "--heads", "origin", ADAPTER.ref).splitlines()
     if not result:
         return ""
-    if len(result) != 1 or result[0].split()[1] != REF:
+    if len(result) != 1 or result[0].split()[1] != ADAPTER.ref:
         raise Refusal("Unexpected rolling branch lookup result.")
     return result[0].split()[0]
 
@@ -186,7 +247,7 @@ def find_pr():
     # a fork PR with an identical branch name must never be edited.
     pages = decode_json(run(
         "gh", "api", "--method", "GET", f"repos/{REPO}/pulls",
-        "-f", "state=all", "-f", f"head=intent-hq:{BRANCH}",
+        "-f", "state=all", "-f", f"head=intent-hq:{ADAPTER.branch}",
         "-f", "base=main", "-f", "per_page=100", "--paginate", "--slurp",
     ))
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
@@ -198,7 +259,7 @@ def find_pr():
                 pr["head"].get("repo") is not None
                 and pr["head"]["repo"]["full_name"] == REPO
                 and pr["base"]["repo"]["full_name"] == REPO
-                and pr["head"]["ref"] == BRANCH
+                and pr["head"]["ref"] == ADAPTER.branch
                 and pr["base"]["ref"] == "main"
             ):
                 matches.append(pr)
@@ -213,7 +274,7 @@ def find_pr():
 
 
 def inspect_branch(head, base):
-    git("fetch", "--quiet", "--no-tags", "origin", REF)
+    git("fetch", "--quiet", "--no-tags", "origin", ADAPTER.ref)
     if git("rev-parse", "FETCH_HEAD").strip() != head:
         raise Refusal("Rolling branch changed during lookup; retry from fresh state.")
     parents = git("rev-list", "--parents", "-n", "1", head).split()
@@ -236,9 +297,9 @@ def inspect_branch(head, base):
             raise Refusal("Adapter metadata was edited; preserving human changes.")
         previous = decode_json(git("show", f"{parent}:{METADATA}"))
         actual = decode_json(metadata)
-        package = actual["codex"]["package"]
-        expected = decode_json(replace_package(json.dumps(previous), "codex", package))
-        if actual != expected or package.get("name") != PACKAGE or package.get("version") != target:
+        package = actual[ADAPTER.key]["package"]
+        expected = decode_json(replace_package(json.dumps(previous), ADAPTER.key, package))
+        if actual != expected or package.get("name") != ADAPTER.package or package.get("version") != target:
             raise Refusal("Unexpected adapter metadata changes; preserving human edits.")
         expected_changes = "\n".join(sorted([expected_changes, f"M\t{METADATA}"]))
     identity = git("show", "-s", "--format=%an%n%ae%n%cn%n%ce", head).splitlines()
@@ -258,13 +319,13 @@ def inspect_branch(head, base):
 
 def make_commit(base, content, current, target, manifest, previous_metadata_hash=None):
     # A private index keeps staging and the caller's working tree untouched.
-    with tempfile.TemporaryDirectory(prefix="codex-acp-pin-") as directory:
+    with tempfile.TemporaryDirectory(prefix="acp-adapter-pin-") as directory:
         env = os.environ | {"GIT_INDEX_FILE": str(Path(directory) / "index")}
         blob = git("hash-object", "-w", "--stdin", input=replace_pin(content, target)).strip()
         git("read-tree", base, env=env)
         mode = git("ls-tree", base, CONFIG).split()[0]
         git("update-index", "--cacheinfo", f"{mode},{blob},{CONFIG}", env=env)
-        metadata = replace_package(git("show", f"{base}:{METADATA}"), "codex", manifest)
+        metadata = replace_package(git("show", f"{base}:{METADATA}"), ADAPTER.key, manifest)
         metadata_blob = git("hash-object", "-w", "--stdin", input=metadata).strip()
         metadata_mode = git("ls-tree", base, METADATA).split()[0]
         git("update-index", "--cacheinfo", f"{metadata_mode},{metadata_blob},{METADATA}", env=env)
@@ -278,12 +339,36 @@ def make_commit(base, content, current, target, manifest, previous_metadata_hash
                    input=message(current, target, previous_metadata_hash, package_metadata_hash), env=env).strip()
 
 
+def node_floor(declared):
+    """The major of a plain `>=N`, `>=N.0`, or `>=N.0.0` range, else None."""
+    match = isinstance(declared, str) and re.fullmatch(
+        r"\s*>=\s*(0|[1-9][0-9]*)(?:\.0){0,2}\s*", declared)
+    return int(match[1]) if match else None
+
+
+def check_engines(manifest):
+    if ADAPTER.engines_node is None:
+        return
+    engines = manifest.get("engines")
+    declared = engines.get("node") if isinstance(engines, dict) else None
+    if node_floor(declared) != node_floor(ADAPTER.engines_node):
+        raise Refusal(
+            f"{ADAPTER.package}@{manifest.get('version')} declares engines.node "
+            f"{json.dumps(declared)}, not {json.dumps(ADAPTER.engines_node)}; update the "
+            "daemon's Node.js requirement and pin by hand, then this automation's "
+            "expected engines.node."
+        )
+
+
 def main():
+    global ADAPTER
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--adapter", required=True, choices=sorted(ADAPTERS))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    ADAPTER = ADAPTERS[args.adapter]
     if not os.environ.get("GH_TOKEN") and not args.dry_run:
-        print("::warning::RELEASE_PLZ_TOKEN is not set; skipping Codex ACP publication.")
+        print(f"::warning::RELEASE_PLZ_TOKEN is not set; skipping {ADAPTER.package} publication.")
         return
     if os.environ.get("GITHUB_REPOSITORY", REPO) != REPO:
         raise Refusal("This automation only publishes to intent-hq/intentd.")
@@ -297,10 +382,10 @@ def main():
     current = read_pin(content)
     manifest = decode_json(run(
         "curl", "--fail", "--silent", "--show-error", "--location",
-        "--max-time", "60", "--retry", "2", REGISTRY,
+        "--max-time", "60", "--retry", "2", ADAPTER.registry,
     ))
-    if not isinstance(manifest, dict) or manifest.get("name") != PACKAGE:
-        raise Refusal("Registry response is not the expected Codex ACP package.")
+    if not isinstance(manifest, dict) or manifest.get("name") != ADAPTER.package:
+        raise Refusal(f"Registry response is not the expected {ADAPTER.package} package.")
     try:
         package_snapshot(manifest)
     except ValueError as error:
@@ -360,6 +445,10 @@ def main():
             disable_auto_merge(pr, f"npm latest {target} is older than {proposed}",
                                args.dry_run)
         return
+    # Only now is `target` about to be proposed or armed. Refuse before any
+    # publication, but after the hold/human/withdrawn-version disarms above so
+    # an unguarded npm latest never strands an armed proposal.
+    check_engines(manifest)
     if proposed == target and pr and metadata_matches:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
         if not pr.get("auto_merge"):
@@ -373,7 +462,7 @@ def main():
         if proposed == target and recover_metadata:
             print(f"dry-run: would repair PR metadata for {target}{arming}; no publication.")
         else:
-            print(f"dry-run: would propose {current} -> {target} on {BRANCH} and arm "
+            print(f"dry-run: would propose {current} -> {target} on {ADAPTER.branch} and arm "
                   "auto-merge; no publication.")
         return
 
@@ -393,8 +482,8 @@ def main():
         base, content, current, target, manifest, pr_metadata_hash(pr) if pr else None,
     )
     if commit != head:
-        git("push", f"--force-with-lease={REF}:{head}", "origin", f"{commit}:{REF}")
-    with tempfile.TemporaryDirectory(prefix="codex-acp-pr-") as directory:
+        git("push", f"--force-with-lease={ADAPTER.ref}:{head}", "origin", f"{commit}:{ADAPTER.ref}")
+    with tempfile.TemporaryDirectory(prefix="acp-adapter-pr-") as directory:
         description = Path(directory) / "body.txt"
         description.write_text(body(previous if proposed == target else current, target))
         if pr:
@@ -404,7 +493,7 @@ def main():
             number = pr["number"]
         else:
             url = run("gh", "pr", "create", "--repo", REPO, "--base", "main",
-                      "--head", BRANCH, "--title", title(target),
+                      "--head", ADAPTER.branch, "--title", title(target),
                       "--body-file", str(description)).strip()
             print(f"Opened {url} for {target}.")
             match = re.fullmatch(rf"https://github\.com/{REPO}/pull/([0-9]+)", url)
