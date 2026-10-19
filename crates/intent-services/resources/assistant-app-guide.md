@@ -554,7 +554,9 @@ available actions. Never construct links from guessed IDs or claim completion fr
 this static guide.
 
 Workspace file links open a file panel. Markdown files open in a read-only preview
-that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+that renders Mermaid diagrams. Relative image paths such as `charts/chart.png`
+resolve from the Markdown file's folder and cannot reach outside the workspace.
+Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
