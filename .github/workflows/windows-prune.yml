@@ -16,6 +16,8 @@ on:
     secrets:
       DEPOT_TOKEN:
         required: false
+      INTENT_SCCACHE_TOKEN:
+        required: false
       CI_QUEUE_READ_TOKEN:
         required: false
     inputs:
@@ -85,6 +87,9 @@ jobs:
         shell: powershell
         env:
           DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python -I -B scripts/setup-depot-sccache.py
       - name: Resolve pinned Rust channel
         if: inputs.apply && inputs.verify_build

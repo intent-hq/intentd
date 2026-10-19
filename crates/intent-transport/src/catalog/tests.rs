@@ -193,8 +193,9 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
 // Human workspace discussions: +5 router methods; PR workspace lookup: +1.
+// Named provider profiles (§5.54): +4 router methods.
 // Generic event recovery adds the events.fence fast path.
-const EXPECTED_TOTAL_METHODS: usize = 441;
+const EXPECTED_TOTAL_METHODS: usize = 445;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -202,7 +203,8 @@ const EXPECTED_TOTAL_METHODS: usize = 441;
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// Five discussion methods and one PR workspace lookup method are additive.
-const EXPECTED_ROUTER_METHODS: usize = 384;
+/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
+const EXPECTED_ROUTER_METHODS: usize = 388;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -787,6 +789,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1345,6 +1351,10 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "principal.list",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -2030,6 +2040,16 @@ mod unbound_owner_only_methods {
                 "scriptMonitor.cancelRun",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            (
+                "providers.profiles.create",
+                json!({ "baseProviderId": "codex", "name": "n" }),
+            ),
+            ("providers.profiles.delete", json!({ "profileId": "p1" })),
+            ("providers.profiles.list", json!({})),
+            (
+                "providers.profiles.update",
+                json!({ "profileId": "p1", "name": "n" }),
+            ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
             ("sentry.getIssue", json!({ "id": "i" })),
@@ -2566,6 +2586,10 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.update",
         "mcp.testConnection",
         "pairing.getInfo",
+        "providers.profiles.create",
+        "providers.profiles.delete",
+        "providers.profiles.list",
+        "providers.profiles.update",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",

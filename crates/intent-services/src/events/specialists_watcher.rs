@@ -254,7 +254,7 @@ fn is_md(path: &Path) -> bool {
 }
 
 /// The project-tier specialists directory, relative to the workspace root.
-const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
+pub(super) const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
 
 /// The project-tier specialists directory for a workspace.
 #[cfg(test)]

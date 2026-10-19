@@ -59,6 +59,11 @@ pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.1";
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
     r#"{"agents":{"enabled":false},"features":{"multi_agent":false,"multi_agent_v2":false}}"#;
 
+/// Codex adapter permission-mode variable Intent writes into every Codex launch
+/// (unless the daemon's own environment sets it). Named provider profiles may
+/// not override it.
+pub const CODEX_INITIAL_AGENT_MODE_ENV: &str = "INITIAL_AGENT_MODE";
+
 /// Actionable prerequisite failure shared by all Codex launch entrypoints.
 pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
     "Codex requires Node.js with npx to run the pinned codex-acp adapter. \

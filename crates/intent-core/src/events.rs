@@ -471,6 +471,13 @@ pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
 // in sync without leaking secrets.
 pub const SETTINGS_CHANGED: &str = "settings:changed";
 
+// Provider profile events (PROTOCOL §5.54/§6.5). Emitted once per committed
+// `providers.profiles.*` mutation (exactly one profile each); global like
+// `settings:changed` (empty workspace id) and administrator-only. The payload
+// `{ revision, change, profileId, profile?, envChanged? }` never carries
+// environment keys or values.
+pub const PROVIDERS_PROFILES_CHANGED: &str = "providers:profiles-changed";
+
 // GitHub auth events (new in intentd; PROTOCOL §5.27). Emitted by the
 // daemon-owned device-flow poller on terminal transitions (authorized /
 // expired / denied / error) and by `github.revoke`. Global like
@@ -708,6 +715,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
+    PROVIDERS_PROFILES_CHANGED,
     GITHUB_AUTH_CHANGED,
     SOURCE_CONTROL_AUTH_CHANGED,
     IDENTITY_AUTH_CHANGED,

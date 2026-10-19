@@ -280,11 +280,11 @@ pub fn build_provider_env_for_spawn(
         }
     }
     match config.id {
-        "codex" if std::env::var_os("INITIAL_AGENT_MODE").is_none() => {
+        "codex" if std::env::var_os(crate::CODEX_INITIAL_AGENT_MODE_ENV).is_none() => {
             // Preserve even empty, invalid, or non-Unicode explicit values:
             // the adapter's fallback must not silently become full access.
             env.insert(
-                "INITIAL_AGENT_MODE".to_string(),
+                crate::CODEX_INITIAL_AGENT_MODE_ENV.to_string(),
                 "agent-full-access".to_string(),
             );
         }
