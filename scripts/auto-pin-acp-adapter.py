@@ -80,8 +80,8 @@ ADAPTERS = {
         package="@agentclientprotocol/claude-agent-acp",
         branch="auto/claude-agent-acp-pin",
         pin=re.compile(
-            r'^(macro_rules! claude_agent_acp_version \{\n    \(\) => \{\n        ")'
-            r'([^"\r\n]+)("\n    \};\n\})$', re.MULTILINE
+            r'^(macro_rules! claude_agent_acp_version \{\s*\(\) => \{\s*")'
+            r'([^"\r\n]+)("\s*\};?\s*\})', re.MULTILINE
         ),
         pin_name="claude_agent_acp_version!",
         title="fix: bump claude-agent-acp pin to v{}",
@@ -93,8 +93,9 @@ ADAPTERS = {
         engines_node=">=22",
     ),
 }
-# Set by main() from --adapter before any other helper runs.
-ADAPTER = ADAPTERS["codex"]
+# Set by main() from --adapter before any other helper runs; there is no
+# default, so a helper used without an adapter fails instead of acting on one.
+ADAPTER = None
 
 
 class Refusal(Exception):
@@ -338,12 +339,19 @@ def make_commit(base, content, current, target, manifest, previous_metadata_hash
                    input=message(current, target, previous_metadata_hash, package_metadata_hash), env=env).strip()
 
 
+def node_floor(declared):
+    """The major of a plain `>=N`, `>=N.0`, or `>=N.0.0` range, else None."""
+    match = isinstance(declared, str) and re.fullmatch(
+        r"\s*>=\s*(0|[1-9][0-9]*)(?:\.0){0,2}\s*", declared)
+    return int(match[1]) if match else None
+
+
 def check_engines(manifest):
     if ADAPTER.engines_node is None:
         return
     engines = manifest.get("engines")
     declared = engines.get("node") if isinstance(engines, dict) else None
-    if declared != ADAPTER.engines_node:
+    if node_floor(declared) != node_floor(ADAPTER.engines_node):
         raise Refusal(
             f"{ADAPTER.package}@{manifest.get('version')} declares engines.node "
             f"{json.dumps(declared)}, not {json.dumps(ADAPTER.engines_node)}; update the "
@@ -397,9 +405,6 @@ def main():
                 disable_auto_merge(pr, "npm latest is not newer than main", args.dry_run)
         return
 
-    # Refuse before any PR lookup or publication; an already-open proposal of an
-    # older, guarded version is left as it is.
-    check_engines(manifest)
     viewer = decode_json(run("gh", "api", "user"))["login"]
     pr = find_pr()
     if pr and any(label["name"] == "hold-release" for label in pr["labels"]):
@@ -440,6 +445,10 @@ def main():
             disable_auto_merge(pr, f"npm latest {target} is older than {proposed}",
                                args.dry_run)
         return
+    # Only now is `target` about to be proposed or armed. Refuse before any
+    # publication, but after the hold/human/withdrawn-version disarms above so
+    # an unguarded npm latest never strands an armed proposal.
+    check_engines(manifest)
     if proposed == target and pr and metadata_matches:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
         if not pr.get("auto_merge"):

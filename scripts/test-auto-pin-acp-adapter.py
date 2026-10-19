@@ -884,8 +884,12 @@ class ClaudeAgentAcpPinTests(PinAutomationTests):
         "test_npm_latest_not_newer_than_main_disarms_open_pr",
         "test_checked_out_human_changes_and_index_are_untouched",
         "test_claude_generated_text_names_its_own_adapter",
-        "test_engines_node_change_refuses_before_lookup_or_publication",
+        "test_engines_node_change_refuses_before_publication",
         "test_engines_node_change_leaves_the_open_proposal_unchanged",
+        "test_equivalent_engines_node_spellings_are_accepted",
+        "test_withdrawn_proposal_is_disarmed_even_when_npm_latest_is_unguarded",
+        "test_hold_release_disarms_even_when_npm_latest_is_unguarded",
+        "test_reformatted_macro_pin_is_still_bumped_in_place",
         "test_codex_rolling_pr_is_never_touched",
     }
 
@@ -908,8 +912,9 @@ class ClaudeAgentAcpPinTests(PinAutomationTests):
                           if line[:1] in "+-" and line[:3] not in ("+++", "---")],
                          ['-        "1.9.0"', '+        "1.13.1"'])
 
-    def test_engines_node_change_refuses_before_lookup_or_publication(self):
-        for engines in ({"node": ">=24"}, {"node": ">=22.5"}, {}, None, "node >=22"):
+    def test_engines_node_change_refuses_before_publication(self):
+        for engines in ({"node": ">=24"}, {"node": ">=22.5"}, {"node": "^22"},
+                        {"node": ">=22 <25"}, {}, None, "node >=22"):
             for args in ((), ("--dry-run",)):
                 with self.subTest(engines=engines, args=args):
                     self.clear_calls()
@@ -919,8 +924,47 @@ class ClaudeAgentAcpPinTests(PinAutomationTests):
                         self.state["manifest"]["engines"] = engines
                     self.assertIn("engines.node", self.invoke(*args, ok=False))
                     self.assert_no_publication()
-                    self.assertFalse(any(call[0] == "gh" for call in self.state["calls"]))
+                    self.assert_no_merge_calls()
                     self.assertIsNone(self.head())
+
+    def test_equivalent_engines_node_spellings_are_accepted(self):
+        for node in (">=22.0.0", ">= 22", ">=22.0", " >=22 "):
+            with self.subTest(node=node):
+                self.state["manifest"]["engines"] = {"node": node}
+                self.assertIn("would propose 1.9.0 -> 1.13.1", self.invoke("--dry-run"))
+
+    def test_withdrawn_proposal_is_disarmed_even_when_npm_latest_is_unguarded(self):
+        # Review regression: the engines refusal must not run before the
+        # withdrawn-version disarm, or the armed proposal would still land.
+        self.state["manifest"]["version"] = "1.14.0"
+        self.invoke()
+        head = self.head()
+        self.clear_calls()
+        self.state["manifest"].update(version="1.13.5", engines={"node": ">=20"})
+        self.assertIn("already proposes newer version 1.14.0", self.invoke())
+        self.assertEqual(self.state["writes"], ["disarm"])
+        self.assertIsNone(self.state["pr"]["auto_merge"])
+        self.assertEqual(self.head(), head)
+
+    def test_hold_release_disarms_even_when_npm_latest_is_unguarded(self):
+        self.invoke()
+        self.state["pr"]["labels"] = [{"name": "hold-release"}]
+        self.state["manifest"].update(version="1.14.0", engines={"node": ">=24"})
+        self.clear_calls()
+        self.assertIn("hold-release", self.invoke())
+        self.assertEqual(self.state["writes"], ["disarm"])
+
+    def test_reformatted_macro_pin_is_still_bumped_in_place(self):
+        reformatted = self.fixture("1.9.0").replace(
+            'macro_rules! claude_agent_acp_version {\n    () => {\n        "1.9.0"\n    };\n}',
+            'macro_rules! claude_agent_acp_version {\n  () => { "1.9.0" };\n}')
+        self.assertNotEqual(reformatted, self.fixture("1.9.0"))
+        self.pin_file.write_text(reformatted)
+        self.git("commit", "-qam", "style: reformat the pin macro")
+        self.git("push", "-q", "origin", "main")
+        self.invoke()
+        self.assertEqual(self.git("show", f"{self.head()}:{CONFIG}"),
+                         reformatted.replace('"1.9.0"', '"1.13.1"').strip())
 
     def test_engines_node_change_leaves_the_open_proposal_unchanged(self):
         self.invoke()
