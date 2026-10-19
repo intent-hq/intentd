@@ -33,6 +33,18 @@ REAL_ARTIFACTS = None
 CANONICAL_FIXTURE = None
 
 
+def inert_env(home):
+    """A minimal child env that can still start sys.executable on self-hosted runners.
+
+    setup-python's shared-lib builds find libpython through LD_LIBRARY_PATH when
+    the tool cache is not /opt/hostedtoolcache (intentd#2488).
+    """
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    return env
+
+
 def fake_package(root):
     """A separately labeled inert payload; no product trust-root override."""
     payload = root / "fake-payload"
@@ -512,7 +524,7 @@ class OfflineTests(unittest.TestCase):
         args = ["space value", "$(not-executed)", "--cli", "quote'\"value", ""]
         result = subprocess.run([str(launcher), *args], cwd=self.root, input="inert stdin\n",
                                 text=True, capture_output=True, timeout=10,
-                                env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)})
+                                env=inert_env(self.root))
         self.assertEqual(result.returncode, 37)
         value = json.loads(result.stdout)
         self.assertEqual(value["cwd"], str(self.root))
@@ -524,7 +536,7 @@ class OfflineTests(unittest.TestCase):
     def test_launcher_exec_keeps_pid_and_signal_inert_child_only(self):
         launcher = self.install()
         child = subprocess.Popen([str(launcher), "--hold"], stdout=subprocess.PIPE, text=True,
-                                 env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)})
+                                 env=inert_env(self.root))
         try:
             import selectors
             with selectors.DefaultSelector() as selector:
