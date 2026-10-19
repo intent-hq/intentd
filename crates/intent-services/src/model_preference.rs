@@ -1,6 +1,7 @@
 //! Port of the Claude Code ACP adapter's model-name resolution
 //! (`resolveModelPreference` in `@agentclientprotocol/claude-agent-acp`
-//! `dist/session-model.js`, pinned 0.81.1), used by the unknown-model guard
+//! `dist/session-model.js`, mirrored at 0.81.1 — a drift test fails when the
+//! adapter pin moves), used by the unknown-model guard
 //! (intent-hq/intent#7121). The adapter applies a caller's model through
 //! `session/set_config_option` and resolves it against its picker rows with
 //! these tiers: exact / canonical id or display name, substring containment
@@ -23,17 +24,22 @@ fn is_word(b: u8) -> bool {
 }
 
 /// Byte offset where a trailing `-(\d+m)` suffix starts, if present.
+///
+/// Every index is guarded before use: an all-digit id such as `123m` walks
+/// the digit scan down to offset 0, which must return `None`, never compute
+/// `0 - 1` (intent-hq/intent#7121 review).
 fn trailing_dash_hint(s: &str) -> Option<usize> {
     let b = s.as_bytes();
-    let n = b.len();
-    if n < 3 || !b[n - 1].eq_ignore_ascii_case(&b'm') {
+    let (&last, rest) = b.split_last()?;
+    if !last.eq_ignore_ascii_case(&b'm') {
         return None;
     }
-    let mut i = n - 1;
-    while i > 0 && b[i - 1].is_ascii_digit() {
-        i -= 1;
+    let digits = rest.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
     }
-    (i < n - 1 && i > 0 && b[i - 1] == b'-').then_some(i - 1)
+    let dash = rest.len().checked_sub(digits + 1)?;
+    (rest[dash] == b'-').then_some(dash)
 }
 
 /// `canonicalizeModelId`: trim, lowercase, `-1m` suffix → `[1m]`.
@@ -241,6 +247,25 @@ mod tests {
         resolve_model_preference(models, pref).map(|i| models[i].value.to_string())
     }
 
+    /// The claude-agent-acp release whose `resolveModelPreference` this
+    /// module mirrors.
+    const MIRRORED_CLAUDE_AGENT_ACP_VERSION: &str = "0.81.1";
+
+    /// Drift guard: the port mirrors one adapter release. When the
+    /// claude-agent-acp pin moves, re-read the new adapter's
+    /// `dist/session-model.js` `resolveModelPreference` (and its helpers),
+    /// port any change here, re-run the cross-check against the adapter, then
+    /// bump [`MIRRORED_CLAUDE_AGENT_ACP_VERSION`].
+    #[test]
+    fn port_tracks_the_pinned_adapter_version() {
+        assert_eq!(
+            intent_providers::CLAUDE_AGENT_ACP_VERSION,
+            MIRRORED_CLAUDE_AGENT_ACP_VERSION,
+            "the claude-agent-acp pin moved: re-check model_preference.rs against the new \
+             adapter's resolveModelPreference before bumping MIRRORED_CLAUDE_AGENT_ACP_VERSION"
+        );
+    }
+
     // Expected values below were cross-checked by running the pinned
     // adapter's own `resolveModelPreference` (claude-agent-acp 0.81.1) on
     // the same inputs.
@@ -300,6 +325,93 @@ mod tests {
             resolved(&picker(), "fable").as_deref(),
             Some("claude-fable-5[1m]")
         );
+    }
+
+    /// Adversarial ids must resolve or reject, never panic
+    /// (intent-hq/intent#7121 review: `123m` underflowed the suffix scan).
+    #[test]
+    fn adversarial_inputs_never_panic() {
+        let aliases = [
+            opt("opus[1m]", "Opus", ""),
+            opt("sonnet", "Sonnet", ""),
+            opt("haiku", "Haiku", ""),
+        ];
+        for pref in [
+            "123m",
+            "123M",
+            "1m",
+            "m",
+            "M",
+            "",
+            "-",
+            "-m",
+            "-1m",
+            "1-m",
+            "12345",
+            "[1m]",
+            "[]",
+            "[m]",
+            "[1m",
+            "1m]",
+            "a[1m]]",
+            "é",
+            "é1m",
+            "ü-1m",
+            "日本語",
+            "sonnet-日本",
+            "4-5",
+            "4.5",
+            "4-",
+            ".5",
+            "1.2.3",
+            "claude-",
+            "opus[1m]-1m",
+            "x-0m",
+            "--1m",
+        ] {
+            let _ = resolve_model_preference(&aliases, pref);
+            let _ = canonicalize(pref);
+            let _ = context_hint_of(pref);
+            let _ = strip_context_hints(pref);
+            let _ = family_version(pref);
+            let _ = tokenize(pref);
+        }
+        let long = "9".repeat(10_000) + "m";
+        assert_eq!(resolve_model_preference(&aliases, &long), None);
+        assert_eq!(resolve_model_preference(&aliases, "123m"), None);
+        assert_eq!(resolve_model_preference(&aliases, "123M"), None);
+        // The adapter's token tier matches a bare context hint (checked
+        // against the pinned adapter): these resolve rather than reject.
+        assert_eq!(resolved(&aliases, "1m").as_deref(), Some("opus[1m]"));
+        assert_eq!(resolved(&aliases, "m").as_deref(), Some("opus[1m]"));
+    }
+
+    /// Deterministic property sweep: every string up to length 4 over an
+    /// alphabet of the characters the parser branches on (digits, `m`, `-`,
+    /// `.`, brackets, a letter, a multibyte char) resolves without panicking,
+    /// both as a preference and as a catalog row.
+    #[test]
+    fn resolver_never_panics_on_short_strings() {
+        let alphabet = ['1', '0', 'm', 'M', '-', '.', '[', ']', 'o', 'é'];
+        let mut inputs = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for c in alphabet {
+                    let mut s = prefix.clone();
+                    s.push(c);
+                    next.push(s);
+                }
+            }
+            inputs.extend(next.iter().cloned());
+            frontier = next;
+        }
+        for input in &inputs {
+            let rows = [opt(input, input, input), opt("sonnet", "Sonnet", "")];
+            let _ = resolve_model_preference(&rows, input);
+            let _ = resolve_model_preference(&rows, "sonnet");
+        }
     }
 
     #[test]

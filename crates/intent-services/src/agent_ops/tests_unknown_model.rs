@@ -118,6 +118,25 @@ async fn create_rejects_unknown_model_and_persists_nothing() {
     );
 }
 
+/// Numeric context-hint-shaped ids reject with `-32602` rather than panicking
+/// in the suffix scan (intent-hq/intent#7121 review).
+#[tokio::test]
+async fn create_rejects_numeric_suffix_ids_without_panicking() {
+    let (_t, svc, ws) = setup().await;
+    use_claude_code(&svc);
+    seed_claude_code(&svc, alias_rows());
+    for model in ["123m", "123M", "12345", "日本語"] {
+        let err = create(&svc, &ws, model, None)
+            .await
+            .expect_err("a numeric id the adapter cannot resolve must be rejected");
+        assert_unknown_model(&err, "agent.create", model, "claude-code");
+    }
+    assert!(
+        sessions(&svc, &ws).await.is_empty(),
+        "no agent row may be created"
+    );
+}
+
 /// Names the pinned adapter resolves against alias-only picker rows pass:
 /// exact ids, bare aliases of bracketed rows, full Claude model ids, and the
 /// `opusplan` family alias. The stored model is the caller's spelling.
