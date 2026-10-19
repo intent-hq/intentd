@@ -19,7 +19,8 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, and personal device pairing are currently experimental.
+Multiplayer, Collaboration, personal device pairing, and provider profiles are
+currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
@@ -105,7 +106,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/SettingsSidebarNav.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -117,6 +118,40 @@ in the Settings sidebar's Agents group. Create one at
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
+
+**Provider profiles (experimental; Codex and Claude Code only).** Describe them
+only when the user asks. To turn them on, use the command menu action **Enable
+experimental provider profiles** (**Disable experimental provider profiles** turns
+them off), or, if asked, propose `labs.providerProfiles` with `ws.app.settings.propose`.
+A profile runs the installed
+CLI with its own environment variables, for example a work and a personal account
+or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
+choose **Add profile**: enter a name and environment variables (literal values,
+**Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` to choose an account; the user signs in or prepares that
+account outside Intent. Credentials inherited from the environment can still
+apply: for a Claude Code profile that should use another account (or none), set
+inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
+**Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
+custom base URL from the environment; for a different endpoint, give the profile
+its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
+**Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
+appears as its own model-picker group, such as **Codex · Work**; with profiles,
+the original configuration is **Codex · Default**. Delegated agents follow their
+explicit, specialist, or default selection, never the parent's profile.
+
+Switching a conversation to another profile, even with the same model, applies on
+the next message: a turn in progress finishes first, then a fresh provider session
+starts with the conversation history. Editing a profile's environment never
+interrupts or restarts anything. Running sessions keep their settings and show
+**Using earlier settings**; new provider processes, including ones restarted after
+idling or a crash, use the saved settings. To refresh existing conversations,
+restart Intent when the app runs the daemon on this computer, otherwise restart
+intentd on the provider host; reconnecting alone does not apply the edit. Remove a
+profile from the same view, after changing any default, specialist, or quick-action
+setting that selects it. Conversations keep their history, and their next message
+asks for another model (**Choose another model to continue**), as does a profile
+whose provider is disabled. Intent never switches them to another account.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is

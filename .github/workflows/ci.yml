@@ -208,6 +208,10 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
+      # Release PRs run this job too: a release that would split the intentd
+      # version_group (intent-hq/intentd#2461) fails here before it merges.
+      - name: Check release-plz version groups stay in lockstep
+        run: python3 -S scripts/test-version-group.py
       - name: Resolve formatting toolchain
         id: rust
         run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"

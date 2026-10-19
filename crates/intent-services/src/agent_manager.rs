@@ -2577,6 +2577,10 @@ struct AgentHandle {
     /// provider id, or the named profile reference whose overlay it carries.
     /// A different selection never reuses this child (PROTOCOL §5.54).
     spawned_selection: String,
+    /// Activation registration of a child started under a named profile
+    /// (the saved settings fingerprint it read at start); dropping the
+    /// handle unregisters it (PROTOCOL §5.54 activation).
+    _activation: Option<crate::profile_activation::ActivationLease>,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
     /// the adapter is believed to be on — updated on every successful
@@ -3764,6 +3768,19 @@ impl AgentManager {
             }
         });
 
+        // The child read the profile's saved settings now; track it until
+        // it is torn down so earlier-settings state stays accurate.
+        let activation = match opts.profile_env {
+            // Boxed: keeps the spawn future's stack frame unchanged.
+            Some(profile) => {
+                Box::pin(
+                    self.services
+                        .register_profile_process(&workspace_id, &agent_id, profile),
+                )
+                .await
+            }
+            None => None,
+        };
         let handle = AgentHandle {
             repository_origin: repository_origin.clone(),
             execution: RuntimeHandle::local(LocalResources {
@@ -3790,6 +3807,7 @@ impl AgentManager {
                 .profile_env
                 .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref)
                 .to_string(),
+            _activation: activation,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -18976,6 +18994,7 @@ mod dead_child_respawn_tests {
             spawned_model: None,
             spawned_provider: "node".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,

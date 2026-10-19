@@ -1,11 +1,20 @@
 # RELEASE_PLZ_TOKEN already has contents + pull-requests write access (see
 # release-plz.yml). Its pushes/PRs trigger normal CI; GITHUB_TOKEN would not.
-# The rolling PR is reviewed and merged by humans, never by this workflow.
+# The script arms squash auto-merge on the rolling PR (pinned to the head it
+# verified), so the merge queue lands each stable update once CI passes; it
+# never merges directly or with admin rights. `hold-release` on the PR disables
+# auto-merge and pauses updates; human edits disable the automation's arming.
+# The stand-down job applies both at once (on the PR event) rather than at the
+# next daily run, so an armed PR cannot merge after someone holds or edits it.
+# Repo-owned merge exemption: intent-hq/intent AGENTS.md (Conventions -> Merging).
 name: Auto-pin Codex ACP
 
 permissions: {}
 
 on:
+  pull_request:
+    types: [labeled, synchronize, edited]
+    branches: [main]
   schedule:
     - cron: '17 7 * * *'
   workflow_dispatch:
@@ -16,11 +25,15 @@ on:
         default: false
 
 concurrency:
-  group: auto-pin-codex-acp
+  group: auto-pin-codex-acp-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'pin' }}
   cancel-in-progress: false
 
 jobs:
   runner-route:
+    # PR events only matter for the rolling PR; skip routing for every other PR.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.ref == 'auto/codex-acp-pin'
     uses: ./.github/workflows/runner-route.yml
     permissions:
       contents: read
@@ -34,7 +47,9 @@ jobs:
     timeout-minutes: 10
     # Manual runs must use trusted main too; never execute a branch's script
     # with the publication token. The checkout resolves main afresh.
-    if: github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name != 'pull_request'
+      && github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -68,3 +83,33 @@ jobs:
           args=()
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
           python3 -S scripts/auto-pin-codex-acp.py "${args[@]}"
+
+  # Disable auto-merge as soon as the rolling PR is held (hold-release label)
+  # or changed by anyone other than the PR's bot author. The PR's own script is
+  # never run here, and no publication token is used.
+  stand-down:
+    needs: [runner-route]
+    if: >-
+      github.event_name == 'pull_request'
+      && github.repository == 'intent-hq/intentd'
+      && github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.auto_merge != null
+      && ((github.event.action == 'labeled' && github.event.label.name == 'hold-release')
+          || (github.event.action != 'labeled'
+              && github.actor != github.event.pull_request.user.login))
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Disable auto-merge on the rolling Codex ACP PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto
+          echo "Disabled auto-merge for #$PR ($ACTION by $ACTOR)."

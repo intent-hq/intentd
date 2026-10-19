@@ -11136,6 +11136,10 @@ mod profile_auth_failure_tests {
             .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
             .await
             .unwrap();
+        // Opened under Work's current settings (a session open records it).
+        p.services
+            .bind_native_session_settings(&p.workspace_id, &p.agent_id, p.work.fingerprint())
+            .await;
         let (conn, _rx, _agent) = connect_failing("session/load");
         let err = p
             .services
@@ -11176,6 +11180,10 @@ mod profile_auth_failure_tests {
             .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
             .await
             .unwrap();
+        // Opened under Work's current settings (a session open records it).
+        p.services
+            .bind_native_session_settings(&p.workspace_id, &p.agent_id, p.work.fingerprint())
+            .await;
         let work = p.work.provider_ref().to_string();
         for owner in ["claude-code", p.personal.provider_ref(), work.as_str()] {
             p.services
@@ -11190,6 +11198,289 @@ mod profile_auth_failure_tests {
                 .await
                 .unwrap();
             assert_eq!(resumed.is_some(), owner == work, "owner {owner}");
+        }
+    }
+}
+
+/// Native-session ownership across profile switches and saved edits
+/// (PROTOCOL §5.54): a native session belongs to the profile reference AND
+/// the settings it was opened under, for both Codex and Claude Code.
+mod profile_native_session_tests {
+    use super::*;
+
+    const BASES: [&str; 2] = ["codex", "claude-code"];
+
+    /// The account-selecting variable of each base.
+    fn account_key(base: &str) -> &'static str {
+        if base == "codex" {
+            "CODEX_HOME"
+        } else {
+            "CLAUDE_CONFIG_DIR"
+        }
+    }
+
+    struct Profiled {
+        _tmp: TempDb,
+        services: Services,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        base: &'static str,
+        work: String,
+        personal: String,
+    }
+
+    async fn profiled(base: &'static str) -> Profiled {
+        let (tmp, services, _bus, agent_id, workspace_id) = setup().await;
+        let services =
+            services.with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let mut refs = Vec::new();
+        for name in ["Work", "Personal"] {
+            let created = services
+                .provider_profiles_create_impl(json!({
+                    "baseProviderId": base,
+                    "name": name,
+                    "env": [{ "key": account_key(base), "kind": "set",
+                              "value": format!("/accounts/{name}") }],
+                }))
+                .await
+                .unwrap();
+            refs.push(
+                created["profile"]["providerRef"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let personal = refs.pop().unwrap();
+        let work = refs.pop().unwrap();
+        let p = Profiled {
+            _tmp: tmp,
+            services,
+            agent_id,
+            workspace_id,
+            base,
+            work,
+            personal,
+        };
+        p.select(&p.work.clone()).await;
+        p
+    }
+
+    impl Profiled {
+        /// `agent.setModel` to `reference`, keeping the same model.
+        async fn select(&self, reference: &str) {
+            self.services
+                .store
+                .set_agent_session_model(
+                    &self.workspace_id,
+                    &self.agent_id,
+                    "same-model",
+                    Some(reference),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+
+        /// Commit `reference` as the owner of the stored native session
+        /// (the turn-start identity commit).
+        async fn commit_owner(&self, reference: &str) {
+            self.services
+                .store
+                .set_agent_session_last_turn_model(
+                    &self.workspace_id,
+                    &self.agent_id,
+                    Some("same-model"),
+                    reference,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn resumes(&self) -> bool {
+            let (conn, _rx, _agent, _seen) = connect_recording();
+            self.services
+                .resume_acp_session(
+                    &conn,
+                    &init_caps(true),
+                    &self.agent_id,
+                    "/tmp/ws",
+                    Vec::new(),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        }
+
+        async fn open_new(&self) {
+            let (conn, _rx, _agent, _seen) = connect_recording();
+            let stored = self
+                .services
+                .store
+                .get_agent_session(&self.agent_id)
+                .await
+                .unwrap();
+            match stored.acp_session_id {
+                None => {
+                    self.services
+                        .open_acp_session(&conn, &self.agent_id, "/tmp/ws", Vec::new())
+                        .await
+                        .unwrap();
+                }
+                Some(old) => {
+                    self.services
+                        .recreate_acp_session(&conn, &self.agent_id, &old, "/tmp/ws", Vec::new())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        async fn saved_fingerprint(&self, reference: &str) -> String {
+            self.services
+                .resolve_profile_env(reference)
+                .await
+                .unwrap()
+                .unwrap()
+                .fingerprint()
+                .to_owned()
+        }
+
+        async fn bound_fingerprint(&self) -> Option<String> {
+            let stored = self
+                .services
+                .store
+                .get_agent_session(&self.agent_id)
+                .await
+                .unwrap();
+            stored
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(crate::provider_profiles::NATIVE_SESSION_SETTINGS_KEY))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+
+        async fn edit_account(&self, reference: &str, value: &str) {
+            let profile_id = reference.split('@').nth(1).unwrap();
+            let updated = self
+                .services
+                .provider_profiles_update_impl(
+                    profile_id.to_string(),
+                    json!({ "env": [{ "key": account_key(self.base), "kind": "set",
+                                      "value": value }] }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated["activation"]["envChanged"], true);
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn a_new_native_session_is_bound_to_the_profile_settings_it_opened_under() {
+        for base in BASES {
+            let p = profiled(base).await;
+            p.open_new().await;
+            let work_fp = p.saved_fingerprint(&p.work).await;
+            assert_eq!(p.bound_fingerprint().await, Some(work_fp), "{base}");
+            p.commit_owner(&p.work).await;
+            assert!(
+                p.resumes().await,
+                "{base}: unchanged settings resume natively"
+            );
+            // The binding is internal: it never reaches the agent projection.
+            let lite = p
+                .services
+                .agent_get_op(p.agent_id.clone(), None)
+                .await
+                .unwrap();
+            let wire = serde_json::to_value(&lite).unwrap();
+            assert!(
+                !wire.to_string().contains("nativeSessionSettings"),
+                "{base}: {wire}"
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn an_account_change_never_loads_the_earlier_native_session() {
+        for base in BASES {
+            let p = profiled(base).await;
+            p.open_new().await;
+            p.commit_owner(&p.work).await;
+            let earlier = p.saved_fingerprint(&p.work).await;
+
+            p.edit_account(&p.work, "/accounts/Other").await;
+            // A process started now reads the saved (new) account: it must
+            // not load the session owned by the earlier account/home.
+            assert!(!p.resumes().await, "{base}: recreate with Intent history");
+
+            // A process still running the earlier settings may keep its own
+            // native session (running processes keep their settings).
+            let lease = p
+                .services
+                .register_profile_process(
+                    &p.workspace_id,
+                    &p.agent_id,
+                    &intent_acp::ProfileEnv::new(p.work.as_str(), earlier.as_str(), Vec::new()),
+                )
+                .await
+                .unwrap();
+            assert!(p.resumes().await, "{base}: the live earlier process");
+            drop(lease);
+
+            // The recreate binds the new session to the saved settings.
+            p.open_new().await;
+            let now = p.saved_fingerprint(&p.work).await;
+            assert_ne!(now, earlier);
+            assert_eq!(p.bound_fingerprint().await, Some(now), "{base}");
+            assert!(p.resumes().await, "{base}: resumes under the new settings");
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn a_same_model_profile_switch_uses_a_native_session_owned_by_the_new_profile() {
+        for base in BASES {
+            let p = profiled(base).await;
+            p.open_new().await;
+            p.commit_owner(&p.work).await;
+
+            // Work → Personal, same model: Work's native session is never
+            // offered to Personal.
+            p.select(&p.personal).await;
+            assert!(
+                !p.resumes().await,
+                "{base}: Work's session is not Personal's"
+            );
+            p.open_new().await;
+            let personal_fp = p.saved_fingerprint(&p.personal).await;
+            assert_eq!(p.bound_fingerprint().await, Some(personal_fp), "{base}");
+            p.commit_owner(&p.personal).await;
+            assert!(
+                p.resumes().await,
+                "{base}: Personal resumes its own session"
+            );
+
+            // And back: Personal's session never returns to Work.
+            p.select(&p.work).await;
+            assert!(
+                !p.resumes().await,
+                "{base}: Personal's session is not Work's"
+            );
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn an_unbound_profile_session_is_recreated_not_loaded() {
+        for base in BASES {
+            let p = profiled(base).await;
+            p.services
+                .store
+                .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
+                .await
+                .unwrap();
+            p.commit_owner(&p.work).await;
+            assert!(!p.resumes().await, "{base}: no recorded settings, no load");
         }
     }
 }

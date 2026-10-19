@@ -3153,6 +3153,24 @@ impl Services {
         })
     }
 
+    /// Record the profile settings a just-opened native session belongs to
+    /// (no-op for a bare selection).
+    async fn bind_profile_native_session(&self, stored: &AgentSession) {
+        let Some(selection) = resolve_provider_id(
+            stored.provider.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
+        ) else {
+            return;
+        };
+        if let Some(fingerprint) = self
+            .profile_process_fingerprint(&stored.id, &selection)
+            .await
+        {
+            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                .await;
+        }
+    }
+
     async fn finish_created_acp_session(
         &self,
         prepared: PreparedAcpSession,
@@ -3170,6 +3188,7 @@ impl Services {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3380,11 +3399,33 @@ impl Services {
             // crosses profiles or a profile and Default (PROTOCOL §5.54).
             let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
+                );
+                return Ok(None);
+            }
+        }
+        // A profile's native session also belongs to the settings it was
+        // opened under: after an edit takes effect (account or home may
+        // differ) recreate with Intent history instead of loading it.
+        if let Some(fingerprint) =
+            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
+        {
+            if !Self::native_session_bound_to(&stored, &fingerprint) {
+                tracing::info!(
+                    agent = %agent_id,
+                    provider = %provider_id,
+                    "profile settings changed: skipping session/load of the earlier settings' session"
                 );
                 return Ok(None);
             }
