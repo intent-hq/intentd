@@ -326,6 +326,7 @@ jobs:
           echo "INTENT_CLAUDE_ADAPTER_PIN_FIXTURE=$adapter" >> "$GITHUB_ENV"
       - name: Real Claude adapter utility-session contract
         env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
         run: "cargo test -p intent-services --lib claude_adapter_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
