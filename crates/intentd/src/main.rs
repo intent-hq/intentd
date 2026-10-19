@@ -1646,9 +1646,16 @@ fn install_panic_hook() {
             "PANIC: daemon panicked"
         );
 
-        // Also write to stderr so it's visible in immediate context
-        eprintln!("PANIC at {location}: {message}");
-        eprintln!("Backtrace:\n{backtrace}");
+        // Also write to stderr so it's visible in immediate context. Ignore
+        // write errors: `eprintln!` panics on a closed stderr pipe, and a
+        // panic inside the panic hook aborts the whole daemon
+        // (intent-hq/intent#7119).
+        {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "PANIC at {location}: {message}");
+            let _ = writeln!(stderr, "Backtrace:\n{backtrace}");
+        }
 
         // Chain the default hook to preserve standard Rust panic formatting
         default_hook(panic_info);
