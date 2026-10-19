@@ -3881,7 +3881,15 @@ impl Services {
             tracing::warn!(%error, agent = %session.id, "pending delete display projection unavailable");
             None
         });
+        // Profile activation overlays (PROTOCOL §5.54): the live process's
+        // earlier-settings flag and a refused next turn's replacement need.
+        let using_earlier_profile_settings =
+            self.profile_activation().uses_earlier_settings(&session.id);
+        let provider_replacement_required =
+            self.provider_replacement_required(session.provider.as_deref());
         let mut lite = project(session);
+        lite.using_earlier_profile_settings = using_earlier_profile_settings;
+        lite.provider_replacement_required = provider_replacement_required;
         lite.is_responding = is_responding;
         lite.is_waiting_on_tool = is_waiting_on_tool;
         lite.is_waiting_for_other_agents = is_waiting_for_other_agents;

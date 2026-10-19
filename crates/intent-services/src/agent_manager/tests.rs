@@ -2714,6 +2714,7 @@ fn mock_handle() -> AgentHandle {
         spawned_model: None,
         spawned_provider: "auggie".to_string(),
         spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+        _activation: None,
         thought_level: None,
         config_options: None,
         confirmed_effort: None,
@@ -5089,6 +5090,7 @@ fn track_mock_agent_inner(
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -5248,6 +5250,7 @@ fn track_mock_agent_prompt_rpc_error_inner(
             spawned_model: None,
             spawned_provider: spawned_provider.to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command(spawned_provider),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9250,6 +9253,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -21978,6 +21982,7 @@ mod harness_wake_tests {
             spawned_model: None,
             spawned_provider: "auggie".to_string(),
             spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -28538,20 +28543,23 @@ mod profile_routing_tests {
             npx_fallback_package: None,
             unsloth_endpoint: None,
         };
-        let command = intent_providers::provider_config("codex").command;
-        let live = |selection: &str, target: &str| {
-            super::super::spawn_identity_changed(
-                Some("same-model"),
-                command,
-                selection,
-                &resolved(target),
-            )
-        };
-        assert!(!live("codex", "codex"));
-        assert!(!live("codex@pwork", "codex@pwork"));
-        assert!(live("codex", "codex@pwork"), "Default → Work");
-        assert!(live("codex@pwork", "codex"), "Work → Default");
-        assert!(live("codex@pwork", "codex@ppersonal"), "Work → Personal");
+        for base in ["codex", "claude-code"] {
+            let command = intent_providers::provider_config(base).command;
+            let live = |selection: &str, target: &str| {
+                super::super::spawn_identity_changed(
+                    Some("same-model"),
+                    command,
+                    selection,
+                    &resolved(target),
+                )
+            };
+            let (work, personal) = (format!("{base}@pwork"), format!("{base}@ppersonal"));
+            assert!(!live(base, base), "{base}");
+            assert!(!live(&work, &work), "{base}");
+            assert!(live(base, &work), "{base}: Default → Work");
+            assert!(live(&work, base), "{base}: Work → Default");
+            assert!(live(&work, &personal), "{base}: Work → Personal");
+        }
     }
 
     #[tokio::test]
@@ -28651,5 +28659,88 @@ mod profile_routing_tests {
             .await
             .unwrap();
         assert!(messages.is_empty(), "no provider_rehomed notice");
+    }
+    /// The real spawn path registers a profile child with the settings it
+    /// read, an edit marks it as running on earlier settings without
+    /// touching it, and tearing the child down (idle reap / crash cleanup /
+    /// respawn all drop the handle) unregisters it.
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn a_spawned_profile_child_is_tracked_until_teardown() {
+        use std::os::unix::fs::PermissionsExt;
+        for base in ["codex", "claude-code"] {
+            let root = crate::test_support::test_tempdir("profile-activation-spawn-");
+            let store = Store::open(&root.path().join("a.db")).await.unwrap();
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store)
+                .with_event_bus(bus.clone())
+                .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+            let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+            let ws = WorkspaceId::from("ws-activation");
+            let id = AgentId::from("a-activation");
+            seed_agent(&mgr, &ws, &id).await;
+            let created = services
+                .provider_profiles_create_impl(json!({
+                    "baseProviderId": base, "name": "Work",
+                    "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "one" }],
+                }))
+                .await
+                .unwrap();
+            let (profile_id, reference) = (
+                created["profile"]["id"].as_str().unwrap().to_string(),
+                created["profile"]["providerRef"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let profile = services
+                .resolve_profile_env(&reference)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // A stand-in adapter that just stays alive until killed.
+            let adapter = root.path().join("adapter");
+            std::fs::write(&adapter, "#!/bin/sh\nread -r request\nsleep 60\n").unwrap();
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut provider = *intent_providers::find_provider("pi").unwrap();
+            provider.mcp_via_pi_extension = false;
+            let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+            opts.npx_fallback_binary = Some(&adapter);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.profile_env = Some(&profile);
+            mgr.create_agent(
+                id.clone(),
+                ws.clone(),
+                "Work",
+                "implementor",
+                root.path().to_owned(),
+                &opts,
+            )
+            .await
+            .unwrap();
+            let activation = services.profile_activation();
+            assert_eq!(
+                activation.live_fingerprint(&id, &reference).as_deref(),
+                Some(profile.fingerprint()),
+                "{base}"
+            );
+
+            services
+                .provider_profiles_update_impl(
+                    profile_id.clone(),
+                    json!({ "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "two" }] }),
+                )
+                .await
+                .unwrap();
+            assert!(mgr.handle_is_live(&id), "{base}: Save restarts nothing");
+            assert!(activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 1);
+
+            mgr.kill_child_only(&id).await;
+            assert!(!activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 0, "{base}");
+            assert_eq!(activation.live_fingerprint(&id, &reference), None);
+        }
     }
 }

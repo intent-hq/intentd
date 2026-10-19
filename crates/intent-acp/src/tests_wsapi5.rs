@@ -927,6 +927,8 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        using_earlier_profile_settings: false,
+        provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
         metadata: AgentMetadata {

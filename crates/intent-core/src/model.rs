@@ -4555,6 +4555,18 @@ pub struct AgentLite {
     /// (not `null`) when no deletion is pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delete_at: Option<String>,
+    /// `true` while the agent's live provider process started with a named
+    /// profile's earlier saved settings (PROTOCOL §5.54 activation). Omitted
+    /// once they match or no process is live. Overlaid by the service
+    /// projection (no runtime context in [`AgentLite::from_session`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub using_earlier_profile_settings: bool,
+    /// `{ providerRef, reason: "profile-missing" | "provider-disabled" }`
+    /// when the session's named profile selection would refuse the next
+    /// turn (PROTOCOL §5.54). Overlaid by the service projection; omitted
+    /// otherwise and always for bare provider ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replacement_required: Option<serde_json::Value>,
     /// ISO timestamp the session was soft-retired at; mirrors
     /// [`AgentSession::retired_at`]. Omitted for active sessions. Rows
     /// carrying it appear in `agent.list` only with `includeRetired: true`
@@ -4680,6 +4692,8 @@ impl AgentLite {
             stop_reason_timestamp: session.stop_reason_timestamp,
             session_corrupted: session.session_corrupted,
             pending_delete_at: session.pending_delete_at,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: session.retired_at,
             notifications_muted: session.notifications_muted,
             harness_version: session.harness_version,
