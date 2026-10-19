@@ -210,7 +210,39 @@ mod tests {
     use sqlx::Connection;
     use std::sync::Arc;
 
-    async fn internal_timeout_retains_worker(read: bool) {
+    /// A plain connection holding an exclusive rollback-journal lock, so any
+    /// other connection's lock-taking PRAGMA waits in `SQLite`'s busy handler.
+    async fn exclusive_blocker(db: &std::path::Path) -> sqlx::SqliteConnection {
+        let mut blocker = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(db),
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+        blocker
+    }
+
+    /// The intentional internal acquisition timeout. It also covers opening the
+    /// scenario connection before its guarded PRAGMA blocks, so it is far above
+    /// loaded-host connect latency while staying below `SCENARIO_BUSY_TIMEOUT`.
+    const SCENARIO_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// The scenario connection waits in `SQLite`'s busy handler until the test
+    /// commits its blocker, not until a production-sized busy window expires.
+    const SCENARIO_BUSY_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Stretches fixture setup past the scenario's acquisition budget. The delay
+    /// only lengthens setup, so it cannot make a correct fixture fail under load.
+    const SLOW_SETUP_HOLD: Duration = Duration::from_millis(1500);
+
+    /// Setup budget, separate from the scenario budget and well above
+    /// `SLOW_SETUP_HOLD` and loaded-host connect latency.
+    const SETUP_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    async fn internal_timeout_retains_worker(read: bool, slow_setup: bool) {
         let directory = tempfile::tempdir().unwrap();
         let db = directory.path().join("timeout.db");
         let initial = crate::Store::open(&db).await.unwrap();
@@ -219,56 +251,117 @@ mod tests {
         let lock = directory.path().join("timeout.db.daemon.lock");
         let owner = Arc::new(crate::daemon_ownership::DaemonOwnership::acquire(&lock).unwrap());
         let weak_owner = Arc::downgrade(&owner);
-        let timeout = Duration::from_millis(100);
-        let raw = if read {
-            crate::connect_read_owned_timeout(&db, Some(owner.clone()), timeout)
-                .await
-                .unwrap()
+        let setup_started = std::time::Instant::now();
+        let setup_blocker = if slow_setup {
+            let mut blocker = exclusive_blocker(&db).await;
+            Some(tokio::spawn(async move {
+                tokio::time::sleep(SLOW_SETUP_HOLD).await;
+                sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
+                blocker.close().await.unwrap();
+            }))
         } else {
-            crate::connect_write_owned(&db, timeout, Some(owner.clone()))
-                .await
-                .unwrap()
+            None
         };
-        let pool = StorePool::new(raw, true);
-        pool.acquire().await.unwrap().close().await.unwrap();
+        // Fixture setup runs the production connect path, whose eager connection
+        // runs the owned initialization PRAGMAs (the positive control), under a
+        // budget that host load cannot plausibly exhaust.
+        let setup_raw = if read {
+            crate::connect_read_owned_timeout(&db, Some(owner.clone()), SETUP_ACQUIRE_TIMEOUT)
+                .await
+                .expect("fixture setup: owned read pool connects")
+        } else {
+            crate::connect_write_owned(&db, SETUP_ACQUIRE_TIMEOUT, Some(owner.clone()))
+                .await
+                .expect("fixture setup: owned write pool connects")
+        };
+        if let Some(release) = setup_blocker {
+            release
+                .await
+                .expect("fixture setup: slow-setup blocker released");
+            // The lock was held before setup began, so setup outlasted the
+            // scenario budget whether or not it reached a PRAGMA before release.
+            assert!(setup_started.elapsed() > SCENARIO_ACQUIRE_TIMEOUT);
+        }
+        // Same pool options (including the owned after_connect hook) and connect
+        // options (including the ownership collation); only the scenario budget
+        // and busy window differ. A lazy pool opens nothing until the timed
+        // acquisition.
+        let pool = StorePool::new(
+            setup_raw
+                .options()
+                .clone()
+                .acquire_timeout(SCENARIO_ACQUIRE_TIMEOUT)
+                .connect_lazy_with(
+                    (*setup_raw.connect_options())
+                        .clone()
+                        .busy_timeout(SCENARIO_BUSY_TIMEOUT),
+                ),
+            true,
+        );
+        assert_eq!(
+            pool.options().get_max_connections(),
+            setup_raw.options().get_max_connections()
+        );
+        assert_eq!(
+            pool.options().get_acquire_timeout(),
+            SCENARIO_ACQUIRE_TIMEOUT
+        );
+        setup_raw.close().await;
+        drop(setup_raw);
+        // No idle connection: the timed acquisition must open and initialize one.
         assert_eq!(pool.size(), 0);
         drop(owner);
-        let mut blocker = sqlx::SqliteConnection::connect_with(
-            &sqlx::sqlite::SqliteConnectOptions::new().filename(&db),
-        )
-        .await
-        .unwrap();
-        sqlx::query("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE")
-            .execute(&mut blocker)
-            .await
-            .unwrap();
+        let mut blocker = exclusive_blocker(&db).await;
         let result = pool.acquire().await;
-        assert!(matches!(result, Err(sqlx::Error::PoolTimedOut)));
+        assert!(
+            matches!(result, Err(sqlx::Error::PoolTimedOut)),
+            "intentional acquisition must time out while initialization is blocked: {result:?}"
+        );
         drop(pool);
         // The acquisition and facade are gone, but SQLite is still busy inside
         // its guarded initialization PRAGMA. Check the actual OS lease as well
         // as eventual destructor release; do not keep a strong test owner alive.
-        assert!(weak_owner.upgrade().is_some());
+        assert!(
+            weak_owner.upgrade().is_some(),
+            "blocked initialization worker must retain the lease after the internal timeout"
+        );
         assert!(crate::daemon_ownership::DaemonOwnership::acquire(&lock).is_err());
         sqlx::query("COMMIT").execute(&mut blocker).await.unwrap();
         blocker.close().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while weak_owner.upgrade().is_some() {
-                tokio::task::yield_now().await;
+        // The worker thread drops the last strong reference when SQLite closes the
+        // connection. Arc reports no strong owners just before that thread runs
+        // the destructor that unlocks the file, so wait on the OS lease itself.
+        let reacquired = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(owner) = crate::daemon_ownership::DaemonOwnership::acquire(&lock) {
+                    break owner;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("initialization worker must eventually release the lease");
-        assert!(crate::daemon_ownership::DaemonOwnership::acquire(&lock).is_ok());
+        assert!(weak_owner.upgrade().is_none());
+        drop(reacquired);
     }
 
     #[tokio::test]
     async fn write_internal_timeout_retains_initializing_worker() {
-        internal_timeout_retains_worker(false).await;
+        internal_timeout_retains_worker(false, false).await;
     }
 
     #[tokio::test]
     async fn read_internal_timeout_retains_initializing_worker() {
-        internal_timeout_retains_worker(true).await;
+        internal_timeout_retains_worker(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn write_internal_timeout_survives_slow_setup() {
+        internal_timeout_retains_worker(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn read_internal_timeout_survives_slow_setup() {
+        internal_timeout_retains_worker(true, true).await;
     }
 }

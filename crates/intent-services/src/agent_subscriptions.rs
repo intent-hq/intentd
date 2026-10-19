@@ -2028,7 +2028,7 @@ impl Services {
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
         // `agent:idle` emit (each omitted when the child owns none), the
         // same emit-time `isWaitingForOtherAgents` flag (pending-watch
-        // derivation with the shared `report_delivered` filter, no 2-cycle
+        // derivation with the shared `report_delivered` filter, no idle-cycle
         // guard — matching the live emit sites), and the persisted
         // completionReport under the same dual keys (canonical + legacy) —
         // which is also what lets the delivery pass apply the monorepo#1945
@@ -2355,11 +2355,11 @@ impl Services {
                         // Same emit-time `isWaitingForOtherAgents` stamp as
                         // the live idle emits. Usually false here (a waiting
                         // child was skipped above), but not always: the skip
-                        // uses the durable classification WITH the 2-cycle
+                        // uses the durable classification WITH the idle-cycle
                         // guard, while this stamp is the in-memory watch
-                        // derivation (report_delivered-filtered, no 2-cycle
+                        // derivation (report_delivered-filtered, no idle-cycle
                         // guard) — a child whose only outgoing watch was
-                        // declassified as a mutual-idle 2-cycle reaches this
+                        // declassified as part of an all-idle cycle reaches this
                         // line and stamps `true`.
                         if event_type == intent_core::events::AGENT_IDLE {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
@@ -2533,7 +2533,7 @@ impl Services {
         // agent that itself holds live outgoing completion watches on other
         // agents has not settled — it will run again when a watched target
         // completes, so its group completion must not be recorded yet.
-        // Classified live (with the 2-cycle deadlock guard) rather than from
+        // Classified live (with the idle-cycle deadlock guard) rather than from
         // the emit-time `isWaitingForOtherAgents` stamp, matching the grouped
         // branch of `deliver_completion_to_watches`; the genuine completion
         // (post-wait idle, failure, deletion, or the watch-removal backstop

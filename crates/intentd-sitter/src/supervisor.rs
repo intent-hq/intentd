@@ -775,7 +775,7 @@ impl Supervisor {
                     signals.restart_during_readiness = false;
                 }
                 if !self
-                    .await_initial_readiness(&binary, &mut child, &mut signals)
+                    .await_initial_readiness(&binary, &current_version, &mut child, &mut signals)
                     .await
                 {
                     let exit = if self.graceful_stop(&mut child).await {
@@ -1384,12 +1384,14 @@ impl Supervisor {
     async fn await_initial_readiness(
         &self,
         binary: &Path,
+        version: &str,
         child: &mut tokio::process::Child,
         signals: &mut Signals,
     ) -> bool {
-        let deadline = Instant::now() + crate::readiness::timeout_from_env();
+        use crate::readiness::{versions_match, ProbeStatus, StartupBudget};
+        let mut budget = StartupBudget::new(crate::readiness::timeout_from_env());
         loop {
-            let probe = crate::readiness::probe_daemon_version_async(binary);
+            let probe = crate::readiness::probe_status_async(binary);
             tokio::select! {
                 biased;
                 status = child.wait() => {
@@ -1406,12 +1408,17 @@ impl Supervisor {
                         return false;
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(budget.deadline.into()) => {
                     eprintln!("intentd-sitter: startup readiness timed out");
                     return false;
                 }
                 result = probe => {
-                    if result.is_some() {
+                    budget.observe(&result);
+                    if result == ProbeStatus::Failed {
+                        eprintln!("intentd-sitter: daemon startup failed");
+                        return false;
+                    }
+                    if matches!(result, ProbeStatus::Ready(actual) if versions_match(&actual, version)) {
                         if !matches!(child.try_wait(), Ok(None)) {
                             return false;
                         }

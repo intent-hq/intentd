@@ -744,7 +744,9 @@ use std::time::{Duration, Instant};
 // does not activate paginated editing, and the old notePaging stays absent.
 // 13.10 adds capability-gated cancellable note deletion controls.
 // 14.0 removes archived script lists and terminal monitor history; active pages and lazy details.
-pub const PROTOCOL_VERSION: &str = "14.0";
+// 14.1 adds owner-only startup readiness and indexing observations.
+// 15.0 removes system.importLegacy, the legacy import CLI commands and first-boot import.
+pub const PROTOCOL_VERSION: &str = "15.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

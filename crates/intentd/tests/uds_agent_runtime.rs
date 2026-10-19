@@ -104,8 +104,10 @@ async fn connect_retry(socket: &PathBuf) -> UnixStream {
     let budget = common::daemon_startup_timeout();
     tokio::time::timeout(budget, async {
         loop {
-            if let Ok(s) = UnixStream::connect(socket).await {
-                return s;
+            if common::daemon_is_ready(socket).await {
+                return UnixStream::connect(socket)
+                    .await
+                    .expect("connect ready daemon");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

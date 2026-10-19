@@ -437,10 +437,13 @@ pub(crate) fn project_served_queue_signal(
     served: &PullRequestInfo,
 ) -> bool {
     let same_known_head = persisted.head_sha.is_some() && persisted.head_sha == served.head_sha;
-    if !same_known_head || persisted.is_in_merge_queue == served.is_in_merge_queue {
+    let queue = served.is_in_merge_queue.filter(|&queued| {
+        queued && persisted.status == PullRequestStatus::Open && persisted.is_draft != Some(true)
+    });
+    if !same_known_head || persisted.is_in_merge_queue == queue {
         return false;
     }
-    persisted.is_in_merge_queue = served.is_in_merge_queue;
+    persisted.is_in_merge_queue = queue;
     true
 }
 
@@ -615,6 +618,14 @@ pub(crate) async fn refresh_stale_pool_entries(
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
                 return (changed, Some(detail));
             }
+            // Expected local admission, not a forge failure: the next
+            // sweep retries it (intent-hq/intent#7264).
+            Ok(Err(e)) if crate::pr_discovery::is_budget_deferral_sc(&e) => {
+                tracing::debug!(
+                    pr_number = number,
+                    "stale PR pool re-fetch deferred by request budget; keeping persisted snapshot"
+                );
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     pr_number = number,
@@ -681,7 +692,8 @@ pub(crate) fn build_pr_info_with_merge_queue(
         mergeable: pr.mergeable,
         mergeable_state: pr.mergeable_state.clone(),
         is_draft: Some(pr.draft),
-        is_in_merge_queue: merge_queue_reported.filter(|&queued| queued),
+        is_in_merge_queue: merge_queue_reported
+            .filter(|&queued| queued && derive_pr_status(pr) == PullRequestStatus::Open),
     }
 }
 
@@ -2154,6 +2166,25 @@ mod tests {
     /// pool, only entries sharing the served URL take the projection (a
     /// same-numbered stranger is left alone, a case-variant URL matches, an
     /// absent entry is never added).
+    #[test]
+    fn queue_projection_does_not_requeue_terminal_or_draft_copies() {
+        let queued = queued_pooled_pr();
+        for status in [
+            PullRequestStatus::Merged,
+            PullRequestStatus::Closed,
+            PullRequestStatus::Draft,
+        ] {
+            let mut persisted = queued.clone();
+            persisted.status = status;
+            persisted.is_in_merge_queue = None;
+            assert!(!project_served_queue_signal(&mut persisted, &queued));
+            assert_eq!(persisted.is_in_merge_queue, None);
+            persisted.is_in_merge_queue = Some(true);
+            assert!(project_served_queue_signal(&mut persisted, &queued));
+            assert_eq!(persisted.is_in_merge_queue, None);
+        }
+    }
+
     #[test]
     fn project_served_queue_signal_writes_only_the_signal_on_the_same_head() {
         let queued = queued_pooled_pr();

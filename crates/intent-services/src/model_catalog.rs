@@ -409,6 +409,14 @@ pub(crate) struct ModelCatalogCache {
     refresh_permits: tokio::sync::Semaphore,
 }
 
+/// One cached catalog row as a provider picker option: bare `id`, display
+/// `name` (falls back to the id) and `description` (may be empty).
+pub(crate) struct CachedModelRow {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
 /// A probe-free catalog view using a snapshot of the effective provider settings.
 pub(crate) struct ModelCatalogReader<'a> {
     cache: &'a ModelCatalogCache,
@@ -626,6 +634,61 @@ impl ModelCatalogReader<'_> {
             .map(|s| s.provider_id.to_string())
             .collect()
     }
+
+    /// The cached catalog rows for a provider reference
+    /// (intent-hq/intent#7121): `Some(rows)` when the reference holds a
+    /// non-empty last-good entry under its **current** version key, `None`
+    /// otherwise (no evidence). A bare id normalizes legacy default aliases
+    /// like [`Self::cached_catalog_claims`]. A named profile (`<base>@<id>`)
+    /// reads only its own cache slot, versioned by its observed installed
+    /// identity — never the base's Default catalog, whose model set may
+    /// differ. Synchronous, read-only and probe-free.
+    pub(crate) fn cached_catalog_rows(&self, provider_ref: &str) -> Option<Vec<CachedModelRow>> {
+        let profile = provider_ref.contains(crate::provider_profiles::REF_SEPARATOR);
+        let slot = if profile {
+            provider_ref
+        } else {
+            intent_providers::provider_config(provider_ref).id
+        };
+        let base = slot
+            .split_once(crate::provider_profiles::REF_SEPARATOR)
+            .map_or(slot, |(base, _)| base);
+        let source = source_for(base)?;
+        let version_key = if profile {
+            self.cache.installed_key(slot)?
+        } else {
+            self.version_key(source)
+        };
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
+        let entry = entries.get(slot)?;
+        if entry.version_key != version_key {
+            return None;
+        }
+        let text =
+            |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+        let rows: Vec<CachedModelRow> = entry
+            .models
+            .iter()
+            .filter_map(|row| {
+                let id = text(row, "id")?;
+                let id = id
+                    .split_once(':')
+                    .filter(|(prefix, _)| *prefix == base)
+                    .map_or(id.as_str(), |(_, bare)| bare)
+                    .to_string();
+                Some(CachedModelRow {
+                    name: text(row, "name").unwrap_or_else(|| id.clone()),
+                    description: text(row, "description").unwrap_or_default(),
+                    id,
+                })
+            })
+            .collect();
+        (!rows.is_empty()).then_some(rows)
+    }
 }
 
 /// Identity observations are refreshed at explicit refreshes and at most once
@@ -634,8 +697,25 @@ impl ModelCatalogReader<'_> {
 #[derive(Clone)]
 struct InstalledSelection {
     observed: tokio::time::Instant,
+    /// The profile reference + settings fingerprint the command was prepared
+    /// under (`None` = Default). A saved edit never reuses the old command.
+    profile_key: Option<String>,
     key: String,
     command: Result<crate::acp_adapter::AcpAdapterCommand, String>,
+}
+
+/// Whether a prior installed selection still describes the requested launch:
+/// observed after the request (or recently, when not forced) and prepared
+/// under exactly the same profile settings.
+fn reusable_selection(
+    prior: &InstalledSelection,
+    requested: tokio::time::Instant,
+    force: bool,
+    profile_key: Option<&str>,
+) -> bool {
+    prior.profile_key.as_deref() == profile_key
+        && (prior.observed >= requested
+            || !force && prior.observed.elapsed() < std::time::Duration::from_secs(60))
 }
 
 impl ModelCatalogCache {
@@ -652,6 +732,25 @@ impl ModelCatalogCache {
         provider: &str,
         force: bool,
     ) -> ResolvedModels {
+        self.resolve_installed_for(provider, None, force).await
+    }
+
+    /// [`Self::resolve_installed`] for a provider reference. A named profile
+    /// (`<base>@<id>` with its resolved overlay) gets its own cache slot keyed
+    /// by the reference; its version key folds in the profile's settings
+    /// fingerprint and effective configuration, so cached catalogs never cross
+    /// profiles, the Default configuration or saved edits.
+    pub(crate) async fn resolve_installed_for(
+        self: &Arc<Self>,
+        provider: &str,
+        profile: Option<Arc<intent_acp::ProfileEnv>>,
+        force: bool,
+    ) -> ResolvedModels {
+        let base = provider
+            .split_once(crate::provider_profiles::REF_SEPARATOR)
+            .map_or(provider, |(base, _)| base)
+            .to_owned();
+        let profile_key = profile.as_ref().map(|p| p.cache_key());
         let requested = tokio::time::Instant::now();
         let lock = self
             .installed_refresh
@@ -668,13 +767,13 @@ impl ModelCatalogCache {
                 .expect("installed catalog poisoned")
                 .get(provider)
                 .cloned();
-            if let Some(prior) = prior.filter(|s| {
-                s.observed >= requested
-                    || !force && s.observed.elapsed() < std::time::Duration::from_secs(60)
-            }) {
+            if let Some(prior) =
+                prior.filter(|s| reusable_selection(s, requested, force, profile_key.as_deref()))
+            {
                 prior
             } else {
-                let command = crate::provider_models::installed_model_command(provider).await;
+                let command =
+                    crate::provider_models::installed_model_command(&base, profile.clone()).await;
                 let key = command
                     .as_ref()
                     .ok()
@@ -682,6 +781,7 @@ impl ModelCatalogCache {
                     .unwrap_or_else(|| format!("installed-unavailable:{provider}"));
                 let selection = InstalledSelection {
                     observed: tokio::time::Instant::now(),
+                    profile_key: profile_key.clone(),
                     key,
                     command,
                 };
@@ -708,8 +808,7 @@ impl ModelCatalogCache {
                     }
                 };
                 let fetched =
-                    crate::provider_models::fetch_installed_models_at(&provider_owned, command)
-                        .await;
+                    crate::provider_models::fetch_installed_models_at(&base, command).await;
                 // A post-probe runtime/auth change invalidates even the last-good
                 // entry: it no longer belongs to the current execution context.
                 if fetched

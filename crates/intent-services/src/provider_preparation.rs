@@ -279,6 +279,7 @@ process.exit(1);
         npx_fallback_binary: Some(npx),
         npx_fallback_package: Some(package),
         node_max_old_space_mb: heap,
+        profile_env: None,
     };
     let prepared = prepare_npx_package(&opts, &script).ok()?;
     let receipt_path = prepared

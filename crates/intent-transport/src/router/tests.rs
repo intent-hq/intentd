@@ -539,6 +539,22 @@ impl WorkspaceApi for FakeApi {
             ])
         })
     }
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
+        Box::pin(async move {
+            if !url.contains("/pull/") {
+                return Err(Error::InvalidParams("url is not a pull-request URL".into()));
+            }
+            Ok(vec![intent_core::PullRequestWorkspace {
+                id: WorkspaceId("ws-1".into()),
+                title: url,
+                archived: true,
+                linked_at: "2026-10-18T04:40:00.000Z".into(),
+            }])
+        })
+    }
     fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             if path == "fail" {
@@ -3571,6 +3587,41 @@ async fn workspace_find_repositories_returns_repositories_array() {
         v["result"]["repositories"],
         serde_json::json!(["/tmp/scan/repo-a", "/tmp/scan/repo-b"])
     );
+}
+
+#[tokio::test]
+async fn workspace_find_by_pull_request_passes_url_and_serves_camel_case_rows() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{"url":"https://github.com/o/r/pull/7"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "workspaces": [{
+            "id": "ws-1",
+            "title": "https://github.com/o/r/pull/7",
+            "archived": true,
+            "linkedAt": "2026-10-18T04:40:00.000Z",
+        }] })
+    );
+}
+
+#[tokio::test]
+async fn workspace_find_by_pull_request_bad_or_missing_url_is_invalid_params() {
+    for params in [
+        r"{}",
+        r#"{"url":7}"#,
+        r#"{"url":"https://github.com/o/r/issues/7"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+        assert_eq!(v["error"]["data"]["code"], "invalid-params", "{params}");
+    }
 }
 
 #[tokio::test]

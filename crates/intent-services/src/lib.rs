@@ -200,6 +200,7 @@ mod line_attribution;
 mod linear_ops;
 mod member_removal;
 mod model_catalog;
+mod model_preference;
 mod nested_repos;
 mod note_annotation;
 mod note_merge;
@@ -221,12 +222,14 @@ mod pr_ops;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
+mod profile_activation;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
+mod provider_profiles;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -337,8 +340,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, InvalidationSubscription, SharedWatchHub, Subscription,
-    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, InvalidationSubscription, SharedWatchHub,
+    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -1020,6 +1023,13 @@ pub struct Services {
     /// finishes before acquiring this gate to commit the ordinary subset.
     settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
     settings_secret_gates: Arc<settings::SecretSettingsGates>,
+    /// Named provider profile metadata (`<data_dir>/provider-profiles.json`),
+    /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
+    /// the composition root calls [`Services::with_provider_profiles_dir`].
+    provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
+    /// Live profile processes and the settings fingerprint each started
+    /// with (PROTOCOL §5.54 activation); in-memory, per daemon process.
+    profile_activation: Arc<profile_activation::ProfileActivation>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1720,6 +1730,8 @@ impl Services {
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
+            provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
+            profile_activation: Arc::default(),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -4747,6 +4759,17 @@ impl Services {
         self
     }
 
+    /// Load named provider profile metadata from
+    /// `<data_dir>/provider-profiles.json` (PROTOCOL §5.54). A malformed file
+    /// is left untouched and `providers.profiles.*` report it unreadable.
+    /// Composition-root only — call before the surface is shared/cloned,
+    /// then run [`Services::sweep_provider_profile_secrets`] once.
+    #[must_use]
+    pub fn with_provider_profiles_dir(mut self, data_dir: &Path) -> Self {
+        self.provider_profiles = Arc::new(provider_profiles::ProviderProfileStore::load(data_dir));
+        self
+    }
+
     /// Persist the per-provider `models.list` cache (PROTOCOL §5.30) under
     /// `dir` (the daemon data dir), reloading any current-version snapshot.
     /// Composition-root only — call before the surface is shared/cloned.
@@ -5044,7 +5067,9 @@ impl Services {
     ///    against its detected repo ([`Services::refresh_git_root_pr`]).
     ///
     /// Fail-soft per root: every per-root error is logged and never aborts
-    /// the sweep, so a bad root never fails the workspace refresh. Each
+    /// the sweep, so a bad root never fails the workspace refresh. A
+    /// request-budget deferral is not a per-root failure: it is counted and
+    /// logged once per repository (intent-hq/intent#7264). Each
     /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// like the workspace refresh itself.
     ///
@@ -5052,12 +5077,17 @@ impl Services {
     /// 1–3 are pure git/store work and still run (so submodule detection,
     /// pruning, and the commit-sha backfill don't require forge
     /// credentials); only the per-root PR refresh (step 4) is skipped.
-    async fn sweep_workspace_git_roots(
+    ///
+    /// Request-budget deferrals are counted into the caller's per-sweep
+    /// `deferrals`, which [`pr_discovery::DeferralTally::log`] reports once
+    /// per repository after the whole sweep.
+    async fn sweep_workspace_git_roots_tallied(
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
         interval_secs: u64,
         local_maintenance: bool,
+        deferrals: &mut pr_discovery::DeferralTally,
     ) {
         if ws.is_remote || ws.archived {
             return;
@@ -5235,6 +5265,7 @@ impl Services {
                 continue;
             };
             let root_id = root.id.clone();
+            let root_repo = root.repo();
             let refreshed = pr_discovery::automatically_refresh(
                 interval_secs,
                 self.refresh_git_root_pr(root, sc),
@@ -5248,6 +5279,16 @@ impl Services {
                     )
                     .await;
                 }
+                // The repository's shared slot hands the same deferral to
+                // every root: summarized once per repository per sweep.
+                Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                    tracing::debug!(
+                        workspace = %ws.id.as_str(),
+                        git_root = %root_id.as_str(),
+                        "git root sweep: root refresh deferred by request budget"
+                    );
+                    deferrals.root(root_repo);
+                }
                 Err(e) => {
                     tracing::warn!(
                         workspace = %ws.id.as_str(),
@@ -5259,6 +5300,28 @@ impl Services {
                 Ok(_) => {}
             }
         }
+    }
+
+    /// One workspace's git-root sweep with its own deferral summary — the
+    /// test entry point for [`Self::sweep_workspace_git_roots_tallied`].
+    #[cfg(test)]
+    async fn sweep_workspace_git_roots(
+        &self,
+        ws: &Workspace,
+        sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
+    ) {
+        let mut deferrals = pr_discovery::DeferralTally::default();
+        self.sweep_workspace_git_roots_tallied(
+            ws,
+            sc,
+            interval_secs,
+            local_maintenance,
+            &mut deferrals,
+        )
+        .await;
+        deferrals.log(&self.pr_discovery);
     }
 
     /// True while the global sweep rate-limit pause window is active
@@ -5632,6 +5695,13 @@ impl Services {
                             discovery_rate_limited = Some(detail);
                             None
                         }
+                        Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                            tracing::debug!(
+                                git_root = %root.id.as_str(),
+                                "git root refresh: relink discovery deferred by request budget, persisting status only"
+                            );
+                            None
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 git_root = %root.id.as_str(),
@@ -5946,6 +6016,13 @@ impl Services {
                     // workspaces (monorepo#2961).
                     Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
                         discovery_rate_limited = Some(detail);
+                        None
+                    }
+                    Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                        tracing::debug!(
+                            workspace_id = %ws.id.as_str(),
+                            "pr refresh: relink discovery deferred by request budget, persisting status only"
+                        );
                         None
                     }
                     Err(e) => {
@@ -6326,6 +6403,7 @@ impl Services {
             )
             .await;
         }
+        let mut deferrals = pr_discovery::DeferralTally::default();
         for ws in workspaces {
             if self.settings_tasks.is_closed() {
                 break;
@@ -6363,6 +6441,13 @@ impl Services {
                         )
                         .await;
                     }
+                    Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                        tracing::debug!(
+                            workspace = %ws_id.as_str(),
+                            "pr refresh: workspace refresh deferred by request budget"
+                        );
+                        deferrals.workspace(ws.repo());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             workspace = %ws_id.as_str(),
@@ -6376,17 +6461,19 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(
+            self.sweep_workspace_git_roots_tallied(
                 &ws,
                 sc.as_ref(),
                 interval,
                 pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+                &mut deferrals,
             )
             .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
+        deferrals.log(&self.pr_discovery);
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at
@@ -6532,129 +6619,172 @@ impl Services {
             .map_err(|error| Error::Internal(format!("token usage worker failed: {error}")))?
     }
 
+    /// Refresh the materialized `agentNames` (§5.23) after an agent rename.
+    /// A rename changes no `agent_message` rows, so neither the end-of-turn
+    /// update nor the watermark-gated reconciliation scan would pick it up.
+    /// Only recomputes when the stored snapshot already names a usage bucket
+    /// for this agent, so renaming a usage-less agent never materializes a
+    /// snapshot. Best-effort: the rename itself already landed.
+    pub(crate) async fn refresh_token_usage_after_rename(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let has_bucket = match self.store.get_workspace(workspace_id).await {
+            Ok(workspace) => workspace
+                .token_usage
+                .is_some_and(|usage| usage.by_agent_id.contains_key(&agent_id.0)),
+            Err(e) => {
+                tracing::warn!(workspace = %workspace_id.as_str(), error = %e, "read token usage before rename refresh failed");
+                return;
+            }
+        };
+        if !has_bucket {
+            return;
+        }
+        if let Err(e) = self
+            .recompute_workspace_token_usage(workspace_id, false)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace_id.as_str(),
+                error = %e,
+                "recompute workspace token usage after rename failed"
+            );
+        }
+    }
+
     async fn recompute_workspace_token_usage_owned(
         &self,
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
     ) -> Result<bool> {
-        let written =
-            self.store
-                .update_workspace_token_usage(workspace_id, |usage_data, current| {
-                    // Tally usage without hydrating full message logs (finding F2;
-                    // snapshot/baseline-backed sessions arrive with empty contents).
-                    let mut tallies = Vec::new();
-                    let mut cross_rows = Vec::new();
-                    for (agent_id, model, snapshot, baseline, contents, cells) in usage_data {
-                        let reported =
-                            intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
-                        let mut contributed = false;
-                        let has_materialized_totals = cells.iter().any(|cell| {
-                            cell.reported_totals != intent_core::TokenUsageTotals::default()
-                        });
-                        for cell in cells {
-                            let totals = if reported {
-                                cell.reported_totals.clone()
-                            } else {
-                                let mut totals = token_usage::agent_token_tally(
-                                    agent_id,
-                                    Some(&cell.model),
-                                    None,
-                                    None,
-                                    &cell.message_usage,
-                                )
-                                .totals;
-                                totals.cost.clone_from(&cell.reported_totals.cost);
-                                totals
-                            };
-                            if totals != intent_core::TokenUsageTotals::default()
-                                || cell.human_messages != 0
-                                || cell.agent_messages != 0
-                            {
-                                contributed = true;
-                                let model = if cell.model.is_empty() {
-                                    token_usage::UNKNOWN_MODEL.to_string()
-                                } else {
-                                    cell.model.clone()
-                                };
-                                tallies.push(token_usage::AgentTokenTally {
-                                    agent_id: agent_id.clone(),
-                                    model: model.clone(),
-                                    totals: totals.clone(),
-                                });
-                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
-                                    agent_id: agent_id.clone(),
-                                    model,
-                                    totals,
-                                    human_messages: cell.human_messages,
-                                    agent_messages: cell.agent_messages,
-                                });
-                            }
-                        }
-                        let fallback = token_usage::agent_token_tally(
-                            agent_id,
-                            model.as_deref(),
-                            baseline.as_ref(),
-                            snapshot.as_ref(),
-                            contents,
-                        );
-                        if reported
-                            && !has_materialized_totals
-                            && fallback.totals != intent_core::TokenUsageTotals::default()
-                        {
-                            if let Some(row) = cross_rows.iter_mut().rev().find(|row| {
-                                row.agent_id == *agent_id && row.model == fallback.model
-                            }) {
-                                row.totals = fallback.totals.clone();
-                            } else {
-                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
-                                    agent_id: agent_id.clone(),
-                                    model: fallback.model.clone(),
-                                    totals: fallback.totals.clone(),
-                                    human_messages: 0,
-                                    agent_messages: 0,
-                                });
-                            }
-                            tallies.push(fallback.clone());
-                            contributed = true;
-                        }
-                        if !contributed {
-                            tallies.push(fallback);
-                        }
-                    }
-                    cross_rows.sort_by(|a, b| {
-                        a.agent_id
-                            .cmp(&b.agent_id)
-                            .then_with(|| a.model.cmp(&b.model))
+        let written = self
+            .store
+            .update_workspace_token_usage(workspace_id, |usage_data, current| {
+                // Tally usage without hydrating full message logs (finding F2;
+                // snapshot/baseline-backed sessions arrive with empty contents).
+                let mut tallies = Vec::new();
+                let mut cross_rows = Vec::new();
+                for (agent_id, model, snapshot, baseline, contents, cells, _name) in usage_data {
+                    let reported =
+                        intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
+                    let mut contributed = false;
+                    let has_materialized_totals = cells.iter().any(|cell| {
+                        cell.reported_totals != intent_core::TokenUsageTotals::default()
                     });
-                    let mut usage = token_usage::aggregate_token_usage(&tallies);
-                    usage.by_agent_model = Some(cross_rows);
-                    usage.last_scan_at = Some(now_iso());
-
-                    if guard_zero_regression
-                        && !usage_data.is_empty()
-                        && usage.totals == intent_core::TokenUsageTotals::default()
-                        && current.is_some_and(|prev| {
-                            prev.totals != intent_core::TokenUsageTotals::default()
-                        })
-                    {
-                        // Reconciliation guard: never clobber a fresher live snapshot
-                        // with an all-zero tally while session rows exist (the racing-
-                        // sweep case). An empty workspace (all sessions deleted) has no
-                        // turn to race, so the zero recount above writes through.
-                        return None;
-                    }
-                    let changed = match current {
-                        Some(prev) => {
-                            prev.by_agent_id != usage.by_agent_id
-                                || prev.by_model != usage.by_model
-                                || prev.by_agent_model != usage.by_agent_model
-                                || prev.totals != usage.totals
+                    for cell in cells {
+                        let totals = if reported {
+                            cell.reported_totals.clone()
+                        } else {
+                            let mut totals = token_usage::agent_token_tally(
+                                agent_id,
+                                Some(&cell.model),
+                                None,
+                                None,
+                                &cell.message_usage,
+                            )
+                            .totals;
+                            totals.cost.clone_from(&cell.reported_totals.cost);
+                            totals
+                        };
+                        if totals != intent_core::TokenUsageTotals::default()
+                            || cell.human_messages != 0
+                            || cell.agent_messages != 0
+                        {
+                            contributed = true;
+                            let model = if cell.model.is_empty() {
+                                token_usage::UNKNOWN_MODEL.to_string()
+                            } else {
+                                cell.model.clone()
+                            };
+                            tallies.push(token_usage::AgentTokenTally {
+                                agent_id: agent_id.clone(),
+                                model: model.clone(),
+                                totals: totals.clone(),
+                            });
+                            cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                agent_id: agent_id.clone(),
+                                model,
+                                totals,
+                                human_messages: cell.human_messages,
+                                agent_messages: cell.agent_messages,
+                            });
                         }
-                        None => true,
-                    };
-                    changed.then_some(usage)
-                })
-                .await?;
+                    }
+                    let fallback = token_usage::agent_token_tally(
+                        agent_id,
+                        model.as_deref(),
+                        baseline.as_ref(),
+                        snapshot.as_ref(),
+                        contents,
+                    );
+                    if reported
+                        && !has_materialized_totals
+                        && fallback.totals != intent_core::TokenUsageTotals::default()
+                    {
+                        if let Some(row) = cross_rows
+                            .iter_mut()
+                            .rev()
+                            .find(|row| row.agent_id == *agent_id && row.model == fallback.model)
+                        {
+                            row.totals = fallback.totals.clone();
+                        } else {
+                            cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                agent_id: agent_id.clone(),
+                                model: fallback.model.clone(),
+                                totals: fallback.totals.clone(),
+                                human_messages: 0,
+                                agent_messages: 0,
+                            });
+                        }
+                        tallies.push(fallback.clone());
+                        contributed = true;
+                    }
+                    if !contributed {
+                        tallies.push(fallback);
+                    }
+                }
+                cross_rows.sort_by(|a, b| {
+                    a.agent_id
+                        .cmp(&b.agent_id)
+                        .then_with(|| a.model.cmp(&b.model))
+                });
+                let mut usage = token_usage::aggregate_token_usage(&tallies);
+                usage.by_agent_model = Some(cross_rows);
+                usage.agent_names = token_usage::agent_names(
+                    &usage.by_agent_id,
+                    usage_data
+                        .iter()
+                        .map(|row| (row.0.as_str(), row.6.as_str())),
+                );
+                usage.last_scan_at = Some(now_iso());
+
+                if guard_zero_regression
+                    && !usage_data.is_empty()
+                    && usage.totals == intent_core::TokenUsageTotals::default()
+                    && current
+                        .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
+                {
+                    // Reconciliation guard: never clobber a fresher live snapshot
+                    // with an all-zero tally while session rows exist (the racing-
+                    // sweep case). An empty workspace (all sessions deleted) has no
+                    // turn to race, so the zero recount above writes through.
+                    return None;
+                }
+                let changed = match current {
+                    Some(prev) => {
+                        prev.by_agent_id != usage.by_agent_id
+                            || prev.by_model != usage.by_model
+                            || prev.by_agent_model != usage.by_agent_model
+                            || prev.totals != usage.totals
+                            || prev.agent_names != usage.agent_names
+                    }
+                    None => true,
+                };
+                changed.then_some(usage)
+            })
+            .await?;
         let Some(usage) = written else {
             return Ok(false);
         };
@@ -7460,20 +7590,23 @@ impl Services {
     /// (`after_all`) watches count too: a coordinator idling while its delegation
     /// group is open is genuinely waiting on its children.
     ///
-    /// 2-cycle deadlock guard: a mutual watch pair (A⇄B) in which BOTH sides
-    /// are idle would defer forever — each waits on the other, neither ever
-    /// fires. An outgoing watch on a target that watches this agent back AND is
-    /// itself idle (not busy, empty ready-to-send queue) is therefore NOT
-    /// counted as a waiting reason, so the deadlocked pair delivers as before
-    /// (both watchers fire). A mutual pair whose counterpart is still busy is a
-    /// genuine wait (the busy side will complete and wake this one), so it
-    /// still defers. The guard fails open in one asymmetric case: a
-    /// counterpart that is idle but itself hook-waiting or agent-waiting on a
-    /// third agent is not actually deadlocked (it will run again when its own
-    /// wait resolves), yet the edge is still declassified and this agent's
-    /// watchers fire early. That is the safe direction (an early wake, not a
-    /// stall) — the same class of accepted imprecision as deeper cycles
-    /// (A→B→C→A), which the guard does not detect either.
+    /// Idle-cycle deadlock guard: a closed watch cycle whose members are ALL
+    /// idle would defer forever — each waits on the next, none ever fires.
+    /// The mutual pair (A⇄B) is the 2-member case; deeper cycles
+    /// (A→B→C→A) deadlock the same way (issue intent-hq/intent#7205: idle
+    /// agents left "waiting" indefinitely on persisted cycles). An outgoing
+    /// watch on a target from which a chain of watches leads back to this
+    /// agent, with the target and every intermediate agent idle (not busy,
+    /// empty ready-to-send queue), is therefore NOT counted as a waiting
+    /// reason, so the last idle in the cycle delivers and the cycle unwinds
+    /// one wake per edge. A cycle with a busy (or queued) member is a genuine
+    /// wait (that member will complete and wake its watcher), so it still
+    /// defers, as does an acyclic chain. The guard fails open in one
+    /// asymmetric case: a cycle member that is idle but hook-waiting or
+    /// agent-waiting on an agent OUTSIDE the cycle is not actually
+    /// deadlocked (it will run again when its own wait resolves), yet the
+    /// edge is still declassified and this agent's watchers fire early. That
+    /// is the safe direction (an early wake, not a stall).
     ///
     /// `report_delivered` watches are excluded (issue
     /// intent-hq/monorepo#1643): such a watch has already delivered its
@@ -7499,12 +7632,18 @@ impl Services {
             .into_iter()
             .map(|w| w.child_agent_id)
             .collect();
-        let incoming: Vec<AgentId> = self
-            .find_watches_for_child(agent_id)
-            .into_iter()
-            .map(|w| w.parent_agent_id)
+        if outgoing.is_empty() {
+            return false;
+        }
+        let edges: Vec<(AgentId, AgentId)> = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .map(|w| (w.parent_agent_id.clone(), w.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Durable variant of [`Services::agent_is_waiting_on_agents`]: falls
@@ -7538,38 +7677,66 @@ impl Services {
         if outgoing.is_empty() {
             return false;
         }
-        let incoming: Vec<AgentId> = rows
+        let edges: Vec<(AgentId, AgentId)> = rows
             .iter()
-            .filter(|r| &r.child_agent_id == agent_id)
-            .map(|r| r.parent_agent_id.clone())
+            .map(|r| (r.parent_agent_id.clone(), r.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Core of the agent-waiting classification, shared between the live
     /// in-memory predicate above and the persisted-row fallback used by group
     /// rehydration (which runs before the watch registry is loaded at
-    /// startup). `outgoing` is the agent's outgoing watch targets and
-    /// `incoming` the parents watching it; busy/queue state is probed live in
-    /// both cases (the 2-cycle guard).
+    /// startup). `outgoing` is the agent's waiting (non-`report_delivered`)
+    /// watch targets and `edges` every `(parent, child)` watch edge in the
+    /// graph; busy/queue state is probed live in both cases (the idle-cycle
+    /// guard).
     pub(crate) fn classify_agent_waiting(
         &self,
         agent_id: &AgentId,
         outgoing: &[AgentId],
-        incoming: &[AgentId],
+        edges: &[(AgentId, AgentId)],
     ) -> bool {
         outgoing.iter().any(|target| {
             if target == agent_id {
                 // Defensive: a self-watch is never a waiting reason.
                 return false;
             }
-            let mutual_idle = incoming.contains(target)
-                && !self.agent_is_busy(target.clone())
-                && !self.has_ready_to_send(target);
-            // Count this edge as a waiting reason unless it is a deadlocked
-            // mutual-idle 2-cycle.
-            !mutual_idle
+            // Count this edge as a waiting reason unless it closes a
+            // deadlocked all-idle cycle back to `agent_id`.
+            !self.idle_watch_path_leads_back(agent_id, target, edges)
         })
+    }
+
+    /// Whether a chain of watch `edges` leads from `target` back to
+    /// `agent_id` through agents that are all idle (not busy, empty
+    /// ready-to-send queue), `target` included — i.e. the outgoing edge
+    /// `agent_id → target` closes an all-idle cycle no member can break.
+    fn idle_watch_path_leads_back(
+        &self,
+        agent_id: &AgentId,
+        target: &AgentId,
+        edges: &[(AgentId, AgentId)],
+    ) -> bool {
+        let mut seen: HashSet<&AgentId> = HashSet::new();
+        let mut stack: Vec<&AgentId> = vec![target];
+        while let Some(node) = stack.pop() {
+            if node == agent_id || !seen.insert(node) {
+                continue;
+            }
+            if self.agent_is_busy(node.clone()) || self.has_ready_to_send(node) {
+                continue;
+            }
+            for (parent, child) in edges {
+                if parent == node {
+                    if child == agent_id {
+                        return true;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+        false
     }
 
     /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
@@ -8236,7 +8403,7 @@ impl Services {
     /// agent-waiting idle defers WATCH delivery exactly like a hook-waiting
     /// one (ungrouped watches neither deliver nor retire; grouped memberships
     /// skip the settlement record), classified LIVE at delivery time via
-    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the 2-cycle
+    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the idle-cycle
     /// deadlock guard). Like hook-waiting (monorepo#1483), agent-waiting does
     /// NOT defer the child's OWN `after_all` group seal — an `after_all`
     /// coordinator always holds grouped outgoing watches on its own children,
@@ -8372,7 +8539,7 @@ impl Services {
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
         // will run again when a watched target completes. Classified LIVE at
-        // delivery time (like the hook probe) and with the 2-cycle deadlock
+        // delivery time (like the hook probe) and with the idle-cycle deadlock
         // guard baked into the predicate. This defers WATCH delivery only; it
         // must NOT defer the child's own after_all group seal (see the
         // `interim_idle` vs. `seal_interim` split below): a coordinator that
@@ -8721,7 +8888,7 @@ impl Services {
                 // Unlike the queue-interim case below, grouped watches DO
                 // defer here: a hook-waiting child is bounded by the hook TTL
                 // (§5.40) and an agent-waiting child is bounded by its watched
-                // target's completion (plus the 2-cycle guard), so the group
+                // target's completion (plus the idle-cycle guard), so the group
                 // cannot hang forever. NB this defers this child's record in
                 // ITS parent's group; the child's OWN after_all group seal is
                 // gated separately on `seal_interim` (which excludes
@@ -14386,6 +14553,22 @@ fn comment_resolved_event(
 /// (§6.5). Self-sufficient payload `{ workspaceId, workspace }` (§6.7) so a
 /// client can render the new workspace without a follow-up read.
 fn workspace_created_event(ws: &Workspace) -> NewEvent {
+    workspace_created_event_with_origin(ws, None)
+}
+
+/// [`workspace_created_event`] plus the optional `data.origin` provenance
+/// (§6.5, [`WorkspaceCreate::origin`]); `None` keeps the plain payload.
+fn workspace_created_event_with_origin(
+    ws: &Workspace,
+    origin: Option<&intent_core::WorkspaceCreateOrigin>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": ws.id.as_str(),
+        "workspace": ws,
+    });
+    if let Some(origin) = origin {
+        data["origin"] = serde_json::json!(origin);
+    }
     NewEvent {
         workspace_id: ws.id.clone(),
         timestamp: now_iso(),
@@ -14395,10 +14578,7 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({
-            "workspaceId": ws.id.as_str(),
-            "workspace": ws,
-        }),
+        data,
     }
 }
 
@@ -18597,7 +18777,7 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(changes, None))
+        Box::pin(self.settings_update_checking_profiles(changes))
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -18637,7 +18817,63 @@ impl WorkspaceApi for Services {
     }
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
+        Box::pin(async move {
+            // Saved profile summaries ride alongside the per-type rows
+            // (PROTOCOL §5.54); `providers` stays one row per provider type.
+            let mut catalog = provider_catalog::build_providers_catalog();
+            catalog["profiles"] = serde_json::Value::Array(self.provider_profile_summaries());
+            Ok(catalog)
+        })
+    }
+
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_list_impl(base_provider_id))
+    }
+
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_create_impl(params))
+    }
+
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_update_impl(profile_id, params))
+    }
+
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_delete_impl(profile_id))
+    }
+
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_auth_status_impl(provider_ref, force))
+    }
+
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_test_prompt_impl(
+            provider_ref,
+            model,
+            node_max_old_space_mb,
+        ))
     }
 
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -20891,6 +21127,23 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let key = intent_core::pull_request_key(&url)
+                .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
+            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            // Same membership narrowing as `workspace.list` (§5.48).
+            if let Some(visible) = this.visible_workspace_ids().await? {
+                rows.retain(|row| visible.contains(&row.id));
+            }
+            Ok(rows)
+        })
+    }
+
     fn workspace_setup_status(&self, id: &WorkspaceId) -> WorkspaceSetupStatus {
         self.workspace_setup_states.get(id)
     }
@@ -21142,6 +21395,7 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    let create_origin = input.origin.take();
                     // Request-shape `-32602`s run here, BEFORE any state
                     // change (row / metadata file / event / spec note /
                     // initial agent): compound `initialAgent.model` and
@@ -21302,6 +21556,7 @@ impl WorkspaceApi for Services {
                                     false,
                                     extra,
                                     spec_wp,
+                                    crate::agent_ops::CreateModelSource::Caller,
                                 )
                                 .await?;
                             Some((plan, prompt, image_blocks))
@@ -22923,7 +23178,11 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_created_event_with_origin(&ws, create_origin.as_ref()),
+                    )
+                    .await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back
@@ -31024,6 +31283,10 @@ impl WorkspaceApi for Services {
             // (monorepo#3338) — rejected before any state change.
             self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
                 .await?;
+            // A named profile that was removed or whose provider is disabled
+            // refuses the turn here, structured, before anything persists
+            // (PROTOCOL §5.54), rather than as a prose spawn failure later.
+            self.ensure_turn_provider_selectable(&agent_id).await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -37474,11 +37737,13 @@ impl Services {
         Ok(())
     }
 
-    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
-    /// `changes:git-status` after a mutating accept-changes step.
-    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+    /// Recompute the workspace's durable line-change aggregates from its
+    /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
+    /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
+    /// stored aggregates are published as they are.
+    pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
-            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {
@@ -37496,6 +37761,12 @@ impl Services {
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        self.recompute_and_publish_metrics(workspace_id).await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
             // The step just mutated the worktree, so the cached scan is the
@@ -37648,6 +37919,7 @@ struct AcExtras {
 /// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
 /// then the metrics / usage-stats recomputes. The status is inferred from the
 /// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Untracked git-ignored paths are not recorded (intent-hq/intent#7266).
 /// Best-effort throughout — a tracking miss never fails the mutation.
 async fn record_agent_file_mutation(
     store: &Store,
@@ -37686,6 +37958,11 @@ async fn record_agent_file_mutation(
             return;
         }
     };
+    // A git-ignored untracked path can never be committed, so a row for it
+    // would sit in `unstaged` forever (intent-hq/intent#7266).
+    if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+        return;
+    }
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =
@@ -37821,6 +38098,7 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;

@@ -17,6 +17,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use crate::Store;
 
 mod prepared_write;
+mod registration;
 pub use prepared_write::PreparedMonitorWrite;
 
 pub(crate) fn captured_monitor_exists(
@@ -918,6 +919,8 @@ pub struct PrMonitorListEntry {
     /// `$.requirements.mergeable` of `last_snapshot` (tri-state: omitted
     /// while the forge is still computing).
     pub snapshot_mergeable: Option<bool>,
+    /// `$.requirements.isInMergeQueue` of `last_snapshot`.
+    pub snapshot_is_in_merge_queue: Option<bool>,
 }
 
 /// One workspace's PR-monitor inputs for `workspace.get`, read by
@@ -949,7 +952,8 @@ fn non_cancelled_list_entry_sql(extra_filter: &str) -> String {
          json_extract(snapshot, '$.headSha') AS snapshot_head_sha, \
          json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
          json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
-         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable \
+         json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
+         json_extract(snapshot, '$.requirements.isInMergeQueue') AS snapshot_is_in_merge_queue \
          FROM (SELECT workspace_id, repo_owner, repo_name, pr_number, state, created_at, \
          updated_at, \
          CASE WHEN json_valid(last_snapshot) THEN last_snapshot END AS snapshot \
@@ -981,6 +985,7 @@ fn workspace_pr_monitor_reads_sql() -> &'static str {
      json_extract(snapshot, '$.requirements.state') AS snapshot_state, \
      json_extract(snapshot, '$.requirements.isDraft') AS snapshot_is_draft, \
      json_extract(snapshot, '$.requirements.mergeable') AS snapshot_mergeable, \
+     json_extract(snapshot, '$.requirements.isInMergeQueue') AS snapshot_is_in_merge_queue, \
      display_row, \
      CASE WHEN display_row THEN last_snapshot END AS display_snapshot \
      FROM (SELECT m.monitor_id, m.agent_id, m.workspace_id, m.repo_owner, m.repo_name, \
@@ -1017,6 +1022,9 @@ fn list_entry_from_row(r: &SqliteRow) -> Result<PrMonitorListEntry> {
             .map_err(err)?,
         snapshot_mergeable: r
             .try_get::<Option<bool>, _>("snapshot_mergeable")
+            .map_err(err)?,
+        snapshot_is_in_merge_queue: r
+            .try_get::<Option<bool>, _>("snapshot_is_in_merge_queue")
             .map_err(err)?,
     })
 }
@@ -2494,6 +2502,7 @@ mod tests {
                 "hasConflicts": false,
                 "isBehind": false,
                 "mergeable": true,
+                "isInMergeQueue": true,
                 "checks": {
                     "total": 0, "passed": 0, "failed": 0, "pending": 0,
                     "items": [], "failingRequired": [], "pendingRequired": [],
@@ -2567,6 +2576,7 @@ mod tests {
         assert_eq!(with_snap.snapshot_state.as_deref(), Some("merged"));
         assert_eq!(with_snap.snapshot_is_draft, Some(false));
         assert_eq!(with_snap.snapshot_mergeable, Some(true));
+        assert_eq!(with_snap.snapshot_is_in_merge_queue, Some(true));
 
         // Snapshotless and malformed-snapshot rows read as NULL scalars
         // (mirroring the tolerant serde parse this projection replaced).
@@ -2577,6 +2587,7 @@ mod tests {
             assert_eq!(e.snapshot_state, None, "pr {}", e.pr_number);
             assert_eq!(e.snapshot_is_draft, None, "pr {}", e.pr_number);
             assert_eq!(e.snapshot_mergeable, None, "pr {}", e.pr_number);
+            assert_eq!(e.snapshot_is_in_merge_queue, None, "pr {}", e.pr_number);
         }
 
         let all = store
@@ -2639,6 +2650,8 @@ mod tests {
             ],
             "display rows: active rows plus only the latest completed row"
         );
+        assert_eq!(reads.list_entries[1].snapshot_is_in_merge_queue, Some(true));
+        assert_eq!(reads.list_entries[0].snapshot_is_in_merge_queue, None);
         let display_1 = &reads.display_rows[0];
         assert_eq!(display_1.workspace_id, ws_id);
         assert_eq!(display_1.agent_id, agent_id);

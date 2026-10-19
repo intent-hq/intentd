@@ -322,16 +322,23 @@ fn apply_installed_update(paths: &SitterPaths, version: &str) -> i32 {
 fn wait_for_restarted_daemon(paths: &SitterPaths, version: &str) -> i32 {
     let timeout = readiness::timeout_from_env();
     println!(
-        "waiting for the daemon to respond (up to {}s)...",
+        "waiting for the daemon to respond ({}s without startup liveness)...",
         timeout.as_secs()
     );
     let binary = paths.daemon_binary(version);
-    match readiness::wait_for_version(version, timeout, readiness::DEFAULT_POLL_INTERVAL, || {
-        readiness::probe_daemon_version(&binary)
-    }) {
+    match readiness::wait_for_startup_version(
+        version,
+        timeout,
+        readiness::DEFAULT_POLL_INTERVAL,
+        |budget| readiness::probe_status(&binary, budget),
+    ) {
         readiness::WaitOutcome::Ready => {
             println!("daemon is up — intentd {version} is responding");
             0
+        }
+        readiness::WaitOutcome::Failed => {
+            eprintln!("intentd-sitter: replacement daemon startup failed; check daemon logs");
+            1
         }
         readiness::WaitOutcome::TimedOut { last_seen } => {
             let still = match last_seen {

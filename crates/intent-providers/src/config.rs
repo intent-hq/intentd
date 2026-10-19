@@ -6,8 +6,11 @@
 
 /// Single source of truth for the pinned `@agentclientprotocol/claude-agent-acp`
 /// version (macro so the literal can feed both `CLAUDE_AGENT_ACP_VERSION` and
-/// the `concat!`-built package spec). Bumping the adapter is a deliberate,
-/// one-line code change here.
+/// the `concat!`-built package spec). The `auto-pin-acp-adapters` workflow
+/// (`scripts/auto-pin-acp-adapter.py --adapter claude-code`) bumps this literal
+/// to each newer stable npm release via a rolling PR that merges on green;
+/// keep this exact macro shape, which that script matches. Hand bumps edit
+/// only this literal and refresh `data/adapter-cli-packages.json`.
 macro_rules! claude_agent_acp_version {
     () => {
         "0.81.1"
@@ -27,8 +30,9 @@ pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
 
 /// Node.js version requirement for the pinned adapter, for user-facing
 /// messages. Must match the npm `engines.node` field of the pinned
-/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`); re-check when bumping
-/// the pin.
+/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`). The auto-pin script
+/// refuses any release declaring a different `engines.node`; changing this
+/// requirement also means updating that script's `engines_node` expectation.
 pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 
 /// Minimum npm version whose `npx` runs the pinned `npx -y <package>` spawns.
@@ -48,7 +52,7 @@ pub const NPX_NPM_REQUIREMENT: &str = "npm 7+";
 /// This adapter ignores `-c` argv and applies `CODEX_CONFIG` JSON on each
 /// thread start/resume. Its Codex dependency permits patch releases;
 /// verify actual runtime versions and policy precedence when updating the pin.
-pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.1";
+pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.2.2";
 
 /// Daemon-owned Codex subagent denial shared by persistent agents, model
 /// probes, and one-shot launches. Explicit agent denial takes precedence over
@@ -58,6 +62,11 @@ pub const CODEX_ACP_NPX_PACKAGE: &str = "@agentclientprotocol/codex-acp@2.1.1";
 /// so the adapter uses the installed CLI. Do not merge user `CODEX_CONFIG`.
 pub const CODEX_SUBAGENT_POLICY_CONFIG: &str =
     r#"{"agents":{"enabled":false},"features":{"multi_agent":false,"multi_agent_v2":false}}"#;
+
+/// Codex adapter permission-mode variable Intent writes into every Codex launch
+/// (unless the daemon's own environment sets it). Named provider profiles may
+/// not override it.
+pub const CODEX_INITIAL_AGENT_MODE_ENV: &str = "INITIAL_AGENT_MODE";
 
 /// Actionable prerequisite failure shared by all Codex launch entrypoints.
 pub const CODEX_ACP_PREREQUISITE_ERROR: &str =
@@ -755,16 +764,55 @@ pub fn first_provider_id() -> &'static str {
 /// suppression list in `getProviderConfig`.
 const DEFAULT_PROVIDER_ALIASES: &[&str] = &["default", "acp", "augment"];
 
+/// Canonical base providers that accept named profiles (PROTOCOL §5.54).
+pub const PROFILE_BASE_PROVIDERS: &[&str] = &["codex", "claude-code"];
+
+/// Separator between a base provider id and a profile id in a provider
+/// reference (`<baseProviderId>@<profileId>`).
+pub const PROFILE_REF_SEPARATOR: char = '@';
+
+/// Split a well-formed profile reference `<base>@<profileId>` into its parts.
+/// The base must be a canonical id in [`PROFILE_BASE_PROVIDERS`] and the id
+/// must match `^[a-z0-9][a-z0-9-]{0,31}$`. `None` for a bare id or any
+/// malformed reference (aliases, other providers, case variants, whitespace,
+/// extra `@`). Syntax only: whether the profile exists is the daemon's call.
+#[must_use]
+pub fn split_profile_ref(reference: &str) -> Option<(&'static str, &str)> {
+    let (base, id) = reference.split_once(PROFILE_REF_SEPARATOR)?;
+    let base = PROFILE_BASE_PROVIDERS.iter().find(|b| **b == base)?;
+    let bytes = id.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+    valid.then_some((*base, id))
+}
+
+/// The base provider id of a selection: the base of a well-formed profile
+/// reference, otherwise `reference` unchanged. Installation, enablement,
+/// paths and capabilities are keyed by this id.
+#[must_use]
+pub fn base_provider_id(reference: &str) -> &str {
+    split_profile_ref(reference).map_or(reference, |(base, _)| base)
+}
+
 /// Resolve a registered id or a recognized legacy alias without treating an
 /// unknown id as the default provider. Legacy aliases name the first registered
-/// provider, independently of application settings.
+/// provider, independently of application settings. A well-formed profile
+/// reference resolves to its base provider's static configuration; it never
+/// selects that base's Default account by itself — execution resolves the
+/// profile separately.
 #[must_use]
 pub fn find_provider_or_legacy_alias(provider_id: &str) -> Option<&'static ProviderConfig> {
-    find_provider(provider_id).or_else(|| {
-        DEFAULT_PROVIDER_ALIASES
-            .contains(&provider_id)
-            .then(first_provider_config)
-    })
+    find_provider(provider_id)
+        .or_else(|| split_profile_ref(provider_id).and_then(|(base, _)| find_provider(base)))
+        .or_else(|| {
+            DEFAULT_PROVIDER_ALIASES
+                .contains(&provider_id)
+                .then(first_provider_config)
+        })
 }
 
 /// Historical aliases that resolve to this exact registered provider. This is

@@ -3383,6 +3383,53 @@ esac
     );
 }
 
+// The CLI may reject a request before opening the private socket. That must
+// fail the assertion with its output, never leave this fixture blocked in join.
+fn serve_stop_eof(
+    listener: &std::os::unix::net::UnixListener,
+    finished: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                drop(stream); // Crash before the owned daemon has stopped.
+                return true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("stop fixture accept failed: {error}"),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || finished.recv_timeout(remaining.min(Duration::from_millis(20)))
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            return false;
+        }
+    }
+}
+
+#[test]
+fn stop_eof_fixture_finishes_when_cli_exits_before_connecting() {
+    for disconnected in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.path().join("stop")).unwrap();
+        let (finished, signal) = std::sync::mpsc::channel();
+        if !disconnected {
+            finished.send(()).unwrap();
+        }
+        drop(finished);
+        let started = Instant::now();
+        assert!(!serve_stop_eof(&listener, &signal));
+        // The 15s deadline also returns false; only the finished signal is prompt.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fixture ignored the CLI-finished signal (disconnected: {disconnected})"
+        );
+    }
+}
+
 #[test]
 fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
     let dir = tempfile::tempdir().unwrap();
@@ -3391,13 +3438,15 @@ fn background_start_stop_rejects_control_eof_without_shutdown_receipt() {
         std::os::unix::net::UnixListener::bind(fixture.paths.pid_path.with_extension("stop"))
             .unwrap();
     fs::write(&fixture.paths.pid_path, std::process::id().to_string()).unwrap();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        drop(stream); // Model a crash before the owned daemon has stopped.
-    });
+    let (finished, signal) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || serve_stop_eof(&listener, &signal));
     let out = background_call(dir.path(), &dead_url(), &["stop"]);
+    let _ = finished.send(());
     fs::remove_file(&fixture.paths.pid_path).unwrap();
-    server.join().unwrap();
+    assert!(
+        server.join().unwrap(),
+        "stop never reached private control: {out:?}"
+    );
     assert!(
         !out.status.success(),
         "early EOF is not confirmed shutdown: {out:?}"
@@ -3763,4 +3812,353 @@ fn background_start_rejects_and_cleans_ready_orphan_after_supervisor_death() {
 #[test]
 fn background_start_cleans_unready_orphan_after_supervisor_death() {
     supervisor_death_during_startup(false);
+}
+
+/// Status stays byte-for-byte unchanged while the real sitter owns a live child.
+fn indexing_fixture(dir: &Path) -> BackgroundFixture {
+    let fixture = background_fixture(dir);
+    let binary = fixture.paths.daemon_binary("0.1.0");
+    let source = fs::read_to_string(&binary).unwrap().replace(
+        "echo '{\"version\":\"0.1.0\"}'",
+        r#"if [ ! -f "$INTENTD_DATA_DIR/release-indexing" ]; then
+      echo probe >> "$INTENTD_DATA_DIR/probes"
+      test ! -f "$INTENTD_DATA_DIR/lost" || exit 1
+      if [ -f "$INTENTD_DATA_DIR/failed" ]; then
+        echo '{"code":-32012,"message":"Daemon startup failed","data":{"code":"daemon-startup-failed","retryable":false,"startup":{"startupStatus":1,"attemptId":"boot-a","phase":"failed","elapsedMs":10,"phaseElapsedMs":0,"progressAgeMs":0,"failure":{"code":"startup-failed","message":"Daemon startup failed. Check daemon logs."}}}}' >&2
+      else
+        echo '{"code":-32012,"message":"Daemon not ready","data":{"code":"daemon-not-ready","retryable":true,"retryAfterMs":1000,"startup":{"startupStatus":1,"attemptId":"boot-a","phase":"indexing","elapsedMs":10,"phaseElapsedMs":10,"progressAgeMs":10,"retryAfterMs":1000,"progress":{"completedNotes":0,"totalNotes":1,"processedSourceBytes":0,"totalSourceBytes":100}}}}' >&2
+      fi
+      echo 'Error: rpc error' >&2
+      exit 1
+    fi
+    echo '{"version":"0.1.0"}'"#,
+    );
+    fs::write(binary, source).unwrap();
+    fixture
+}
+
+fn live_indexing_deadline_case(detached: bool, terminal: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let base = dead_url();
+    let mut cmd = sitter_command(dir.path(), &base);
+    cmd.arg(if detached { "start" } else { "serve" })
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "800")
+        .env(KILL_TIMEOUT_ENV, "100");
+    if !detached {
+        cmd.env(intentd_sitter::startup::STARTING_ENV, "1");
+    }
+    let mut child = spawn_guarded(&mut cmd);
+    wait_until("first indexing probe", Duration::from_secs(5), || {
+        dir.path().join("probes").exists()
+    });
+    let started = Instant::now();
+    wait_until(
+        "live indexing beyond original deadline",
+        Duration::from_secs(5),
+        || {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "startup exited while indexing still answered"
+            );
+            started.elapsed() > Duration::from_millis(1800)
+        },
+    );
+    assert!(fixture.paths.pid_path.exists());
+    assert!(
+        fs::read_to_string(dir.path().join("probes"))
+            .unwrap()
+            .lines()
+            .count()
+            > 3
+    );
+    if terminal != "ready" {
+        if terminal == "cancel" {
+            assert!(background_call(dir.path(), &base, &["stop"])
+                .status
+                .success());
+        } else {
+            fs::write(dir.path().join(terminal), "stop answering starting").unwrap();
+        }
+        let exit = child
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exit.success(),
+            terminal == "cancel" && !detached,
+            "{terminal}, detached={detached}"
+        );
+        wait_until("owned startup cleanup", Duration::from_secs(5), || {
+            !fixture.paths.pid_path.exists()
+        });
+        let pid = fs::read_to_string(dir.path().join("daemon-pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+        if terminal == "failed" {
+            let logs = read_or_empty(&stderr_path(dir.path()))
+                + &read_or_empty(&fixture.paths.sitter_dir.join("start.log"));
+            assert!(logs.contains("daemon startup failed"), "{logs}");
+        }
+        return;
+    }
+    fs::write(dir.path().join("release-indexing"), "ready").unwrap();
+    if detached {
+        assert!(child
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+}
+
+#[test]
+fn live_indexing_concurrent_stop_during_first_probe_never_relaunches() {
+    for contended in [true, false] {
+        stop_during_probe_case(contended);
+    }
+}
+
+fn stop_during_probe_case(contended: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let binary = fixture.paths.daemon_binary("0.1.0");
+    let source = fs::read_to_string(&binary).unwrap().replace(
+        "call|status)",
+        r#"call|status)
+    if [ "${BLOCK_START_PROBE:-}" = 1 ]; then
+      touch "$INTENTD_DATA_DIR/probe-parked"
+      # // timing-guard: deterministic probe barrier released after real stop
+      while [ ! -f "$INTENTD_DATA_DIR/probe-release" ]; do sleep 0.01; done
+    fi"#,
+    );
+    fs::write(binary, source).unwrap();
+    let base = dead_url();
+    let command = || {
+        let mut command = sitter_command(dir.path(), &base);
+        command
+            .arg("start")
+            .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+            .env(KILL_TIMEOUT_ENV, "100");
+        command
+    };
+    let mut first = spawn_guarded(&mut command());
+    wait_until("owned indexing", Duration::from_secs(5), || {
+        dir.path().join("probes").exists()
+    });
+    if !contended {
+        fs::write(
+            dir.path().join("release-indexing"),
+            "ready before second start",
+        )
+        .unwrap();
+        assert!(first
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    let mut second_command = command();
+    second_command.env("BLOCK_START_PROBE", "1");
+    let mut second = spawn_guarded(&mut second_command);
+    wait_until(
+        "contender first probe barrier",
+        Duration::from_secs(5),
+        || dir.path().join("probe-parked").exists(),
+    );
+    assert!(background_call(dir.path(), &base, &["stop"])
+        .status
+        .success());
+    if contended {
+        assert!(!first
+            .wait_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .success());
+    }
+    fs::write(dir.path().join("probe-release"), "resume after stop").unwrap();
+    assert!(!second
+        .wait_with_timeout(Duration::from_secs(7))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        read_or_empty(&daemon_log_path(dir.path()))
+            .lines()
+            .filter(|line| line.starts_with("spawn "))
+            .count(),
+        1,
+        "stop must not be undone by contender"
+    );
+    assert!(!fixture.paths.pid_path.exists());
+}
+
+#[test]
+fn live_indexing_concurrent_start_without_status_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let file = fs::File::create(fixture.paths.sitter_dir.join("start.lock")).unwrap();
+    let _lock = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+    let mut command = sitter_command(dir.path(), &dead_url());
+    command
+        .arg("start")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "800");
+    let mut child = spawn_guarded(&mut command);
+    assert!(!child
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    assert!(read_or_empty(&daemon_log_path(dir.path())).is_empty());
+}
+
+#[test]
+fn live_indexing_concurrent_start_waits_for_owner_and_real_readiness() {
+    for terminal in ["ready", "lost", "failed", "cancel"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = indexing_fixture(dir.path());
+        let base = dead_url();
+        let launch = || {
+            let mut command = sitter_command(dir.path(), &base);
+            command
+                .arg("start")
+                .env(intentd_sitter::readiness::TIMEOUT_ENV, "800")
+                .env(KILL_TIMEOUT_ENV, "100");
+            spawn_guarded(&mut command)
+        };
+        let mut first = launch();
+        wait_until("owner indexing", Duration::from_secs(5), || {
+            dir.path().join("probes").exists()
+        });
+        let owner = fs::read_to_string(&fixture.paths.pid_path).unwrap();
+        let mut second = launch();
+        let started = Instant::now();
+        wait_until(
+            "both callers beyond deadline",
+            Duration::from_secs(5),
+            || {
+                assert!(
+                    first.try_wait().unwrap().is_none(),
+                    "owner exited: {terminal}"
+                );
+                assert!(
+                    second.try_wait().unwrap().is_none(),
+                    "contender exited: {terminal}"
+                );
+                assert_eq!(fs::read_to_string(&fixture.paths.pid_path).unwrap(), owner);
+                started.elapsed() > Duration::from_millis(1800)
+            },
+        );
+        match terminal {
+            "ready" => fs::write(dir.path().join("release-indexing"), "ready").unwrap(),
+            "cancel" => assert!(background_call(dir.path(), &base, &["stop"])
+                .status
+                .success()),
+            _ => fs::write(dir.path().join(terminal), "stop answering").unwrap(),
+        }
+        for caller in [&mut first, &mut second] {
+            assert_eq!(
+                caller
+                    .wait_with_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap()
+                    .success(),
+                terminal == "ready",
+                "{terminal}"
+            );
+        }
+        assert_eq!(
+            read_or_empty(&daemon_log_path(dir.path()))
+                .lines()
+                .filter(|line| line.starts_with("spawn "))
+                .count(),
+            1,
+            "a contending caller must never spawn a replacement: {terminal}"
+        );
+        if terminal == "ready" {
+            assert_eq!(fs::read_to_string(&fixture.paths.pid_path).unwrap(), owner);
+            assert!(background_call(dir.path(), &base, &["stop"])
+                .status
+                .success());
+        }
+        wait_until("single owner cleaned", Duration::from_secs(5), || {
+            !fixture.paths.pid_path.exists()
+        });
+    }
+}
+
+#[test]
+fn live_indexing_preserves_outer_start_deadline_until_real_ready() {
+    live_indexing_deadline_case(true, "ready");
+}
+
+#[test]
+fn live_indexing_preserves_supervisor_deadline_until_real_ready() {
+    live_indexing_deadline_case(false, "ready");
+}
+
+#[test]
+fn live_indexing_lost_failed_and_cancelled_startup_clean_owned_children() {
+    for detached in [true, false] {
+        for terminal in ["lost", "failed", "cancel"] {
+            live_indexing_deadline_case(detached, terminal);
+        }
+    }
+}
+
+#[test]
+fn live_indexing_existing_unsupervised_owner_is_never_replaced_or_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = indexing_fixture(dir.path());
+    let mut command = Command::new(fixture.paths.daemon_binary("0.1.0"));
+    command
+        .arg("serve")
+        .env(DATA_DIR_ENV, dir.path())
+        .env(FAKE_DAEMON_LOG, daemon_log_path(dir.path()));
+    let mut daemon = spawn_guarded(&mut command);
+    wait_until("unsupervised indexing", Duration::from_secs(5), || {
+        dir.path().join("ready").exists()
+    });
+    let base = dead_url();
+    let mut command = sitter_command(dir.path(), &base);
+    command
+        .arg("start")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "800");
+    let mut caller = spawn_guarded(&mut command);
+    let started = Instant::now();
+    wait_until(
+        "existing indexing exceeds silence budget",
+        Duration::from_secs(5),
+        || {
+            assert!(caller.try_wait().unwrap().is_none());
+            assert!(daemon.try_wait().unwrap().is_none());
+            assert!(
+                !fixture.paths.pid_path.exists(),
+                "must not spawn a duplicate supervisor"
+            );
+            started.elapsed() > Duration::from_millis(1800)
+        },
+    );
+    fs::write(dir.path().join("lost"), "disconnected").unwrap();
+    assert!(!caller
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "cannot stop another owner on timeout"
+    );
+    daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    assert!(daemon
+        .wait_with_timeout(Duration::from_secs(5))
+        .unwrap()
+        .is_some());
 }

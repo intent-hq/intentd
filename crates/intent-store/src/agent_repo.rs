@@ -339,7 +339,8 @@ pub(crate) fn unread_workspaces_batch_sql() -> String {
 }
 
 /// One agent session's usage inputs for the workspace token-usage tally
-/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage, cells, name)`,
+/// where `name` is the raw session display name.
 /// `message_usage` is non-empty only for sessions whose decoded snapshot and
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
@@ -351,6 +352,7 @@ pub(crate) type AgentUsageRow = (
     Option<TokenUsageTotals>,
     Vec<serde_json::Value>,
     Vec<AgentUsageCellRow>,
+    String,
 );
 
 /// Indexed aggregate counts for delegated children of one parent agent.
@@ -474,7 +476,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Vec<AgentUsageRow>> {
-    let session_sql = "SELECT id, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
+    let session_sql = "SELECT id, name, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
         FROM agent_session WHERE workspace_id = ?";
     let session_rows = sqlx::query(session_sql)
         .bind(&workspace_id.0)
@@ -498,7 +500,21 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        result.push((agent_id, model, snapshot, baseline, Vec::new(), Vec::new()));
+        // Display name for `TokenUsage::agent_names` (§5.23); the services
+        // helper owns trimming and the empty-name rule.
+        let name = session_row
+            .get::<Option<String>, _>("name")
+            .unwrap_or_default();
+
+        result.push((
+            agent_id,
+            model,
+            snapshot,
+            baseline,
+            Vec::new(),
+            Vec::new(),
+            name,
+        ));
     }
 
     let mut by_agent = std::collections::HashMap::new();
@@ -12364,9 +12380,9 @@ mod tests {
             .get_workspace_agent_usage_data(&ws_id)
             .await
             .expect("usage rollup");
-        let (_, rollup_model, _, _, _, _) = rows
+        let (_, rollup_model, _, _, _, _, _) = rows
             .into_iter()
-            .find(|(id, _, _, _, _, _)| *id == agent_id.0)
+            .find(|(id, _, _, _, _, _, _)| *id == agent_id.0)
             .expect("rollup row");
         assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
     }

@@ -103,7 +103,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

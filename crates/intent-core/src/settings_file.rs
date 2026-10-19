@@ -177,8 +177,10 @@ pub struct WorkspaceSettings {
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
     /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
-    /// sandboxing (requires `CoW` filesystem support on the workspaces root;
-    /// workspace creation fails when unsupported).
+    /// sandboxing (requires `CoW` filesystem support on the workspaces root).
+    /// A preference, not a guarantee: when the filesystem cannot `CoW`-clone,
+    /// `workspace.create` falls back to a linked worktree (local repository)
+    /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
 }
 

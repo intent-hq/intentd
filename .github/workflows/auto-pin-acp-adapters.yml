@@ -1,0 +1,138 @@
+# RELEASE_PLZ_TOKEN already has contents + pull-requests write access (see
+# release-plz.yml). Its pushes/PRs trigger normal CI; GITHUB_TOKEN would not.
+# The script arms squash auto-merge on the rolling PR (pinned to the head it
+# verified), so the merge queue lands each stable update once CI passes; it
+# never merges directly or with admin rights. `hold-release` on the PR disables
+# auto-merge and pauses updates; human edits disable the automation's arming.
+# The stand-down job applies both at once (on the PR event) rather than at the
+# next daily run, so an armed PR cannot merge after someone holds or edits it.
+# Each adapter has its own rolling branch and PR (auto/codex-acp-pin,
+# auto/claude-agent-acp-pin); the matrix never lets one adapter block another.
+# pi-acp is deliberately manual: PI_CLI_MIN_VERSION needs a human re-check.
+# Repo-owned merge exemption: intent-hq/intent AGENTS.md (Conventions -> Merging).
+name: Auto-pin ACP adapters
+
+permissions: {}
+
+on:
+  pull_request:
+    types: [labeled, synchronize, edited]
+    branches: [main]
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report the proposed update without pushing or changing a PR'
+        type: boolean
+        default: false
+      adapter:
+        description: 'Limit the run to one adapter'
+        type: choice
+        options: [all, codex, claude-code]
+        default: all
+
+concurrency:
+  group: auto-pin-acp-adapters-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'pin' }}
+  cancel-in-progress: false
+
+jobs:
+  runner-route:
+    # PR events only matter for the rolling PRs; skip routing for every other PR.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+      || github.event.pull_request.head.ref == 'auto/claude-agent-acp-pin'
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
+  pin:
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    # Manual runs must use trusted main too; never execute a branch's script
+    # with the publication token. The checkout resolves main afresh.
+    if: >-
+      github.event_name != 'pull_request'
+      && github.repository == 'intent-hq/intentd' && github.ref == 'refs/heads/main'
+    strategy:
+      # One adapter's refusal (for example a changed engines.node) must not
+      # cancel or hide another adapter's update.
+      fail-fast: false
+      matrix:
+        adapter: [codex, claude-code]
+    name: pin (${{ matrix.adapter }})
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check for RELEASE_PLZ_TOKEN
+        id: token
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          ADAPTER: ${{ matrix.adapter }}
+          SELECTED: ${{ inputs.adapter || 'all' }}
+        run: |
+          if [ "$SELECTED" != all ] && [ "$SELECTED" != "$ADAPTER" ]; then
+            echo "Skipping $ADAPTER; this run is limited to $SELECTED."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$RELEASE_PLZ_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::RELEASE_PLZ_TOKEN is not set; skipping $ADAPTER pin publication."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout main with the CI-triggering token
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Propose the stable ${{ matrix.adapter }} adapter pin
+        if: steps.token.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          ADAPTER: ${{ matrix.adapter }}
+        run: |
+          args=()
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          python3 -S scripts/auto-pin-acp-adapter.py --adapter "$ADAPTER" "${args[@]}"
+
+  # Disable auto-merge as soon as a rolling PR is held (hold-release label)
+  # or changed by anyone other than the PR's bot author. The PR's own script is
+  # never run here, and no publication token is used.
+  stand-down:
+    needs: [runner-route]
+    if: >-
+      github.event_name == 'pull_request'
+      && github.repository == 'intent-hq/intentd'
+      && (github.event.pull_request.head.ref == 'auto/codex-acp-pin'
+          || github.event.pull_request.head.ref == 'auto/claude-agent-acp-pin')
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.auto_merge != null
+      && ((github.event.action == 'labeled' && github.event.label.name == 'hold-release')
+          || (github.event.action != 'labeled'
+              && github.actor != github.event.pull_request.user.login))
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Disable auto-merge on the rolling ACP adapter PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto
+          echo "Disabled auto-merge for #$PR ($ACTION by $ACTOR)."

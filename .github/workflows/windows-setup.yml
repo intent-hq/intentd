@@ -1,19 +1,7 @@
 name: Windows setup regression
 
 on:
-  pull_request:
-    paths:
-      - .github/workflows/windows-setup.yml
-      - .github/workflows/ci.yml
-      - crates/intent-pty/**
-      - crates/intent-services/src/lib.rs
-      - crates/intent-services/src/setup_runner/**
-      - crates/intentd/tests/e2e_wss_setup_headless.rs
-      - crates/intentd/tests/fixtures/pty-io-backpressure.cjs
-      - crates/intentd/tests/common/**
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,9 +11,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   headless-setup:
-    if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: depot-windows-2022-16
+    if: github.event_name == 'workflow_dispatch'
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['gh-windows-16x'] || fromJSON('["gh-windows-16x"]') }}
     timeout-minutes: 45
     defaults:
       run:
@@ -37,6 +34,9 @@ jobs:
       INTENTD_ASSERT_BOUND_CALLER: "1"
       INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
@@ -53,11 +53,13 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-msvc
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Test cursor parser
         run: |
           mkdir -p setup-headless-evidence

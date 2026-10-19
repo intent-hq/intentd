@@ -2,6 +2,157 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.12] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agents)* Declassify all-idle completion-watch cycles of any length ([#2509](https://github.com/intent-hq/intentd/pull/2509))
+- Match visible text around comment anchors in note.edit ([#2507](https://github.com/intent-hq/intentd/pull/2507))
+
+
+## [0.11.11] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject agent.delegate with a nonexistent task note ([#2501](https://github.com/intent-hq/intentd/pull/2501))
+- *(pr)* Find workspace PRs on repos with >1,000 open PRs ([#2503](https://github.com/intent-hq/intentd/pull/2503))
+- *(serve)* Never panic on a closed stderr pipe ([#7119](https://github.com/intent-hq/intentd/pull/7119)) ([#2504](https://github.com/intent-hq/intentd/pull/2504))
+
+
+## [0.11.10] - 2026-10-19
+
+### 📚 Documentation
+
+- *(app-guide)* Remembered agent setup per repository ([#2498](https://github.com/intent-hq/intentd/pull/2498))
+
+
+## [0.11.9] - 2026-10-19
+
+### 🚀 Features
+
+- *(providers)* Profile-aware execution context ([#2460](https://github.com/intent-hq/intentd/pull/2460))
+- *(agent)* Flag list-row previews the list cap shortened ([#2480](https://github.com/intent-hq/intentd/pull/2480))
+- *(cli)* Add intentd pair --host for loopback-only daemons ([#2486](https://github.com/intent-hq/intentd/pull/2486))
+- *(providers)* Store named provider profiles and add providers.profiles.* RPCs ([#2459](https://github.com/intent-hq/intentd/pull/2459))
+- *(providers)* Route named profile selections through every selection path ([#2462](https://github.com/intent-hq/intentd/pull/2462))
+- *(providers)* Profile switches, native-session ownership and settings activation ([#2465](https://github.com/intent-hq/intentd/pull/2465))
+
+### 🐛 Bug Fixes
+
+- *(events)* Broadcast persisted events before waking the publisher ([#2487](https://github.com/intent-hq/intentd/pull/2487))
+- Bump Codex ACP fallback to v2.2.2 ([#2382](https://github.com/intent-hq/intentd/pull/2382))
+- *(file-tracking)* Stop keeping attribution rows for git-ignored and clean paths ([#2479](https://github.com/intent-hq/intentd/pull/2479))
+- *(release)* Keep the intentd version group in lockstep on sitter-only releases ([#2485](https://github.com/intent-hq/intentd/pull/2485))
+
+### 📚 Documentation
+
+- *(guide)* Single Open in original workspace item shows only its label ([#2494](https://github.com/intent-hq/intentd/pull/2494))
+
+
+## [0.11.8] - 2026-10-18
+
+### 🚀 Features
+
+- Record PR-to-workspace links and add workspace.findByPullRequest ([#2476](https://github.com/intent-hq/intentd/pull/2476))
+- Stamp workspace:created origin for proposal-created workspaces ([#2470](https://github.com/intent-hq/intentd/pull/2470))
+- *(specialists)* Add INTENTD_USER_SPECIALISTS_DIR user-tier override ([#2457](https://github.com/intent-hq/intentd/pull/2457))
+
+### 🐛 Bug Fixes
+
+- *(intent-services)* Do not resume settled turns after graceful shutdown ([#2458](https://github.com/intent-hq/intentd/pull/2458))
+- *(pr-refresh)* Log one budget-deferral WARN per repository per sweep ([#2474](https://github.com/intent-hq/intentd/pull/2474))
+- *(events)* Stop watching git-ignored and non-tier trees on Linux ([#2471](https://github.com/intent-hq/intentd/pull/2471))
+- Report the intentd binary version in client.hello ([#2473](https://github.com/intent-hq/intentd/pull/2473))
+
+### 🧪 Testing
+
+- *(store)* Make pool-timeout fixture setup and release checks deterministic ([#2456](https://github.com/intent-hq/intentd/pull/2456))
+
+
+## [0.11.7] - 2026-10-18
+
+### 🐛 Bug Fixes
+
+- Realign library crate versions with intentd 0.11.6 ([#2472](https://github.com/intent-hq/intentd/pull/2472))
+
+### 🧪 Testing
+
+- Use one version source for transfer manifests ([#2469](https://github.com/intent-hq/intentd/pull/2469))
+
+
+## [0.11.6] - 2026-10-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Updated the following local packages: intent-core, intent-core, intent-git, intent-js, intent-providers, intent-providers, intent-acp, intent-acp, intent-context, intent-linear, intent-sentry, intent-sourcecontrol, intent-sourcecontrol, intent-store, intent-store, intent-services, intent-services, intent-transport
+
+
+## [0.11.5] - 2026-10-17
+
+
+## [0.11.4] - 2026-10-17
+
+### 🚀 Features
+
+- *(acp)* Clone sibling proposals from a GitHub origin ([#2452](https://github.com/intent-hq/intentd/pull/2452))
+
+
+## [0.11.3] - 2026-10-17
+
+### 🧪 Testing
+
+- Synchronize retirement fixture progress and ordering ([#2448](https://github.com/intent-hq/intentd/pull/2448))
+
+
+## [0.11.2] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Recover shell credentials for Claude auth checks ([#2445](https://github.com/intent-hq/intentd/pull/2445))
+- Surface generic event loss with ordered recovery fences ([#2404](https://github.com/intent-hq/intentd/pull/2404))
+
+
+## [0.11.1] - 2026-10-17
+
+### 🐛 Bug Fixes
+
+- Restore legacy PR monitor visibility on re-registration ([#2441](https://github.com/intent-hq/intentd/pull/2441))
+
+
+## [0.11.0] - 2026-10-16
+
+### 🔧 Refactor
+
+- [**breaking**] Retire legacy workspace importer ([#1630](https://github.com/intent-hq/intentd/pull/1630))
+
+
+## [0.10.50] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Preserve unfinished PRs in workspace summaries ([#2435](https://github.com/intent-hq/intentd/pull/2435))
+
+
+## [0.10.49] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- Keep Home PR queue status synchronized ([#2416](https://github.com/intent-hq/intentd/pull/2416))
+- Show login guidance for expired Claude OAuth sessions ([#2420](https://github.com/intent-hq/intentd/pull/2420))
+- Report protected daemon startup status ([#2419](https://github.com/intent-hq/intentd/pull/2419))
+
+### 🧪 Testing
+
+- Guard restart readiness and bootstrap signal registration ([#2408](https://github.com/intent-hq/intentd/pull/2408))
+
+
+## [0.10.48] - 2026-10-15
+
+### 📚 Documentation
+
+- Explain current workspace toast suppression ([#2374](https://github.com/intent-hq/intentd/pull/2374))
+
+
 ## [0.10.47] - 2026-10-15
 
 ### 🚀 Features

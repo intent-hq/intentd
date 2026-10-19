@@ -24,7 +24,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "build", "windows", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
@@ -147,8 +147,9 @@ REQUIRED_TEST_STEPS = {
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"): None,
-    ("build", "Headless workspace setup (Windows runtime)"): 1,
-    ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
+    # Post-merge only (push); see the `windows` job.
+    ("windows", "Headless workspace setup (Windows runtime)"): 2,
+    ("windows", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("macos-services-runtime", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,
@@ -304,6 +305,38 @@ class CiPolicyTests(unittest.TestCase):
                         proof["env"] = {"LLVM_PROFILE_FILE_NAME": "intent-%p.profraw"}
                     self.assertTrue(profile_pool_violations(workflow))
                     self.assertTrue(violations(workflow, "1"))
+
+    def test_changed_coverage_uses_the_same_verified_profile_pool(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        self.assertEqual(job["env"].get("LLVM_PROFILE_FILE_NAME"),
+                         self.workflow["jobs"]["coverage-all"]["env"]["LLVM_PROFILE_FILE_NAME"])
+        steps = job["steps"]
+        proof = next(s for s in steps if s.get("name") == "Verify bounded coverage profile pooling")
+        self.assertEqual(proof["run"], "python3 -I -B scripts/test-coverage-profile-pool.py")
+        self.assertEqual(proof["if"], "steps.select.outputs.has_selection == 'true'")
+        self.assertFalse(proof.get("continue-on-error"))
+        toolchain = next(s for s in steps if s.get("uses", "").startswith("dtolnay/rust-toolchain@"))
+        execute = next(s for s in steps if s.get("name") == "Run changed tests under llvm-cov")
+        self.assertLess(steps.index(toolchain), steps.index(proof))
+        self.assertLess(steps.index(proof), steps.index(execute))
+
+    def test_changed_coverage_storage_evidence_is_retained_on_failure(self):
+        job = self.workflow["jobs"]["coverage-changed"]
+        steps = job["steps"]
+        init = next(s for s in steps if s.get("name") == "Initialize coverage storage evidence")
+        proof = next(s for s in steps if s.get("name") == "Verify bounded coverage profile pooling")
+        execute = next(s for s in steps if s.get("name") == "Run changed tests under llvm-cov")
+        upload = next(s for s in steps if s.get("name") == "Upload changed coverage evidence")
+        self.assertEqual(init["if"], "steps.select.outputs.has_selection == 'true'")
+        self.assertLess(steps.index(proof), steps.index(init))
+        self.assertLess(steps.index(init), steps.index(execute))
+        self.assertEqual(upload["if"], "always()")
+        self.assertIn("coverage-storage", upload["with"]["path"])
+        self.assertIn("coverage-changed-plan.json", upload["with"]["path"])
+        self.assertFalse(execute.get("continue-on-error"))
+        self.assertIn("python3 -I -B scripts/test-coverage-storage.py",
+                      "\n".join(s.get("run", "") for j in self.workflow["jobs"].values()
+                                for s in j.get("steps", [])))
 
     def test_callback_inventory_shares_coverage_environment_and_fails_closed(self):
         job = self.workflow["jobs"]["coverage-changed"]
@@ -653,7 +686,7 @@ class CallbackDiscoveryTests(unittest.TestCase):
         cls.job = cls.workflow["jobs"]["coverage-changed"]
         cls.step = next(s for s in cls.job["steps"] if s.get("name") == "Run callback fixture composition under llvm-cov")
 
-    def probe(self, *, target=None, coverage_target=None, listing="exact", failure=None, style="wrapper", plans=None):
+    def probe(self, *, target=None, coverage_target=None, listing="exact", failure=None, style="wrapper", plans=None, storage=False):
         with tempfile.TemporaryDirectory(prefix="callback-discovery-") as tmp:
             root = Path(tmp)
             stub = root / "cargo"
@@ -702,6 +735,12 @@ else:
                        RUSTFLAGS="--cfg=existing", RUSTC_WRAPPER="existing-wrapper")
             if target: env["CARGO_TARGET_DIR"] = str(root / target)
             if coverage_target: env["CARGO_LLVM_COV_TARGET_DIR"] = str(root / coverage_target)
+            if storage:
+                evidence = root / "evidence"
+                evidence.mkdir()
+                (evidence / "paths.json").write_text(json.dumps({name: str(root) for name in
+                    ("workspace", "target", "profiles", "temporary", "home")}))
+                env["COVERAGE_STORAGE_DIR"] = str(evidence)
             head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
             (root / "coverage-changed-plan.json").write_text(json.dumps({
                 "version": 1, "head": head, "mergeBase": head,
@@ -711,7 +750,19 @@ else:
                                     env=env, cwd=ROOT, capture_output=True, text=True, timeout=10)
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             expected_target = str(root / (coverage_target or ((target or "target") + "/llvm-cov-target")))
+            if storage:
+                self.storage_rows = [json.loads(line) for line in
+                                     (evidence / "resources.jsonl").read_text().splitlines()]
             return result, calls, expected_target
+
+    def test_storage_evidence_preserves_callback_discovery_and_execution_status(self):
+        for failure, code in ((None, 0), ("show-env", 9), ("list", 10), ("run", 11)):
+            with self.subTest(failure=failure):
+                result, _, _ = self.probe(failure=failure, storage=True)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual([(row["stage"], row["event"]) for row in self.storage_rows],
+                                 [("callback", "start"), ("callback", "exit")])
+                self.assertEqual(self.storage_rows[-1]["exit_code"], code)
 
     def test_instrumented_discovery_reuses_execution_build_without_environment_leak(self):
         for target, override in ((None, None), ("slot target", None), ("slot target", "coverage override")):

@@ -10416,6 +10416,13 @@ async fn agent_list_row_stays_within_row_budget() {
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
+    // Every shortened preview string carries its truncation flag, and the
+    // flags are measured inside the row budget below.
+    assert!(row.last_agent_response_truncated);
+    assert!(row.last_user_message_truncated);
+    assert!(row.digest_truncated);
+    assert!(row.metadata.completion_report_truncated);
+    assert!(row.metadata.attention_request_reason_truncated);
     assert_eq!(row.waiting_on_hooks.len(), 2);
     assert_eq!(row.waiting_on_pr_monitors.len(), 2);
     assert_eq!(row.waiting_for_agent_ids.len(), 1);
@@ -11146,10 +11153,10 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
 
 /// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRJ` on PR #104):
 /// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
-/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
-/// workspace must NOT leak the foreign note's title/content into the TASK-C
-/// preamble injected as the child's first message; the preamble is skipped and
-/// the message falls back to the caller-supplied `agentInstructions`.
+/// is workspace-scoped. A `taskNoteId` that belongs to another workspace is
+/// "not found" from this workspace's point of view, so the delegation is
+/// rejected (intent-hq/intent#7120) before any child is created — and the
+/// rejection must not leak the foreign note's title/content.
 #[intent_test_macros::daemon_test]
 async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     let (_t, svc, ws_a) = setup().await;
@@ -11180,28 +11187,82 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
         agent_instructions: Some("do the work".into()),
         ..Default::default()
     };
-    let resp = svc
+    let err = svc
         .agent_delegate_op(ws_a.clone(), input, None)
         .await
-        .expect("delegate");
-    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("a task note from another workspace must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "out-of-workspace taskNoteId rejects with -32602: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("CROSS-WORKSPACE-SECRET"),
+        "the rejection must not leak the foreign note: {msg}"
+    );
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_a)
+        .await
+        .expect("list ws_a sessions");
+    assert!(
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
+    );
+}
 
-    let body = child_session_messages_json(&svc, &child).await;
+/// intent-hq/intent#7120: `agent.delegate` with a `taskNoteId` (or `noteId`)
+/// that does not exist must fail with `-32602` and create no agent, instead
+/// of returning `ok` and spawning an idle child bound to the missing id.
+#[intent_test_macros::daemon_test]
+async fn delegate_nonexistent_task_note_id_is_rejected_without_spawning() {
+    let (_t, svc, ws) = setup().await;
+
+    for input in [
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            agent_instructions: Some("do the work".into()),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            note_id: Some(intent_core::NoteId::from("no-such-note-456")),
+            task_text: Some("tick the box".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = svc
+            .agent_delegate_op(ws.clone(), input.clone(), None)
+            .await
+            .expect_err("a nonexistent task note must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "nonexistent note id rejects with -32602: {err:?}"
+        );
+        let missing = input
+            .task_note_id
+            .as_ref()
+            .or(input.note_id.as_ref())
+            .expect("id")
+            .0
+            .clone();
+        assert!(
+            err.to_string().contains(&missing),
+            "the rejection names the missing id: {err}"
+        );
+    }
+
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
     assert!(
-        body.contains("do the work"),
-        "explicit instructions must still reach the child: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
-        "foreign note title must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
-        "foreign note body must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("**Your Task Note:**"),
-        "preamble must be skipped when the linked note is out of workspace: {body}"
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
     );
 }
 
@@ -17837,6 +17898,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect("plan while auggie is enabled and authenticated");
@@ -17862,6 +17924,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect_err("the demotion must reject a fresh plan");
@@ -26974,6 +27037,122 @@ async fn mutual_idle_two_cycle_does_not_defer() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// N-cycle deadlock guard (issue intent-hq/intent#7205): A→B→C→A watch each
+/// other and all three are idle. Before the fix only direct 2-cycles were
+/// declassified, so every member counted its outgoing edge as a waiting
+/// reason, every idle deferred, and the closed cycle stayed unsettled
+/// forever. The last idle in the cycle must deliver, and the cycle must then
+/// unwind with each watch firing exactly once.
+#[tokio::test]
+async fn idle_three_cycle_does_not_defer() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+
+    for id in [&a, &b, &c] {
+        assert!(
+            !svc.agent_is_waiting_on_agents(id),
+            "an all-idle 3-cycle is not a waiting reason for {}",
+            id.0
+        );
+        assert!(
+            !svc.agent_is_waiting_on_agents_durable(id).await,
+            "durable (rehydration) classification agrees for {}",
+            id.0
+        );
+    }
+
+    // C idles last: not deferred — B's watch on C fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B woken by C");
+    assert!(svc.find_watches_for_child(&c).is_empty());
+
+    // B (now watchless) idles: A's watch on B fires; then A idles: C's
+    // watch on A fires. The cycle unwinds with exactly one wake per edge.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &a,
+        json!({ "agentId": a.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1, "A woken once");
+    assert_eq!(parent_message_count(&svc, &c).await, 1, "C woken once");
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B not re-woken");
+    for id in [&a, &b, &c] {
+        assert!(svc.find_watches_for_child(id).is_empty());
+        assert!(svc.waiting_watches_for_parent(id).is_empty());
+    }
+}
+
+/// Control for the N-cycle guard (issue intent-hq/intent#7205): a cycle
+/// with one BUSY member is a genuine wait — the busy agent will complete and
+/// wake its watcher — so every member still defers. An acyclic idle chain
+/// ending in a busy agent defers too.
+#[tokio::test]
+async fn three_cycle_with_busy_member_still_defers() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let d = create_agent(&svc, &ws, "D").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+    svc.register_completion_watch(&ws, &ws, d.clone(), "D".into(), a.clone(), None)
+        .expect("D watches A (acyclic tail)");
+
+    svc.set_test_busy(&b, true);
+    assert!(
+        svc.agent_is_waiting_on_agents(&c),
+        "C's cycle passes through busy B: genuine wait"
+    );
+    assert!(
+        svc.agent_is_waiting_on_agents(&d),
+        "D waits on A, which waits on busy B"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &b).await,
+        0,
+        "C's idle deferred while the cycle has a busy member"
+    );
+    assert_eq!(svc.find_watches_for_child(&c).len(), 1);
+    svc.set_test_busy(&b, false);
+}
+
 /// Agent-waiting deferral (grouped): a parent P delegates child B in an
 /// `after_all` group, and B itself watches C. B idling while it watches C does
 /// NOT record in P's group — the sealed group stays open. When C completes and
@@ -30270,6 +30449,65 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     assert_eq!(session.stop_reason, None);
 }
 
+/// List-row truncation flag (intent-hq/intent#7250 follow-up): a reason over
+/// the 400-byte list cap is served shortened on `agent.list` with
+/// `metadata.attentionRequestReasonTruncated: true`; a short reason carries
+/// no flag; `agent.get` serves the full reason and never the flag.
+#[tokio::test]
+async fn agent_list_flags_shortened_attention_reason() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let long = create_agent(&svc, &ws, "Long").await;
+    let short = create_agent(&svc, &ws, "Short").await;
+    let reason = format!("blocked: {}", "r".repeat(BUDGET * 2));
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        reason.clone(),
+        Some(long.clone()),
+    )
+    .await
+    .expect("long request");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "short reason".into(),
+        Some(short.clone()),
+    )
+    .await
+    .expect("short request");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let wire = |id: &AgentId| {
+        serde_json::to_value(rows.iter().find(|a| a.id == *id).expect("listed")).unwrap()
+    };
+    let long_row = wire(&long);
+    assert_eq!(
+        long_row["metadata"]["attentionRequestReasonTruncated"],
+        json!(true)
+    );
+    let served = long_row["metadata"]["attentionRequestReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(served.len(), BUDGET);
+    assert!(reason.starts_with(served));
+    let short_row = wire(&short);
+    assert_eq!(
+        short_row["metadata"]["attentionRequestReason"],
+        "short reason"
+    );
+    assert!(short_row["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+
+    let got =
+        serde_json::to_value(svc.agent_get_op(long.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(got["metadata"]["attentionRequestReason"], json!(reason));
+    assert!(got["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+}
+
 /// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
 /// linked task to the new `blocked` status; `kind: "discussion"` moves it to
 /// `discussion_needed`.
@@ -32639,7 +32877,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
 
 use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
 
-async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+pub(super) async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
     let note = svc
         .create_note(
             ws.clone(),

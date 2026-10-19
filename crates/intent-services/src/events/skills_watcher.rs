@@ -291,7 +291,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
 }
 
 /// Project-tier skill roots, relative to the workspace root.
-const PROJECT_SKILL_TIERS: &[&str] = &[
+pub(super) const PROJECT_SKILL_TIERS: &[&str] = &[
     ".agents/skills",
     ".claude/skills",
     ".intent/skills",

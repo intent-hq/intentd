@@ -56,7 +56,7 @@ async fn deleted_workspace_metadata_can_be_reimported_over_wss() {
         .unwrap();
     let manifest = json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"), "workspaceId":ws,
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION, "workspaceId":ws,
         "createdAt":"2026-09-25T00:00:00Z", "tables":[], "assets":[],
         "git":{"hasRepository":false, "dirtyFiles":[], "sandboxBranches":[]}
     });

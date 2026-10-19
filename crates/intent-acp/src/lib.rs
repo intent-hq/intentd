@@ -28,6 +28,7 @@ pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
 pub mod permission;
+pub mod profile_env;
 pub mod review_monitoring;
 pub mod session;
 pub mod spawn;
@@ -61,6 +62,7 @@ pub use mcp_server::{
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
+pub use profile_env::ProfileEnv;
 pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};

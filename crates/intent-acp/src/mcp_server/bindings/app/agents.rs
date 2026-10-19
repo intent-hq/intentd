@@ -828,6 +828,9 @@ mod tests {
 
     fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             id: AgentId::from_string(id),
@@ -872,9 +875,13 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
