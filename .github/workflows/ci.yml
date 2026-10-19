@@ -29,14 +29,14 @@ permissions:
 
 env:
   # Number of intent-cache Linux runner slots: the route job bursts Linux
-  # jobs to Depot once this many intent-cache jobs are queued or running
+  # jobs to GitHub-hosted runners once this many intent-cache jobs are queued or running
   # ahead of this run. Raise it when slots are added. Jobs still blocked on
   # `needs` are invisible to the jobs API, so only jobs already released to
   # the slots count. Bursted jobs don't carry the intent-cache label and
   # stop counting, so routing returns to the slots as they free up.
   LINUX_BURST_THRESHOLD: 2
   # Same for the fast pool (intent-cache-small, one core per slot), which
-  # serves the jobs that ask for a standard depot-ubuntu-* label.
+  # serves the jobs that ask for a standard ubuntu-* label.
   LINUX_SMALL_BURST_THRESHOLD: 6
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
@@ -48,13 +48,13 @@ concurrency:
 
 jobs:
   # All workloads prefer compatible self-hosted capacity. Keep the probe
-  # hosted so unavailable self-hosted runners cannot block Depot fallback.
+  # hosted so unavailable self-hosted runners cannot block the GitHub-hosted fallback.
   route:
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
       contents: read
       actions: read
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       LINUX_SIZE: '16'
@@ -116,7 +116,7 @@ jobs:
                 runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => x.name?.toLowerCase() === l.toLowerCase()))),
               ]));
               const jobs = [];
-              // A missing sibling view is unknown demand, not zero demand. Fail open to Depot.
+              // A missing sibling view is unknown demand, not zero demand. Fail open to GitHub-hosted runners.
               if (Object.values(online).some(rs => rs.length)) {
                 for (const repo of new Set(['intent', 'intentd', 'cloudlands-fe', context.repo.repo])) {
                   const seen = new Set();
@@ -145,35 +145,31 @@ jobs:
             } catch (error) {
               for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
             }
+            // Keys are the GitHub-hosted fallback labels jobs ask for; values are
+            // the self-hosted fleet labels, or the key itself when the fleet bursts.
+            const hosted = {
+              // Larger runners carry the heavy jobs; standard runners the fast ones.
+              linux: ['gh-linux-8x', 'gh-linux-16x'],
+              small: ['ubuntu-22.04', 'ubuntu-24.04'],
+              arm: ['ubuntu-24.04-arm', 'gh-linux-arm64-8x'],
+              windows: ['windows-2022', 'windows-2025', 'gh-windows-16x'],
+              macos: ['macos-26-xlarge'],
+              intel: ['macos-latest-large'],
+            };
             const mapping = {};
-            for (const version of ['22.04', '24.04']) {
-              for (const size of ['', '-4', '-8', '-16', '-32', '-64']) {
-                for (const arch of ['', '-arm']) {
-                  const label = `depot-ubuntu-${version}${arch}${size}`;
-                  // Larger runners carry the heavy jobs; standard runners the fast ones.
-                  const key = arch ? 'arm' : ['-8', '-16', '-32', '-64'].includes(size) ? 'linux' : 'small';
-                  mapping[label] = burst[key] ? [label] : fleets[key];
-                }
-              }
+            for (const [key, labels] of Object.entries(hosted)) {
+              for (const label of labels) mapping[label] = burst[key] ? [label] : fleets[key];
             }
-            for (const version of ['2022', '2025']) {
-              for (const size of ['', '-4', '-8', '-16', '-32', '-64']) {
-                const label = `depot-windows-${version}${size}`;
-                mapping[label] = burst.windows ? [label] : fleets.windows;
-              }
-            }
-            mapping['depot-macos-latest'] = burst.macos ? ['depot-macos-latest'] : fleets.macos;
-            mapping['macos-latest-large'] = burst.intel ? ['macos-latest-large'] : fleets.intel;
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
             core.setOutput('runners', JSON.stringify(mapping));
-            core.setOutput('linux_labels', JSON.stringify(mapping[`depot-ubuntu-24.04-${process.env.LINUX_SIZE || '8'}`]));
-            core.setOutput('check_labels', JSON.stringify(mapping['depot-ubuntu-24.04-8']));
-            core.setOutput('windows_labels', JSON.stringify(mapping['depot-windows-2022-16']));
-            core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
+            core.setOutput('linux_labels', JSON.stringify(mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`]));
+            core.setOutput('check_labels', JSON.stringify(mapping['gh-linux-8x']));
+            core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
+            core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
       # The heavy Rust jobs (check, coverage-*, daemon-lifecycle) are the only
       # readers of linux_labels / check_labels / linux_burst. In the merge
-      # queue they stay on Depot: one queue run starts ~4 of them at once,
+      # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
       # sized for 16 CPUs, and the route decision is made before any of them
       # is queued, so all would land on the two 8-CPU intent-cache slots and
       # run one after another past the queue's time budget. PR and push
@@ -189,10 +185,10 @@ jobs:
           LINUX_BURST: ${{ steps.decide.outputs.linux_burst }}
         run: |
           if [[ "$EVENT" == merge_group ]]; then
-            LINUX_LABELS="[\"depot-ubuntu-24.04-$LINUX_SIZE\"]"
-            CHECK_LABELS='["depot-ubuntu-24.04-8"]'
+            LINUX_LABELS="[\"gh-linux-${LINUX_SIZE}x\"]"
+            CHECK_LABELS='["gh-linux-8x"]'
             LINUX_BURST=true
-            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on Depot)"
+            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on GitHub-hosted larger runners)"
           fi
           {
             echo "linux_labels=$LINUX_LABELS"
@@ -205,7 +201,7 @@ jobs:
   pr-static:
     needs: route
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -235,7 +231,7 @@ jobs:
 
   cache-smoke:
     if: github.event_name == 'merge_group'
-    uses: ./.github/workflows/depot-cache-smoke.yml
+    uses: ./.github/workflows/cache-smoke.yml
     secrets: inherit
 
   check:
@@ -266,15 +262,14 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
-      # openssl-sys needs the OpenSSL headers. Depot and intent-cache images
+        run: python3 scripts/setup-sccache.py
+      # openssl-sys needs the OpenSSL headers. GitHub-hosted and intent-cache images
       # ship libssl-dev, so this is normally a no-op; the install path needs
       # passwordless sudo, which intent-cache slots do not have. Concurrent
       # jobs can race for the apt locks (monorepo#1515):
@@ -480,7 +475,7 @@ jobs:
   # per-matrix required-context constraint (intentd#868) no longer applies.
   release-fast-path:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo release-plz PRs only (fork PRs get no CI — see the
     # `pull_request` trigger comment). Ordinary PRs skip it at once, so the
     # `check` / `coverage-changed` dependency costs them no queue time.
@@ -519,7 +514,7 @@ jobs:
     # validation on merge_group after a route failure.
     # `route` places the native entries (Windows: intent-hq/intent#5518; see the
     # matrix) and runs on every event this job runs on. route runs on
-    # depot-ubuntu-24.04, so this dependency can never queue behind the
+    # ubuntu-24.04, so this dependency can never queue behind the
     # self-hosted runners it decides about.
     needs: [release-fast-path, route]
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
@@ -530,16 +525,16 @@ jobs:
         include:
           # temporarily disabled — re-enable when needed
           # - target: x86_64-unknown-linux-gnu
-          #   os: depot-ubuntu-24.04
+          #   os: ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
           # use the latest hosted ARM64 image. Empty route output also falls back to
           # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
             name: build (aarch64-apple-darwin)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
-          # depot-windows-2022-16 runner otherwise (fail-open to burst, like the
+          # gh-windows-16x runner otherwise (fail-open to burst, like the
           # Linux jobs — an offline 5090pc used to leave this required check
           # QUEUED forever and block every merge: intent-hq/intent#1382,
           # #1583). The self-hosted labels are selected ONLY when route
@@ -549,7 +544,7 @@ jobs:
           # online. (The fallback also keeps `fromJSON('')` from failing the
           # matrix expansion.) Retain the name below for check history.
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["depot-windows-2022-16"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
@@ -576,15 +571,14 @@ jobs:
         if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         if: needs.release-fast-path.outputs.fast_path != 'true'
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
       # self-hosted macOS and Windows runners are single-slot, so no $RUNNER_NAME key. On the
@@ -805,7 +799,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -817,14 +811,13 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
         if: contains(matrix.os, 'self-hosted')
         shell: bash
@@ -941,7 +934,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core depot-ubuntu-24.04-16 runner this merge-queue
+      # 16 matches the 16-core gh-linux-16x runner this merge-queue
       # job runs on. Higher counts (32 and 64 on a 64-core host) made the
       # latency-bound stress tests — e.g. e2e_wss_pool_contention_stress's
       # <2s read assert — blow their wall-clock bounds under llvm-cov load on
@@ -952,14 +945,13 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
@@ -1076,7 +1068,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core depot-ubuntu-24.04-16 runner this merge-queue
+      # 16 matches the 16-core gh-linux-16x runner this merge-queue
       # job runs on. Higher counts (32 and 64 on a 64-core host) thrashed
       # SQLite/WAL and wall-clock-timeout tests hard enough that even the
       # nextest retry failed: concurrent_writes_no_sqlite_busy hit "database
@@ -1087,14 +1079,13 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
@@ -1112,7 +1103,7 @@ jobs:
       # instances can exhaust mid-run — watcher starts in unrelated tests
       # then fail with EMFILE "Too many open files" (intentd PR #882).
       # Needs passwordless sudo: this merge-queue-only job always runs on
-      # Depot (see the route job's `heavy` step), never on intent-cache.
+      # a GitHub-hosted runner (see the route job's `heavy` step), never on intent-cache.
       - name: Raise inotify instance limit
         run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
       - name: Resolve pinned Rust channel
@@ -1217,14 +1208,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # PRs check out GitHub's synthetic merge commit: its second parent is
       # the PR head and its first parent the base tip it merged against —
       # never pull_request.base.sha, which is not guaranteed to be that
@@ -1433,7 +1423,7 @@ jobs:
           retention-days: 7
   pr-title:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1485,7 +1475,7 @@ jobs:
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1550,7 +1540,6 @@ jobs:
       contents: read
     secrets:
       CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
-      DEPOT_TOKEN: ${{ secrets.DEPOT_TOKEN }}
       INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
     uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
     with:
@@ -1562,10 +1551,10 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Both the self-hosted Linux fleet and Depot fallback provide dpkg-deb / tar+xz.
+  # Both the self-hosted Linux fleet and the GitHub-hosted fallback provide dpkg-deb / tar+xz.
   deb-packaging:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs after queueing and on main pushes.
     if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
@@ -1613,12 +1602,12 @@ jobs:
   # the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs on same-repo PRs (so a change to these scripts is proven before
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job.
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
-    # About 2 min on Depot; on a busy shared self-hosted slot it ran 5 min
+    # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
     # next to a PR's check and coverage-changed (run 39178412485) with every
     # step passing, so the budget leaves self-hosted headroom.
     timeout-minutes: 15
@@ -1646,9 +1635,9 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
-          python3 -B scripts/test-setup-depot-sccache.py
+          python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
-          python3 -B scripts/test-depot-runners.py
+          python3 -B scripts/test-hosted-runners.py
           python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test optional Intel cargo-dist publication
@@ -1680,14 +1669,13 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       - name: Test WebDAV compiler reuse and source invalidation
         run: python3 -B scripts/test-release-cache-smoke.py
       - name: Test publish-channel-manifest.sh
@@ -1742,7 +1730,7 @@ jobs:
         shell: [powershell, pwsh]
     name: install-ps1 (${{ matrix.shell }})
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-windows-2025'] || fromJSON('["depot-windows-2025"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['windows-2025'] || fromJSON('["windows-2025"]') }}
     timeout-minutes: 15
     # The matrix context is not available in a step-level `shell:` (the
     # workflow fails validation with "Unrecognized named-value: 'matrix'"),
@@ -1800,7 +1788,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [depot-ubuntu-24.04, depot-windows-2025]
+        os: [ubuntu-24.04, windows-2025]
         node: [22, 24]
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
@@ -1869,11 +1857,11 @@ jobs:
       matrix:
         include:
           - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["depot-ubuntu-24.04-16"]') }}
+            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
           - platform: windows
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["depot-windows-2022-16"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -1893,14 +1881,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
           INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-depot-sccache.py
+        run: python3 scripts/setup-sccache.py
       # These runners have one slot. Prefer the native Windows home path:
       # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
       - name: Point lifecycle target outside checkout (macOS and Windows)
@@ -1931,7 +1918,7 @@ jobs:
   gate:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results

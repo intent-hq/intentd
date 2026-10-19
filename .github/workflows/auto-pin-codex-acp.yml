@@ -43,7 +43,7 @@ jobs:
 
   pin:
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     # Manual runs must use trusted main too; never execute a branch's script
     # with the publication token. The checkout resolves main afresh.
@@ -98,7 +98,7 @@ jobs:
       && ((github.event.action == 'labeled' && github.event.label.name == 'hold-release')
           || (github.event.action != 'labeled'
               && github.actor != github.event.pull_request.user.login))
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 5
     permissions:
       contents: read

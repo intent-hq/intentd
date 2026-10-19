@@ -32,7 +32,7 @@ jobs:
     # Fork PRs only — same-repo PRs are left completely alone.
     if: github.event.pull_request.head.repo.full_name != github.repository
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 5
     steps:
       # SHA-pinned (not tag-pinned): in a pull_request_target workflow the
