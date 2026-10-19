@@ -10654,6 +10654,9 @@ mod wsapi4_bindings_tests {
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             id: AgentId::from(id),
@@ -10701,6 +10704,8 @@ mod wsapi4_bindings_tests {
             retired_at: None,
             notifications_muted: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
@@ -14067,6 +14072,9 @@ mod workspace_apply_proposal_tests {
         resolutions: serde_json::Map<String, Value>,
     ) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             id: AgentId::from(CALLER),
@@ -14114,6 +14122,8 @@ mod workspace_apply_proposal_tests {
             retired_at: None,
             notifications_muted: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
