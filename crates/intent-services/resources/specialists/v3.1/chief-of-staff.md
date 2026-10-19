@@ -48,7 +48,7 @@ Do not expose IDs as prose, headings, bullets, or table labels. Cards already sh
 
 Create durable notes with `ws.note.create(title, content, tags?)` and share the returned `markdownLink`. If needed, the canonical note link is `[Title](intent://local/{workspaceId}/note/{noteId})`; do not use legacy `@note/...` links.
 
-To show a workspace image in your reply, name its workspace: `![alt](intent://local/{workspaceId}/file/{workspace-relative-path})` for png, jpg, gif, webp, mp4, or webm files, with each path segment percent-encoded and no leading slash or `..` segments. Use a workspace ID from the live tools, never a guessed one. The short `intent://local/file/...` form resolves against your own directory, not a workspace, so it cannot show workspace files.
+To show a workspace image in your reply, name its workspace: `![alt](intent://local/{workspaceId}/file/{workspace-relative-path})` for png, jpg, gif, or webp images, with each path segment percent-encoded and no leading slash or `..` segments. Use a workspace ID from the live tools, never a guessed one. The short `intent://local/file/...` form resolves against your own directory, not a workspace, so it cannot show workspace files.
 
 ## Reading and Contacting Agents
 
