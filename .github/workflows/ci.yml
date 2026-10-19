@@ -56,11 +56,13 @@ jobs:
       actions: read
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 5
+    env:
+      LINUX_SIZE: '16'
     outputs:
       runners: ${{ steps.decide.outputs.runners }}
-      linux_labels: ${{ steps.decide.outputs.linux_labels }}
-      check_labels: ${{ steps.decide.outputs.check_labels }}
-      linux_burst: ${{ steps.decide.outputs.linux_burst }}
+      linux_labels: ${{ steps.heavy.outputs.linux_labels }}
+      check_labels: ${{ steps.heavy.outputs.check_labels }}
+      linux_burst: ${{ steps.heavy.outputs.linux_burst }}
       windows_labels: ${{ steps.decide.outputs.windows_labels }}
       windows_burst: ${{ steps.decide.outputs.windows_burst }}
       macos_labels: ${{ steps.decide.outputs.macos_labels }}
@@ -70,7 +72,6 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
-          LINUX_SIZE: '16'
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
@@ -164,6 +165,33 @@ jobs:
             core.setOutput('windows_labels', JSON.stringify(mapping['depot-windows-2022-16']));
             core.setOutput('macos_labels', JSON.stringify(mapping['depot-macos-latest']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+      # The heavy Rust jobs (check, coverage-*, daemon-lifecycle) are the only
+      # readers of linux_labels / check_labels / linux_burst. In the merge
+      # queue they stay on Depot: one queue run starts ~4 of them at once,
+      # each needing 30+ GiB, and the 8 tinybox slots share one /raid volume,
+      # which hit ENOSPC mid-run (runs 39131949771, 39134737536). PR and push
+      # runs, and the light jobs routed through `runners`, keep the probe's
+      # choice. This override stays out of the probe script above, which is
+      # kept identical to runner-route.yml across intent, intentd and
+      # cloudlands-fe.
+      - id: heavy
+        env:
+          EVENT: ${{ github.event_name }}
+          LINUX_LABELS: ${{ steps.decide.outputs.linux_labels }}
+          CHECK_LABELS: ${{ steps.decide.outputs.check_labels }}
+          LINUX_BURST: ${{ steps.decide.outputs.linux_burst }}
+        run: |
+          if [[ "$EVENT" == merge_group ]]; then
+            LINUX_LABELS="[\"depot-ubuntu-24.04-$LINUX_SIZE\"]"
+            CHECK_LABELS='["depot-ubuntu-24.04-8"]'
+            LINUX_BURST=true
+            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on Depot)"
+          fi
+          {
+            echo "linux_labels=$LINUX_LABELS"
+            echo "check_labels=$CHECK_LABELS"
+            echo "linux_burst=$LINUX_BURST"
+          } >> "$GITHUB_OUTPUT"
 
   # Dependency-free PR policy checks; the PR's compiled Linux checks live in
   # `check` and `coverage-changed`, and native runners stay queue-only.
@@ -1918,9 +1946,14 @@ jobs:
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    # Runs after queueing and on main pushes.
-    if: github.event_name == 'merge_group' || github.event_name == 'push'
-    timeout-minutes: 5
+    # Runs on same-repo PRs (so a change to these scripts is proven before
+    # it queues), after queueing and on main pushes. Fork PRs skip it with
+    # the route job.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+    # About 2 min on Depot; on a busy tinybox slot it ran 5 min next to a
+    # PR's check and coverage-changed (run 39178412485) with every step
+    # passing, so the budget leaves self-hosted headroom.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -1954,8 +1987,12 @@ jobs:
         shell: bash
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("dist-workspace.toml", "rb"))["dist"]["cargo-dist-version"])')
-          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" | sh
-          python3 -I -B scripts/test-optional-intel-dist.py
+          # Job-private, unmanaged install: the tinybox slots share one $HOME,
+          # so the default ~/.cargo/bin target races between concurrent jobs.
+          dir="$RUNNER_TEMP/cargo-dist"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" \
+            | CARGO_DIST_UNMANAGED_INSTALL="$dir" sh
+          PATH="$dir:$PATH" python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py
@@ -2008,7 +2045,15 @@ jobs:
           python3 -S scripts/test-provider-cli-metadata.py
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
+      # Per-slot HOME for install-action (shared ~/.install-action tmp/bin
+      # race across the 8 tinybox slots; monorepo#1239). This job follows the
+      # shared `runners` route, not linux_burst, so it keys on the slot name
+      # everywhere; on ephemeral Depot runners the extra directory is harmless.
+      - name: Key install-action dirs per runner slot
+        run: echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@v2
+        env:
+          HOME: ${{ env.INSTALL_ACTION_HOME }}
         with:
           tool: release-plz@0.3.162
       - name: Test Cargo packaging and historical baseline compatibility
@@ -2307,7 +2352,7 @@ jobs:
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               optional deb-packaging "${{ needs.deb-packaging.result }}"
-              optional release-scripts "${{ needs.release-scripts.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
               optional install-ps1 "${{ needs.install-ps1.result }}"
               optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
