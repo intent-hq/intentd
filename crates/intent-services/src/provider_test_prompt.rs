@@ -101,6 +101,29 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     provider_paths: &HashMap<String, String, S>,
     node_max_old_space_mb: Option<u32>,
 ) -> Result<Value, String> {
+    provider_test_prompt_for(
+        api,
+        provider_id,
+        model,
+        provider_paths,
+        node_max_old_space_mb,
+        None,
+    )
+    .await
+}
+
+/// [`provider_test_prompt`] under a named profile (PROTOCOL §5.54):
+/// `provider_id` is the profile's base provider and the launch carries the
+/// profile's saved overlay before account lookup. The outcome promotes or
+/// demotes only that profile's verdict, never the base's Default verdict.
+pub(crate) async fn provider_test_prompt_for<S: std::hash::BuildHasher>(
+    api: Option<&dyn intent_core::WorkspaceApi>,
+    provider_id: &str,
+    model: Option<&str>,
+    provider_paths: &HashMap<String, String, S>,
+    node_max_old_space_mb: Option<u32>,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Result<Value, String> {
     let Some(provider) = intent_providers::find_provider(provider_id) else {
         return Err(format!("Unknown providerId: {provider_id}"));
     };
@@ -178,7 +201,8 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
     ) {
         cmd = cmd.env(key, value);
     }
-    let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd);
+    let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd)
+        .with_profile(profile.clone());
     let cmd = match cmd.prepare_installed().await {
         Ok(cmd) => cmd,
         Err(reason) => return Ok(failure("not-installed", reason)),
@@ -216,13 +240,19 @@ pub async fn provider_test_prompt<S: std::hash::BuildHasher>(
         // prompt and finished the turn, which is the end-to-end signal the
         // probe exists to observe. The answer itself is never surfaced.
         Ok(_) | Err(OneShotError::Empty) => {
-            crate::provider_auth::promote_auth_verdict(provider_id);
+            match &profile {
+                Some(profile) => crate::provider_auth::promote_profile_auth_verdict(profile),
+                None => crate::provider_auth::promote_auth_verdict(provider_id),
+            }
             json!({ "ok": true })
         }
         Err(err) => {
             let reason = failure_reason(&err);
             if reason == "auth-required" {
-                crate::provider_auth::demote_auth_verdict(provider_id);
+                match &profile {
+                    Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+                    None => crate::provider_auth::demote_auth_verdict(provider_id),
+                }
             }
             failure(reason, err.to_string())
         }

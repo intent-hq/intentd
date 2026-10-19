@@ -18684,7 +18684,13 @@ impl WorkspaceApi for Services {
     }
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
+        Box::pin(async move {
+            // Saved profile summaries ride alongside the per-type rows
+            // (PROTOCOL §5.54); `providers` stays one row per provider type.
+            let mut catalog = provider_catalog::build_providers_catalog();
+            catalog["profiles"] = serde_json::Value::Array(self.provider_profile_summaries());
+            Ok(catalog)
+        })
     }
 
     fn provider_profiles_list(
@@ -18714,6 +18720,27 @@ impl WorkspaceApi for Services {
         profile_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.provider_profiles_delete_impl(profile_id))
+    }
+
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_auth_status_impl(provider_ref, force))
+    }
+
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_test_prompt_impl(
+            provider_ref,
+            model,
+            node_max_old_space_mb,
+        ))
     }
 
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -31072,6 +31099,10 @@ impl WorkspaceApi for Services {
             // (monorepo#3338) — rejected before any state change.
             self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
                 .await?;
+            // A named profile that was removed or whose provider is disabled
+            // refuses the turn here, structured, before anything persists
+            // (PROTOCOL §5.54), rather than as a prose spawn failure later.
+            self.ensure_turn_provider_selectable(&agent_id).await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
