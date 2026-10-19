@@ -574,6 +574,190 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     );
 }
 
+/// One-shot `intentd call <method>` against the daemon in `data_dir`,
+/// returning the printed result object.
+fn call_json(data_dir: &Path, method: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("call")
+        .arg(method)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd call");
+    assert!(
+        output.status.success(),
+        "intentd call {method} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("intentd call prints JSON")
+}
+
+fn run_pair(data_dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("pair")
+        .args(args)
+        .env("INTENTD_DATA_DIR", data_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd pair")
+}
+
+#[tokio::test]
+async fn pair_with_host_pairs_loopback_only_daemon() {
+    // intent-hq/intent#7243: a loopback-only daemon (the default bind) has no
+    // daemon-advertised dialable route, so plain `pair` refuses — but a
+    // client reaching it through a local forward (Windows → WSL localhost)
+    // can name the host itself with `--host`.
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+
+    // UDS-only daemon: `--yes` must also run the listener-enable flow.
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_pair(&data_dir, &["--yes", "--host", "localhost"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pair --yes --host localhost on a loopback-only bind must succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("External connections enabled")
+            && stderr.contains("listening on 127.0.0.1"),
+        "the unattended enable keeps the loopback bind and reports it: {stderr}"
+    );
+
+    // Every printed value comes from what the daemon actually serves.
+    let status = call_json(&data_dir, "system.status");
+    let port = status["port"].as_u64().expect("listener up after pair");
+    let served_fingerprint = status["fingerprint"].as_str().expect("fingerprint");
+    let served_token = stored_token(&data_dir).expect("daemon persisted its token");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "URL:         intent://pair?v=1&host=localhost&port={port}&fp={served_fingerprint}&token={served_token}"
+        )),
+        "payload URI names the chosen host and the served port/fingerprint/token: {stdout}"
+    );
+    assert_eq!(
+        labeled_value(&stdout, "Host:"),
+        Some("localhost"),
+        "{stdout}"
+    );
+    assert_eq!(
+        labeled_value(&stdout, "Port:"),
+        Some(port.to_string().as_str()),
+        "{stdout}"
+    );
+    assert_eq!(
+        labeled_value(&stdout, "Token:"),
+        Some(served_token.as_str()),
+        "{stdout}"
+    );
+    assert_eq!(
+        labeled_value(&stdout, "Fingerprint:"),
+        Some(served_fingerprint),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains('\u{2588}'),
+        "pair --host still renders the QR code: {stdout}"
+    );
+    assert!(
+        stdout.contains("localhost only works for clients on this machine")
+            && !stdout.contains("Scan with the Intent iOS app"),
+        "a loopback --host replaces the phone-scan invitation with a local-only note: {stdout}"
+    );
+
+    // Without --host the same daemon still refuses (unchanged behavior).
+    let plain = run_pair(&data_dir, &[]);
+    let plain_stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !plain.status.success() && plain_stderr.contains("loopback only"),
+        "plain pair keeps the loopback-only refusal: {plain_stderr}"
+    );
+}
+
+#[tokio::test]
+async fn pair_with_host_and_rotate_prints_new_token() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+
+    let child = spawn_daemon(&data_dir);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let first = run_pair(&data_dir, &["--yes", "--host", "localhost"]);
+    assert!(
+        first.status.success(),
+        "first pair --host run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout1 = String::from_utf8_lossy(&first.stdout).to_string();
+    let token1 = labeled_value(&stdout1, "Token:").expect("token1");
+
+    let rotated = run_pair(&data_dir, &["--host", "localhost", "--rotate"]);
+    assert!(
+        rotated.status.success(),
+        "pair --host --rotate failed: {}",
+        String::from_utf8_lossy(&rotated.stderr)
+    );
+    let stdout2 = String::from_utf8_lossy(&rotated.stdout).to_string();
+    let token2 = labeled_value(&stdout2, "Token:").expect("token2");
+
+    assert_ne!(token1, token2, "rotation mints a new token");
+    assert_eq!(
+        stored_token(&data_dir).as_deref(),
+        Some(token2),
+        "the printed token is the persisted one"
+    );
+    assert!(
+        stdout2.contains(&format!("token={token2}")),
+        "payload URI embeds the rotated token: {stdout2}"
+    );
+}
+
+#[tokio::test]
+async fn pair_host_rejects_invalid_values() {
+    // clap-level validation: rejected before any daemon contact, so no
+    // daemon is needed and none of the messages is a connection error.
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    for (value, reason) in [
+        ("", "must not be empty"),
+        ("localhost,10.0.0.5", "no commas"),
+        ("local host", "must not contain whitespace"),
+        ("localhost:9000", "without a port"),
+        ("[::1]", "without a port"),
+    ] {
+        let output = run_pair(&data_dir, &["--host", value]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "--host {value:?} must be rejected: {stderr}"
+        );
+        assert!(
+            stderr.contains("invalid value") && stderr.contains(reason),
+            "--host {value:?} names the reason: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cannot connect to daemon"),
+            "--host {value:?} is rejected before any RPC: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "nothing printed for {value:?}");
+    }
+}
+
 #[tokio::test]
 async fn pair_fails_when_daemon_down() {
     let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
@@ -747,29 +931,35 @@ async fn pair_rotate_does_not_rotate_when_enable_is_declined() {
     await_socket(&mut daemon, &socket).await;
     let before = await_stored_token(&data_dir).await;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
-        .arg("pair")
-        .arg("--rotate")
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run intentd pair --rotate without listener");
+    // Both pairing sources share one fetch sequence: the default
+    // (`pairing.getInfo`) and `--host` (`server.pairingInfo`, PR #2486
+    // review) must each refuse before rotating.
+    for extra in [&[][..], &["--host", "localhost"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .arg("pair")
+            .arg("--rotate")
+            .args(extra)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run intentd pair --rotate without listener");
 
-    assert!(
-        !output.status.success(),
-        "pair --rotate must fail when the enable path refuses"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("re-run with --yes"),
-        "should point at --yes: {stderr}"
-    );
+        assert!(
+            !output.status.success(),
+            "pair --rotate {extra:?} must fail when the enable path refuses"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("re-run with --yes"),
+            "{extra:?} should point at --yes: {stderr}"
+        );
 
-    let after = stored_token(&data_dir).expect("stored token after declined run");
-    assert_eq!(
-        before, after,
-        "declined enable must not rotate the stored token"
-    );
+        let after = stored_token(&data_dir).expect("stored token after declined run");
+        assert_eq!(
+            before, after,
+            "declined enable must not rotate the stored token ({extra:?})"
+        );
+    }
 }
 
 /// Run `intentd pair --select-endpoints` with `input` piped to stdin (the
@@ -1118,11 +1308,14 @@ async fn pair_select_endpoints_fails_when_daemon_down() {
 async fn pair_select_endpoints_conflicts_with_pairing_flags() {
     // clap-level: --select-endpoints re-runs ONLY the selection, so the
     // pairing-output flags are rejected up front.
-    for conflicting in ["--yes", "--rotate", "--png", "--svg"] {
+    for conflicting in ["--yes", "--rotate", "--png", "--svg", "--host"] {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
         cmd.arg("pair").arg("--select-endpoints").arg(conflicting);
         if matches!(conflicting, "--png" | "--svg") {
             cmd.arg("/tmp/out.img");
+        }
+        if conflicting == "--host" {
+            cmd.arg("localhost");
         }
         let output = cmd
             .stdin(Stdio::null())

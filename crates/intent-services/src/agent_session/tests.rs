@@ -10972,3 +10972,224 @@ async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
 
 #[path = "review_startup_tests.rs"]
 mod review_startup_tests;
+
+/// A runtime auth-required failure on a named-profile session (PROTOCOL
+/// §5.54) demotes only that profile's saved-settings verdict: the base
+/// provider's Default verdict and every other profile stay untouched, on
+/// `session/new`, `session/load` and `session/prompt` alike.
+mod profile_auth_failure_tests {
+    use super::*;
+
+    fn auth_required() -> Value {
+        json!({ "code": -32000, "message": "Authentication required" })
+    }
+
+    /// Mock adapter: `initialize` advertises `loadSession`; `failing` answers
+    /// with an auth-required RPC error, every other method succeeds.
+    fn connect_failing(
+        failing: &'static str,
+    ) -> (
+        Connection,
+        mpsc::UnboundedReceiver<IncomingNotification>,
+        JoinHandle<()>,
+    ) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(16 * 1024);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(16 * 1024);
+        let agent = tokio::spawn(async move {
+            let mut lines = BufReader::new(c2a_agent).lines();
+            let mut write = a2c_agent;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let (Some(id), Some(method)) =
+                    (value.get("id"), value.get("method").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let resp = if method == failing {
+                    json!({ "jsonrpc": "2.0", "id": id, "error": auth_required() })
+                } else {
+                    let result = match method {
+                        "initialize" => json!({ "protocolVersion": 1,
+                            "agentCapabilities": { "loadSession": true } }),
+                        "session/new" => json!({ "sessionId": ACP_SID }),
+                        "session/prompt" => json!({ "stopReason": "end_turn" }),
+                        _ => json!({}),
+                    };
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                };
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+            }
+        });
+        let (note_tx, note_rx) = mpsc::unbounded_channel();
+        let hooks = ConnectionHooks {
+            notifications: Some(note_tx),
+            ..ConnectionHooks::default()
+        };
+        (
+            Connection::new(c2a_client, a2c_client, None, hooks),
+            note_rx,
+            agent,
+        )
+    }
+
+    struct Profiled {
+        _tmp: TempDb,
+        services: Services,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+        work: intent_acp::ProfileEnv,
+        personal: intent_acp::ProfileEnv,
+    }
+
+    async fn profiled() -> Profiled {
+        let (tmp, services, _bus, agent_id, workspace_id) = setup().await;
+        let services =
+            services.with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let mut refs = Vec::new();
+        for name in ["Work", "Personal"] {
+            let created = services
+                .provider_profiles_create_impl(
+                    json!({ "baseProviderId": "claude-code", "name": name }),
+                )
+                .await
+                .unwrap();
+            refs.push(
+                created["profile"]["providerRef"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        services
+            .store
+            .set_agent_session_model(&workspace_id, &agent_id, "m", Some(&refs[0]), &now_iso())
+            .await
+            .unwrap();
+        let work = services
+            .resolve_profile_env(&refs[0])
+            .await
+            .unwrap()
+            .unwrap();
+        let personal = services
+            .resolve_profile_env(&refs[1])
+            .await
+            .unwrap()
+            .unwrap();
+        crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(true));
+        crate::provider_auth::promote_profile_auth_verdict(&work);
+        crate::provider_auth::promote_profile_auth_verdict(&personal);
+        Profiled {
+            _tmp: tmp,
+            services,
+            agent_id,
+            workspace_id,
+            work,
+            personal,
+        }
+    }
+
+    fn assert_only_work_demoted(p: &Profiled, path: &str, err: &intent_core::Error) {
+        assert!(
+            matches!(err, intent_core::Error::InvalidParams(m) if m.contains("not authenticated")),
+            "{path}: {err:?}"
+        );
+        assert_eq!(
+            crate::provider_auth::cached_auth_verdict("claude-code"),
+            Some(true),
+            "{path}: the Default verdict is untouched"
+        );
+        assert_eq!(
+            crate::provider_auth::cached_profile_auth_verdict(&p.work),
+            Some(false),
+            "{path}: the failing profile is demoted"
+        );
+        assert_eq!(
+            crate::provider_auth::cached_profile_auth_verdict(&p.personal),
+            Some(true),
+            "{path}: another profile is untouched"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn session_new_auth_failure_demotes_only_the_profile() {
+        let p = profiled().await;
+        let (conn, _rx, _agent) = connect_failing("session/new");
+        let err = p
+            .services
+            .open_acp_session(&conn, &p.agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap_err();
+        assert_only_work_demoted(&p, "session/new", &err);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn session_load_auth_failure_demotes_only_the_profile() {
+        let p = profiled().await;
+        p.services
+            .store
+            .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
+            .await
+            .unwrap();
+        let (conn, _rx, _agent) = connect_failing("session/load");
+        let err = p
+            .services
+            .resume_acp_session(&conn, &init_caps(true), &p.agent_id, "/tmp/ws", Vec::new())
+            .await
+            .unwrap_err();
+        assert_only_work_demoted(&p, "session/load", &err);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn session_prompt_auth_failure_demotes_only_the_profile() {
+        let p = profiled().await;
+        let (conn, mut rx, _agent) = connect_failing("session/prompt");
+        let err = p
+            .services
+            .run_connection_prompt_turn(
+                &conn,
+                &mut rx,
+                &p.agent_id,
+                &p.workspace_id,
+                ACP_SID,
+                vec![text_block("hi")],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_only_work_demoted(&p, "session/prompt", &err);
+    }
+
+    /// The `session/load` owner guard treats a profile reference as its own
+    /// owner: a native session committed under Default (or another profile)
+    /// is never offered to a profile, and vice versa.
+    #[intent_test_macros::daemon_test]
+    async fn session_load_never_offers_another_selections_native_session() {
+        let p = profiled().await;
+        p.services
+            .store
+            .set_acp_session_id(&p.workspace_id, &p.agent_id, ACP_SID)
+            .await
+            .unwrap();
+        let work = p.work.provider_ref().to_string();
+        for owner in ["claude-code", p.personal.provider_ref(), work.as_str()] {
+            p.services
+                .store
+                .set_agent_session_last_turn_model(&p.workspace_id, &p.agent_id, Some("m"), owner)
+                .await
+                .unwrap();
+            let (conn, _rx, _agent) = connect();
+            let resumed = p
+                .services
+                .resume_acp_session(&conn, &init_caps(true), &p.agent_id, "/tmp/ws", Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(resumed.is_some(), owner == work, "owner {owner}");
+        }
+    }
+}

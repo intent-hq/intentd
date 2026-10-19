@@ -390,6 +390,7 @@ require('node:fs').writeFileSync({}, JSON.stringify({{argv:process.argv.slice(2)
             npx_fallback_binary: Some(&npx),
             npx_fallback_package: provider.npx_only_package,
             node_max_old_space_mb: None,
+            profile_env: None,
         };
         let mut launch = intent_acp::spawn::prepare_provider(&opts).unwrap();
         launch

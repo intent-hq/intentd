@@ -342,7 +342,10 @@ impl EventBus {
     ///
     /// **Ordering guarantee**: Events broadcast from a single publisher (e.g., one
     /// agent session) are delivered to subscribers in publish order, whether they
-    /// are transient or persisted. Cross-publisher ordering is not guaranteed; if
+    /// are transient or persisted. This holds because the writer broadcasts a
+    /// persisted event before it resolves the publisher's oneshot, so
+    /// `publish().await` returns only once the event is already on the channel
+    /// (see `flush_prepared`). Cross-publisher ordering is not guaranteed; if
     /// publisher A calls `publish_transient(ev1)` and publisher B calls
     /// `publish(ev2).await` concurrently, A's transient event may broadcast before
     /// B's persisted event commits, even if B's call started first.
@@ -563,8 +566,9 @@ impl Drop for Subscription {
 }
 
 /// Writer task: drains events from the inbound channel, batch-persists them in
-/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), resolves each
-/// oneshot with the result, and broadcasts each stored event in order. Stops
+/// a single transaction (up to `WRITER_BATCH_SIZE` per batch), then broadcasts
+/// each stored event in order and only afterwards resolves its oneshot (the
+/// order single-publisher delivery depends on — see [`flush_prepared`]). Stops
 /// when the channel closes (all `EventBus` handles dropped).
 ///
 /// **Latency/batching**: after awaiting the first event, the task greedily
@@ -627,7 +631,8 @@ pub(crate) async fn writer_loop<F, Fut>(
     }
 }
 
-/// Helper: batch-insert pending events, resolve oneshots, and broadcast in order.
+/// Helper: batch-insert pending events, then broadcast each in order and resolve
+/// its oneshot (broadcast first — see [`flush_prepared`]).
 /// Oversized `agent:tool:call` payloads are bounded in the persisted copy only
 /// ([`TOOL_CALL_PERSIST_CAP_BYTES`]); the broadcast (and the publisher's
 /// returned event) keeps the original full payload so live consumers (§7.1
@@ -644,8 +649,13 @@ where
     flush_prepared(|| insert(Arc::clone(&events)), pending, broadcast_tx).await;
 }
 
-/// Insert-retry + resolve/broadcast core of [`flush_batch`], generic over the
+/// Insert-retry + broadcast/resolve core of [`flush_batch`], generic over the
 /// insert operation so tests can inject failures (monorepo#2673).
+///
+/// On success each stored event is broadcast BEFORE its publisher's oneshot
+/// resolves, so `publish().await` returns only once the event is already on
+/// the channel and the publisher's next (possibly transient) event cannot
+/// overtake it (intent-hq/intent#7296).
 ///
 /// Transient insert failures ([`is_transient_insert_error`]) retry with a
 /// capped exponential backoff ([`INSERT_RETRY_BACKOFF`] doubling up to
@@ -710,14 +720,21 @@ pub(crate) async fn flush_prepared<F, Fut>(
 
     match result {
         Ok(stored) => {
-            // Resolve each oneshot with its corresponding event.
             for (i, (orig, tx)) in pending.drain(..).enumerate() {
                 let mut evt = stored[i].clone();
                 // Restore the original payload (identical when not truncated).
                 evt.data = orig.data;
-                let _ = tx.send(Ok(evt.clone()));
-                // Broadcast in insertion order (append-then-broadcast semantics).
-                broadcast_tx.send(Arc::new(BroadcastEvent::Public(evt)));
+                // Broadcast in insertion order (append-then-broadcast
+                // semantics) BEFORE resolving the publisher's oneshot. A
+                // woken publisher can resume at once on another worker
+                // thread; resolving first let its NEXT event — a transient
+                // `chat:stream:delta`, which skips this writer — reach the
+                // broadcast ahead of this one, breaking the single-publisher
+                // ordering `publish_transient` documents (an agent's closing
+                // text overtook a parallel `tool_result`,
+                // intent-hq/intent#7296).
+                broadcast_tx.send(Arc::new(BroadcastEvent::Public(evt.clone())));
+                let _ = tx.send(Ok(evt));
             }
         }
         Err(e) => {

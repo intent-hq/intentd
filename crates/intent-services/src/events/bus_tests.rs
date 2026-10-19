@@ -834,7 +834,7 @@ async fn oneshot_receiver_drop_is_handled_gracefully() {
 
 // --- Batch-insert retry on transient failure (monorepo#2673) ---------------
 //
-// `flush_prepared` is the insert-retry + resolve/broadcast core of the writer
+// `flush_prepared` is the insert-retry + broadcast/resolve core of the writer
 // task's `flush_batch`, generic over the insert operation so these tests can
 // inject failures without a real contended pool. `start_paused` auto-advances
 // the retry backoff sleeps.
@@ -1449,5 +1449,97 @@ async fn recovery_fence_covers_private_quiet_tail_without_projection() {
         ack.send(()).unwrap();
         receipt.await.unwrap();
         assert!(sub.try_recv_delivery().is_none());
+    }
+}
+
+/// What one publisher could already see on the broadcast channel at the
+/// instant its oneshot woke it: the waker runs synchronously inside the
+/// writer's `oneshot::Sender::send`, so the ids drained here are exactly the
+/// events broadcast BEFORE the publisher was released.
+struct WakeProbe {
+    brx: std::sync::Mutex<
+        tokio::sync::broadcast::Receiver<std::sync::Arc<super::monitor_delivery::BroadcastEvent>>,
+    >,
+    visible_at_wake: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+impl std::task::Wake for WakeProbe {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        let mut brx = self.brx.lock().unwrap();
+        let mut ids = Vec::new();
+        while let Ok(event) = brx.try_recv() {
+            ids.push(event.id.clone());
+        }
+        self.visible_at_wake
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Vec::new)
+            .extend(ids);
+    }
+}
+
+/// Regression (intent-hq/intent#7296): a persisted event must be broadcast
+/// BEFORE its publisher's oneshot resolves. On the multi-threaded runtime a
+/// woken publisher resumes immediately on another worker; if the broadcast
+/// still trailed the wake, the publisher's NEXT event — a transient
+/// `chat:stream:delta` that skips the writer — could overtake it. That let an
+/// agent's closing text reach `chat.subscribe` ahead of the parallel
+/// `tool_result` it follows in the durable transcript, breaking the bus's
+/// single-publisher ordering guarantee. Each publisher here records what was
+/// broadcast at the exact moment it was woken (no timing involved).
+#[tokio::test]
+async fn persisted_event_is_broadcast_before_its_publisher_wakes() {
+    use std::future::Future;
+
+    let (btx, _keep) = tokio::sync::broadcast::channel(16);
+    let btx = super::bus::RawBus::from(btx);
+    let mut pending: Vec<super::bus::WriterRequest> = Vec::new();
+    let mut stored = Vec::new();
+    let mut publishers = Vec::new();
+    for id in ["evt-1", "evt-2"] {
+        let ev = new_event("agent:tool:call", Some("agent-1"), ActorType::Agent);
+        stored.push(stored_event(id, &ev));
+        let (otx, mut orx) = tokio::sync::oneshot::channel::<intent_core::Result<Event>>();
+        let probe = std::sync::Arc::new(WakeProbe {
+            brx: std::sync::Mutex::new(btx.subscribe()),
+            visible_at_wake: std::sync::Mutex::new(None),
+        });
+        let waker = std::task::Waker::from(probe.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            std::pin::Pin::new(&mut orx).poll(&mut cx).is_pending(),
+            "publisher parks on its oneshot before the flush"
+        );
+        pending.push((ev, otx));
+        publishers.push((id, orx, probe));
+    }
+
+    super::bus::flush_prepared(
+        || {
+            let stored = stored.clone();
+            async move { Ok(stored) }
+        },
+        &mut pending,
+        &btx,
+    )
+    .await;
+
+    for (id, orx, probe) in publishers {
+        let visible = probe
+            .visible_at_wake
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| panic!("{id}'s publisher was woken"));
+        assert!(
+            visible.iter().any(|v| v == id),
+            "{id} must already be broadcast when its publisher wakes (saw {visible:?}); \
+             otherwise the publisher's next transient event can overtake it"
+        );
+        assert_eq!(orx.await.expect("resolved").expect("ok").id, id);
     }
 }

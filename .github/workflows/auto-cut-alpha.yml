@@ -22,8 +22,12 @@
 #     * the 60-minute throttle below silences anything that slips past the
 #       message check (belt and braces against self-retrigger loops).
 # - Hourly cron at :00: the backstop for pushes whose chained run timed out
-#   (e.g. slow CI on the refreshed head) or was throttled. Cron runs keep
-#   the check-once-and-exit behavior (no polling).
+#   (e.g. slow CI on the refreshed head) or was throttled. Cron and manual
+#   runs check other conditions once, but every run waits (up to
+#   AUTO_CUT_CI_WAIT_MINUTES, 25 by default) while the Release PR's CI Gate
+#   is still running: release PRs run the ~13 min Linux check and changed
+#   tests, and a check-once cron kept finding that CI pending after each
+#   release-plz refresh (v0.11.8 stalled ~7 h).
 #
 # Throttle — at most one cut per hour from automated runs: before merging,
 # cron and push runs read the latest vX.Y.Z tag's commit timestamp (when
@@ -72,8 +76,10 @@ permissions: {}
 
 on:
   schedule:
-    # Hourly at :00 (backstop); each run is a seconds-long API check that
-    # either squash-merges a green Release PR or exits quietly.
+    # Hourly at :00 (backstop); each run is a short API check that either
+    # squash-merges a green Release PR or exits quietly — or, while the
+    # Release PR's CI Gate is still running, waits up to
+    # AUTO_CUT_CI_WAIT_MINUTES for it.
     - cron: "0 * * * *"
   push:
     branches: [main]
@@ -108,15 +114,16 @@ jobs:
   # final merge.
   auto-merge-release-pr:
     name: Auto-merge green Release PR
-    # Lightweight job (seconds on cron/dispatch runs; up to ~15 min of polling
-    # on push-triggered runs): routed with the small ubuntu-24.04 fallback key
-    # (same rationale as ci.yml's pr-title/gate jobs).
+    # Lightweight job (seconds when nothing is pending; up to ~25 min while it
+    # waits for the Release PR's CI or, on push runs, for its refresh):
+    # routed with the small ubuntu-24.04 fallback key (same rationale as
+    # ci.yml's pr-title/gate jobs).
     needs: [runner-route]
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
-    # Covers the 15-min push-run polling budget plus headroom; cron and
-    # dispatch runs still finish in seconds.
-    timeout-minutes: 20
+    # Covers the 25-min CI wait (push runs: 15-min refresh polling within it)
+    # plus headroom; runs with nothing pending still finish in seconds.
+    timeout-minutes: 35
     permissions:
       pull-requests: read
       checks: read
@@ -157,6 +164,7 @@ jobs:
           # empty and this renders "false".
           DRY_RUN: ${{ inputs.dry_run == true }}
           EVENT_NAME: ${{ github.event_name }}
+          AUTO_CUT_CI_WAIT_MINUTES: '25'
           PUSH_SHA: ${{ github.sha }}
           # Push events only; used to recognize the cut's own merge push.
           HEAD_COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
@@ -227,14 +235,32 @@ jobs:
           # turn CI Gate green on the refreshed head, so the run waits (30s
           # interval, up to 15 min total) for the PR to exist, contain the
           # pushed commit, and go green — then merges through the same
-          # guardrail chain. Cron and manual-dispatch runs keep the
-          # check-once-and-exit behavior (deadline stays 0, so transient()
-          # never retries).
+          # guardrail chain. Cron and manual-dispatch runs check the other
+          # conditions once (deadline stays 0, so transient() never
+          # retries); only a running CI Gate waits, via ci_pending() below.
           deadline=0
           if [[ "$EVENT_NAME" == "push" ]]; then
             deadline=$(( $(date +%s) + 15 * 60 ))
             echo "Push-triggered chained cut: polling up to 15 min for a refreshed, green Release PR."
           fi
+          # Every run (cron and dispatch included) may also wait, up to
+          # AUTO_CUT_CI_WAIT_MINUTES, while the Release PR's own CI Gate is
+          # still running — and only then: the PR must target main with no
+          # blocking review, and a failed gate still exits at once.
+          # The budget is set once in the step env; keep it below the job's
+          # timeout-minutes minus the merge itself.
+          ci_wait=${AUTO_CUT_CI_WAIT_MINUTES:-25}
+          if [[ ! "$ci_wait" =~ ^[0-9]+$ ]] || (( ci_wait > 30 )); then
+            echo "::error::AUTO_CUT_CI_WAIT_MINUTES must be whole minutes between 0 and 30 (got '$ci_wait')"
+            exit 1
+          fi
+          now=$(date +%s)
+          ci_deadline=$(( now + ci_wait * 60 ))
+          (( ci_deadline > deadline )) || ci_deadline=$deadline
+          # A CI Gate that has not reported at all gets at most 5 min (or the
+          # push budget, whichever is longer).
+          missing_deadline=$(( now + (ci_wait < 5 ? ci_wait : 5) * 60 ))
+          (( missing_deadline > deadline )) || missing_deadline=$deadline
 
           # Transient-condition helper: a push run with budget left returns
           # so the caller can sleep 30s and retry; every other case logs and
@@ -248,6 +274,33 @@ jobs:
             fi
             echo "$1; skipping."
             exit 0
+          }
+
+          # CI-pending helper: like transient(), but every event gets the
+          # CI wait budget.
+          ci_pending() {
+            if (( $(date +%s) < ${2:-$ci_deadline} )); then
+              echo "$1 — waiting for CI Gate, retrying in 30s."
+              return 0
+            fi
+            echo "$1; CI wait budget exhausted, skipping."
+            exit 0
+          }
+
+          # The Release PR's CI Gate state: success, missing (checks not
+          # started), terminal (any unsuccessful conclusion — never retried),
+          # or pending. FAILURE also matches STARTUP_FAILURE via substring —
+          # intentional, both are terminal. NEUTRAL/SKIPPED/STALE are
+          # terminal too (a gate in those states never becomes SUCCESS).
+          gate_state() {
+            jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
+              | if length == 0 then "missing"
+                elif all(.conclusion == "SUCCESS") then "success"
+                else (map(.conclusion // .status // "PENDING") | join(","))
+                end' <<<"$1"
+          }
+          gate_terminal() {
+            grep -E 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|NEUTRAL|SKIPPED|STALE' <<<"$1" >/dev/null
           }
 
           while :; do
@@ -364,57 +417,13 @@ jobs:
 
             # --admin bypasses queue rules, so enforce the clean/review/base
             # guards explicitly before considering the metadata exemption.
-            if [[ "$merge_state" != "CLEAN" || $(jq -r '.baseRefName' <<<"$detail") != "main" ]] ||
-               [[ $(jq -r '.reviewDecision' <<<"$detail") == "CHANGES_REQUESTED" || $(jq -r '.reviewDecision' <<<"$detail") == "REVIEW_REQUIRED" ]]; then
+            review=$(jq -r '.reviewDecision' <<<"$detail")
+            if [[ $(jq -r '.baseRefName' <<<"$detail") != "main" || "$review" == "CHANGES_REQUESTED" || "$review" == "REVIEW_REQUIRED" ]]; then
               transient "Release PR #$number is not clean on main or still requires review"
               sleep 30; continue
             fi
-            head_sha=$(jq -r '.headRefOid' <<<"$detail")
-            base_sha=$(jq -r '.baseRefOid' <<<"$detail")
-            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
-              transient "Release PR #$number has unreadable head/base commits"
-              sleep 30; continue
-            fi
-
-            # Chained-cut freshness gate (push runs only): the Release PR
-            # head must already contain the pushed commit — otherwise
-            # release-plz has not refreshed the PR since the push, and
-            # merging now would cut a release WITHOUT the change that
-            # triggered this run. Compare status "ahead"/"identical" means
-            # the PR head's history contains PUSH_SHA. Read failures are
-            # treated as not-yet-refreshed (retried within the budget).
-            if [[ "$EVENT_NAME" == "push" ]]; then
-              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_sha" \
-                --jq '.status' 2>/dev/null) || cmp_status=""
-              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
-                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
-                sleep 30; continue
-              fi
-            fi
-
-            # Required check "CI Gate" must be green on the current head
-            # (statusCheckRollup reflects the head commit). "missing" covers
-            # a head whose checks have not started yet. A terminal
-            # non-success conclusion is a hard skip (retrying cannot rerun a
-            # failed check); anything else (missing/pending) is transient.
-            # FAILURE also matches STARTUP_FAILURE via substring —
-            # intentional, both are terminal. NEUTRAL/SKIPPED/STALE are
-            # terminal too (a gate in those states never becomes SUCCESS),
-            # so they hard-skip rather than burn the polling budget.
-            gate=$(jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
-              | if length == 0 then "missing"
-                elif all(.conclusion == "SUCCESS") then "success"
-                else (map(.conclusion // .status // "PENDING") | join(","))
-                end' <<<"$detail")
-            if [[ "$gate" != "success" ]]; then
-              if grep -Eq 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|NEUTRAL|SKIPPED|STALE' <<<"$gate"; then
-                echo "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
-                exit 0
-              fi
-              transient "CI Gate is not green on the current head (state: $gate)"
-              sleep 30; continue
-            fi
-
+            # Hard guardrail, checked before any CI wait so a human thread never
+            # holds a run for the CI budget.
             # --paginate walks every reviewThreads page (an unresolved
             # thread past the first page must still block the merge); --jq
             # emits one per-page count, summed by awk. Only unresolved
@@ -462,6 +471,56 @@ jobs:
               echo "Release PR #$number has $unresolved unresolved human review thread(s); skipping."
               exit 0
             fi
+
+            # Required check "CI Gate" must be green on the current head
+            # (statusCheckRollup reflects the head commit). One decision for
+            # every merge state: a terminal non-success conclusion is a hard
+            # skip (retrying cannot rerun a failed check, and a failed
+            # required check is what makes the PR BLOCKED); a gate still
+            # running waits within the CI budget; a gate that has not
+            # reported at all ("missing") waits only a short grace period,
+            # since CI that never starts must not hold every cron run.
+            gate=$(gate_state "$detail")
+            if gate_terminal "$gate"; then
+              echo "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
+              exit 0
+            fi
+            if [[ "$gate" == "missing" ]]; then
+              ci_pending "CI Gate has not reported on the current head yet" "$missing_deadline"
+              sleep 30; continue
+            fi
+            if [[ "$gate" != "success" ]]; then
+              ci_pending "CI Gate is not green on the current head (state: $gate)"
+              sleep 30; continue
+            fi
+            if [[ "$merge_state" != "CLEAN" ]]; then
+              transient "Release PR #$number is not clean on main or still requires review"
+              sleep 30; continue
+            fi
+            head_sha=$(jq -r '.headRefOid' <<<"$detail")
+            base_sha=$(jq -r '.baseRefOid' <<<"$detail")
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              transient "Release PR #$number has unreadable head/base commits"
+              sleep 30; continue
+            fi
+
+            # Chained-cut freshness gate (push runs only): the Release PR
+            # head must already contain the pushed commit — otherwise
+            # release-plz has not refreshed the PR since the push, and
+            # merging now would cut a release WITHOUT the change that
+            # triggered this run. Compare status "ahead"/"identical" means
+            # the PR head's history contains PUSH_SHA. Read failures are
+            # treated as not-yet-refreshed (retried within the budget).
+            if [[ "$EVENT_NAME" == "push" ]]; then
+              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_sha" \
+                --jq '.status' 2>/dev/null) || cmp_status=""
+              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
+                transient "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
+                sleep 30; continue
+              fi
+            fi
+
+
 
             # Re-check the throttle at merge time: a push run may have spent
             # minutes polling, and the previous cut's tag may only have been

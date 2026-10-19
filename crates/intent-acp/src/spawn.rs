@@ -23,6 +23,7 @@ use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 
 use crate::error::{AcpError, AcpResult};
+use crate::profile_env::ProfileEnv;
 use crate::transport::{Connection, ConnectionHooks};
 
 /// Inputs for spawning a provider process.
@@ -85,6 +86,10 @@ pub struct SpawnOptions<'a> {
     /// built-in 8192 MB default applies. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
     /// env var still overrides either. Native runtimes ignore it.
     pub node_max_old_space_mb: Option<u32>,
+    /// The selected named profile's resolved overlay (PROTOCOL §5.54), or
+    /// `None` for the provider's Default configuration. Applied over the
+    /// inherited and captured environment, below Intent's launch wiring.
+    pub profile_env: Option<&'a ProfileEnv>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -148,6 +153,7 @@ impl<'a> SpawnOptions<'a> {
             npx_fallback_binary: None,
             npx_fallback_package: None,
             node_max_old_space_mb: None,
+            profile_env: None,
         }
     }
 }
@@ -610,6 +616,13 @@ fn build_command_in(
         via_npx,
         opts.node_max_old_space_mb,
     );
+    // A named profile's overlay beats the inherited and captured environment
+    // but never Intent's own wiring: provider env and extra_env are applied
+    // after it (an unset never removes them), and the enforced config, npm
+    // scrub and PATH below come last.
+    if let Some(profile) = opts.profile_env {
+        profile.apply_to_command(&mut cmd);
+    }
     for (key, value) in &provider_env {
         cmd.env(key, value);
     }
@@ -626,6 +639,7 @@ fn build_command_in(
     for (key, value) in captured {
         if provider_env.contains_key(key)
             || opts.extra_env.contains_key(key)
+            || opts.profile_env.is_some_and(|p| p.controls(key))
             || std::env::var_os(key).is_some()
         {
             continue;
@@ -658,7 +672,12 @@ fn build_command_in(
             .keys()
             .chain(opts.extra_env.keys())
             .chain(captured.keys())
-            .map(String::as_str);
+            .map(String::as_str)
+            .chain(
+                opts.profile_env
+                    .into_iter()
+                    .flat_map(|p| p.entries().map(|(k, _)| k)),
+            );
         for key in npm_workspace_selector_env_keys(explicit) {
             cmd.env_remove(key);
         }
@@ -1876,6 +1895,117 @@ mod captured_env_tests {
                 .any(|(k, _)| k.to_string_lossy() == present),
             "a var already in the daemon's process env must be inherited, not set from the capture"
         );
+    }
+
+    fn env_removed(cmd: &Command, key: &str) -> bool {
+        cmd.as_std()
+            .get_envs()
+            .any(|(k, v)| k == key && v.is_none())
+    }
+
+    fn work_profile(extra: Vec<(String, Option<String>)>) -> crate::ProfileEnv {
+        crate::ProfileEnv::new("codex@work", "fwork", extra)
+    }
+
+    #[test]
+    fn profile_set_beats_conflicting_captured_credential() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let name = absent_var_name();
+        let profile = work_profile(vec![(name.clone(), Some("work-value".into()))]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let captured = BTreeMap::from([(name.clone(), "personal-captured".to_string())]);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+        assert_eq!(env_value(&cmd, &name).as_deref(), Some("work-value"));
+    }
+
+    #[test]
+    fn profile_unset_removes_captured_and_inherited_credentials() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let captured_name = absent_var_name();
+        // An unset is an explicit removal whether or not the daemon env
+        // carries the variable.
+        let inherited_name = "LOGNAME".to_string();
+        let profile = work_profile(vec![
+            (captured_name.clone(), None),
+            (inherited_name.clone(), None),
+        ]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let captured = BTreeMap::from([(captured_name.clone(), "captured".to_string())]);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+        assert!(env_removed(&cmd, &captured_name));
+        assert!(env_removed(&cmd, &inherited_name));
+    }
+
+    #[test]
+    fn profile_never_overrides_intent_launch_wiring() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let npx = Path::new("/usr/local/bin/npx");
+        let profile = work_profile(vec![
+            (
+                "INTENT_SESSION_WIRING".into(),
+                Some("profile-must-lose".into()),
+            ),
+            ("INTENT_UNSET_WIRING".into(), None),
+            ("CODEX_CONFIG".into(), Some("profile-must-lose".into())),
+            ("PATH".into(), Some("/profile/must/lose".into())),
+            (
+                "npm_config_workspace".into(),
+                Some("profile-must-lose".into()),
+            ),
+        ]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(npx);
+        opts.npx_fallback_package = provider.npx_only_package;
+        opts.profile_env = Some(&profile);
+        opts.extra_env
+            .insert("INTENT_SESSION_WIRING".into(), "intent".into());
+        opts.extra_env
+            .insert("INTENT_UNSET_WIRING".into(), "intent".into());
+        let cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
+        assert_eq!(
+            env_value(&cmd, "INTENT_SESSION_WIRING").as_deref(),
+            Some("intent")
+        );
+        assert_eq!(
+            env_value(&cmd, "INTENT_UNSET_WIRING").as_deref(),
+            Some("intent")
+        );
+        assert_eq!(
+            env_value(&cmd, "CODEX_CONFIG").as_deref(),
+            Some(CODEX_SUBAGENT_POLICY_CONFIG)
+        );
+        assert_ne!(
+            env_value(&cmd, "PATH").as_deref(),
+            Some("/profile/must/lose")
+        );
+        assert!(env_removed(&cmd, "npm_config_workspace"));
+    }
+
+    #[test]
+    fn two_profiles_build_independent_commands_without_touching_daemon_env() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let name = absent_var_name();
+        let work = work_profile(vec![(name.clone(), Some("work".into()))]);
+        let personal = crate::ProfileEnv::new(
+            "codex@personal",
+            "fp",
+            vec![(name.clone(), Some("personal".into()))],
+        );
+        let mut work_opts = SpawnOptions::new(provider);
+        work_opts.profile_env = Some(&work);
+        let mut personal_opts = SpawnOptions::new(provider);
+        personal_opts.profile_env = Some(&personal);
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| build_command_with_captured_env(&work_opts, &BTreeMap::new(), 0));
+            let b =
+                s.spawn(|| build_command_with_captured_env(&personal_opts, &BTreeMap::new(), 0));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(env_value(&a, &name).as_deref(), Some("work"));
+        assert_eq!(env_value(&b, &name).as_deref(), Some("personal"));
+        assert!(std::env::var_os(&name).is_none());
     }
 
     #[test]

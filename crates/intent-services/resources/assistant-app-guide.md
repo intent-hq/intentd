@@ -122,7 +122,7 @@ Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
 
-<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; packages/intentd/crates/intentd/src/main.rs (`intentd pair --host`). -->
 
 ## Find the mobile pairing QR code
 
@@ -152,7 +152,9 @@ with **Test connection** inside its editing panel. Workspaces and agents belong 
 host, so identify the intended device before explaining missing work or changing
 host settings. **Mobile** follows the active connection and its permissions; do not
 describe a remote connection's QR as belonging to the local desktop. To pair the
-local machine, connect to it first. Enabling access, changing listening addresses,
+local machine, connect to it first. For intentd running in WSL on the same Windows
+PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL prints
+the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
@@ -314,12 +316,12 @@ unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
 behavior** is **Show choices**, the default). If another workspace worked on that
-PR, the last menu item is **Open in original workspace**, followed by that
-workspace's name; with several such workspaces it opens a submenu of their names,
-most recent first. Archived workspaces are included
-and marked **Archived**. Intent links a PR to a workspace when it discovers the PR on
-that workspace's branch or one of its submodules; PRs seen only before this feature
-shipped are not linked until Intent sees them again.
+PR, the last menu item is **Open in original workspace**, which opens it; with
+several such workspaces it opens a submenu of their names, most recent first.
+Archived workspaces are included, and the submenu marks them **Archived**. Intent
+links a PR to a workspace when it discovers the PR on that workspace's branch or
+one of its submodules; PRs seen only before this feature shipped are not linked
+until Intent sees them again.
 
 ## Home Workspaces
 

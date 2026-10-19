@@ -66,13 +66,12 @@ class AutoCutTests(Fixture):
         gh = self.bin / 'gh'
         gh.write_text(f'#!{sys.executable} -S\n' + MOCK)
         gh.chmod(0o755)
-        sleep = self.bin / 'sleep'
-        sleep.write_text('#!/bin/sh\necho "Unexpected polling" >&2\nexit 97\n')
-        sleep.chmod(0o755)
+        self.forbid_polling()
         self.state = {
             'calls': [], 'pr': {'number': 42, 'title': 'chore: release', 'headRefName': 'release-plz-test', 'isDraft': False, 'labels': [], 'isCrossRepository': False, 'author': {'login': 'release-bot'}},
             'detail': {'isDraft': False, 'mergeable': 'MERGEABLE', 'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}], 'headRefOid': self.head, 'baseRefOid': self.base, 'baseRefName': 'main', 'reviewDecision': ''},
         }
+        self.initial_state = json.loads(json.dumps(self.state))
         self.env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'MOCK_STATE': str(self.repo / 'state'), 'GH_TOKEN': 'read-token', 'RELEASE_PLZ_TOKEN': 'merge-token', 'GITHUB_REPOSITORY': 'intent-hq/intentd', 'EVENT_NAME': 'workflow_dispatch', 'DRY_RUN': 'false', 'PUSH_SHA': self.base, 'HEAD_COMMIT_MSG': 'fix: example'}
         self.env.pop('GITHUB_TOKEN', None)
         # Execute trusted helpers from the workflow checkout, never PR blobs.
@@ -93,6 +92,37 @@ class AutoCutTests(Fixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
+    def forbid_polling(self):
+        sleep = self.bin / 'sleep'
+        sleep.write_text('#!/bin/sh\necho "Unexpected polling" >&2\nexit 97\n')
+        sleep.chmod(0o755)
+
+    def reset(self):
+        # Fresh gh state and no-polling sleep for the next subtest, reusing
+        # the fixture repository.
+        self.state = json.loads(json.dumps(self.initial_state))
+        self.forbid_polling()
+
+    def finish_ci_after_polls(self, polls=1):
+        # Replace the no-polling sleep stub: each "sleep" records a poll and,
+        # after `polls` of them, turns the Release PR's CI Gate green.
+        sleep = self.bin / 'sleep'
+        sleep.write_text(f"""#!{sys.executable} -S
+import json, os, pathlib
+path = pathlib.Path(os.environ['MOCK_STATE'])
+s = json.loads(path.read_text())
+s['polls'] = s.get('polls', 0) + 1
+if s['polls'] >= {polls}:
+    s['detail']['mergeStateStatus'] = 'CLEAN'
+    s['detail']['statusCheckRollup'] = [{{'name': 'CI Gate', 'conclusion': 'SUCCESS'}}]
+path.write_text(json.dumps(s))
+""")
+        sleep.chmod(0o755)
+
+    def pending_ci(self):
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = [{'name': 'CI Gate', 'status': 'IN_PROGRESS', 'conclusion': None}]
+
     def merge_calls(self):
         return [c for c in self.state['calls'] if c['args'][:2] == ['pr', 'merge']]
 
@@ -105,11 +135,92 @@ class AutoCutTests(Fixture):
         self.assertIn('Directly squash-merged', output)
 
     def test_missing_or_failed_gate_skips(self):
+        # A zero CI wait budget keeps the check-once behavior (the sleep stub
+        # fails the run if anything polls).
         for checks in ([], [{'name': 'CI Gate', 'conclusion': 'FAILURE'}], [{'name': 'CI Gate', 'status': 'IN_PROGRESS', 'conclusion': None}]):
             with self.subTest(checks=checks):
                 self.state['calls'] = []
                 self.state['detail']['statusCheckRollup'] = checks
-                self.run_workflow()
+                self.run_workflow(AUTO_CUT_CI_WAIT_MINUTES='0')
+                self.assertEqual(self.merge_calls(), [])
+
+    def test_failed_gate_never_polls_even_with_ci_budget(self):
+        # A failed required check is what makes GitHub report BLOCKED, so the
+        # realistic shape is BLOCKED + FAILURE; push runs must not spend
+        # their refresh budget on it either.
+        for event in ('push', 'schedule', 'workflow_dispatch'):
+            for merge_state in ('BLOCKED', 'CLEAN'):
+                with self.subTest(event=event, merge_state=merge_state):
+                    self.reset()
+                    self.state['detail']['mergeStateStatus'] = merge_state
+                    self.state['detail']['statusCheckRollup'] = [{'name': 'CI Gate', 'conclusion': 'FAILURE'}]
+                    output = self.run_workflow(EVENT_NAME=event)
+                    self.assertEqual(self.merge_calls(), [])
+                    self.assertIn('CI Gate concluded unsuccessfully', output)
+
+    def test_missing_gate_waits_only_a_short_grace(self):
+        # CI that never starts must not hold every cron run for the full
+        # budget (it gets a short grace instead). A zero budget proves no
+        # wait; the green-after-one-poll case proves the grace still waits
+        # for checks that are merely late.
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = []
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.merge_calls(), [])
+        self.reset()
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = []
+        self.finish_ci_after_polls(1)
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 1)
+        self.assertEqual(len(self.merge_calls()), 1)
+
+    def test_unresolved_human_thread_exits_before_any_ci_wait(self):
+        self.pending_ci()
+        self.state['unresolved'] = 1
+        output = self.run_workflow(EVENT_NAME='schedule')
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn('unresolved human review thread', output)
+
+    def test_invalid_ci_wait_budget_fails_loudly(self):
+        self.state_path = self.repo / 'state'
+        self.state_path.write_text(json.dumps(self.state))
+        workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
+        step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        for value in ('40m', '31'):
+            with self.subTest(value=value):
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo,
+                                        env={**self.env, 'EVENT_NAME': 'schedule', 'AUTO_CUT_CI_WAIT_MINUTES': value},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('AUTO_CUT_CI_WAIT_MINUTES must be whole minutes', result.stdout)
+
+    def test_scheduled_and_dispatched_runs_wait_for_pending_release_ci(self):
+        # Release-PR CI runs the ~13 min Linux checks; a cron run that checked
+        # once kept finding it pending (intentd v0.11.8 stalled ~7 h).
+        for event in ('schedule', 'workflow_dispatch'):
+            with self.subTest(event=event):
+                self.reset()
+                self.pending_ci()
+                self.finish_ci_after_polls(2)
+                output = self.run_workflow(EVENT_NAME=event)
+                self.assertEqual(self.state.get('polls'), 2)
+                self.assertEqual(len(self.merge_calls()), 1)
+                self.assertIn('waiting for CI Gate', output)
+
+    def test_pending_ci_wait_is_bounded(self):
+        self.pending_ci()
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.merge_calls(), [])
+
+    def test_review_or_base_blockers_never_wait_for_ci(self):
+        for field, value in (('reviewDecision', 'REVIEW_REQUIRED'), ('reviewDecision', 'CHANGES_REQUESTED'), ('baseRefName', 'other')):
+            with self.subTest(field=field, value=value):
+                self.reset()
+                self.pending_ci()
+                self.state['detail'][field] = value
+                self.run_workflow(EVENT_NAME='schedule')
                 self.assertEqual(self.merge_calls(), [])
 
     def test_held_draft_conflicted_behind_unknown_or_changes_requested_skips(self):
