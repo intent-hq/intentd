@@ -87,7 +87,8 @@ class AutoCutTests(Fixture):
         workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
         step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
         script = textwrap.dedent(step.split('        run: |\n', 1)[1])
-        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10)
+        # Hang guard only; the longest fixture makes ~40 mocked polls.
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
         self.state = json.loads(state_path.read_text())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
