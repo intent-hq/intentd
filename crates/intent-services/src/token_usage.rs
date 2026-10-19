@@ -134,6 +134,23 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     usage
 }
 
+/// Build `TokenUsage::agent_names` (§5.23): one entry per `by_agent_id` key
+/// whose session name is non-empty after trimming. Sessions without usage
+/// are skipped so the keys stay a subset of `by_agent_id`.
+pub(crate) fn agent_names<'a>(
+    by_agent_id: &BTreeMap<String, TokenUsageTotals>,
+    sessions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> BTreeMap<String, String> {
+    sessions
+        .into_iter()
+        .filter_map(|(agent_id, name)| {
+            let name = name.trim();
+            (!name.is_empty() && by_agent_id.contains_key(agent_id))
+                .then(|| (agent_id.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 /// Map one end-of-turn ACP `Usage` report into [`TokenUsageTotals`].
 ///
 /// **Report semantics are provider-keyed** (intent-hq/intent#3794, #3795):

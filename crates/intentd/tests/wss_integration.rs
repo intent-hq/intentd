@@ -3382,6 +3382,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: BTreeMap::default(),
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
