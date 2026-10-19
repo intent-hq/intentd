@@ -156,10 +156,12 @@ whose provider is disabled. Intent never switches them to another account.
 <!-- Sources: packages/ios/Intent/Views/Conversation/Transcript/ConversationView.swift; packages/ios/Intent/Views/Conversation/Composer/ModelPickerView.swift. -->
 
 The iOS update allowing model changes in conversations with existing messages is
-not released yet. In builds with this update, open a workspace agent's **…** menu
-and tap the current model name. Select a model from the agent's current provider. A successful
-change applies to the next turn and preserves the conversation and draft. If saving
-fails, the picker stays open and shows an error so the user can try again.
+not released yet. In builds with this update, open a workspace agent or Assistant
+chat's **…** menu and tap the current model name. Choices come from the agent's
+provider, or the host's default provider when the chat inherits it. A successful
+change applies to the next turn and preserves the conversation and draft. If the
+list is unavailable or empty, use **Retry**. If saving fails, the picker stays open
+and shows an error so the user can try again.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
