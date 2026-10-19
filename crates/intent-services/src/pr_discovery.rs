@@ -139,7 +139,7 @@ struct Key {
     scope: CacheScope,
     repo: RepoRef,
     number: Option<u64>,
-    /// Open PRs of one same-repository head branch: the oversized-repository
+    /// Open PRs of one head branch, forks included: the oversized-repository
     /// path. Costed and capped like a single record read.
     head: Option<String>,
 }
@@ -357,24 +357,36 @@ impl Discovery {
         std::mem::take(&mut *self.deferred_reads.lock().unwrap())
     }
 
+    /// A successful listing started after `started` supersedes a record:
+    /// the repository-wide list, or a head list that observed this PR.
     fn newer_listing(&self, key: &Key, started: Instant) -> bool {
-        if key.number.is_none() {
+        let Some(number) = key.number else {
             return false;
-        }
+        };
         let slots = self.slots.lock().unwrap();
-        let Some((_, slot)) = slots.get(&Key {
-            number: None,
-            head: None,
-            ..key.clone()
-        }) else {
-            return false;
+        let newer = |slot: &Slot, head: bool| {
+            let Ok(entry) = slot.entry.try_lock() else {
+                return false;
+            };
+            entry.as_ref().is_some_and(|entry| {
+                entry.started > started
+                    && match &entry.result {
+                        Ok(Value::Listing(index)) if head => index
+                            .branches
+                            .values()
+                            .flatten()
+                            .any(|pr| pr.number == number),
+                        Ok(Value::Listing(_)) => true,
+                        _ => false,
+                    }
+            })
         };
-        let Ok(entry) = slot.entry.try_lock() else {
-            return false;
-        };
-        entry
-            .as_ref()
-            .is_some_and(|entry| entry.started > started && entry.result.is_ok())
+        slots.iter().any(|(other, (_, slot))| {
+            other.scope == key.scope
+                && other.repo == key.repo
+                && other.number.is_none()
+                && newer(slot, other.head.is_some())
+        })
     }
     pub(crate) fn last_attempt(
         &self,
@@ -597,23 +609,8 @@ impl Discovery {
                         .map(|pr| Value::Record(Arc::new(pr)));
                 }
                 if let Some(head) = &key.head {
-                    // GitHub ignores a head filter without the owner prefix.
-                    let page = sc
-                        .list_prs(
-                            &key.repo,
-                            PrQuery {
-                                state: Some(PrState::Open),
-                                head: Some(format!("{}:{head}", key.repo.owner)),
-                                limit: Some(100),
-                                ..PrQuery::default()
-                            },
-                        )
-                        .await?;
-                    if page.next_cursor.is_some() || page.items.len() > 100 {
-                        return Err(unknown("oversized head-filtered PR page"));
-                    }
                     let mut index = Index::default();
-                    for pr in page.items {
+                    for pr in sc.list_open_prs_by_head(&key.repo, head).await? {
                         if pr.state == PrState::Open && pr.source_branch == *head {
                             index.branches.entry(head.clone()).or_default().push(pr);
                         }
