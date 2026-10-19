@@ -1358,7 +1358,12 @@ async fn tampered_reserved_entries_are_never_resolved() {
 fn account_dir_tilde_expands_only_bare_and_slash_forms_of_account_keys() {
     let home = Path::new("/home/me");
     let expand = |key: &str, value: &str| expand_account_dir(key, value, Some(home));
-    for key in ["CLAUDE_CONFIG_DIR", "CODEX_HOME"] {
+    for key in [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "codex_home",
+        "Claude_Config_Dir",
+    ] {
         assert_eq!(expand(key, "~"), "/home/me", "{key}");
         assert_eq!(expand(key, "~/"), "/home/me/", "{key}");
         assert_eq!(expand(key, "~/.claude-work"), "/home/me/.claude-work");
@@ -1377,12 +1382,7 @@ fn account_dir_tilde_expands_only_bare_and_slash_forms_of_account_keys() {
             assert_eq!(expand(key, literal), literal, "{key}={literal:?}");
         }
     }
-    for other in [
-        "HOME",
-        "OPENAI_API_KEY",
-        "claude_config_dir",
-        "XDG_CONFIG_HOME",
-    ] {
+    for other in ["HOME", "OPENAI_API_KEY", "CODEX_HOMES", "XDG_CONFIG_HOME"] {
         assert_eq!(expand(other, "~/x"), "~/x", "{other}");
     }
     assert_eq!(
@@ -1563,4 +1563,26 @@ async fn delete_prunes_the_profile_fast_mode_entry_only() {
         std::collections::BTreeMap::from([("codex".to_string(), true), (kept_ref, false)])
     );
     assert!(settings.model.provider_defaults.is_empty());
+}
+
+#[test]
+fn readable_selection_never_calls_a_profile_removed_when_the_list_is_unreadable() {
+    let work = ProfileMeta {
+        id: "pwork".into(),
+        base_provider: "codex".into(),
+        name: "Work".into(),
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    let saved = [work];
+    assert_eq!(readable_selection("codex", Some(&saved)), "codex");
+    assert_eq!(
+        readable_selection("codex@pwork", Some(&saved)),
+        "codex (Work)"
+    );
+    assert_eq!(
+        readable_selection("codex@pgone", Some(&saved)),
+        "codex (removed profile)"
+    );
+    assert_eq!(readable_selection("codex@pwork", None), "codex");
 }

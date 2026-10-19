@@ -108,9 +108,10 @@ pub(crate) fn canonical_selection(provider_id: &str) -> String {
 }
 
 /// A human-readable label for a selection in daemon-written text: a bare id
-/// unchanged, a saved profile as `<base> (<name>)`, and a reference whose
-/// profile no longer exists (or an unreadable profile list) as
-/// `<base> (removed profile)`. Never the internal reference.
+/// unchanged, a saved profile as `<base> (<name>)`, a reference whose
+/// profile no longer exists as `<base> (removed profile)`, and any reference
+/// as just `<base>` when the profile list is unreadable (`None`), since the
+/// profile may still exist. Never the internal reference.
 pub(crate) fn readable_selection(selection: &str, profiles: Option<&[ProfileMeta]>) -> String {
     if !is_qualified_ref(selection) {
         return selection.to_owned();
@@ -118,9 +119,11 @@ pub(crate) fn readable_selection(selection: &str, profiles: Option<&[ProfileMeta
     let (base, id) = selection
         .split_once(REF_SEPARATOR)
         .unwrap_or((selection, ""));
+    let Some(profiles) = profiles else {
+        return base.to_owned();
+    };
     profiles
-        .into_iter()
-        .flatten()
+        .iter()
         .find(|p| p.id == id && p.base_provider == base)
         .map_or_else(
             || format!("{base} (removed profile)"),
@@ -439,7 +442,8 @@ fn is_valid_key(key: &str) -> bool {
 const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
 
 /// Expand a leading `~` in an account-directory value at resolution time:
-/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only, a value of exactly `~` or
+/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
+/// ASCII case), a value of exactly `~` or
 /// one starting with `~/` is joined onto `home` (the daemon user's home).
 /// `~user`, variables and every other key stay literal, and without a home
 /// the value is used as typed. The saved value is never rewritten.
@@ -447,7 +451,10 @@ pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) ->
     let Some(home) = home.and_then(Path::to_str) else {
         return value.to_owned();
     };
-    if !TILDE_EXPANDED_KEYS.contains(&key) {
+    if !TILDE_EXPANDED_KEYS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(key))
+    {
         return value.to_owned();
     }
     match value.strip_prefix('~') {
