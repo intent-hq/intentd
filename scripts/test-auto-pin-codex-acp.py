@@ -121,6 +121,9 @@ elif tool == "gh":
             assert args[5:8] == ["--squash", "--auto", "--match-head-commit"], args
             assert len(args) == 9 and args[8] == remote_head(), (args, remote_head())
             if state.get("arm_error"): fail()
+            if state.get("arm_failures", 0) > 0:
+                state["arm_failures"] -= 1
+                fail()
             state["pr"]["auto_merge"] = {"enabled_by": {"login": "pin-bot"},
                                          "merge_method": "squash"}
             state["armed_heads"] = state.get("armed_heads", []) + [args[8]]
@@ -153,6 +156,7 @@ class PinAutomationTests(unittest.TestCase):
             "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
             "GH_TOKEN": "offline-test-token-never-log", "GITHUB_REPOSITORY": REPO,
             "MOCK_STATE": str(self.state_path), "REAL_GIT": REAL_GIT,
+            "AUTO_PIN_ARM_RETRY_SECONDS": "0",
         }
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GITHUB_TOKEN"):
             self.env.pop(key, None)
@@ -278,8 +282,8 @@ class PinAutomationTests(unittest.TestCase):
         self.state["manifest"]["version"] = "1.14.0"
         self.invoke()
         self.assertNotEqual(self.head(), old)
-        self.assertEqual(self.state["writes"], ["edit", "arm"])
-        self.assertEqual(self.state["armed_heads"][-1], self.head())
+        self.assertEqual(self.state["writes"], ["edit"])
+        self.assertEqual(len(self.state["armed_heads"]), 1)
         self.assertEqual(self.state["pr"]["number"], 12)
         self.assertIn("v1.14.0", self.state["pr"]["title"])
 
@@ -314,6 +318,8 @@ class PinAutomationTests(unittest.TestCase):
         self.clear_calls()
         self.state["manifest"]["version"] = "1.10.0"
         self.assertIn("already proposes newer", self.invoke())
+        self.assertEqual(self.state["writes"], ["disarm"])
+        self.state["writes"] = []
         self.assert_no_publication()
 
     def test_dry_run_with_and_without_token_has_no_mutations(self):
@@ -406,6 +412,8 @@ class PinAutomationTests(unittest.TestCase):
         self.state["manifest"]["version"] = "1.14.0"
         self.invoke(ok=False)
         self.assertEqual(self.head(), human_head)
+        self.assertEqual(self.state["writes"], ["disarm"])
+        self.state["writes"] = []
         self.assert_no_publication()
 
     def test_human_pr_metadata_and_hold_label_are_preserved(self):
@@ -725,6 +733,88 @@ class PinAutomationTests(unittest.TestCase):
                 self.invoke(ok=False)
                 self.assert_no_merge_calls()
                 del self.state[flag]
+
+    def test_transient_arm_failure_is_retried_in_the_same_run(self):
+        self.state["arm_failures"] = 2
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["create", "arm"])
+        self.assertEqual(self.state["armed_heads"], [self.head()])
+
+    def test_bot_push_never_overrides_an_existing_arming(self):
+        self.invoke()
+        self.state["pr"]["auto_merge"] = {"enabled_by": {"login": "a-human"},
+                                          "merge_method": "rebase"}
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.invoke()
+        self.assertEqual(self.state["writes"], ["edit"])
+        self.assertEqual(self.state["pr"]["auto_merge"]["merge_method"], "rebase")
+
+    def test_npm_latest_not_newer_than_main_disarms_open_pr(self):
+        self.invoke()
+        self.state["manifest"]["version"] = "1.9.0"
+        self.clear_calls()
+        self.assertIn("would disable auto-merge", self.invoke("--dry-run"))
+        self.assert_no_merge_calls()
+        self.clear_calls()
+        self.assertIn("nothing to do", self.invoke())
+        self.assertEqual(self.state["writes"], ["disarm"])
+        self.clear_calls()
+        self.invoke()
+        self.assert_no_merge_calls()
+
+    def test_npm_latest_not_newer_keeps_a_humans_arming_and_tolerates_lookup_errors(self):
+        self.invoke()
+        self.state["pr"]["auto_merge"] = {"enabled_by": {"login": "a-human"}}
+        self.state["manifest"]["version"] = "1.9.0"
+        self.clear_calls()
+        self.invoke()
+        self.assert_no_merge_calls()
+        self.state["pr"]["state"] = "closed"
+        self.clear_calls()
+        self.assertIn("nothing to do", self.invoke())
+
+    def test_human_branch_push_dry_run_reports_disarm(self):
+        self.invoke()
+        self.git("checkout", "-q", "--detach", self.head())
+        (self.repo / "other.txt").write_text("Human change\n")
+        self.git("commit", "-qam", "fix: human work")
+        self.git("push", "-q", "origin", f"HEAD:{REF}")
+        self.clear_calls()
+        self.assertIn("would disable auto-merge for #12 (human branch changes)",
+                      self.invoke("--dry-run", ok=False))
+        self.assert_no_merge_calls()
+
+    def test_human_metadata_dry_run_reports_disarm(self):
+        self.invoke()
+        self.state["pr"]["title"] = "My proposal"
+        self.state["manifest"]["version"] = "1.14.0"
+        self.clear_calls()
+        self.assertIn("would disable auto-merge for #12 (human edits)",
+                      self.invoke("--dry-run", ok=False))
+
+    def test_dry_run_repair_of_armed_pr_does_not_claim_arming(self):
+        self.invoke()
+        self.state["pr"]["body"] = self.legacy_body("1.9.0", "1.13.1")
+        self.clear_calls()
+        output = self.invoke("--dry-run")
+        self.assertIn("would repair PR metadata for 1.13.1; no publication", output)
+        self.assertNotIn("arm auto-merge", output)
+
+    def test_workflow_stands_down_on_hold_or_foreign_change_without_secrets(self):
+        text = (ROOT / ".github/workflows/auto-pin-codex-acp.yml").read_text()
+        self.assertIn("types: [labeled, synchronize, edited]", text)
+        job = text.split("\n  stand-down:\n", 1)[1]
+        for needle in ("github.event.pull_request.head.ref == 'auto/codex-acp-pin'",
+                       "github.event.pull_request.head.repo.full_name == github.repository",
+                       "github.event.label.name == 'hold-release'",
+                       "github.actor != github.event.pull_request.user.login",
+                       "GH_TOKEN: ${{ github.token }}", "--disable-auto"):
+            self.assertIn(needle, job)
+        self.assertNotIn("secrets.", job)
+        self.assertNotIn("scripts/", job)
+        pin = text.split("\n  pin:\n", 1)[1].split("\n  stand-down:\n", 1)[0]
+        self.assertIn("github.event_name != 'pull_request'", pin)
 
     def test_checked_out_human_changes_and_index_are_untouched(self):
         self.pin_file.write_text("Uncommitted user work\n")

@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from provider_cli_metadata import METADATA, package_snapshot, replace_package
 
@@ -136,18 +137,34 @@ def legacy_body(current, target):
     ))
 
 
+ARM_ATTEMPTS = 3
+
+
 def arm_auto_merge(number, head):
-    """Queue the PR once CI passes; a failure is retried by the next daily run."""
-    try:
-        run("gh", "pr", "merge", str(number), "--repo", REPO, "--squash", "--auto",
-            "--match-head-commit", head)
-    except Refusal:
-        print(f"::warning::Could not arm auto-merge for #{number}; the next run retries.")
+    """Queue the PR once CI passes, pinned to the verified head.
+
+    GitHub syncs a pushed head and a new PR's mergeability asynchronously, so a
+    first attempt can race them; retry briefly, then leave it to the next run.
+    """
+    delay = float(os.environ.get("AUTO_PIN_ARM_RETRY_SECONDS", "15"))
+    for attempt in range(1, ARM_ATTEMPTS + 1):
+        try:
+            run("gh", "pr", "merge", str(number), "--repo", REPO, "--squash", "--auto",
+                "--match-head-commit", head)
+        except Refusal:
+            if attempt < ARM_ATTEMPTS:
+                time.sleep(delay)
+                continue
+            print(f"::warning::Could not arm auto-merge for #{number}; the next run retries.")
+            return
+        print(f"Armed squash auto-merge for #{number} at {head}.")
         return
-    print(f"Armed squash auto-merge for #{number} at {head}.")
 
 
-def disable_auto_merge(pr, reason):
+def disable_auto_merge(pr, reason, dry_run):
+    if dry_run:
+        print(f"dry-run: would disable auto-merge for #{pr['number']} ({reason}).")
+        return
     try:
         run("gh", "pr", "merge", str(pr["number"]), "--repo", REPO, "--disable-auto")
     except Refusal:
@@ -306,29 +323,43 @@ def main():
     target = manifest.get("version")
     if version(target) <= version(current):
         print(f"Main pin {current} is not older than npm stable {target}; nothing to do.")
+        # An open rolling PR proposes a version npm no longer offers as latest
+        # (or main already moved past it); never let our arming land it.
+        if os.environ.get("GH_TOKEN"):
+            try:
+                viewer = decode_json(run("gh", "api", "user"))["login"]
+                pr = find_pr()
+            except Refusal:
+                return
+            if pr and armed_by(pr, viewer):
+                disable_auto_merge(pr, "npm latest is not newer than main", args.dry_run)
         return
 
     viewer = decode_json(run("gh", "api", "user"))["login"]
     pr = find_pr()
     if pr and any(label["name"] == "hold-release" for label in pr["labels"]):
         if pr.get("auto_merge"):
-            if args.dry_run:
-                print("dry-run: would disable auto-merge for the held rolling PR.")
-            else:
-                disable_auto_merge(pr, "hold-release")
+            disable_auto_merge(pr, "hold-release", args.dry_run)
         print("Rolling PR has hold-release; leaving it unchanged.")
         return
     head = branch_head()
-    previous, proposed, recorded_metadata_hash = (
-        inspect_branch(head, base) if head else (current, None, None)
-    )
+    try:
+        previous, proposed, recorded_metadata_hash = (
+            inspect_branch(head, base) if head else (current, None, None)
+        )
+    except Refusal:
+        # Unexpected branch history (e.g. a human push): a human now owns it.
+        if pr and armed_by(pr, viewer):
+            disable_auto_merge(pr, "human branch changes", args.dry_run)
+        raise
     metadata_current = pr is not None and (
         pr["title"] == title(proposed) and pr["body"] == body(previous, proposed)
     )
-    # Descriptions generated before auto-merge are still ours; the edit path
-    # below rewrites them to the current text and then arms the PR.
-    metadata_matches = metadata_current or pr is not None and (
-        pr["title"] == title(proposed) and pr["body"] == legacy_body(previous, proposed)
+    # Descriptions generated before auto-merge are still ours (intentd#2382);
+    # the edit path rewrites them to the current text, then arms the PR. Drop
+    # legacy_body once no open rolling PR carries the old text.
+    metadata_matches = pr is not None and pr["title"] == title(proposed) and (
+        pr["body"] in (body(previous, proposed), legacy_body(previous, proposed))
     )
     # A push may have succeeded before gh pr edit failed. The new bot commit
     # records the exact generated metadata verified before that push. Accept
@@ -340,11 +371,15 @@ def main():
         or pr["draft"]
     ):
         # A human now owns the PR; never let the automation's arming merge it.
-        if armed_by(pr, viewer) and not args.dry_run:
-            disable_auto_merge(pr, "human edits")
+        if armed_by(pr, viewer):
+            disable_auto_merge(pr, "human edits", args.dry_run)
         raise Refusal("Rolling PR has unexpected ownership or edits; preserving it.")
     if proposed and version(proposed) > version(target):
         print(f"Rolling branch already proposes newer version {proposed}; nothing to do.")
+        # npm latest moved back below the proposal (withdrawn or deprecated).
+        if pr and armed_by(pr, viewer):
+            disable_auto_merge(pr, f"npm latest {target} is older than {proposed}",
+                               args.dry_run)
         return
     if proposed == target and pr and metadata_current:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
@@ -355,9 +390,9 @@ def main():
                 arm_auto_merge(pr["number"], head)
         return
     if args.dry_run:
+        arming = "" if pr and pr.get("auto_merge") else " and arm auto-merge"
         if proposed == target and (recover_metadata or metadata_matches):
-            print(f"dry-run: would repair PR metadata for {target} and arm auto-merge; "
-                  "no publication.")
+            print(f"dry-run: would repair PR metadata for {target}{arming}; no publication.")
         else:
             print(f"dry-run: would propose {current} -> {target} on {BRANCH} and arm "
                   "auto-merge; no publication.")
@@ -398,9 +433,10 @@ def main():
                 print("::warning::Unexpected PR URL; the next run arms auto-merge.")
                 return
             number = int(match.group(1))
-    # Arm with the exact verified head. A new push re-arms; an armed PR whose
-    # head did not move needs no write.
-    if commit != head or not (pr and pr.get("auto_merge")):
+    # Arm once, pinned to the verified head. GitHub keeps auto-merge enabled
+    # across pushes by a writer (this bot), and an existing arming, possibly a
+    # human's with their chosen method, is never overridden.
+    if not (pr and pr.get("auto_merge")):
         arm_auto_merge(number, commit)
 
 
