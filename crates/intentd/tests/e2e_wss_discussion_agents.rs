@@ -1,0 +1,768 @@
+//! Real WSS + deterministic mock ACP coverage for explicit discussion addressing.
+//! Ordinary discussion traffic never wakes agents. An addressed agent explicitly
+//! reads bounded history and posts its reply through the caller-bound MCP tools.
+//! Private targeting and unaddressed reads fail closed; a delivered retry never
+//! starts a second turn. No live model or external identity service is used.
+
+#![cfg(unix)]
+
+mod common;
+
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use intentd_test_support::GuardedChild;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
+
+const ADDRESSED: &str = "DISCUSSION_ADDRESSED_E2E";
+const ORDINARY: &str = "DISCUSSION_ORDINARY_E2E";
+const PROBE: &str = "DISCUSSION_UNADDRESSED_PROBE";
+const REPLY: &str = "Explicit agent discussion reply";
+
+/// Live `intentd serve` process; killed (whole process group) on drop, with
+/// the daemon log echoed for post-mortems.
+struct Daemon {
+    child: GuardedChild,
+    data_dir: tempfile::TempDir,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let log_path = self.data_dir.path().join("daemon.log");
+        if let Ok(log) = std::fs::read_to_string(&log_path) {
+            eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
+        }
+    }
+}
+
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-discussion-agents-")
+}
+
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    common::enable_ws_api(data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+    cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    common::hermetic_fixture_identity(&mut cmd, data_dir);
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+async fn await_uds(socket: &Path) -> bool {
+    timeout(common::daemon_startup_timeout(), async {
+        loop {
+            if common::daemon_is_ready(socket).await {
+                return;
+            }
+            // timing-guard: poll interval
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
+    let stream = UnixStream::connect(socket).await.expect("connect uds");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut line = serde_json::to_string(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+    )
+    .unwrap();
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await.unwrap();
+    write_half.flush().await.unwrap();
+    let mut reader = BufReader::new(read_half);
+    let mut buf = String::new();
+    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
+        .await
+        .expect("uds rpc timed out")
+        .expect("read uds response");
+    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+}
+
+/// Pin `workspaceApi.toonOutput` off over UDS so `workspace_api` tool result
+/// bodies stay plain JSON for the `serde_json::from_str` assertions below
+/// (TOON encoding is on by default).
+async fn disable_toon_output(socket: &Path) {
+    let resp = uds_rpc(
+        socket,
+        900,
+        "settings.update",
+        json!({ "changes": [ { "path": "workspaceApi.toonOutput", "value": false } ] }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "disable toonOutput failed: {resp}"
+    );
+}
+
+/// Pin the server's SHA-256 fingerprint (colon-UPPER hex over the DER cert).
+#[derive(Debug)]
+struct PinnedVerifier {
+    fingerprint: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = Sha256::digest(end_entity.as_ref())
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        if fp == self.fingerprint {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("fingerprint mismatch".into()))
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedVerifier {
+            fingerprint: fingerprint.to_string(),
+            provider,
+        }))
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+/// Open an authenticated WSS connection (token in the query string).
+async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> common::TlsWs {
+    let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
+    common::wss_connect_with_retry(port, cfg, &url).await
+}
+
+/// Send one JSON-RPC frame and return the result whose id matches; any
+/// out-of-band notifications (`events.event`) are ignored. Preserve errors
+/// so negative cases can assert the actual wire envelope.
+async fn wss_response<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(common::rpc_read_timeout(), ws.next())
+            .await
+            .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert_eq!(v["jsonrpc"], "2.0", "RPC envelope: {v}");
+                    return v;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Read one `events.event` notification from a subscriber connection, or
+/// `None` once `secs` elapse without one.
+async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(secs));
+    loop {
+        let next = tokio::time::timeout_at(deadline, ws.next()).await.ok()?;
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["method"] == "events.event" {
+                    return Some(v);
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+}
+
+/// Extract every JSON-parsable `tool_result` text payload from an
+/// `agent.getConversation` result's `messages` array. The mock provider's
+/// `emitToolBlocks` persists each MCP tool call as a `tool_use` +
+/// `tool_result` block pair whose `output[0].text` carries the JSON the
+/// agent-side JS returned.
+fn tool_result_jsons(messages: &Value) -> Vec<Value> {
+    messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["contentBlocks"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == json!("tool_result"))
+        .filter_map(|b| b["output"].as_array().and_then(|arr| arr.first()))
+        .filter_map(|item| item["text"].as_str())
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect()
+}
+
+/// Mock-agent gate (parity with the other WSS E2E suites).
+fn gate(test: &str) -> Option<String> {
+    let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/tests/fixtures/mock-acp-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping {test}: node not on PATH");
+        return None;
+    }
+    if !std::path::Path::new(&script).exists() {
+        eprintln!("skipping {test}: mock script missing at {script}");
+        return None;
+    }
+    Some(script)
+}
+
+async fn seed_workspace(data_dir: &Path) -> (String, String) {
+    use intent_core::{
+        now_iso, Principal, PrincipalId, Workspace, WorkspaceActivity, WorkspaceAttention,
+        WorkspaceId, WorkspaceRole, WorkspaceStatus,
+    };
+    use intent_store::Store;
+    let db_path = data_dir.join("intentd.db");
+    let store = Store::open(&db_path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let ts = now_iso();
+    store
+        .insert_workspace(&Workspace {
+            id: ws.clone(),
+            title: "WSS-DISCUSSION-AGENTS-E2E".to_string(),
+            branch: "main".to_string(),
+            base_ref: None,
+            base_commit_sha: None,
+            status: WorkspaceStatus::Active,
+            status_message: None,
+            status_image_asset_id: None,
+            activity: WorkspaceActivity::Idle,
+            attention: WorkspaceAttention::None,
+            created_at: ts.clone(),
+            updated_at: ts,
+            last_activity: None,
+            last_content_activity: None,
+            tags: vec![],
+            path: None,
+            repository_path: None,
+            repository_owner: None,
+            repository_name: None,
+            worktree_path: None,
+            scope: None,
+            skip_worktree: false,
+            setup_script: None,
+            is_remote: false,
+            default_model: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            active_pull_request: None,
+            pull_requests: None,
+            context_links: None,
+            archived: false,
+            archived_at: None,
+            task_stats: None,
+            agent_summary: None,
+            diff_summary: None,
+            token_usage: None,
+            cow_supported: None,
+            browser_client_id: None,
+            pull_requests_total: None,
+            display_status: None,
+            waiting: false,
+            checkout_mode: None,
+            disk_usage: None,
+            pending_delete_at: None,
+            membership: None,
+        })
+        .await
+        .expect("insert ws");
+    let member = Principal {
+        id: PrincipalId::new(),
+        identity: None,
+        github_user_id: None,
+        login: Some("discussion-member".into()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    store
+        .upsert_principal(&member)
+        .await
+        .expect("seed private-chat participant");
+    store
+        .add_workspace_member(&ws, &member.id, WorkspaceRole::Collaborator)
+        .await
+        .expect("seed membership");
+    store.close().await;
+    (ws.0, member.id.0)
+}
+
+async fn wss_rpc<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let response = wss_response(ws, id, method, params).await;
+    assert!(response.get("error").is_none(), "{method}: {response}");
+    response["result"].clone()
+}
+
+async fn completed_turn(sub: &mut common::TlsWs, agent: &str) -> Vec<Value> {
+    timeout(common::test_timeout(Duration::from_secs(60)), async {
+        let mut events = Vec::new();
+        loop {
+            let frame = wss_event_opt(sub, 30).await.expect("agent turn event");
+            let event = frame["params"]["event"].clone();
+            let finished = event["type"] == "agent:stream:end" && event["data"]["agentId"] == agent;
+            events.push(event);
+            if finished {
+                return events;
+            }
+        }
+    })
+    .await
+    .expect("addressed agent must complete its real ACP turn")
+}
+
+/// Bound the negative observation window; do not use a blind sleep as evidence.
+async fn assert_no_turn(sub: &mut common::TlsWs) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(1));
+    let mut seen = Vec::new();
+    while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, wss_event_opt(sub, 1)).await {
+        let event = frame["params"]["event"].clone();
+        assert_ne!(
+            event["type"], "agent:stream:start",
+            "unexpected wake: {event}"
+        );
+        seen.push(event);
+    }
+    seen
+}
+
+fn prompt_log(path: &Path) -> Vec<Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("prompt JSON"))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read mock prompt log: {error}"),
+    }
+}
+
+fn assert_discussion_event(events: &[Value], message: &Value) {
+    let event = events
+        .iter()
+        .find(|event| {
+            event["type"] == "discussion:message" && event["data"]["message"]["id"] == message["id"]
+        })
+        .unwrap_or_else(|| panic!("live discussion event for {message}: {events:?}"));
+    assert_eq!(event["data"]["conversationId"], "default");
+    assert_eq!(event["data"]["message"]["body"], message["body"]);
+    assert_eq!(event["data"]["message"]["author"], message["author"]);
+}
+
+#[intent_test_macros::daemon_test]
+async fn explicit_discussion_address_drives_history_and_reply_without_automatic_subscription() {
+    let Some(script) = gate("explicit discussion agents WSS") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let (workspace, member) = seed_workspace(data_dir.path()).await;
+    let log = data_dir.path().join("mock-prompts.jsonl");
+    let history_and_reply = format!(
+        r#"
+        const page = await ws.discussion.list('default', {{ limit: 1 }});
+        const addressed = page.messages[0];
+        const older = await ws.discussion.list('default', {{ beforeSequence: addressed.sequence, limit: 1 }});
+        const reply = await ws.discussion.send('default', {reply}, {{
+            messageId: 'agent-reply', replyToMessageId: addressed.id,
+            author: {{ principalId: 'forged-human', agentId: 'forged-agent', displayName: 'Forged' }}
+        }});
+        return {{ page, older, reply }};
+    "#,
+        reply = json!(REPLY)
+    );
+    let denied_probe = r#"
+        const out = {};
+        try { out.history = await ws.discussion.list('default', {limit: 1}); }
+        catch (e) { out.historyError = e.message; }
+        try { out.sent = await ws.discussion.send('default', 'unauthorized reply', {messageId: 'unaddressed-send'}); }
+        catch (e) { out.sendError = e.message; }
+        return out;
+    "#;
+    let behavior = json!({
+        "response": "Unexpected automatic discussion wake",
+        "rules": [
+            {"ifPromptContains": PROBE, "toolCall": {"name":"workspace_api",
+                "arguments":{"code":denied_probe,"summary":"Check unaddressed discussion access"}},
+                "response":"Unaddressed access checked", "emitToolBlocks":true},
+            {"ifPromptContains": ADDRESSED, "toolCall":{"name":"workspace_api",
+                "arguments":{"code":history_and_reply,"summary":"Read addressed chat and explicitly reply"}},
+                "response":"This final response must not be posted to the discussion", "emitToolBlocks":true}
+        ]
+    }).to_string();
+    let log_string = log.to_str().expect("UTF-8 fixture path");
+    let child = spawn_serve(
+        data_dir.path(),
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ("MOCK_AGENT_PROMPT_LOG", log_string),
+        ],
+    );
+    let daemon = Daemon { child, data_dir };
+    let socket = daemon.data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await, "fixture daemon must start");
+    disable_toon_output(&socket).await;
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let capabilities = wss_rpc(&mut rpc, 1, "system.capabilities", json!({})).await;
+    assert_eq!(capabilities["discussionAgentMessaging"], 1);
+    let subscription = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "workspaceId":workspace, "eventTypes":["discussion:message", "agent:*"]
+        }),
+    )
+    .await;
+    assert!(subscription["subscriptionId"].is_string());
+    let target = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({
+            "workspaceId":workspace,"name":"Addressed agent","provider":"mock","model":"default"
+        }),
+    )
+    .await["agent"]["id"]
+        .as_str()
+        .expect("target agent id")
+        .to_owned();
+    let observer = wss_rpc(
+        &mut rpc,
+        3,
+        "agent.create",
+        json!({
+            "workspaceId":workspace,"name":"Unaddressed agent","provider":"mock","model":"default"
+        }),
+    )
+    .await["agent"]["id"]
+        .as_str()
+        .expect("observer agent id")
+        .to_owned();
+
+    // Neither agent has been addressed: a human message alone does not run ACP.
+    let ordinary = wss_rpc(
+        &mut rpc,
+        4,
+        "discussion.send",
+        json!({
+            "workspaceId":workspace,"messageId":"ordinary","body":ORDINARY
+        }),
+    )
+    .await;
+    let quiet = assert_no_turn(&mut sub).await;
+    assert_discussion_event(&quiet, &ordinary["message"]);
+    assert!(
+        prompt_log(&log).is_empty(),
+        "ordinary traffic reached the provider"
+    );
+
+    // A real agent tool call cannot read or reply merely by knowing the chat ID.
+    wss_rpc(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({
+            "workspaceId":workspace,"agentId":observer,"content":PROBE
+        }),
+    )
+    .await;
+    completed_turn(&mut sub, &observer).await;
+    let observer_history = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({
+            "workspaceId":workspace,"agentId":observer
+        }),
+    )
+    .await;
+    let probe = tool_result_jsons(&observer_history["messages"])
+        .into_iter()
+        .find(|value| value.get("historyError").is_some())
+        .unwrap_or_else(|| panic!("unaddressed tool denial missing: {observer_history}"));
+    assert!(
+        probe["historyError"]
+            .as_str()
+            .is_some_and(|s| s.contains("not found")),
+        "{probe}"
+    );
+    assert!(
+        probe["sendError"]
+            .as_str()
+            .is_some_and(|s| s.contains("not found")),
+        "{probe}"
+    );
+    assert!(
+        probe.get("history").is_none() && probe.get("sent").is_none(),
+        "{probe}"
+    );
+    assert_eq!(prompt_log(&log).len(), 1);
+
+    // Private targeting must fail even when the human is a participant.
+    let private = wss_rpc(
+        &mut rpc,
+        7,
+        "discussion.send",
+        json!({
+            "workspaceId":workspace,"messageId":"private-create","body":"Private seed",
+            "recipientPrincipalIds":[member]
+        }),
+    )
+    .await;
+    let private_id = private["conversation"]["id"]
+        .as_str()
+        .expect("private conversation id");
+    let refused = wss_response(
+        &mut rpc,
+        8,
+        "discussion.send",
+        json!({
+            "workspaceId":workspace,"conversationId":private_id,"messageId":"private-address",
+            "body":"Private address must not wake","recipientAgentIds":[target]
+        }),
+    )
+    .await;
+    assert!(refused.get("result").is_none(), "{refused}");
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
+    assert_eq!(refused["error"]["data"]["code"], "forbidden", "{refused}");
+    assert_no_turn(&mut sub).await;
+    assert_eq!(
+        prompt_log(&log).len(),
+        1,
+        "private rejection started a turn"
+    );
+    let private_history = wss_rpc(
+        &mut rpc,
+        9,
+        "discussion.list",
+        json!({
+            "workspaceId":workspace,"conversationId":private_id
+        }),
+    )
+    .await;
+    assert_eq!(private_history["messages"].as_array().unwrap().len(), 1);
+
+    // The first explicit address grants context and drives the real mock turn.
+    let request = json!({"workspaceId":workspace,"conversationId":"default",
+        "messageId":"addressed","body":ADDRESSED,"recipientAgentIds":[target]});
+    let sent = wss_rpc(&mut rpc, 10, "discussion.send", request.clone()).await;
+    assert_eq!(sent["message"]["recipientAgentIds"], json!([target]));
+    assert!(sent["message"]["author"]["principalId"].is_string());
+    assert!(sent["message"]["author"].get("agentId").is_none());
+    let events = completed_turn(&mut sub, &target).await;
+    assert_discussion_event(&events, &sent["message"]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "agent:stream:start"
+                && event["data"]["agentId"] == observer),
+        "unaddressed observer woke: {events:?}"
+    );
+    let target_history = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.getConversation",
+        json!({
+            "workspaceId":workspace,"agentId":target
+        }),
+    )
+    .await;
+    let output = tool_result_jsons(&target_history["messages"])
+        .into_iter()
+        .find(|value| value.get("reply").is_some())
+        .unwrap_or_else(|| panic!("addressed history/reply tool result missing: {target_history}"));
+    assert_eq!(output["page"]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(output["page"]["hasMore"], true);
+    assert_eq!(output["page"]["messages"][0]["id"], sent["message"]["id"]);
+    assert_eq!(output["older"]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(output["older"]["messages"][0]["body"], ORDINARY);
+    assert_eq!(output["older"]["hasMore"], false);
+    let reply = &output["reply"]["message"];
+    assert_eq!(reply["body"], REPLY);
+    assert_eq!(reply["author"]["agentId"], target);
+    assert!(reply["author"]["principalId"].is_null());
+    assert_eq!(reply["author"]["displayName"], "Addressed agent");
+    assert_eq!(reply["replyToMessageId"], sent["message"]["id"]);
+    assert_discussion_event(&events, reply);
+    let rows = target_history["messages"].as_array().unwrap();
+    let user_rows: Vec<_> = rows.iter().filter(|row| row["role"] == "user").collect();
+    assert_eq!(
+        user_rows.len(),
+        1,
+        "one addressed delivery: {target_history}"
+    );
+    assert_eq!(user_rows[0]["metadata"]["type"], "discussion_message");
+    assert_eq!(
+        user_rows[0]["metadata"]["discussionMessageId"],
+        sent["message"]["id"]
+    );
+    let prompts = prompt_log(&log);
+    assert_eq!(
+        prompts.len(),
+        2,
+        "one probe and one addressed turn: {prompts:?}"
+    );
+    let addressed_prompt = prompts
+        .iter()
+        .find(|p| p["text"].as_str().is_some_and(|s| s.contains(ADDRESSED)))
+        .unwrap();
+    assert!(
+        !addressed_prompt["text"]
+            .as_str()
+            .unwrap()
+            .contains(ORDINARY),
+        "ordinary history was injected before the explicit history tool read"
+    );
+
+    // Retry only after completion; pending-queue dedup alone cannot satisfy this.
+    let retry = wss_rpc(&mut rpc, 12, "discussion.send", request).await;
+    assert_eq!(retry["message"], sent["message"]);
+    let late = assert_no_turn(&mut sub).await;
+    assert!(
+        !late
+            .iter()
+            .any(|event| event["type"] == "discussion:message"
+                && event["data"]["message"]["id"] == sent["message"]["id"]),
+        "retry rebroadcast: {late:?}"
+    );
+    assert_eq!(
+        prompt_log(&log).len(),
+        2,
+        "delivered retry or ordinary reply woke an agent"
+    );
+    for agent in [&target, &observer] {
+        let queue = wss_rpc(
+            &mut rpc,
+            13,
+            "agent.getQueue",
+            json!({
+                "workspaceId":workspace,"agentId":agent
+            }),
+        )
+        .await;
+        assert!(
+            queue["queue"].as_array().is_some_and(Vec::is_empty),
+            "{queue}"
+        );
+    }
+    let history = wss_rpc(
+        &mut rpc,
+        14,
+        "discussion.list",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 3,
+        "only human ordinary/addressed messages and the explicit reply belong in discussion: {history}");
+    assert_eq!(history["messages"][2]["id"], reply["id"]);
+    rpc.close(None).await.expect("close RPC socket");
+    sub.close(None).await.expect("close event socket");
+}
