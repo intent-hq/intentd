@@ -237,18 +237,25 @@ state, it shows the most recently updated available PR. Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
 agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
+Selecting a repository restores the agent setup last used to create a workspace
+there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
+reasoning effort. A repository with no saved setup uses the most recent setup.
+Changes you make in the form are kept when you switch repositories.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
 
 An agent can suggest a follow-up workspace as a card in its conversation. Review
-it and choose **Create workspace** on the card, or ask the agent to apply it. The
+it and choose **Create workspace** on the card, or ask the agent to apply it.
+Unless the agent named one, the card starts with the agent last used in New
+workspace for that repository, and shows the model and reasoning effort it will use
+while that agent stays selected. The
 new workspace opens as a tab at the end of the top tab strip, and the current
 workspace stays selected.
 
