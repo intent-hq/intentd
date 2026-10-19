@@ -6,8 +6,11 @@
 
 /// Single source of truth for the pinned `@agentclientprotocol/claude-agent-acp`
 /// version (macro so the literal can feed both `CLAUDE_AGENT_ACP_VERSION` and
-/// the `concat!`-built package spec). Bumping the adapter is a deliberate,
-/// one-line code change here.
+/// the `concat!`-built package spec). The `auto-pin-acp-adapters` workflow
+/// (`scripts/auto-pin-acp-adapter.py --adapter claude-code`) bumps this literal
+/// to each newer stable npm release via a rolling PR that merges on green;
+/// keep this exact macro shape, which that script matches. Hand bumps edit
+/// only this literal and refresh `data/adapter-cli-packages.json`.
 macro_rules! claude_agent_acp_version {
     () => {
         "0.81.1"
@@ -27,8 +30,9 @@ pub const CLAUDE_AGENT_ACP_NPX_PACKAGE: &str = concat!(
 
 /// Node.js version requirement for the pinned adapter, for user-facing
 /// messages. Must match the npm `engines.node` field of the pinned
-/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`); re-check when bumping
-/// the pin.
+/// [`CLAUDE_AGENT_ACP_NPX_PACKAGE`] (currently `>=22`). The auto-pin script
+/// refuses any release declaring a different `engines.node`; changing this
+/// requirement also means updating that script's `engines_node` expectation.
 pub const CLAUDE_AGENT_ACP_NODE_REQUIREMENT: &str = "Node.js 22+";
 
 /// Minimum npm version whose `npx` runs the pinned `npx -y <package>` spawns.

@@ -1350,16 +1350,31 @@ mod build_command_tests {
         let cmd = build_command(&opts);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
+        // The version is derived, not repeated: the auto-pin-acp-adapters
+        // workflow bumps only the `claude_agent_acp_version!` literal (and the
+        // adapter metadata snapshot that `adapter_cli` tests tie to it).
+        let version = intent_providers::CLAUDE_AGENT_ACP_VERSION;
         assert_eq!(
             args,
             vec![
                 "--workspaces=false".to_string(),
                 "-y".to_string(),
-                "@agentclientprotocol/claude-agent-acp@0.81.1".to_string(),
-            ],
-            "bumping the adapter pin is a deliberate change — update this literal with it"
+                format!("@agentclientprotocol/claude-agent-acp@{version}"),
+            ]
         );
-        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.81.1");
+        assert_eq!(
+            intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE,
+            format!("@agentclientprotocol/claude-agent-acp@{version}")
+        );
+        // An exact stable pin: three numeric parts, no range or tag.
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(parts.len(), 3, "{version}");
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+            "{version}"
+        );
     }
 
     #[test]
