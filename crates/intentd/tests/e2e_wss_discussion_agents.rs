@@ -850,3 +850,273 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     rpc.close(None).await.expect("close RPC socket");
     sub.close(None).await.expect("close event socket");
 }
+
+/// Persist the exact two crash boundaries while the fixture daemon is stopped.
+/// The outbox case uses the production store transaction; the admitted case
+/// uses the real service handoff without a runtime manager, so no provider runs.
+async fn seed_recovery_delivery(
+    data_dir: &Path,
+    workspace: &str,
+    agent: &str,
+    admitted: bool,
+) -> String {
+    use intent_core::discussion::{DiscussionAuthor, DiscussionTarget};
+    use intent_core::{with_caller, AgentId, Caller, HostRole, WorkspaceApi, WorkspaceId};
+    use intent_services::Services;
+    use intent_store::Store;
+
+    let store = Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open stopped fixture database");
+    let principal = store.get_primary_principal().await.expect("fixture owner");
+    let workspace = WorkspaceId(workspace.into());
+    let target = DiscussionTarget {
+        conversation_id: Some("default".into()),
+        recipient_agent_ids: vec![AgentId(agent.into())],
+        ..Default::default()
+    };
+    let sent = if admitted {
+        let services =
+            Services::new(store.clone()).with_workspaces_root(data_dir.join("workspaces"));
+        with_caller(
+            Caller::Wire {
+                principal_id: principal.id.clone(),
+                host_role: HostRole::Owner,
+            },
+            services.discussion_send(
+                workspace.clone(),
+                "restart-address".into(),
+                "Recover this addressed message".into(),
+                target,
+            ),
+        )
+        .await
+        .expect("seed already-admitted durable queue")
+    } else {
+        let author = DiscussionAuthor {
+            principal_id: Some(principal.id.clone()),
+            agent_id: None,
+            login: principal.login.clone(),
+            display_name: principal.display_name.clone(),
+            avatar_url: principal.avatar_url.clone(),
+        };
+        let (sent, inserted) = store
+            .send_discussion_message(
+                &workspace,
+                "restart-address",
+                "Recover this addressed message",
+                &author,
+                &target,
+            )
+            .await
+            .expect("seed committed message and pending outbox");
+        assert!(inserted);
+        sent
+    };
+    let pending = store
+        .discussion_pending_deliveries(Some(&sent.message.id))
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), usize::from(!admitted));
+    let queue = store
+        .load_all_agent_queues()
+        .await
+        .expect("read durable fixture queue");
+    assert_eq!(queue.len(), usize::from(admitted));
+    if admitted {
+        assert_eq!(
+            queue[0].payload["messageMetadata"]["discussionMessageId"],
+            sent.message.id
+        );
+        assert_eq!(
+            queue[0].payload["messageMetadata"]["fromPrincipalId"],
+            principal.id.0
+        );
+        assert_eq!(queue[0].payload["userOrigin"], true);
+    }
+    store.close().await;
+    sent.message.id
+}
+
+async fn restart_and_retry_discussion_delivery(admitted: bool) {
+    let Some(script) = gate("discussion agent restart retry WSS") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    common::disable_resume_on_start(data_dir.path());
+    let (workspace, _) = seed_workspace(data_dir.path()).await;
+    let log = data_dir.path().join("restart-prompts.jsonl");
+    let env = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        (
+            "MOCK_AGENT_PROMPT_LOG",
+            log.to_str().expect("fixture log path"),
+        ),
+        (
+            "MOCK_AGENT_BEHAVIOR",
+            r#"{"response":"Recovered addressed delivery"}"#,
+        ),
+    ];
+    let child = spawn_serve(data_dir.path(), &env);
+    let mut daemon = Daemon { child, data_dir };
+    let socket = daemon.data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let mut rpc = connect_ws(
+        port,
+        client_config(status["result"]["fingerprint"].as_str().unwrap()),
+    )
+    .await;
+    let agent = wss_rpc(
+        &mut rpc,
+        1,
+        "agent.create",
+        json!({
+            "workspaceId":workspace,"name":"Restart recipient","provider":"mock","model":"default"
+        }),
+    )
+    .await["agent"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        prompt_log(&log).is_empty(),
+        "fixture agent must be idle before crash boundary"
+    );
+    rpc.close(None).await.expect("close pre-restart socket");
+    daemon
+        .child
+        .kill()
+        .expect("stop fixture before seeding crash boundary");
+    daemon.child.wait().expect("wait for stopped fixture");
+
+    let message =
+        seed_recovery_delivery(daemon.data_dir.path(), &workspace, &agent, admitted).await;
+    daemon.child = spawn_serve(daemon.data_dir.path(), &env);
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "workspaceId":workspace,"eventTypes":["agent:*", "discussion:message"]
+        }),
+    )
+    .await;
+    // Startup is restore-only. The exact original human retry must kick this
+    // existing queue entry, without relying on interrupted-agent auto-resume.
+    let queue = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.getQueue",
+        json!({
+            "workspaceId":workspace,"agentId":agent
+        }),
+    )
+    .await;
+    assert_eq!(
+        queue["queue"].as_array().unwrap().len(),
+        1,
+        "restored queue: {queue}"
+    );
+    assert_eq!(
+        queue["queue"][0]["messageMetadata"]["discussionMessageId"],
+        message
+    );
+    assert_no_turn(&mut sub).await;
+    assert!(
+        prompt_log(&log).is_empty(),
+        "no startup turn before explicit retry"
+    );
+    let request = json!({"workspaceId":workspace,"conversationId":"default",
+        "messageId":"restart-address","body":"Recover this addressed message","recipientAgentIds":[agent]});
+    let retry = wss_rpc(&mut rpc, 3, "discussion.send", request.clone()).await;
+    assert_eq!(retry["message"]["id"], message);
+    let events = completed_turns(&mut sub, &[&agent]).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| event["type"] == "agent:stream:start" && event["data"]["agentId"] == agent
+            )
+            .count(),
+        1,
+        "one recovered turn: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "discussion:message"),
+        "retry must not rebroadcast the old discussion message: {events:?}"
+    );
+    assert_eq!(prompt_log(&log).len(), 1, "one provider turn after retry");
+    let transcript = wss_rpc(
+        &mut rpc,
+        4,
+        "agent.getConversation",
+        json!({
+            "workspaceId":workspace,"agentId":agent
+        }),
+    )
+    .await;
+    let rows: Vec<_> = transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["role"] == "user")
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one durable delivery after restart: {transcript}"
+    );
+    assert_eq!(rows[0]["metadata"]["discussionMessageId"], message);
+    wss_rpc(&mut rpc, 5, "discussion.send", request).await;
+    assert_no_turn(&mut sub).await;
+    assert_eq!(
+        prompt_log(&log).len(),
+        1,
+        "completed recovery retry duplicated provider work"
+    );
+    let queue = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getQueue",
+        json!({
+            "workspaceId":workspace,"agentId":agent
+        }),
+    )
+    .await;
+    assert!(
+        queue["queue"].as_array().is_some_and(Vec::is_empty),
+        "{queue}"
+    );
+    let history = wss_rpc(
+        &mut rpc,
+        7,
+        "discussion.list",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["id"], message);
+    rpc.close(None).await.expect("close restarted RPC socket");
+    sub.close(None).await.expect("close restarted subscriber");
+}
+
+#[intent_test_macros::daemon_test]
+async fn pending_discussion_outbox_restarts_and_sender_retry_runs_once() {
+    restart_and_retry_discussion_delivery(false).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn admitted_discussion_queue_restarts_and_sender_retry_runs_once() {
+    restart_and_retry_discussion_delivery(true).await;
+}
