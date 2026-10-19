@@ -587,9 +587,10 @@ jobs:
   release-fast-path:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
-    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
-    # trigger comment).
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    # Same-repo release-plz PRs only (fork PRs get no CI — see the
+    # `pull_request` trigger comment). Ordinary PRs skip it at once, so the
+    # `check` / `coverage-changed` dependency costs them no queue time.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
     timeout-minutes: 5
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
@@ -2359,10 +2360,11 @@ jobs:
             pull_request)
               require route "${{ needs.route.result }}"
               require pr-static "${{ needs.pr-static.result }}"
-              optional release-fast-path "${{ needs.release-fast-path.result }}"
-              # Release-metadata PRs skip the two slow test jobs (see `check`);
-              # the skip is accepted only when the classifier job succeeded and
-              # reported the fast path. Any other PR must run them.
+              # release-fast-path itself is advisory: a failed classifier must
+              # degrade to full CI, never block the PR. Release-metadata PRs
+              # skip the two slow test jobs (see `check`); the skip is accepted
+              # only when the classifier job succeeded and reported the fast
+              # path. Any other PR must run them.
               slow=require
               if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.fast_path }}" = true ]; then
                 slow=optional
@@ -2386,7 +2388,6 @@ jobs:
             merge_group)
               require route "${{ needs.route.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
-              optional release-fast-path "${{ needs.release-fast-path.result }}"
               require cache-smoke "${{ needs.cache-smoke.result }}"
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
@@ -2406,7 +2407,6 @@ jobs:
             push)
               require route "${{ needs.route.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
-              optional release-fast-path "${{ needs.release-fast-path.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"

@@ -34,7 +34,10 @@ PR_METADATA = {"pr-title", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "coverage-changed"}
-OPTIONAL = {"release-fast-path"}
+# Advisory gate dependencies: any result is accepted (the gate reads only
+# their outputs), so a failed classifier degrades to full CI.
+ADVISORY = {"release-fast-path"}
+RELEASE_BRANCH = "release-plz-2026-10-19T04-14-25Z"
 NATIVE_STEPS = {
     "Check (native production configuration)": {"macOS", "Windows"},
     "Clippy (target-gated code)": {"macOS", "Windows"},
@@ -70,6 +73,8 @@ def condition(value, context, *, success=True, cancelled=False):
     expression = re.sub(r"\b(always|success|failure|cancelled)\(\)", lambda m: repr(statuses[m[1]]), expression)
     expression = re.sub(r"contains\(matrix.os, 'self-hosted'\)",
                         lambda _: repr("self-hosted" in context.get("matrix.os", [])), expression)
+    expression = re.sub(r"startsWith\(github.head_ref, '([\w.-]+)'\)",
+                        lambda m: repr(str(context.get("github.head_ref", "")).startswith(m[1])), expression)
     expression = re.sub(r"\b(?:github|needs|runner|env)\.[\w.-]+", lambda m: repr(context.get(m[0], "")), expression)
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", " not ", expression).strip()
@@ -82,9 +87,10 @@ def condition(value, context, *, success=True, cancelled=False):
     return (has_status or success) and bool(eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}}))
 
 
-def context(event, *, fork=False, fast_path="", platform="macOS"):
+def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feature"):
     return {
         "github.event_name": event,
+        "github.head_ref": head_ref if event == "pull_request" else "",
         "github.repository": "intent-hq/intentd",
         "github.event.pull_request.head.repo.full_name": "outside/intentd" if fork else "intent-hq/intentd",
         "needs.release-fast-path.outputs.fast_path": fast_path,
@@ -92,7 +98,7 @@ def context(event, *, fork=False, fast_path="", platform="macOS"):
     }
 
 
-def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False):
+def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False, head_ref="feature"):
     results = {}
     pending = dict(workflow["jobs"])
     while pending:
@@ -107,7 +113,7 @@ def scheduled(workflow, event, *, fork=False, fast_path="", route="success", can
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        values = context(event, fork=fork, fast_path=fast_path)
+        values = context(event, fork=fork, fast_path=fast_path, head_ref=head_ref)
         values.update({f"needs.{key}.result": value for key, value in results.items()})
         runs = condition(job.get("if", True), values,
                          success=all(results[n] == "success" for n in needs), cancelled=cancelled)
@@ -131,7 +137,7 @@ def gate_errors(workflow):
     if gate.get("continue-on-error") or step.get("continue-on-error") or step.get("if"):
         errors.append("gate result check must be unconditional and fatal")
     needs = set(workflow["jobs"]["gate"]["needs"])
-    expected = set.union(*REQUIRED.values(), PR_METADATA, OPTIONAL) | {"route"}
+    expected = set.union(*REQUIRED.values(), PR_METADATA, ADVISORY) | {"route"}
     if needs != expected:
         errors.append("gate dependencies changed")
     for event, required in REQUIRED.items():
@@ -141,7 +147,7 @@ def gate_errors(workflow):
             errors.append(f"{event}: intended skips rejected")
         for name in expected:
             for result in RESULTS:
-                accepted = result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
+                accepted = name in ADVISORY or result == "success" or (result == "skipped" and name not in required and not (event == "pull_request" and name in PR_METADATA))
                 if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
                     errors.append(f"{event}: {name}={result}")
     errors.extend(fast_path_gate_errors(workflow, expected))
@@ -160,12 +166,11 @@ def fast_path_gate_errors(workflow, expected):
             for name in FAST_PATH_SKIPS:
                 baseline[name] = "skipped" if reported else "success"
             label = f"pull_request/fast_path={fast_path or '-'}/release-fast-path={classifier}"
-            if gate_passes(workflow, "pull_request", baseline, fast_path) != (classifier in ("success", "skipped")):
+            if not gate_passes(workflow, "pull_request", baseline, fast_path):
                 errors.append(f"{label}: baseline")
             for name in FAST_PATH_SKIPS:
                 for result in RESULTS:
-                    accepted = classifier in ("success", "skipped") and (
-                        result == "success" or (result == "skipped" and reported))
+                    accepted = result == "success" or (result == "skipped" and reported)
                     if gate_passes(workflow, "pull_request", {**baseline, name: result}, fast_path) != accepted:
                         errors.append(f"{label}: {name}={result}")
     return errors
@@ -174,16 +179,19 @@ def fast_path_gate_errors(workflow, expected):
 def routing_errors(workflow):
     errors = []
     for event in REQUIRED:
-        for fast_path in ("", "false", "true") if event == "pull_request" else ("",):
-            jobs = scheduled(workflow, event, fast_path=fast_path)
+        cases = [("feature", "")] + [(RELEASE_BRANCH, f) for f in ("", "false", "true")] if event == "pull_request" else [("", "")]
+        for head_ref, fast_path in cases:
+            jobs = scheduled(workflow, event, fast_path=fast_path, head_ref=head_ref)
             expected = REQUIRED[event] | {"route", "gate"}
             if event == "pull_request":
-                expected |= PR_METADATA | {"release-fast-path"}
+                expected |= PR_METADATA
+                if head_ref == RELEASE_BRANCH:
+                    expected |= {"release-fast-path"}
                 if fast_path == "true":
                     expected -= FAST_PATH_SKIPS
             actual = {name for name, result in jobs.items() if result == "success"}
             if actual != expected:
-                errors.append(f"{event}/{fast_path}: wrong jobs {actual ^ expected}")
+                errors.append(f"{event}/{head_ref}/{fast_path}: wrong jobs {actual ^ expected}")
     if any(value != "skipped" for value in scheduled(workflow, "pull_request", fork=True).values()):
         errors.append("fork PR allocated runners")
     for event in REQUIRED:
@@ -929,7 +937,7 @@ class NativeRoutingTests(unittest.TestCase):
     def test_release_fast_path_skips_only_pr_slow_jobs(self):
         for fast_path in ("", "false", "true"):
             for event in REQUIRED:
-                jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "")
+                jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "", head_ref=RELEASE_BRANCH)
                 for name in FAST_PATH_SKIPS:
                     expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" else "success"
                     self.assertEqual(jobs[name], expected, f"{event}/{fast_path}: {name}")
@@ -939,6 +947,19 @@ class NativeRoutingTests(unittest.TestCase):
             jobs = scheduled(self.workflow, "pull_request", route=route)
             self.assertTrue(all(jobs[name] == "skipped" for name in FAST_PATH_SKIPS))
             self.assertFalse(gate_passes(self.workflow, "pull_request", jobs))
+
+    def test_classifier_runs_only_on_release_plz_branches(self):
+        # Ordinary PRs skip the classifier at once, so the slow jobs that
+        # need it start right after route, and a failed classifier on a
+        # release branch still leaves the gate passing with full CI.
+        jobs = scheduled(self.workflow, "pull_request", head_ref="feature/release-plz-like")
+        self.assertEqual(jobs["release-fast-path"], "skipped")
+        self.assertTrue(all(jobs[name] == "success" for name in FAST_PATH_SKIPS))
+        self.assertTrue(gate_passes(self.workflow, "pull_request", jobs))
+        jobs = scheduled(self.workflow, "pull_request", head_ref=RELEASE_BRANCH)
+        self.assertTrue(gate_passes(self.workflow, "pull_request", {**jobs, "release-fast-path": "failure"}))
+        self.assertFalse(gate_passes(self.workflow, "pull_request",
+                                     {**jobs, "release-fast-path": "failure", "check": "skipped"}, "true"))
 
     def test_mutations_cannot_widen_the_release_fast_path(self):
         mutations = {
