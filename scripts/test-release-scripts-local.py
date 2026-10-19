@@ -95,7 +95,8 @@ class RunnerTests(unittest.TestCase):
         environ = {key: os.environ[key] for key in LOADER_PATH if key in os.environ}
         environ.update(PATH=str(self.bin), HOME=str(self.temp),
                        RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(self.preload), **extra_env)
-        return subprocess.run([sys.executable, '-I', '-B', str(RUNNER), '--root', str(self.root), *args],
+        # No -I: a user-site PyYAML must stay importable for the runner.
+        return subprocess.run([sys.executable, '-B', str(RUNNER), '--root', str(self.root), *args],
                               env=environ, capture_output=True, text=True, timeout=60)
 
     def test_runs_every_test_line_in_ci_order_and_fails_on_a_real_failure(self):
@@ -164,6 +165,55 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('HOST_RULES names suites no longer in job', result.stderr)
         self.assertIn('test-changed-tests-stdin.py', result.stderr)
+
+    def ci_with(self, step):
+        self.write('.github/workflows/ci.yml', CI + textwrap.indent(textwrap.dedent(step), '      '))
+
+    def test_literal_inline_env_is_kept_and_step_context_applied(self):
+        (self.root / 'sub').mkdir()
+        self.script('scripts/test-env.sh', 'echo "ran test-env.sh FOO=$FOO BAR=$BAR PWD=${PWD##*/}"')
+        self.ci_with('''\
+            - name: Env
+              working-directory: sub
+              env:
+                BAR: two
+              run: FOO=one ../scripts/test-env.sh
+            ''')
+        result = self.run_runner()
+        self.assertIn('ran test-env.sh FOO=one BAR=two PWD=sub', result.stdout)
+
+    def test_steps_needing_ci_context_are_skipped(self):
+        for step, reason in [
+            ("- if: runner.os == 'macOS'\n  run: ./scripts/test-pass.sh\n", "step runs only if: runner.os == 'macOS'"),
+            ('- env:\n    TOKEN: ${{ secrets.X }}\n  run: ./scripts/test-pass.sh\n', 'step env TOKEN is a CI expression'),
+            ('- shell: pwsh\n  run: ./scripts/test-pass.sh\n', "step runs under shell 'pwsh'"),
+            ('- run: ./scripts/test-pass.sh ${{ matrix.os }}\n', 'the command uses a CI expression'),
+        ]:
+            with self.subTest(reason=reason):
+                self.ci_with(step)
+                result = self.run_runner('--list')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'SKIP test-pass.sh: needs CI context ({reason})', result.stdout)
+
+    def test_shell_the_runner_cannot_reproduce_is_a_setup_error(self):
+        for run in ['for s in pass; do ./scripts/test-$s.sh; done', 'cd sub\n    ./scripts/test-pass.sh',
+                    'false | ./scripts/test-pass.sh', 'chmod +x scripts/test-pass.sh']:
+            with self.subTest(run=run):
+                self.ci_with(f'- run: |\n    {run}\n')
+                result = self.run_runner('--list')
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn('teach scripts/release-scripts-local.py this shape', result.stderr)
+
+    def test_unreadable_dist_pin_is_a_setup_error(self):
+        (self.root / 'dist-workspace.toml').unlink()
+        result = self.run_runner('--list')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('cannot read [dist].cargo-dist-version', result.stderr)
+
+    def test_a_tool_without_a_version_reads_unknown_version(self):
+        self.tool('release-plz', 'release-plz nightly')
+        result = self.run_runner('--list')
+        self.assertIn('SKIP test-plz.sh: needs release-plz 1.2.3 (found unknown version)', result.stdout)
 
     def test_missing_job_or_no_test_commands_is_a_setup_error(self):
         result = self.run_runner('--job', 'nope')

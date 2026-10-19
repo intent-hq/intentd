@@ -12,25 +12,38 @@ are not run. Suites that need CI-only tooling are skipped with
 - a step that runs the cargo-dist installer needs `dist` at the
   dist-workspace.toml cargo-dist-version;
 - HOST_RULES below name the suites that depend on the host itself. A rule whose
-  suite is no longer in the job is a setup error, so the table cannot go stale.
+  suite is no longer in the job is a setup error, so the table cannot go stale;
+- a step whose `if:`, `env:` or shell needs CI context is skipped.
 
-Exit 0 when nothing failed (skips allowed), 1 when a suite failed, 2 on a setup
-error. `--list` prints the plan without running anything.
+Each command runs as CI runs it: the step's shell flags (`shell: bash` adds
+pipefail), its working-directory, and its literal job/step env. A test step that
+mixes test lines with shell the runner cannot reproduce line by line (loops,
+conditionals, cd, ...) is a setup error rather than a silent divergence.
 
-Run: make test-release-scripts   (or python3 scripts/release-scripts-local.py)
+Exit 0 when nothing failed (skips allowed, but a skipped suite is unverified), 1
+when a suite failed, 2 on a setup error. `--list` prints the plan without
+running any suite.
+
+Run from packages/intentd: make test-release-scripts
+(monorepo root: make -C packages/intentd test-release-scripts)
 """
 import argparse
+import functools
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_SCRIPT = re.compile(r'(?:^|[\s/])(?:\./)?scripts/(test-[\w.-]+)')
-ASSIGNMENTS = re.compile(r'^(?:[A-Za-z_]\w*=(?:"[^"]*"|\'[^\']*\'|\S*)\s+)+')
+ASSIGNMENT = re.compile(r'^([A-Za-z_]\w*)=("[^"]*"|\'[^\']*\'|\S*)\s+')
+VARIABLE = re.compile(r'\$\{?([A-Za-z_]\w*)')
+TEST_COMMAND = re.compile(r'^(?:python3(?:\s+-[A-Za-z]+)*\s+)?(?:\.{1,2}/)*scripts/test-[\w.-]+(?:\s+[^;&|<>`$()]*)?$')
+# Non-test lines a test step may carry: CI-only setup the runner leaves out.
+SETUP_LINE = re.compile(r'^(?:[A-Za-z_]\w*=|python3 -m pip install\s|curl\s|rustup\s|'
+                        r'python3 scripts/setup-|echo\s.*>>\s*"?\$GITHUB_(?:ENV|PATH)"?$)')
 VERSION = re.compile(r'(\d+(?:\.\d+)+)')
 
 
@@ -38,12 +51,14 @@ class SetupError(Exception):
     pass
 
 
+@functools.cache
 def tool_version(command):
-    """First dotted version printed by `command --version`, or None if absent."""
-    if not shutil.which(command[0]):
+    """First dotted version printed by `command --version`, '' when it prints none,
+    or None when the command is absent or does not answer."""
+    if not shutil.which(command):
         return None
     try:
-        out = subprocess.run([*command, '--version'], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run([command, '--version'], capture_output=True, text=True, timeout=30).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     match = VERSION.search(out)
@@ -54,14 +69,14 @@ def as_tuple(version):
     return tuple(int(part) for part in version.split('.'))
 
 
-def exact_tool(name, version, command=None):
+def exact_tool(name, version):
     """A requirement that `name` is on PATH, at `version` when one is pinned."""
     def check():
-        found = tool_version(command or [name])
+        found = tool_version(name)
         if found is None:
             return 'not on PATH'
         if version and found != version:
-            return f'found {found}'
+            return f'found {found or "unknown version"}'
         return None
     return (f'{name} {version}' if version else name), check
 
@@ -75,7 +90,7 @@ def sccache_rule(root):
 
     def check():
         binary = os.environ.get('SCCACHE_BIN') or 'sccache'
-        found = tool_version([binary])
+        found = tool_version(binary)
         if found is None:
             return f'{binary} not found'
         if not found or as_tuple(found) < as_tuple(pinned):
@@ -111,18 +126,61 @@ def load_job(workflow, job):
         import yaml
     except ImportError:
         raise SetupError('PyYAML is required (CI pins it): python3 -m pip install PyYAML==6.0.2')
-    doc = yaml.safe_load(workflow.read_text())
-    steps = ((doc or {}).get('jobs') or {}).get(job, {}).get('steps')
-    if not steps:
+    try:
+        doc = yaml.safe_load(workflow.read_text())
+    except (OSError, yaml.YAMLError) as error:
+        raise SetupError(f'cannot read {workflow}: {error}')
+    found = ((doc or {}).get('jobs') or {}).get(job) or {}
+    if not found.get('steps'):
         raise SetupError(f'{workflow}: job {job!r} has no steps')
-    return steps
+    return found, found['steps']
+
+
+def ci_context(reason):
+    return 'CI context', lambda: reason
+
+
+def dist_pin(root):
+    try:
+        import tomllib
+        return tomllib.loads((root / 'dist-workspace.toml').read_text())['dist']['cargo-dist-version']
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        raise SetupError(f'cannot read [dist].cargo-dist-version from dist-workspace.toml: {error!r}')
+
+
+def env_needs(env, where):
+    """Literal env values to apply, plus a CI-context need for any expression."""
+    literal, needs = {}, []
+    for key, value in (env or {}).items():
+        if '${{' in str(value):
+            needs.append(ci_context(f'{where} env {key} is a CI expression'))
+        else:
+            literal[str(key)] = str(value)
+    return literal, needs
+
+
+def test_command(line, local, name):
+    """The command to run for a test line, CI-only VAR=$local prefixes dropped."""
+    command = line
+    kept = []
+    while match := ASSIGNMENT.match(command):
+        if not set(VARIABLE.findall(match.group(2))) & local:
+            kept.append(match.group(0))
+        command = command[match.end():]
+    if not TEST_COMMAND.match(command):
+        raise SetupError(f'step {name!r}: cannot run {line!r} on its own; '
+                         'teach scripts/release-scripts-local.py this shape')
+    return ''.join(kept) + command
 
 
 def plan(root, workflow, job):
-    """[(suite, command, [(need, check)])] in CI order."""
+    """[{suite, command, needs, shell, cwd, env}] in CI order."""
+    doc_job, steps = load_job(workflow, job)
+    job_env, job_needs = env_needs(doc_job.get('env'), 'job')
+    job_shell = ((doc_job.get('defaults') or {}).get('run') or {}).get('shell')
     entries = []
     carried = []
-    for step in load_job(workflow, job):
+    for step in steps:
         uses = step.get('uses', '')
         if uses.startswith('taiki-e/install-action@'):
             for tool in str((step.get('with') or {}).get('tool', '')).split(','):
@@ -133,27 +191,51 @@ def plan(root, workflow, job):
         run = step.get('run')
         if not run:
             continue
-        needs = list(carried)
+        name = step.get('name') or run.splitlines()[0]
+        lines = [line.strip() for line in run.replace('\\\n', ' ').splitlines()]
+        lines = [line for line in lines if line and not line.startswith('#')]
+        if not any('scripts/test-' in line for line in lines):
+            continue
+        step_env, needs = env_needs(step.get('env'), 'step')
+        needs = job_needs + needs + carried
+        if 'if' in step:
+            needs.append(ci_context(f'step runs only if: {step["if"]}'))
+        shell = step.get('shell', job_shell)
+        if shell not in (None, 'bash'):
+            needs.append(ci_context(f'step runs under shell {shell!r}'))
         if 'cargo-dist-installer' in run:
-            pinned = tomllib.loads((root / 'dist-workspace.toml').read_text())['dist']['cargo-dist-version']
-            needs.append(exact_tool('dist', pinned))
-        for line in run.replace('\\\n', ' ').splitlines():
-            line = line.strip()
-            if line.startswith('#'):
+            needs.append(exact_tool('dist', dist_pin(root)))
+        cwd = root / str(step.get('working-directory', '.'))
+        local = set()
+        for line in lines:
+            if 'scripts/test-' not in line:
+                if not SETUP_LINE.match(line):
+                    raise SetupError(f'step {name!r}: {line!r} is shell the runner cannot reproduce '
+                                     'line by line; teach scripts/release-scripts-local.py this shape')
+                if assigned := re.match(r'^([A-Za-z_]\w*)=', line):
+                    local.add(assigned.group(1))
                 continue
             match = TEST_SCRIPT.search(line)
-            if not match:
-                continue
-            entries.append((match.group(1), ASSIGNMENTS.sub('', line), needs))
+            line_needs = list(needs)
+            if '${{' in line and match:
+                line_needs.append(ci_context('the command uses a CI expression'))
+                command = line
+            else:
+                command = test_command(line, local, name)
+            entries.append({'suite': match.group(1), 'command': command,
+                            'needs': line_needs, 'shell': shell, 'cwd': cwd,
+                            'env': {**job_env, **step_env}})
     if not entries:
         raise SetupError(f'{workflow}: job {job!r} runs no scripts/test-* commands')
-    suites = {suite for suite, _, _ in entries}
+    suites = {entry['suite'] for entry in entries}
     stale = sorted(set(HOST_RULES) - suites)
     if stale:
         raise SetupError(f'HOST_RULES names suites no longer in job {job!r}: {", ".join(stale)}; '
                          'remove them from scripts/release-scripts-local.py')
-    return [(suite, command, needs + ([HOST_RULES[suite](root)] if suite in HOST_RULES else []))
-            for suite, command, needs in entries]
+    for entry in entries:
+        if entry['suite'] in HOST_RULES:
+            entry['needs'] = entry['needs'] + [HOST_RULES[entry['suite']](root)]
+    return entries
 
 
 def missing(needs):
@@ -166,7 +248,7 @@ def missing(needs):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--list', action='store_true', help='print the plan without running anything')
+    parser.add_argument('--list', action='store_true', help='print the plan without running any suite')
     parser.add_argument('--root', type=Path, default=ROOT, help=argparse.SUPPRESS)
     parser.add_argument('--job', default='release-scripts', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -179,8 +261,9 @@ def main(argv=None):
         return 2
 
     results = []
-    for index, (suite, command, needs) in enumerate(entries, 1):
-        reason = missing(needs)
+    for index, entry in enumerate(entries, 1):
+        suite, command = entry['suite'], entry['command']
+        reason = missing(entry['needs'])
         if reason:
             print(f'SKIP {suite}: {reason}', flush=True)
             results.append(('skip', suite, reason))
@@ -189,7 +272,10 @@ def main(argv=None):
             print(f'RUN  {suite}: {command}')
             continue
         print(f'==> [{index}/{len(entries)}] {command}', flush=True)
-        status = subprocess.run(['bash', '-eo', 'pipefail', '-c', command], cwd=root).returncode
+        # GitHub's default `bash -e {0}`; `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`.
+        shell = ['bash', '--noprofile', '--norc', '-eo', 'pipefail'] if entry['shell'] == 'bash' else ['bash', '-e']
+        status = subprocess.run([*shell, '-c', command], cwd=entry['cwd'],
+                                env={**os.environ, **entry['env']}).returncode
         results.append(('pass' if status == 0 else 'fail', suite, f'exit {status}'))
         print(f'{"PASS" if status == 0 else "FAIL"} {suite} (exit {status})', flush=True)
     if args.list:
@@ -201,10 +287,15 @@ def main(argv=None):
           f'{len(skipped)} skipped, {len(failed)} failed')
     for _, suite, reason in skipped:
         print(f'  skipped: {suite}: {reason}')
+    if skipped:
+        print('  Skipped suites were not checked; CI still runs them.')
     for _, suite, reason in failed:
         print(f'  FAILED:  {suite} ({reason})')
     return 1 if failed else 0
 
 
 if __name__ == '__main__':
+    if sys.version_info < (3, 11):
+        print('release-scripts-local: Python 3.11+ is required (CI uses 3.11)', file=sys.stderr)
+        sys.exit(2)
     sys.exit(main())
