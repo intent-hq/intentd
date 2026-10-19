@@ -421,6 +421,9 @@ mod tests_settings_default_effort;
 #[cfg(test)]
 mod tests_catalog_default_model;
 
+#[cfg(test)]
+mod tests_unknown_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -814,6 +817,40 @@ pub(crate) fn ensure_bare_model_matches_provider(
         )));
     }
     Ok(())
+}
+
+/// Reject an explicit model id the provider's cached catalog provably does not
+/// offer with `-32602` (`InvalidParams`), naming the valid models
+/// (intent-hq/intent#7121). Without it an unknown id was persisted and the
+/// provider silently ran its default model. Evidence is
+/// [`crate::model_catalog::ModelCatalogReader::cached_catalog_ids`] for
+/// `provider_ref` (profile-aware); with no usable cached catalog the id passes
+/// through — absence of evidence is never a rejection, so creation never
+/// blocks on model discovery. The `"default"` sentinel always passes, and a
+/// bracketed variant suffix is ignored on both sides so a bare alias matches
+/// its variant rows (`opus` ↔ `opus[1m]`).
+pub(crate) fn ensure_model_offered_by_provider(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
+    provider_ref: &str,
+    model_id: &str,
+) -> Result<()> {
+    if model_id == "default" {
+        return Ok(());
+    }
+    let Some(ids) = cache.cached_catalog_ids(provider_ref) else {
+        return Ok(());
+    };
+    let family = |id: &str| id.split_once('[').map_or(id, |(base, _)| base).to_string();
+    let wanted = family(model_id);
+    if ids.iter().any(|id| family(id) == wanted) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "{method}: model {model_id} is not available for provider {provider_ref} \
+         (valid models: {})",
+        ids.join(", ")
+    )))
 }
 
 /// Reject a `reasoningEffort` level the resolved model provably does not
@@ -4860,6 +4897,12 @@ impl Services {
                 .or(derived_default.as_deref())
                 .expect("guarded above: provider or derived default present");
             match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
+                // An explicit id must also be one the provider offers
+                // (intent-hq/intent#7121); derived defaults keep their
+                // ownership-only check.
+                Ok(()) if model_explicit => {
+                    ensure_model_offered_by_provider(method, &self.cached_models(), effective, m)?;
+                }
                 Ok(()) => {}
                 Err(e) if model_explicit => return Err(e),
                 Err(e) => {

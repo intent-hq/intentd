@@ -626,6 +626,53 @@ impl ModelCatalogReader<'_> {
             .map(|s| s.provider_id.to_string())
             .collect()
     }
+
+    /// The cached catalog row ids for a provider reference
+    /// (intent-hq/intent#7121): `Some(ids)` when the reference holds a
+    /// non-empty last-good entry under its **current** version key, `None`
+    /// otherwise (no evidence). A bare id normalizes legacy default aliases
+    /// like [`Self::cached_catalog_claims`]. A named profile (`<base>@<id>`)
+    /// reads only its own cache slot, versioned by its observed installed
+    /// identity — never the base's Default catalog, whose model set may
+    /// differ. Synchronous, read-only and probe-free.
+    pub(crate) fn cached_catalog_ids(&self, provider_ref: &str) -> Option<Vec<String>> {
+        let profile = provider_ref.contains(crate::provider_profiles::REF_SEPARATOR);
+        let slot = if profile {
+            provider_ref
+        } else {
+            intent_providers::provider_config(provider_ref).id
+        };
+        let base = slot
+            .split_once(crate::provider_profiles::REF_SEPARATOR)
+            .map_or(slot, |(base, _)| base);
+        let source = source_for(base)?;
+        let version_key = if profile {
+            self.cache.installed_key(slot)?
+        } else {
+            self.version_key(source)
+        };
+        let entries = self
+            .cache
+            .entries
+            .lock()
+            .expect("model catalog cache poisoned");
+        let entry = entries.get(slot)?;
+        if entry.version_key != version_key {
+            return None;
+        }
+        let ids: Vec<String> = entry
+            .models
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .map(|id| {
+                id.split_once(':')
+                    .filter(|(prefix, _)| *prefix == base)
+                    .map_or(id, |(_, bare)| bare)
+                    .to_string()
+            })
+            .collect();
+        (!ids.is_empty()).then_some(ids)
+    }
 }
 
 /// Identity observations are refreshed at explicit refreshes and at most once
