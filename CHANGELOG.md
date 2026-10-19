@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.13] - 2026-10-19
+
+### 🚀 Features
+
+- *(token-usage)* Include agentNames in the TokenUsage snapshot ([#2508](https://github.com/intent-hq/intentd/pull/2508))
+
+### 🐛 Bug Fixes
+
+- *(agent)* Reject unknown model ids at agent creation ([#7121](https://github.com/intent-hq/intentd/pull/7121)) ([#2510](https://github.com/intent-hq/intentd/pull/2510))
+
+### 📚 Documentation
+
+- *(guide)* Note relative image paths in Markdown file previews ([#2500](https://github.com/intent-hq/intentd/pull/2500))
+
+### 🧪 Testing
+
+- *(store)* Scale note-page test waits with the timeout multiplier ([#2514](https://github.com/intent-hq/intentd/pull/2514))
+
+### ⚙️ Miscellaneous Tasks
+
+- Auto-pin claude-agent-acp alongside codex-acp (merge on green) ([#2502](https://github.com/intent-hq/intentd/pull/2502))
+
+
 ## [0.11.12] - 2026-10-19
 
 ### 🐛 Bug Fixes
