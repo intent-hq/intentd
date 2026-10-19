@@ -246,7 +246,7 @@ def executes_node(path):
 def node_without_setup(workflow):
     """Jobs whose steps execute Node before an unconditional actions/setup-node step.
 
-    Depot images preinstall Node, but the self-hosted tinybox runners do not,
+    Depot images preinstall Node, but the self-hosted runner images do not,
     so routing a job there fails with `node` not found unless it sets Node up.
     A conditional setup-node step covers only later steps with the identical
     `if:` expression (a Windows-only setup does not cover Linux). Detected:
@@ -294,7 +294,7 @@ const github = {
 };
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
 const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: fixture.eventName || 'push', payload: fixture.payload || {} };
-process.env.THRESHOLD = '8';
+process.env.THRESHOLD = '2';
 process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
@@ -353,9 +353,23 @@ def matrix_labels(value, outputs):
     return json.loads(outputs.get(match[1], "") or match[2])
 
 
-def runner(platform="macOS", arch="ARM64", *, status="online", busy=False):
+def runner(platform="macOS", arch="ARM64", *, status="online", busy=False, extra=()):
     return {"status": status, "busy": busy,
-            "labels": [{"name": name} for name in ("self-hosted", platform, arch)]}
+            "labels": [{"name": name} for name in ("self-hosted", platform, arch, *extra)]}
+
+
+# intent-cache slots register with GitHub's default labels plus `intent-cache`;
+# routed Linux jobs ask for exactly these labels.
+CACHE = ["self-hosted", "linux", "x64", "intent-cache"]
+SMALL = ["self-hosted", "linux", "x64", "intent-cache-small"]
+
+
+def slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache",), **kwargs)
+
+
+def small_slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache-small",), **kwargs)
 
 
 class RunnerAvailabilityTests(unittest.TestCase):
@@ -413,24 +427,26 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                      else {"owner": "intent-hq", "repo": "intentd", "per_page": 100})
 
     def test_linux_keeps_queue_semantics_and_idle_windows_stays_self_hosted(self):
-        fleet = [runner("Linux", "X64", busy=True)] * 8 + [runner("Windows", "X64"), runner()]
-        for depth, queue_errors, linux_burst in ((8, [], False), (9, [], True),
+        fleet = [slot(busy=True)] * 2 + [runner("Windows", "X64"), runner()]
+        for depth, queue_errors, linux_burst in ((1, [], False), (2, [], True),
                                                (0, ["intentd"], True), (0, ["cloudlands-fe", "intent"], True)):
             with self.subTest(depth=depth, queue_errors=queue_errors):
-                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": ["self-hosted", "Linux", "X64"], "created_at": "2099-01-01T00:00:00Z"}
+                jobs = [{"status": "queued" if i % 2 else "in_progress", "labels": CACHE, "created_at": "2099-01-01T00:00:00Z"}
                         for i in range(depth)]
                 jobs += [{"status": "in_progress", "labels": ["depot-ubuntu-24.04-16"]}] * 20
+                # Jobs still asking for the generic self-hosted Linux fleet never occupy a slot.
+                jobs += [{"status": "in_progress", "labels": ["self-hosted", "Linux", "X64"]}] * 5
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
                                               ["depot-macos-latest"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else ["self-hosted", "Linux", "X64"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-8"] if linux_burst else ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"] if linux_burst else CACHE)
+                self.assertEqual(json.loads(outputs["check_labels"]), ["depot-ubuntu-24.04-8"] if linux_burst else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["depot-windows-2022-16"] if queue_errors else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
-                        {"org": [runner("Linux", "X64", status="offline"), runner("Windows", "X64", status="offline")]},
-                        {"org": [runner("linux", "x64"), runner("windows", "x64")]}):
+                        {"org": [slot(status="offline"), runner("Windows", "X64", status="offline")]},
+                        {"org": [runner("Linux", "X64"), runner("Linux", "X64")]}):
             with self.subTest(fixture=fixture):
                 outputs = run_route(self.workflow, **fixture)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]), ["depot-ubuntu-24.04-16"])
@@ -440,12 +456,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["windows_burst"], "true")
 
     def test_merge_queue_keeps_heavy_linux_jobs_on_depot(self):
-        # The heavy Rust jobs share one tinybox /raid volume; in the queue
-        # several start at once and ran it out of space (runs 39131949771,
-        # 39134737536). Light jobs, PRs and pushes keep the probe's choice.
+        # The queue starts ~4 heavy 16-CPU Rust jobs at once, more than the two
+        # 8-CPU intent-cache slots absorb in the queue's time budget. Light
+        # jobs, PRs and pushes keep the probe's choice.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         for idle in (True, False):
-            fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()] if idle else []
+            fleet = [slot(), small_slot(), runner("Windows", "X64"), runner()] if idle else []
             for event in ("pull_request", "push", "merge_group"):
                 with self.subTest(idle=idle, event=event):
                     result = run_route(self.workflow, org=fleet, eventName=event,
@@ -453,12 +469,13 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     outputs = route_outputs(self.workflow, result["outputs"], event)
                     hosted = event == "merge_group" or not idle
                     self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["depot-ubuntu-24.04-16"] if hosted else ["self-hosted", "Linux", "X64"])
+                                     ["depot-ubuntu-24.04-16"] if hosted else CACHE)
                     self.assertEqual(json.loads(outputs["check_labels"]),
-                                     ["depot-ubuntu-24.04-8"] if hosted else ["self-hosted", "Linux", "X64"])
+                                     ["depot-ubuntu-24.04-8"] if hosted else CACHE)
                     self.assertEqual(outputs["linux_burst"], str(hosted).lower())
+                    # Light jobs ask for the standard label, which the fast pool serves.
                     self.assertEqual(json.loads(outputs["runners"])["depot-ubuntu-24.04"],
-                                     ["self-hosted", "Linux", "X64"] if idle else ["depot-ubuntu-24.04"])
+                                     SMALL if idle else ["depot-ubuntu-24.04"])
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
@@ -497,25 +514,25 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_windows_maintenance_override_preserves_other_runner_preferences(self):
         step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
         self.assertEqual(step["env"].get("WINDOWS_RUNNER_DISABLED"), "${{ vars.CI_WINDOWS_RUNNER_DISABLED }}")
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        fleet = [slot(), runner("Windows", "X64"), runner()]
         for disabled in ("", "false", "true"):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, windowsDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["windows_labels"]),
                                  ["depot-windows-2022-16"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(disabled == "true").lower())
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
 
     def test_linux_maintenance_override_preserves_native_runner_preferences(self):
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        fleet = [slot(), runner("Windows", "X64"), runner()]
         for disabled in ("", "false", "true"):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, linuxDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]),
-                                 ["depot-ubuntu-24.04-16"] if disabled == "true" else ["self-hosted", "Linux", "X64"])
+                                 ["depot-ubuntu-24.04-16"] if disabled == "true" else CACHE)
                 self.assertEqual(json.loads(outputs["check_labels"]),
-                                 ["depot-ubuntu-24.04-8"] if disabled == "true" else ["self-hosted", "Linux", "X64"])
+                                 ["depot-ubuntu-24.04-8"] if disabled == "true" else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -523,14 +540,14 @@ class RunnerAvailabilityTests(unittest.TestCase):
         self.assertEqual(step["env"].get("LINUX_RUNNER_DISABLED"), "${{ vars.CI_LINUX_RUNNER_DISABLED }}")
 
     def test_macos_maintenance_override_preserves_other_runner_preferences(self):
-        fleet = [runner("Linux", "X64"), runner("Windows", "X64"), runner()]
+        fleet = [slot(), runner("Windows", "X64"), runner()]
         for disabled in ("", "false", "true"):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["macos_labels"]),
                                  ["depot-macos-latest"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["self-hosted", "Linux", "X64"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
         step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
         self.assertEqual(step["env"].get("MACOS_RUNNER_DISABLED"), "${{ vars.CI_MACOS_RUNNER_DISABLED }}")
@@ -610,9 +627,7 @@ class LifecycleCacheTests(unittest.TestCase):
         self.assertNotIn("if", cache)
 
     def test_persistent_paths_are_platform_scoped_and_precede_compilation(self):
-        names = {"Point lifecycle target outside checkout (Linux)": {"Linux"},
-                 "Point lifecycle target outside checkout (macOS and Windows)": {"macOS", "Windows"},
-                 "Disk-space preflight (tinybox only)": {"Linux"},
+        names = {"Point lifecycle target outside checkout (macOS and Windows)": {"macOS", "Windows"},
                  "Ensure macOS CI disk headroom": {"macOS"}}
         toolchain = self.steps.index(self.step("Resolve pinned Rust channel"))
         for name, platforms in names.items():
@@ -624,53 +639,16 @@ class LifecycleCacheTests(unittest.TestCase):
                     values = {**context("merge_group", platform=platform),
                               "matrix.os": [platform] if hosted else ["self-hosted", platform]}
                     self.assertEqual(condition(step.get("if", True), values), not hosted and platform in platforms)
-        self.assertLess(self.steps.index(self.step("Disk-space preflight (tinybox only)")),
-                        self.steps.index(self.step("Point lifecycle target outside checkout (Linux)")))
 
-    def test_linux_slot_targets_survive_checkout_and_release_after_failure(self):
-        step = self.step("Point lifecycle target outside checkout (Linux)")
-        self.assertIn('/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle', step["run"])
-        release = self.step("Release lifecycle target dir")
-        self.assertEqual(self.steps[-1], release)
-        for platform in ("Linux", "macOS", "Windows"):
-            for marked in (False, True):
-                values = {**context("pull_request", platform=platform),
-                          "matrix.os": ["self-hosted", platform],
-                          "env.CARGO_TARGET_DIR": "/fixture/target" if marked else ""}
-                for success in (False, True):
-                    self.assertEqual(condition(release["if"], values, success=success, cancelled=True),
-                                     platform == "Linux" and marked)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            checkout = root / "checkout"
-            checkout.mkdir()
-            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
-            targets = []
-            for slot in ("slot1", "slot2"):
-                envfile = root / (slot + ".env")
-                body = step["run"].replace("/raid/ci-target", str(root / "ci-target"))
-                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
-                                        env={**os.environ, "RUNNER_NAME": slot, "GITHUB_ENV": str(envfile)},
-                                        capture_output=True, text=True, timeout=5)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                target = Path(envfile.read_text().strip().removeprefix("CARGO_TARGET_DIR="))
-                self.assertEqual(target, root / "ci-target/intentd" / slot / "daemon-lifecycle")
-                self.assertTrue((target / ".in-use").is_file())
-                artifact = target / "warm-artifact"
-                artifact.touch()
-                disposable = checkout / "target"
-                disposable.mkdir()
-                (disposable / "cold-artifact").touch()
-                subprocess.run(["git", "-C", str(checkout), "clean", "-ffdx"], check=True, capture_output=True)
-                self.assertFalse(disposable.exists())
-                self.assertTrue(artifact.exists())
-                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", release["run"]], cwd=ROOT,
-                                        env={**os.environ, "CARGO_TARGET_DIR": str(target)}, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse((target / ".in-use").exists())
-                self.assertTrue(artifact.exists())
-                targets.append(target)
-            self.assertNotEqual(*targets)
+    def test_linux_jobs_assume_a_fresh_runner(self):
+        # intent-cache slots are fresh containers: no shared /raid volume, no
+        # per-slot target dirs or markers, and nothing tinybox-specific.
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        for forbidden in ("/raid", "ci-target-slot.sh", "INSTALL_ACTION_HOME", "ci-target/intentd/$RUNNER_NAME"):
+            self.assertNotIn(forbidden, text)
+        for path in [*(ROOT / ".github").rglob("*.yml"), *(ROOT / ".github").rglob("*.yaml")]:
+            self.assertNotRegex(path.read_text(), r"(?i)tinybox", str(path))
+        self.assertFalse((ROOT / "scripts/ci-target-slot.sh").exists())
 
     def test_macos_and_windows_keep_native_persistent_paths(self):
         step = self.step("Point lifecycle target outside checkout (macOS and Windows)")
@@ -687,58 +665,6 @@ class LifecycleCacheTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(envfile.read_text().strip(),
                                  f"CARGO_TARGET_DIR={profile or os.environ['HOME']}/ci-target/intentd/daemon-lifecycle-{platform}")
-
-    def test_linux_preflight_executes_only_safe_fixture_evictions(self):
-        step = self.step("Disk-space preflight (tinybox only)")
-        for scenario, age_minutes in (("adequate", 5000), ("stale", 5000), ("lru", 60), ("exhausted", 0)):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                raid = root / "raid"
-                targets = raid / "ci-target/intentd"
-                own = targets / "self/daemon-lifecycle"
-                live = targets / "other/daemon-lifecycle"
-                idle = targets / "idle/daemon-lifecycle"
-                for target in (own, live, idle):
-                    (target / "debug/deps").mkdir(parents=True)
-                    (target / "debug/deps/artifact").touch()
-                    for entry in sorted(target.rglob("*"), reverse=True):
-                        os.utime(entry, (1, 1))
-                    os.utime(target, (1, 1))
-                (live / ".in-use").touch()
-                now = (live / ".in-use").stat().st_mtime
-                for entry in [idle, *idle.rglob("*")]:
-                    os.utime(entry, (now - age_minutes * 60,) * 2)
-                stub = root / "df"
-                available = 20 if scenario == "adequate" else 5
-                stub.write_text("#!/bin/sh\nblocks=" + str(available * 1048576) +
-                                "\n[ -d " + shlex.quote(str(idle)) + " ] || blocks=20971520\n" +
-                                "printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfixture 99999999 0 %s 0%% /fixture\n' \"$blocks\"\n")
-                stub.chmod(0o755)
-                # Rewrite every absolute production root before running deletion.
-                body = step["run"].replace("/raid", str(raid))
-                self.assertNotIn("/raid/ci-target", body.replace(str(raid), "FIXTURE"))
-                result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
-                                        env={**os.environ, **{k: str(v) for k, v in step["env"].items()},
-                                             "RUNNER_NAME": "self", "PATH": str(root) + os.pathsep + os.environ["PATH"]},
-                                        capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 1 if scenario == "exhausted" else 0, result.stdout + result.stderr)
-                self.assertEqual(idle.exists(), scenario in ("adequate", "exhausted"))
-                self.assertTrue((own / "debug/deps/artifact").exists())
-                self.assertTrue((live / "debug/deps/artifact").exists())
-
-    def test_linux_preflight_keeps_existing_prune_rails(self):
-        step = self.step("Disk-space preflight (tinybox only)")
-        self.assertEqual(step["env"]["JOB_TARGET_SUBDIR"], "daemon-lifecycle")
-        self.assertGreaterEqual(int(step["env"]["NEED_GIB"]), 15)
-        body = step["run"]
-        for required in ('/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR',
-                         'is-purgeable "$dir" --quiet-min "$quiet_min"',
-                         'purge-candidates /raid/ci-target',
-                         'evict_until_free pruning 2880 --skip-dir "$own_dir"',
-                         'evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"', 'exit 1'):
-            self.assertIn(required, body)
-        self.assertLess(body.index('is-purgeable'), body.index('rm -rf'))
-
 
 class NativeRoutingTests(unittest.TestCase):
     def test_consumer_workflow_allows_nested_runner_probe_reads(self):
