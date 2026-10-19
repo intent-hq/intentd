@@ -34765,6 +34765,62 @@ mod worktree_provisioning {
         assert_eq!(ws2.branch, "aw/auth-fix-2");
     }
 
+    /// `workspace.create`'s initial agent pins the settings default provider
+    /// on its row, so a later `model.defaultProvider` change never moves the
+    /// workspace's first conversation (a NULL provider is a legacy row).
+    #[intent_test_macros::daemon_test]
+    async fn create_initial_agent_pins_the_default_provider() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set default provider");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-initpin-repo");
+        let root = unique_dir("intentd-initpin-root");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("pin the provider".to_string()),
+                        model: Some("sonnet4.5".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("codex"),
+            )])
+            .expect("change default provider");
+        let sessions = store.list_agent_sessions(&ws.id).await.expect("sessions");
+        let initial = sessions
+            .iter()
+            .find(|s| s.is_initial_agent())
+            .expect("initial agent");
+        assert_eq!(initial.provider.as_deref(), Some("auggie"));
+        assert_eq!(initial.model.as_deref(), Some("sonnet4.5"));
+    }
+
     /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
     #[intent_test_macros::daemon_test]
     async fn create_keeps_explicit_branch_untouched() {

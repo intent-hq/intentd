@@ -371,6 +371,12 @@ pub(crate) struct AcpSessionOpened {
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
     pub config_options: Option<Value>,
+    /// The model id the session-open fill persisted onto a session spawned
+    /// without one (`fill_identity_from_session_open`) — exactly what the
+    /// child runs. The manager records it as the handle's spawned model.
+    /// `None` when nothing was filled (or the fill lost to a concurrent
+    /// write).
+    pub filled_model: Option<String>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -1579,6 +1585,41 @@ pub(crate) fn resolve_base_provider_id(
         .map(|id| intent_providers::base_provider_id(&id).to_owned())
 }
 
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id; a profile reference is
+/// kept as-is) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`]. A store
+/// read error is returned, never treated as "no last turn".
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Option<String>> {
+    // A store error must not read as "never ran": falling through to the
+    // current default would pin exactly the wrong provider permanently.
+    let (_, last_turn) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await?;
+    // A named profile reference (`<base>@<profileId>`, PROTOCOL §5.54) is
+    // kept as-is: the session ran that profile, not its base's Default.
+    let last_turn = last_turn.map(|raw| raw.trim().to_string()).and_then(|raw| {
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            Some(raw)
+        } else {
+            intent_providers::find_provider_or_legacy_alias(&raw).map(|p| p.id.to_string())
+        }
+    });
+    Ok(last_turn.or_else(|| derived_default_provider(&services.effective_settings())))
+}
+
 /// Resolve the provider id the agent's failing TURN ran on, for event
 /// annotation: `last_turn_provider` (the identity the turn committed) with
 /// the session's persisted `provider` column — under the same precedence
@@ -2768,6 +2809,82 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` from what the provider reports at
+    /// session open — the model select's `currentValue`, a selectable option
+    /// id (never the D13 display name, monorepo#1534, and never the adapter's
+    /// floating `"default"` alias: no concrete model is known then and the
+    /// column stays NULL) — so a session created without a resolvable model
+    /// (cold catalog cache, legacy row) ends up pinned to what it runs.
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten.
+    /// Returns the model that actually landed, which the manager records as
+    /// the child's spawned model (no respawn, no `model_changed` row). A NULL
+    /// `reasoning_effort` is filled at the turn boundary from the level the
+    /// provider confirmed instead (`AgentManager::maybe_persist_effort_change_notice`).
+    /// Best-effort: failures are logged, never propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| {
+                !m.trim().is_empty()
+                    && !m.contains(char::is_whitespace)
+                    && !m.eq_ignore_ascii_case("default")
+            });
+        let model = model?;
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                Some(&model),
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                // Report what actually landed: a column a concurrent write
+                // set first keeps that writer's value.
+                let landed = match self.store.get_agent_session(&stored.id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
+                        return None;
+                    }
+                };
+                let filled_model =
+                    (landed.model.as_deref() == Some(model.as_str())).then_some(model);
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?landed.model,
+                    field = "model",
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": stored.id.0, "modelId": landed.model }),
+                )
+                .await;
+                filled_model
+            }
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+                None
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -3184,7 +3301,7 @@ impl Services {
         } = prepared;
         // On CAS loss the provider metadata belongs to the losing candidate.
         // Preserve the winner's usage, effective model and effort metadata.
-        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+        let (modes, thought_level, filled_model) = if canonical == resp.session_id.0.as_ref() {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
@@ -3203,9 +3320,13 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            (resp.modes, thought_level)
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
+            (resp.modes, thought_level, filled_model)
         } else {
-            (None, None)
+            (None, None, None)
         };
         AcpSessionOpened {
             config_options: (canonical == resp.session_id.0.as_ref())
@@ -3214,6 +3335,7 @@ impl Services {
             session_id: canonical,
             modes,
             thought_level,
+            filled_model,
         }
     }
 
@@ -3559,11 +3681,15 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
+            filled_model,
         }
     }
 
