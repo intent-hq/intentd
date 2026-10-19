@@ -857,7 +857,7 @@ The design docs live in the monorepo under `docs/`:
 Routed jobs prefer the free self-hosted fleet and burst to GitHub-hosted runners
 when the fleet is unavailable or busy. Burst Linux checks use the `gh-linux-8x`
 org larger runner and coverage/release compilation uses `gh-linux-16x`; Windows
-uses `gh-windows-16x` and Apple Silicon uses `macos-15-xlarge`. The larger
+uses `gh-windows-16x` and Apple Silicon uses `macos-26-xlarge`. The larger
 runners' group must allow public repositories. Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or

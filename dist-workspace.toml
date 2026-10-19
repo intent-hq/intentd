@@ -78,11 +78,11 @@ github-build-setup = "../dist-build-setup.yml"
 global = "ubuntu-24.04"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
-runner = "macos-15-xlarge"
+runner = "macos-26-xlarge"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
-runner = "macos-15-xlarge"
+runner = "macos-26-xlarge"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]

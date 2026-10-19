@@ -112,9 +112,9 @@ jobs:
           # Windows Server 2022 image) for faster release builds
           # (intent-hq/monorepo#1803).
           - target: aarch64-apple-darwin
-            os: macos-15-xlarge
+            os: macos-26-xlarge
           - target: x86_64-apple-darwin
-            os: macos-15-xlarge
+            os: macos-26-xlarge
           - target: x86_64-unknown-linux-musl
             os: gh-linux-16x
             zigbuild: true
