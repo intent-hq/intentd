@@ -1950,7 +1950,10 @@ jobs:
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job.
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
-    timeout-minutes: 5
+    # About 2 min on Depot; on a busy tinybox slot it ran 5 min next to a
+    # PR's check and coverage-changed (run 39178412485) with every step
+    # passing, so the budget leaves self-hosted headroom.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
