@@ -50,7 +50,8 @@
 #   Release PR must not wedge the release train; humans engage by
 #   replying (which makes the thread blocking) or resolving it. Anything
 #   else logs and exits 0 (push runs first retry transient states within
-#   their bounded wait) — the next scheduled run retries. Never
+#   their bounded wait; every run re-reads a transient mergeable=UNKNOWN
+#   for up to 2 min per episode) — the next scheduled run retries. Never
 #   bypasses a failed guard. Metadata-only releases use the CI identity’s
 #   existing queue exemption; other diffs retain the ordinary queue path.
 # - The PR branch is never updated from here: release-plz owns the Release
@@ -276,6 +277,10 @@ jobs:
             exit 0
           }
 
+          # Bounded re-reads of a transient mergeable=UNKNOWN (see below).
+          UNKNOWN_GRACE_SECONDS=120
+          unknown_deadline=0
+
           # CI-pending helper: like transient(), but every event gets the
           # CI wait budget.
           ci_pending() {
@@ -287,14 +292,27 @@ jobs:
             exit 0
           }
 
-          # The Release PR's CI Gate state: success, missing (checks not
-          # started), terminal (any unsuccessful conclusion — never retried),
-          # or pending. FAILURE also matches STARTUP_FAILURE via substring —
-          # intentional, both are terminal. NEUTRAL/SKIPPED/STALE are
-          # terminal too (a gate in those states never becomes SUCCESS).
+          # The Release PR's CI Gate state: success, running (no gate yet,
+          # other CI jobs on the head are still queued or in progress, and
+          # none has already failed — a failed job dooms the gate, so it gets
+          # only the short missing grace),
+          # missing (no CI activity at all), terminal (any unsuccessful
+          # conclusion — never retried), or pending. CI Gate `needs:` every
+          # CI job, so its check run only appears once CI has finished: a
+          # missing gate beside running CI jobs is CI in progress, not CI that
+          # never started, and gets the full CI budget (intentd#2493: every
+          # push run waited out the short missing grace while CI ran).
+          # FAILURE also matches STARTUP_FAILURE via substring — intentional,
+          # both are terminal. NEUTRAL/SKIPPED/STALE are terminal too (a gate
+          # in those states never becomes SUCCESS).
           gate_state() {
-            jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate")]
-              | if length == 0 then "missing"
+            jq -r '(.statusCheckRollup // []) as $rollup
+              | [$rollup[] | select(.name == "CI Gate")]
+              | if length == 0 then
+                  (if any($rollup[]; .workflowName == "CI" and .status != null and .status != "COMPLETED")
+                      and (any($rollup[]; .workflowName == "CI"
+                        and ((.conclusion // "") | test("FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED"))) | not)
+                   then "running" else "missing" end)
                 elif all(.conclusion == "SUCCESS") then "success"
                 else (map(.conclusion // .status // "PENDING") | join(","))
                 end' <<<"$1"
@@ -403,13 +421,29 @@ jobs:
               sleep 30; continue
             fi
 
-            # UNKNOWN just means GitHub is still computing mergeability;
-            # anything else non-MERGEABLE is a real conflict.
+            # UNKNOWN just means GitHub is still computing mergeability
+            # (seconds to a minute, typically right after release-plz
+            # refreshes the branch); anything else non-MERGEABLE is a real
+            # conflict. Every event — cron and dispatch included, and push
+            # runs past their refresh budget — re-reads it for up to
+            # UNKNOWN_GRACE_SECONDS per UNKNOWN episode (the deadline re-arms
+            # once mergeability resolves, so an early episode cannot use up
+            # the grace for the one after CI turns green) before falling back
+            # to transient(); scheduled runs used to skip on the first read
+            # (intentd#2493). Episodes are bounded by the other budgets: every
+            # path between them waits only within deadline / ci_deadline.
             mergeable=$(jq -r '.mergeable' <<<"$detail")
             if [[ "$mergeable" == "UNKNOWN" ]]; then
+              now=$(date +%s)
+              (( unknown_deadline > 0 )) || unknown_deadline=$(( now + UNKNOWN_GRACE_SECONDS ))
+              if (( now < unknown_deadline )); then
+                echo "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN) — re-reading in 30s."
+                sleep 30; continue
+              fi
               transient "Release PR #$number mergeability is still being computed (mergeable=UNKNOWN)"
               sleep 30; continue
             fi
+            unknown_deadline=0
             if [[ "$mergeable" != "MERGEABLE" ]]; then
               echo "Release PR #$number is not mergeable (mergeable=$mergeable, mergeStateStatus=$merge_state); skipping."
               exit 0
@@ -487,6 +521,10 @@ jobs:
             fi
             if [[ "$gate" == "missing" ]]; then
               ci_pending "CI Gate has not reported on the current head yet" "$missing_deadline"
+              sleep 30; continue
+            fi
+            if [[ "$gate" == "running" ]]; then
+              ci_pending "CI Gate has not reported on the current head yet, but CI is still running"
               sleep 30; continue
             fi
             if [[ "$gate" != "success" ]]; then

@@ -87,7 +87,8 @@ class AutoCutTests(Fixture):
         workflow = (ROOT / '.github/workflows/auto-cut-alpha.yml').read_text()
         step = workflow.split('      - name: Merge the Release PR when green\n', 1)[1]
         script = textwrap.dedent(step.split('        run: |\n', 1)[1])
-        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10)
+        # Hang guard only; the longest fixture makes ~40 mocked polls.
+        result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=60)
         self.state = json.loads(state_path.read_text())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
@@ -98,26 +99,53 @@ class AutoCutTests(Fixture):
         sleep.chmod(0o755)
 
     def reset(self):
-        # Fresh gh state and no-polling sleep for the next subtest, reusing
-        # the fixture repository.
+        # Fresh gh state, real clock and no-polling sleep for the next
+        # subtest, reusing the fixture repository.
         self.state = json.loads(json.dumps(self.initial_state))
+        (self.bin / 'date').unlink(missing_ok=True)
         self.forbid_polling()
 
     def finish_ci_after_polls(self, polls=1):
-        # Replace the no-polling sleep stub: each "sleep" records a poll and,
-        # after `polls` of them, turns the Release PR's CI Gate green.
+        # After `polls` sleeps, the Release PR's CI Gate turns green.
+        self.update_after_polls(polls, {'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}]})
+
+    def update_after_polls(self, polls, detail, seconds_per_poll=30, stages=None):
+        # Each "sleep" records a poll and advances the fake clock; after
+        # `polls` of them the Release PR detail takes the given values
+        # (`stages` maps several poll counts to successive updates).
+        stages = {str(k): v for k, v in (stages or {polls: detail}).items()}
         sleep = self.bin / 'sleep'
         sleep.write_text(f"""#!{sys.executable} -S
 import json, os, pathlib
 path = pathlib.Path(os.environ['MOCK_STATE'])
 s = json.loads(path.read_text())
 s['polls'] = s.get('polls', 0) + 1
-if s['polls'] >= {polls}:
-    s['detail']['mergeStateStatus'] = 'CLEAN'
-    s['detail']['statusCheckRollup'] = [{{'name': 'CI Gate', 'conclusion': 'SUCCESS'}}]
+update = json.loads({json.dumps(json.dumps(stages))}).get(str(s['polls']))
+if update:
+    s['detail'].update(update)
 path.write_text(json.dumps(s))
 """)
         sleep.chmod(0o755)
+        # `date +%s` returns real start time plus seconds_per_poll per poll,
+        # so wait budgets are exercised without real waiting; every other
+        # date call goes to the real binary.
+        real = shutil.which('date')
+        date = self.bin / 'date'
+        date.write_text(f"""#!{sys.executable} -S
+import json, os, pathlib, sys
+if sys.argv[1:] == ['+%s']:
+    s = json.loads(pathlib.Path(os.environ['MOCK_STATE']).read_text())
+    print(int(os.environ['FAKE_EPOCH']) + s.get('polls', 0) * {seconds_per_poll})
+else:
+    os.execv({real!r}, [{real!r}, *sys.argv[1:]])
+""")
+        date.chmod(0o755)
+        import time
+        self.env['FAKE_EPOCH'] = str(int(time.time()))
+
+    def tearDown(self):
+        (self.bin / 'date').unlink(missing_ok=True)
+        super().tearDown()
 
     def pending_ci(self):
         self.state['detail']['mergeStateStatus'] = 'BLOCKED'
@@ -223,9 +251,9 @@ path.write_text(json.dumps(s))
                 self.run_workflow(EVENT_NAME='schedule')
                 self.assertEqual(self.merge_calls(), [])
 
-    def test_held_draft_conflicted_behind_unknown_or_changes_requested_skips(self):
+    def test_held_draft_conflicted_behind_or_changes_requested_skips(self):
         original = json.loads(json.dumps(self.state))
-        for field, value in [('hold', True), ('isDraft', True), ('mergeable', 'CONFLICTING'), ('mergeable', 'UNKNOWN'), ('mergeStateStatus', 'BEHIND'), ('mergeStateStatus', 'BLOCKED'), ('reviewDecision', 'CHANGES_REQUESTED'), ('reviewDecision', 'REVIEW_REQUIRED'), ('baseRefName', 'other')]:
+        for field, value in [('hold', True), ('isDraft', True), ('mergeable', 'CONFLICTING'), ('mergeStateStatus', 'BEHIND'), ('mergeStateStatus', 'BLOCKED'), ('reviewDecision', 'CHANGES_REQUESTED'), ('reviewDecision', 'REVIEW_REQUIRED'), ('baseRefName', 'other')]:
             with self.subTest(field=field, value=value):
                 self.state = json.loads(json.dumps(original))
                 if field == 'hold':
@@ -234,6 +262,104 @@ path.write_text(json.dumps(s))
                     self.state['detail'][field] = value
                 self.run_workflow()
                 self.assertEqual(self.merge_calls(), [])
+
+    def test_unknown_mergeability_is_re_read_on_every_event(self):
+        # intentd#2493: scheduled runs skipped on the first UNKNOWN read even
+        # though GitHub recomputes mergeability within a minute.
+        for event in ('schedule', 'workflow_dispatch', 'push'):
+            with self.subTest(event=event):
+                self.reset()
+                self.state['detail']['mergeable'] = 'UNKNOWN'
+                self.update_after_polls(1, {'mergeable': 'MERGEABLE'})
+                output = self.run_workflow(EVENT_NAME=event)
+                self.assertEqual(self.state.get('polls'), 1)
+                self.assertEqual(len(self.merge_calls()), 1)
+                self.assertIn('mergeable=UNKNOWN) — re-reading in 30s.', output)
+
+    def test_persistent_unknown_mergeability_skips_after_bounded_reads(self):
+        self.state['detail']['mergeable'] = 'UNKNOWN'
+        self.update_after_polls(99, {})
+        output = self.run_workflow(EVENT_NAME='schedule')
+        self.assertEqual(self.state.get('polls'), 4)
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn('mergeable=UNKNOWN); skipping.', output)
+
+    def test_unknown_after_push_budget_still_gets_bounded_reads(self):
+        # The 07:39 shape from intentd#2493: a push run spends its 15-min
+        # refresh budget waiting for CI; CI then goes green while GitHub
+        # recomputes mergeability. That UNKNOWN must be re-read, not skipped.
+        self.pending_ci()
+        green = {'mergeStateStatus': 'CLEAN', 'mergeable': 'UNKNOWN',
+                 'statusCheckRollup': [{'name': 'CI Gate', 'conclusion': 'SUCCESS'}]}
+        self.update_after_polls(None, None, seconds_per_poll=8 * 60,
+                                stages={2: green, 3: {'mergeable': 'MERGEABLE'}})
+        output = self.run_workflow(EVENT_NAME='push')
+        self.assertEqual(self.state.get('polls'), 3)
+        self.assertEqual(len(self.merge_calls()), 1)
+        self.assertIn('mergeable=UNKNOWN) — re-reading in 30s.', output)
+
+    def test_missing_gate_beside_running_ci_gets_the_full_ci_budget(self):
+        # CI Gate needs every CI job, so it only appears once CI finishes.
+        # Three 400-second polls (20 min) outlast the 5-min missing grace;
+        # with CI visibly running they fit the 25-min CI budget, and the
+        # gate turns green on the third.
+        running = [{'name': 'check', 'workflowName': 'CI', 'status': 'IN_PROGRESS', 'conclusion': None},
+                   {'name': 'route', 'workflowName': 'CI', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = running
+        self.update_after_polls(3, {'mergeStateStatus': 'CLEAN', 'statusCheckRollup': [{'name': 'CI Gate', 'workflowName': 'CI', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]}, seconds_per_poll=400)
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 3)
+        self.assertEqual(len(self.merge_calls()), 1)
+        self.assertIn('but CI is still running', output)
+
+    def test_each_unknown_episode_gets_its_own_grace(self):
+        # An UNKNOWN right after the refresh must not use up the grace for
+        # the UNKNOWN that follows CI turning green after the push budget.
+        self.state['detail']['mergeable'] = 'UNKNOWN'
+        pending = {'mergeable': 'MERGEABLE', 'mergeStateStatus': 'BLOCKED',
+                   'statusCheckRollup': [{'name': 'check', 'workflowName': 'CI', 'status': 'IN_PROGRESS', 'conclusion': None}]}
+        green = {'mergeable': 'UNKNOWN', 'mergeStateStatus': 'CLEAN',
+                 'statusCheckRollup': [{'name': 'CI Gate', 'workflowName': 'CI', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'}]}
+        self.update_after_polls(None, None, stages={4: pending, 40: green, 42: {'mergeable': 'MERGEABLE'}})
+        self.run_workflow(EVENT_NAME='push')
+        self.assertEqual(self.state.get('polls'), 42)
+        self.assertEqual(len(self.merge_calls()), 1)
+
+    def test_missing_gate_beside_a_failed_ci_job_keeps_the_short_grace(self):
+        # A failed CI job dooms the gate; do not hold the run for 25 min.
+        doomed = [{'name': 'check', 'workflowName': 'CI', 'status': 'COMPLETED', 'conclusion': 'FAILURE'},
+                  {'name': 'coverage-changed', 'workflowName': 'CI', 'status': 'IN_PROGRESS', 'conclusion': None}]
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = doomed
+        self.update_after_polls(99, {}, seconds_per_poll=400)
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 1)
+        self.assertEqual(self.merge_calls(), [])
+        self.assertNotIn('but CI is still running', output)
+
+    def test_missing_gate_without_ci_activity_keeps_the_short_grace(self):
+        # Only finished CI jobs or other workflows: CI is not running, so the
+        # 5-min grace applies — one 400-second poll exhausts it.
+        idle = [{'name': 'route', 'workflowName': 'CI', 'status': 'COMPLETED', 'conclusion': 'SUCCESS'},
+                {'name': 'probe', 'workflowName': 'Release', 'status': 'IN_PROGRESS', 'conclusion': None}]
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = idle
+        self.update_after_polls(99, {}, seconds_per_poll=400)
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 1)
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn('CI Gate has not reported on the current head yet; CI wait budget exhausted', output)
+
+    def test_running_ci_wait_is_still_bounded(self):
+        running = [{'name': 'check', 'workflowName': 'CI', 'status': 'QUEUED', 'conclusion': None}]
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = running
+        self.update_after_polls(99, {}, seconds_per_poll=400)
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='25')
+        self.assertEqual(self.state.get('polls'), 4)
+        self.assertEqual(self.merge_calls(), [])
+        self.assertIn('CI wait budget exhausted', output)
 
     def test_untrusted_or_fork_pr_skips(self):
         for key, value in [('author', {'login': 'outsider'}), ('isCrossRepository', True), ('headRefName', 'ordinary')]:
