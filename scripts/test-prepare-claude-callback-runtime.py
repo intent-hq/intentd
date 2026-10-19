@@ -33,15 +33,15 @@ REAL_ARTIFACTS = None
 CANONICAL_FIXTURE = None
 
 
-def inert_env(home):
-    """A minimal child env that can still start sys.executable on self-hosted runners.
+# setup-python exports the interpreter's library directory through these;
+# its builds hard-code /opt/hostedtoolcache as their RUNPATH (intentd#2490).
+LOADER_PATH = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
 
-    setup-python's shared-lib builds find libpython through LD_LIBRARY_PATH when
-    the tool cache is not /opt/hostedtoolcache (intentd#2490).
-    """
+
+def inert_env(home, parent=os.environ):
+    """A minimal child env that can still start sys.executable on self-hosted runners."""
     env = {"PATH": "/usr/bin:/bin", "HOME": str(home)}
-    if "LD_LIBRARY_PATH" in os.environ:
-        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    env.update({name: parent[name] for name in LOADER_PATH if name in parent})
     return env
 
 
@@ -515,6 +515,11 @@ class OfflineTests(unittest.TestCase):
         with self.assertRaises(runtime.InvalidRuntime):
             runtime.remove(self.contract, self.install_root, self.contract.identity, True)
         self.assertTrue((held / "node/LICENSE").is_file())
+
+    def test_inert_env_forwards_only_the_loader_path(self):
+        self.assertEqual(inert_env(self.root, {"LD_LIBRARY_PATH": "/toolcache/lib", "GH_TOKEN": "x"}),
+                         {"PATH": "/usr/bin:/bin", "HOME": str(self.root), "LD_LIBRARY_PATH": "/toolcache/lib"})
+        self.assertEqual(inert_env(self.root, {}), {"PATH": "/usr/bin:/bin", "HOME": str(self.root)})
 
     def test_launcher_preserves_cwd_literal_argv_stdio_and_exit_inert_child_only(self):
         self.install()
