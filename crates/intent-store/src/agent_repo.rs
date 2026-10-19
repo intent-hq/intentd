@@ -340,7 +340,7 @@ pub(crate) fn unread_workspaces_batch_sql() -> String {
 
 /// One agent session's usage inputs for the workspace token-usage tally
 /// (§5.23): `(agent_id, model, snapshot, baseline, message_usage, cells, name)`,
-/// where `name` is the trimmed session display name (empty when unnamed).
+/// where `name` is the raw session display name.
 /// `message_usage` is non-empty only for sessions whose decoded snapshot and
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
@@ -500,13 +500,11 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        // Display name for `TokenUsage::agent_names` (§5.23), trimmed so a
-        // whitespace-only name reads as unnamed.
+        // Display name for `TokenUsage::agent_names` (§5.23); the services
+        // helper owns trimming and the empty-name rule.
         let name = session_row
             .get::<Option<String>, _>("name")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+            .unwrap_or_default();
 
         result.push((
             agent_id,

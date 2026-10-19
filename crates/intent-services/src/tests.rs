@@ -46142,26 +46142,79 @@ mod turn_token_usage {
     async fn token_usage_omits_blank_names_and_agents_without_usage_rows() {
         let h = harness().await;
         let blank = AgentId::new();
-        h.store
-            .insert_agent_session(&agent_session(&blank, &h.ws, "model-a"))
-            .await
-            .expect("insert session");
+        let idle = AgentId::new();
+        for agent in [&blank, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
         set_session_name(&h, &blank, "   ").await;
+        set_session_name(&h, &idle, "Idle helper").await;
         h.services
             .persist_turn_token_usage(&blank, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
             .await;
 
         let usage = stored_usage(&h).await;
         assert!(usage.by_agent_id.contains_key(&blank.0));
-        assert!(usage.agent_names.is_empty(), "blank name omitted");
+        assert!(
+            usage.by_agent_id.contains_key(&idle.0),
+            "the recompute seeds a bucket for the usage-less session"
+        );
+        assert!(
+            usage.agent_names.is_empty(),
+            "blank name and usage-less named session are both omitted: {:?}",
+            usage.agent_names
+        );
         let wire = serde_json::to_value(&usage).expect("serialize usage");
         assert!(
             wire.get("agentNames").is_none(),
             "empty map omitted from the wire"
         );
-        for key in usage.agent_names.keys() {
-            assert!(usage.by_agent_id.contains_key(key));
+    }
+
+    #[tokio::test]
+    async fn agent_rename_refreshes_token_usage_agent_names() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let idle = AgentId::new();
+        for id in [&agent, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(id, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
         }
+        set_session_name(&h, &agent, "Builder").await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+
+        let mut sub = subscribe_usage(&h);
+        h.services
+            .agent_rename_op(agent.clone(), "Release builder".into(), false)
+            .await
+            .expect("rename");
+        assert_eq!(
+            stored_usage(&h).await.agent_names[&agent.0],
+            "Release builder"
+        );
+        let event = recv_usage_event(&mut sub).await;
+        assert_eq!(
+            event["data"]["tokenUsage"]["agentNames"][&agent.0],
+            "Release builder"
+        );
+
+        let before = stored_usage(&h).await;
+        h.services
+            .agent_rename_op(idle.clone(), "Idle helper".into(), false)
+            .await
+            .expect("rename usage-less agent");
+        let after = stored_usage(&h).await;
+        assert_eq!(
+            after.last_scan_at, before.last_scan_at,
+            "renaming a usage-less agent writes nothing"
+        );
+        assert!(!after.agent_names.contains_key(&idle.0));
     }
 
     #[tokio::test]

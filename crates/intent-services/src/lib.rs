@@ -6571,6 +6571,41 @@ impl Services {
             .map_err(|error| Error::Internal(format!("token usage worker failed: {error}")))?
     }
 
+    /// Refresh the materialized `agentNames` (§5.23) after an agent rename.
+    /// A rename changes no `agent_message` rows, so neither the end-of-turn
+    /// update nor the watermark-gated reconciliation scan would pick it up.
+    /// Only recomputes when the stored snapshot already names a usage bucket
+    /// for this agent, so renaming a usage-less agent never materializes a
+    /// snapshot. Best-effort: the rename itself already landed.
+    pub(crate) async fn refresh_token_usage_after_rename(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let has_bucket = match self.store.get_workspace(workspace_id).await {
+            Ok(workspace) => workspace
+                .token_usage
+                .is_some_and(|usage| usage.by_agent_id.contains_key(&agent_id.0)),
+            Err(e) => {
+                tracing::warn!(workspace = %workspace_id.as_str(), error = %e, "read token usage before rename refresh failed");
+                return;
+            }
+        };
+        if !has_bucket {
+            return;
+        }
+        if let Err(e) = self
+            .recompute_workspace_token_usage(workspace_id, false)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace_id.as_str(),
+                error = %e,
+                "recompute workspace token usage after rename failed"
+            );
+        }
+    }
+
     async fn recompute_workspace_token_usage_owned(
         &self,
         workspace_id: &WorkspaceId,

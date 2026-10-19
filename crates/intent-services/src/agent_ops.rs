@@ -5549,6 +5549,8 @@ impl Services {
             json!({ "agentId": agent_id.0, "name": name }),
         )
         .await;
+        self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
+            .await;
         Ok(json!({ "success": true, "name": name }))
     }
 
@@ -6769,6 +6771,10 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
+        if obj.contains_key("name") {
+            self.refresh_token_usage_after_rename(&session.workspace_id, &agent_id)
+                .await;
+        }
         // `status` / `isBackground` / `notificationsMuted` feed the
         // needs_attention derivation (a deleted, background, or muted
         // session's pending request/question/error no longer counts):
