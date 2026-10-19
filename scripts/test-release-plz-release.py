@@ -14,16 +14,24 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = Path(os.environ.get("RELEASE_PLZ_TEST_RUNNER", ROOT / "scripts/release-plz-release.py"))
+# Dynamic-loader variables the interpreter itself may need to start: the
+# self-hosted runners' setup-python CPython finds libpython only through
+# LD_LIBRARY_PATH. They select shared libraries, not behavior, so the
+# otherwise minimal fixture env keeps them.
+LOADER_ENV = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH")
 QUOTA = 'Response body:\n' + json.dumps({
     "message": "API rate limit exceeded for user ID 526899.", "status": "403",
 }) + '\nCaused by:\n    HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/intent-hq/intentd/commits/abc/pulls)\n'
 
 
 class ReleaseTests(unittest.TestCase):
+    PYTHON = sys.executable
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="release-quota-test-")
         self.addCleanup(temp.cleanup)
@@ -39,9 +47,10 @@ class ReleaseTests(unittest.TestCase):
             "GITHUB_STEP_SUMMARY": str(self.summary),
             "GITHUB_OUTPUT": str(self.outputs),
             "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_ROOT": str(self.repo),
+            **{name: os.environ[name] for name in LOADER_ENV if name in os.environ},
         }
         stub = self.bin / "release-plz"
-        stub.write_text(f"#!{sys.executable} -S\n" + '''import json, os, pathlib, sys
+        stub.write_text(f"#!{self.PYTHON} -S\n" + '''import json, os, pathlib, sys
 root = pathlib.Path(os.environ["FIXTURE_ROOT"])
 with (root / "calls").open("a") as log:
     log.write(json.dumps(sys.argv[1:]) + "\\n")
@@ -55,16 +64,20 @@ sys.exit(fixture.get("exit", 0))
         stub.chmod(0o700)
         for name in ("gh", "cargo", "git", "curl", "sleep"):
             guard = self.bin / name
-            guard.write_text(f"#!{sys.executable} -S\nraise SystemExit('unexpected external command: {name}')\n")
+            guard.write_text(f"#!{self.PYTHON} -S\nraise SystemExit('unexpected external command: {name}')\n")
             guard.chmod(0o700)
 
     def invoke(self, **fixture):
         (self.repo / "fixture").write_text(json.dumps(fixture))
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", str(RUNNER)],
+            [self.PYTHON, "-I", "-S", "-B", str(RUNNER)],
             cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=10,
         )
-        self.calls = [json.loads(line) for line in (self.repo / "calls").read_text().splitlines()]
+        calls = self.repo / "calls"
+        if not calls.exists():
+            self.fail(f"the release runner never reached release-plz (exit {result.returncode}):\n"
+                      f"{result.stdout}{result.stderr}")
+        self.calls = [json.loads(line) for line in calls.read_text().splitlines()]
         self.assertEqual(self.calls[-1], ["release", "--git-token", self.env["GITHUB_TOKEN"], "--forge", "github", "-o", "json"])
         return result
 
@@ -200,6 +213,33 @@ sys.exit(fixture.get("exit", 0))
         self.assertIn("Release quota blocked", result.stderr)
         self.assertIn("Could not write release failure summary", result.stderr)
         self.assertIn("Could not write release failure output", result.stderr)
+
+
+class LoaderDependentInterpreterTests(ReleaseTests):
+    """Rerun every release scenario under an interpreter that, like setup-python's
+    toolcache CPython on the self-hosted runners, cannot start without its
+    dynamic-loader path. The fixture env is otherwise minimal, so a missing
+    pass-through made every scenario fail with no `calls` file (tinybox only)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        temp = tempfile.TemporaryDirectory(prefix="release-quota-loader-")
+        cls.addClassCleanup(temp.cleanup)
+        wrapper = Path(temp.name) / "python3"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            '[ -n "${LD_LIBRARY_PATH:-}" ] || { echo "error while loading shared libraries: libpython: cannot open shared object file" >&2; exit 127; }\n'
+            f'exec "{sys.executable}" "$@"\n'
+        )
+        wrapper.chmod(0o700)
+        cls.PYTHON = str(wrapper)
+
+    def setUp(self):
+        patcher = unittest.mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH") or "/fixture-loader-path"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
 
 
 class WorkflowTests(unittest.TestCase):
