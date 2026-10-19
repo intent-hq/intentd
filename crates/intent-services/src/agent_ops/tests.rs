@@ -11152,10 +11152,10 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
 
 /// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRJ` on PR #104):
 /// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
-/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
-/// workspace must NOT leak the foreign note's title/content into the TASK-C
-/// preamble injected as the child's first message; the preamble is skipped and
-/// the message falls back to the caller-supplied `agentInstructions`.
+/// is workspace-scoped. A `taskNoteId` that belongs to another workspace is
+/// "not found" from this workspace's point of view, so the delegation is
+/// rejected (intent-hq/intent#7120) before any child is created — and the
+/// rejection must not leak the foreign note's title/content.
 #[intent_test_macros::daemon_test]
 async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     let (_t, svc, ws_a) = setup().await;
@@ -11186,28 +11186,82 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
         agent_instructions: Some("do the work".into()),
         ..Default::default()
     };
-    let resp = svc
+    let err = svc
         .agent_delegate_op(ws_a.clone(), input, None)
         .await
-        .expect("delegate");
-    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("a task note from another workspace must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "out-of-workspace taskNoteId rejects with -32602: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("CROSS-WORKSPACE-SECRET"),
+        "the rejection must not leak the foreign note: {msg}"
+    );
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws_a)
+        .await
+        .expect("list ws_a sessions");
+    assert!(
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
+    );
+}
 
-    let body = child_session_messages_json(&svc, &child).await;
+/// intent-hq/intent#7120: `agent.delegate` with a `taskNoteId` (or `noteId`)
+/// that does not exist must fail with `-32602` and create no agent, instead
+/// of returning `ok` and spawning an idle child bound to the missing id.
+#[intent_test_macros::daemon_test]
+async fn delegate_nonexistent_task_note_id_is_rejected_without_spawning() {
+    let (_t, svc, ws) = setup().await;
+
+    for input in [
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            agent_instructions: Some("do the work".into()),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            note_id: Some(intent_core::NoteId::from("no-such-note-456")),
+            task_text: Some("tick the box".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = svc
+            .agent_delegate_op(ws.clone(), input.clone(), None)
+            .await
+            .expect_err("a nonexistent task note must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "nonexistent note id rejects with -32602: {err:?}"
+        );
+        let missing = input
+            .task_note_id
+            .as_ref()
+            .or(input.note_id.as_ref())
+            .expect("id")
+            .0
+            .clone();
+        assert!(
+            err.to_string().contains(&missing),
+            "the rejection names the missing id: {err}"
+        );
+    }
+
+    let sessions = svc
+        .store()
+        .list_agent_sessions(&ws)
+        .await
+        .expect("list sessions");
     assert!(
-        body.contains("do the work"),
-        "explicit instructions must still reach the child: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
-        "foreign note title must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
-        "foreign note body must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("**Your Task Note:**"),
-        "preamble must be skipped when the linked note is out of workspace: {body}"
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
     );
 }
 

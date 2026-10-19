@@ -10769,10 +10769,24 @@ impl Services {
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
         // child's first message when a task is linked.
+        //
+        // A named note that does not exist in THIS workspace (a typo, a stale
+        // id, or another workspace's note — `fetch_note` is workspace-scoped)
+        // rejects with `-32602` here, before any side effect, so the caller
+        // gets an error instead of an idle child bound to a missing note
+        // (intent-hq/intent#7120). The message deliberately names only the
+        // caller-supplied id, never the foreign note's content.
         let task_note = match session_task_note_id.as_ref() {
-            Some(note_id) => crate::fetch_note(&self.store, &workspace_id, note_id)
-                .await
-                .ok(),
+            Some(note_id) => match crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                Ok(note) => Some(note),
+                Err(Error::NotFound(_)) => {
+                    return Err(Error::InvalidParams(format!(
+                        "agent.delegate: task note not found in this workspace: {}",
+                        note_id.0
+                    )));
+                }
+                Err(e) => return Err(e),
+            },
             None => None,
         };
         if message.is_none() {
