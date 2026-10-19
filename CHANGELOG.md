@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.12] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agents)* Declassify all-idle completion-watch cycles of any length ([#2509](https://github.com/intent-hq/intentd/pull/2509))
+- Match visible text around comment anchors in note.edit ([#2507](https://github.com/intent-hq/intentd/pull/2507))
+
+
 ## [0.11.11] - 2026-10-19
 
 ### 🐛 Bug Fixes
