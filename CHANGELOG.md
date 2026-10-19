@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.10] - 2026-10-19
+
+### 📚 Documentation
+
+- *(app-guide)* Remembered agent setup per repository ([#2498](https://github.com/intent-hq/intentd/pull/2498))
+
+
 ## [0.11.9] - 2026-10-19
 
 ### 🚀 Features
