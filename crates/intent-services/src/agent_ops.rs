@@ -6852,17 +6852,13 @@ impl Services {
                     remember_specialist && is_manual_foreground_agent(&session),
                     obj.contains_key("notificationsMuted")
                         .then_some(session.notifications_muted),
+                    // An explicit effort choice — even the level an
+                    // Auto-pinned session already carries — clears the Auto
+                    // pin in this same write, so the next model switch keeps
+                    // it and no concurrent setModel can slip in between.
+                    obj.contains_key("reasoningEffort"),
                 )
                 .await?;
-            // An explicit effort choice — even the level an Auto-pinned
-            // session already carries — clears the Auto pin, so the next
-            // model switch keeps it (the row write above keeps the mark on a
-            // same-value rewrite).
-            if obj.contains_key("reasoningEffort") {
-                self.store
-                    .clear_agent_session_effort_auto(&workspace_id, &agent_id)
-                    .await?;
-            }
         }
         // Mute-only requests retain their narrow write without advancing
         // activity. Mixed requests apply an explicit mute patch in the session

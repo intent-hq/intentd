@@ -2828,13 +2828,19 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, false)
             .await
     }
 
     /// Atomically update a session, optional manual specialist memory, and an
     /// explicitly requested notification-mute patch. Ordinary row writes omit
     /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
+    /// choice: the same UPDATE clears the Auto-pin mark
+    /// (`reasoning_effort_auto`) even when the value is unchanged, so no
+    /// concurrent `agent.setModel` can slip between the value and the mark.
+    /// Otherwise an unchanged value keeps the mark and a changed one clears
+    /// it.
     ///
     /// # Errors
     /// Returns an error if validation or either write fails.
@@ -2844,6 +2850,7 @@ impl Store {
         s: &AgentSession,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        explicit_effort: bool,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Lightweight invariant check: read only workspace_id, model,
@@ -2947,7 +2954,7 @@ impl Store {
                  THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
              stop_reason=?, stop_reason_timestamp=?, \
-             reasoning_effort_auto=CASE WHEN reasoning_effort IS ? \
+             reasoning_effort_auto=CASE WHEN ? THEN 0 WHEN reasoning_effort IS ? \
                  THEN reasoning_effort_auto ELSE 0 END, \
              reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
@@ -2981,8 +2988,9 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
-        // Any effort change (an explicit choice) clears the daemon's
-        // Auto-pin flag; rewriting the same value keeps it.
+        // An explicit effort write, or any effort change, clears the daemon's
+        // Auto-pin flag; an unrelated rewrite of the same value keeps it.
+        .bind(explicit_effort)
         .bind(&s.reasoning_effort)
         .bind(&s.reasoning_effort)
         .bind(&s.id.0)
@@ -3343,33 +3351,6 @@ impl Store {
         .rows_affected();
         lifecycle.settle_after_retirement().await?;
         Ok(rows > 0)
-    }
-
-    /// Clear the Auto-pin mark (`reasoning_effort_auto`) after an explicit
-    /// effort choice. Written separately because choosing the level the
-    /// session already carries is still a choice: `update_agent_session`
-    /// keeps the mark on a same-value rewrite (an unrelated row update), so
-    /// the explicit-effort path calls this to make the choice survive the
-    /// next model switch.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
-    pub async fn clear_agent_session_effort_auto(
-        &self,
-        workspace_id: &WorkspaceId,
-        id: &AgentId,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_session SET reasoning_effort_auto=0 \
-             WHERE id=? AND workspace_id=? AND reasoning_effort_auto<>0",
-        )
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("clear effort auto mark failed: {e}")))?;
-        Ok(())
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -13745,11 +13726,26 @@ mod tests {
             }
         };
         assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
+        let mut row = store.get_agent_session(&agent_id).await.unwrap();
         store
-            .clear_agent_session_effort_auto(&ws_id, &agent_id)
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, false)
             .await
             .unwrap();
-        assert_eq!(auto(&store).await, 0, "an explicit choice clears the mark");
+        assert_eq!(
+            auto(&store).await,
+            1,
+            "an unrelated same-value rewrite keeps the mark"
+        );
+        row.reasoning_effort = Some("low".into());
+        store
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            auto(&store).await,
+            0,
+            "an explicit same-value choice clears the mark in the same write"
+        );
     }
 
     /// `pin_agent_session_provider_if_null` only lands on a NULL/blank
