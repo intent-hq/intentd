@@ -157,11 +157,14 @@ whose provider is disabled. Intent never switches them to another account.
 
 The iOS update allowing model changes in conversations with existing messages is
 not released yet. In builds with this update, open a workspace agent or Assistant
-chat's **…** menu and tap the current model name. Choices come from the agent's
-provider, or the host's default provider when the chat inherits it. A successful
-change applies to the next turn and preserves the conversation and draft. If the
-list is unavailable or empty, use **Retry**. If saving fails, the picker stays open
-and shows an error so the user can try again.
+chat's **…** menu and tap the current model name. The sheet uses the same
+**Provider**, **Model**, and **Reasoning** controls as Create Workspace. It starts
+with the chat's current choices, including its inherited host provider. Select
+**Provider default** or an explicit model, then tap **Save**. Changing provider
+resets Model to Provider default and Reasoning to Auto. Changes apply to the next
+turn and preserve the conversation and draft; **Cancel** discards unsaved choices.
+Use **Retry** if a list is unavailable. Save errors keep the sheet open; if only
+reasoning fails, the message explains that provider and model were saved.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
