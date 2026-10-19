@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.14] - 2026-10-19
+
+### 🚀 Features
+
+- *(provider-profiles)* Expand ~ in account dirs and per-profile fast mode ([#2518](https://github.com/intent-hq/intentd/pull/2518))
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts for client hello and note writes ([#2512](https://github.com/intent-hq/intentd/pull/2512))
+
+
 ## [0.11.13] - 2026-10-19
 
 ### 🚀 Features
