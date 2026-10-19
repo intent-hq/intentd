@@ -32,7 +32,8 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 const ADDRESSED: &str = "DISCUSSION_ADDRESSED_E2E";
 const ORDINARY: &str = "DISCUSSION_ORDINARY_E2E";
 const PROBE: &str = "DISCUSSION_UNADDRESSED_PROBE";
-const REPLY: &str = "Explicit agent discussion reply";
+const REPLY: &str = "DISCUSSION_AGENT_RELAY_E2E";
+const RELAY_REPLY: &str = "Plain reply to the first agent without addressing it";
 
 /// Live `intentd serve` process; killed (whole process group) on drop, with
 /// the daemon log echoed for post-mortems.
@@ -392,15 +393,18 @@ where
     response["result"].clone()
 }
 
-async fn completed_turn(sub: &mut common::TlsWs, agent: &str) -> Vec<Value> {
+async fn completed_turns(sub: &mut common::TlsWs, agents: &[&str]) -> Vec<Value> {
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         let mut events = Vec::new();
+        let mut remaining = agents.to_vec();
         loop {
             let frame = wss_event_opt(sub, 30).await.expect("agent turn event");
             let event = frame["params"]["event"].clone();
-            let finished = event["type"] == "agent:stream:end" && event["data"]["agentId"] == agent;
+            if event["type"] == "agent:stream:end" {
+                remaining.retain(|agent| event["data"]["agentId"] != *agent);
+            }
             events.push(event);
-            if finished {
+            if remaining.is_empty() {
                 return events;
             }
         }
@@ -460,13 +464,26 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         const page = await ws.discussion.list('default', {{ limit: 1 }});
         const addressed = page.messages[0];
         const older = await ws.discussion.list('default', {{ beforeSequence: addressed.sequence, limit: 1 }});
+        const relay = (await ws.agent.list(true)).find(agent => agent.name === 'Relay agent');
+        if (!relay) throw new Error('Relay agent missing');
         const reply = await ws.discussion.send('default', {reply}, {{
-            messageId: 'agent-reply', replyToMessageId: addressed.id,
+            messageId: 'agent-reply', replyToMessageId: addressed.id, recipientAgentIds: [relay.id],
             author: {{ principalId: 'forged-human', agentId: 'forged-agent', displayName: 'Forged' }}
         }});
         return {{ page, older, reply }};
     "#,
         reply = json!(REPLY)
+    );
+    let relay_history_and_reply = format!(
+        r#"
+        const page = await ws.discussion.list('default', {{ limit: 1 }});
+        const addressed = page.messages[0];
+        const reply = await ws.discussion.send('default', {reply}, {{
+            messageId: 'relay-reply', replyToMessageId: addressed.id
+        }});
+        return {{ page, reply }};
+    "#,
+        reply = json!(RELAY_REPLY)
     );
     let denied_probe = r#"
         const out = {};
@@ -482,6 +499,9 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
             {"ifPromptContains": PROBE, "toolCall": {"name":"workspace_api",
                 "arguments":{"code":denied_probe,"summary":"Check unaddressed discussion access"}},
                 "response":"Unaddressed access checked", "emitToolBlocks":true},
+            {"ifPromptContains": REPLY, "toolCall":{"name":"workspace_api",
+                "arguments":{"code":relay_history_and_reply,"summary":"Reply to an agent without addressing it"}},
+                "response":"Relay final response stays outside discussion", "emitToolBlocks":true},
             {"ifPromptContains": ADDRESSED, "toolCall":{"name":"workspace_api",
                 "arguments":{"code":history_and_reply,"summary":"Read addressed chat and explicitly reply"}},
                 "response":"This final response must not be posted to the discussion", "emitToolBlocks":true}
@@ -547,7 +567,20 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         .expect("observer agent id")
         .to_owned();
 
-    // Neither agent has been addressed: a human message alone does not run ACP.
+    let relay = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.create",
+        json!({
+            "workspaceId":workspace,"name":"Relay agent","provider":"mock","model":"default"
+        }),
+    )
+    .await["agent"]["id"]
+        .as_str()
+        .expect("relay agent id")
+        .to_owned();
+
+    // None of the agents has been addressed: human traffic alone does not run ACP.
     let ordinary = wss_rpc(
         &mut rpc,
         4,
@@ -574,7 +607,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         }),
     )
     .await;
-    completed_turn(&mut sub, &observer).await;
+    completed_turns(&mut sub, &[&observer]).await;
     let observer_history = wss_rpc(
         &mut rpc,
         6,
@@ -657,7 +690,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     assert_eq!(sent["message"]["recipientAgentIds"], json!([target]));
     assert!(sent["message"]["author"]["principalId"].is_string());
     assert!(sent["message"]["author"].get("agentId").is_none());
-    let events = completed_turn(&mut sub, &target).await;
+    let events = completed_turns(&mut sub, &[&target, &relay]).await;
     assert_discussion_event(&events, &sent["message"]);
     assert!(
         !events
@@ -687,6 +720,7 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     assert_eq!(output["older"]["hasMore"], false);
     let reply = &output["reply"]["message"];
     assert_eq!(reply["body"], REPLY);
+    assert_eq!(reply["recipientAgentIds"], json!([relay]));
     assert_eq!(reply["author"]["agentId"], target);
     assert!(reply["author"]["principalId"].is_null());
     assert_eq!(reply["author"]["displayName"], "Addressed agent");
@@ -704,11 +738,57 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         user_rows[0]["metadata"]["discussionMessageId"],
         sent["message"]["id"]
     );
+    let relay_history = wss_rpc(
+        &mut rpc,
+        31,
+        "agent.getConversation",
+        json!({
+            "workspaceId":workspace,"agentId":relay
+        }),
+    )
+    .await;
+    let relay_output = tool_result_jsons(&relay_history["messages"])
+        .into_iter()
+        .find(|value| value.get("reply").is_some())
+        .unwrap_or_else(|| panic!("agent-addressed relay did not read and reply: {relay_history}"));
+    assert_eq!(
+        relay_output["page"]["messages"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(relay_output["page"]["messages"][0]["id"], reply["id"]);
+    let plain_reply = &relay_output["reply"]["message"];
+    assert_eq!(plain_reply["body"], RELAY_REPLY);
+    assert_eq!(plain_reply["author"]["agentId"], relay);
+    assert!(plain_reply["author"]["principalId"].is_null());
+    assert_eq!(plain_reply["replyToMessageId"], reply["id"]);
+    assert_eq!(plain_reply["recipientAgentIds"], json!([]));
+    assert_discussion_event(&events, plain_reply);
+    let relay_rows: Vec<_> = relay_history["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["role"] == "user")
+        .collect();
+    assert_eq!(
+        relay_rows.len(),
+        1,
+        "one agent-to-agent delivery: {relay_history}"
+    );
+    assert_eq!(
+        relay_rows[0]["metadata"]["discussionMessageId"],
+        reply["id"]
+    );
+    assert_eq!(relay_rows[0]["metadata"]["fromAgentId"], target);
+    for agent in [&target, &relay] {
+        assert_eq!(events.iter().filter(|event| event["type"] == "agent:stream:start"
+            && event["data"]["agentId"] == *agent).count(), 1,
+            "each explicitly addressed agent runs once; plain replyTo never wakes its author: {events:?}");
+    }
     let prompts = prompt_log(&log);
     assert_eq!(
         prompts.len(),
-        2,
-        "one probe and one addressed turn: {prompts:?}"
+        3,
+        "one probe and two explicitly addressed turns: {prompts:?}"
     );
     let addressed_prompt = prompts
         .iter()
@@ -735,10 +815,10 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     );
     assert_eq!(
         prompt_log(&log).len(),
-        2,
-        "delivered retry or ordinary reply woke an agent"
+        3,
+        "delivered retry or plain replyTo woke an agent"
     );
-    for agent in [&target, &observer] {
+    for agent in [&target, &relay, &observer] {
         let queue = wss_rpc(
             &mut rpc,
             13,
@@ -760,9 +840,13 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         json!({"workspaceId":workspace}),
     )
     .await;
-    assert_eq!(history["messages"].as_array().unwrap().len(), 3,
-        "only human ordinary/addressed messages and the explicit reply belong in discussion: {history}");
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        4,
+        "only two human messages and two explicit agent posts belong in discussion: {history}"
+    );
     assert_eq!(history["messages"][2]["id"], reply["id"]);
+    assert_eq!(history["messages"][3]["id"], plain_reply["id"]);
     rpc.close(None).await.expect("close RPC socket");
     sub.close(None).await.expect("close event socket");
 }
