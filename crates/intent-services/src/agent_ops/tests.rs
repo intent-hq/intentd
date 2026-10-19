@@ -17897,6 +17897,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect("plan while auggie is enabled and authenticated");
@@ -17922,6 +17923,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect_err("the demotion must reject a fresh plan");
@@ -32874,7 +32876,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
 
 use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
 
-async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+pub(super) async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
     let note = svc
         .create_note(
             ws.clone(),
