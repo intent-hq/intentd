@@ -213,6 +213,10 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
+      # Allowlisted subprocess envs must keep setup-python's interpreter
+      # startable on self-hosted tool caches (intentd#2488).
+      - name: Check subprocess env policy
+        run: python3 -I -B scripts/test-subprocess-env-policy.py
       - name: Resolve formatting toolchain
         id: rust
         run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
@@ -1998,6 +2002,7 @@ jobs:
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+          python3 -I -B scripts/test-subprocess-env-policy.py
       - name: Test obsolete merge-run policy and workflow integration (offline)
         run: |
           python3 -I -B scripts/test-retire-obsolete-merge-runs.py

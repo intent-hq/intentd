@@ -900,6 +900,7 @@ class NativeRoutingTests(unittest.TestCase):
         commands = "\n".join(step.get("run", "") for step in job["steps"])
         self.assertIn("cargo fmt --all -- --check", commands)
         self.assertIn("python3 -I -B scripts/test-ci-native-routing.py", commands)
+        self.assertIn("python3 -I -B scripts/test-subprocess-env-policy.py", commands)
         self.assertNotRegex(commands, r"cargo (build|check|clippy|test|nextest|llvm-cov)|pnpm install|npm install")
 
     def changed_test_base_step(self):
