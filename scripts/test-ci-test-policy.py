@@ -24,7 +24,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "build", "windows", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
@@ -147,8 +147,9 @@ REQUIRED_TEST_STEPS = {
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"): None,
-    ("build", "Headless workspace setup (Windows runtime)"): 2,
-    ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
+    # Post-merge only (push); see the `windows` job.
+    ("windows", "Headless workspace setup (Windows runtime)"): 2,
+    ("windows", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("macos-services-runtime", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,

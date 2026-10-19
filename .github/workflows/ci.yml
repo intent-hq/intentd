@@ -1,12 +1,15 @@
 name: CI
 on:
-  # Push-to-main runs only the release build matrix (+ route, which places
-  # its Windows entry, + deb-packaging + gate). The main ruleset routes
-  # every merge through the merge queue (see `merge_group` below) and
-  # blocks direct pushes, so every main commit's tree is identical to one a
-  # merge-queue (or, pre-queue, strict-up-to-date PR) run just tested — the
-  # test jobs (check/coverage-e2e/coverage-all) are push-skipped via their
-  # `if`s (CI audit, 2026-08).
+  # Push-to-main runs the macOS release build, packaging and runtime
+  # checks, and ALL Windows validation (the `windows` job, install-ps1 and the
+  # Windows pi-session-paths legs). Windows never runs on pull_request or
+  # merge_group: it is post-merge only, and a red or unfinished push CI Gate
+  # on the main tip blocks the next alpha cut (auto-cut-alpha.yml checks it
+  # before merging the Release PR). The main ruleset routes every merge
+  # through the merge queue (see `merge_group` below) and blocks direct
+  # pushes, so every main commit's tree is identical to one a merge-queue run
+  # just tested — the Linux/macOS test jobs (check/coverage-e2e/coverage-all)
+  # are push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
   # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
@@ -19,8 +22,9 @@ on:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
   # checks plus the Linux `check` job (clippy, source lints) and
   # `coverage-changed` (the PR's changed tests). The queue reruns both and
-  # adds runtime/platform matrices and full instrumented coverage on the
-  # merged tree; CI Gate enforces each tier.
+  # adds the Linux/macOS runtime matrices and full instrumented coverage on
+  # the merged tree (no Windows — see `push` above); CI Gate enforces each
+  # tier.
   merge_group:
 
 permissions:
@@ -505,17 +509,17 @@ jobs:
           echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
 
   build:
-    # Native Rust validation runs once on the queue's merged tree; main
-    # pushes retain release builds. The explicit event allowlist prevents
-    # matrix expansion for all PRs, including forks and release-shaped PRs.
+    # Native macOS Rust validation runs once on the queue's merged tree; main
+    # pushes retain the release build. Windows lives in the push-only
+    # `windows` job below. The explicit event allowlist prevents matrix
+    # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
-    # dependencies: release metadata is PR-only, and each native OS has a hosted
-    # fallback when routing fails. CI Gate still rejects skipped Linux
+    # dependencies: release metadata is PR-only, and the native runner has a
+    # hosted fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
-    # `route` places the native entries (Windows: intent-hq/intent#5518; see the
-    # matrix) and runs on every event this job runs on. route runs on
-    # ubuntu-24.04, so this dependency can never queue behind the
-    # self-hosted runners it decides about.
+    # `route` places the native entry and runs on every event this job runs
+    # on. route runs on ubuntu-24.04, so this dependency can never queue
+    # behind the self-hosted runners it decides about.
     needs: [release-fast-path, route]
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
     strategy:
@@ -532,20 +536,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
             name: build (aarch64-apple-darwin)
-          # Routed by the route job (intent-hq/intent#5518): the self-hosted
-          # 5090pc runner when the probe confirms it online, the org-hosted
-          # gh-windows-16x runner otherwise (fail-open to burst, like the
-          # Linux jobs — an offline 5090pc used to leave this required check
-          # QUEUED forever and block every merge: intent-hq/intent#1382,
-          # #1583). The self-hosted labels are selected ONLY when route
-          # positively emitted them: an empty output — route failed, timed
-          # out, or was skipped (`!cancelled()` still runs this job) — falls
-          # back to the burst label, never to a runner nothing confirmed
-          # online. (The fallback also keeps `fromJSON('')` from failing the
-          # matrix expansion.) Retain the name below for check history.
-          - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
-            name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -563,14 +553,6 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
-      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
-      # runner's Windows-path step scripts. Prepend Git's bin dir so every
-      # later `shell: bash` step resolves Git Bash instead.
-      - name: Put Git Bash first on PATH (Windows)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
-        shell: cmd
-        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Configure the self-hosted compiler cache
         if: needs.release-fast-path.outputs.fast_path != 'true'
         shell: bash
@@ -581,15 +563,11 @@ jobs:
         run: python3 scripts/setup-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
-      # self-hosted macOS and Windows runners are single-slot, so no $RUNNER_NAME key. On the
-      # Windows runner this runs under Git Bash, where $HOME is an MSYS-style
-      # path cargo (spawned from the default pwsh shell) can't use —
-      # $USERPROFILE carries the native C:\Users\... form, so prefer it when
-      # set.
+      # self-hosted macOS runner is single-slot, so no $RUNNER_NAME key.
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
         if: needs.release-fast-path.outputs.fast_path != 'true' && contains(matrix.os, 'self-hosted')
         shell: bash
-        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       # Run before toolchain/build steps. Only known CI profiles are eligible;
       # Cargo locks remain held and their inodes survive every deletion.
       - name: Ensure macOS CI disk headroom
@@ -607,8 +585,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-          # clippy is needed by the target-gated lint step below, which runs
-          # on both the macOS and the Windows matrix entries.
+          # clippy is needed by the target-gated lint step below.
           components: clippy
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
@@ -622,20 +599,17 @@ jobs:
       - name: Check (native production configuration)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo check --workspace --target ${{ matrix.target }}
-      # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
-      # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
-      # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
-      # `#[cfg(not(unix))]` code is never compiled, so warnings in
-      # target-only code (including outer `#[allow]`s that only expand there
-      # and trip `clippy::allow_attributes`) land silently and break
-      # `make check` on every macOS or Windows dev box. Linting here (same
-      # invocation as the check job) closes the gap. It runs on
-      # merge-queue runs, not on push: the queue tests the actual merged
-      # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
-      # own PR run) land a Windows-only E0433 via the queue — main's push
-      # run skipped the step, so ~8 open PRs failed the required gate until
-      # intent-hq/intentd#1835 fixed it. Main's push run builds a tree the
-      # queue already linted, so it stays skipped there. It runs on the
+      # Clippy over target-gated code (intent-hq/monorepo#3285): the `check`
+      # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
+      # compiled, so warnings in target-only code (including outer
+      # `#[allow]`s that only expand there and trip
+      # `clippy::allow_attributes`) land silently and break `make check` on
+      # every macOS dev box. Linting here (same invocation as the check job)
+      # closes the gap. It runs on merge-queue runs, not on push: the queue
+      # tests the actual merged tree, and main's push run builds a tree the
+      # queue already linted. (The Windows equivalent runs post-merge in the
+      # `windows` job, so a Windows-only lint or compile error reaches main
+      # and holds the next alpha until fixed.) It runs on the
       # native runners rather than as Linux cross-target runs because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
@@ -645,7 +619,7 @@ jobs:
       # is pull_request-only, so its output is empty on merge_group and the
       # `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && (runner.os == 'macOS' || runner.os == 'Windows')
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       # Exercise the deterministic deadline oracle and real TLS controls on
       # macOS; listen backlog saturation cannot guarantee a pending connect.
@@ -739,12 +713,97 @@ jobs:
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
+      - name: Build (release)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Warm merge queue check cache
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo check --workspace --target ${{ matrix.target }}
+
+  # ALL Windows validation, post-merge only: native production check,
+  # target-gated Clippy, the Windows runtime proofs, the daemon lifecycle
+  # proof and the release build run on push to main — never on pull_request
+  # or merge_group, so PRs and the queue never wait on a Windows runner. A
+  # Windows-only failure therefore lands on main; the push CI Gate goes red
+  # and auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
+  # turns it green. Clippy here closes the target-gated lint gap the Linux
+  # `check` job cannot see (`#[cfg(windows)]` / `#[cfg(not(unix))]` code,
+  # intent-hq/intentd#1813, #1825 → #1835).
+  # Routed by the route job (intent-hq/intent#5518): the self-hosted 5090pc
+  # runner when the probe confirms it idle, the org-hosted
+  # gh-windows-16x runner otherwise. The self-hosted labels are
+  # selected ONLY when route positively emitted them: an empty output —
+  # route failed, timed out, or was skipped (`!cancelled()` still runs this
+  # job) — falls back to the hosted label, never to a runner nothing
+  # confirmed online (intent-hq/intent#1382, #1583). The single-entry matrix
+  # keeps `matrix.target` / `matrix.os` shared with the `build` job's steps.
+  windows:
+    needs: [route]
+    if: ${{ !cancelled() && github.event_name == 'push' }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+    name: Windows post-merge (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Check + Clippy + runtime proofs + lifecycle proof + release build share
+    # one warm target dir; budgeted as the sum of the former queue (60) and
+    # push (60) Windows jobs.
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
+      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
+      # runner's Windows-path step scripts. Prepend Git's bin dir so every
+      # later `shell: bash` step resolves Git Bash instead.
+      - name: Put Git Bash first on PATH (Windows)
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # Persistent target dir outside the work dir on the single-slot
+      # self-hosted runner (see the `check` job's comment). Under Git Bash
+      # $HOME is an MSYS-style path cargo (spawned from the default pwsh
+      # shell) can't use — $USERPROFILE carries the native C:\Users\... form.
+      # windows-ci-cleanup.py prunes this directory.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      # Non-test production configuration; see the `build` job's comment on
+      # why --all-targets Clippy cannot replace it.
+      - name: Check (native production configuration)
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Clippy (target-gated code)
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - uses: actions/setup-node@v7
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         with:
           node-version: 24
       - name: Headless workspace setup (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         timeout-minutes: 20
         shell: bash
         env:
@@ -755,7 +814,7 @@ jobs:
           rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
           rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
       - uses: actions/upload-artifact@v7
-        if: always() && needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
+        if: always()
         with:
           name: setup-headless-windows
           path: setup-headless-evidence
@@ -763,7 +822,6 @@ jobs:
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -778,12 +836,13 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+      # The Windows leg of `daemon-lifecycle` (which keeps Linux and macOS in
+      # the queue). Its Clippy is covered by the workspace Clippy above.
+      - name: Native lifecycle runtime proof (Windows)
+        shell: bash
+        run: python3 -I -B scripts/test-daemon-lifecycle.py
       - name: Build (release)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
-      - name: Warm merge queue check cache
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
-        run: cargo check --workspace --target ${{ matrix.target }}
 
   # Services test code generation must not share the native check/Clippy
   # budget: a cold macOS queue run reached discovery compilation with only
@@ -1722,8 +1781,8 @@ jobs:
   # here — the register block self-skips off Windows, so a skip on this job
   # means the module went missing, and the step fails on it.
   install-ps1:
-    # Runs after queueing and on main pushes.
-    if: github.event_name == 'merge_group' || github.event_name == 'push'
+    # Windows-only, so post-merge only (see the `windows` job).
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -1782,13 +1841,15 @@ jobs:
   # Exercise the shipping Pi ACP package through real session/new, prompt and
   # session/load traffic. CMD quoting needs native Windows, not compilation or
   # Linux platform simulation. Both platforms also cover extension forwarding.
-  # The shipping-pin matrix is strict and required by CI Gate.
+  # The shipping-pin matrix is strict and required by CI Gate. Linux runs in
+  # the queue and on push; the Windows legs run post-merge only (see the
+  # `windows` job).
   pi-session-paths:
     if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-24.04", "windows-2025"]' || '["ubuntu-24.04"]') }}
         node: [22, 24]
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
@@ -1848,6 +1909,8 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
+  # Linux and macOS in the queue; the Windows lifecycle proof runs
+  # post-merge in the `windows` job.
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
     needs: route
@@ -1860,8 +1923,6 @@ jobs:
             os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
           - platform: macos
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
-          - platform: windows
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -1873,14 +1934,6 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
-      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
-      # runner's Windows-path step scripts. Prepend Git's bin dir so every
-      # later `shell: bash` step resolves Git Bash instead.
-      - name: Put Git Bash first on PATH (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Configure the self-hosted compiler cache
         shell: bash
         env:
@@ -1888,12 +1941,11 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # These runners have one slot. Prefer the native Windows home path:
-      # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
-      - name: Point lifecycle target outside checkout (macOS and Windows)
-        if: runner.os != 'Linux' && contains(matrix.os, 'self-hosted')
+      # The self-hosted macOS runner has one slot.
+      - name: Point lifecycle target outside checkout (macOS)
+        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
         shell: bash
-        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
       - name: Ensure macOS CI disk headroom
         if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply
@@ -1913,13 +1965,15 @@ jobs:
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
   # Required context for each event: PRs certify only the lightweight tier.
-  # Queue entries require all native/runtime/coverage proofs; push keeps its
-  # release-build and packaging checks. Missing/failed results never pass.
+  # Queue entries require the Linux/macOS native/runtime/coverage proofs;
+  # push requires the release builds, packaging checks and ALL Windows
+  # validation (auto-cut-alpha.yml reads this push gate on the main tip
+  # before cutting an alpha). Missing/failed results never pass.
   gate:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -1946,6 +2000,7 @@ jobs:
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               "$slow" check "${{ needs.check.result }}"
               optional build "${{ needs.build.result }}"
+              optional windows "${{ needs.windows.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
@@ -1965,6 +2020,7 @@ jobs:
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
               require build "${{ needs.build.result }}"
+              optional windows "${{ needs.windows.result }}"
               require macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               require coverage-e2e "${{ needs.coverage-e2e.result }}"
               require coverage-all "${{ needs.coverage-all.result }}"
@@ -1974,7 +2030,7 @@ jobs:
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               require deb-packaging "${{ needs.deb-packaging.result }}"
               require release-scripts "${{ needs.release-scripts.result }}"
-              require install-ps1 "${{ needs.install-ps1.result }}"
+              optional install-ps1 "${{ needs.install-ps1.result }}"
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
             push)
@@ -1984,6 +2040,7 @@ jobs:
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
               require build "${{ needs.build.result }}"
+              require windows "${{ needs.windows.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"
