@@ -421,6 +421,9 @@ mod tests_settings_default_effort;
 #[cfg(test)]
 mod tests_catalog_default_model;
 
+#[cfg(test)]
+mod tests_unknown_model;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -496,6 +499,17 @@ pub(crate) enum DefaultModelSource {
     CatalogDefault,
     /// Step 5 — nothing resolved; the provider CLI default applies.
     CliDefault,
+}
+
+/// Where an agent create's `model` argument came from (intent-hq/intent#7121):
+/// only a model the caller supplied in this request is checked against the
+/// provider's catalog; one inherited from stored state is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreateModelSource {
+    /// Supplied by the caller of this request (or absent).
+    Caller,
+    /// Carried over from a stored session (`agent.wakeOrCreate` inheritance).
+    Inherited,
 }
 
 /// Output of [`Services::resolve_create_model_and_effort`]: the model and
@@ -814,6 +828,53 @@ pub(crate) fn ensure_bare_model_matches_provider(
         )));
     }
     Ok(())
+}
+
+/// Reject a caller-supplied model id the provider provably cannot resolve
+/// with `-32602` (`InvalidParams`), naming the valid models
+/// (intent-hq/intent#7121). Without it an unknown id was persisted and the
+/// provider silently ran its default model.
+///
+/// "Provably" needs both a warm cached catalog
+/// ([`crate::model_catalog::ModelCatalogReader::cached_catalog_rows`],
+/// profile-aware) and known resolution rules. Catalogs are picker lists, not
+/// every id a provider accepts, so a model is judged the way the provider
+/// itself resolves it: Claude Code's adapter matches aliases, full model ids
+/// and family names against its picker rows
+/// ([`crate::model_preference::resolve_model_preference`]). Providers whose
+/// rules are not mirrored, and any cold / empty / stale catalog, pass
+/// through — absence of evidence is never a rejection, so creation never
+/// blocks on model discovery. The `"default"` sentinel always passes.
+pub(crate) fn ensure_model_offered_by_provider(
+    method: &str,
+    cache: &crate::model_catalog::ModelCatalogReader<'_>,
+    provider_ref: &str,
+    model_id: &str,
+) -> Result<()> {
+    if model_id == "default" || intent_providers::provider_config(provider_ref).id != "claude-code"
+    {
+        return Ok(());
+    }
+    let Some(rows) = cache.cached_catalog_rows(provider_ref) else {
+        return Ok(());
+    };
+    let options: Vec<crate::model_preference::ModelOption<'_>> = rows
+        .iter()
+        .map(|row| crate::model_preference::ModelOption {
+            value: &row.id,
+            display_name: &row.name,
+            description: &row.description,
+        })
+        .collect();
+    if crate::model_preference::resolve_model_preference(&options, model_id).is_some() {
+        return Ok(());
+    }
+    let valid: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+    Err(Error::InvalidParams(format!(
+        "{method}: model {model_id} is not available for provider {provider_ref} \
+         (valid models: {})",
+        valid.join(", ")
+    )))
 }
 
 /// Reject a `reasoningEffort` level the resolved model provably does not
@@ -4746,6 +4807,7 @@ impl Services {
     ///
     /// `method` labels the errors (`agent.create` / `workspace.create`);
     /// `spec_wp` is the project-tier hint for the specialist lookups.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn resolve_create_model_and_effort(
         &self,
         method: &'static str,
@@ -4754,6 +4816,7 @@ impl Services {
         provider: Option<&str>,
         reasoning_effort: Option<String>,
         spec_wp: Option<&Path>,
+        model_origin: CreateModelSource,
     ) -> Result<CreateModelAndEffort> {
         // A present value — even blank — means the effort was decided by the
         // caller or by an upstream rung (`resolve_delegate_reasoning_effort`),
@@ -4860,6 +4923,12 @@ impl Services {
                 .or(derived_default.as_deref())
                 .expect("guarded above: provider or derived default present");
             match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
+                // A caller-supplied id must also be one the provider can
+                // resolve (intent-hq/intent#7121); derived defaults and models
+                // inherited from stored state keep the ownership-only check.
+                Ok(()) if model_explicit && model_origin == CreateModelSource::Caller => {
+                    ensure_model_offered_by_provider(method, &self.cached_models(), effective, m)?;
+                }
                 Ok(()) => {}
                 Err(e) if model_explicit => return Err(e),
                 Err(e) => {
@@ -4983,6 +5052,37 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        self.agent_create_with_model_source_op(
+            workspace_id,
+            name,
+            model,
+            specialist,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            extra,
+            CreateModelSource::Caller,
+        )
+        .await
+    }
+
+    /// [`Self::agent_create_op`] with the provenance of `model` spelled out:
+    /// a model inherited from stored state ([`CreateModelSource::Inherited`])
+    /// skips the unknown-model guard (intent-hq/intent#7121), so a later
+    /// catalog change never blocks re-creating an agent for existing work.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn agent_create_with_model_source_op(
+        &self,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        specialist: Option<String>,
+        parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
+        extra: AgentCreateExtra,
+        model_origin: CreateModelSource,
+    ) -> Result<Value> {
         // SECURITY: the project tier resolves against the stored workspace
         // record's path, never a client-supplied one (review thread
         // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed
@@ -5011,6 +5111,7 @@ impl Services {
                 skip_auto_commit,
                 extra,
                 spec_wp.clone(),
+                model_origin,
             )
             .await?;
         Ok(self
@@ -5046,6 +5147,7 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
         spec_wp: Option<PathBuf>,
+        model_origin: CreateModelSource,
     ) -> Result<AgentCreatePlan> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
         // front-door check so every path that spawns a child for a parent
@@ -5238,6 +5340,7 @@ impl Services {
                 provider.as_deref(),
                 reasoning_effort,
                 spec_wp.as_deref(),
+                model_origin,
             )
             .await?;
         let remember_specialist = remember_specialist
@@ -5549,6 +5652,8 @@ impl Services {
             json!({ "agentId": agent_id.0, "name": name }),
         )
         .await;
+        self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
+            .await;
         Ok(json!({ "success": true, "name": name }))
     }
 
@@ -6769,6 +6874,10 @@ impl Services {
             Value::Object(event_data),
         )
         .await;
+        if obj.contains_key("name") {
+            self.refresh_token_usage_after_rename(&session.workspace_id, &agent_id)
+                .await;
+        }
         // `status` / `isBackground` / `notificationsMuted` feed the
         // needs_attention derivation (a deleted, background, or muted
         // session's pending request/question/error no longer counts):
@@ -12292,9 +12401,9 @@ impl Services {
     /// grouped or ungrouped — on the caller, i.e. the target is itself
     /// waiting on the caller to settle. Accepting the registration would arm
     /// an A⇄B pair where each side's settlement is deferred by the other's
-    /// watch; the settlement-time `mutual_idle` break in
+    /// watch; the settlement-time idle-cycle break in
     /// [`Services::classify_agent_waiting`] eventually declassifies such a
-    /// deadlocked 2-cycle, but only once both sides sit idle — refusing to
+    /// deadlocked all-idle cycle, but only once both sides sit idle — refusing to
     /// create the pair up front is strictly better. "Live" means
     /// non-`report_delivered` ([`Services::waiting_watches_for_parent`]): a
     /// `report_delivered` reverse watch has already delivered its
@@ -12305,11 +12414,12 @@ impl Services {
     /// rehydration) pair the watch with a message/wake that settles one side
     /// or must keep rehydrating persisted pairs, and stay covered by the
     /// settlement-time backstop. Direct pair check only — deeper cycles
-    /// (A→B→C→A) are intentionally not detected here. Best-effort under
+    /// (A→B→C→A) are intentionally not detected here; the settlement-time
+    /// idle-cycle backstop declassifies them too. Best-effort under
     /// concurrency (TOCTOU): two agents racing explicit registrations on
     /// each other can both pass this check before either watch lands and
     /// still form the mutual pair — that race is covered by the same
-    /// settlement-time `mutual_idle` backstop.
+    /// settlement-time idle-cycle backstop.
     fn check_no_reverse_watch(
         &self,
         caller_agent_id: &AgentId,
@@ -14681,10 +14791,19 @@ impl Services {
             None => None,
         };
         let specialist = inherited_specialist.or(create_opts.specialist.clone());
+        let inherited_model = inheritance_source.as_ref().and_then(|s| s.model.clone());
+        // Only a model the caller passed in this request is validated against
+        // the provider catalog (intent-hq/intent#7121); an inherited one is
+        // carried over as-is so a later catalog change cannot block the wake.
+        let model_origin = if input.model.is_none() && inherited_model.is_some() {
+            CreateModelSource::Inherited
+        } else {
+            CreateModelSource::Caller
+        };
         let model = input
             .model
             .clone()
-            .or_else(|| inheritance_source.as_ref().and_then(|s| s.model.clone()))
+            .or(inherited_model)
             .or(create_opts.model.clone());
         let provider = create_opts.provider.clone();
         let agent_type = create_opts.agent_type.clone();
@@ -14754,7 +14873,7 @@ impl Services {
         // B3 but is rejected by LC-1. That pass-then-reject is intentional
         // fail-closed behavior: the wire value cannot bypass the stored cap.
         let created = self
-            .agent_create_op(
+            .agent_create_with_model_source_op(
                 workspace_id.clone(),
                 name,
                 model,
@@ -14763,6 +14882,7 @@ impl Services {
                 Some(task_note_id.clone()),
                 skip_auto_commit,
                 extra,
+                model_origin,
             )
             .await?;
         let agent_lite = &created["agent"];

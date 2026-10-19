@@ -874,11 +874,13 @@ The design docs live in the monorepo under `docs/`:
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
 
-### Depot CI and compiler cache
+### CI runners and compiler cache
 
-Routed jobs prefer the free self-hosted fleet and burst to Depot when the fleet
-is unavailable or busy. Depot Linux checks use 8 CPUs and coverage/release
-compilation uses 16 CPUs. Physical-host pruning remains scheduled.
+Routed jobs prefer the free self-hosted fleet and burst to GitHub-hosted runners
+when the fleet is unavailable or busy. Burst Linux checks use the `gh-linux-8x`
+org larger runner and coverage/release compilation uses `gh-linux-16x`; Windows
+uses `gh-windows-16x` and Apple Silicon uses `macos-26-xlarge`. The larger
+runners' group must allow public repositories. Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
 `CI_MACOS_RUNNER_DISABLED=true`.
@@ -886,19 +888,16 @@ Restore the default self-hosted preference by deleting that variable with
 `gh variable delete <VARIABLE> --repo intent-hq/intentd` after recovery.
 Each override affects only its named platform.
 
-`scripts/setup-depot-sccache.py` installs pinned, checksum-verified sccache directly.
-Depot supplies its job-scoped WebDAV endpoint. Self-hosted runners use the
-`DEPOT_TOKEN` Actions secret, or existing `SCCACHE_WEBDAV_*` environment settings.
-Without credentials, compilation proceeds uncached with a notice. Rust caches
-use the managed service, without Rust cache actions or Actions cache archives.
-Setting the organization variable `INTENT_SCCACHE_ENDPOINT` switches every Rust
-CI and release build to the self-hosted sccache WebDAV cache, authenticated by
-the `INTENT_SCCACHE_TOKEN` secret. Every job that receives secrets (main,
+`scripts/setup-sccache.py` installs pinned, checksum-verified sccache directly,
+without Rust cache actions or Actions cache archives. The organization variable
+`INTENT_SCCACHE_ENDPOINT` points every Rust CI and release build at the
+self-hosted sccache WebDAV cache, authenticated by the `INTENT_SCCACHE_TOKEN`
+secret. Every job that receives secrets (main,
 releases, the cache producer and same-repo pull requests) reads and writes it;
 `INTENT_SCCACHE_MODE=READ_ONLY` overrides that. Fork pull requests get no
-token and build uncached. Delete the variable to return to Depot Cache.
-The build-only release-cache workflow warms release inputs; the managed smoke
-workflow verifies compiler hits across jobs and invalidation after source changes.
+token and build uncached, as does every build when the variable is deleted.
+The build-only release-cache workflow warms release inputs; the cache smoke
+workflow (`cache-smoke.yml`) verifies compiler hits across jobs and invalidation after source changes.
 
 ### Windows CI disk cleanup
 
@@ -911,19 +910,11 @@ unknown owner or insufficient eligible space fails visibly.
 Cleanup locks existing Cargo lock files without allocating new ones, so a full
 disk can still be recovered. The legacy Cargo lock is required for each profile.
 
-Before the new workflow lands, the existing Mac maintenance dispatcher can run
-it from this branch without merging:
-
-```sh
-gh workflow run macos-prune.yml --repo intent-hq/intentd --ref ci/depot-managed-cache -f runner=5090pc -f apply=false
-# Inspect the dry-run, then use -f apply=true -f verify_build=true.
-```
-
-Once available on main, invoke `windows-prune.yml` directly. After cleanup,
+Invoke `windows-prune.yml` directly (dry-run first, then
+`-f apply=true -f verify_build=true`). After cleanup,
 verify a self-hosted Windows build before removing the maintenance routing
 variable documented above. The optional `verify_build=true` input compiles the
 real daemon with the pinned Rust toolchain after a successful apply; it has no
-effect on dry runs. It uses the same compiler cache as CI (Depot managed sccache when
-`DEPOT_TOKEN` is configured).
+effect on dry runs. It uses the same self-hosted compiler cache as CI.
 The cleanup log reports actual free bytes before
 and after deletion; a rebuild repopulates any evicted debug cache.

@@ -166,6 +166,16 @@ impl GitHubSourceControl {
     }
 
     async fn graphql_accounted(&self, payload: &Value) -> octocrab::Result<Value> {
+        self.graphql_accounted_as(payload, crate::traffic::Operation::PrDetail)
+            .await
+    }
+
+    /// [`Self::graphql_accounted`], attributing a query to `query_operation`.
+    async fn graphql_accounted_as(
+        &self,
+        payload: &Value,
+        query_operation: crate::traffic::Operation,
+    ) -> octocrab::Result<Value> {
         let mut payload = payload.clone();
         let is_mutation = payload
             .get("query")
@@ -174,7 +184,7 @@ impl GitHubSourceControl {
         let operation = if is_mutation {
             crate::traffic::Operation::Other
         } else {
-            crate::traffic::Operation::PrDetail
+            query_operation
         };
         // All documents here are daemon-owned. Queries can request their actual
         // cost alongside the existing selections; mutations do not expose it.
@@ -1243,6 +1253,35 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
 }
 ";
 
+/// Open PRs of one head branch from ANY head repository: the REST `head`
+/// filter needs `owner:branch` (a bare branch is ignored), so it cannot find
+/// a contributor's fork PR without knowing the fork owner.
+const OPEN_PRS_BY_HEAD_QUERY: &str = r"
+query OpenPrsByHead($owner: String!, $repo: String!, $head: String!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(headRefName: $head, states: OPEN, first: 100) {
+      pageInfo { hasNextPage }
+      nodes {
+        number
+        url
+        title
+        body
+        state
+        isDraft
+        headRefName
+        headRefOid
+        author { login }
+        mergeable
+        createdAt
+        updatedAt
+        mergeStateStatus
+        baseRefName
+      }
+    }
+  }
+}
+";
+
 /// Map the `pullRequest` node of [`PR_OBSERVATION_QUERY`] onto the same
 /// [`PullRequest`] `GET /pulls/{n}` yields: GraphQL's `mergeable`
 /// (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`) becomes the REST tri-state bool,
@@ -1989,6 +2028,44 @@ impl SourceControl for GitHubSourceControl {
             None => prs,
         };
         Ok(Page { items, next_cursor })
+    }
+
+    async fn list_open_prs_by_head(
+        &self,
+        repo: &RepoRef,
+        head_ref: &str,
+    ) -> Result<Vec<PullRequest>> {
+        let payload = json!({
+            "query": OPEN_PRS_BY_HEAD_QUERY,
+            "variables": { "owner": repo.owner, "repo": repo.name, "head": head_ref },
+        });
+        let data = graphql_data(
+            self.graphql_accounted_as(&payload, crate::traffic::Operation::Discovery)
+                .await?,
+        )?;
+        let prs = data
+            .pointer("/repository/pullRequests")
+            .ok_or_else(|| Error::Decode("repository pullRequests missing".into()))?;
+        if prs
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            return Err(Error::Api(
+                "more than one page of open PRs for one head".into(),
+            ));
+        }
+        prs.get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Decode("pullRequests nodes missing".into()))?
+            .iter()
+            .map(map_graphql_pull)
+            .filter(|pr| {
+                pr.as_ref().map_or(true, |pr| {
+                    pr.state == PrState::Open && pr.source_branch == head_ref
+                })
+            })
+            .collect()
     }
 
     async fn list_org_prs(&self, org: &str, query: PrQuery) -> Result<Page<PullRequest>> {

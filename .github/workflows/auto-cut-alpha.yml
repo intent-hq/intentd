@@ -54,6 +54,14 @@
 #   for up to 2 min per episode) — the next scheduled run retries. Never
 #   bypasses a failed guard. Metadata-only releases use the CI identity’s
 #   existing queue exemption; other diffs retain the ordinary queue path.
+# - Post-merge gate: the latest push-event ci.yml run on the Release PR's
+#   base (the main tip being released) must have succeeded. That push run
+#   is where ALL Windows validation runs (never on PRs or in the merge
+#   queue), plus the release builds and packaging its CI Gate requires.
+#   Still running → wait within the CI budget, then the next cron retries;
+#   any other conclusion → skip until a fix or re-run turns main green.
+#   Applies to every trigger (dispatch only bypasses the throttle); a human
+#   merging the Release PR by hand is the deliberate override.
 # - The PR branch is never updated from here: release-plz owns the Release
 #   PR branch content and refreshes it on every push to main, which is how
 #   the ruleset's strict up-to-date requirement gets satisfied. A branch
@@ -117,10 +125,10 @@ jobs:
     name: Auto-merge green Release PR
     # Lightweight job (seconds when nothing is pending; up to ~25 min while it
     # waits for the Release PR's CI or, on push runs, for its refresh):
-    # pinned to depot-ubuntu-24.04 (same rationale as
+    # pinned to ubuntu-24.04 (same rationale as
     # ci.yml's pr-title/gate jobs — a self-hosted slot would be wasted on it).
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['depot-ubuntu-24.04'] || fromJSON('["depot-ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     if: ${{ github.repository_owner == 'intent-hq' }}
     # Covers the 25-min CI wait (push runs: 15-min refresh polling within it)
     # plus headroom; runs with nothing pending still finish in seconds.
@@ -558,7 +566,38 @@ jobs:
               fi
             fi
 
-
+            # Post-merge gate: Windows validation never runs on PRs or in the
+            # merge queue — it runs in ci.yml's push run on main, whose CI
+            # Gate also requires the release builds and packaging. The
+            # Release PR's base is the main tip it will release, so the
+            # latest push-event ci.yml run on that commit must have
+            # succeeded. Pending waits within the CI budget (not started at
+            # all: the short grace); any other conclusion — failure,
+            # cancelled (e.g. superseded), timed out — blocks the cut until a
+            # fix or re-run turns it green. A human merging the Release PR by
+            # hand is the deliberate override.
+            if ! main_ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$base_sha&event=push&per_page=100" \
+              --jq '([.workflow_runs[]?] | max_by(.id)) as $r
+                | if $r == null then "missing"
+                  else [($r.status // "pending"), ($r.conclusion // "none"), ($r.html_url // "no-url")] | join(" ")
+                  end'); then
+              transient "main's post-merge CI lookup failed for $base_sha (transient API error?)"
+              sleep 30; continue
+            fi
+            read -r main_status main_conclusion main_url <<<"$main_ci"
+            if [[ "$main_status" == "missing" ]]; then
+              ci_pending "main's post-merge CI has not started on $base_sha yet" "$missing_deadline"
+              sleep 30; continue
+            fi
+            if [[ "$main_status" != "completed" ]]; then
+              ci_pending "main's post-merge CI is still $main_status on $base_sha ($main_url)"
+              sleep 30; continue
+            fi
+            if [[ "$main_conclusion" != "success" ]]; then
+              echo "::notice::main's post-merge CI concluded $main_conclusion on $base_sha ($main_url); not cutting an alpha until it is green — re-run the failed jobs or land a fix."
+              exit 0
+            fi
+            echo "main's post-merge CI passed on $base_sha ($main_url)."
 
             # Re-check the throttle at merge time: a push run may have spent
             # minutes polling, and the previous cut's tag may only have been

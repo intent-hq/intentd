@@ -75,7 +75,7 @@ fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
 /// well would say it twice. Every other provider keeps the composed prompt
 /// and no `_meta`, exactly as before.
 ///
-/// Verified against the pinned `@agentclientprotocol/claude-agent-acp` 0.81.1
+/// Verified when introduced against `@agentclientprotocol/claude-agent-acp` 0.81.1
 /// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
 /// 0.3.280:
 /// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`

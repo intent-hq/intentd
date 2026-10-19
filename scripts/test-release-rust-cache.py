@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Depot managed compiler-cache and release warming contracts."""
+"""Self-hosted compiler-cache and release warming contracts."""
 from copy import deepcopy
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import tomllib
@@ -9,7 +10,7 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-CACHE_RUN = 'python3 scripts/setup-depot-sccache.py'
+CACHE_RUN = 'python3 scripts/setup-sccache.py'
 
 
 def workflow(name):
@@ -17,8 +18,17 @@ def workflow(name):
 
 
 class ManagedCache(unittest.TestCase):
+    def test_managed_smoke_skips_when_cache_is_switched_off(self):
+        # No cache endpoint; keep the loader path so a setup-python interpreter still starts.
+        env = {'PATH': '/usr/bin:/bin', **{k: v for k, v in os.environ.items() if k == 'LD_LIBRARY_PATH'}}
+        for phase in ('populate', 'verify'):
+            result = subprocess.run(['python3', '-I', '-B', 'scripts/test-release-cache-smoke.py', '--managed', '--phase', phase],
+                                    cwd=ROOT, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('skipping the managed cache smoke test', result.stdout)
+
     def test_no_archive_backend_or_local_cache_limits(self):
-        text = (ROOT / 'scripts/setup-depot-sccache.py').read_text()
+        text = (ROOT / 'scripts/setup-sccache.py').read_text()
         for obsolete in ['actions/cache', 'SCCACHE_DIR', 'SCCACHE_CACHE_SIZE', 'SCCACHE_LOCAL_RW_MODE']:
             self.assertNotIn(obsolete, text)
         for name in ['release-cache.yml', 'release-plz.yml']:

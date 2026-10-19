@@ -145,7 +145,16 @@ fn legacy_alias_metadata_is_the_reverse_of_the_strict_resolver() {
 
 #[test]
 fn claude_agent_acp_pin_is_single_sourced() {
-    assert!(!CLAUDE_AGENT_ACP_VERSION.is_empty());
+    // An exact stable pin (three numeric parts, no range or tag): the
+    // auto-pin-acp-adapters workflow only ever writes such a version.
+    let parts: Vec<&str> = CLAUDE_AGENT_ACP_VERSION.split('.').collect();
+    assert_eq!(parts.len(), 3, "{CLAUDE_AGENT_ACP_VERSION}");
+    assert!(
+        parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+        "{CLAUDE_AGENT_ACP_VERSION}"
+    );
     assert_eq!(
         CLAUDE_AGENT_ACP_NPX_PACKAGE,
         format!("@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}")

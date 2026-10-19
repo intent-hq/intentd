@@ -17089,6 +17089,30 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         usage["lastScanAt"].is_string(),
         "lastScanAt stamped by the live update: {read}"
     );
+    // Additive agentNames (§5.23): the snapshot names the agent so clients can
+    // label rows for agents they have not loaded.
+    assert_eq!(
+        usage["agentNames"][&agent_id], "Usage",
+        "agentNames: {read}"
+    );
+
+    // A rename alone refreshes agentNames and publishes the changed snapshot.
+    let renamed = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.rename",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "name": "Usage renamed" }),
+    )
+    .await;
+    assert_eq!(renamed["success"], true, "rename ok: {renamed}");
+    let ev3 = wss_event(&mut sub, 30).await;
+    let ev3 = &ev3["params"]["event"];
+    assert_eq!(ev3["type"], "workspace:tokenUsage-changed");
+    assert_eq!(
+        ev3["data"]["tokenUsage"]["agentNames"][&agent_id], "Usage renamed",
+        "rename publishes the refreshed name: {ev3}"
+    );
+    assert_eq!(ev3["data"]["tokenUsage"]["totals"]["inputTokens"], 100);
 }
 
 /// ACP `usage_update` cost capture over the real WSS transport (§5.23): the
