@@ -566,6 +566,16 @@ that renders Mermaid diagrams. For files in the main workspace checkout, relativ
 outside the workspace; files from other registered repositories do not resolve them.
 Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+MP4 and WebM files open in a video player. If an MP4 video track cannot be decoded,
+the macOS desktop app tries a temporary compatible preview; the original is unchanged.
+If playback or conversion is unavailable, the panel explains the failure. Use
+**Download file**, when available, to play the original in another app. Video codec
+support varies by device; a file-loading error can instead mean a missing file or
+disconnected workspace.
+Saved MP4 and WebM asset links in chat and rendered Markdown open an in-app video
+preview in their original workspace. Close the preview to return to the link;
+use the video's actions menu to download it. Invalid or unsupported saved-media
+links show an explanation rather than opening an external browser.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
@@ -574,7 +584,7 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/editor/{FileViewer,FileVideoPreview}.svelte; packages/cloudlands-fe/src/main/utils/video-preview.ts; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownMediaPreview,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/ui/VideoLightbox.svelte; packages/cloudlands-fe/src/features/navigation/link-handler.ts; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
 
 ## Daemon lifecycle from the terminal
 
