@@ -2946,7 +2946,10 @@ impl Store {
                  WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
                  THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
+             stop_reason=?, stop_reason_timestamp=?, \
+             reasoning_effort_auto=CASE WHEN reasoning_effort IS ? \
+                 THEN reasoning_effort_auto ELSE 0 END, \
+             reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -2978,6 +2981,9 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
+        // Any effort change (an explicit choice) clears the daemon's
+        // Auto-pin flag; rewriting the same value keeps it.
+        .bind(&s.reasoning_effort)
         .bind(&s.reasoning_effort)
         .bind(&s.id.0)
         .bind(&workspace_id.0);
@@ -3094,9 +3100,18 @@ impl Store {
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
+        // A level the daemon pinned from Auto (`reasoning_effort_auto`)
+        // belongs to the old model's default: a real model change resets it
+        // to Auto, so the new model's default applies (and is re-pinned at
+        // the next confirmed turn). A level someone chose is kept.
         let rows = sqlx::query(
-            "UPDATE agent_session SET model=?, provider=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
+            "UPDATE agent_session SET \
+               reasoning_effort = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                       THEN NULL ELSE reasoning_effort END, \
+               reasoning_effort_auto = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                            THEN 0 ELSE reasoning_effort_auto END, \
+               model=?1, provider=?2, updated_at=?3 \
+             WHERE id=?4 AND workspace_id=?5",
         )
         .bind(model)
         .bind(provider)
@@ -3153,7 +3168,8 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
         let rows = sqlx::query(
-            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, \
+             reasoning_effort_auto=0, updated_at=? \
              WHERE id=? AND workspace_id=? AND provider IS ?",
         )
         .bind(provider)
@@ -3183,6 +3199,177 @@ impl Store {
         }
         lifecycle.settle_after_retirement().await?;
         Ok(false)
+    }
+
+    /// Pin the provider of a legacy session — one whose `provider` column is
+    /// NULL or blank — at turn start. Every create pins its provider, so a
+    /// NULL column only survives on rows written before that rule; pinning it
+    /// stops the session from following later `model.defaultProvider`
+    /// changes. A narrow write of `provider` and `updated_at` only, and a
+    /// compare-and-set on the column still being NULL/blank: a concurrent
+    /// `agent.setModel` that pinned a provider first wins and the call
+    /// returns `Ok(false)` without mutating anything. Scoped to
+    /// `workspace_id` (defense-in-depth).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn pin_agent_session_provider_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        provider: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // No lifecycle invalidation: the pinned provider is the one the
+        // session already resolves to (its last turn's, else the current
+        // default), so its repository bindings stay valid.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND (provider IS NULL OR provider='')",
+        )
+        .bind(provider)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("pin agent session provider failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        if rows == 0 && current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(rows > 0)
+    }
+
+    /// Fill a session's `model` / `reasoning_effort` from the identity a turn
+    /// actually ran under, only where the column is still NULL or blank (a
+    /// legacy row, or a create that could not resolve them up front — a cold
+    /// catalog cache, or an effort left to the provider). Values already set
+    /// are never overwritten, so an `agent.setModel` / effort change racing
+    /// the commit wins. `None` arguments leave their column alone. A filled
+    /// effort is the provider's level for an Auto session, so it sets
+    /// `reasoning_effort_auto` (reset on the next real model change by
+    /// [`Store::set_agent_session_model`]). Returns whether any column
+    /// changed. Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_identity_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let model = model.filter(|m| !m.trim().is_empty());
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
+        if model.is_none() && reasoning_effort.is_none() {
+            return Ok(false);
+        }
+        // No lifecycle invalidation: the filled values are the ones the
+        // running provider already reports, so nothing the session's
+        // repository bindings depend on changes.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+               model = CASE WHEN (model IS NULL OR model='') AND ?1 IS NOT NULL \
+                            THEN ?1 ELSE model END, \
+               reasoning_effort_auto = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN 1 ELSE reasoning_effort_auto END, \
+               reasoning_effort = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN ?2 ELSE reasoning_effort END, \
+               updated_at = ?3 \
+             WHERE id=?4 AND workspace_id=?5 AND ( \
+               ((model IS NULL OR model='') AND ?1 IS NOT NULL) OR \
+               ((reasoning_effort IS NULL OR reasoning_effort='') AND ?2 IS NOT NULL))",
+        )
+        .bind(model)
+        .bind(reasoning_effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session identity failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
+    }
+
+    /// Fill a NULL/blank `reasoning_effort` with the level the provider
+    /// confirmed for a turn, marked Auto-pinned (`reasoning_effort_auto`),
+    /// only while the row still carries the provider and model that turn
+    /// started with (`expected_*`, `None` matching NULL). A concurrent
+    /// `agent.setModel` / provider change that landed first therefore never
+    /// inherits the old identity's level. Returns whether the fill landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_effort_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        effort: &str,
+        expected_provider: Option<&str>,
+        expected_model: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if effort.trim().is_empty() {
+            return Ok(false);
+        }
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET reasoning_effort=?, reasoning_effort_auto=1, updated_at=? \
+             WHERE id=? AND workspace_id=? \
+               AND (reasoning_effort IS NULL OR TRIM(reasoning_effort)='') \
+               AND provider IS ? AND model IS ?",
+        )
+        .bind(effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session effort failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
+    }
+
+    /// Clear the Auto-pin mark (`reasoning_effort_auto`) after an explicit
+    /// effort choice. Written separately because choosing the level the
+    /// session already carries is still a choice: `update_agent_session`
+    /// keeps the mark on a same-value rewrite (an unrelated row update), so
+    /// the explicit-effort path calls this to make the choice survive the
+    /// next model switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn clear_agent_session_effort_auto(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE agent_session SET reasoning_effort_auto=0 \
+             WHERE id=? AND workspace_id=? AND reasoning_effort_auto<>0",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("clear effort auto mark failed: {e}")))?;
+        Ok(())
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -13483,6 +13670,162 @@ mod tests {
         session.name = "New Name".to_string();
         let result4 = store.update_agent_session(&ws_id, &session).await;
         assert!(result4.is_ok(), "name change should succeed");
+    }
+
+    /// The confirmed-effort fill lands only while the row still carries the
+    /// turn's provider/model: a model switch that landed first never inherits
+    /// the old model's level. A landed fill is Auto-pinned; an explicit
+    /// choice clears the mark.
+    #[tokio::test]
+    async fn effort_fill_is_guarded_by_the_turn_identity() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort-guard".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-effort-guard".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("codex".to_string());
+        session.model = Some("model-a".to_string());
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+        store
+            .set_agent_session_model(&ws_id, &agent_id, "model-b", Some("codex"), &ts)
+            .await
+            .expect("racing model switch");
+        assert!(
+            !store
+                .fill_agent_session_effort_if_identity(
+                    &ws_id,
+                    &agent_id,
+                    "high",
+                    Some("codex"),
+                    Some("model-a"),
+                    &ts
+                )
+                .await
+                .unwrap(),
+            "model A's level must not land on model B"
+        );
+        assert_eq!(
+            store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+        assert!(store
+            .fill_agent_session_effort_if_identity(
+                &ws_id,
+                &agent_id,
+                "low",
+                Some("codex"),
+                Some("model-b"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let auto = |store: &Store| {
+            let store = store.clone();
+            let id = agent_id.0.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT reasoning_effort_auto FROM agent_session WHERE id=?",
+                )
+                .bind(id)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
+        store
+            .clear_agent_session_effort_auto(&ws_id, &agent_id)
+            .await
+            .unwrap();
+        assert_eq!(auto(&store).await, 0, "an explicit choice clears the mark");
+    }
+
+    /// `pin_agent_session_provider_if_null` only lands on a NULL/blank
+    /// provider (compare-and-set: a provider pinned first wins), and
+    /// `fill_agent_session_identity_if_null` only fills NULL/blank columns.
+    #[tokio::test]
+    async fn legacy_identity_writers_fill_only_unset_columns() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-identity".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-identity".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = None;
+        session.model = None;
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let other = WorkspaceId("ws-other".to_string());
+        assert!(matches!(
+            store
+                .pin_agent_session_provider_if_null(&other, &agent_id, "codex", &ts)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(store
+            .pin_agent_session_provider_if_null(&ws_id, &agent_id, "codex", &ts)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .pin_agent_session_provider_if_null(&ws_id, &agent_id, "claude-code", &ts)
+                .await
+                .unwrap(),
+            "an already pinned provider is never overwritten"
+        );
+
+        assert!(!store
+            .fill_agent_session_identity_if_null(&other, &agent_id, Some("x"), Some("y"), &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(&ws_id, &agent_id, Some("gpt-5"), None, &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("medium"),
+                &ts
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("high"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let got = store.get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(got.provider.as_deref(), Some("codex"));
+        assert_eq!(got.model.as_deref(), Some("gpt-5"), "set model kept");
+        assert_eq!(got.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(got.acp_session_id.as_deref(), Some("acp-live"));
     }
 
     /// The narrow `set_agent_session_model` writer (`agent.setModel`,
