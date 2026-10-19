@@ -399,11 +399,16 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
 
                 if let Some(existing) = discovered_by_name.get(&name) {
                     let existing: &DiscoveredSkill = existing;
-                    eprintln!(
-                        "WARN: Skill name collision detected, keeping higher-precedence skill: name={}, kept={}, shadowed={}",
-                        name,
-                        if target.precedence >= existing.precedence { &parsed.metadata.location } else { &existing.metadata.location },
-                        if target.precedence >= existing.precedence { &existing.metadata.location } else { &parsed.metadata.location }
+                    let (kept, shadowed) = if target.precedence >= existing.precedence {
+                        (&parsed.metadata.location, &existing.metadata.location)
+                    } else {
+                        (&existing.metadata.location, &parsed.metadata.location)
+                    };
+                    tracing::warn!(
+                        name = %name,
+                        kept = %kept,
+                        shadowed = %shadowed,
+                        "Skill name collision detected, keeping higher-precedence skill"
                     );
                 }
 
@@ -574,10 +579,10 @@ fn walk_directory(
     let mut entries = match std::fs::read_dir(current_path) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!(
-                "WARN: Failed to read potential skills directory: path={}, error={}",
-                current_path.display(),
-                e
+            tracing::warn!(
+                path = %current_path.display(),
+                error = %e,
+                "Failed to read potential skills directory"
             );
             return;
         }
@@ -638,10 +643,10 @@ fn walk_directory(
                     skill_files,
                 );
                 if scan_state.scanned_directories >= MAX_SCANNED_DIRECTORIES {
-                    eprintln!(
-                        "WARN: Skills discovery stopped after reaching directory scan limit: rootPath={}, limit={}",
-                        current_path.display(),
-                        MAX_SCANNED_DIRECTORIES
+                    tracing::warn!(
+                        root_path = %current_path.display(),
+                        limit = MAX_SCANNED_DIRECTORIES,
+                        "Skills discovery stopped after reaching directory scan limit"
                     );
                     return;
                 }
@@ -675,10 +680,10 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
     }) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!(
-                "WARN: Failed to read skill file: skillPath={}, error={}",
-                skill_path.display(),
-                e
+            tracing::warn!(
+                skill_path = %skill_path.display(),
+                error = %e,
+                "Failed to read skill file"
             );
             return None;
         }
@@ -687,17 +692,17 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
     let parsed = parse_skill_content(&content)?;
 
     if parsed.name.is_none() {
-        eprintln!(
-            "WARN: Skipping skill missing required name field: skillPath={}",
-            skill_path.display()
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            "Skipping skill missing required name field"
         );
         return None;
     }
 
     if parsed.description.is_none() {
-        eprintln!(
-            "WARN: Skipping skill missing required description field: skillPath={}",
-            skill_path.display()
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            "Skipping skill missing required description field"
         );
         return None;
     }
@@ -712,11 +717,11 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
         .and_then(|n| n.to_str())
     {
         if name != parent_dir_name {
-            eprintln!(
-                "WARN: Skill name does not match parent directory name: skillPath={}, name={}, parentDirectoryName={}",
-                skill_path.display(),
-                name,
-                parent_dir_name
+            tracing::warn!(
+                skill_path = %skill_path.display(),
+                name = %name,
+                parent_directory_name = %parent_dir_name,
+                "Skill name does not match parent directory name"
             );
         }
     }
@@ -725,10 +730,10 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        eprintln!(
-            "WARN: Skill name does not match the Agent Skills naming convention: skillPath={}, name={}",
-            skill_path.display(),
-            name
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            name = %name,
+            "Skill name does not match the Agent Skills naming convention"
         );
     }
 
