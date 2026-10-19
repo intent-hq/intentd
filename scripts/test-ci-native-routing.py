@@ -361,10 +361,15 @@ def runner(platform="macOS", arch="ARM64", *, status="online", busy=False, extra
 # intent-cache slots register with GitHub's default labels plus `intent-cache`;
 # routed Linux jobs ask for exactly these labels.
 CACHE = ["self-hosted", "linux", "x64", "intent-cache"]
+SMALL = ["self-hosted", "linux", "x64", "intent-cache-small"]
 
 
 def slot(**kwargs):
     return runner("Linux", "X64", extra=("intent-cache",), **kwargs)
+
+
+def small_slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache-small",), **kwargs)
 
 
 class RunnerAvailabilityTests(unittest.TestCase):
@@ -456,7 +461,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         # jobs, PRs and pushes keep the probe's choice.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         for idle in (True, False):
-            fleet = [slot(), runner("Windows", "X64"), runner()] if idle else []
+            fleet = [slot(), small_slot(), runner("Windows", "X64"), runner()] if idle else []
             for event in ("pull_request", "push", "merge_group"):
                 with self.subTest(idle=idle, event=event):
                     result = run_route(self.workflow, org=fleet, eventName=event,
@@ -468,8 +473,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(json.loads(outputs["check_labels"]),
                                      ["depot-ubuntu-24.04-8"] if hosted else CACHE)
                     self.assertEqual(outputs["linux_burst"], str(hosted).lower())
+                    # Light jobs ask for the standard label, which the fast pool serves.
                     self.assertEqual(json.loads(outputs["runners"])["depot-ubuntu-24.04"],
-                                     CACHE if idle else ["depot-ubuntu-24.04"])
+                                     SMALL if idle else ["depot-ubuntu-24.04"])
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
