@@ -27034,6 +27034,122 @@ async fn mutual_idle_two_cycle_does_not_defer() {
     assert!(svc.find_watches_for_child(&b).is_empty());
 }
 
+/// N-cycle deadlock guard (issue intent-hq/intent#7205): A→B→C→A watch each
+/// other and all three are idle. Before the fix only direct 2-cycles were
+/// declassified, so every member counted its outgoing edge as a waiting
+/// reason, every idle deferred, and the closed cycle stayed unsettled
+/// forever. The last idle in the cycle must deliver, and the cycle must then
+/// unwind with each watch firing exactly once.
+#[tokio::test]
+async fn idle_three_cycle_does_not_defer() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+
+    for id in [&a, &b, &c] {
+        assert!(
+            !svc.agent_is_waiting_on_agents(id),
+            "an all-idle 3-cycle is not a waiting reason for {}",
+            id.0
+        );
+        assert!(
+            !svc.agent_is_waiting_on_agents_durable(id).await,
+            "durable (rehydration) classification agrees for {}",
+            id.0
+        );
+    }
+
+    // C idles last: not deferred — B's watch on C fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B woken by C");
+    assert!(svc.find_watches_for_child(&c).is_empty());
+
+    // B (now watchless) idles: A's watch on B fires; then A idles: C's
+    // watch on A fires. The cycle unwinds with exactly one wake per edge.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &a,
+        json!({ "agentId": a.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1, "A woken once");
+    assert_eq!(parent_message_count(&svc, &c).await, 1, "C woken once");
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B not re-woken");
+    for id in [&a, &b, &c] {
+        assert!(svc.find_watches_for_child(id).is_empty());
+        assert!(svc.waiting_watches_for_parent(id).is_empty());
+    }
+}
+
+/// Control for the N-cycle guard (issue intent-hq/intent#7205): a cycle
+/// with one BUSY member is a genuine wait — the busy agent will complete and
+/// wake its watcher — so every member still defers. An acyclic idle chain
+/// ending in a busy agent defers too.
+#[tokio::test]
+async fn three_cycle_with_busy_member_still_defers() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let d = create_agent(&svc, &ws, "D").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+    svc.register_completion_watch(&ws, &ws, d.clone(), "D".into(), a.clone(), None)
+        .expect("D watches A (acyclic tail)");
+
+    svc.set_test_busy(&b, true);
+    assert!(
+        svc.agent_is_waiting_on_agents(&c),
+        "C's cycle passes through busy B: genuine wait"
+    );
+    assert!(
+        svc.agent_is_waiting_on_agents(&d),
+        "D waits on A, which waits on busy B"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &b).await,
+        0,
+        "C's idle deferred while the cycle has a busy member"
+    );
+    assert_eq!(svc.find_watches_for_child(&c).len(), 1);
+    svc.set_test_busy(&b, false);
+}
+
 /// Agent-waiting deferral (grouped): a parent P delegates child B in an
 /// `after_all` group, and B itself watches C. B idling while it watches C does
 /// NOT record in P's group — the sealed group stays open. When C completes and

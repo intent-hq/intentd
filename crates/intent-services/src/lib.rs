@@ -7499,20 +7499,23 @@ impl Services {
     /// (`after_all`) watches count too: a coordinator idling while its delegation
     /// group is open is genuinely waiting on its children.
     ///
-    /// 2-cycle deadlock guard: a mutual watch pair (A⇄B) in which BOTH sides
-    /// are idle would defer forever — each waits on the other, neither ever
-    /// fires. An outgoing watch on a target that watches this agent back AND is
-    /// itself idle (not busy, empty ready-to-send queue) is therefore NOT
-    /// counted as a waiting reason, so the deadlocked pair delivers as before
-    /// (both watchers fire). A mutual pair whose counterpart is still busy is a
-    /// genuine wait (the busy side will complete and wake this one), so it
-    /// still defers. The guard fails open in one asymmetric case: a
-    /// counterpart that is idle but itself hook-waiting or agent-waiting on a
-    /// third agent is not actually deadlocked (it will run again when its own
-    /// wait resolves), yet the edge is still declassified and this agent's
-    /// watchers fire early. That is the safe direction (an early wake, not a
-    /// stall) — the same class of accepted imprecision as deeper cycles
-    /// (A→B→C→A), which the guard does not detect either.
+    /// Idle-cycle deadlock guard: a closed watch cycle whose members are ALL
+    /// idle would defer forever — each waits on the next, none ever fires.
+    /// The mutual pair (A⇄B) is the 2-member case; deeper cycles
+    /// (A→B→C→A) deadlock the same way (issue intent-hq/intent#7205: idle
+    /// agents left "waiting" indefinitely on persisted cycles). An outgoing
+    /// watch on a target from which a chain of watches leads back to this
+    /// agent, with the target and every intermediate agent idle (not busy,
+    /// empty ready-to-send queue), is therefore NOT counted as a waiting
+    /// reason, so the last idle in the cycle delivers and the cycle unwinds
+    /// one wake per edge. A cycle with a busy (or queued) member is a genuine
+    /// wait (that member will complete and wake its watcher), so it still
+    /// defers, as does an acyclic chain. The guard fails open in one
+    /// asymmetric case: a cycle member that is idle but hook-waiting or
+    /// agent-waiting on an agent OUTSIDE the cycle is not actually
+    /// deadlocked (it will run again when its own wait resolves), yet the
+    /// edge is still declassified and this agent's watchers fire early. That
+    /// is the safe direction (an early wake, not a stall).
     ///
     /// `report_delivered` watches are excluded (issue
     /// intent-hq/monorepo#1643): such a watch has already delivered its
@@ -7538,12 +7541,18 @@ impl Services {
             .into_iter()
             .map(|w| w.child_agent_id)
             .collect();
-        let incoming: Vec<AgentId> = self
-            .find_watches_for_child(agent_id)
-            .into_iter()
-            .map(|w| w.parent_agent_id)
+        if outgoing.is_empty() {
+            return false;
+        }
+        let edges: Vec<(AgentId, AgentId)> = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .map(|w| (w.parent_agent_id.clone(), w.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Durable variant of [`Services::agent_is_waiting_on_agents`]: falls
@@ -7577,38 +7586,66 @@ impl Services {
         if outgoing.is_empty() {
             return false;
         }
-        let incoming: Vec<AgentId> = rows
+        let edges: Vec<(AgentId, AgentId)> = rows
             .iter()
-            .filter(|r| &r.child_agent_id == agent_id)
-            .map(|r| r.parent_agent_id.clone())
+            .map(|r| (r.parent_agent_id.clone(), r.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Core of the agent-waiting classification, shared between the live
     /// in-memory predicate above and the persisted-row fallback used by group
     /// rehydration (which runs before the watch registry is loaded at
-    /// startup). `outgoing` is the agent's outgoing watch targets and
-    /// `incoming` the parents watching it; busy/queue state is probed live in
-    /// both cases (the 2-cycle guard).
+    /// startup). `outgoing` is the agent's waiting (non-`report_delivered`)
+    /// watch targets and `edges` every `(parent, child)` watch edge in the
+    /// graph; busy/queue state is probed live in both cases (the idle-cycle
+    /// guard).
     pub(crate) fn classify_agent_waiting(
         &self,
         agent_id: &AgentId,
         outgoing: &[AgentId],
-        incoming: &[AgentId],
+        edges: &[(AgentId, AgentId)],
     ) -> bool {
         outgoing.iter().any(|target| {
             if target == agent_id {
                 // Defensive: a self-watch is never a waiting reason.
                 return false;
             }
-            let mutual_idle = incoming.contains(target)
-                && !self.agent_is_busy(target.clone())
-                && !self.has_ready_to_send(target);
-            // Count this edge as a waiting reason unless it is a deadlocked
-            // mutual-idle 2-cycle.
-            !mutual_idle
+            // Count this edge as a waiting reason unless it closes a
+            // deadlocked all-idle cycle back to `agent_id`.
+            !self.idle_watch_path_leads_back(agent_id, target, edges)
         })
+    }
+
+    /// Whether a chain of watch `edges` leads from `target` back to
+    /// `agent_id` through agents that are all idle (not busy, empty
+    /// ready-to-send queue), `target` included — i.e. the outgoing edge
+    /// `agent_id → target` closes an all-idle cycle no member can break.
+    fn idle_watch_path_leads_back(
+        &self,
+        agent_id: &AgentId,
+        target: &AgentId,
+        edges: &[(AgentId, AgentId)],
+    ) -> bool {
+        let mut seen: HashSet<&AgentId> = HashSet::new();
+        let mut stack: Vec<&AgentId> = vec![target];
+        while let Some(node) = stack.pop() {
+            if node == agent_id || !seen.insert(node) {
+                continue;
+            }
+            if self.agent_is_busy(node.clone()) || self.has_ready_to_send(node) {
+                continue;
+            }
+            for (parent, child) in edges {
+                if parent == node {
+                    if child == agent_id {
+                        return true;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+        false
     }
 
     /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
@@ -8275,7 +8312,7 @@ impl Services {
     /// agent-waiting idle defers WATCH delivery exactly like a hook-waiting
     /// one (ungrouped watches neither deliver nor retire; grouped memberships
     /// skip the settlement record), classified LIVE at delivery time via
-    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the 2-cycle
+    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the idle-cycle
     /// deadlock guard). Like hook-waiting (monorepo#1483), agent-waiting does
     /// NOT defer the child's OWN `after_all` group seal — an `after_all`
     /// coordinator always holds grouped outgoing watches on its own children,
@@ -8411,7 +8448,7 @@ impl Services {
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
         // will run again when a watched target completes. Classified LIVE at
-        // delivery time (like the hook probe) and with the 2-cycle deadlock
+        // delivery time (like the hook probe) and with the idle-cycle deadlock
         // guard baked into the predicate. This defers WATCH delivery only; it
         // must NOT defer the child's own after_all group seal (see the
         // `interim_idle` vs. `seal_interim` split below): a coordinator that
@@ -8760,7 +8797,7 @@ impl Services {
                 // Unlike the queue-interim case below, grouped watches DO
                 // defer here: a hook-waiting child is bounded by the hook TTL
                 // (§5.40) and an agent-waiting child is bounded by its watched
-                // target's completion (plus the 2-cycle guard), so the group
+                // target's completion (plus the idle-cycle guard), so the group
                 // cannot hang forever. NB this defers this child's record in
                 // ITS parent's group; the child's OWN after_all group seal is
                 // gated separately on `seal_interim` (which excludes
