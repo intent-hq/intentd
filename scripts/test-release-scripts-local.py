@@ -15,8 +15,29 @@ import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 LOADER_PATH = ('LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH')
+# Where the caller's PyYAML may live besides the system site.
+IMPORT_PATH = ('PYTHONPATH',)
+
+
+def child_env(bin_dir, home, preload, **extra_env):
+    """Environment for a child runner: stub-only PATH, fixture HOME.
+
+    The loader path is forwarded so a toolcache python3 still starts
+    (intentd#2490). The fixture HOME would move Python's user site, so the
+    caller's user base is pinned and PYTHONPATH forwarded: a PyYAML installed
+    with `pip install --user` (or reached through PYTHONPATH) must stay
+    importable for the runner. `extra_env` overrides any of these.
+    """
+    environ = {key: os.environ[key] for key in LOADER_PATH + IMPORT_PATH if key in os.environ}
+    environ.update(PATH=str(bin_dir), HOME=str(home), RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(preload))
+    user_base = os.environ.get('PYTHONUSERBASE') or site.getuserbase()
+    if user_base:
+        environ['PYTHONUSERBASE'] = user_base
+    environ.update(extra_env)
+    return environ
 RUNNER = Path(__file__).resolve().with_name('release-scripts-local.py')
 
 CI = '''\
@@ -90,26 +111,36 @@ class RunnerTests(unittest.TestCase):
         target.write_text(f'#!/usr/bin/env bash\necho "{version}"\n')
         target.chmod(0o755)
 
-    def child_env(self, **extra_env):
-        # A minimal PATH isolates the stub tools; the loader path is forwarded so a
-        # toolcache python3 still starts (intentd#2490). The fixture HOME would
-        # move the user site, so the caller's user base is pinned: a
-        # `pip install --user` PyYAML must stay importable for the runner.
-        environ = {key: os.environ[key] for key in LOADER_PATH if key in os.environ}
-        environ.update(PATH=str(self.bin), HOME=str(self.temp),
-                       PYTHONUSERBASE=os.environ.get('PYTHONUSERBASE') or site.getuserbase(),
-                       RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(self.preload), **extra_env)
-        return environ
+    RUNNER_FLAGS = ('-B',)  # No -I/-s: they drop the user site the runner may need for PyYAML.
 
     def run_runner(self, *args, **extra_env):
-        # No -I, which would drop the user site the runner may need for PyYAML.
-        return subprocess.run([sys.executable, '-B', str(RUNNER), '--root', str(self.root), *args],
-                              env=self.child_env(**extra_env), capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, *self.RUNNER_FLAGS, str(RUNNER), '--root', str(self.root), *args],
+                              env=child_env(self.bin, self.temp, self.preload, **extra_env),
+                              capture_output=True, text=True, timeout=60)
 
-    def test_child_runner_keeps_the_callers_user_site(self):
-        probe = subprocess.run([sys.executable, '-B', '-c', 'import site; print(site.getusersitepackages())'],
-                               env=self.child_env(), capture_output=True, text=True, timeout=60)
-        self.assertEqual(probe.stdout.strip(), site.getusersitepackages())
+    def test_child_runner_imports_from_the_callers_user_site(self):
+        # Same interpreter flags and env as run_runner; the user site must be live
+        # on sys.path, not merely computed.
+        expected = site.getusersitepackages()
+        probe = subprocess.run(
+            [sys.executable, *self.RUNNER_FLAGS, '-c',
+             'import site, sys; print(site.ENABLE_USER_SITE, site.getusersitepackages() in sys.path, '
+             'site.getusersitepackages())'],
+            env=child_env(self.bin, self.temp, self.preload), capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        enabled, on_path, path = probe.stdout.split(maxsplit=2)
+        self.assertEqual(path.strip(), expected, probe.stderr)
+        self.assertEqual(enabled, 'True', 'the child runner disables the user site')
+        if os.path.isdir(expected):
+            self.assertEqual(on_path, 'True', f'{expected} is not on the child sys.path')
+
+    def test_child_env_forwards_import_path_and_accepts_overrides(self):
+        with unittest.mock.patch.dict(os.environ, {'PYTHONPATH': '/fixture/py', 'LD_LIBRARY_PATH': '/fixture/lib'}):
+            environ = child_env(self.bin, self.temp, self.preload, PYTHONUSERBASE='/override', HOME='/h')
+        self.assertEqual(environ['PYTHONPATH'], '/fixture/py')
+        self.assertEqual(environ['LD_LIBRARY_PATH'], '/fixture/lib')
+        self.assertEqual(environ['PYTHONUSERBASE'], '/override')
+        self.assertEqual(environ['HOME'], '/h')
 
     def test_runs_every_test_line_in_ci_order_and_fails_on_a_real_failure(self):
         result = self.run_runner()
