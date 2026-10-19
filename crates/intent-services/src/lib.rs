@@ -227,6 +227,7 @@ pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
+mod provider_profiles;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
@@ -1017,6 +1018,10 @@ pub struct Services {
     /// finishes before acquiring this gate to commit the ordinary subset.
     settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
     settings_secret_gates: Arc<settings::SecretSettingsGates>,
+    /// Named provider profile metadata (`<data_dir>/provider-profiles.json`),
+    /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
+    /// the composition root calls [`Services::with_provider_profiles_dir`].
+    provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1715,6 +1720,7 @@ impl Services {
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
+            provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -4697,6 +4703,17 @@ impl Services {
     #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Load named provider profile metadata from
+    /// `<data_dir>/provider-profiles.json` (PROTOCOL §5.54). A malformed file
+    /// is left untouched and `providers.profiles.*` report it unreadable.
+    /// Composition-root only — call before the surface is shared/cloned,
+    /// then run [`Services::sweep_provider_profile_secrets`] once.
+    #[must_use]
+    pub fn with_provider_profiles_dir(mut self, data_dir: &Path) -> Self {
+        self.provider_profiles = Arc::new(provider_profiles::ProviderProfileStore::load(data_dir));
         self
     }
 
@@ -18627,7 +18644,7 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(changes, None))
+        Box::pin(self.settings_update_checking_profiles(changes))
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -18668,6 +18685,35 @@ impl WorkspaceApi for Services {
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
+    }
+
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_list_impl(base_provider_id))
+    }
+
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_create_impl(params))
+    }
+
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_update_impl(profile_id, params))
+    }
+
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_delete_impl(profile_id))
     }
 
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
