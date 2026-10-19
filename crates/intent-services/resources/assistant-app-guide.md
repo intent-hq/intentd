@@ -384,6 +384,10 @@ groups. In list view, **Status** groups workspace statuses in this order:
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
 
+Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
+**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
+activity first within the pinned and unpinned groups.
+
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
