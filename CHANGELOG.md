@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.15] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- *(agents)* Always pin provider, model and reasoning level on conversations ([#2453](https://github.com/intent-hq/intentd/pull/2453))
+
+### 📚 Documentation
+
+- Tell the Assistant how to show other workspaces' images ([#2520](https://github.com/intent-hq/intentd/pull/2520))
+- Explain Home board pin indicators ([#2526](https://github.com/intent-hq/intentd/pull/2526))
+
+
 ## [0.11.14] - 2026-10-19
 
 ### 🚀 Features
