@@ -61,7 +61,7 @@ command -v bwrap >/dev/null 2>&1 ||
   die "bwrap not found: install bubblewrap (Debian/Ubuntu: sudo apt-get install bubblewrap)"
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 names=("${PROVIDER_CLIS[@]}")
 if [[ "${HIDE_NODE:-0}" == 1 ]]; then
@@ -147,8 +147,23 @@ for dir in "${dirs[@]}"; do
     args+=(--ro-bind /dev/null "$real")
   done
 done
+# An empty tmpfs would also hide a checkout (or cwd) living under a provider
+# home, e.g. a Codex worktree in ~/.codex/worktrees: keep that home, whose
+# CLI files are still masked one by one above.
+cwd_real=$(pwd -P)
 for home_dir in "${PROVIDER_HOMES[@]}"; do
-  if [[ -d "$HOME/$home_dir" ]]; then args+=(--tmpfs "$HOME/$home_dir"); fi
+  home_path="$HOME/$home_dir"
+  [[ -d "$home_path" ]] || continue
+  home_real=$(cd "$home_path" && pwd -P)
+  case "$repo_root/" in "$home_real"/*)
+    echo "test-without-provider-clis: keeping $home_path (it contains $repo_root); its CLIs are still masked" >&2
+    continue ;;
+  esac
+  case "$cwd_real/" in "$home_real"/*)
+    echo "test-without-provider-clis: keeping $home_path (it contains $cwd_real); its CLIs are still masked" >&2
+    continue ;;
+  esac
+  args+=(--tmpfs "$home_path")
 done
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/intentd-no-provider-clis.XXXXXX")
@@ -158,6 +173,12 @@ args+=(--setenv INTENTD_USER_SPECIALISTS_DIR "$scratch/user-specialists")
 if [[ "${HIDE_NODE:-0}" == 1 ]]; then
   args+=(--setenv INTENTD_EXPECT_NO_NODE 1)
 fi
+# Set by this script only (not by callers): tells a test runner inside that
+# it really runs sandboxed, and whether the self-check vouched for it, e.g.
+# so resumable gate records keep sandboxed passes separate.
+self_check=checked
+if [[ "${SKIP_SELF_CHECK:-0}" == 1 ]]; then self_check=skipped; fi
+args+=(--setenv INTENTD_PROVIDER_CLIS_HIDDEN "$self_check" --die-with-parent)
 
 echo "test-without-provider-clis: hiding ${#masked[@]} CLI file(s) and provider home folders" >&2
 if [[ "${SKIP_SELF_CHECK:-0}" != 1 ]]; then
@@ -165,4 +186,7 @@ if [[ "${SKIP_SELF_CHECK:-0}" != 1 ]]; then
     -- --ignored --exact provider_cli_guard::no_provider_cli_visible) ||
     die "self-check failed: a provider CLI is still visible (see the test output above)"
 fi
+# Foreground, so a terminal Ctrl-C reaches the whole sandboxed run. A
+# supervisor that signals only this script kills it, and --die-with-parent
+# then tears the sandbox down instead of leaving the run orphaned.
 bwrap "${args[@]}" "$@"
