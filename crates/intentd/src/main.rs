@@ -2128,6 +2128,8 @@ async fn cmd_serve_owned(
         .with_models_cache_dir(&config.data_dir.clone())
         // Named provider profile metadata lives next to config.toml (§5.54).
         .with_provider_profiles_dir(&config.data_dir)
+        // Script output logs, one file per run (`<data_dir>/script-output`).
+        .with_script_output_dir(&config.data_dir)
         .with_event_bus(bus.clone())
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())

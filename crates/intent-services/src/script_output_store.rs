@@ -86,11 +86,19 @@ impl ScriptOutputStore {
     }
 
     /// The store root (`<data_dir>/script-output`).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
     /// The per-run byte cap applied to writers opened from now on.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn max_bytes_per_run(&self) -> u64 {
         self.max_bytes_per_run
     }
@@ -163,6 +171,10 @@ impl ScriptOutputStore {
     }
 
     /// Whether the run's log exists.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn exists(&self, workspace_id: &str, script_id: &str, run_id: &str) -> Result<bool> {
         let path = self.run_path(workspace_id, script_id, run_id)?;
         check_below_root(&self.root, &path, Walk::Read).map_err(|e| io_err(&path, &e))?;
@@ -189,6 +201,29 @@ impl ScriptOutputStore {
         Ok(Some(TailText { text, total_lines }))
     }
 
+    /// At most the trailing `max_bytes` bytes of a run's log, or `None` when
+    /// the run has no log.
+    pub(crate) fn tail_bytes(
+        &self,
+        workspace_id: &str,
+        script_id: &str,
+        run_id: &str,
+        max_bytes: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.run_path(workspace_id, script_id, run_id)?;
+        let Some(mut file) = open_read(&self.root, &path)? else {
+            return Ok(None);
+        };
+        let len = file.metadata().map_err(|e| io_err(&path, &e))?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
+            .map_err(|e| io_err(&path, &e))?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|e| io_err(&path, &e))?;
+        Ok(Some(bytes))
+    }
+
     /// The newest→oldest `{ items, nextToken }` page of a run's log lines —
     /// identical to [`crate::pagination::paginate_text_lines`] over the whole
     /// log, without loading it. A missing log yields an empty page.
@@ -210,6 +245,10 @@ impl ScriptOutputStore {
     }
 
     /// Delete one run's log. A missing log is not an error.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn delete_run(
         &self,
         workspace_id: &str,
@@ -223,12 +262,20 @@ impl ScriptOutputStore {
     }
 
     /// Delete every log of one script. A missing folder is not an error.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn delete_script(&self, workspace_id: &str, script_id: &str) -> Result<()> {
         let dir = self.script_dir(workspace_id, script_id)?;
         remove_tree(&self.root, &dir)
     }
 
     /// Delete every log of one workspace. A missing folder is not an error.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
         let dir = self.workspace_dir(workspace_id)?;
         remove_tree(&self.root, &dir)
@@ -238,6 +285,10 @@ impl ScriptOutputStore {
     /// for which `is_live` returns true, then prune emptied folders.
     /// `max_age == 0` disables the sweep (`scripts.outputRetentionHours = 0`).
     /// Unrecognized entries are left alone; failures are logged and counted.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn sweep(
         &self,
         max_age: Duration,
@@ -312,16 +363,28 @@ impl RunOutputWriter {
     }
 
     /// The log path (empty for a writer disabled by an invalid ID).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     /// Whether appends still reach disk.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn is_enabled(&self) -> bool {
         self.file.is_some()
     }
 
     /// The log's current size in bytes, as tracked by this writer.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired by the script output cleanup change")
+    )]
     pub(crate) fn len(&self) -> u64 {
         self.len
     }

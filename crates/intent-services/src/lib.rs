@@ -240,8 +240,6 @@ mod rtk;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
-// Wired into `script_ops` by the follow-up output-to-disk change.
-#[cfg_attr(not(test), expect(dead_code))]
 mod script_output_store;
 mod search_ops;
 mod sentry_ops;
@@ -905,6 +903,10 @@ pub struct Services {
     /// Shared across clones and manager views: bootstrap serializes per
     /// workspace; definition replacement serializes per durable script id.
     script_locks: script_ops::ScriptLocks,
+    /// On-disk per-run script output logs (`<data_dir>/script-output`). The
+    /// composition root points it at the daemon data dir; until then it uses a
+    /// per-instance temp dir so unconfigured instances never share logs.
+    script_output: script_output_store::ScriptOutputStore,
     /// The `script.*` too-fast-exit floor in milliseconds
     /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
@@ -1705,6 +1707,10 @@ impl Services {
             daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
+            script_output: script_output_store::ScriptOutputStore::new(
+                &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
+                intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+            ),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
@@ -2512,6 +2518,7 @@ impl Services {
             self.script_parks.clone(),
         )
         .with_settings(self.settings_registry.clone())
+        .with_output_store(self.script_output.clone())
         .with_tasks(self.store_tasks.clone())
         .with_owner_services(self.clone())
     }
@@ -4715,6 +4722,23 @@ impl Services {
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
         self
+    }
+
+    /// Store script output logs under `<data_dir>/script-output` (one file
+    /// per run). Composition-root only — call before the surface is shared.
+    #[must_use]
+    pub fn with_script_output_dir(mut self, data_dir: &Path) -> Self {
+        self.script_output = script_output_store::ScriptOutputStore::new(
+            data_dir,
+            intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        );
+        self
+    }
+
+    /// The on-disk script output store.
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by output cleanup"))]
+    pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
+        &self.script_output
     }
 
     /// Load named provider profile metadata from
@@ -20957,6 +20981,7 @@ impl WorkspaceApi for Services {
                 paginate.unwrap_or(false),
                 page_token.as_ref(),
             )
+            .await
         })
     }
 
