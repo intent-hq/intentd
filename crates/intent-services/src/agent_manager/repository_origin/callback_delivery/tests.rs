@@ -8657,13 +8657,19 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 .unwrap();
             let observed = h.rpc("fixture/inspect", json!({})).await;
             assert_eq!(count_requests(&observed, METHOD), 0);
-            assert!(observed["requests"]
+            // No callback or monitoring offer; the only client `_meta` is
+            // the §5.5b worker request claude-code always makes.
+            let meta = &observed["requests"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["method"] == "initialize")
-                .unwrap()["params"]["clientCapabilities"]["_meta"]
-                .is_null());
+                .unwrap()["params"]["clientCapabilities"]["_meta"];
+            assert_eq!(
+                meta.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                Some(vec!["jetbrains".to_string()]),
+                "{meta}"
+            );
             assert!(!h.prompts().await[0].to_string().contains(FACTS));
             h.finish().await;
         }

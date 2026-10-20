@@ -4130,7 +4130,8 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
-        let started = self.start_session_opened(agent_id, cwd, provider).await?;
+        // Boxed: keeps the caller's session-open future frame unchanged.
+        let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
         let workers = self.services.agent_workers();
         if let Some(generation) = workers.current_generation(agent_id) {
             if let Some(snapshot) = workers.bind_session(agent_id, &generation, &started.session_id)
