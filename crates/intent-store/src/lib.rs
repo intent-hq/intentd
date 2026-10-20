@@ -683,25 +683,80 @@ impl Store {
         })
     }
 
+    /// Database page size in bytes (`PRAGMA page_size`), read on the read
+    /// pool so it never queues behind the writer. Used to express freelist
+    /// backlogs in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn page_size(&self) -> Result<i64> {
+        sqlx::query("PRAGMA page_size")
+            .fetch_one(&self.read_pool)
+            .await
+            .map(|row| row.get::<i64, _>(0))
+            .map_err(|e| Error::Internal(format!("page_size failed: {e}")))
+    }
+
     /// Release up to `max_pages` freelist pages back to the filesystem via
     /// `PRAGMA incremental_vacuum(N)`. Only effective when the database has
     /// `auto_vacuum = INCREMENTAL` (a no-op otherwise — see [`connect_write`]
-    /// for the activation story). Bounded `N` keeps each call short so the
-    /// single-connection write pool is never held for long; call it
-    /// periodically (e.g. after retention sweeps) to reclaim space
-    /// incrementally. Returns the number of pages actually freed.
+    /// for the activation story). Returns the number of pages actually freed.
+    ///
+    /// The per-page cost grows with the database (4–7 ms/page on a 33 GB
+    /// file, intent-hq/intent#7448), so a fixed `max_pages` does NOT bound
+    /// how long the single-connection write pool is held; periodic callers
+    /// should use [`Self::incremental_vacuum_chunk`] with a time-paced chunk
+    /// size instead.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
-        let before = self.freelist_count().await?;
+        self.incremental_vacuum_chunk(max_pages)
+            .await
+            .map(|chunk| chunk.pages_freed)
+    }
+
+    /// One bounded `PRAGMA incremental_vacuum(max_pages)` step, run with the
+    /// freelist reads on a single acquired write connection (one pool
+    /// acquisition per chunk), which is returned to the pool before this
+    /// method returns so queued writers can run between chunks. `elapsed`
+    /// times only the vacuum statement — the caller paces the next chunk
+    /// from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the acquisition or any statement fails.
+    pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
+        let mut conn = self
+            .write_pool
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("incremental_vacuum acquire failed: {e}")))?;
+        let freelist = |row: sqlx::sqlite::SqliteRow| row.get::<i64, _>(0);
+        let before = sqlx::query("PRAGMA freelist_count")
+            .fetch_one(&mut *conn)
+            .await
+            .map(freelist)
+            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))?;
+        let started = std::time::Instant::now();
         sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
-            .execute(&self.write_pool)
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
-        let after = self.freelist_count().await?;
-        Ok((before - after).max(0).cast_unsigned())
+        let elapsed = started.elapsed();
+        let after = sqlx::query("PRAGMA freelist_count")
+            .fetch_one(&mut *conn)
+            .await
+            .map(freelist)
+            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))?;
+        drop(conn);
+        Ok(VacuumChunk {
+            pages_freed: (before - after).max(0).cast_unsigned(),
+            freelist_remaining: after.max(0).cast_unsigned(),
+            elapsed,
+        })
     }
 
     /// Run `PRAGMA optimize` on the write connection. Cheap when called
@@ -780,6 +835,18 @@ impl Store {
                 .collect();
         Ok(MigrationStatus { expected, applied })
     }
+}
+
+/// Outcome of one [`Store::incremental_vacuum_chunk`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumChunk {
+    /// Freelist pages released back to the filesystem by this step.
+    pub pages_freed: u64,
+    /// Freelist pages still waiting after this step.
+    pub freelist_remaining: u64,
+    /// Wall time of the `PRAGMA incremental_vacuum` statement alone — the
+    /// span the single write connection was busy vacuuming.
+    pub elapsed: std::time::Duration,
 }
 
 /// Outcome of [`Store::activate_incremental_vacuum`].

@@ -6080,13 +6080,6 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
-/// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
-/// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —
-/// enough to keep up with sweep-driven churn while keeping each call short on
-/// the single-connection write pool. A large backlog (e.g. the dev seat's
-/// ~54k free pages) drains over successive ticks instead of one long stall.
-const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
-
 /// Spawn the periodic retention/compaction sweep (§10.2 / finding F4). When
 /// `stream_retention_hours > 0` each tick deletes high-volume ephemeral
 /// events (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
@@ -6104,11 +6097,14 @@ const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
 /// sweeps themselves are [`intent_services::retention::run_retention_tick`]
 /// (testable in isolation with a fixed `now`); this loop owns only the timer
 /// and the pool maintenance. After
-/// the sweeps each tick runs a bounded `PRAGMA incremental_vacuum`
-/// ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to release freelist pages back to the
-/// filesystem (effective on incremental-auto-vacuum databases; a no-op
-/// otherwise — see `intent_store::connect_write` for the activation story)
-/// and `PRAGMA optimize` to keep planner statistics current. The sweep
+/// the sweeps each tick runs a time-paced freelist drain
+/// ([`intent_services::retention::run_incremental_vacuum_drain`]): short
+/// `PRAGMA incremental_vacuum` chunks that each hold the single write
+/// connection for ≈250 ms at most, with pauses between them so queued writes
+/// run, for up to 1/6 of the tick interval (intent-hq/intent#7448; effective
+/// on incremental-auto-vacuum databases, a no-op otherwise — see
+/// `intent_store::connect_write` for the activation story), then
+/// `PRAGMA optimize` to keep planner statistics current. The sweep
 /// interval is derived from the event TTL (≈4×/TTL), clamped so long TTLs
 /// still sweep periodically and short ones do not busy-loop; with the event
 /// sweep disabled it is the hourly ceiling. A failed sweep is logged and
@@ -6136,6 +6132,7 @@ fn spawn_stream_retention_loop(
         );
         interval
     };
+    let vacuum_policy = intent_services::retention::VacuumDrainPolicy::for_tick_interval(interval);
     intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -6149,21 +6146,48 @@ fn spawn_stream_retention_loop(
                 &settings.effective,
             )
             .await;
-            match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
-                Ok(freed) if freed > 0 => {
-                    tracing::info!(
-                        pages_freed = freed,
-                        "incremental vacuum released freelist pages"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "incremental vacuum failed"),
-            }
+            let drain =
+                intent_services::retention::run_incremental_vacuum_drain(&store, vacuum_policy)
+                    .await;
+            log_incremental_vacuum_drain(&store, &drain).await;
             if let Err(e) = store.optimize().await {
                 tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
     })
+}
+
+/// Log one retention tick's freelist drain: freed pages, chunk pacing, and
+/// the remaining backlog with a ticks-to-drain estimate, so a large
+/// freelist (intent-hq/intent#7448: 15.9 GB) is visible in the daemon log.
+/// Silent when nothing was freed (an empty freelist, or a database still in
+/// `auto_vacuum = NONE`; a failed chunk is warned about by the drain).
+async fn log_incremental_vacuum_drain(
+    store: &Store,
+    drain: &intent_services::retention::VacuumDrainOutcome,
+) {
+    if drain.pages_freed == 0 {
+        return;
+    }
+    let remaining = drain.freelist_remaining.unwrap_or(0);
+    let page_size = store
+        .page_size()
+        .await
+        .unwrap_or(4096)
+        .max(0)
+        .cast_unsigned();
+    tracing::info!(
+        pages_freed = drain.pages_freed,
+        chunks = drain.chunks,
+        active_ms = drain.active.as_millis(),
+        max_chunk_ms = drain.max_chunk.as_millis(),
+        ms_per_page = drain.ms_per_page.map(|ms| format!("{ms:.3}")),
+        freelist_pages = remaining,
+        freelist_bytes = remaining.saturating_mul(page_size),
+        ticks_to_drain = drain.ticks_to_drain(),
+        stop = ?drain.stop,
+        "incremental vacuum released freelist pages"
+    );
 }
 
 /// Spawn the periodic idempotency-key reaper (design note TB-0 §5.4). Runs
