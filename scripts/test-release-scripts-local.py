@@ -229,10 +229,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('ran test-env.sh FOO=one BAR=two PWD=sub', result.stdout)
 
     def git(self, *args):
-        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-        env.update(HOME=str(self.temp), GIT_CONFIG_NOSYSTEM='1')
-        return subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=t', '-c', 'user.email=t@t',
-                               *args], env=env, capture_output=True, text=True, check=True).stdout
+        # The caller's git config must not reach the fixture: a global ignore of
+        # __pycache__ would hide the very file the test looks for.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith('GIT_') and key != 'XDG_CONFIG_HOME'}
+        env.update(HOME=str(self.temp), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        config = ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', f'core.excludesFile={os.devnull}',
+                  '-c', 'commit.gpgsign=false']
+        return subprocess.run(['git', '-C', str(self.root), *config, *args],
+                              env=env, capture_output=True, text=True, check=True).stdout
 
     def test_suites_leave_no_untracked_files(self):
         # A suite that imports a sibling module would leave scripts/__pycache__
