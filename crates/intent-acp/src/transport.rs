@@ -409,6 +409,22 @@ struct WriteFences {
     count: AtomicUsize,
 }
 
+/// Disarms a fence whose line never made it into the outbound queue.
+struct FenceArmGuard<'a> {
+    fences: &'a WriteFences,
+    id: i64,
+    /// Cleared once the line is queued: the writer owns the entry from then.
+    armed: bool,
+}
+
+impl Drop for FenceArmGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fences.disarm(self.id);
+        }
+    }
+}
+
 /// Just the id of an outbound request line.
 #[derive(serde::Deserialize)]
 struct LineId {
@@ -425,15 +441,18 @@ impl WriteFences {
         }
     }
 
-    fn disarm(&self, id: i64) {
-        if self.by_id.lock().unwrap().remove(&id).is_some() {
+    fn disarm(&self, id: i64) -> Option<Arc<AtomicBool>> {
+        let fence = self.by_id.lock().unwrap().remove(&id);
+        if fence.is_some() {
             self.count.fetch_sub(1, Ordering::SeqCst);
         }
+        fence
     }
 
     /// Whether `line` is a fenced request whose fence is revoked; if so its
-    /// pending caller is failed. Ordinary lines are not parsed unless a
-    /// fenced request is outstanding.
+    /// pending caller (if still waiting) is failed. The writer consumes the
+    /// fence entry either way: it is the queued line's owner. Ordinary lines
+    /// are not parsed unless a fenced request is outstanding.
     fn revoked_at_write(&self, line: &str, pending: &PendingMap) -> bool {
         if self.count.load(Ordering::SeqCst) == 0 {
             return false;
@@ -442,10 +461,7 @@ impl WriteFences {
             return false;
         };
         let revoked = self
-            .by_id
-            .lock()
-            .unwrap()
-            .get(&id)
+            .disarm(id)
             .is_some_and(|fence| fence.load(Ordering::SeqCst));
         if revoked {
             if let Some(request) = pending.lock().unwrap().remove(&id) {
@@ -1160,7 +1176,8 @@ impl Connection {
             self.review_monitoring.lock().unwrap().retire();
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.request_with_id(id, method, params, timeout).await
+        self.request_with_id(id, method, params, timeout, None)
+            .await
     }
 
     /// [`Connection::request_timeout`] bound to a revocable write fence: the
@@ -1187,10 +1204,12 @@ impl Connection {
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.write_fences.arm(id, fence);
-        let result = self.request_with_id(id, method, params, timeout).await;
-        self.write_fences.disarm(id);
-        result
+        // The fence travels with the queued line: once enqueued only the
+        // writer removes it (when it writes or withholds the line), so a
+        // timeout, an error or a dropped caller can never leave the line
+        // queued without its fence.
+        self.request_with_id(id, method, params, timeout, Some(fence))
+            .await
     }
 
     pub(crate) async fn initialize_recipient(
@@ -1201,7 +1220,7 @@ impl Connection {
         let generation = self.review_monitoring.lock().unwrap().begin();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let response = self
-            .request_with_id(id, "initialize", params, timeout)
+            .request_with_id(id, "initialize", params, timeout, None)
             .await?;
         Ok((response, generation))
     }
@@ -1237,7 +1256,9 @@ impl Connection {
             self.review_monitoring.lock().unwrap().retire();
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let result = self.request_with_id(id, method, params, timeout).await;
+        let result = self
+            .request_with_id(id, method, params, timeout, None)
+            .await;
         if matches!(result, Err(AcpError::Timeout(_))) {
             let (cancel_method, cancel_params) = cancel(id);
             if let Err(e) = self.try_notify(&cancel_method, &cancel_params) {
@@ -1276,6 +1297,7 @@ impl Connection {
         method: &str,
         params: Value,
         timeout: Duration,
+        fence: Option<Arc<AtomicBool>>,
     ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -1303,8 +1325,22 @@ impl Connection {
         }
 
         let line = encode_message(Some(id), method, &params)?;
+        // Arm right before enqueueing. Until the line is queued the guard
+        // disarms on every exit (closed writer, a dropped caller); after it
+        // is queued the writer owns the fence entry.
+        let mut armed = fence.map(|fence| {
+            self.write_fences.arm(id, fence);
+            FenceArmGuard {
+                fences: &self.write_fences,
+                id,
+                armed: true,
+            }
+        });
         if self.writer_tx.send(line).await.is_err() {
             return Err(AcpError::Transport("writer task closed".to_string()));
+        }
+        if let Some(guard) = armed.as_mut() {
+            guard.armed = false;
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -2917,6 +2953,63 @@ mod write_fence_tests {
             conn.write_fences.count.load(Ordering::SeqCst),
             0,
             "fence disarmed after the answer"
+        );
+    }
+
+    /// A fenced request whose caller gave up (timeout) or was cancelled
+    /// while its line was still queued keeps its fence: revoking it later
+    /// still withholds the write.
+    #[tokio::test]
+    async fn a_timed_out_or_cancelled_fenced_request_stays_fenced_in_the_queue() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let timed_out_fence = Arc::new(AtomicBool::new(false));
+        let timed_out = conn
+            .request_fenced(
+                "stop/timed-out",
+                json!({}),
+                Duration::from_millis(200),
+                Arc::clone(&timed_out_fence),
+            )
+            .await;
+        assert!(
+            matches!(timed_out, Err(AcpError::Timeout(_))),
+            "{timed_out:?}"
+        );
+        let cancelled_fence = Arc::new(AtomicBool::new(false));
+        let cancelled = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&cancelled_fence));
+            tokio::spawn(async move {
+                conn.request_fenced("stop/cancelled", json!({}), Duration::from_secs(30), fence)
+                    .await
+            })
+        };
+        // timing-guard: let the cancelled request's line reach the queue first
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancelled.abort();
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            2,
+            "both queued lines keep their fences"
+        );
+        timed_out_fence.store(true, Ordering::SeqCst);
+        cancelled_fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(
+            !written.contains("stop/timed-out"),
+            "timed-out line was written: {written}"
+        );
+        assert!(
+            !written.contains("stop/cancelled"),
+            "cancelled line was written: {written}"
+        );
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            0,
+            "the writer consumed both fences"
         );
     }
 }
