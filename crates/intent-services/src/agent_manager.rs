@@ -13066,10 +13066,10 @@ fn resolve_spawn(
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
-    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // (`npx_only_honors_path_override`; none today) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
-    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for codex/pi — is ignored.
+    // directly in place of the pinned npx spawn (monorepo#4352); otherwise
+    // any override is ignored. Tests use `test_support::provider_installed`.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -13098,12 +13098,15 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
-        // Test-only: the `agent_ops::TEST_RUNNABLE_PATH` marker stands in for
-        // a host npx so pure resolution tests do not depend on Node/npx.
+        // Test-only: a provider marked by `test_support::provider_installed`
+        // gets a placeholder npx, so pure resolution tests do not depend on
+        // the host's Node/npx.
         #[cfg(test)]
         let npx = npx.or_else(|| {
-            (read_provider_path_setting(settings, provider.id).as_deref()
-                == Some(crate::agent_ops::TEST_RUNNABLE_PATH))
+            crate::test_support::provider_installed::is_marked(
+                &settings.providers.paths,
+                provider.id,
+            )
             .then(|| std::path::PathBuf::from("npx"))
         });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;

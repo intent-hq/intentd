@@ -1181,15 +1181,6 @@ pub(crate) fn resolve_disabled_provider_rehome(
     Some(DisabledProviderRehome { provider, model })
 }
 
-/// Test-only `providers.paths` value marking a base provider installed for
-/// [`ensure_provider_available`]. Codex and Claude Code are npx-only and ignore
-/// path overrides, so without it their availability follows the host's
-/// Node/npx. Being settings data, it reaches every call site (including the
-/// `spawn_blocking` delegate resolver) per `Services` instance, without
-/// mutating process-global `PATH`. The disabled and auth gates still run.
-#[cfg(test)]
-pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
-
 /// Reject a known provider id that is disabled in settings, whose cached
 /// auth verdict is hard-false, or that the daemon's own provider discovery
 /// reports as unrunnable (not installed, or gated off by a missing env
@@ -1201,9 +1192,11 @@ pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
 /// with its own distinct message. Mirrors `resolve_spawn`'s override-aware resolution
 /// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
 /// by the same `providers.paths` settings, and aligns "installed" with what
-/// the spawn path can actually run: a provider whose only runnable path is
-/// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
-/// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
+/// the spawn path can actually run. npx-only providers (Codex, Claude Code,
+/// Pi) are installed only when npx resolves and, for Codex and Claude Code,
+/// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
+/// a `providers.paths` override changes neither. Tests mark a provider
+/// installed with `test_support::provider_installed`, never with an override.
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
@@ -1215,19 +1208,19 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    #[cfg(test)]
-    if providers
-        .paths
-        .get(intent_providers::base_provider_id(provider_id))
-        .is_some_and(|path| path == TEST_RUNNABLE_PATH)
-    {
-        return Ok(());
-    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
         &|key| providers.paths.get(key).cloned(),
     );
+    // Test-only: a provider marked by `test_support::provider_installed`
+    // counts as installed; feature gating still applies.
+    #[cfg(test)]
+    let availability = availability.map(|mut availability| {
+        availability.installed |=
+            crate::test_support::provider_installed::is_marked(&providers.paths, provider_id);
+        availability
+    });
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
