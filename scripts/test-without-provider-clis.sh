@@ -103,7 +103,11 @@ fi
 volta_home=${volta_home:-$HOME/.volta}
 dirs+=(/usr/local/bin /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin /usr/local/opt/node/bin)
 dirs+=("$volta_home/bin")
-for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims; do
+# User-local tool dirs plus the native installer tiers discovery probes
+# directly (find_provider_binary: ~/.grok/bin, ~/.opencode/bin,
+# ~/.augment/bin), so their CLIs are masked even when the provider home
+# itself is kept below.
+for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims .grok/bin .opencode/bin .augment/bin; do
   dirs+=("$HOME/$sub")
 done
 for dir in "$HOME"/.nvm/versions/node/*/bin; do
@@ -132,20 +136,34 @@ fi
 
 args=(--dev-bind / /)
 declare -A masked=()
+candidates=()
 for dir in "${dirs[@]}"; do
   [[ -n "$dir" && -d "$dir" ]] || continue
   for name in "${names[@]}"; do
-    candidate="$dir/$name"
-    [[ -e "$candidate" ]] || continue
-    real=$(readlink -f "$candidate")
-    [[ -f "$real" && -z "${masked[$real]:-}" ]] || continue
-    if [[ -n "${kept[$real]:-}" ]]; then
-      echo "test-without-provider-clis: cannot hide $candidate: it shares $real with Node (the self-check will report it)" >&2
-      continue
-    fi
-    masked[$real]=1
-    args+=(--ro-bind /dev/null "$real")
+    candidates+=("$dir/$name")
   done
+done
+# auggie's install record (~/.augment/auggie-path): the first non-blank line
+# names the binary discovery runs (auggie_marker_path_with_home).
+if [[ -f "$HOME/.augment/auggie-path" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ -n "$line" ]]; then
+      if [[ "$line" == /* ]]; then candidates+=("$line"); fi
+      break
+    fi
+  done <"$HOME/.augment/auggie-path"
+fi
+for candidate in "${candidates[@]}"; do
+  [[ -e "$candidate" ]] || continue
+  real=$(readlink -f "$candidate")
+  [[ -f "$real" && -z "${masked[$real]:-}" ]] || continue
+  if [[ -n "${kept[$real]:-}" ]]; then
+    echo "test-without-provider-clis: cannot hide $candidate: it shares $real with Node (the self-check will report it)" >&2
+    continue
+  fi
+  masked[$real]=1
+  args+=(--ro-bind /dev/null "$real")
 done
 # An empty tmpfs would also hide a checkout (or cwd) living under a provider
 # home, e.g. a Codex worktree in ~/.codex/worktrees: keep that home, whose
@@ -178,7 +196,10 @@ fi
 # so resumable gate records keep sandboxed passes separate.
 self_check=checked
 if [[ "${SKIP_SELF_CHECK:-0}" == 1 ]]; then self_check=skipped; fi
-args+=(--setenv INTENTD_PROVIDER_CLIS_HIDDEN "$self_check" --die-with-parent)
+# A PID namespace (with its own /proc) so that when this script is killed,
+# --die-with-parent takes down the whole tree (cargo, nextest, test daemons),
+# not just the immediate command.
+args+=(--setenv INTENTD_PROVIDER_CLIS_HIDDEN "$self_check" --unshare-pid --proc /proc --die-with-parent)
 
 echo "test-without-provider-clis: hiding ${#masked[@]} CLI file(s) and provider home folders" >&2
 if [[ "${SKIP_SELF_CHECK:-0}" != 1 ]]; then
