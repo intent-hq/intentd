@@ -2544,6 +2544,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `agent.workers.list` (PROTOCOL §5.5b): the agent's complete
+    /// `WorkerSnapshot` — a memory-only read, never a provider call.
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.list".into())) })
+    }
+
+    /// `agent.workers.stop` (PROTOCOL §5.5b): ask the provider to stop one
+    /// worker of `connection_generation`; `{ asyncTaskId, stopped }`.
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, connection_generation, async_task_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.stop".into())) })
+    }
+
     /// `agent.stop`: cancel an in-flight stream; `{ success: true }` (PROTOCOL §5.5).
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = agent_id;

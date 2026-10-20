@@ -12,6 +12,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
+
 use agent_client_protocol::schema::v1::{
     AuthMethodId, AuthenticateRequest, ClientCapabilities, ClientSessionCapabilities,
     FileSystemCapabilities, Implementation, InitializeRequest, InitializeResponse,
@@ -116,7 +118,8 @@ pub async fn handshake_with_review_monitoring(
     offer: CallbackOffer,
     monitoring: ReviewMonitoringOffer,
 ) -> AcpResult<CallbackHandshake> {
-    let (initialize, generation) = initialize_with_offers(&conn, offer, monitoring).await?;
+    let (initialize, generation) =
+        initialize_with_offers(&conn, offer, monitoring, provider.requests_agent_workers).await?;
     let authenticated = authenticate(&conn, provider).await?;
     let generation = (offer == CallbackOffer::V1
         && monitoring == ReviewMonitoringOffer::V1
@@ -146,7 +149,7 @@ async fn initialize_with_offer(
     conn: &Connection,
     offer: CallbackOffer,
 ) -> AcpResult<InitializeResponse> {
-    initialize_with_offers(conn, offer, ReviewMonitoringOffer::Disabled)
+    initialize_with_offers(conn, offer, ReviewMonitoringOffer::Disabled, false)
         .await
         .map(|(result, _)| result)
 }
@@ -155,6 +158,7 @@ async fn initialize_with_offers(
     conn: &Connection,
     offer: CallbackOffer,
     monitoring: ReviewMonitoringOffer,
+    agent_workers: bool,
 ) -> AcpResult<(InitializeResponse, Arc<Generation>)> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
@@ -168,12 +172,21 @@ async fn initialize_with_offers(
         .client_info(Implementation::new(CLIENT_NAME, env!("CARGO_PKG_VERSION")));
 
     let mut params = serde_json::to_value(&request)?;
+    let mut meta = serde_json::Map::new();
     if offer == CallbackOffer::V1 {
-        params["clientCapabilities"]["_meta"] = serde_json::json!({META_KEY: {"version": 1}});
+        meta.insert(META_KEY.into(), serde_json::json!({"version": 1}));
     }
     if offer == CallbackOffer::V1 && monitoring == ReviewMonitoringOffer::V1 {
-        params["clientCapabilities"]["_meta"][crate::review_monitoring::META_KEY] =
-            serde_json::json!(1);
+        meta.insert(
+            crate::review_monitoring::META_KEY.into(),
+            serde_json::json!(1),
+        );
+    }
+    if agent_workers {
+        crate::workers::request_async_tasks(&mut meta);
+    }
+    if !meta.is_empty() {
+        params["clientCapabilities"]["_meta"] = Value::Object(meta);
     }
     let (result, generation) = conn
         .initialize_recipient(params, initialize_timeout())

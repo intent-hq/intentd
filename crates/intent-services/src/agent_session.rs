@@ -902,6 +902,17 @@ impl Transcript {
     /// block), or `None` when the id was never seen. ACP `tool_call_update`s
     /// are name-less — the name only arrives on the first `tool_call` — so
     /// the completion-side registry claim resolves the name here.
+    /// The status recorded for a known tool call.
+    fn tool_status_for(&self, tool_call_id: &str) -> Option<&'static str> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        match self.blocks[i]["metadata"]["status"].as_str()? {
+            "completed" => Some("completed"),
+            "error" => Some("error"),
+            "started" => Some("started"),
+            _ => None,
+        }
+    }
+
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
@@ -6304,7 +6315,14 @@ impl Services {
                 }
                 return false;
             }
-            MappedUpdate::ToolCall(tc) => {
+            MappedUpdate::ToolCall(mut tc) => {
+                // §5.5b: a backgrounded marker without an explicit status
+                // keeps the tool's recorded status (never reopens it).
+                if tc.keeps_status {
+                    if let Some(status) = transcript.tool_status_for(&tc.tool_call_id) {
+                        tc.status = status;
+                    }
+                }
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
                 // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit

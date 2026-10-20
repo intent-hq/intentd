@@ -314,6 +314,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "rate-limited" })),
         },
+        ref e @ Error::ProviderRequest(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "provider-error" })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -2539,6 +2544,22 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
+        }
+        "agent.workers.list" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            api.agent_workers_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "agent.workers.stop" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            let generation = require_wire_id(params, "connectionGeneration")?;
+            let task = require_wire_id(params, "asyncTaskId")?;
+            api.agent_workers_stop(ws, agent, generation, task)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.stop" => {
             let agent_id = require_agent_id(params)?;
@@ -5311,6 +5332,25 @@ fn merge_user_app_message_id(
 }
 
 /// Require a string param, mirroring TS `requireParam` (undefined/null → error).
+/// The §5.5b wire-ID rule: a nonempty string of at most 256 UTF-8 bytes
+/// without ASCII control characters.
+pub(crate) fn wire_id(params: &Map<String, Value>, name: &str) -> Option<String> {
+    match params.get(name) {
+        Some(Value::String(s)) if intent_services::is_wire_id(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Require a §5.5b wire ID (`-32602` `invalid-params` otherwise).
+fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
+    match wire_id(params, name) {
+        Some(s) => Ok(s),
+        _ => Err(invalid_params(format!(
+            "{name} must be a nonempty string of at most 256 bytes without control characters"
+        ))),
+    }
+}
+
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),
