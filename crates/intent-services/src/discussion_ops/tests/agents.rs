@@ -430,3 +430,455 @@ async fn discussion_agent_handoff_survives_cancelled_request_and_does_not_transf
         "local discussion references must not replay after transfer"
     );
 }
+
+#[tokio::test]
+async fn discussion_activity_controls_are_correlated_idempotent_and_durable() {
+    use intent_core::discussion::DiscussionAgentControl;
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-activity").await;
+    let target = addressed(std::slice::from_ref(&a));
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "activity", "work", &target),
+    )
+    .await
+    .unwrap();
+    let other = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "other-activity", "other work", &target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.message.agent_activity[0].state, "queued");
+    assert!(
+        svc.dequeue_ready_batch(&a, false, 2).is_none(),
+        "discussion requests must not share a provider turn"
+    );
+    let queued_id = svc.queue_snapshot(&a)[0]["id"].as_str().unwrap().to_owned();
+    assert!(with_caller(
+        human(&people[1].id),
+        svc.agent_edit_queued_message_op(a.clone(), queued_id.clone(), "changed".into(), None),
+    )
+    .await
+    .is_err());
+    assert!(with_caller(
+        human(&people[1].id),
+        svc.agent_remove_queued_message_op(a.clone(), queued_id),
+    )
+    .await
+    .is_err());
+    assert!(
+        !svc.clear_queue(&a),
+        "unrelated regeneration retains discussion work"
+    );
+    assert_eq!(svc.queue_snapshot(&a).len(), 2);
+    let request = DiscussionAgentControl {
+        workspace_id: ws.clone(),
+        conversation_id: "default".into(),
+        message_id: sent.message.id.clone(),
+        agent_id: a.clone(),
+        attempt: 1,
+    };
+    assert!(with_caller(
+        as_agent(&a),
+        svc.discussion_control_op(request.clone(), false)
+    )
+    .await
+    .is_err());
+    let stopped = with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request.clone(), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped["activity"]["state"], "stopped");
+    assert_eq!(svc.queue_snapshot(&a).len(), 1);
+    assert_eq!(
+        svc.queue_snapshot(&a)[0]["messageMetadata"]["discussionMessageId"],
+        other.message.id
+    );
+    let (left, right) = tokio::join!(
+        with_caller(
+            human(&people[1].id),
+            svc.discussion_control_op(request.clone(), true)
+        ),
+        with_caller(
+            human(&people[1].id),
+            svc.discussion_control_op(request.clone(), true)
+        )
+    );
+    let retried = left.unwrap();
+    assert_eq!(retried, right.unwrap());
+    assert_eq!(retried["activity"]["attempt"], 2);
+    assert_eq!(svc.queue_snapshot(&a).len(), 2);
+    assert_eq!(
+        with_caller(
+            human(&people[1].id),
+            svc.discussion_control_op(request.clone(), false)
+        )
+        .await
+        .unwrap(),
+        retried,
+        "stale Stop must not touch retry"
+    );
+    let current = svc
+        .store
+        .discussion_activity(&ws, "default", &sent.message.id, &a)
+        .await
+        .unwrap();
+    assert!(
+        svc.store
+            .transition_discussion_activity(
+                &format!("discussion:{}:{}", sent.message.id, a),
+                "completed",
+                None
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "stale completion cannot settle retry"
+    );
+    svc.set_discussion_activity(&current.turn_id, "working", None)
+        .await;
+    svc.set_discussion_activity(&current.turn_id, "failed", Some("provider unavailable"))
+        .await;
+    let current = svc
+        .store
+        .discussion_activity(&ws, "default", &sent.message.id, &a)
+        .await
+        .unwrap();
+    assert_eq!(current.activity.state, "failed");
+    assert!(current.activity.version > retried["activity"]["version"].as_i64().unwrap());
+    let history = with_caller(
+        human(&people[1].id),
+        svc.discussion_history_op(&ws, "default", None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        history["messages"].as_array().unwrap().len(),
+        2,
+        "Retry never inserts another human discussion message"
+    );
+    assert_eq!(
+        history["messages"][0]["agentActivity"][0]["error"],
+        "provider unavailable"
+    );
+    assert_eq!(
+        with_caller(
+            human(&people[1].id),
+            svc.discussion_control_op(request, true)
+        )
+        .await
+        .unwrap()["activity"]["attempt"],
+        2,
+        "repeated old Retry cannot create attempt3"
+    );
+    svc.store.recover_discussion_activity().await.unwrap();
+    assert_eq!(
+        svc.store
+            .discussion_activity(&ws, "default", &sent.message.id, &a)
+            .await
+            .unwrap()
+            .activity
+            .state,
+        "failed"
+    );
+}
+
+#[tokio::test]
+async fn discussion_activity_restart_stops_working_and_retains_queued() {
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-restart-activity").await;
+    let target = addressed(std::slice::from_ref(&a));
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "running", "work", &target),
+    )
+    .await
+    .unwrap();
+    let queued = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "queued", "next work", &target),
+    )
+    .await
+    .unwrap();
+    let active = svc
+        .store
+        .discussion_activity(&ws, "default", &sent.message.id, &a)
+        .await
+        .unwrap();
+    svc.set_discussion_activity(&active.turn_id, "working", None)
+        .await;
+    sqlx::query("INSERT INTO interrupted_agent(agent_id,workspace_id,prev_status,interrupted_at,resolution) VALUES(?,?,'active',?,'pending')").bind(a.as_str()).bind(ws.as_str()).bind(intent_core::now_iso()).execute(svc.store.write_pool()).await.unwrap();
+    let svc = Services::new(svc.store.clone());
+    svc.rehydrate_agent_queues().await.unwrap();
+    let resolution: String =
+        sqlx::query_scalar("SELECT resolution FROM interrupted_agent WHERE agent_id=?")
+            .bind(a.as_str())
+            .fetch_one(svc.store.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        resolution, "abandoned",
+        "generic restart continuation must not replay stopped discussion work"
+    );
+    assert_eq!(svc.queue_snapshot(&a).len(), 1);
+    assert_eq!(
+        svc.queue_snapshot(&a)[0]["messageMetadata"]["discussionMessageId"],
+        queued.message.id
+    );
+    let interrupted = svc
+        .store
+        .discussion_activity(&ws, "default", &sent.message.id, &a)
+        .await
+        .unwrap();
+    assert_eq!(interrupted.activity.state, "stopped");
+    assert_eq!(
+        interrupted.activity.error.as_deref(),
+        Some("Interrupted by daemon restart.")
+    );
+    let version = interrupted.activity.version;
+    svc.rehydrate_agent_queues().await.unwrap();
+    assert_eq!(
+        svc.store
+            .discussion_activity(&ws, "default", &sent.message.id, &a)
+            .await
+            .unwrap()
+            .activity
+            .version,
+        version
+    );
+}
+
+#[tokio::test]
+async fn discussion_mentions_snapshot_utf16_and_exact_retry_are_enforced() {
+    use intent_core::discussion::DiscussionAgentMention;
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-mention").await;
+    let mut target = addressed(std::slice::from_ref(&a));
+    target.agent_mentions = vec![DiscussionAgentMention {
+        agent_id: a.clone(),
+        name: "Helper".into(),
+        start: 3,
+        end: 10,
+    }];
+    let body = "🦀 @Helper please review";
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "mention", body, &target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.message.agent_mentions, target.agent_mentions);
+    target.agent_mentions.clear();
+    assert!(
+        with_caller(
+            human(&people[1].id),
+            svc.discussion_send_to_op(&ws, "mention", body, &target)
+        )
+        .await
+        .is_err(),
+        "same retry key must preserve selected spans"
+    );
+    target.agent_mentions = sent.message.agent_mentions;
+    target.agent_mentions[0].start = 2;
+    assert!(with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "bad-span", body, &target)
+    )
+    .await
+    .is_err());
+    target.agent_mentions[0].start = 3;
+    target.recipient_agent_ids.clear();
+    assert!(with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "no-recipient", body, &target)
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn discussion_control_survives_cancelled_request_and_retry_rolls_back_atomically() {
+    use intent_core::discussion::DiscussionAgentControl;
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-control-cancel").await;
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(
+            &ws,
+            "control-cancel",
+            "work",
+            &addressed(std::slice::from_ref(&a)),
+        ),
+    )
+    .await
+    .unwrap();
+    let request = DiscussionAgentControl {
+        workspace_id: ws.clone(),
+        conversation_id: "default".into(),
+        message_id: sent.message.id.clone(),
+        agent_id: a.clone(),
+        attempt: 1,
+    };
+    let gate = svc.agent_queue_persist_gate.lock().await;
+    {
+        let control = with_caller(
+            human(&people[1].id),
+            svc.discussion_control_op(request.clone(), false),
+        );
+        tokio::pin!(control);
+        tokio::select! {
+            biased;
+            result=&mut control=>panic!("control must wait for gate: {result:?}"),
+            ()=std::future::ready(())=>{}
+        }
+    }
+    drop(gate);
+    // Repeating Stop joins the serialized control lane and observes the retained result.
+    let stopped = with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request.clone(), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stopped["activity"]["state"], "stopped");
+    assert!(svc.queue_snapshot(&a).is_empty());
+    sqlx::query("CREATE TRIGGER reject_discussion_retry BEFORE INSERT ON discussion_agent_delivery BEGIN SELECT RAISE(ABORT,'retry fixture'); END").execute(svc.store.write_pool()).await.unwrap();
+    assert!(with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request.clone(), true)
+    )
+    .await
+    .is_err());
+    let unchanged = svc
+        .store
+        .discussion_activity(&ws, "default", &sent.message.id, &a)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(unchanged.activity).unwrap(),
+        stopped["activity"]
+    );
+    assert!(svc.store.load_all_agent_queues().await.unwrap().is_empty());
+    assert!(svc
+        .store
+        .discussion_pending_deliveries(None)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("DROP TRIGGER reject_discussion_retry")
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    let retried = with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retried["activity"]["attempt"], 2);
+    assert_eq!(svc.queue_snapshot(&a).len(), 1);
+}
+
+#[tokio::test]
+async fn discussion_retry_outbox_restores_the_same_attempt_after_restart() {
+    use intent_core::discussion::DiscussionAgentControl;
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-retry-outbox").await;
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(
+            &ws,
+            "retry-outbox",
+            "work",
+            &addressed(std::slice::from_ref(&a)),
+        ),
+    )
+    .await
+    .unwrap();
+    let request = DiscussionAgentControl {
+        workspace_id: ws.clone(),
+        conversation_id: "default".into(),
+        message_id: sent.message.id.clone(),
+        agent_id: a.clone(),
+        attempt: 1,
+    };
+    with_caller(
+        human(&people[1].id),
+        svc.discussion_control_op(request.clone(), false),
+    )
+    .await
+    .unwrap();
+    let (retry, changed) = svc
+        .store
+        .control_discussion_activity(&ws, "default", &sent.message.id, &a, 1, true)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert_eq!(retry.activity.attempt, 2);
+    // Crash after atomic Retry, before queue adoption.
+    let restored = Services::new(svc.store.clone());
+    assert_eq!(restored.rehydrate_agent_queues().await.unwrap(), 1);
+    assert_eq!(restored.queue_snapshot(&a)[0]["turnId"], retry.turn_id);
+    let repeated = with_caller(
+        human(&people[1].id),
+        restored.discussion_control_op(request, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated["activity"],
+        serde_json::to_value(retry.activity).unwrap()
+    );
+    assert_eq!(restored.queue_snapshot(&a).len(), 1);
+    assert!(restored
+        .store
+        .discussion_pending_deliveries(None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn discussion_legacy_delivered_retry_returns_history_without_new_invocation() {
+    let (_tmp, svc, ws, people) = conversation_fixture().await;
+    let a = agent(&svc, &ws, "agent-legacy-delivered").await;
+    let target = addressed(std::slice::from_ref(&a));
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "legacy-delivered", "original request", &target),
+    )
+    .await
+    .unwrap();
+    // Model the migration's delivered-history boundary: no pending work or receipt.
+    svc.dequeue_message(&a).unwrap();
+    svc.publish_queue_updated(&a).await;
+    sqlx::query("DELETE FROM discussion_agent_activity WHERE message_id=?")
+        .bind(&sent.message.id)
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace_discussion_message SET agent_activity_json='[]' WHERE id=?")
+        .bind(&sent.message.id)
+        .execute(svc.store.write_pool())
+        .await
+        .unwrap();
+    let retried = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(&ws, "legacy-delivered", "original request", &target),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retried.message.id, sent.message.id);
+    assert!(retried.message.agent_activity.is_empty());
+    assert!(svc.queue_snapshot(&a).is_empty());
+    assert!(svc.store.load_all_agent_queues().await.unwrap().is_empty());
+    assert!(svc
+        .store
+        .discussion_pending_deliveries(None)
+        .await
+        .unwrap()
+        .is_empty());
+}

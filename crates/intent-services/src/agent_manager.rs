@@ -2774,6 +2774,7 @@ pub struct AgentManager {
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
     turn_start_gates: crate::agent_ops::AgentRetirementGates,
+    active_discussion_turns: Mutex<HashMap<AgentId, String>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
     /// on the non-empty → empty edge. Every access — the two writers AND the
@@ -3035,6 +3036,7 @@ impl AgentManager {
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
+            active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -6063,6 +6065,16 @@ impl AgentManager {
             self.retain_finishing_worker(worker);
         }
         if sync_store && !self.is_shutting_down() {
+            let discussion_turn = self
+                .active_discussion_turns
+                .lock()
+                .unwrap()
+                .remove(agent_id);
+            if let Some(turn) = discussion_turn {
+                self.services
+                    .set_discussion_activity(&turn, "stopped", None)
+                    .await;
+            }
             self.services.settle_script_monitor_worker(agent_id).await;
         }
         self.services
@@ -6238,6 +6250,16 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
             self.retain_finishing_worker(worker);
+        }
+        let discussion_turn = self
+            .active_discussion_turns
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+        if let Some(turn) = discussion_turn {
+            self.services
+                .set_discussion_activity(&turn, "stopped", None)
+                .await;
         }
         self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
@@ -9369,6 +9391,47 @@ impl AgentManager {
         }
     }
 
+    fn track_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            if let Some(turn) = &options.turn_id {
+                active.insert(agent.clone(), turn.clone());
+            }
+        } else {
+            active.remove(agent);
+        }
+    }
+
+    fn clear_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if active.get(agent) == options.turn_id.as_ref() {
+            active.remove(agent);
+        }
+    }
+
+    /// Fence new admissions, then abort only the worker owning this invocation.
+    pub(crate) async fn stop_discussion_turn(&self, agent: &AgentId, turn: &str) {
+        let gate = self.turn_start_gates.for_agent(agent);
+        let _admission = gate.lock().await;
+        {
+            let mut active = self.active_discussion_turns.lock().unwrap();
+            if active.get(agent).map(String::as_str) != Some(turn) {
+                return;
+            }
+            self.services.pin_live_turn(agent);
+            if let Some(worker) = self.workers.lock().unwrap().remove(agent) {
+                worker.abort();
+                self.retain_finishing_worker(worker);
+            }
+            active.remove(agent);
+        }
+        self.interrupt_inner(agent, InterruptReason::UserStop, None)
+            .await;
+        // Explicit stopped invocations can only be resumed with Retry.
+        self.stop_redelivery.lock().unwrap().remove(agent);
+        self.sync_stop_redelivery(agent).await;
+    }
+
     /// Spawn (and track) the background turn worker for an agent. The caller must
     /// already hold the in-flight slot (`try_begin`). `user_persisted` reports
     /// whether the initial turn's user row durably reached the transcript, so a
@@ -9398,6 +9461,7 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.track_discussion_turn(&agent_id, &options);
         self.services
             .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
@@ -9422,7 +9486,9 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = if options.monitor_turn.is_none() {
+        let armed = if options.monitor_turn.is_none()
+            && !crate::discussion_activity::is_discussion(options.message_metadata.as_ref())
+        {
             self.stop_redelivery.lock().unwrap().remove(&agent_id)
         } else {
             None
@@ -12307,7 +12373,10 @@ fn redelivery_prepend(
     if messages
         .iter()
         .rfind(|message| message.role == "user")
-        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+        .is_some_and(|message| {
+            crate::agent_ops::is_qualified_monitor_message(message)
+                || crate::discussion_activity::is_discussion(message.metadata.as_ref())
+        })
     {
         return None;
     }
@@ -13354,7 +13423,8 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if next.monitor_turn.is_some()
+    if crate::discussion_activity::is_discussion(next.message_metadata.as_ref())
+        || next.monitor_turn.is_some()
         || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
     {
         return None;
@@ -13405,6 +13475,33 @@ async fn run_message_worker(
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
     'outer: loop {
+        mgr.track_discussion_turn(&agent_id, &options);
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            let turn = options.turn_id.as_deref().expect("discussion turn id");
+            match mgr
+                .services
+                .store
+                .discussion_invocation_allowed(turn, &agent_id)
+                .await
+            {
+                Ok(true) => {
+                    mgr.services
+                        .set_discussion_activity(turn, "working", None)
+                        .await;
+                }
+                Ok(false) => {
+                    mgr.clear_discussion_turn(&agent_id, &options);
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retrying discussion admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue 'outer;
+                }
+            }
+        }
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
                 // Keep the qualified turn future out of the ordinary worker frame.
@@ -13605,7 +13702,19 @@ async fn run_message_worker(
                     )
                     .await
                 {
-                    Ok(_stop_reason) => {
+                    Ok(stop_reason) => {
+                        mgr.clear_discussion_turn(&agent_id, &options);
+                        mgr.services
+                            .settle_discussion_options(
+                                &options,
+                                if stop_reason == StopReason::Cancelled {
+                                    "stopped"
+                                } else {
+                                    "completed"
+                                },
+                                None,
+                            )
+                            .await;
                         if let Some(id) =
                             crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                         {
@@ -13680,6 +13789,10 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            mgr.clear_discussion_turn(&agent_id, &options);
+                            mgr.services
+                                .settle_discussion_options(&options, "stopped", None)
+                                .await;
                             if let Some(id) =
                                 crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                             {
@@ -13691,7 +13804,11 @@ async fn run_message_worker(
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
                             consecutive_idle_timeouts = 0;
-                        } else if prompt_idle_timeout_error(&e) {
+                        } else if prompt_idle_timeout_error(&e)
+                            && !crate::discussion_activity::is_discussion(
+                                options.message_metadata.as_ref(),
+                            )
+                        {
                             // Warn-and-continue: the turn went the whole idle
                             // window silent. `run_prompt_turn` already flushed
                             // the partial transcript and emitted a NORMAL
@@ -15711,6 +15828,15 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    mgr.clear_discussion_turn(agent_id, options);
+    if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+        mgr.services
+            .settle_discussion_options(options, "failed", Some(&error.error_text))
+            .await;
+        publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error)
+            .await;
+        return;
+    }
     publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,

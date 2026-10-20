@@ -203,7 +203,9 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
-/// A newly persisted human discussion message.
+/// Versioned activity of an explicitly addressed discussion invocation.
+pub const DISCUSSION_ACTIVITY: &str = "discussion:activity";
+/// A newly persisted discussion message.
 pub const DISCUSSION_MESSAGE: &str = "discussion:message";
 /// Transient committed reaction metadata; never a new message.
 pub const DISCUSSION_REACTION: &str = "discussion:reaction";
@@ -632,6 +634,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
     DISCUSSION_MESSAGE,
+    DISCUSSION_ACTIVITY,
     DISCUSSION_REACTION,
     NOTE_CREATED,
     NOTE_UPDATED,
@@ -906,6 +909,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DISCUSSION_ACTIVITY, "Discussion: versioned activity for one explicitly addressed invocation."),
     (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
     (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),

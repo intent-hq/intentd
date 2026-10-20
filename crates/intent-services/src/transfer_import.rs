@@ -1356,7 +1356,10 @@ fn transform_rows(
 
     for (table, mut objects) in rows {
         match table.as_str() {
-            "draft" | "discussion_agent_grant" | "discussion_agent_delivery" => continue,
+            "draft"
+            | "discussion_agent_grant"
+            | "discussion_agent_delivery"
+            | "discussion_agent_activity" => continue,
             "agent_queue" => {
                 // Also fence archives produced before the source-side filter,
                 // including discussion references nested in combined retry groups.
@@ -1373,6 +1376,7 @@ fn transform_rows(
                     map.insert("principal_id".into(), serde_json::Value::Null);
                     if table == "workspace_discussion_message" {
                         map.insert("agent_id".into(), serde_json::Value::Null);
+                        map.insert("agent_activity_json".into(), serde_json::json!("[]"));
                     }
                 }
             }

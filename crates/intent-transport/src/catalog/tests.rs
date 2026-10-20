@@ -195,7 +195,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Human workspace discussions: +5 router methods; PR workspace lookup: +1.
 // Named provider profiles (§5.54): +4 router methods.
 // Generic event recovery adds the events.fence fast path.
-const EXPECTED_TOTAL_METHODS: usize = 445;
+// Correlated discussion controls: +2 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 447;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -204,7 +205,8 @@ const EXPECTED_TOTAL_METHODS: usize = 445;
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// Five discussion methods and one PR workspace lookup method are additive.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
-const EXPECTED_ROUTER_METHODS: usize = 388;
+/// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
+const EXPECTED_ROUTER_METHODS: usize = 390;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -593,7 +595,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "discussion.list",
     "discussion.react",
     "discussion.recipients",
+    "discussion.retryAgent",
     "discussion.send",
+    "discussion.stopAgent",
     "drafts.clear",
     "drafts.get",
     "drafts.set",

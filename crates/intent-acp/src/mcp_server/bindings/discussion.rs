@@ -88,6 +88,14 @@ pub(crate) async fn dispatch(
                             intent_core::discussion::DiscussionTarget {
                                 conversation_id: Some(req_str(args, "conversationId")?),
                                 recipient_agent_ids: recipients,
+                                agent_mentions: args
+                                    .get("agentMentions")
+                                    .map(|v| {
+                                        serde_json::from_value(v.clone())
+                                            .map_err(|_| "invalid agentMentions".to_string())
+                                    })
+                                    .transpose()?
+                                    .unwrap_or_default(),
                                 reply_to_message_id: optional_string(args, "replyToMessageId")?,
                                 ..Default::default()
                             },

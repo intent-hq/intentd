@@ -5287,6 +5287,15 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = (workspace_id, message_id, body, target);
         Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
     }
+    /// Human-only compare-and-swap control of an explicitly addressed invocation.
+    fn discussion_control_agent(
+        &self,
+        request: crate::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, retry);
+        Box::pin(async { Err(Error::Internal("discussion control not implemented".into())) })
+    }
     /// Set one human's desired reaction state; retries are no-ops.
     fn discussion_react(
         &self,

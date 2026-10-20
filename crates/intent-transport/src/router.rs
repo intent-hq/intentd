@@ -1217,6 +1217,21 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
         }
+        "discussion.stopAgent" | "discussion.retryAgent" => {
+            let request: intent_core::discussion::DiscussionAgentControl =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    invalid_params("expected workspaceId, messageId, agentId and positive attempt")
+                })?;
+            if request.attempt == 0
+                || request.message_id.trim().is_empty()
+                || request.agent_id.as_str().is_empty()
+            {
+                return Err(invalid_params("invalid discussion invocation"));
+            }
+            api.discussion_control_agent(request, method == "discussion.retryAgent")
+                .await
+                .map_err(domain_to_rpc)
+        }
         "discussion.send" => {
             let id = require_workspace_id(params)?;
             let message_id = require_str_param(params, "messageId")?;
@@ -1256,6 +1271,14 @@ async fn dispatch_other(
                     message_id,
                     body,
                     intent_core::discussion::DiscussionTarget {
+                        agent_mentions: params
+                            .get("agentMentions")
+                            .map(|v| {
+                                serde_json::from_value(v.clone())
+                                    .map_err(|_| invalid_params("invalid agentMentions"))
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
                         recipient_agent_ids,
                         conversation_id,
                         recipient_principal_ids,

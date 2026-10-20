@@ -206,6 +206,7 @@ impl Store {
                 "agent messaging is available only in the workspace discussion".into(),
             ));
         }
+        intent_core::discussion::validate_agent_mentions(body, target)?;
         let mut recipients = target.recipient_agent_ids.clone();
         recipients.sort();
         if recipients.len() > intent_core::discussion::DISCUSSION_RECIPIENT_MAX
@@ -260,7 +261,8 @@ impl Store {
                     .unwrap_or(DEFAULT_CONVERSATION)
                     == message.conversation_id
             };
-            if message.recipient_agent_ids != recipients
+            if message.agent_mentions != target.agent_mentions
+                || message.recipient_agent_ids != recipients
                 || message.body != body
                 || !same_target
                 || message.reply_to_message_id != target.reply_to_message_id
@@ -346,11 +348,12 @@ impl Store {
         };
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at,reply_to_message_id,reply_to_json) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(principal_id.map(PrincipalId::as_str)).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).bind(&target.reply_to_message_id).bind(reply).execute(&mut *tx).await.map_err(|e|db(&e))?;
-        sqlx::query("UPDATE workspace_discussion_message SET agent_id=?,recipient_agent_ids_json=? WHERE id=?")
+        sqlx::query("UPDATE workspace_discussion_message SET agent_id=?,recipient_agent_ids_json=?,agent_mentions_json=? WHERE id=?")
             .bind(agent_id.map(intent_core::AgentId::as_str))
             .bind(serde_json::to_string(&recipients).map_err(|e| Error::Internal(e.to_string()))?)
-            .bind(&id).execute(&mut *tx).await.map_err(|e| db(&e))?;
+            .bind(serde_json::to_string(&target.agent_mentions).map_err(|e| Error::Internal(e.to_string()))?).bind(&id).execute(&mut *tx).await.map_err(|e| db(&e))?;
         for recipient in &recipients {
+            super::discussion_activity_repo::insert(&mut tx, &id, recipient, &now_iso()).await?;
             sqlx::query("INSERT OR IGNORE INTO discussion_agent_grant(workspace_id,conversation_id,agent_id) VALUES(?,?,?)")
                 .bind(ws.as_str()).bind(&conversation.id).bind(recipient.as_str())
                 .execute(&mut *tx).await.map_err(|e| db(&e))?;
@@ -358,6 +361,7 @@ impl Store {
                 .bind(&id).bind(recipient.as_str()).bind(ws.as_str())
                 .execute(&mut *tx).await.map_err(|e| db(&e))?;
         }
+        super::discussion_activity_repo::refresh(&mut tx, &id).await?;
         let row = sqlx::query("SELECT * FROM workspace_discussion_message WHERE id=?")
             .bind(&id)
             .fetch_one(&mut *tx)

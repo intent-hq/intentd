@@ -140,11 +140,11 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — index or namespace docs
   ws.workspace.* — workspace info, title, status message
   ws.app.question.* — ask the user structured questions
   ws.note.* — notes; the spec is note id "spec"
-  ws.discussion.* — explicitly addressed workspace discussion history and replies (Multiplayer Labs)
+  ws.discussion.* — Labs chats
   ws.comment.* — comment threads on notes
   ws.task.* — task notes + checkbox statuses
   ws.primitive.* — rich note blocks
@@ -195,7 +195,7 @@ API:
 
   ws.discussion.conversations({ beforeId?, limit? }?) → { conversations, hasMore }  // Lists only discussions that explicitly addressed this agent. Multiplayer Labs; currently workspace-wide only. No implicit access or subscriptions.
   ws.discussion.list(conversationId, { beforeSequence?, afterSequence?, limit? }?) → { messages, hasMore, conversation }  // Read context only after being explicitly addressed. Pages contain at most 100 messages (default 50); before/after are exclusive and mutually exclusive. Private discussions remain unavailable to agents.
-  ws.discussion.send(conversationId, body, { messageId, recipientAgentIds?, replyToMessageId? }) → { message, conversation }  // Explicitly post a reply to a granted discussion. messageId is a required unique retry key (keep it and all fields unchanged on retry). Only recipientAgentIds wakes agents; ordinary text or links never do. Up to 31 distinct same-workspace, nonretired agents, excluding yourself. Omit recipients to reply to humans without waking agents. Identity is stamped from this session. Your final turn output never automatically posts here.
+  ws.discussion.send(conversationId, body, { messageId, recipientAgentIds?, replyToMessageId?, agentMentions? }) → { message, conversation }  // Explicitly post a reply to a granted discussion. messageId is a required unique retry key (keep it and all fields unchanged on retry). Only recipientAgentIds wakes agents; ordinary text or links never do. Up to 31 distinct same-workspace, nonretired agents, excluding yourself. Omit recipients to reply to humans without waking agents. Identity is stamped from this session. Your final turn output never automatically posts here. Optional agentMentions are immutable {agentId,name,start,end} UTF-16 @name spans for selected recipients; text alone grants no delivery. Activity/Stop/Retry are human controls for the particular request; do not retry a stopped invocation yourself.
 
   ws.comment.add(noteId, { searchContext, commentTarget, comment, type?, author?, authorType? }) → { ... }  // Anchor a comment by text search. Use enough `searchContext` to be unique; `commentTarget` must be a substring inside it. `authorType` is `"user"` or `"agent"` (default `"agent"`).
     Search is case- and whitespace-sensitive. You can use the same text for both fields to comment on an entire phrase, and anchor errors explain how to fix mismatches.
@@ -401,7 +401,7 @@ Parameters:
   summary (required): Short description of what this call does, shown in the UI.
 
 Namespaces (index — full signatures in API below):
-  ws.help(namespace?) — runtime docs: ws.help() returns this index, ws.help("pr") the full pr docs
+  ws.help(namespace?) — index or namespace docs
   ws.workspace.* — workspace info, title, status message
   ws.app.* — agents, chats, mcp, proposal, settings, specialists, ui, workspaces
   ws.app.question.* — ask the user structured questions
@@ -1354,6 +1354,7 @@ mod tests {
     const BINDINGS_NOTE: &str = include_str!("bindings/note.rs");
     const BINDINGS_TASK: &str = include_str!("bindings/task.rs");
     const BINDINGS_COMMENT: &str = include_str!("bindings/comment.rs");
+    const BINDINGS_DISCUSSION: &str = include_str!("bindings/discussion.rs");
     const BINDINGS_PRIMITIVE: &str = include_str!("bindings/primitive.rs");
     const BINDINGS_CROSS_WORKSPACE: &str = include_str!("bindings/cross_workspace.rs");
     const BINDINGS_PR: &str = include_str!("bindings/pr.rs");
@@ -1386,6 +1387,7 @@ mod tests {
             ("note", BINDINGS_NOTE),
             ("task", BINDINGS_TASK),
             ("comment", BINDINGS_COMMENT),
+            ("discussion", BINDINGS_DISCUSSION),
             ("primitive", BINDINGS_PRIMITIVE),
             ("crossWorkspace", BINDINGS_CROSS_WORKSPACE),
             ("pr", BINDINGS_PR),
@@ -2165,16 +2167,17 @@ mod tests {
     // Size budget for the system-prompt copy: the all-defaults non-chief
     // rendering (the common case for truncating providers) includes the
     // retirement/monitor bindings and four compact-page/detail helpers.
-    // The four new signatures add ~0.5k to the prior 22.7k budget;
-    // detailed guidance remains in on-demand help.
+    // The four compact helpers and three discussion methods add ~1.3k to
+    // the prior 22.7k budget; detailed guidance remains in on-demand help.
+    // The separate compact-description budget stays at the client cutoff of 2k.
     #[test]
     fn condensed_description_size_budget() {
         let condensed =
             condensed_workspace_api_description(false, &AgentFeaturesSettings::default(), &[]);
         eprintln!("condensed all-on description: {} bytes", condensed.len());
         assert!(
-            condensed.len() < 23_250,
-            "condensed all-on description is {} bytes, over the 23.25k budget",
+            condensed.len() < 24_000,
+            "condensed all-on description is {} bytes, over the 24k budget",
             condensed.len()
         );
     }

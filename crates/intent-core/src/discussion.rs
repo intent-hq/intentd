@@ -25,6 +25,18 @@ pub struct DiscussionAuthor {
     pub avatar_url: Option<String>,
 }
 
+/// Durable state of one recipient's explicitly addressed invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionAgentActivity {
+    pub agent_id: AgentId,
+    pub attempt: u32,
+    pub version: i64,
+    pub state: String,
+    pub updated_at: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussionMessage {
@@ -36,6 +48,10 @@ pub struct DiscussionMessage {
     pub body: String,
     #[serde(default)]
     pub recipient_agent_ids: Vec<AgentId>,
+    #[serde(default)]
+    pub agent_activity: Vec<DiscussionAgentActivity>,
+    #[serde(default)]
+    pub agent_mentions: Vec<DiscussionAgentMention>,
     pub author: DiscussionAuthor,
     pub created_at: String,
     #[serde(default)]
@@ -103,8 +119,65 @@ pub struct DiscussionSendResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscussionTarget {
+    pub agent_mentions: Vec<DiscussionAgentMention>,
     pub recipient_agent_ids: Vec<AgentId>,
     pub conversation_id: Option<String>,
     pub recipient_principal_ids: Option<Vec<PrincipalId>>,
     pub reply_to_message_id: Option<String>,
+}
+
+/// Exact invocation observed by a human control. Attempt is a compare-and-swap fence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionAgentControl {
+    pub workspace_id: WorkspaceId,
+    #[serde(default = "default_conversation_id")]
+    pub conversation_id: String,
+    pub message_id: String,
+    pub agent_id: AgentId,
+    pub attempt: u32,
+}
+
+/// Immutable selected span; offsets are UTF-16 code units, as in browser strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiscussionAgentMention {
+    pub agent_id: AgentId,
+    pub name: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Validate presentation metadata without deriving any delivery authority from text.
+/// # Errors
+/// Rejects malformed, overlapping, non-selected or altered mention spans.
+pub fn validate_agent_mentions(body: &str, target: &DiscussionTarget) -> crate::Result<()> {
+    let units: Vec<u16> = body.encode_utf16().collect();
+    let mut end = 0usize;
+    if target.agent_mentions.len() > 100 {
+        return Err(crate::Error::InvalidParams(
+            "too many agent mentions".into(),
+        ));
+    }
+    for mention in &target.agent_mentions {
+        let start = mention.start as usize;
+        let next = mention.end as usize;
+        if mention.name.trim().is_empty()
+            || mention.name.len() > 256
+            || start < end
+            || start >= next
+            || !target.recipient_agent_ids.contains(&mention.agent_id)
+            || units
+                .get(start..next)
+                .and_then(|span| String::from_utf16(span).ok())
+                .as_deref()
+                != Some(format!("@{}", mention.name).as_str())
+        {
+            return Err(crate::Error::InvalidParams(
+                "invalid selected agent mention".into(),
+            ));
+        }
+        end = next;
+    }
+    Ok(())
 }

@@ -82,6 +82,7 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_activity;
 mod discussion_delivery;
 mod discussion_ops;
 mod disk_usage;
@@ -1247,6 +1248,7 @@ pub struct Services {
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
+    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -1772,6 +1774,7 @@ impl Services {
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
+            discussion_control_gates: Arc::default(),
             #[cfg(test)]
             invite_create_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
@@ -18759,6 +18762,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionConversations".into(), serde_json::json!(1));
             caps.insert("discussionMessageActions".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
+            caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -34273,6 +34277,13 @@ impl WorkspaceApi for Services {
             self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
                 .await
         })
+    }
+    fn discussion_control_agent(
+        &self,
+        request: intent_core::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.discussion_control_op(request, retry))
     }
     fn discussion_react(
         &self,

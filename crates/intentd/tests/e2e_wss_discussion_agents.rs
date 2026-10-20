@@ -832,7 +832,22 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
 
     // Retry only after completion; pending-queue dedup alone cannot satisfy this.
     let retry = wss_rpc(&mut rpc, 12, "discussion.send", request).await;
-    assert_eq!(retry["message"], sent["message"]);
+    let mut original = sent["message"].clone();
+    original["agentActivity"] = retry["message"]["agentActivity"].clone();
+    assert_eq!(
+        retry["message"], original,
+        "retry preserves every immutable message field"
+    );
+    assert_eq!(retry["message"]["agentActivity"][0]["attempt"], 1);
+    assert_eq!(retry["message"]["agentActivity"][0]["state"], "completed");
+    assert!(
+        retry["message"]["agentActivity"][0]["version"]
+            .as_i64()
+            .unwrap()
+            > sent["message"]["agentActivity"][0]["version"]
+                .as_i64()
+                .unwrap()
+    );
     let late = assert_no_turn(&mut sub).await;
     assert!(
         !late
@@ -1145,4 +1160,237 @@ async fn pending_discussion_outbox_restarts_and_sender_retry_runs_once() {
 #[intent_test_macros::daemon_test]
 async fn admitted_discussion_queue_restarts_and_sender_retry_runs_once() {
     restart_and_retry_discussion_delivery(true).await;
+}
+
+async fn wait_activity(
+    rpc: &mut common::TlsWs,
+    workspace: &str,
+    message: &str,
+    state: &str,
+) -> Value {
+    timeout(common::test_timeout(Duration::from_secs(40)), async {
+        loop {
+            let page = wss_rpc(
+                rpc,
+                900,
+                "discussion.list",
+                json!({"workspaceId":workspace}),
+            )
+            .await;
+            let row = page["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == message)
+                .unwrap();
+            if row["agentActivity"][0]["state"] == state {
+                return row["agentActivity"][0].clone();
+            }
+            // timing-guard: poll durable activity until the mock reaches the requested state.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("discussion activity transition")
+}
+
+#[tokio::test]
+async fn discussion_stop_retains_partial_output_and_never_stops_another_invocation() {
+    let Some(script) = gate("discussion exact Stop WSS") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let (workspace, _) = seed_workspace(data_dir.path()).await;
+    let log = data_dir.path().join("control-prompts.jsonl");
+    let behavior=json!({"blockUntilCancel":true,"parkIfPromptEndsWith":"UNRELATED_PARK","response":"retry completed"}).to_string();
+    let child = spawn_serve(
+        data_dir.path(),
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ("MOCK_AGENT_PROMPT_LOG", log.to_str().unwrap()),
+        ],
+    );
+    let daemon = Daemon { child, data_dir };
+    let socket = daemon.data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    assert_eq!(
+        wss_rpc(&mut rpc, 1, "system.capabilities", json!({})).await["discussionAgentActivity"],
+        1
+    );
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({"workspaceId":workspace,"eventTypes":["discussion:activity","agent:*"]}),
+    )
+    .await;
+    let agent=wss_rpc(&mut rpc,2,"agent.create",json!({"workspaceId":workspace,"name":"Controlled recipient","provider":"mock","model":"default"})).await["agent"]["id"].as_str().unwrap().to_owned();
+    let sent=wss_rpc(&mut rpc,3,"discussion.send",json!({"workspaceId":workspace,"messageId":"control-original","body":"Please do this work","recipientAgentIds":[agent]})).await;
+    let message = sent["message"]["id"].as_str().unwrap().to_owned();
+    wait_activity(&mut rpc, &workspace, &message, "working").await;
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        loop {
+            let frame = wss_event_opt(&mut sub, 10)
+                .await
+                .expect("streamed mock output");
+            if frame.to_string().contains("streaming-before-cancel") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    wss_rpc(&mut rpc,4,"agent.sendMessage",json!({"workspaceId":workspace,"agentId":agent,"content":"UNRELATED_PARK","priority":"queue"})).await;
+    let control = json!({"workspaceId":workspace,"messageId":message,"agentId":agent,"attempt":1});
+    assert_eq!(
+        wss_rpc(&mut rpc, 5, "discussion.stopAgent", control.clone()).await["activity"]["state"],
+        "stopped"
+    );
+    timeout(common::test_timeout(Duration::from_secs(30)), async {
+        loop {
+            if prompt_log(&log).len() >= 2 {
+                break;
+            }
+            // timing-guard: observe the independent queued prompt entering the mock.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let transcript = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({"agentId":agent}),
+    )
+    .await;
+    assert!(
+        transcript.to_string().contains("streaming-before-cancel"),
+        "Stop retains partial text: {transcript}"
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 7, "discussion.retryAgent", control.clone()).await["activity"]["attempt"],
+        2
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 8, "discussion.retryAgent", control.clone()).await["activity"]["attempt"],
+        2
+    );
+    assert_eq!(
+        wss_rpc(&mut rpc, 9, "discussion.stopAgent", control.clone()).await["activity"]["state"],
+        "queued",
+        "stale Stop must not affect attempt2"
+    );
+    let mut next = control.clone();
+    next["attempt"] = json!(2);
+    assert_eq!(
+        wss_rpc(&mut rpc, 10, "discussion.stopAgent", next.clone()).await["activity"]["state"],
+        "stopped"
+    );
+    assert_eq!(
+        prompt_log(&log).len(),
+        2,
+        "queued Retry was never delivered into unrelated work"
+    );
+    let session = wss_rpc(&mut rpc, 11, "agent.get", json!({"agentId":agent})).await;
+    assert_eq!(
+        session["agent"]["status"], "active",
+        "stopping a queued discussion must retain unrelated active turn: {session}"
+    );
+    rpc.close(None).await.unwrap();
+    rpc = connect_ws(port, cfg).await;
+    let restored = wait_activity(&mut rpc, &workspace, &message, "stopped").await;
+    assert_eq!(restored["attempt"], 2);
+    wss_rpc(&mut rpc, 12, "agent.stop", json!({"agentId":agent})).await;
+    assert_eq!(
+        wss_rpc(&mut rpc, 13, "discussion.retryAgent", next).await["activity"]["attempt"],
+        3
+    );
+    wait_activity(&mut rpc, &workspace, &message, "completed").await;
+    let page = wss_rpc(
+        &mut rpc,
+        14,
+        "discussion.list",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        prompt_log(&log).len(),
+        3,
+        "exactly one provider delivery per admitted attempt"
+    );
+}
+
+#[tokio::test]
+async fn discussion_failed_retry_redrives_only_the_observed_attempt() {
+    let Some(script) = gate("discussion failed Retry WSS") else {
+        return;
+    };
+    let data_dir = temp_data_dir();
+    let (workspace, _) = seed_workspace(data_dir.path()).await;
+    let log = data_dir.path().join("failed-prompts.jsonl");
+    let behavior =
+        json!({"promptRpcError":{"code":-32603,"message":"Discussion fixture provider failure"}})
+            .to_string();
+    let child = spawn_serve(
+        data_dir.path(),
+        &[
+            ("INTENTD_AUTH_TOKEN", TOKEN),
+            ("MOCK_AGENT_SCRIPT_PATH", &script),
+            ("MOCK_AGENT_BEHAVIOR", &behavior),
+            ("MOCK_AGENT_PROMPT_LOG", log.to_str().unwrap()),
+        ],
+    );
+    let daemon = Daemon { child, data_dir };
+    let socket = daemon.data_dir.path().join("intentd.sock");
+    assert!(await_uds(&socket).await);
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg).await;
+    let agent=wss_rpc(&mut rpc,1,"agent.create",json!({"workspaceId":workspace,"name":"Failing recipient","provider":"mock","model":"default"})).await["agent"]["id"].as_str().unwrap().to_owned();
+    let sent=wss_rpc(&mut rpc,2,"discussion.send",json!({"workspaceId":workspace,"messageId":"failed-original","body":"Do the work","recipientAgentIds":[agent]})).await;
+    let message = sent["message"]["id"].as_str().unwrap().to_owned();
+    let failed = wait_activity(&mut rpc, &workspace, &message, "failed").await;
+    assert!(failed["error"]
+        .as_str()
+        .unwrap()
+        .contains("Discussion fixture provider failure"));
+    let request = json!({"workspaceId":workspace,"messageId":message,"agentId":agent,"attempt":1});
+    assert_eq!(
+        wss_rpc(&mut rpc, 3, "discussion.retryAgent", request.clone()).await["activity"]["attempt"],
+        2
+    );
+    let failed_again = wait_activity(&mut rpc, &workspace, &message, "failed").await;
+    assert_eq!(failed_again["attempt"], 2);
+    assert_eq!(
+        wss_rpc(&mut rpc, 4, "discussion.retryAgent", request).await["activity"],
+        failed_again
+    );
+    let page = wss_rpc(
+        &mut rpc,
+        5,
+        "discussion.list",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        prompt_log(&log).len(),
+        2,
+        "stale Retry does not create a third provider invocation"
+    );
+    let queue = wss_rpc(&mut rpc, 6, "agent.getQueue", json!({"agentId":agent})).await;
+    assert!(
+        queue["queue"].as_array().unwrap().is_empty(),
+        "terminal discussion failures require explicit correlated Retry"
+    );
 }

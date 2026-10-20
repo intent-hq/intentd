@@ -47,7 +47,12 @@ impl Services {
             for delivery in pending {
                 let m = delivery.message;
                 let agent = delivery.agent_id;
-                let id = format!("discussion:{}:{}", m.id, agent.as_str());
+                let id = delivery.turn_id;
+                let queued_at = if delivery.attempt == 1 {
+                    m.created_at.clone()
+                } else {
+                    delivery.updated_at
+                };
                 let author = m
                     .author
                     .display_name
@@ -57,7 +62,7 @@ impl Services {
                 let conversation = serde_json::to_string(&m.conversation_id)
                     .map_err(|e| Error::Internal(e.to_string()))?;
                 let content = format!("[EXPLICIT DISCUSSION MESSAGE]\n{author} addressed you in the workspace discussion.\nConversation ID: {conversation}\nMessage ID: {}\n\n{}\n\nRead context with ws.discussion.list({conversation}). Reply to this discussion with ws.discussion.send({conversation}, body, {{ messageId: aUniqueRetryKey }}). Only explicit send calls post replies; your final response is not posted. Other discussion messages are not delivered automatically.", m.id, m.body);
-                let mut metadata = json!({"type":"discussion_message","workspaceId":m.workspace_id,"conversationId":m.conversation_id,"discussionMessageId":m.id});
+                let mut metadata = json!({"type":"discussion_message","workspaceId":m.workspace_id,"conversationId":m.conversation_id,"discussionMessageId":m.id,"discussionAttempt":delivery.attempt});
                 if let Some(sender) = &m.author.agent_id {
                     metadata["fromAgentId"] = json!(sender);
                     metadata["fromAgentName"] = json!(author);
@@ -71,7 +76,7 @@ impl Services {
                     .queue_submission_order
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                let payload = json!({"id":id,"turnId":id,"content":content,"imageBlocks":null,"fileBlocks":null,"queuedAt":m.created_at,"messageMetadata":metadata,"userOrigin":m.author.principal_id.is_some(),"submissionOrder":order,"correlationOrderKnown":true});
+                let payload = json!({"id":id,"turnId":id,"content":content,"imageBlocks":null,"fileBlocks":null,"queuedAt":queued_at,"messageMetadata":metadata,"userOrigin":m.author.principal_id.is_some(),"submissionOrder":order,"correlationOrderKnown":true});
                 let queued: QueuedMessage = serde_json::from_value(payload.clone())
                     .map_err(|e| Error::Internal(e.to_string()))?;
                 let row = intent_store::AgentQueueRow {
@@ -124,7 +129,21 @@ impl Services {
         message: &DiscussionMessage,
     ) -> Result<()> {
         for agent in &message.recipient_agent_ids {
-            let id = format!("discussion:{}:{}", message.id, agent.as_str());
+            let receipt = match self
+                .store
+                .discussion_activity(
+                    &message.workspace_id,
+                    &message.conversation_id,
+                    &message.id,
+                    agent,
+                )
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(Error::NotFound(_)) => continue, // Legacy delivered/imported history has no local invocation.
+                Err(error) => return Err(error),
+            };
+            let id = receipt.turn_id;
             if self.find_queued_message(agent, &id).is_some()
                 && self
                     .store

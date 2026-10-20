@@ -112,7 +112,9 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     let first = sent["result"]["message"].clone();
     assert!(first["id"].is_string(), "{sent}");
     assert_ne!(first["id"], "same-client-id");
-    assert_eq!(first.as_object().unwrap().len(), 12);
+    assert_eq!(first.as_object().unwrap().len(), 14);
+    assert_eq!(first["agentActivity"], json!([]));
+    assert_eq!(first["agentMentions"], json!([]));
     assert_eq!(first["recipientAgentIds"], json!([]));
     assert_eq!(first["replyToMessageId"], Value::Null);
     assert_eq!(first["replyTo"], Value::Null);
@@ -1107,6 +1109,95 @@ async fn discussion_explicit_agent_delivery_grants_replies_and_retry_over_wss() 
         let denied = owner.call(8, "discussion.send", json!({"workspaceId":ws,"messageId":"invalid","body":"no","recipientAgentIds":recipients})).await;
         assert!(denied.get("error").is_some(), "{denied}");
     }
+    owner.close().await;
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn discussion_activity_controls_recheck_wss_membership_and_restore_versions() {
+    let srv = start(WsOptions::default()).await;
+    let mut guest = Guest::connect(&srv, &"bd".repeat(32)).await;
+    let mut outsider = Guest::connect(&srv, &"ac".repeat(32)).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    srv.store
+        .add_workspace_member(&ws, &guest.principal.id, WorkspaceRole::Collaborator)
+        .await
+        .unwrap();
+    let agent = AgentId::new();
+    sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES(?,?,'Helper','idle',?,?)").bind(agent.as_str()).bind(ws.as_str()).bind(intent_core::now_iso()).bind(intent_core::now_iso()).execute(srv.store.write_pool()).await.unwrap();
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    assert_eq!(
+        owner
+            .call(1, "client.hello", json!({"name":"Activity client"}))
+            .await["result"]["server"]["capabilities"]["discussionAgentActivity"],
+        1
+    );
+    owner
+        .call(
+            2,
+            "events.subscribe",
+            json!({"workspaceId":ws,"eventTypes":["discussion:activity"]}),
+        )
+        .await;
+    let sent=guest.call("discussion.send",json!({"workspaceId":ws,"messageId":"activity-wire","body":"@Helper work","recipientAgentIds":[agent],"agentMentions":[{"agentId":agent,"name":"Helper","start":0,"end":7}]})).await;
+    let message = sent["result"]["message"].clone();
+    assert_eq!(
+        message["author"]["principalId"],
+        guest.principal.id.as_str()
+    );
+    assert_eq!(message["agentActivity"][0]["state"], "queued");
+    assert_eq!(message["agentMentions"][0]["name"], "Helper");
+    let request = json!({"workspaceId":ws,"messageId":message["id"],"agentId":agent,"attempt":1});
+    assert!(outsider
+        .call("discussion.stopAgent", request.clone())
+        .await
+        .get("error")
+        .is_some());
+    let stopped = guest.call("discussion.stopAgent", request.clone()).await;
+    assert_eq!(
+        stopped["result"]["activity"]["state"], "stopped",
+        "{stopped}"
+    );
+    let event = owner.event("discussion:activity").await;
+    assert_eq!(event["data"]["activity"], stopped["result"]["activity"]);
+    assert!(srv.store.load_all_agent_queues().await.unwrap().is_empty());
+    let retried = guest.call("discussion.retryAgent", request.clone()).await;
+    assert_eq!(retried["result"]["activity"]["attempt"], 2, "{retried}");
+    assert_eq!(
+        guest.call("discussion.retryAgent", request.clone()).await["result"],
+        retried["result"]
+    );
+    assert_eq!(srv.store.load_all_agent_queues().await.unwrap().len(), 1);
+    let removed = owner
+        .call(
+            3,
+            "workspace.members.remove",
+            json!({"workspaceId":ws,"principalId":guest.principal.id}),
+        )
+        .await;
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+    assert!(guest
+        .call("discussion.stopAgent", request.clone())
+        .await
+        .get("error")
+        .is_some());
+    assert!(guest
+        .call("discussion.retryAgent", request)
+        .await
+        .get("error")
+        .is_some());
+    let page = owner
+        .call(3, "discussion.list", json!({"workspaceId":ws}))
+        .await;
+    assert_eq!(page["result"]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        page["result"]["messages"][0]["agentActivity"][0],
+        retried["result"]["activity"]
+    );
     owner.close().await;
     srv.ws.stop().await;
 }

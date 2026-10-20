@@ -34,6 +34,9 @@ pub(super) async fn agent_access_in(
 pub struct DiscussionDelivery {
     pub message: DiscussionMessage,
     pub agent_id: AgentId,
+    pub turn_id: String,
+    pub attempt: i64,
+    pub updated_at: String,
 }
 
 impl Store {
@@ -58,10 +61,10 @@ impl Store {
         message: Option<&str>,
     ) -> Result<Vec<DiscussionDelivery>> {
         let rows = if let Some(message) = message {
-            sqlx::query("SELECT m.*,d.agent_id AS recipient_agent_id FROM discussion_agent_delivery d JOIN workspace_discussion_message m ON m.id=d.message_id WHERE d.message_id=? ORDER BY d.agent_id LIMIT 100")
+            sqlx::query("SELECT m.*,d.agent_id AS recipient_agent_id,a.turn_id AS invocation_turn_id,a.attempt AS invocation_attempt,a.updated_at AS invocation_updated_at FROM discussion_agent_delivery d JOIN workspace_discussion_message m ON m.id=d.message_id JOIN discussion_agent_activity a ON a.message_id=d.message_id AND a.agent_id=d.agent_id WHERE d.message_id=? ORDER BY d.agent_id LIMIT 100")
                 .bind(message).fetch_all(self.read_pool()).await.map_err(|e| db(&e))?
         } else {
-            sqlx::query("SELECT m.*,d.agent_id AS recipient_agent_id FROM discussion_agent_delivery d JOIN workspace_discussion_message m ON m.id=d.message_id ORDER BY d.message_id,d.agent_id LIMIT 100")
+            sqlx::query("SELECT m.*,d.agent_id AS recipient_agent_id,a.turn_id AS invocation_turn_id,a.attempt AS invocation_attempt,a.updated_at AS invocation_updated_at FROM discussion_agent_delivery d JOIN workspace_discussion_message m ON m.id=d.message_id JOIN discussion_agent_activity a ON a.message_id=d.message_id AND a.agent_id=d.agent_id ORDER BY d.message_id,d.agent_id LIMIT 100")
                 .fetch_all(self.read_pool()).await.map_err(|e| db(&e))?
         };
         rows.iter()
@@ -69,6 +72,9 @@ impl Store {
                 Ok(DiscussionDelivery {
                     message: super::discussion_repo::message(row)?,
                     agent_id: AgentId(row.get("recipient_agent_id")),
+                    turn_id: row.get("invocation_turn_id"),
+                    attempt: row.get("invocation_attempt"),
+                    updated_at: row.get("invocation_updated_at"),
                 })
             })
             .collect()
@@ -96,13 +102,15 @@ impl Store {
         let Some(ws) = ws else {
             return Ok(false);
         };
-        let eligible = agent_access_in(
-            &mut tx,
-            &WorkspaceId(ws),
-            DEFAULT_CONVERSATION,
-            &row.agent_id,
-        )
-        .await?;
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_agent_activity WHERE turn_id=? AND state='queued')").bind(&row.turn_id).fetch_one(&mut *tx).await.map_err(|e| db(&e))?;
+        let eligible = active
+            && agent_access_in(
+                &mut tx,
+                &WorkspaceId(ws),
+                DEFAULT_CONVERSATION,
+                &row.agent_id,
+            )
+            .await?;
         if eligible {
             sqlx::query("INSERT INTO agent_queue(id,agent_id,position,payload,created_at,turn_id) VALUES(?,?,(SELECT coalesce(max(position),-1)+1 FROM agent_queue WHERE agent_id=?),?,?,?)")
                 .bind(&row.id).bind(row.agent_id.as_str()).bind(row.agent_id.as_str()).bind(row.payload.to_string()).bind(&row.created_at).bind(&row.turn_id)

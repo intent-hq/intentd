@@ -222,7 +222,7 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .insert_workspace(&sample_workspace(&ws, "Existing discussion", false))
         .await
         .unwrap();
-    sqlx::raw_sql("DROP TABLE discussion_agent_delivery; DROP TABLE discussion_agent_grant; DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
+    sqlx::raw_sql("DROP TABLE discussion_agent_activity; DROP TABLE discussion_agent_delivery; DROP TABLE discussion_agent_grant; DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
         .execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../migrations/0163_workspace_discussions.sql"))
         .execute(store.write_pool())
@@ -253,6 +253,11 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .execute(store.write_pool())
         .await
         .unwrap();
+    sqlx::query("UPDATE workspace_discussion_message SET recipient_agent_ids_json='[\"historical-agent\"]' WHERE id='old-message'").execute(store.write_pool()).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0167_discussion_activity.sql"))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
     let page = store
         .list_discussion_messages(&ws, None, None, 50)
         .await
@@ -260,15 +265,28 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
     assert_eq!(page.messages.len(), 1);
     let old = &page.messages[0];
     assert_eq!(old.id, "old-message");
+    assert!(
+        old.agent_activity.is_empty(),
+        "migration must not invent activity for delivered historical work"
+    );
     assert_eq!(old.conversation_id, "default");
     assert_eq!(old.sequence, 7);
     assert_eq!(old.author, author);
     let (retry, inserted) = store
-        .insert_discussion_message(&ws, "retry", "preserved", &author)
+        .send_discussion_message(
+            &ws,
+            "retry",
+            "preserved",
+            &author,
+            &intent_core::discussion::DiscussionTarget {
+                recipient_agent_ids: vec![intent_core::AgentId::from("historical-agent")],
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert!(!inserted);
-    assert_eq!(&retry, old);
+    assert_eq!(&retry.message, old);
     let (next, _) = store
         .insert_discussion_message(&ws, "next", "next", &author)
         .await
