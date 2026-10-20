@@ -1009,7 +1009,8 @@ async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
 /// omitted from `prMonitor.list`'s `lastSnapshot` while not queued, present
 /// as `{ position, queueSize, state, enqueuedAt, estimatedTimeToMerge }`
 /// once queued, refreshed as the queue moves — and queue movement alone is
-/// informational: no `prMonitor:changed` line, nothing pending, no wake.
+/// informational: no `prMonitor:changed` line, nothing pending, no wake;
+/// only the UI-only `prMonitor:refreshed` re-read hint fires.
 #[intent_test_macros::daemon_test]
 async fn pr_monitor_list_carries_merge_queue_position_without_waking_over_wss() {
     let fx = boot().await;
@@ -1076,10 +1077,33 @@ async fn pr_monitor_list_carries_merge_queue_position_without_waking_over_wss() 
     )
     .await;
     assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    // The UI-only re-read hint, on its own front-door subscription.
+    let mut hint = connect(fx.port, fx.cfg.clone()).await;
+    let hint_res = wss_rpc(
+        &mut hint,
+        5,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:refreshed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(
+        hint_res["subscriptionId"].is_string(),
+        "hint sub id: {hint_res}"
+    );
     fx.forge.edit(|s| s.merge_queue_entry = Some(entry(1, 600)));
     fx.services.poll_pr_monitors().await;
+    let refreshed = next_event(&mut hint, "prMonitor:refreshed").await;
+    assert_eq!(refreshed["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        refreshed["data"].get("changes").is_none(),
+        "the hint carries no change lines: {refreshed}"
+    );
     assert_no_event(&mut sub, "prMonitor:changed").await;
-    let listed = wss_rpc(&mut rpc, 5, "prMonitor.list", list).await;
+
+    // An unchanged queue entry sends no hint.
+    fx.services.poll_pr_monitors().await;
+    assert_no_event(&mut hint, "prMonitor:refreshed").await;
+    let listed = wss_rpc(&mut rpc, 6, "prMonitor.list", list).await;
     let row = &listed["monitors"][0];
     assert_eq!(
         row["lastSnapshot"]["mergeQueue"]["position"],

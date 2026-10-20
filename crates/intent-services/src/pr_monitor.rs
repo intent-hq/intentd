@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use intent_core::events::{
     PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_EMITTED,
-    PR_MONITOR_REGISTERED,
+    PR_MONITOR_REFRESHED, PR_MONITOR_REGISTERED,
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
@@ -3742,6 +3742,11 @@ impl Services {
         let poll_activity = previous
             .as_ref()
             .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
+        // Informational queue movement since the last poll (position, size,
+        // entry state, estimate): never a change line, only a UI re-read hint.
+        let queue_moved = previous
+            .as_ref()
+            .is_some_and(|prev| prev.requirements.merge_queue != fresh.requirements.merge_queue);
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -3845,6 +3850,12 @@ impl Services {
                 Some(json!({ "changes": updated.pending_changes })),
             )
             .await;
+        } else if queue_moved {
+            // Queue movement is informational: no change line, no wake.
+            // The UI-only re-read hint keeps the displayed position current
+            // (agent-owned subscriptions can never receive it).
+            self.emit_pr_monitor_event(PR_MONITOR_REFRESHED, &updated, None)
+                .await;
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an

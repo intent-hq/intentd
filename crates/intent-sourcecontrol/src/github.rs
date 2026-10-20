@@ -1489,12 +1489,16 @@ fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
 /// limit (a `RATE_LIMIT` envelope maps onto [`Error::RateLimited`], never
 /// `Api`), network — stays a hard failure.
 fn merge_queue_field_unsupported(err: &Error) -> bool {
+    // Case-insensitive: covers `isInMergeQueue`, `mergeQueueEntry`, the
+    // nested `MergeQueueEntry` / `MergeQueue` types (a host lacking one of
+    // the entry's fields names its type), `RemovedFromMergeQueueEvent`, and
+    // a field error whose `path` runs through the entry selection.
     matches!(
         err,
-        Error::Api(msg) if msg.contains("isInMergeQueue")
-            || msg.contains("mergeQueueEntry")
-            || msg.contains("RemovedFromMergeQueueEvent")
-            || msg.contains("REMOVED_FROM_MERGE_QUEUE_EVENT")
+        Error::Api(msg) if {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("mergequeue") || msg.contains("merge_queue")
+        }
     )
 }
 
@@ -3284,6 +3288,20 @@ mod tests {
             "GraphQL Error: Field 'mergeQueueEntry' doesn't exist on type 'PullRequest'".into(),
         );
         assert!(merge_queue_field_unsupported(&entry));
+        // A host with the entry but without one of its nested fields names
+        // the nested type instead.
+        let nested = Error::Api(
+            "GraphQL Error: Field 'estimatedTimeToMerge' doesn't exist on type 'MergeQueueEntry'"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&nested));
+        // A field-level denial on the selection carries its path.
+        let denied = Error::Api(
+            "GraphQL Error: 1 GraphQL Error\n1: Resource not accessible by personal access token \
+             (path: [Key(\"repository\"), Key(\"pullRequest\"), Key(\"mergeQueueEntry\")])"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&denied));
 
         // Any other failure — auth, rate limit, unrelated API error — stays
         // a hard failure rather than triggering the degraded retry.
