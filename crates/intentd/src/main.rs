@@ -1597,6 +1597,21 @@ const IDLE_UPDATE_TICK: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const STAGED_RESTART_POLL: Duration = Duration::from_secs(1);
 
+/// Upper bound on how long a pending staged restart waits for running
+/// command-mode scripts (the 2026-10-19 burn-down lost 20–60 min Rust test
+/// runs to idle-mode restarts that ignored them). Measured from accepting
+/// the staged restart; past it the restart proceeds and stops the scripts,
+/// so a stuck script cannot pin an old daemon forever. In-flight agent turns
+/// are still waited for without a cap.
+#[cfg(unix)]
+const STAGED_RESTART_SCRIPT_WAIT_CAP: Duration = Duration::from_secs(90 * 60);
+
+/// Probe for the number of command-mode script runs in flight
+/// (`Services::running_command_script_count`); injected so the handshake
+/// state stays testable without a script registry.
+#[cfg(unix)]
+type RunningScriptsProbe = Arc<dyn Fn() -> usize + Send + Sync>;
+
 /// Exit status mirroring a default-disposition SIGPIPE death (128 + 13), the
 /// code shells report for standard Unix tools whose output pipe closes early.
 const SIGPIPE_EXIT_CODE: i32 = 141;
@@ -2709,8 +2724,12 @@ async fn cmd_serve_owned(
     // control surface so `system.status` can report it; the requester and
     // staged-restart watcher below share it.
     #[cfg(unix)]
-    let idle_update_state = Arc::new(IdleUpdateState::new(
+    let idle_update_state = Arc::new(IdleUpdateState::with_running_scripts(
         SITTER_IDLE_RESTART.load(std::sync::atomic::Ordering::Relaxed),
+        {
+            let services = services.clone();
+            Arc::new(move || services.running_command_script_count())
+        },
     ));
 
     let control = Arc::new(DaemonControl {
@@ -2741,10 +2760,11 @@ async fn cmd_serve_owned(
     );
 
     // Sitter idle-update handshake (unix only): the requester asks the sitter
-    // for an idle-mode update check (SIGUSR2) while no turn is in flight, and
-    // the staged-restart watcher answers the sitter's SIGUSR2 ("a newer
-    // version is staged") by exiting with RESTART_FOR_UPDATE_EXIT_CODE the
-    // moment `list_busy()` drains. Both are gated on the sitter having
+    // for an idle-mode update check (SIGUSR2) while no turn is in flight and
+    // no command script runs, and the staged-restart watcher answers the
+    // sitter's SIGUSR2 ("a newer version is staged") by exiting with
+    // RESTART_FOR_UPDATE_EXIT_CODE the moment `list_busy()` drains and the
+    // command scripts finish (bounded by STAGED_RESTART_SCRIPT_WAIT_CAP). Both are gated on the sitter having
     // advertised the handshake via INTENTD_SITTER_IDLE_RESTART.
     #[cfg(unix)]
     let staged_restart_watcher = spawn_staged_restart_watcher(
@@ -5397,6 +5417,12 @@ struct IdleUpdateState {
     /// [`RESTART_FOR_UPDATE_EXIT_CODE`] as soon as it is idle. Suppresses
     /// further idle update requests meanwhile.
     restart_pending: std::sync::atomic::AtomicBool,
+    /// Running command-mode scripts count as busy for the handshake.
+    running_scripts: RunningScriptsProbe,
+    /// When a pending staged restart stops waiting for running command
+    /// scripts ([`STAGED_RESTART_SCRIPT_WAIT_CAP`] after it was accepted);
+    /// `None` until a staged restart is accepted.
+    script_wait_deadline: std::sync::Mutex<Option<std::time::Instant>>,
     /// Why the serve loop is shutting down, as a [`ShutdownCause`]
     /// discriminant. Latched WRITE-ONCE (compare-and-set from `Undecided`)
     /// at the moment the shutdown decision is made — before any teardown
@@ -5453,11 +5479,19 @@ struct IdleUpdateTiming {
 
 #[cfg(unix)]
 impl IdleUpdateState {
+    /// Test constructor: no script registry, so no script ever counts.
+    #[cfg(test)]
     fn new(advertised: bool) -> Self {
+        Self::with_running_scripts(advertised, Arc::new(|| 0))
+    }
+
+    fn with_running_scripts(advertised: bool, running_scripts: RunningScriptsProbe) -> Self {
         Self {
             advertised,
             boot_at: std::time::Instant::now(),
             restart_pending: std::sync::atomic::AtomicBool::new(false),
+            running_scripts,
+            script_wait_deadline: std::sync::Mutex::new(None),
             shutdown_cause: std::sync::atomic::AtomicU8::new(ShutdownCause::Undecided as u8),
             timing: std::sync::Mutex::new(IdleUpdateTiming::default()),
         }
@@ -5497,6 +5531,24 @@ impl IdleUpdateState {
         self.shutdown_cause() == ShutdownCause::RestartForUpdate
     }
 
+    fn running_scripts(&self) -> usize {
+        (self.running_scripts)()
+    }
+
+    fn script_wait_deadline(&self) -> Option<std::time::Instant> {
+        *self
+            .script_wait_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_script_wait_deadline(&self, deadline: Option<std::time::Instant>) {
+        *self
+            .script_wait_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+    }
+
     fn timing(&self) -> IdleUpdateTiming {
         *self
             .timing
@@ -5519,6 +5571,14 @@ impl IdleUpdateState {
         let timing = self.timing();
         let now = std::time::Instant::now();
         let now_sys = std::time::SystemTime::now();
+        let running_scripts = self.running_scripts();
+        let restart_pending = self.is_restart_pending();
+        let restart_deferred_until = restart_deferred_until(
+            restart_pending,
+            running_scripts,
+            self.script_wait_deadline(),
+        )
+        .map(|at| instant_to_iso(at, now, now_sys));
         intent_transport::IdleUpdateCheckStatus {
             enabled,
             supported: self.advertised && supervised,
@@ -5528,9 +5588,22 @@ impl IdleUpdateState {
             next_eligible_at: timing
                 .next_eligible_at
                 .map(|at| instant_to_iso(at, now, now_sys)),
-            restart_pending: self.is_restart_pending(),
+            restart_pending,
+            running_scripts,
+            restart_deferred_until,
         }
     }
+}
+
+/// `idleUpdateCheck.restartDeferredUntil`: the script-wait deadline, only
+/// while a staged restart is pending AND running command scripts hold it.
+#[cfg(unix)]
+fn restart_deferred_until(
+    restart_pending: bool,
+    running_scripts: usize,
+    deadline: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    deadline.filter(|_| restart_pending && running_scripts > 0)
 }
 
 /// Project a monotonic `Instant` onto the wall clock as an RFC 3339 UTC
@@ -5663,12 +5736,76 @@ fn next_eligible_at(
     interval_from.checked_add(policy.interval)
 }
 
+/// Start of the current stretch with no running command-mode script, as seen
+/// by requester ticks: `None` while one runs, restarted at the first tick
+/// that sees none (a script that ends between ticks is treated as running
+/// until that tick, so the grace always follows the end of a run).
+#[cfg(unix)]
+fn next_scripts_idle_since(
+    previous: Option<std::time::Instant>,
+    running_scripts: usize,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    if running_scripts > 0 {
+        None
+    } else {
+        Some(previous.unwrap_or(now))
+    }
+}
+
+/// The daemon's continuous-idle start for the requester: idle only while
+/// both no turn is in flight and no command script runs, from the later of
+/// the two stretches.
+#[cfg(unix)]
+fn combined_idle_since(
+    turns_idle_since: Option<std::time::Instant>,
+    scripts_idle_since: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    Some(turns_idle_since?.max(scripts_idle_since?))
+}
+
+/// What a pending staged restart does on one watcher poll (see
+/// [`staged_restart_wait`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedRestartWait {
+    /// A turn is in flight: keep waiting, uncapped.
+    Turns,
+    /// Command scripts are running and the cap has not passed: keep waiting.
+    Scripts,
+    /// Scripts are still running but the cap passed: restart anyway.
+    ScriptCapReached,
+    /// Idle: restart now.
+    Proceed,
+}
+
+/// Pure decision for one staged-restart poll. Turns win over scripts so a
+/// capped script wait never restarts under an in-flight turn.
+#[cfg(unix)]
+fn staged_restart_wait(
+    busy_turns: usize,
+    running_scripts: usize,
+    now: std::time::Instant,
+    script_deadline: std::time::Instant,
+) -> StagedRestartWait {
+    if busy_turns > 0 {
+        StagedRestartWait::Turns
+    } else if running_scripts == 0 {
+        StagedRestartWait::Proceed
+    } else if now < script_deadline {
+        StagedRestartWait::Scripts
+    } else {
+        StagedRestartWait::ScriptCapReached
+    }
+}
+
 /// Spawn the idle update requester: every [`IDLE_UPDATE_TICK`] it reads the
 /// start of the current continuous-idle stretch from
 /// `AgentManager::idle_since` (maintained on the in-flight-turn edges under
 /// the busy lock, so a turn that starts and ends between two ticks still
 /// resets the grace; hooks, PR monitors, subscriptions, queued messages and
-/// idle agents never count), and when [`should_request_idle_update`] holds
+/// idle agents never count) combined with the running command-mode scripts
+/// ([`next_scripts_idle_since`]), and when [`should_request_idle_update`] holds
 /// and the daemon is sitter-supervised, sends the sitter SIGUSR2. A failed
 /// signal is logged and still counts for the interval; an unsupervised tick
 /// does not. Each tick publishes its bookkeeping to
@@ -5688,11 +5825,14 @@ fn spawn_idle_update_requester(
     intent_core::spawn_daemon(async move {
         let mut ticker = tokio::time::interval(IDLE_UPDATE_TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut scripts_idle_since = Some(state.boot_at);
         loop {
             ticker.tick().await;
             let now = std::time::Instant::now();
             let mut timing = state.timing();
-            timing.idle_since = manager.idle_since();
+            scripts_idle_since =
+                next_scripts_idle_since(scripts_idle_since, state.running_scripts(), now);
+            timing.idle_since = combined_idle_since(manager.idle_since(), scripts_idle_since);
             let policy = IdleUpdatePolicy::from_settings(
                 state.advertised,
                 &settings_registry.snapshot().effective.updates,
@@ -5739,9 +5879,11 @@ fn spawn_idle_update_requester(
 /// Spawn the staged-restart watcher using the reserved SIGUSR2 receiver (the
 /// sitter's "a newer version is staged; exit when idle"), and on receipt
 /// marks the restart pending and triggers the graceful shutdown as soon as
-/// `list_busy()` is empty — immediately if already idle, otherwise polled
-/// every [`STAGED_RESTART_POLL`] with no cap (the sitter's periodic check is
-/// the forced fallback). The serve loop then exits with
+/// `list_busy()` is empty and no command-mode script is running —
+/// immediately if already idle, otherwise polled every
+/// [`STAGED_RESTART_POLL`]. The turn wait has no cap (the sitter's periodic
+/// check is the forced fallback); the script wait is capped at
+/// [`STAGED_RESTART_SCRIPT_WAIT_CAP`] ([`staged_restart_wait`]). The serve loop then exits with
 /// [`RESTART_FOR_UPDATE_EXIT_CODE`]. Installed even when the handshake was
 /// not advertised so a stray SIGUSR2 cannot kill the daemon via the default
 /// disposition; it is then logged and ignored. Signals received before readiness
@@ -5800,10 +5942,15 @@ fn spawn_staged_restart_watcher(
                 );
                 continue;
             }
+            let script_deadline = std::time::Instant::now() + STAGED_RESTART_SCRIPT_WAIT_CAP;
+            state.set_script_wait_deadline(Some(script_deadline));
             state
                 .restart_pending
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!("staged update restart accepted; exiting once no turn is in flight");
+            tracing::info!(
+                "staged update restart accepted; exiting once no turn is in flight and no command script is running"
+            );
+            let mut announced_script_wait = false;
             loop {
                 if cancellation.stopping() || state.shutdown_cause() != ShutdownCause::Undecided {
                     tracing::info!(
@@ -5812,10 +5959,36 @@ fn spawn_staged_restart_watcher(
                     return;
                 }
                 let busy = manager.list_busy().len();
-                if busy == 0 {
-                    break;
+                let scripts = state.running_scripts();
+                match staged_restart_wait(busy, scripts, std::time::Instant::now(), script_deadline)
+                {
+                    StagedRestartWait::Proceed => break,
+                    StagedRestartWait::ScriptCapReached => {
+                        tracing::warn!(
+                            scripts,
+                            cap_minutes = STAGED_RESTART_SCRIPT_WAIT_CAP.as_secs() / 60,
+                            "staged update restart stopped waiting for running scripts; restarting anyway"
+                        );
+                        break;
+                    }
+                    StagedRestartWait::Turns => {
+                        tracing::debug!(busy, "staged update restart waiting for in-flight turns");
+                    }
+                    StagedRestartWait::Scripts if !announced_script_wait => {
+                        announced_script_wait = true;
+                        tracing::info!(
+                            scripts,
+                            cap_minutes = STAGED_RESTART_SCRIPT_WAIT_CAP.as_secs() / 60,
+                            "staged update restart waiting for running scripts"
+                        );
+                    }
+                    StagedRestartWait::Scripts => {
+                        tracing::debug!(
+                            scripts,
+                            "staged update restart waiting for running scripts"
+                        );
+                    }
                 }
-                tracing::debug!(busy, "staged update restart waiting for in-flight turns");
                 tokio::time::sleep(STAGED_RESTART_POLL).await;
             }
             // Latch BEFORE notifying so the serve loop's own `Stop` latch on
@@ -9119,6 +9292,144 @@ for line in sys.stdin:
         assert!(!state.restart_exit_fired());
         assert!(state.latch_shutdown_cause(ShutdownCause::RestartForUpdate));
         assert!(state.restart_exit_fired());
+    }
+
+    /// The staged-restart poll waits for running command scripts until the
+    /// cap, then restarts anyway; turns are waited for uncapped and win over
+    /// a passed script cap.
+    #[cfg(unix)]
+    #[test]
+    fn staged_restart_wait_holds_for_scripts_until_the_cap() {
+        let accepted = std::time::Instant::now();
+        let deadline = accepted + STAGED_RESTART_SCRIPT_WAIT_CAP;
+        let later = accepted + Duration::from_secs(60);
+        let past_cap = deadline + Duration::from_secs(1);
+        assert_eq!(STAGED_RESTART_SCRIPT_WAIT_CAP, Duration::from_secs(90 * 60));
+        assert_eq!(
+            staged_restart_wait(0, 0, accepted, deadline),
+            StagedRestartWait::Proceed
+        );
+        assert_eq!(
+            staged_restart_wait(0, 1, later, deadline),
+            StagedRestartWait::Scripts
+        );
+        assert_eq!(
+            staged_restart_wait(0, 3, deadline, deadline),
+            StagedRestartWait::ScriptCapReached
+        );
+        assert_eq!(
+            staged_restart_wait(1, 0, past_cap, deadline),
+            StagedRestartWait::Turns,
+            "the turn wait is uncapped"
+        );
+        assert_eq!(
+            staged_restart_wait(1, 2, past_cap, deadline),
+            StagedRestartWait::Turns,
+            "a passed script cap never restarts under a turn"
+        );
+    }
+
+    /// A running command script resets the requester's idle stretch exactly
+    /// like an in-flight turn, so no idle update request goes out while a
+    /// check runs or within the grace after it ends.
+    #[cfg(unix)]
+    #[test]
+    fn running_scripts_hold_off_the_idle_update_request() {
+        let boot = std::time::Instant::now();
+        let policy = IdleUpdatePolicy {
+            advertised: true,
+            check_on_idle: true,
+            interval: Duration::from_secs(3600),
+            grace: Duration::from_secs(120),
+        };
+        let tick = |secs| boot + Duration::from_secs(secs);
+        let turns_idle = Some(boot);
+
+        // Script running at the 2 h tick: busy, no request.
+        let scripts = next_scripts_idle_since(Some(boot), 1, tick(7200));
+        assert_eq!(scripts, None);
+        let idle = combined_idle_since(turns_idle, scripts);
+        assert_eq!(idle, None);
+        assert!(!should_request_idle_update(
+            tick(7200),
+            boot,
+            idle,
+            None,
+            false,
+            &policy
+        ));
+
+        // First tick after the script ended starts a fresh stretch: still
+        // inside the grace, no request.
+        let scripts = next_scripts_idle_since(scripts, 0, tick(7230));
+        assert_eq!(scripts, Some(tick(7230)));
+        let idle = combined_idle_since(turns_idle, scripts);
+        assert_eq!(idle, Some(tick(7230)));
+        assert!(!should_request_idle_update(
+            tick(7260),
+            boot,
+            idle,
+            None,
+            false,
+            &policy
+        ));
+
+        // The stretch is kept across idle ticks; past the grace it requests.
+        let scripts = next_scripts_idle_since(scripts, 0, tick(7380));
+        assert_eq!(scripts, Some(tick(7230)));
+        let idle = combined_idle_since(turns_idle, scripts);
+        assert!(should_request_idle_update(
+            tick(7380),
+            boot,
+            idle,
+            None,
+            false,
+            &policy
+        ));
+
+        // A turn in flight still blocks regardless of scripts.
+        assert_eq!(combined_idle_since(None, Some(boot)), None);
+    }
+
+    /// `system.status` reports the running command scripts and the script
+    /// wait deadline only while a pending restart is actually held by them.
+    #[cfg(unix)]
+    #[test]
+    fn idle_update_status_reports_running_scripts_and_deferral() {
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = running.clone();
+        let state = IdleUpdateState::with_running_scripts(
+            true,
+            Arc::new(move || probe.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        let idle = state.status(true, true);
+        assert_eq!(idle.running_scripts, 0);
+        assert_eq!(idle.restart_deferred_until, None);
+
+        running.store(2, std::sync::atomic::Ordering::Relaxed);
+        let not_pending = state.status(true, true);
+        assert_eq!(not_pending.running_scripts, 2);
+        assert_eq!(
+            not_pending.restart_deferred_until, None,
+            "no deferral without a pending restart"
+        );
+
+        state.set_script_wait_deadline(Some(
+            std::time::Instant::now() + STAGED_RESTART_SCRIPT_WAIT_CAP,
+        ));
+        state
+            .restart_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deferred = state.status(true, true);
+        assert!(deferred.restart_pending);
+        assert_eq!(deferred.running_scripts, 2);
+        assert!(
+            deferred.restart_deferred_until.is_some(),
+            "pending restart held by scripts reports its deadline"
+        );
+
+        running.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(state.status(true, true).restart_deferred_until, None);
     }
 
     /// The shutdown cause is write-once: whichever decision lands first

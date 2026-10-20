@@ -2976,6 +2976,17 @@ impl Services {
         self.script_manager().hydrate().await
     }
 
+    /// Command-mode scripts whose run is in flight right now (`starting`,
+    /// `running` or `restarting`). The idle update handshake counts these as
+    /// busy so a staged self-update does not kill a long check mid-run.
+    /// Service-mode scripts never count: they run indefinitely and an
+    /// auto-start service is restored after a restart. One registry lock, no
+    /// I/O — cheap enough for `system.status` and a 1 s poll.
+    #[must_use]
+    pub fn running_command_script_count(&self) -> usize {
+        script_ops::running_command_count(&self.scripts)
+    }
+
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
     /// user-stop semantics (so no auto-restart races the teardown), kill every
     /// PTY session the host tracks — scripts and terminals alike — in one

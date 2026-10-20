@@ -149,6 +149,23 @@ fn next_generation() -> u64 {
 /// globally unique; this registry does not permit duplicate public definitions.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
+/// Number of command-mode entries in `registry` with a run in flight
+/// (see [`crate::Services::running_command_script_count`]).
+pub(crate) fn running_command_count(registry: &ScriptRegistry) -> usize {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|m| {
+            m.def.mode == ScriptMode::Command
+                && matches!(
+                    m.state.status,
+                    ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
+                )
+        })
+        .count()
+}
+
 /// Shared async locks for workspace bootstrap and script definition updates.
 /// Bootstrap is workspace-scoped; updates use the durable script id across
 /// all workspaces, matching the store's primary key and legacy owner moves.
@@ -5885,6 +5902,59 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["timedOut"], true);
+    }
+
+    /// The idle update handshake's busy probe: only an in-flight command-mode
+    /// run counts — a running service and a finished command run do not.
+    #[intent_test_macros::daemon_test]
+    async fn running_command_script_count_counts_only_in_flight_command_runs() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        assert_eq!(h.services.running_command_script_count(), 0);
+
+        let svc = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), svc.clone())
+            .await
+            .expect("start service");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == svc.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        assert_eq!(
+            h.services.running_command_script_count(),
+            0,
+            "a running service never holds off an update"
+        );
+
+        let cmd = create_simple(&h, "check", "sleep 3600", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), cmd.clone())
+            .await
+            .expect("start command");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        assert_eq!(h.services.running_command_script_count(), 1);
+
+        h.services
+            .script_stop(h.ws.clone(), cmd.clone())
+            .await
+            .expect("stop command");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "exited"
+        })
+        .await;
+        assert_eq!(
+            h.services.running_command_script_count(),
+            0,
+            "a finished command run no longer counts"
+        );
+        h.services
+            .script_stop(h.ws.clone(), svc)
+            .await
+            .expect("stop service");
     }
 
     /// Regression (monorepo#1155): a second `script.run` while the script is
