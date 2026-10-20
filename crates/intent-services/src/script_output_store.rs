@@ -16,7 +16,12 @@
 //!   sibling temp file and renames it over the log, so a concurrent read keeps
 //!   its open handle on a complete (old) file and a fresh open sees the
 //!   complete new one: readers never see a log shrink mid-read, and neither
-//!   side ever waits on a lock.
+//!   side ever waits on a lock. If the rename fails (e.g. a filesystem or old
+//!   Windows that refuses to replace an open file), the old log is kept, the
+//!   chunk is appended anyway and compaction is retried later; only past twice
+//!   the cap does the writer fall back to rewriting the log in place.
+//! - Sweeps also delete compaction temp files (`*.compact`) left behind by a
+//!   crash once they are a few minutes old, even when retention is disabled.
 //! - Reads stream the file and hold at most the requested lines (plus one line
 //!   at a time), never the whole log.
 //! - IDs are percent-encoded into a single safe path segment, so no ID can
@@ -39,6 +44,11 @@ pub(crate) const SCRIPT_OUTPUT_DIR: &str = "script-output";
 const LOG_EXT: &str = ".log";
 /// Longest encoded path segment accepted (common filesystem `NAME_MAX`).
 const MAX_SEGMENT_BYTES: usize = 255;
+/// Suffix of compaction temp files (no `.log`, so never read as a run log).
+const COMPACT_EXT: &str = ".compact";
+/// Age past which a compaction temp file is a crash leftover: a live
+/// compaction finishes in well under a second.
+const STALE_COMPACT_AGE: Duration = Duration::from_secs(300);
 /// Chunk size for backward tail scans and line counting.
 const SCAN_CHUNK: usize = 64 * 1024;
 
@@ -69,6 +79,8 @@ pub(crate) struct SweepReport {
     pub skipped_live: usize,
     /// Logs that could not be inspected or deleted (each logged as a warning).
     pub failed: usize,
+    /// Stale compaction temp files (`*.compact`) deleted.
+    pub stale_temps_deleted: usize,
 }
 
 /// The on-disk script output store rooted at `<data_dir>/script-output`.
@@ -166,6 +178,7 @@ impl ScriptOutputStore {
                 file: Some(file),
                 len,
                 cap: self.max_bytes_per_run,
+                defer_until: 0,
             },
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "script output log disabled: open failed");
@@ -288,22 +301,29 @@ impl ScriptOutputStore {
 
     /// Delete every log last modified more than `max_age` ago, except those
     /// for which `is_live` returns true, then prune emptied folders.
-    /// `max_age == 0` disables the sweep (`scripts.outputRetentionHours = 0`).
-    /// Unrecognized entries are left alone; failures are logged and counted.
+    /// `max_age == 0` disables log expiry (`scripts.outputRetentionHours = 0`).
+    /// Compaction temp files older than [`STALE_COMPACT_AGE`] are deleted
+    /// either way. Unrecognized entries are left alone; failures are logged
+    /// and counted.
     pub(crate) fn sweep(
         &self,
         max_age: Duration,
         is_live: impl Fn(&RunKey) -> bool,
     ) -> SweepReport {
         let mut report = SweepReport::default();
-        if max_age.is_zero() {
-            return report;
-        }
-        let Some(cutoff) = SystemTime::now().checked_sub(max_age) else {
-            return report;
+        let now = SystemTime::now();
+        let log_cutoff = if max_age.is_zero() {
+            None
+        } else {
+            now.checked_sub(max_age)
         };
+        let temp_cutoff = now.checked_sub(STALE_COMPACT_AGE);
         for (ws_dir, workspace_id) in decoded_children(&self.root, true, &mut report) {
             for (script_dir, script_id) in decoded_children(&ws_dir, true, &mut report) {
+                if let Some(cutoff) = temp_cutoff {
+                    remove_stale_temps(&script_dir, cutoff, &mut report);
+                }
+                let Some(cutoff) = log_cutoff else { continue };
                 for (path, run_id) in decoded_children(&script_dir, false, &mut report) {
                     let key = RunKey {
                         workspace: workspace_id.clone(),
@@ -336,9 +356,42 @@ impl ScriptOutputStore {
                 }
                 let _ = fs::remove_dir(&script_dir);
             }
-            let _ = fs::remove_dir(&ws_dir);
+            if log_cutoff.is_some() {
+                let _ = fs::remove_dir(&ws_dir);
+            }
         }
         report
+    }
+}
+
+/// Delete the regular `*.compact` files in `dir` last modified before
+/// `cutoff` (crash leftovers of [`replace_log`]); symlinks are left alone.
+fn remove_stale_temps(dir: &Path, cutoff: SystemTime, report: &mut SweepReport) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_temp = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.ends_with(COMPACT_EXT));
+        if !is_temp || !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let stale = fs::symlink_metadata(&path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < cutoff);
+        if !stale {
+            continue;
+        }
+        match ignore_missing(fs::remove_file(&path)) {
+            Ok(()) => report.stale_temps_deleted += 1,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "script output sweep: temp delete failed");
+                report.failed += 1;
+            }
+        }
     }
 }
 
@@ -351,6 +404,9 @@ pub(crate) struct RunOutputWriter {
     file: Option<File>,
     len: u64,
     cap: u64,
+    /// After a failed compaction rename, the size up to which appends skip
+    /// compaction before retrying it (0 when no retry is pending).
+    defer_until: u64,
 }
 
 impl RunOutputWriter {
@@ -360,6 +416,7 @@ impl RunOutputWriter {
             file: None,
             len: 0,
             cap,
+            defer_until: 0,
         }
     }
 
@@ -399,7 +456,14 @@ impl RunOutputWriter {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let result = write_capped(&self.path, file, &mut self.len, self.cap, chunk);
+        let result = write_capped(
+            &self.path,
+            file,
+            &mut self.len,
+            self.cap,
+            &mut self.defer_until,
+            chunk,
+        );
         if let Err(e) = result {
             tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
             self.file = None;
@@ -408,21 +472,25 @@ impl RunOutputWriter {
 }
 
 /// Append `chunk` to the log at `path` (open as `file`, read + append, size
-/// `*len`) without ever exceeding `cap` bytes. Compaction replaces `*file`
-/// with the handle of the renamed-in log (see [`replace_log`]).
+/// `*len`), keeping it within `cap` bytes. Compaction replaces `*file` with
+/// the handle of the renamed-in log (see [`replace_log`]). If that rename
+/// fails, nothing is lost: the old log is kept, the chunk is appended, and
+/// compaction is retried once the log has grown another quarter cap (tracked
+/// in `*defer_until`). Only a log that would pass twice the cap is rewritten
+/// in place, trading the concurrent-read guarantee for bounded size.
 fn write_capped(
     path: &Path,
     file: &mut File,
     len: &mut u64,
     cap: u64,
+    defer_until: &mut u64,
     chunk: &[u8],
 ) -> io::Result<()> {
     let chunk_len = chunk.len() as u64;
-    if *len + chunk_len <= cap {
-        file.write_all(chunk)?;
-        file.flush()?;
-        *len += chunk_len;
-        return Ok(());
+    let hard_cap = cap.saturating_mul(2);
+    let new_len = len.saturating_add(chunk_len);
+    if new_len <= cap || new_len <= (*defer_until).min(hard_cap) {
+        return append_chunk(file, len, chunk);
     }
     // `cap` fits in usize whenever the chunk does not (chunk_len > cap below).
     let mut kept: Vec<u8> = if chunk_len >= cap {
@@ -431,15 +499,56 @@ fn write_capped(
         let budget = (cap / 2).min(cap - chunk_len).min(*len);
         newest_bytes_at_line_start(file, *len, budget)?
     };
-    let chunk = if chunk_len > cap {
+    let tail = if chunk_len > cap {
         &chunk[chunk.len() - usize::try_from(cap).expect("cap < chunk length fits in usize")..]
     } else {
         chunk
     };
-    kept.extend_from_slice(chunk);
-    *file = replace_log(path, &kept)?;
-    *len = kept.len() as u64;
+    kept.extend_from_slice(tail);
+    match replace_log(path, &kept) {
+        Ok(new_file) => {
+            *file = new_file;
+            *len = kept.len() as u64;
+            *defer_until = 0;
+            Ok(())
+        }
+        Err(e) if new_len <= hard_cap => {
+            tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed; keeping the old log and retrying later");
+            *defer_until = new_len.saturating_add(cap / 4).max(new_len + 1);
+            append_chunk(file, len, chunk)
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed past twice the cap; rewriting in place");
+            file.set_len(0)?;
+            // Append mode writes at the (now zero) end regardless of the cursor.
+            file.write_all(&kept)?;
+            file.flush()?;
+            *len = kept.len() as u64;
+            *defer_until = 0;
+            Ok(())
+        }
+    }
+}
+
+fn append_chunk(file: &mut File, len: &mut u64, chunk: &[u8]) -> io::Result<()> {
+    file.write_all(chunk)?;
+    file.flush()?;
+    *len += chunk.len() as u64;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to make [`rename_log`] fail like a refused Windows rename.
+    static FAIL_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rename_log(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RENAME.with(std::cell::Cell::get) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    fs::rename(from, to)
 }
 
 /// Atomically replace the log at `path` with `contents` and return a read +
@@ -447,10 +556,12 @@ fn write_capped(
 /// (never through a symlink) that is then renamed over `path`, so the log is
 /// never observed truncated or partially written: an already-open reader keeps
 /// reading the complete old file through its handle and a new open sees the
-/// complete new one. On Windows, std opens files with `FILE_SHARE_DELETE` and
-/// `fs::rename` uses POSIX rename semantics, so replacing a log that readers
-/// (or the old writer handle) hold open works there too. The temp name has no
-/// `.log` suffix, so a sweep never mistakes it for a run log.
+/// complete new one. On Windows, std opens every file with `FILE_SHARE_DELETE`
+/// and `fs::rename` retries a refused `MoveFileExW` with POSIX rename
+/// semantics, so replacing a log that readers (or the old writer handle) hold
+/// open works on Windows 10 1607+ NTFS; elsewhere the rename may still fail,
+/// which callers handle by keeping the old log. The temp name ends in
+/// [`COMPACT_EXT`], never `.log`, so a sweep never reads it as a run log.
 fn replace_log(path: &Path, contents: &[u8]) -> io::Result<File> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path
@@ -458,14 +569,14 @@ fn replace_log(path: &Path, contents: &[u8]) -> io::Result<File> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| io::Error::other("script output log has no file name"))?;
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_file_name(format!("{name}.{}-{seq}.compact", std::process::id()));
+    let tmp = path.with_file_name(format!("{name}.{}-{seq}{COMPACT_EXT}", std::process::id()));
     let mut opts = OpenOptions::new();
     opts.create_new(true).read(true).append(true);
     let mut file = no_follow(opts).open(&tmp)?;
     let result = file
         .write_all(contents)
         .and_then(|()| file.flush())
-        .and_then(|()| fs::rename(&tmp, path));
+        .and_then(|()| rename_log(&tmp, path));
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -595,9 +706,18 @@ fn open_append(root: &Path, path: &Path, cap: u64) -> io::Result<(File, u64)> {
     let mut len = file.metadata()?.len();
     if len > cap {
         // Reopened under a smaller cap: keep the newest bytes now.
+        // If the rename fails the oversized log is kept; the writer retries
+        // compaction on its next append.
         let kept = newest_bytes_at_line_start(&mut file, len, cap)?;
-        file = replace_log(path, &kept)?;
-        len = kept.len() as u64;
+        match replace_log(path, &kept) {
+            Ok(new_file) => {
+                file = new_file;
+                len = kept.len() as u64;
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed on reopen; keeping the old log");
+            }
+        }
     }
     Ok((file, len))
 }

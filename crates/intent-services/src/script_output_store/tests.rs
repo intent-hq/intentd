@@ -333,7 +333,8 @@ fn sweep_deletes_expired_keeps_live_and_fresh() {
         SweepReport {
             deleted: 2,
             skipped_live: 1,
-            failed: 0
+            failed: 0,
+            stale_temps_deleted: 0,
         }
     );
     assert!(!store.exists("w1", "s1", "old").unwrap());
@@ -655,4 +656,124 @@ fn compaction_leaves_no_temp_files_behind() {
         .collect();
     assert_eq!(names, vec!["r.log".to_string()]);
     assert!(read_all(&store, "ws", "s", "r").ends_with("line 199\n"));
+}
+
+fn compact_temps(store: &ScriptOutputStore) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(store.script_dir("ws", "s").unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(COMPACT_EXT))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Run `f` with every compaction rename failing, like Windows refusing to
+/// replace a log another process holds open without `FILE_SHARE_DELETE`.
+fn with_failing_rename<T>(f: impl FnOnce() -> T) -> T {
+    FAIL_RENAME.with(|c| c.set(true));
+    let out = f();
+    FAIL_RENAME.with(|c| c.set(false));
+    out
+}
+
+#[test]
+fn failed_compaction_rename_keeps_every_byte_and_retries_later() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    let lines: Vec<String> = (0..40)
+        .map(|i| format!("line {i:04} {}\n", "z".repeat(28)))
+        .collect();
+    let mut expected = String::new();
+    with_failing_rename(|| {
+        // 40 * 40 bytes = 1600 < 2 * cap: nothing is dropped while renames fail.
+        for line in &lines {
+            w.append(line.as_bytes());
+            expected.push_str(line);
+        }
+    });
+    assert!(w.is_enabled());
+    assert_eq!(read_all(&store, "ws", "s", "r"), expected);
+    assert_eq!(w.len(), expected.len() as u64);
+    assert!(compact_temps(&store).is_empty());
+
+    // Renames work again: the next append past the retry point compacts.
+    for line in &lines {
+        w.append(line.as_bytes());
+    }
+    assert!(w.is_enabled());
+    assert!(w.len() <= 1000, "len {}", w.len());
+    let text = read_all(&store, "ws", "s", "r");
+    assert_eq!(text.len() as u64, w.len());
+    assert!(text.ends_with(&lines[39]));
+    assert!(compact_temps(&store).is_empty());
+}
+
+#[test]
+fn persistently_failing_rename_bounds_the_log_at_twice_the_cap() {
+    let (_dir, store) = store(1000);
+    let mut w = store.open_writer("ws", "s", "r");
+    with_failing_rename(|| {
+        for i in 0..500 {
+            w.append(format!("line {i:04} {}\n", "q".repeat(28)).as_bytes());
+            assert!(w.len() <= 2000, "len {} after {i}", w.len());
+        }
+    });
+    assert!(w.is_enabled());
+    let text = read_all(&store, "ws", "s", "r");
+    assert_eq!(text.len() as u64, w.len());
+    assert!(text.ends_with(&format!("line 0499 {}\n", "q".repeat(28))));
+    assert!(compact_temps(&store).is_empty());
+}
+
+#[test]
+fn failed_reopen_compaction_keeps_the_oversized_log() {
+    let (dir, small) = store(100);
+    let big = ScriptOutputStore::new(dir.path(), 1 << 20);
+    let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    big.open_writer("ws", "s", "r").append(body.as_bytes());
+    let mut w = with_failing_rename(|| small.open_writer("ws", "s", "r"));
+    assert!(w.is_enabled());
+    assert_eq!(w.len(), body.len() as u64);
+    assert_eq!(read_all(&small, "ws", "s", "r"), body);
+    // The next append compacts once renames work.
+    w.append(b"next\n");
+    assert!(w.len() <= 100);
+    assert!(read_all(&small, "ws", "s", "r").ends_with("line 19\nnext\n"));
+}
+
+#[test]
+fn sweep_deletes_stale_compaction_temps_even_with_retention_disabled() {
+    let (_dir, store) = store(1024);
+    store.open_writer("ws", "s", "r").append(b"keep\n");
+    let dir = store.script_dir("ws", "s").unwrap();
+    let stale = dir.join("r.log.1-0.compact");
+    let fresh = dir.join("r.log.1-1.compact");
+    fs::write(&stale, b"old").unwrap();
+    fs::write(&fresh, b"new").unwrap();
+    backdate(&stale, STALE_COMPACT_AGE + Duration::from_secs(60));
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.compact");
+        std::os::unix::fs::symlink(&stale, &link).unwrap();
+    }
+
+    let report = store.sweep(Duration::ZERO, |_| false);
+    assert_eq!(report.stale_temps_deleted, 1, "{report:?}");
+    assert_eq!(report.deleted, 0);
+    assert!(!stale.exists());
+    assert!(fresh.exists(), "an in-flight compaction temp is kept");
+    assert!(store.exists("ws", "s", "r").unwrap());
+
+    backdate(&fresh, STALE_COMPACT_AGE + Duration::from_secs(60));
+    let report = store.sweep(Duration::from_secs(3600), |_| false);
+    assert_eq!(report.stale_temps_deleted, 1, "{report:?}");
+    assert_eq!(report.deleted, 0);
+    assert!(!fresh.exists());
+    assert!(store.exists("ws", "s", "r").unwrap());
+    #[cfg(unix)]
+    assert!(
+        fs::symlink_metadata(dir.join("link.compact")).is_ok(),
+        "symlinks are left alone"
+    );
 }

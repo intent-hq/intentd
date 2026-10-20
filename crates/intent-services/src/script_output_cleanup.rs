@@ -1,6 +1,6 @@
 //! Deletes on-disk script output (`<data_dir>/script-output`) that is no
 //! longer needed: logs older than `scripts.outputRetentionHours` (read live
-//! at every sweep), and folders of workspaces that no longer exist. Script
+//! at every sweep), compaction temp files left by a crash, and folders of workspaces that no longer exist. Script
 //! removal and workspace deletion delete their own folders directly.
 use std::time::Duration;
 
@@ -31,11 +31,9 @@ impl Services {
 
     /// Delete script run logs last written more than `max_age` ago, except
     /// the current run of a script that is still running (a service
-    /// auto-restart keeps appending to that run's log). Zero deletes nothing.
+    /// auto-restart keeps appending to that run's log). Zero deletes no logs;
+    /// stale compaction temp files are deleted either way.
     pub(crate) async fn sweep_script_output_older_than(&self, max_age: Duration) -> SweepReport {
-        if max_age.is_zero() {
-            return SweepReport::default();
-        }
         let store = self.script_output_store().clone();
         let mgr = self.script_manager();
         tokio::task::spawn_blocking(move || {
@@ -118,11 +116,12 @@ impl Services {
             }
             loop {
                 let report = services.sweep_expired_script_output().await;
-                if report.deleted > 0 || report.failed > 0 {
+                if report.deleted > 0 || report.failed > 0 || report.stale_temps_deleted > 0 {
                     tracing::info!(
                         deleted = report.deleted,
                         skipped_live = report.skipped_live,
                         failed = report.failed,
+                        stale_temps_deleted = report.stale_temps_deleted,
                         "script output: expiry sweep complete"
                     );
                 }
