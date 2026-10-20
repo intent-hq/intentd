@@ -680,23 +680,48 @@ pub(crate) fn rebuild<'a>(
             sqlx::query("UPDATE note_page_head SET task_count=?,source_length=?,source_bytes=?,scalar_count=?,lf_count=?,content_generation=? WHERE workspace_id=? AND note_id=?")
             .bind(sql_offset(task_count)?).bind(sql_offset(note.content.encode_utf16().count())?).bind(sql_offset(note.content.len())?).bind(sql_offset(note.content.chars().count())?).bind(sql_offset(note.content.bytes().filter(|b|*b==b'\n').count())?).bind(&content_generation).bind(ws).bind(id).execute(&mut *conn).await.map_err(db_error)?;
         }
-        for (collection, position, mut value) in entries.rows {
-            let admission = value
-                .as_object_mut()
-                .expect("index object")
-                .remove("_admissionRange")
-                .unwrap_or_else(|| value["sourceRange"].clone());
-            sqlx::query("INSERT INTO note_page_entry VALUES (?,?,?,?,?,?,?)")
-                .bind(ws)
-                .bind(id)
-                .bind(collection)
-                .bind(sql_offset(position)?)
-                .bind(value.to_string())
-                .bind(admission["start"].as_i64())
-                .bind(admission["end"].as_i64())
-                .execute(&mut *conn)
-                .await
-                .map_err(db_error)?;
+        // Avoid one SQLite-worker round trip per descriptor while holding the
+        // sole writer. Seven binds per row keep each batch below even SQLite's
+        // legacy 999-variable limit; all batches retain this transaction.
+        let mut rows = entries.rows.into_iter();
+        loop {
+            let batch = rows
+                .by_ref()
+                .take(128)
+                .map(|(collection, position, mut value)| {
+                    let admission = value
+                        .as_object_mut()
+                        .expect("index object")
+                        .remove("_admissionRange")
+                        .unwrap_or_else(|| value["sourceRange"].clone());
+                    Ok((
+                        collection,
+                        sql_offset(position)?,
+                        value.to_string(),
+                        admission["start"].as_i64(),
+                        admission["end"].as_i64(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if batch.is_empty() {
+                break;
+            }
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO note_page_entry (workspace_id,note_id,collection,position,value,source_start,source_end) ",
+            );
+            query.push_values(
+                batch,
+                |mut row, (collection, position, value, start, end)| {
+                    row.push_bind(ws)
+                        .push_bind(id)
+                        .push_bind(collection)
+                        .push_bind(position)
+                        .push_bind(value)
+                        .push_bind(start)
+                        .push_bind(end);
+                },
+            );
+            query.build().execute(&mut *conn).await.map_err(db_error)?;
         }
         for (native, source, primitive) in entries.artifact_sources {
             sqlx::query("INSERT INTO note_artifact_source(workspace_id,note_id,native_collection,source_collection,primitive) VALUES (?,?,?,?,?)")
