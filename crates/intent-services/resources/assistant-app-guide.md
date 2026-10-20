@@ -300,7 +300,10 @@ reporting the problem.
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
-or edit its full definition. Output is temporary and may no longer be available after a restart. Script watches show
+or edit its full definition. Output from each script's latest run is saved and
+stays available after a restart or archive. Saved output is cleared after 7 days by
+default, when you delete the script, or when you delete the workspace; very long runs
+keep only their most recent output. Script watches show
 only active monitors and disappear when they finish, trigger, expire, or are
 cancelled; completion notices remain in the agent conversation.
 
