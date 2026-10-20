@@ -522,7 +522,10 @@ pub struct BranchRules {
 /// The PR's latest merge-queue removal event (GitHub GraphQL
 /// `RemovedFromMergeQueueEvent` timeline item): when the queue ejected the PR
 /// and why. Monotonic — a new ejection produces a new event with a later
-/// `at`; the host never retracts one.
+/// `at`; the host never retracts one. This is the raw event: GitHub also
+/// records one (reason `merged`) when the queue *lands* the PR, so consumers
+/// project it through intent-services' `MergeQueueEjection::from_removal`,
+/// which drops merge removals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeQueueRemoval {

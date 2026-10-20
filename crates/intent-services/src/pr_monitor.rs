@@ -597,8 +597,12 @@ impl SharedPrSnapshot {
             true
         } else {
             if requirements.merge_queue_ejection.is_none() {
-                requirements.merge_queue_ejection =
-                    previous.and_then(|p| p.requirements.merge_queue_ejection.clone());
+                // Never resurrect a held event that records a merge (a
+                // baseline persisted before merged removals were filtered,
+                // or a PR that has since merged).
+                requirements.merge_queue_ejection = previous
+                    .and_then(|p| p.requirements.merge_queue_ejection.clone())
+                    .filter(|e| !e.records_merge(&requirements.state));
             }
             // The hold carries the observation forward, so tracked-ness
             // carries with it; an untracked previous stays untracked until
@@ -6355,6 +6359,42 @@ mod tests {
         let m = known.materialize(Some(&prev));
         assert_eq!(m.requirements.merge_queue_ejection, None);
         assert!(m.ejection_tracked);
+    }
+
+    /// Regression (cloudlands-fe#3524): a degraded probe never carries a
+    /// held event forward when it records a merge — a `merged` removal from
+    /// a baseline persisted before the filter existed, or any held event once
+    /// the PR itself has merged.
+    #[test]
+    fn materialize_never_holds_a_merge_as_an_ejection() {
+        let merged_removal = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:57:04Z".into(),
+                reason: Some("merged".into()),
+            });
+        });
+        let degraded = shared_from(&snapshot(|_| {}), false);
+        let m = degraded.materialize(Some(&merged_removal));
+        assert_eq!(m.requirements.merge_queue_ejection, None);
+        assert!(diff_snapshots(&merged_removal, &m)
+            .iter()
+            .all(|c| !c.starts_with("removed from the merge queue")));
+
+        let real = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        let degraded_merged =
+            shared_from(&snapshot(|s| s.requirements.state = "merged".into()), false);
+        assert_eq!(
+            degraded_merged
+                .materialize(Some(&real))
+                .requirements
+                .merge_queue_ejection,
+            None
+        );
     }
 
     #[test]
