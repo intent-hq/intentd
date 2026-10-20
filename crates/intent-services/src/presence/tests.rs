@@ -9,16 +9,10 @@ fn cursor(head: u64) -> Value {
 }
 
 /// `base` scaled for slow environments (coverage runs export
-/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`): the multiplier is never below 1.0,
-/// non-finite values are ignored, and an unrepresentable product saturates
-/// to `Duration::MAX`, so no value of the variable can panic here.
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`) via the shared
+/// [`intentd_test_support::test_timeout`].
 fn scaled_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Poll `cond` until it holds, failing with `what` if it has not within

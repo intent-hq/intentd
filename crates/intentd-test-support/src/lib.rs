@@ -18,6 +18,9 @@
 //! - [`Barrier`]: a release-file handshake between a test and a shell-script
 //!   fake, so a held state stays stable for as long as the assertions take
 //!   instead of racing a fixed `sleep`.
+//! - [`test_timeout`]: the one place test budgets read
+//!   `INTENTD_TEST_TIMEOUT_MULTIPLIER`, so hang guards stretch on slow
+//!   coverage runners instead of flaking (`fixed_deadline_lint`).
 //!
 //! # The reaped-pid caveat
 //!
@@ -36,7 +39,11 @@ mod barrier;
 #[cfg(unix)]
 mod guarded_child;
 pub mod source_lint;
+mod timeout;
 
 pub use barrier::Barrier;
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
+pub use timeout::{
+    scale_test_timeout, test_timeout, MAX_TIMEOUT_MULTIPLIER, TIMEOUT_MULTIPLIER_ENV,
+};
