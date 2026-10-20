@@ -1068,13 +1068,23 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core gh-linux-16x runner this merge-queue
-      # job runs on. Higher counts (32 and 64 on a 64-core host) made the
-      # latency-bound stress tests — e.g. e2e_wss_pool_contention_stress's
-      # <2s read assert — blow their wall-clock bounds under llvm-cov load on
-      # both nextest tries.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16). 16 is
+      # the 16-core gh-linux-16x burst runner; an intent-cache heavy slot is
+      # cpuset-pinned to 8 CPUs, where a fixed 16 oversubscribed 2x and timed
+      # out latency-bound tests. Higher counts (32 and 64 on a 64-core host)
+      # made the latency-bound stress tests — e.g.
+      # e2e_wss_pool_contention_stress's <2s read assert — blow their
+      # wall-clock bounds under llvm-cov load on both nextest tries, hence
+      # the cap.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -1202,13 +1212,21 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core gh-linux-16x runner this merge-queue
-      # job runs on. Higher counts (32 and 64 on a 64-core host) thrashed
-      # SQLite/WAL and wall-clock-timeout tests hard enough that even the
-      # nextest retry failed: concurrent_writes_no_sqlite_busy hit "database
-      # is locked" on both tries, bridge/auto-commit timing tests timed out.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), as in
+      # coverage-e2e. The cap stays at 16 because higher counts (32 and 64
+      # on a 64-core host) thrashed SQLite/WAL and wall-clock-timeout tests
+      # hard enough that even the nextest retry failed:
+      # concurrent_writes_no_sqlite_busy hit "database is locked" on both
+      # tries, bridge/auto-commit timing tests timed out.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -1321,9 +1339,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Same value and rationale as coverage-e2e (matches the 16-core
-      # burst runner).
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), same
+      # rationale as coverage-e2e.
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
@@ -1336,6 +1353,14 @@ jobs:
       PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'

@@ -97,8 +97,45 @@ def profile_pool_violations(workflow):
     return errors
 
 
+THREAD_STEP = "Size nextest threads from runner CPUs"
+THREAD_RUN = (
+    "cpus=$(nproc)\n"
+    "threads=$(( cpus < 16 ? cpus : 16 ))\n"
+    'echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"\n'
+    'echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"\n'
+)
+COVERAGE_JOBS = ("coverage-e2e", "coverage-all", "coverage-changed")
+HARDCODED_THREADS = re.compile(r"(?:NEXTEST_TEST_THREADS=|--test-threads[= ])\d")
+
+
+def thread_sizing_violations(workflow):
+    """Coverage jobs size nextest from the runner's CPUs (min(nproc, 16)).
+
+    A fixed 16 oversubscribed the 8-CPU cpuset-pinned intent-cache heavy slot
+    2x and timed out latency-bound tests.
+    """
+    errors = []
+    if "NEXTEST_TEST_THREADS" in workflow.get("env", {}):
+        errors.append("workflow env must not fix NEXTEST_TEST_THREADS")
+    for job_id in COVERAGE_JOBS:
+        job = workflow["jobs"][job_id]
+        steps = job["steps"]
+        if "NEXTEST_TEST_THREADS" in job.get("env", {}):
+            errors.append(f"{job_id}: do not hardcode NEXTEST_TEST_THREADS; size it from nproc")
+        sizing = [s for s in steps if s.get("name") == THREAD_STEP]
+        if (len(sizing) != 1 or steps.index(sizing[0]) != 0 or sizing[0].get("run") != THREAD_RUN
+                or sizing[0].get("shell") != "bash" or sizing[0].get("if") or sizing[0].get("continue-on-error")):
+            errors.append(f"{job_id}: the first step must size NEXTEST_TEST_THREADS from nproc")
+        for step in steps:
+            if step.get("name") == THREAD_STEP:
+                continue
+            if "NEXTEST_TEST_THREADS" in step.get("env", {}) or HARDCODED_THREADS.search(str(step.get("run", ""))):
+                errors.append(f"{job_id}: {step.get('name')} must not override the sized nextest thread count")
+    return errors
+
+
 def violations(workflow, policy):
-    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow)
+    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow) + thread_sizing_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -273,6 +310,66 @@ class CiPolicyTests(unittest.TestCase):
                         target["timeout-minutes"] = limit
                     self.assertTrue(coverage_budget_violations(workflow))
                     self.assertTrue(violations(workflow, "1"))
+
+    def test_coverage_threads_are_sized_from_runner_cpus(self):
+        self.assertEqual(thread_sizing_violations(self.workflow), [])
+        for job_id in COVERAGE_JOBS:
+            steps = self.workflow["jobs"][job_id]["steps"]
+            first_test = min(steps.index(step) for name, _, step in test_steps(self.workflow) if name == job_id)
+            self.assertEqual(steps[0]["name"], THREAD_STEP)
+            self.assertLess(0, first_test)
+        for mutation in ("hardcoded-job", "missing", "late", "step-override", "fixed-run", "skipped", "cli-flag"):
+            for job_id in COVERAGE_JOBS:
+                with self.subTest(job=job_id, mutation=mutation):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"][job_id]
+                    steps = job["steps"]
+                    sizing = steps[0]
+                    test_step = next(step for name, _, step in test_steps(workflow) if name == job_id)
+                    if mutation == "hardcoded-job":
+                        job.setdefault("env", {})["NEXTEST_TEST_THREADS"] = 16
+                    elif mutation == "missing":
+                        steps.remove(sizing)
+                    elif mutation == "late":
+                        steps.remove(sizing)
+                        steps.insert(steps.index(test_step) + 1, sizing)
+                    elif mutation == "step-override":
+                        test_step.setdefault("env", {})["NEXTEST_TEST_THREADS"] = "16"
+                    elif mutation == "fixed-run":
+                        sizing["run"] = 'echo "NEXTEST_TEST_THREADS=16" >> "$GITHUB_ENV"\n'
+                    elif mutation == "skipped":
+                        sizing["if"] = "false"
+                    else:
+                        test_step["run"] += "\ncargo nextest run --test-threads 16\n"
+                    self.assertTrue(thread_sizing_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_hardcoded_threads_in_previous_workflow_are_rejected(self):
+        workflow = copy.deepcopy(self.workflow)
+        for job_id in COVERAGE_JOBS:
+            job = workflow["jobs"][job_id]
+            job["steps"] = [s for s in job["steps"] if s.get("name") != THREAD_STEP]
+            job["env"]["NEXTEST_TEST_THREADS"] = 16
+        errors = thread_sizing_violations(workflow)
+        for job_id in COVERAGE_JOBS:
+            self.assertIn(f"{job_id}: do not hardcode NEXTEST_TEST_THREADS; size it from nproc", errors)
+            self.assertIn(f"{job_id}: the first step must size NEXTEST_TEST_THREADS from nproc", errors)
+
+    def test_thread_sizing_step_caps_nproc_at_sixteen(self):
+        for cpus, expected in (("1", "1"), ("8", "8"), ("16", "16"), ("64", "16")):
+            with self.subTest(cpus=cpus), tempfile.TemporaryDirectory() as tmp:
+                stub = Path(tmp) / "nproc"
+                stub.write_text(f"#!/bin/sh\necho {cpus}\n")
+                stub.chmod(0o755)
+                github_env = Path(tmp) / "github_env"
+                result = subprocess.run(
+                    ["bash", "-e", "-c", THREAD_RUN],
+                    env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "GITHUB_ENV": str(github_env)},
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(github_env.read_text(), f"NEXTEST_TEST_THREADS={expected}\n")
+                self.assertIn(f"NEXTEST_TEST_THREADS={expected} (nproc={cpus}, cap 16)", result.stdout)
 
     def test_full_coverage_budget_includes_report_generation(self):
         self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
