@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,16 +21,18 @@ spec = importlib.util.spec_from_file_location('dist_test', ROOT / 'scripts/test-
 dist_test = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dist_test)
 
-# Records its argv and the cargo network env, then fails until the call count
-# exceeds STUB_FAILURES.
+# Records its argv and the cargo network env, then fails (or, with STUB_HANG,
+# hangs) until the call count exceeds STUB_FAILURES.
 STUB = '''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 log = os.environ['STUB_LOG']
 calls = open(log).read().splitlines() if os.path.exists(log) else []
 keys = ('CARGO_NET_RETRY', 'CARGO_HTTP_MULTIPLEXING', 'CARGO_NET_OFFLINE')
 with open(log, 'a') as out:
     out.write(json.dumps({'argv': sys.argv[1:], 'env': {k: os.environ.get(k) for k in keys}}) + '\\n')
 if len(calls) < int(os.environ.get('STUB_FAILURES', '0')):
+    if os.environ.get('STUB_HANG'):
+        time.sleep(60)
     sys.stderr.write('error: failed to get `anyhow` as a dependency\\n')
     sys.exit(101)
 print(json.dumps({'artifacts': {}}))
@@ -56,9 +59,43 @@ class Network(unittest.TestCase):
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
-    def fetch(self, failures, attempts=4):
+    def fetch(self, failures, attempts=4, **limits):
         self.env['STUB_FAILURES'] = str(failures)
-        return dist_test.fetch_dependencies(self.dir, self.env, attempts=attempts, sleep=self.sleeps.append)
+        return dist_test.fetch_dependencies(self.dir, self.env, attempts=attempts, sleep=self.sleeps.append, **limits)
+
+    def test_worst_case_fits_the_job_budget(self):
+        attempts, timeout, deadline = (dist_test.FETCH_ATTEMPTS, dist_test.FETCH_ATTEMPT_TIMEOUT,
+                                       dist_test.FETCH_DEADLINE)
+        backoff = sum(5 * 2 ** n for n in range(attempts - 1))
+        self.assertLessEqual(deadline, 8 * 60, 'leaves the 15-minute job room for its other steps')
+        self.assertLess(timeout, deadline)
+        self.assertLessEqual(min(deadline, attempts * timeout) + backoff, 9 * 60)
+
+    def test_hung_fetch_is_a_failed_attempt(self):
+        self.env['STUB_HANG'] = '1'
+        start = time.monotonic()
+        self.fetch(failures=1, attempt_timeout=3)
+        self.assertLess(time.monotonic() - start, 30, 'the hung attempt was killed')
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_final_timeout_gives_network_message(self):
+        self.env['STUB_HANG'] = '1'
+        with self.assertRaises(SystemExit) as raised:
+            self.fetch(failures=10, attempts=2, attempt_timeout=3)
+        self.assertEqual(len(self.calls()), 2)
+        message = str(raised.exception.code)
+        self.assertIn('network', message)
+        self.assertIn('cargo fetch --locked', message)
+
+    def test_overall_deadline_stops_retrying(self):
+        self.env['STUB_HANG'] = '1'
+        start = time.monotonic()
+        with self.assertRaises(SystemExit) as raised:
+            self.fetch(failures=10, attempts=4, attempt_timeout=10, deadline=3)
+        self.assertLess(time.monotonic() - start, 8, 'the deadline caps the running attempt too')
+        self.assertLess(len(self.calls()), 4, 'no attempts start after the deadline')
+        self.assertIn('network', str(raised.exception.code))
 
     def test_fetch_retries_until_success(self):
         self.fetch(failures=2)
@@ -67,7 +104,7 @@ class Network(unittest.TestCase):
         for call in calls:
             self.assertEqual(call['argv'], ['fetch', '--locked'])
             self.assertEqual(call['env']['CARGO_HTTP_MULTIPLEXING'], 'false')
-            self.assertGreaterEqual(int(call['env']['CARGO_NET_RETRY']), 5)
+            self.assertEqual(call['env']['CARGO_NET_RETRY'], '3', 'cargo retries stay inside the attempt timeout')
             self.assertIsNone(call['env']['CARGO_NET_OFFLINE'])
         self.assertEqual(len(self.sleeps), 2)
         self.assertLess(self.sleeps[0], self.sleeps[1], 'retries back off')

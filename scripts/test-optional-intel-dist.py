@@ -21,21 +21,38 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 INTEL = 'x86_64-apple-darwin'
 FETCH = ['cargo', 'fetch', '--locked']
+# Worst case (deadline plus backoff) is under 8 minutes, inside the 15-minute
+# release-scripts job alongside its other steps.
+FETCH_ATTEMPTS = 4
+FETCH_ATTEMPT_TIMEOUT = 150
+FETCH_DEADLINE = 420
 
 
-def fetch_dependencies(root, env, attempts=4, sleep=time.sleep):
+def fetch_dependencies(root, env, attempts=FETCH_ATTEMPTS, sleep=time.sleep,
+                       attempt_timeout=FETCH_ATTEMPT_TIMEOUT, deadline=FETCH_DEADLINE, clock=time.monotonic):
     """Download the locked crates, retrying transient network failures with backoff.
 
-    HTTP/2 multiplexing is off: it caused the crates.io "HTTP2 framing layer" error.
+    A hung attempt is killed after attempt_timeout and counts as a failure; no
+    attempt starts, or runs, past the overall deadline. HTTP/2 multiplexing is
+    off: it caused the crates.io "HTTP2 framing layer" error.
     """
-    env = {**env, 'CARGO_NET_RETRY': '10', 'CARGO_HTTP_MULTIPLEXING': 'false'}
+    env = {**env, 'CARGO_NET_RETRY': '3', 'CARGO_HTTP_MULTIPLEXING': 'false'}
     env.pop('CARGO_NET_OFFLINE', None)
+    end = clock() + deadline
+    tried = 0
     for attempt in range(1, attempts + 1):
-        if subprocess.run(FETCH, cwd=root, env=env).returncode == 0:
-            return
+        remaining = end - clock()
+        if remaining <= 0:
+            break
+        tried = attempt
+        try:
+            if subprocess.run(FETCH, cwd=root, env=env, timeout=min(attempt_timeout, remaining)).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            print(f'cargo fetch attempt {attempt} timed out', flush=True)
         if attempt < attempts:
             sleep(5 * 2 ** (attempt - 1))
-    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {attempts} attempts; the network '
+    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {tried} attempts ({deadline}s limit); the network '
                      '(crates.io) is unavailable, not the cargo-dist behaviour under test. Re-run the job.')
 
 
