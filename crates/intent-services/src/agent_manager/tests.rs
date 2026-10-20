@@ -137,7 +137,7 @@ fn usage_origin_uses_trusted_delivery_origin_before_opaque_metadata() {
 /// panic) also covers `-wal`/`-shm` sidecars, and a background task that
 /// lazily reopens a pool connection after drop cannot recreate the file at
 /// the TMPDIR root. Set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir.
-struct TempDb {
+pub(super) struct TempDb {
     path: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -2381,7 +2381,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     assert_eq!(ev.data["reason"], "slots", "slot-cap resume reason");
 }
 
-async fn manager() -> (TempDb, AgentManager) {
+pub(super) async fn manager() -> (TempDb, AgentManager) {
     let (tmp, mgr, _bus) = manager_with_bus().await;
     (tmp, mgr)
 }

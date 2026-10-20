@@ -23626,6 +23626,10 @@ mod legacy_identity_tests;
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
 
+#[cfg(test)]
+#[path = "agent_manager/future_size_tests.rs"]
+mod future_size_tests;
+
 /// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
 /// command carries the profile over inherited and captured values, never over
 /// Intent's wiring, executable selection or enforced policy.
