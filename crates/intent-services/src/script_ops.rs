@@ -163,12 +163,29 @@ pub(crate) struct ScriptLocks {
     workspaces: Arc<Mutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
     definitions: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     publications: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+    /// Workspaces being deleted: launch admission, service auto-restart and
+    /// output logs are refused until the deletion finishes or fails.
+    closing: Arc<Mutex<HashSet<WorkspaceId>>>,
 }
 
 impl ScriptLocks {
     /// Create an empty lock registry.
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether `workspace_id` is being deleted.
+    pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
+        self.closing.lock().unwrap().contains(workspace_id)
+    }
+
+    fn set_closing(&self, workspace_id: &WorkspaceId, closing: bool) {
+        let mut set = self.closing.lock().unwrap();
+        if closing {
+            set.insert(workspace_id.clone());
+        } else {
+            set.remove(workspace_id);
+        }
     }
 
     /// Resolve (or create) the lock for a workspace.
@@ -277,6 +294,23 @@ pub(crate) struct ScriptParks {
     pub(crate) settlement_ready: Option<Arc<SupervisePark>>,
     /// Parks a terminal runtime transition before marker persistence/events.
     pub(crate) terminal_persist: Option<Arc<SupervisePark>>,
+    /// Parks workspace deletion after its scripts stop, before the output
+    /// folder is deleted.
+    pub(crate) workspace_closed: Option<Arc<SupervisePark>>,
+}
+
+/// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
+/// dropping it reopens the workspace for launches, e.g. a recreated
+/// workspace with the same id or a deletion that failed.
+pub(crate) struct WorkspaceClosing {
+    locks: ScriptLocks,
+    workspace_id: WorkspaceId,
+}
+
+impl Drop for WorkspaceClosing {
+    fn drop(&mut self) {
+        self.locks.set_closing(&self.workspace_id, false);
+    }
 }
 
 /// Cancellation guard for the `script.run` reservation window (reserve →
@@ -380,6 +414,9 @@ impl ScriptManager {
     /// Open the run's on-disk log with the cap read live from settings, and
     /// wrap it as a PTY output sink (written on the PTY reader thread).
     async fn open_output_sink(&self, ws: &WorkspaceId, id: &str, run: &str) -> Option<OutputSink> {
+        if self.locks.is_closing(ws) {
+            return None;
+        }
         let mut store = self.output_store.clone();
         store.set_max_bytes_per_run(self.settings.as_ref().map_or(
             intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
@@ -1283,21 +1320,38 @@ impl ScriptManager {
         }
     }
 
-    /// Stop every running script of one workspace with `script.stop`
-    /// semantics, so no supervisor respawns or reopens a log afterwards.
-    /// Best-effort: a failed stop is logged and the rest still stop.
-    pub(crate) async fn stop_workspace(&self, workspace_id: &WorkspaceId) {
+    /// Close one workspace's scripts for deletion: refuse new launches,
+    /// service auto-restarts and output logs, then stop every running script
+    /// with `script.stop` semantics. Each script's definition lock is taken,
+    /// so a launch admitted before the mark finishes admission first and is
+    /// then stopped. Best-effort: a failed stop is logged and the rest still
+    /// stop. The mark lasts until the returned guard is dropped.
+    pub(crate) async fn close_workspace(&self, workspace_id: &WorkspaceId) -> WorkspaceClosing {
+        self.locks.set_closing(workspace_id, true);
+        let closing = WorkspaceClosing {
+            locks: self.locks.clone(),
+            workspace_id: workspace_id.clone(),
+        };
         let ids: Vec<String> = self
             .scripts
             .lock()
             .unwrap()
-            .iter()
-            .filter(|((ws, _), m)| ws == workspace_id && self.entry_is_live_or_admitted(m))
-            .map(|((_, id), _)| id.clone())
+            .keys()
+            .filter(|(ws, _)| ws == workspace_id)
+            .map(|(_, id)| id.clone())
             .collect();
         for id in ids {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            let running = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(workspace_id.clone(), id.clone()))
+                .is_some_and(|m| self.entry_is_live_or_admitted(m));
+            if !running {
+                continue;
+            }
             if let Err(e) = self
                 .stop_inner_reason(workspace_id, &id, true, "cancelled by workspace deletion")
                 .await
@@ -1305,6 +1359,11 @@ impl ScriptManager {
                 tracing::warn!(workspace = %workspace_id, script = %id, error = %e, "script stop during workspace delete failed");
             }
         }
+        if let Some(park) = &self.parks.workspace_closed {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+        closing
     }
 
     /// `script.status`: the script's runtime state. Scoped to `workspace_id`.
@@ -2150,7 +2209,7 @@ impl ScriptManager {
                 self.release_pty(pty_id).await;
                 return;
             };
-            if stopped_by_user || def.mode != ScriptMode::Service {
+            if stopped_by_user || def.mode != ScriptMode::Service || self.locks.is_closing(&ws) {
                 self.queue_settlement(&ws, &script_id, generation);
                 break;
             }
@@ -2189,7 +2248,7 @@ impl ScriptManager {
             {
                 let guard = self.scripts.lock().unwrap();
                 match guard.get(&key).filter(|m| m.generation == generation) {
-                    Some(m) if m.stopped_by_user => break,
+                    Some(m) if m.stopped_by_user || self.locks.is_closing(&ws) => break,
                     Some(_) => {}
                     None => return,
                 }

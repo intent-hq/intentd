@@ -300,3 +300,366 @@ async fn startup_sweep_deletes_output_of_workspaces_that_no_longer_exist() {
         "chief kept"
     );
 }
+
+/// Every log file below one workspace's output folder.
+fn workspace_logs(services: &Services, ws: &str) -> Vec<PathBuf> {
+    let dir = services
+        .script_output_store()
+        .workspace_dir(ws)
+        .expect("dir");
+    let mut out = Vec::new();
+    for script in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        for run in std::fs::read_dir(script.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            out.push(run.path());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_delete_refuses_launches_after_scripts_stop_and_recreates_no_log() {
+    let (data, mut h) = output_harness().await;
+    let park = Arc::new(SupervisePark::default());
+    h.services = h
+        .services
+        .clone()
+        .with_workspaces_root(data.0.join("workspaces"))
+        .with_script_workspace_closed_park(park.clone());
+    let ws = h.ws.as_str().to_string();
+    let idle = create_simple(&h, "idle", "echo idle-out; sleep 60", ScriptMode::Service).await;
+    let svc = create_simple(&h, "svc", "echo svc-out; sleep 60", ScriptMode::Service).await;
+    let cmd = create_simple(&h, "cmd", "echo cmd-out", ScriptMode::Command).await;
+    h.services
+        .script_start(h.ws.clone(), svc.clone())
+        .await
+        .expect("start");
+    wait_for_log(&h.services, &h.ws, &svc).await;
+
+    let deleting = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        intent_core::spawn_daemon(async move { services.delete_workspace(ws).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("deletion parks after its scripts stop");
+    let mgr = h.services.script_manager();
+    assert!(mgr.locks.is_closing(&h.ws));
+    assert!(
+        !mgr.is_live(&h.ws, &svc).unwrap(),
+        "running service stopped"
+    );
+    let before = workspace_logs(&h.services, &ws);
+
+    let start = h.services.script_start(h.ws.clone(), idle.clone()).await;
+    assert!(start.is_err(), "idle start is refused: {start:?}");
+    let restart = h.services.script_restart(h.ws.clone(), svc.clone()).await;
+    assert!(restart.is_err(), "restart is refused: {restart:?}");
+    let run = h
+        .services
+        .script_run(
+            h.ws.clone(),
+            cmd.clone(),
+            None,
+            Some(LIVENESS.as_secs().cast_signed()),
+        )
+        .await;
+    assert!(run.is_err(), "run is refused: {run:?}");
+    for id in [&idle, &svc, &cmd] {
+        assert!(!mgr.is_live(&h.ws, id).unwrap(), "{id} did not launch");
+    }
+    assert_eq!(
+        workspace_logs(&h.services, &ws),
+        before,
+        "no new log opened"
+    );
+
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, deleting)
+        .await
+        .expect("deletion finishes")
+        .expect("join")
+        .expect("delete workspace");
+    let ws_dir = h
+        .services
+        .script_output_store()
+        .workspace_dir(&ws)
+        .expect("dir");
+    assert!(!ws_dir.exists(), "workspace output folder is deleted");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !ws_dir.exists(),
+        "no log is recreated after the folder delete"
+    );
+    assert!(
+        !mgr.locks.is_closing(&h.ws),
+        "the mark is cleared once the delete returns, so a recreated workspace can launch"
+    );
+}
+
+fn no_live_pty(services: &Services, ws: &WorkspaceId) -> bool {
+    let pty = services.pty();
+    services
+        .script_manager()
+        .scripts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((w, _), _)| w == ws)
+        .all(|(_, m)| m.pty_id.is_none_or(|id| !pty.is_alive(id)))
+}
+
+#[intent_test_macros::daemon_test]
+async fn workspace_delete_drains_launches_admitted_before_it_and_a_cancelled_caller() {
+    let (data, mut h) = output_harness().await;
+    let closed = Arc::new(SupervisePark::default());
+    h.services = h
+        .services
+        .clone()
+        .with_workspaces_root(data.0.join("workspaces"))
+        .with_script_workspace_closed_park(closed.clone());
+    let ws = h.ws.as_str().to_string();
+    let svc = create_simple(&h, "svc", "echo svc-out; sleep 60", ScriptMode::Service).await;
+    let cmd = create_simple(&h, "cmd", "echo cmd-out; sleep 60", ScriptMode::Command).await;
+
+    // A service launch admitted before deletion, parked in its detached
+    // supervisor before the PTY spawns.
+    let svc_park = Arc::new(SupervisePark::default());
+    let mut svc_mgr = h.services.script_manager();
+    svc_mgr.parks.before_spawn = Some(svc_park.clone());
+    svc_mgr.start(&h.ws, &svc).await.expect("start admitted");
+    tokio::time::timeout(LIVENESS, svc_park.entered.notified())
+        .await
+        .expect("service launch parks before spawn");
+
+    // A command run admitted before deletion whose caller is then cancelled.
+    let run_park = Arc::new(SupervisePark::default());
+    let mut run_mgr = h.services.script_manager();
+    run_mgr.parks.before_spawn = Some(run_park.clone());
+    let caller = {
+        let mgr = run_mgr.clone();
+        let ws = h.ws.clone();
+        let id = cmd.clone();
+        intent_core::spawn_daemon(async move {
+            mgr.run(&ws, &id, None, Some(LIVENESS.as_secs().cast_signed()))
+                .await
+        })
+    };
+    tokio::time::timeout(LIVENESS, run_park.entered.notified())
+        .await
+        .expect("run parks before spawn");
+    caller.abort();
+    let _ = caller.await;
+
+    let deleting = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        intent_core::spawn_daemon(async move { services.delete_workspace(ws).await })
+    };
+    svc_park.release.notify_one();
+    run_park.release.notify_one();
+    tokio::time::timeout(LIVENESS, closed.entered.notified())
+        .await
+        .expect("deletion parks after its scripts stop");
+    let mgr = h.services.script_manager();
+    for id in [&svc, &cmd] {
+        assert!(
+            !mgr.is_live(&h.ws, id).unwrap(),
+            "{id} admitted launch was drained"
+        );
+    }
+    assert!(no_live_pty(&h.services, &h.ws), "no PTY survives the stop");
+
+    closed.release.notify_one();
+    tokio::time::timeout(LIVENESS, deleting)
+        .await
+        .expect("deletion finishes")
+        .expect("join")
+        .expect("delete workspace");
+    let ws_dir = h
+        .services
+        .script_output_store()
+        .workspace_dir(&ws)
+        .expect("dir");
+    assert!(!ws_dir.exists(), "workspace output folder is deleted");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!ws_dir.exists(), "no drained launch recreates a log");
+    assert!(no_live_pty(&h.services, &h.ws));
+}
+
+#[intent_test_macros::daemon_test]
+async fn cancelled_workspace_delete_reopens_scripts_and_retry_deletes_output() {
+    let (data, mut h) = output_harness().await;
+    let closed = Arc::new(SupervisePark::default());
+    h.services = h
+        .services
+        .clone()
+        .with_workspaces_root(data.0.join("workspaces"))
+        .with_script_workspace_closed_park(closed.clone());
+    let ws = h.ws.as_str().to_string();
+    let svc = create_simple(&h, "svc", "echo svc-out; sleep 60", ScriptMode::Service).await;
+    h.services
+        .script_start(h.ws.clone(), svc.clone())
+        .await
+        .expect("start");
+    wait_for_log(&h.services, &h.ws, &svc).await;
+
+    let deleting = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        intent_core::spawn_daemon(async move { services.delete_workspace(ws).await })
+    };
+    tokio::time::timeout(LIVENESS, closed.entered.notified())
+        .await
+        .expect("deletion parks during script teardown");
+    deleting.abort();
+    assert!(deleting.await.is_err_and(|e| e.is_cancelled()));
+
+    let mgr = h.services.script_manager();
+    assert!(
+        !mgr.locks.is_closing(&h.ws),
+        "a cancelled delete reopens the workspace"
+    );
+    assert!(
+        h.services.store.get_workspace(&h.ws).await.is_ok(),
+        "workspace survives"
+    );
+    assert!(
+        !mgr.is_live(&h.ws, &svc).unwrap(),
+        "its service stays stopped"
+    );
+    assert!(no_live_pty(&h.services, &h.ws), "no orphan PTY");
+
+    // Retry: the park lets the next deletion through.
+    closed.release.notify_one();
+    tokio::time::timeout(LIVENESS, h.services.delete_workspace(h.ws.clone()))
+        .await
+        .expect("retry does not deadlock")
+        .expect("retry deletes the workspace");
+    let ws_dir = h
+        .services
+        .script_output_store()
+        .workspace_dir(&ws)
+        .expect("dir");
+    assert!(!ws_dir.exists(), "output folder is gone after the retry");
+    assert!(no_live_pty(&h.services, &h.ws));
+}
+
+#[intent_test_macros::daemon_test]
+async fn orphan_sweep_keeps_every_folder_when_the_store_cannot_be_read() {
+    let (_data, h) = output_harness().await;
+    let ws = h.ws.as_str().to_string();
+    let orphan = WorkspaceId::new();
+    write_log(&h.services, &ws, "s", "r");
+    write_log(&h.services, orphan.as_str(), "s", "r");
+    h.services.store.close().await;
+    assert!(
+        h.services
+            .store
+            .get_workspace(&h.ws)
+            .await
+            .is_err_and(|e| !matches!(e, crate::Error::NotFound(_))),
+        "the closed store fails reads with a non-NotFound error"
+    );
+
+    assert_eq!(h.services.sweep_orphaned_script_output().await, 0);
+    assert!(
+        log_exists(&h.services, &ws, "s", "r"),
+        "existing workspace kept"
+    );
+    assert!(
+        log_exists(&h.services, orphan.as_str(), "s", "r"),
+        "an unverifiable folder is kept for the next startup"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn expiry_sweep_keeps_the_current_run_through_a_service_auto_restart() {
+    let (_data, mut h) = output_harness().await;
+    let park = Arc::new(SupervisePark::default());
+    h.services = h
+        .services
+        .clone()
+        .with_script_too_fast_ms(0)
+        .with_script_supervise_park(park.clone());
+    let ws = h.ws.as_str().to_string();
+    let svc = create_simple(
+        &h,
+        "flappy",
+        "echo attempt-out; sleep 0.2; exit 1",
+        ScriptMode::Service,
+    )
+    .await;
+    h.services
+        .script_start(h.ws.clone(), svc.clone())
+        .await
+        .expect("start");
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("first attempt spawns");
+    park.release.notify_one();
+    let run = wait_for_log(&h.services, &h.ws, &svc).await;
+
+    // The first attempt exits; the supervisor backs off and respawns under
+    // the same run, parking before the new attempt is recorded.
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("the service auto-restarts");
+    let mgr = h.services.script_manager();
+    assert_eq!(
+        current_run(&h.services, &h.ws, &svc),
+        run,
+        "a restart keeps its run"
+    );
+    assert!(
+        mgr.run_is_live(&ws, &svc, &run),
+        "the restarting run is live"
+    );
+    let old = Duration::from_secs(10 * 3600);
+    backdate_log(&h.services, &ws, &svc, &run, old);
+    write_log(&h.services, &ws, &svc, "older-run");
+    backdate_log(&h.services, &ws, &svc, "older-run", old);
+
+    let report = h
+        .services
+        .sweep_script_output_older_than(Duration::from_secs(3600))
+        .await;
+    assert_eq!((report.deleted, report.skipped_live), (1, 1), "{report:?}");
+    assert!(
+        log_exists(&h.services, &ws, &svc, &run),
+        "current run's log kept"
+    );
+    assert!(
+        !log_exists(&h.services, &ws, &svc, "older-run"),
+        "older run deleted"
+    );
+
+    // The respawn appends to the kept log: both attempts' output remains.
+    park.release.notify_one();
+    let path = h
+        .services
+        .script_output_store()
+        .run_path(&ws, &svc, &run)
+        .expect("path");
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.matches("attempt-out").count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the second attempt appends to the same log");
+    park.release.notify_one();
+    h.services
+        .script_stop(h.ws.clone(), svc.clone())
+        .await
+        .expect("stop");
+}

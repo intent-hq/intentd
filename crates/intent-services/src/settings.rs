@@ -6706,6 +6706,7 @@ mod tests {
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let mut notices = registry.subscribe();
 
         let got = svc.get("scripts.outputRetentionHours").await.expect("get");
         assert_eq!(got["value"], json!(168.0));
@@ -6716,6 +6717,14 @@ mod tests {
         ]))
         .await
         .expect("update");
+        assert!(notices.has_changed().expect("registry alive"));
+        let changed = notices.borrow_and_update().changed.clone();
+        for path in [
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+        ] {
+            assert!(changed.contains(path), "{path} notice: {changed:?}");
+        }
         let live = registry.snapshot().effective.clone();
         assert_eq!(intent_core::config::script_output_retention_hours(&live), 0);
         assert_eq!(

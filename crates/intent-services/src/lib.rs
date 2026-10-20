@@ -2545,6 +2545,17 @@ impl Services {
         self
     }
 
+    /// Test seam: park workspace deletion after its scripts stop, before the
+    /// script output folder is deleted.
+    #[cfg(test)]
+    pub(crate) fn with_script_workspace_closed_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.workspace_closed = Some(park);
+        self
+    }
+
     /// Test seam (monorepo#4952): park `mark_running` after its eligibility
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
@@ -17942,9 +17953,10 @@ impl Services {
             services
                 .cancel_script_monitors(&id, None, "workspace-deleted")
                 .await?;
-            // Stop the workspace's scripts so no supervisor respawns or reopens
-            // a log after the output folder is deleted below.
-            services.script_manager().stop_workspace(&id).await;
+            // Refuse new script launches, auto-restarts and output logs, and
+            // stop the running scripts, so nothing writes a log after the
+            // output folder is deleted below. Held until this delete returns.
+            let _scripts_closed = services.script_manager().close_workspace(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are

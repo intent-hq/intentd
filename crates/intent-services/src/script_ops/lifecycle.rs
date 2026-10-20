@@ -51,6 +51,12 @@ impl ScriptManager {
     }
 
     async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
+        // Caller holds the definition lock, which workspace deletion takes
+        // after setting the mark: a launch either finishes admission first
+        // (and is then stopped) or is refused here.
+        if self.locks.is_closing(ws) {
+            return Err(Error::NotFound(format!("workspace {ws}")));
+        }
         if self
             .scripts
             .lock()
