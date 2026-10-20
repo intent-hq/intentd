@@ -759,10 +759,11 @@ async fn running_command_script_defers_restart_until_it_exits() {
     let (mut daemon, socket) = launch_daemon(data_dir_guard.path(), &script, true).await;
     let mut client = Client::connect(&socket).await;
 
+    // The script blocks until the test releases it, so the deferral window
+    // is under test control rather than a fixed sleep racing a loaded runner.
+    let release = Barrier::new(data_dir_guard.path(), "script-release");
     let marker = data_dir_guard.path().join("script-finished");
-    let run_secs = stay_alive_window().as_secs() + 3;
-    // timing-guard: the script is the workload under test; it must outlive the stay-alive window.
-    let command = format!("sleep {run_secs} && touch '{}'", marker.display());
+    let command = format!("{} && touch '{}'", release.sh_wait(), marker.display());
     client
         .rpc(
             1,
@@ -828,6 +829,7 @@ async fn running_command_script_defers_restart_until_it_exits() {
     );
     assert!(!log.contains("exiting for staged update restart"), "{log}");
 
+    release.release();
     let result = tokio::time::timeout(exit_budget(), run)
         .await
         .expect("script.run never returned")

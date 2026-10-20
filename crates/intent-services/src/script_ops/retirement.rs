@@ -180,6 +180,7 @@ impl ScriptManager {
                     }
                     m.run_id = None;
                     m.pending_result = None;
+                    m.run_settled_at = Some(std::time::Instant::now());
                 }
             }
             Ok(false) => return,

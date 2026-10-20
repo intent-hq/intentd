@@ -242,6 +242,7 @@ mod script_monitor;
 mod script_ops;
 mod script_output_cleanup;
 mod script_output_store;
+pub use script_ops::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
 mod settings;
@@ -2976,15 +2977,16 @@ impl Services {
         self.script_manager().hydrate().await
     }
 
-    /// Command-mode scripts whose run is in flight right now (`starting`,
-    /// `running` or `restarting`). The idle update handshake counts these as
-    /// busy so a staged self-update does not kill a long check mid-run.
-    /// Service-mode scripts never count: they run indefinitely and an
-    /// auto-start service is restored after a restart. One registry lock, no
-    /// I/O — cheap enough for `system.status` and a 1 s poll.
+    /// Command-mode script runs in flight right now (admitted and not yet
+    /// durably settled, or with a live process) plus when the last one
+    /// settled. The idle update handshake counts these as busy so a staged
+    /// self-update does not kill a long check mid-run. Service-mode scripts
+    /// never count: they run indefinitely and an auto-start service is
+    /// restored after a restart. One registry lock, no I/O — cheap enough
+    /// for `system.status` and a 1 s poll.
     #[must_use]
-    pub fn running_command_script_count(&self) -> usize {
-        script_ops::running_command_count(&self.scripts)
+    pub fn command_script_activity(&self) -> CommandScriptActivity {
+        script_ops::command_activity(&self.scripts)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with

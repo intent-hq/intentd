@@ -131,6 +131,9 @@ pub(crate) struct ManagedScript {
     cancellation: Option<&'static str>,
     /// Terminal result awaiting the owned finalizer; never cleared by a waiter.
     pending_result: Option<intent_core::ScriptLastRun>,
+    /// When this entry's last command run durably settled (`run_id`
+    /// consumed); feeds [`CommandScriptActivity::last_settled_at`].
+    run_settled_at: Option<Instant>,
 }
 
 /// Process-wide monotonic counter behind [`ManagedScript::generation`]. Every
@@ -149,21 +152,37 @@ fn next_generation() -> u64 {
 /// globally unique; this registry does not permit duplicate public definitions.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
-/// Number of command-mode entries in `registry` with a run in flight
-/// (see [`crate::Services::running_command_script_count`]).
-pub(crate) fn running_command_count(registry: &ScriptRegistry) -> usize {
-    registry
+/// Command-mode run activity for the idle update handshake (see
+/// [`crate::Services::command_script_activity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandScriptActivity {
+    /// Command runs in flight: admitted and not yet durably settled, or with
+    /// a live process. A run stays in flight after its process exits until
+    /// its result is persisted, so a restart never races the settlement.
+    pub in_flight: usize,
+    /// When the most recent command run settled, so a run that starts and
+    /// ends between two samples still restarts an idle grace.
+    pub last_settled_at: Option<Instant>,
+}
+
+/// [`CommandScriptActivity`] over `registry`, under one registry lock.
+pub(crate) fn command_activity(registry: &ScriptRegistry) -> CommandScriptActivity {
+    let guard = registry
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .filter(|m| {
-            m.def.mode == ScriptMode::Command
-                && matches!(
-                    m.state.status,
-                    ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
-                )
-        })
-        .count()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut activity = CommandScriptActivity::default();
+    for m in guard.values().filter(|m| m.def.mode == ScriptMode::Command) {
+        if m.run_id.is_some()
+            || matches!(
+                m.state.status,
+                ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
+            )
+        {
+            activity.in_flight += 1;
+        }
+        activity.last_settled_at = activity.last_settled_at.max(m.run_settled_at);
+    }
+    activity
 }
 
 /// Shared async locks for workspace bootstrap and script definition updates.
@@ -672,6 +691,7 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
+                run_settled_at: None,
             },
         );
         self.emit_changed_locked(&workspace_id, &def.id, change)
@@ -784,6 +804,7 @@ impl ScriptManager {
                     run_generation: None,
                     cancellation: None,
                     pending_result: None,
+                    run_settled_at: None,
                 }
             };
             self.scripts.lock().unwrap().insert(key.clone(), managed);
@@ -860,6 +881,7 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
+                run_settled_at: None,
             },
         );
         Ok(())
@@ -948,6 +970,7 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
+                run_settled_at: None,
             },
         );
         self.emit_changed_locked(workspace_id, script_id, change)
@@ -1182,6 +1205,7 @@ impl ScriptManager {
                                         run_generation: None,
                                         cancellation: None,
                                         pending_result: None,
+                                        run_settled_at: None,
                                     },
                                 );
                                 self.emit_changed_locked(workspace_id, &id, "created").await;
@@ -5907,10 +5931,10 @@ mod tests {
     /// The idle update handshake's busy probe: only an in-flight command-mode
     /// run counts — a running service and a finished command run do not.
     #[intent_test_macros::daemon_test]
-    async fn running_command_script_count_counts_only_in_flight_command_runs() {
+    async fn command_script_activity_counts_only_in_flight_command_runs() {
         let h = harness().await;
         let mut sub = subscribe(&h);
-        assert_eq!(h.services.running_command_script_count(), 0);
+        assert_eq!(h.services.command_script_activity().in_flight, 0);
 
         let svc = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
         h.services
@@ -5922,7 +5946,7 @@ mod tests {
         })
         .await;
         assert_eq!(
-            h.services.running_command_script_count(),
+            h.services.command_script_activity().in_flight,
             0,
             "a running service never holds off an update"
         );
@@ -5936,8 +5960,9 @@ mod tests {
             v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "running"
         })
         .await;
-        assert_eq!(h.services.running_command_script_count(), 1);
+        assert_eq!(h.services.command_script_activity().in_flight, 1);
 
+        assert_eq!(h.services.command_script_activity().last_settled_at, None);
         h.services
             .script_stop(h.ws.clone(), cmd.clone())
             .await
@@ -5946,10 +5971,21 @@ mod tests {
             v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "exited"
         })
         .await;
-        assert_eq!(
-            h.services.running_command_script_count(),
-            0,
-            "a finished command run no longer counts"
+        // The run stays in flight until its result durably settles; then it
+        // no longer counts and the settlement is stamped.
+        let deadline = Instant::now() + LIVENESS;
+        let settled = loop {
+            let activity = h.services.command_script_activity();
+            if activity.in_flight == 0 {
+                break activity;
+            }
+            assert!(Instant::now() < deadline, "command run never settled");
+            // timing-guard: poll interval for the observable settlement, deadline-bounded.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            settled.last_settled_at.is_some(),
+            "settlement stamps the end of the run"
         );
         h.services
             .script_stop(h.ws.clone(), svc)
