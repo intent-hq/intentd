@@ -74,20 +74,33 @@ fi
 dirs=()
 IFS=: read -r -a path_dirs <<<"${PATH:-}"
 dirs+=("${path_dirs[@]}")
-# setsid: an interactive shell attached to a terminal is stopped by job
-# control (SIGTTIN/SIGTTOU), and a stopped process ignores timeout's TERM.
-login_env=$(timeout -s KILL 10 setsid "${SHELL:-/bin/sh}" -ilc 'printf "__INTENT_ENV__%s__INTENT_SEP__%s__INTENT_ENV__" "$PATH" "${VOLTA_HOME:-}"' </dev/null 2>/dev/null || true)
-login_volta_home=
-if [[ "$login_env" == *__INTENT_ENV__*__INTENT_SEP__*__INTENT_ENV__* ]]; then
-  login_env=${login_env#*__INTENT_ENV__}
-  login_env=${login_env%%__INTENT_ENV__*}
-  login_volta_home=${login_env#*__INTENT_SEP__}
-  IFS=: read -r -a login_dirs <<<"${login_env%%__INTENT_SEP__*}"
-  dirs+=("${login_dirs[@]}")
+# The login shell's environment, captured the way intent_core::path_utils
+# does: a shell-neutral command (works under bash, zsh and fish) printing a
+# NUL-separated `env -0` dump between sentinels, in a new session (setsid)
+# because an interactive shell on a terminal is stopped by job control and a
+# stopped process ignores timeout's TERM. Falls back from -ilc to -lc.
+login_env=
+for flags in -ilc -lc; do
+  login_env=$(timeout -s KILL 10 setsid "${SHELL:-/bin/sh}" "$flags" \
+    "printf '__INTENT_ENV__'; /usr/bin/env -0 2>/dev/null; printf '__INTENT_END__'" \
+    </dev/null 2>/dev/null | tr '\0' '\n' || true)
+  [[ "$login_env" == *__INTENT_ENV__*__INTENT_END__* ]] && break
+  login_env=
+done
+login_env=${login_env#*__INTENT_ENV__}
+login_env=${login_env%%__INTENT_END__*}
+login_value() { sed -n "s/^$1=//p" <<<"$login_env" | head -n 1; }
+IFS=: read -r -a login_dirs <<<"$(login_value PATH)"
+dirs+=("${login_dirs[@]}")
+# Volta's home as discovery resolves it (path_utils::enriched_tool_dirs_for):
+# the inherited VOLTA_HOME when set (even empty), else the login shell's;
+# an empty value falls back to ~/.volta.
+if [[ -v VOLTA_HOME ]]; then
+  volta_home=$VOLTA_HOME
+else
+  volta_home=$(login_value VOLTA_HOME)
 fi
-# Volta's home as discovery resolves it: inherited VOLTA_HOME, then the login
-# shell's, then ~/.volta (path_utils::enriched_tool_dirs_for).
-volta_home=${VOLTA_HOME:-${login_volta_home:-$HOME/.volta}}
+volta_home=${volta_home:-$HOME/.volta}
 dirs+=(/usr/local/bin /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin /usr/local/opt/node/bin)
 dirs+=("$volta_home/bin")
 for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims; do
