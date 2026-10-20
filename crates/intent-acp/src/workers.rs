@@ -127,8 +127,20 @@ pub fn route(params: &Value) -> Routing {
 /// Whether an update carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
 #[must_use]
 pub fn is_backgrounded_marker(update: &Value) -> bool {
-    update["_meta"][JETBRAINS_META_KEY][AIR_META_KEY][ASYNC_TASKS_CAPABILITY]["backgrounded"]
-        == Value::Bool(true)
+    update
+        .get("_meta")
+        .and_then(Value::as_object)
+        .is_some_and(meta_is_backgrounded)
+}
+
+/// Whether a `_meta` object carries `jetbrains.air.asyncTasks.backgrounded: true`.
+#[must_use]
+pub fn meta_is_backgrounded(meta: &Map<String, Value>) -> bool {
+    meta.get(JETBRAINS_META_KEY)
+        .and_then(|j| j.get(AIR_META_KEY))
+        .and_then(|a| a.get(ASYNC_TASKS_CAPABILITY))
+        .and_then(|t| t.get("backgrounded"))
+        == Some(&Value::Bool(true))
 }
 
 /// Build the frame for a diverted worker report.
@@ -285,5 +297,48 @@ mod tests {
             frame(&json!({ "sessionId": 4, "update": {} })).session_id,
             None
         );
+    }
+
+    #[test]
+    fn only_a_status_less_marker_keeps_the_recorded_status() {
+        let marker = json!({ "jetbrains": { "air": { "asyncTasks": { "backgrounded": true } } } });
+        let mapped = |update: Value| {
+            let note = crate::transport::IncomingNotification {
+                method: "session/update".into(),
+                params: json!({ "sessionId": "s", "update": update }),
+            };
+            match crate::session::map_notification(&note) {
+                Some(crate::session::MappedUpdate::ToolCall(tc)) => tc,
+                other => panic!("expected a tool call, got {other:?}"),
+            }
+        };
+        let mixed = mapped(
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c",
+                                   "rawOutput": "running in background", "_meta": marker }),
+        );
+        assert!(
+            mixed.keeps_status,
+            "no explicit status: keep the recorded one"
+        );
+        assert_eq!(
+            mixed.output,
+            Some(json!("running in background")),
+            "genuine fields kept"
+        );
+        let explicit = mapped(
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c",
+                                      "status": "failed", "_meta": marker }),
+        );
+        assert!(!explicit.keeps_status);
+        assert_eq!(explicit.status, "error");
+        let ordinary = mapped(
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c",
+                                      "rawOutput": "x" }),
+        );
+        assert!(
+            !ordinary.keeps_status,
+            "other providers' updates are unchanged"
+        );
+        assert_eq!(ordinary.status, "started");
     }
 }

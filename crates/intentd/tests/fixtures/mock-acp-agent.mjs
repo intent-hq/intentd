@@ -435,6 +435,9 @@ function maybeSpawnAsyncTask(behavior, params) {
   update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
     rawOutput: `Command running in background with ID: ${taskId}`, _meta: AIR_BACKGROUNDED });
   update({ sessionUpdate: 'tool_call_update', toolCallId, _meta: AIR_BACKGROUNDED });
+  // A mixed marker with a genuine field but no status must not reopen the tool.
+  update({ sessionUpdate: 'tool_call_update', toolCallId,
+    rawOutput: `Output is being written to /tmp/${taskId}.output`, _meta: AIR_BACKGROUNDED });
   asyncTasks.set(taskId, 'running');
   update({ sessionUpdate: 'async_task_spawned', asyncTaskId: taskId, name: command, taskType: 'shell',
     canStop: true, showInTranscript: true, toolCallId });

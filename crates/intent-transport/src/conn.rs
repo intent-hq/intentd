@@ -1317,7 +1317,7 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
 /// seq-0 read so no change is missed, and every later push re-reads the
 /// projection instead of forwarding event data, so a push is never older than
 /// one already sent. Returns `false` when the outbound channel is closed.
-async fn handle_workers_subscribe(
+pub(crate) async fn handle_workers_subscribe(
     req: crate::agent_workers::WorkersSubscribe,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
@@ -1342,8 +1342,14 @@ async fn handle_workers_subscribe(
         WorkspaceId::from(workspace_id),
         AgentId::from(agent_id.as_str()),
     );
+    // `workspace:updated` carries membership changes: each one re-checks the
+    // caller's access so a revoked member's subscription ends promptly even
+    // when the agent's workers are quiet.
     let subscription = bus.subscribe(SubscriptionFilter {
-        event_types: vec![intent_core::events::AGENT_WORKERS_CHANGED.to_string()],
+        event_types: vec![
+            intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            WORKSPACE_UPDATED.to_string(),
+        ],
         workspace_id: Some(workspace_id.0.clone()),
         batch_window: None,
         collaborator_only: crate::context::is_non_administrator_caller(),
@@ -1418,18 +1424,25 @@ async fn forward_workers(
 ) {
     let mut seq = 0_u64;
     while let Some(batch) = subscription.recv().await {
-        if !batch
-            .iter()
-            .any(|e| e.data.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str()))
-        {
+        let changed = batch.iter().any(|e| {
+            e.event_type == intent_core::events::AGENT_WORKERS_CHANGED
+                && e.data.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str())
+        });
+        let membership = batch.iter().any(|e| e.event_type == WORKSPACE_UPDATED);
+        if !changed && !membership {
             continue;
         }
         let Ok(snapshot) = api
             .agent_workers_list(workspace_id.clone(), agent_id.clone())
             .await
         else {
+            // Access lost or agent gone: end the stream. The per-connection
+            // cap does not count a finished forwarder.
             return;
         };
+        if !changed {
+            continue;
+        }
         seq += 1;
         let frame = subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot);
         if out_tx.send_bulk(frame).await.is_err() {

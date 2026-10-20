@@ -31637,6 +31637,20 @@ impl WorkspaceApi for Services {
                     session_id,
                 } => (connection, session_id),
             };
+            // Last check before the write: the deciding generation must still
+            // be this agent's current one. A retired generation's connection is
+            // its own provider process's pipe, so a request already admitted
+            // can never reach a newer process (§5.5b).
+            if self
+                .agent_workers
+                .generation_for(&agent_id, &connection)
+                .as_deref()
+                != Some(connection_generation.as_str())
+            {
+                return Err(Error::ProviderRequest(
+                    "the worker's provider connection was replaced before the stop was sent".into(),
+                ));
+            }
             let answer =
                 intent_acp::workers::request_stop(&connection, &session_id, &async_task_id)
                     .await
