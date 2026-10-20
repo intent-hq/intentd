@@ -1474,3 +1474,26 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
         .await
         .unwrap());
 }
+
+/// The maintenance loop writes to the store every second; it must exit once
+/// shutdown closes the settings task group, before the store closes.
+#[intent_test_macros::daemon_test]
+async fn script_monitor_maintenance_loop_exits_once_settings_tasks_close() {
+    let h = harness().await;
+    let running = || {
+        h.services
+            .script_locks
+            .monitor_maintenance
+            .load(Ordering::SeqCst)
+    };
+    h.services.start_script_monitor_maintenance();
+    assert!(running(), "maintenance loop started");
+    h.services.settings_tasks.close();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while running() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the maintenance loop exits after settings tasks close");
+}
