@@ -550,6 +550,13 @@ In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+On iPhone and iPad, open a workspace's **Context** tab for **Notes** and **Files**.
+In **Files**, expand folders to browse the workspace checkout and tap a file to
+preview it. Pull down to refresh the listing. Text previews are read-only; images,
+videos, PDFs, and HTML use the app's existing viewers. Other binary files may not
+have a preview.
+<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceContextView,WorkspaceFilesView,WorkspaceFilePreview}.swift; packages/ios/Intent/Services/WorkspaceFilesStore.swift. -->
+
 When a supported note deletion offers **Undo**, it cancels a pending deletion during
 the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the
