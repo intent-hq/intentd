@@ -6,7 +6,7 @@ crates/intent-acp/src/callback_registration/tests.rs 9
 crates/intent-acp/src/mcp_bridge/guidance_tests.rs 1
 crates/intent-acp/src/review_monitoring.rs 7
 crates/intent-acp/src/tests.rs 54
-crates/intent-acp/src/transport.rs 6
+crates/intent-acp/src/transport.rs 7
 crates/intent-acp/src/transport_review_history.rs 3
 crates/intent-acp/tests/acp_integration.rs 3
 crates/intent-core/src/caller.rs 1
@@ -14,7 +14,7 @@ crates/intent-git/src/repo_cache.rs 3
 crates/intent-git/src/worktree.rs 1
 crates/intent-js/tests/engine.rs 3
 crates/intent-js/tests/guarded_host.rs 3
-crates/intent-pty/src/host.rs 3
+crates/intent-pty/src/host.rs 4
 crates/intent-pty/src/host/unix_io.rs 1
 crates/intent-services/src/acp_adapter.rs 6
 crates/intent-services/src/agent_locks/tests.rs 1
@@ -97,6 +97,7 @@ crates/intent-services/src/repository_context_output/tests.rs 8
 crates/intent-services/src/repository_credentials/tests/provider.rs 3
 crates/intent-services/src/repository_credentials/tests/state.rs 7
 crates/intent-services/src/script_ops.rs 7
+crates/intent-services/src/script_ops/monitor_tests.rs 1
 crates/intent-services/src/settings.rs 38
 crates/intent-services/src/settings_shutdown_tests.rs 77
 crates/intent-services/src/source_control_auth_ops/repository_owner/adoption/tests.rs 3
@@ -132,12 +133,14 @@ crates/intent-store/src/repository_lifecycle/tests.rs 3
 crates/intent-store/src/repository_lifecycle/wire_authority_tests.rs 4
 crates/intent-store/src/repository_selection_repo/tests.rs 4
 crates/intent-store/src/store_pool.rs 1
+crates/intent-store/src/tests.rs 1
 crates/intent-store/src/tests/note_line_attribution.rs 6
 crates/intent-store/src/tests/workspace_delete.rs 3
 crates/intent-store/src/tests/workspace_delete/annotation_retirement.rs 2
 crates/intent-store/src/tests/workspace_delete/review.rs 3
 crates/intent-store/src/transfer_reimport_tests.rs 2
 crates/intent-store/src/workspace_annotation_cleanup_tests.rs 2
+crates/intent-transport/src/agent_workers.rs 1
 crates/intent-transport/src/auth/tests.rs 5
 crates/intent-transport/src/browser/tests.rs 3
 crates/intent-transport/src/conn.rs 3
@@ -200,6 +203,7 @@ crates/intentd/tests/e2e_wss_agent_set_model.rs 1
 crates/intentd/tests/e2e_wss_agent_spawn_retry.rs 2
 crates/intentd/tests/e2e_wss_agent_state_snapshot.rs 6
 crates/intentd/tests/e2e_wss_agent_turn_correlation.rs 2
+crates/intentd/tests/e2e_wss_agent_workers.rs 2
 crates/intentd/tests/e2e_wss_archive_interrupt.rs 2
 crates/intentd/tests/e2e_wss_archive_self.rs 2
 crates/intentd/tests/e2e_wss_auto_commit_llm.rs 2
