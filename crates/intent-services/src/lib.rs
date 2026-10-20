@@ -59,6 +59,8 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod agent_workers;
+/// The §5.5b wire-ID rule, shared by the transport's request validation.
+pub use intent_acp::workers::is_wire_id;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -31607,7 +31609,7 @@ impl WorkspaceApi for Services {
                 ("connectionGeneration", &connection_generation),
                 ("asyncTaskId", &async_task_id),
             ] {
-                if !agent_workers::valid_wire_id(value) {
+                if !intent_acp::workers::is_wire_id(value) {
                     return Err(Error::InvalidParams(format!(
                         "{name} must be a nonempty string of at most 256 bytes without control characters"
                     )));

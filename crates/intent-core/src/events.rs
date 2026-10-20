@@ -902,7 +902,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_TOOL_CALL, "Agent stream: a recorded tool call; transcript content the guest reads through the conversation."),
     (AGENT_UPDATED, "Agent lifecycle: agent row fields changed."),
     (AGENT_USER_MESSAGE_SENT, "Agent stream: a human message reached an agent; conversation content."),
-    (AGENT_WORKERS_CHANGED, "Agent lifecycle: provider-reported background worker snapshot (§5.5b); labels and states only, no output or paths. Same projection agent.workers.list serves."),
+    (AGENT_WORKERS_CHANGED, "Agent lifecycle: provider-reported background worker snapshot (§5.5b); task labels (a shell label may be its command line, already visible in the transcript) and states, no output or output paths. Same projection agent.workers.list serves."),
     (CHANGES_AGENT_LOCKS, "Changes: which agent holds which file lock; workspace-relative paths."),
     (CHANGES_GIT_STATUS, "Changes: working-tree status counters of the workspace repo."),
     (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),

@@ -11,7 +11,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use intent_acp::transport::Connection;
 use intent_acp::workers::WorkerFrame;
@@ -84,18 +83,7 @@ impl AdapterIdentity {
     }
 }
 
-/// The §5.5b wire-ID rule, shared with request validation.
-pub(crate) fn valid_wire_id(value: &str) -> bool {
-    valid_id(value)
-}
-
-fn valid_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && !value.chars().any(is_control)
-}
-
-fn is_control(c: char) -> bool {
-    c <= '\u{1f}' || c == '\u{7f}'
-}
+use intent_acp::workers::{is_control, is_wire_id as valid_id};
 
 /// Replace control characters with spaces and truncate to `max_bytes` on a
 /// character boundary.
@@ -123,12 +111,7 @@ fn accepted_task_type(provider: &str, task_type: Option<&Value>) -> Option<Strin
     Some(task_type)
 }
 
-/// Unix milliseconds now.
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
+pub(crate) use intent_acp::workers::now_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Continuity {
@@ -267,21 +250,29 @@ impl Projection {
         self.scope.connection_generation.as_deref()
     }
 
-    fn support(&self) -> Value {
+    /// `(status, reason)`; `reason` is `None` only when supported.
+    fn support_state(&self) -> (&'static str, Option<&'static str>) {
         if self.scope.acp_session_id.is_none() || self.scope.connection_generation.is_none() {
-            return json!({ "status": "unavailable", "reason": "no-session" });
+            return ("unavailable", Some("no-session"));
         }
         if let Some(reason) = self.unsupported {
-            return json!({ "status": "unsupported", "reason": reason });
+            return ("unsupported", Some(reason));
         }
         if self.continuity == Continuity::Lost {
-            return json!({ "status": "unavailable", "reason": "continuity-lost" });
+            return ("unavailable", Some("continuity-lost"));
         }
-        json!({ "status": "supported" })
+        ("supported", None)
+    }
+
+    fn support(&self) -> Value {
+        match self.support_state() {
+            (status, None) => json!({ "status": status }),
+            (status, Some(reason)) => json!({ "status": status, "reason": reason }),
+        }
     }
 
     fn supported(&self) -> bool {
-        self.support()["status"] == "supported"
+        self.support_state().1.is_none()
     }
 
     /// Bind the ACP session once `session/new` or `session/load` returns.
@@ -332,6 +323,14 @@ impl Projection {
         } else {
             None
         };
+        if kind == Some("async_task_spawned") && task_type.is_none() {
+            // Not a worker (a subagent, or a Codex non-shell task): tombstone
+            // the ID without a row so its later end report cannot create one.
+            if !self.seen.contains(task_id) && self.seen.len() < self.max_seen {
+                self.seen.insert(task_id.to_owned());
+            }
+            return false;
+        }
         let spawned = task_type.is_some();
         let ended_state = (kind == Some("async_task_state_update"))
             .then(|| u.get("state").and_then(Value::as_str))
@@ -559,10 +558,15 @@ impl AgentWorkers {
         f(&mut entry.projection)
     }
 
-    /// The generation this daemon currently holds for the agent.
-    pub(crate) fn current_generation(&self, agent_id: &AgentId) -> Option<String> {
+    /// The generation of `connection`, when it is the agent's current one.
+    pub(crate) fn generation_for(
+        &self,
+        agent_id: &AgentId,
+        connection: &Arc<Connection>,
+    ) -> Option<String> {
         self.lock()
             .get(agent_id)
+            .filter(|e| std::ptr::eq(e.connection.as_ptr(), Arc::as_ptr(connection)))
             .and_then(|e| e.projection.generation().map(str::to_owned))
     }
 
@@ -579,7 +583,10 @@ impl AgentWorkers {
         self.with_generation(agent_id, generation, |p| {
             let mut scope = p.scope.clone();
             scope.acp_session_id = None;
+            let continuity = p.continuity;
             *p = Projection::new(scope, identity, negotiated);
+            // A connection that already dropped stays dropped.
+            p.continuity = continuity;
             Some(p.snapshot(now_ms()))
         })
     }

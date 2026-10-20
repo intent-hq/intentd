@@ -9,7 +9,8 @@
 //! [`WorkerFrame`] sink stamped with the receipt time; the service layer owns
 //! the bounded projection built from them.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -140,10 +141,32 @@ pub fn frame(params: &Value) -> WorkerFrame {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// Daemon receipt time in Unix milliseconds, from a monotonic clock anchored
+/// to the wall clock once per process: a system clock step can never make a
+/// later report look older than an earlier one (§5.5b ordering).
+#[must_use]
+pub fn now_ms() -> u64 {
+    static ANCHOR: OnceLock<(Instant, u64)> = OnceLock::new();
+    let (instant, wall) = ANCHOR.get_or_init(|| {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        (Instant::now(), wall)
+    });
+    wall.saturating_add(u64::try_from(instant.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The §5.5b wire-ID rule: a nonempty string of at most 256 UTF-8 bytes
+/// without ASCII control characters.
+#[must_use]
+pub fn is_wire_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(is_control)
+}
+
+/// ASCII control characters (U+0000–U+001F and U+007F).
+#[must_use]
+pub fn is_control(c: char) -> bool {
+    c <= '\u{1f}' || c == '\u{7f}'
 }
 
 /// Ask the provider to stop one worker. Returns the provider's raw answer.
@@ -252,6 +275,12 @@ mod tests {
         assert_eq!(f.session_id.as_deref(), Some("s-1"));
         assert_eq!(f.update["sessionUpdate"], "async_task_spawned");
         assert!(f.received_at_ms > 0);
+        assert!(
+            now_ms() >= f.received_at_ms,
+            "receipt clock never goes backwards"
+        );
+        assert!(is_wire_id("t-1") && !is_wire_id("") && !is_wire_id("a\u{7f}"));
+        assert!(!is_wire_id(&"x".repeat(257)) && is_wire_id(&"x".repeat(256)));
         assert_eq!(
             frame(&json!({ "sessionId": 4, "update": {} })).session_id,
             None

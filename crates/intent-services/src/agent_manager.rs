@@ -3747,14 +3747,7 @@ impl AgentManager {
         // (a respawn installed a newer child with its own watcher).
         let child_pid = child.id();
         let connection = Arc::new(connection);
-        self.begin_worker_generation(
-            &workspace_id,
-            &agent_id,
-            opts.profile_env
-                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
-            &connection,
-            worker_rx,
-        );
+        let worker_connection = Arc::downgrade(&connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
             Arc::new(crate::PtyTerminalHost::with_shell_mode(
@@ -3893,6 +3886,17 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
+        // §5.5b: only an installed handle gets a worker generation (a fenced
+        // spawn must not leave a projection behind for a deleted agent).
+        // Reports buffer in the channel until the drain starts.
+        self.begin_worker_generation(
+            &workspace_id,
+            &agent_id,
+            opts.profile_env
+                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
+            worker_connection,
+            worker_rx,
+        );
         // Proactive dead-child detection (monorepo#764): watch the installed
         // child for an unexpected exit so an idle agent's death is reaped
         // (handle + registry) as it happens, not just at the next prompt.
@@ -4133,7 +4137,12 @@ impl AgentManager {
         // Boxed: keeps the caller's session-open future frame unchanged.
         let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
         let workers = self.services.agent_workers();
-        if let Some(generation) = workers.current_generation(agent_id) {
+        if let Some(generation) = started
+            .turn
+            .connection
+            .as_ref()
+            .and_then(|conn| workers.generation_for(agent_id, conn))
+        {
             if let Some(snapshot) = workers.bind_session(agent_id, &generation, &started.session_id)
             {
                 self.services.publish_workers_snapshot(snapshot);
@@ -4150,7 +4159,7 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         provider: &str,
-        connection: &Arc<Connection>,
+        connection: std::sync::Weak<Connection>,
         mut frames: mpsc::UnboundedReceiver<intent_acp::workers::WorkerFrame>,
     ) {
         let generation = Uuid::new_v4().to_string();
@@ -4164,7 +4173,7 @@ impl AgentManager {
             },
             &crate::agent_workers::AdapterIdentity::default(),
             false,
-            Arc::downgrade(connection),
+            connection,
         );
         self.services.publish_workers_snapshot(snapshot);
         let services = self.services.clone();
@@ -4257,7 +4266,7 @@ impl AgentManager {
         let handshake = negotiated.ordinary;
         {
             let workers = self.services.agent_workers();
-            if let Some(generation) = workers.current_generation(agent_id) {
+            if let Some(generation) = workers.generation_for(agent_id, &conn) {
                 let info = serde_json::to_value(&handshake.initialize.agent_info).ok();
                 let identity =
                     crate::agent_workers::AdapterIdentity::from_initialize(info.as_ref());

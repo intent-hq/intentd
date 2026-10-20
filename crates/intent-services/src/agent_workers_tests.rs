@@ -178,7 +178,6 @@ fn ownership_and_malformed_frames_reject_before_allocation() {
         with(spawn("w"), "asyncTaskId", json!("bad\n")),
         with(spawn("w"), "toolCallId", json!(4)),
         with(spawn("w"), "toolCallId", Value::Null),
-        with(spawn("w"), "taskType", json!("agent")),
         state("w", "paused"),
     ] {
         assert!(!p.ingest(&frame(update, 1000)));
@@ -357,7 +356,7 @@ fn provider_profiles_use_their_base_provider() {
     s.provider = "codex@p2".into();
     let mut x = Projection::new(s, &identity("codex"), true);
     assert!(!x.ingest(&frame(
-        with(spawn("w"), "taskType", json!("workflow")),
+        with(spawn("wf"), "taskType", json!("workflow")),
         1000
     )));
     assert!(x.ingest(&frame(spawn("w"), 1000)));
@@ -533,10 +532,6 @@ fn negotiation_after_spawn_sets_support_without_rows() {
         ..scope("claude-code")
     };
     workers.begin(unbound, &AdapterIdentity::default(), false, Weak::new());
-    assert_eq!(
-        workers.current_generation(&agent).as_deref(),
-        Some("generation-A")
-    );
     assert!(workers
         .negotiate(&agent, "generation-old", &identity("claude-code"), true)
         .is_none());
@@ -557,4 +552,94 @@ fn negotiation_after_spawn_sets_support_without_rows() {
         .bind_session(&agent, "generation-A", "session-A")
         .unwrap();
     assert_eq!(rebound["support"]["reason"], "adapter-version");
+}
+
+fn connection() -> Arc<Connection> {
+    let (client_out, _agent_in) = tokio::io::duplex(64);
+    let (_agent_out, client_in) = tokio::io::duplex(64);
+    Arc::new(Connection::new(
+        client_out,
+        client_in,
+        None,
+        intent_acp::transport::ConnectionHooks::default(),
+    ))
+}
+
+#[tokio::test]
+async fn generations_are_found_by_their_own_connection_only() {
+    let workers = AgentWorkers::default();
+    let agent = AgentId::from("agent-A");
+    let (mine, other) = (connection(), connection());
+    let unbound = Scope {
+        acp_session_id: None,
+        ..scope("claude-code")
+    };
+    workers.begin(
+        unbound,
+        &AdapterIdentity::default(),
+        false,
+        Arc::downgrade(&mine),
+    );
+    assert_eq!(
+        workers.generation_for(&agent, &mine).as_deref(),
+        Some("generation-A")
+    );
+    assert!(
+        workers.generation_for(&agent, &other).is_none(),
+        "a stale connection finds nothing"
+    );
+    assert!(workers
+        .generation_for(&AgentId::from("agent-B"), &mine)
+        .is_none());
+}
+
+#[test]
+fn negotiation_keeps_a_connection_that_already_dropped_disconnected() {
+    let workers = AgentWorkers::default();
+    let agent = AgentId::from("agent-A");
+    let unbound = Scope {
+        acp_session_id: None,
+        ..scope("claude-code")
+    };
+    workers.begin(unbound, &AdapterIdentity::default(), false, Weak::new());
+    assert!(workers.disconnect(&agent, "generation-A").is_some());
+    let s = workers
+        .negotiate(&agent, "generation-A", &identity("claude-code"), true)
+        .unwrap();
+    assert_eq!(s["continuity"], "disconnected");
+    let bound = workers
+        .bind_session(&agent, "generation-A", "session-A")
+        .unwrap();
+    assert_eq!(bound["continuity"], "disconnected");
+    assert!(workers
+        .ingest(&agent, "generation-A", &frame(spawn("w"), 1000))
+        .is_none());
+}
+
+#[test]
+fn rejected_spawns_tombstone_their_id_so_an_end_report_creates_no_row() {
+    let mut p = claude();
+    for t in ["agent", "local_agent"] {
+        let id = format!("sub-{t}");
+        assert!(!p.ingest(&frame(with(spawn(&id), "taskType", json!(t)), 1000)));
+        assert!(!p.ingest(&frame(state(&id, "completed"), 2000)), "{t}");
+    }
+    let mut x = codex();
+    assert!(!x.ingest(&frame(
+        with(spawn("wf"), "taskType", json!("workflow")),
+        1000
+    )));
+    assert!(!x.ingest(&frame(state("wf", "completed"), 2000)));
+    assert_eq!(rows(&mut p, 0).len() + rows(&mut x, 0).len(), 0);
+    assert_eq!(p.seen.len(), 2);
+    let mut full =
+        Projection::with_bounds(scope("claude-code"), &identity("claude-code"), true, 2, 1);
+    full.ingest(&frame(with(spawn("sub"), "taskType", json!("agent")), 1000));
+    full.ingest(&frame(spawn("next"), 1000));
+    assert_eq!(
+        rows(&mut full, 0).len(),
+        0,
+        "tombstones share the ledger bound"
+    );
+    assert_eq!(full.snapshot(0)["truncated"], true);
 }

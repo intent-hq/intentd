@@ -1367,7 +1367,12 @@ async fn handle_workers_subscribe(
             return !id.present || out_tx.send_priority(frame).await.is_ok();
         }
     };
-    subs.worker_subs.retain(|sub| subs.subs.contains_key(sub));
+    // A forwarder that ended (agent gone, access lost) no longer counts.
+    subs.worker_subs.retain(|sub| {
+        subs.subs
+            .get(sub)
+            .is_some_and(|live| !live.handle.is_finished())
+    });
     if subs.worker_subs.len() >= crate::agent_workers::MAX_WORKER_SUBSCRIPTIONS {
         let frame = reply(
             -32602,

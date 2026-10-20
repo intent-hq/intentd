@@ -5336,13 +5336,7 @@ fn merge_user_app_message_id(
 /// without ASCII control characters.
 pub(crate) fn wire_id(params: &Map<String, Value>, name: &str) -> Option<String> {
     match params.get(name) {
-        Some(Value::String(s))
-            if !s.is_empty()
-                && s.len() <= 256
-                && !s.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}') =>
-        {
-            Some(s.clone())
-        }
+        Some(Value::String(s)) if intent_services::is_wire_id(s) => Some(s.clone()),
         _ => None,
     }
 }
