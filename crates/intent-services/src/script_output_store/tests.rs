@@ -730,7 +730,10 @@ fn persistently_failing_rename_bounds_the_log_at_twice_the_cap() {
 fn failed_reopen_compaction_keeps_the_oversized_log() {
     let (dir, small) = store(100);
     let big = ScriptOutputStore::new(dir.path(), 1 << 20);
-    let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    let body = (0..20).fold(String::new(), |mut body, i| {
+        let _ = writeln!(body, "line {i}");
+        body
+    });
     big.open_writer("ws", "s", "r").append(body.as_bytes());
     let mut w = with_failing_rename(|| small.open_writer("ws", "s", "r"));
     assert!(w.is_enabled());
