@@ -12,15 +12,18 @@
 //! `intent-sourcecontrol`'s `traffic.rs`) so the growth fails here, at the
 //! moment it is introduced, with the fix in the message.
 //!
-//! Re-measure: set a budget to 0 and run
-//! `cargo nextest run -p intent-services --lib future_size`; the failure
-//! message prints the current size. Budgets are debug-profile sizes (the test
-//! profile, where the overflows happened) plus headroom.
+//! Budgets are debug-profile sizes (the test profile, where the overflows
+//! happened) measured on `x86_64` Linux, plus headroom; release builds lay
+//! futures out differently, so the test only runs with debug assertions.
+//! Re-measure: run `cargo nextest run -p intent-services --lib future_size`
+//! with a budget lowered to 0; the failure message lists every size.
+//!
+//! Removing only the `Box::pin(retry_spawn_owned(..))` in the worker does not
+//! grow the worker today (its size is set by other awaits), so
+//! `RETRY_SPAWN_BUDGET` is the guard for the inner `ensure_started_owned` box.
 
+use super::tests::manager;
 use super::*;
-use crate::events::EventBus;
-use crate::test_support::test_tempdir;
-use intent_store::Store;
 
 /// `ensure_started_owned` itself (measured `28_912` bytes). Large by design —
 /// its callers box it; this cap only catches runaway growth of the body.
@@ -33,31 +36,11 @@ const RETRY_SPAWN_BUDGET: usize = 9 * 1024;
 /// chain grows this to ~40 KiB.
 const MESSAGE_WORKER_BUDGET: usize = 34 * 1024;
 
-fn assert_within_budget(name: &str, size: usize, budget: usize) {
-    assert!(
-        size <= budget,
-        "{name} future is {size} bytes, over its {budget}-byte budget. A new inline \
-         `.await` on the agent turn-start path grew it, which overflows the stack on deep \
-         send/interrupt paths (intent-hq/intent#6658, intent-hq/intent#6741). Wrap the \
-         large await in `Box::pin(...)`. Raise the budget in \
-         agent_manager/future_size_tests.rs only if the growth is intentional and bounded."
-    );
-}
-
-async fn manager() -> (tempfile::TempDir, Arc<AgentManager>) {
-    let dir = test_tempdir("intentd-future-size-");
-    let store = Store::open(&dir.path().join("store.db"))
-        .await
-        .expect("open store");
-    let bus = EventBus::new(store.clone());
-    let services = Services::new(store).with_event_bus(bus.clone());
-    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
-    (dir, Arc::new(AgentManager::new(services, sink, 8)))
-}
-
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn turn_start_future_sizes_stay_within_budget() {
-    let (_dir, mgr) = manager().await;
+    let (_db, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
     let agent = AgentId::from("future-size-agent");
     let ws = WorkspaceId::from("future-size-workspace");
 
@@ -74,13 +57,30 @@ async fn turn_start_future_sizes_stay_within_budget() {
         TurnAdmission(0),
     ));
 
-    assert_within_budget(
-        "AgentManager::ensure_started_owned",
-        ensure_started,
-        ENSURE_STARTED_BUDGET,
+    let measured = [
+        (
+            "AgentManager::ensure_started_owned",
+            ensure_started,
+            ENSURE_STARTED_BUDGET,
+        ),
+        ("retry_spawn_owned", retry_spawn, RETRY_SPAWN_BUDGET),
+        ("run_message_worker", worker, MESSAGE_WORKER_BUDGET),
+    ];
+    let over: Vec<String> = measured
+        .iter()
+        .filter(|(_, size, budget)| size > budget)
+        .map(|(name, size, budget)| format!("{name} future is {size} bytes (budget {budget})"))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{}. An inline `.await` of a large future on the agent turn-start path grew it, which \
+         overflows the stack on deep send/interrupt paths (intent-hq/intent#6658, \
+         intent-hq/intent#6741): wrap the large await in `Box::pin(...)`. If no await was \
+         added (new locals, larger types, a toolchain bump), re-measure and raise the budget \
+         in agent_manager/future_size_tests.rs only if the growth is intentional and bounded. \
+         All sizes: {measured:?}",
+        over.join("; ")
     );
-    assert_within_budget("retry_spawn_owned", retry_spawn, RETRY_SPAWN_BUDGET);
-    assert_within_budget("run_message_worker", worker, MESSAGE_WORKER_BUDGET);
     // Keeps the retry budget meaningful: it only catches an un-boxed
     // `ensure_started_owned` while that future is much larger than the budget.
     assert!(
