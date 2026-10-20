@@ -213,29 +213,28 @@ fn target(
     }
 }
 
-/// Implicit (repo-less, non-addressed) reads only: a GitHub workspace inserted
-/// with repository metadata has an unresolved historical primary selection
-/// (intent-hq/intent#7449), which would otherwise refuse every repo-less
-/// read. Treat it as Automatic, resolving the fetch remotes, but accept only a
-/// GitHub result; anything else keeps the original refusal, so managed
-/// (GitLab) reads and their revalidation are unchanged.
-fn implicit_github_target(
+/// Implicit (repo-less, non-addressed) reads only. A workspace inserted with
+/// repository metadata has an unresolved historical primary selection
+/// (intent-hq/intent#7449), which would otherwise refuse every repo-less read.
+/// This is a deliberate services-level exception to the intent-core rule that
+/// current remotes never recover historical intent: the selection is treated
+/// as Automatic, and the result is accepted only when it is a GitHub target.
+/// Anything else (GitLab, ambiguous, unmapped, no remote) keeps the strict
+/// refusal, so managed reads, their revalidation and addressed reads, which
+/// all use `selected_target`, are unchanged.
+fn implicit_target(
     observed: &RepositoryObservedRoot,
-    saved: &SavedReviewSelection,
-) -> Option<intent_core::RepositoryTarget> {
-    if !matches!(saved, SavedReviewSelection::UnresolvedHistorical { .. }) {
-        return None;
-    }
-    match resolve_review_selection(&SavedReviewSelection::Automatic, &observed.remotes, None)
-        .outcome
-    {
-        ReviewSelectionOutcome::Resolved { target, .. }
-            if target.provider == RepositoryProvider::Github =>
-        {
-            Some(target)
+    selection: &SelectionFacts,
+) -> AdmissionResult<intent_core::RepositoryTarget> {
+    let saved = selection.saved()?;
+    if matches!(saved, SavedReviewSelection::UnresolvedHistorical { .. }) {
+        if let Ok(target) = target(observed, &SavedReviewSelection::Automatic) {
+            if target.provider == RepositoryProvider::Github {
+                return Ok(target);
+            }
         }
-        _ => None,
     }
+    target(observed, &saved)
 }
 
 fn selected_target(
@@ -426,15 +425,17 @@ impl CapturedReview {
         if SelectionFacts::read(services, &root_id).await? != selection {
             return Err(AdmissionError::BindingChanged);
         }
-        let selected = match selected_target(
-            &observed,
-            &selection,
-            self.explicit.as_ref(),
-            self.settled.as_ref().ok(),
-        ) {
-            Ok(selected) => selected,
-            Err(error) if self.addressed || self.explicit.is_some() => return Err(error),
-            Err(error) => implicit_github_target(&observed, &selection.saved()?).ok_or(error)?,
+        // Only `capture_addressed` sets `explicit`, so an implicit read never
+        // carries one and `selected_target` would reduce to `target`.
+        let selected = if self.addressed {
+            selected_target(
+                &observed,
+                &selection,
+                self.explicit.as_ref(),
+                self.settled.as_ref().ok(),
+            )?
+        } else {
+            implicit_target(&observed, &selection)?
         };
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
