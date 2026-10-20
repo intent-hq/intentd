@@ -33,7 +33,10 @@
 //!   executed).
 //!
 //! The disabled gate, the cached-auth gate and feature gating
-//! (`requires_env_var` / `requires_feature_code`) still run for real.
+//! (`requires_env_var` / `requires_feature_code`) still run for real. The
+//! auth gate on a marked provider is covered by
+//! `provider_profiles::routing_tests::explicit_delegation_checks_the_profiles_own_auth_verdict`,
+//! which seeds a per-profile verdict instead of the process-wide one.
 //!
 //! Only those two seams honor the marker. Discovery surfaces
 //! (`host.providerDiscovery`, the discovery cache, default-provider healing)
@@ -162,20 +165,6 @@ mod tests {
         let err = crate::agent_ops::ensure_provider_available("agent.create", "codex", &providers)
             .expect_err("disabled provider rejected");
         assert!(err.to_string().contains("not enabled"), "{err}");
-    }
-
-    #[test]
-    fn the_auth_gate_still_applies() {
-        // The verdict cache is process-wide: like the crate's other
-        // verdict-seeding tests this relies on nextest's process-per-test
-        // isolation (`make test`, CI).
-        let providers = marked(&["claude-code"]);
-        crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(false));
-        let result =
-            crate::agent_ops::ensure_provider_available("agent.create", "claude-code", &providers);
-        crate::provider_auth::seed_auth_verdict_for_tests("claude-code", None);
-        let err = result.expect_err("unauthenticated provider rejected");
-        assert!(err.to_string().contains("not authenticated"), "{err}");
     }
 
     #[test]

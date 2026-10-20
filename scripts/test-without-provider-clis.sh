@@ -76,15 +76,21 @@ IFS=: read -r -a path_dirs <<<"${PATH:-}"
 dirs+=("${path_dirs[@]}")
 # setsid: an interactive shell attached to a terminal is stopped by job
 # control (SIGTTIN/SIGTTOU), and a stopped process ignores timeout's TERM.
-login_path=$(timeout -s KILL 10 setsid "${SHELL:-/bin/sh}" -ilc 'printf "__INTENT_PATH__%s__INTENT_PATH__" "$PATH"' </dev/null 2>/dev/null || true)
-if [[ "$login_path" == *__INTENT_PATH__*__INTENT_PATH__* ]]; then
-  login_path=${login_path#*__INTENT_PATH__}
-  login_path=${login_path%%__INTENT_PATH__*}
-  IFS=: read -r -a login_dirs <<<"$login_path"
+login_env=$(timeout -s KILL 10 setsid "${SHELL:-/bin/sh}" -ilc 'printf "__INTENT_ENV__%s__INTENT_SEP__%s__INTENT_ENV__" "$PATH" "${VOLTA_HOME:-}"' </dev/null 2>/dev/null || true)
+login_volta_home=
+if [[ "$login_env" == *__INTENT_ENV__*__INTENT_SEP__*__INTENT_ENV__* ]]; then
+  login_env=${login_env#*__INTENT_ENV__}
+  login_env=${login_env%%__INTENT_ENV__*}
+  login_volta_home=${login_env#*__INTENT_SEP__}
+  IFS=: read -r -a login_dirs <<<"${login_env%%__INTENT_SEP__*}"
   dirs+=("${login_dirs[@]}")
 fi
+# Volta's home as discovery resolves it: inherited VOLTA_HOME, then the login
+# shell's, then ~/.volta (path_utils::enriched_tool_dirs_for).
+volta_home=${VOLTA_HOME:-${login_volta_home:-$HOME/.volta}}
 dirs+=(/usr/local/bin /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin /usr/local/opt/node/bin)
-for sub in .npm-global/bin .npm-packages/bin .local/bin .volta/bin .asdf/shims; do
+dirs+=("$volta_home/bin")
+for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims; do
   dirs+=("$HOME/$sub")
 done
 for dir in "$HOME"/.nvm/versions/node/*/bin; do
