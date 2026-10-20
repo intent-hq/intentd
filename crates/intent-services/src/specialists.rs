@@ -272,8 +272,13 @@ fn user_dir_override_from_env() -> Option<PathBuf> {
 
 /// Default user specialists directory: [`USER_DIR_ENV`] if set, else
 /// `~/.intent/specialists/`. Shared with the specialists watcher so the
-/// watched and written directories cannot drift.
+/// watched and written directories cannot drift. Unit tests get no user tier
+/// unless they pass one explicitly: the developer's own specialists (e.g. a
+/// verifier pinned to `codingAgent: codex`) made tests depend on the host.
 pub(crate) fn default_user_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     user_dir_override_from_env()
         .or_else(|| home_dir().map(|h| h.join(".intent").join(SPECIALISTS_FOLDER)))
 }

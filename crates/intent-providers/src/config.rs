@@ -258,8 +258,9 @@ pub struct ProviderConfig {
     /// session spawn, discovery `installed`, one-shot / test-prompt launches,
     /// the ACP auth fallback probe) — so users can track the adapter
     /// themselves (intent-hq/monorepo#4352). An invalid override contributes
-    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
-    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
+    /// nothing and the pinned spawn applies. Opt-in per provider; no provider
+    /// opts in today. Codex and Claude Code stay pinned to the reviewed
+    /// package plus their installed CLI. pi stays pinned-npx-only — its adapter
     /// additionally routes through the version-gated real `pi` CLI and the
     /// extension wrapper, and its auth probe runs the pinned package, so an
     /// override there would advertise `installed` for a spawn that still

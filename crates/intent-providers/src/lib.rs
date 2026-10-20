@@ -69,4 +69,6 @@ pub use version_gate::{
 };
 
 #[cfg(test)]
+mod provider_cli_guard;
+#[cfg(test)]
 mod tests;
