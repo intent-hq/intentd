@@ -55,6 +55,28 @@ async fn wait_for_log(services: &Services, ws: &WorkspaceId, id: &str) -> String
     .expect("the run's log appears on disk")
 }
 
+/// Wait until a run's log holds `line` terminated by a newline. A script that
+/// prints that one line and then sleeps or exits writes nothing more, so a
+/// log backdated after this keeps its mtime.
+async fn wait_for_log_line(services: &Services, ws: &str, id: &str, run: &str, line: &str) {
+    let path = services
+        .script_output_store()
+        .run_path(ws, id, run)
+        .expect("run path");
+    let (lf, crlf) = (format!("{line}\n"), format!("{line}\r\n"));
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.contains(&lf) || text.contains(&crlf) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} gets the line {line:?}", path.display()));
+}
+
 fn write_log(services: &Services, ws: &str, id: &str, run: &str) {
     services
         .script_output_store()
@@ -89,6 +111,7 @@ async fn expiry_sweep_deletes_expired_logs_and_keeps_recent_and_live() {
         .await
         .expect("run");
     let done_run = current_run(&h.services, &h.ws, &done);
+    wait_for_log_line(&h.services, &ws, &done, &done_run, "done-out").await;
     backdate_log(&h.services, &ws, &done, &done_run, old);
 
     // A recent log of an exited run is kept.
@@ -112,6 +135,9 @@ async fn expiry_sweep_deletes_expired_logs_and_keeps_recent_and_live() {
         .await
         .expect("start");
     let svc_run = wait_for_log(&h.services, &h.ws, &svc).await;
+    // The log exists from the run's start; backdating before the service's
+    // one line lands would let that write refresh the mtime.
+    wait_for_log_line(&h.services, &ws, &svc, &svc_run, "svc-out").await;
     backdate_log(&h.services, &ws, &svc, &svc_run, old);
     write_log(&h.services, &ws, &svc, "previous-run");
     backdate_log(&h.services, &ws, &svc, "previous-run", old);
