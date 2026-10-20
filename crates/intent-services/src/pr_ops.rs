@@ -1091,7 +1091,9 @@ pub struct MergeRequirementsApprovals {
 
 /// The `mergeQueueEjection` block: the PR's latest merge-queue removal event
 /// (when the queue ejected the PR and why). Mirrors
-/// [`intent_sourcecontrol::MergeQueueRemoval`] onto the wire.
+/// [`intent_sourcecontrol::MergeQueueRemoval`] onto the wire, except that a
+/// removal whose reason is `merged` (the queue landed the PR) is not an
+/// ejection and is omitted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeQueueEjection {
@@ -1432,11 +1434,23 @@ pub(crate) fn merge_requirements(
         is_in_merge_queue: signals.and_then(|s| s.is_in_merge_queue).filter(|&q| q),
         merge_queue_ejection: signals
             .and_then(|s| s.merge_queue_removal.as_ref())
+            .filter(|r| !is_merged_queue_removal(r))
             .map(|r| MergeQueueEjection {
                 at: r.at.clone(),
                 reason: r.reason.clone(),
             }),
     }
+}
+
+/// Whether a merge-queue removal event records the queue *landing* the PR
+/// (GitHub reason `merged`) rather than ejecting it. Such an event is not an
+/// ejection, so the checklist never surfaces it as `mergeQueueEjection`
+/// (cloudlands-fe#3524 was reported ejected on merge).
+fn is_merged_queue_removal(removal: &intent_sourcecontrol::MergeQueueRemoval) -> bool {
+    removal
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
 }
 
 /// Fetch and compose the merge-requirements checklist for one PR — the
@@ -3234,7 +3248,8 @@ mod tests {
     }
 
     /// The probe's removal event maps onto the wire as `mergeQueueEjection`
-    /// — raw reason value preserved — and the key is omitted when the host
+    /// — raw reason value preserved (a `merged` removal is excluded; see
+    /// below) — and the key is omitted when the host
     /// reports no event.
     #[test]
     fn merge_requirements_carries_merge_queue_ejection_raw_on_the_wire() {
@@ -3274,6 +3289,45 @@ mod tests {
         assert_eq!(
             wire["mergeQueueEjection"],
             serde_json::json!({ "at": "2026-01-02T03:04:05Z" })
+        );
+    }
+
+    /// Regression: GitHub also records a `RemovedFromMergeQueueEvent` (reason
+    /// `merged`) when the queue lands the PR. That is not an ejection, so the
+    /// checklist omits `mergeQueueEjection` — cloudlands-fe#3524's merge was
+    /// surfaced as an ejection and stalled a watcher.
+    #[test]
+    fn merge_requirements_omits_merge_queue_ejection_for_merged_removal() {
+        let p = pr(PrState::Merged, false, Some(true), Some("clean"));
+        for reason in ["merged", "MERGED", "Merged"] {
+            let signals = MergeRequirementSignals {
+                merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                    at: "2026-10-19T17:57:04Z".into(),
+                    reason: Some(reason.into()),
+                }),
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            assert_eq!(req.merge_queue_ejection, None, "reason {reason}");
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire.get("mergeQueueEjection").is_none(), "reason {reason}");
+        }
+
+        // A real ejection on the same PR shape is still reported.
+        let ejected = MergeRequirementSignals {
+            merge_queue_removal: Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-10-19T17:57:04Z".into(),
+                reason: Some("failed_checks".into()),
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&ejected), &[], &agg(0, 0), Some(0));
+        assert_eq!(
+            req.merge_queue_ejection,
+            Some(MergeQueueEjection {
+                at: "2026-10-19T17:57:04Z".into(),
+                reason: Some("failed_checks".into()),
+            })
         );
     }
 
