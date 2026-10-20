@@ -551,3 +551,15 @@ fn delete_never_reaches_through_a_symlinked_folder() {
     );
     assert_eq!(fs::read(outside.join("s").join("r.log")).unwrap(), b"keep");
 }
+
+#[test]
+fn workspace_ids_lists_decoded_workspace_folders_only() {
+    let (_dir, store) = store(1024);
+    assert!(store.workspace_ids().is_empty(), "no root yet");
+    store.open_writer("ws-1", "s", "r").append(b"x");
+    store.open_writer("ws/odd.id", "s", "r").append(b"x");
+    fs::write(store.root().join("stray-file"), b"x").unwrap();
+    let mut ids = store.workspace_ids();
+    ids.sort();
+    assert_eq!(ids, vec!["ws-1".to_string(), "ws/odd.id".to_string()]);
+}

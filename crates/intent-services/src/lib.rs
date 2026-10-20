@@ -240,6 +240,7 @@ mod rtk;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
+mod script_output_cleanup;
 mod script_output_store;
 mod search_ops;
 mod sentry_ops;
@@ -4736,7 +4737,6 @@ impl Services {
     }
 
     /// The on-disk script output store.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by output cleanup"))]
     pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
         &self.script_output
     }
@@ -17942,6 +17942,9 @@ impl Services {
             services
                 .cancel_script_monitors(&id, None, "workspace-deleted")
                 .await?;
+            // Stop the workspace's scripts so no supervisor respawns or reopens
+            // a log after the output folder is deleted below.
+            services.script_manager().stop_workspace(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -18208,6 +18211,9 @@ impl Services {
                 }
                 Err(e) => return Err(e),
             }
+            // The row is gone and its scripts are stopped: delete its on-disk
+            // script output (best-effort; the startup orphan sweep retries).
+            services.delete_workspace_script_output(&id).await;
             // Cancel any pending debounced lastActivity derivation
             // (monorepo#3623): the timer must not outlive the workspace —
             // it would fire against the deleted row and log a spurious

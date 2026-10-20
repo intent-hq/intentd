@@ -262,33 +262,30 @@ impl ScriptOutputStore {
     }
 
     /// Delete every log of one script. A missing folder is not an error.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the script output cleanup change")
-    )]
     pub(crate) fn delete_script(&self, workspace_id: &str, script_id: &str) -> Result<()> {
         let dir = self.script_dir(workspace_id, script_id)?;
         remove_tree(&self.root, &dir)
     }
 
     /// Delete every log of one workspace. A missing folder is not an error.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the script output cleanup change")
-    )]
     pub(crate) fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
         let dir = self.workspace_dir(workspace_id)?;
         remove_tree(&self.root, &dir)
+    }
+
+    /// Decoded IDs of every workspace folder under the root (symlinks and
+    /// unrecognized entries are skipped). Empty when the root is missing.
+    pub(crate) fn workspace_ids(&self) -> Vec<String> {
+        decoded_children(&self.root, true, &mut SweepReport::default())
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
     }
 
     /// Delete every log last modified more than `max_age` ago, except those
     /// for which `is_live` returns true, then prune emptied folders.
     /// `max_age == 0` disables the sweep (`scripts.outputRetentionHours = 0`).
     /// Unrecognized entries are left alone; failures are logged and counted.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the script output cleanup change")
-    )]
     pub(crate) fn sweep(
         &self,
         max_age: Duration,

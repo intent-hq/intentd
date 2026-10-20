@@ -1254,6 +1254,7 @@ impl ScriptManager {
         if !scoped {
             self.store.remove_script(script_id).await?;
         }
+        self.delete_script_output(workspace_id, script_id).await;
         publish_event(
             self.bus.as_ref(),
             script_event(
@@ -1264,6 +1265,46 @@ impl ScriptManager {
         )
         .await;
         Ok(json!({ "ok": true, "scriptId": script_id }))
+    }
+
+    /// Delete every on-disk log of one script. Best-effort: a failure is
+    /// logged and never fails the caller.
+    async fn delete_script_output(&self, workspace_id: &WorkspaceId, script_id: &str) {
+        let store = self.output_store.clone();
+        let (ws, id) = (workspace_id.as_str().to_owned(), script_id.to_owned());
+        match tokio::task::spawn_blocking(move || store.delete_script(&ws, &id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(workspace = %workspace_id, script = %script_id, error = %e, "script output delete failed");
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %workspace_id, script = %script_id, error = %e, "script output delete task failed");
+            }
+        }
+    }
+
+    /// Stop every running script of one workspace with `script.stop`
+    /// semantics, so no supervisor respawns or reopens a log afterwards.
+    /// Best-effort: a failed stop is logged and the rest still stop.
+    pub(crate) async fn stop_workspace(&self, workspace_id: &WorkspaceId) {
+        let ids: Vec<String> = self
+            .scripts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((ws, _), m)| ws == workspace_id && self.entry_is_live_or_admitted(m))
+            .map(|((_, id), _)| id.clone())
+            .collect();
+        for id in ids {
+            let lock = self.locks.definition_lock(&id);
+            let _guard = lock.lock().await;
+            if let Err(e) = self
+                .stop_inner_reason(workspace_id, &id, true, "cancelled by workspace deletion")
+                .await
+            {
+                tracing::warn!(workspace = %workspace_id, script = %id, error = %e, "script stop during workspace delete failed");
+            }
+        }
     }
 
     /// `script.status`: the script's runtime state. Scoped to `workspace_id`.
@@ -2956,6 +2997,7 @@ mod tests {
     include!("script_ops/monitor_tests.rs");
     include!("script_ops/snapshot_tests.rs");
     include!("script_ops/output_tests.rs");
+    include!("script_ops/cleanup_tests.rs");
     use std::path::PathBuf;
     use std::time::Duration;
 

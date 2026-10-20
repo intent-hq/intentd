@@ -13,6 +13,24 @@ impl ScriptManager {
         Ok(self.entry_is_live(m))
     }
 
+    /// Whether `run` is the script's current run and that run is still
+    /// active. A service auto-restart appends to the same run's log, so an
+    /// old log modification time alone never means the run is over.
+    pub(crate) fn run_is_live(&self, ws: &str, id: &str, run: &str) -> bool {
+        let scripts = self.scripts.lock().unwrap();
+        scripts
+            .get(&(WorkspaceId::from_string(ws), id.to_owned()))
+            .is_some_and(|m| {
+                (m.state.run_id.as_deref() == Some(run) || m.run_id.as_deref() == Some(run))
+                    && self.entry_is_live(m)
+            })
+    }
+
+    /// Live, or holding an admitted run that has not settled yet.
+    pub(super) fn entry_is_live_or_admitted(&self, m: &ManagedScript) -> bool {
+        m.run_id.is_some() || self.entry_is_live(m)
+    }
+
     fn entry_is_live(&self, m: &ManagedScript) -> bool {
         !matches!(m.state.status, ScriptStatus::Idle | ScriptStatus::Exited)
             || m.run_reserved.is_some()
