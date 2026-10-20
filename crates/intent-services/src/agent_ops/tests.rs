@@ -82,8 +82,16 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
 /// `agent.setModel`'s cross-provider gate) pass without the real binary on the
 /// test host. Merges into the `providers.paths` map seeded by
 /// [`test_registry_with_default_provider`] rather than replacing it, so
-/// auggie's override survives.
+/// auggie's override survives. npx-only providers (Codex, Claude Code, pi)
+/// ignore path overrides: mark those with
+/// `test_support::provider_installed::mark_on` instead.
 pub(super) fn seed_provider_path(svc: &Services, provider_id: &str) {
+    assert!(
+        intent_providers::provider_config(provider_id)
+            .npx_only_package
+            .is_none(),
+        "{provider_id} ignores providers.paths; use test_support::provider_installed"
+    );
     let mut paths = svc.effective_settings().providers.paths;
     paths.insert(provider_id.to_string(), "/bin/sh".to_string());
     svc.settings_registry()
@@ -150,7 +158,12 @@ pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store).with_settings_registry(registry);
+    // An empty user specialists tier: the default reads the developer's
+    // `~/.intent/specialists/`, whose `codingAgent` pins (e.g. a verifier
+    // on codex) made specialist tests depend on the host's installed CLIs.
+    let services = Services::new(store)
+        .with_settings_registry(registry)
+        .with_specialist_dirs(Some(tmp.path.with_extension("user-specialists")), None);
     (tmp, services, ws)
 }
 
@@ -9638,7 +9651,7 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     // The cross-provider switch below runs the availability gate against the
     // target, so pin claude-code to a deterministic executable rather than
     // depending on whether the test host happens to have it installed.
-    seed_provider_path(&svc, "claude-code");
+    crate::test_support::provider_installed::mark_on(&svc, &["claude-code"]);
     #[cfg(unix)]
     let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
     #[cfg(not(unix))]

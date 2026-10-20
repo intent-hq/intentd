@@ -68,7 +68,7 @@ impl Fixture {
         };
         fx.set(
             "providers.paths",
-            json!({ "codex": "/bin/sh", "claude-code": "/bin/sh" }),
+            crate::test_support::provider_installed::paths_json(&["codex", "claude-code"]),
         );
         fx
     }
