@@ -709,20 +709,115 @@ fn failed_compaction_rename_keeps_every_byte_and_retries_later() {
     assert!(compact_temps(&store).is_empty());
 }
 
+fn numbered_line(i: usize) -> String {
+    format!("line {i:04} {}\n", "q".repeat(29))
+}
+
+/// Append 500 40-byte lines to a 1000-byte-cap log while compaction keeps
+/// failing, with a reader holding the log open from the start. The log must
+/// never be truncated or rewritten in place: the reader's handle only ever
+/// grows, stays the same file as the path, and always reads back an exact
+/// prefix of the output; the log never passes twice the cap.
+fn assert_failed_compaction_never_truncates(
+    store: &ScriptOutputStore,
+    mut append_all: impl FnMut(&mut dyn FnMut(&[u8])),
+) {
+    let mut w = store.open_writer("ws", "s", "r");
+    w.append(numbered_line(0).as_bytes());
+    let path = w.path().to_path_buf();
+    let mut reader = File::open(&path).unwrap();
+    let mut last_len = 0u64;
+    let mut check = |w: &RunOutputWriter| {
+        let len = reader.metadata().unwrap().len();
+        assert!(
+            len >= last_len,
+            "log shrank from {last_len} to {len} under a reader"
+        );
+        assert!(len <= 2000, "log grew to {len}, past twice the cap");
+        assert_eq!(len, w.len());
+        last_len = len;
+        let mut text = String::new();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        (&reader).read_to_string(&mut text).unwrap();
+        let expected: String = (0..text.len() / 40).map(numbered_line).collect();
+        assert_eq!(text, expected, "the log is an exact prefix of the output");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                fs::metadata(&path).unwrap().ino(),
+                reader.metadata().unwrap().ino()
+            );
+        }
+    };
+    append_all(&mut |chunk| {
+        w.append(chunk);
+        check(&w);
+    });
+    assert!(w.is_enabled());
+    assert_eq!(w.len(), 2000, "appends continue right up to twice the cap");
+    assert!(compact_temps(store).is_empty());
+}
+
 #[test]
-fn persistently_failing_rename_bounds_the_log_at_twice_the_cap() {
+fn persistently_failing_compaction_never_truncates_and_stops_at_twice_the_cap() {
+    let (_dir, store) = store(1000);
+    with_failing_rename(|| {
+        assert_failed_compaction_never_truncates(&store, |append| {
+            for i in 1..500 {
+                append(numbered_line(i).as_bytes());
+            }
+        });
+    });
+}
+
+/// A real replacement failure: the run folder is read-only, so the temp file
+/// cannot be created while the log itself stays writable.
+#[cfg(unix)]
+#[test]
+fn uncreatable_compaction_temp_never_truncates_the_log() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_dir, store) = store(1000);
+    store.open_writer("ws", "s", "r");
+    let dir = store.script_dir("ws", "s").unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join("probe");
+    if fs::write(&probe, b"").is_ok() {
+        // Running as root: permissions are not enforced, so nothing to test.
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = fs::remove_file(store.run_path("ws", "s", "r").unwrap());
+    let dir_for_lock = dir.clone();
+    assert_failed_compaction_never_truncates(&store, move |append| {
+        fs::set_permissions(&dir_for_lock, fs::Permissions::from_mode(0o555)).unwrap();
+        for i in 1..500 {
+            append(numbered_line(i).as_bytes());
+        }
+        fs::set_permissions(&dir_for_lock, fs::Permissions::from_mode(0o755)).unwrap();
+    });
+}
+
+#[test]
+fn compaction_recovers_after_dropping_output_past_twice_the_cap() {
     let (_dir, store) = store(1000);
     let mut w = store.open_writer("ws", "s", "r");
     with_failing_rename(|| {
-        for i in 0..500 {
-            w.append(format!("line {i:04} {}\n", "q".repeat(28)).as_bytes());
-            assert!(w.len() <= 2000, "len {} after {i}", w.len());
+        for i in 0..200 {
+            w.append(numbered_line(i).as_bytes());
         }
     });
-    assert!(w.is_enabled());
+    assert_eq!(w.len(), 2000);
+    // Renames work again: within a quarter cap the next attempt compacts.
+    for i in 200..210 {
+        w.append(numbered_line(i).as_bytes());
+    }
+    assert!(w.len() <= 1000, "len {}", w.len());
     let text = read_all(&store, "ws", "s", "r");
     assert_eq!(text.len() as u64, w.len());
-    assert!(text.ends_with(&format!("line 0499 {}\n", "q".repeat(28))));
+    assert!(text.ends_with(&numbered_line(209)));
     assert!(compact_temps(&store).is_empty());
 }
 

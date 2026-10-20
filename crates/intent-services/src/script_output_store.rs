@@ -17,9 +17,11 @@
 //!   its open handle on a complete (old) file and a fresh open sees the
 //!   complete new one: readers never see a log shrink mid-read, and neither
 //!   side ever waits on a lock. If the rename fails (e.g. a filesystem or old
-//!   Windows that refuses to replace an open file), the old log is kept, the
-//!   chunk is appended anyway and compaction is retried later; only past twice
-//!   the cap does the writer fall back to rewriting the log in place.
+//!   Windows that refuses to replace an open file), the log is never
+//!   truncated or rewritten in place: the old file is kept, chunks are still
+//!   appended up to twice the cap (past that they are dropped from disk; the
+//!   live `script:output` stream is unaffected) and compaction is retried
+//!   after every further quarter cap of output.
 //! - Sweeps also delete compaction temp files (`*.compact`) left behind by a
 //!   crash once they are a few minutes old, even when retention is disabled.
 //! - Reads stream the file and hold at most the requested lines (plus one line
@@ -178,7 +180,7 @@ impl ScriptOutputStore {
                 file: Some(file),
                 len,
                 cap: self.max_bytes_per_run,
-                defer_until: 0,
+                retry: CompactionRetry::default(),
             },
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "script output log disabled: open failed");
@@ -404,9 +406,17 @@ pub(crate) struct RunOutputWriter {
     file: Option<File>,
     len: u64,
     cap: u64,
-    /// After a failed compaction rename, the size up to which appends skip
-    /// compaction before retrying it (0 when no retry is pending).
-    defer_until: u64,
+    retry: CompactionRetry,
+}
+
+/// Backoff state after a failed compaction (see [`write_capped`]).
+#[derive(Debug, Default)]
+struct CompactionRetry {
+    /// Output bytes still to pass before the next compaction attempt (0 when
+    /// no retry is pending).
+    credit: u64,
+    /// Whether this run already warned about a failed compaction.
+    warned: bool,
 }
 
 impl RunOutputWriter {
@@ -416,7 +426,7 @@ impl RunOutputWriter {
             file: None,
             len: 0,
             cap,
-            defer_until: 0,
+            retry: CompactionRetry::default(),
         }
     }
 
@@ -461,7 +471,7 @@ impl RunOutputWriter {
             file,
             &mut self.len,
             self.cap,
-            &mut self.defer_until,
+            &mut self.retry,
             chunk,
         );
         if let Err(e) = result {
@@ -473,24 +483,34 @@ impl RunOutputWriter {
 
 /// Append `chunk` to the log at `path` (open as `file`, read + append, size
 /// `*len`), keeping it within `cap` bytes. Compaction replaces `*file` with
-/// the handle of the renamed-in log (see [`replace_log`]). If that rename
-/// fails, nothing is lost: the old log is kept, the chunk is appended, and
-/// compaction is retried once the log has grown another quarter cap (tracked
-/// in `*defer_until`). Only a log that would pass twice the cap is rewritten
-/// in place, trading the concurrent-read guarantee for bounded size.
+/// the handle of the renamed-in log (see [`replace_log`]); the open log is
+/// never truncated or rewritten in place, because concurrent readers hold it.
+/// If the replacement fails, the old log is kept and chunks are still appended
+/// while the log stays within twice the cap; a chunk that would pass that is
+/// dropped from disk (the caller's live stream still carries it). Compaction
+/// is retried once another quarter cap of output has gone by, and the first
+/// failure per run logs one warning.
 fn write_capped(
     path: &Path,
     file: &mut File,
     len: &mut u64,
     cap: u64,
-    defer_until: &mut u64,
+    retry: &mut CompactionRetry,
     chunk: &[u8],
 ) -> io::Result<()> {
     let chunk_len = chunk.len() as u64;
-    let hard_cap = cap.saturating_mul(2);
     let new_len = len.saturating_add(chunk_len);
-    if new_len <= cap || new_len <= (*defer_until).min(hard_cap) {
+    if new_len <= cap {
         return append_chunk(file, len, chunk);
+    }
+    let fits_fallback = new_len <= cap.saturating_mul(2);
+    if retry.credit > 0 {
+        retry.credit = retry.credit.saturating_sub(chunk_len);
+        return if fits_fallback {
+            append_chunk(file, len, chunk)
+        } else {
+            Ok(())
+        };
     }
     // `cap` fits in usize whenever the chunk does not (chunk_len > cap below).
     let mut kept: Vec<u8> = if chunk_len >= cap {
@@ -509,23 +529,20 @@ fn write_capped(
         Ok(new_file) => {
             *file = new_file;
             *len = kept.len() as u64;
-            *defer_until = 0;
+            retry.credit = 0;
             Ok(())
-        }
-        Err(e) if new_len <= hard_cap => {
-            tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed; keeping the old log and retrying later");
-            *defer_until = new_len.saturating_add(cap / 4).max(new_len + 1);
-            append_chunk(file, len, chunk)
         }
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed past twice the cap; rewriting in place");
-            file.set_len(0)?;
-            // Append mode writes at the (now zero) end regardless of the cursor.
-            file.write_all(&kept)?;
-            file.flush()?;
-            *len = kept.len() as u64;
-            *defer_until = 0;
-            Ok(())
+            if !retry.warned {
+                retry.warned = true;
+                tracing::warn!(path = %path.display(), error = %e, "script output log compaction failed; keeping the old log (output past twice the cap is not saved) and retrying");
+            }
+            retry.credit = (cap / 4).max(1);
+            if fits_fallback {
+                append_chunk(file, len, chunk)
+            } else {
+                Ok(())
+            }
         }
     }
 }
