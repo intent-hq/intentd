@@ -323,6 +323,10 @@ impl Projection {
         } else {
             None
         };
+        let at = frame.received_at_ms;
+        if at > MAX_SAFE_INTEGER {
+            return false;
+        }
         if kind == Some("async_task_spawned") && task_type.is_none() {
             // Not a worker (a subagent, or a Codex non-shell task): tombstone
             // the ID without a row so its later end report cannot create one.
@@ -337,10 +341,6 @@ impl Projection {
             .flatten()
             .and_then(|s| TERMINAL.iter().find(|t| **t == s).copied());
         if !spawned && ended_state.is_none() {
-            return false;
-        }
-        let at = frame.received_at_ms;
-        if at > MAX_SAFE_INTEGER {
             return false;
         }
         self.clock(at);

@@ -643,3 +643,13 @@ fn rejected_spawns_tombstone_their_id_so_an_end_report_creates_no_row() {
     );
     assert_eq!(full.snapshot(0)["truncated"], true);
 }
+
+#[test]
+fn an_invalid_receipt_time_records_no_tombstone() {
+    let mut p = claude();
+    assert!(!p.ingest(&frame(
+        with(spawn("sub"), "taskType", json!("agent")),
+        MAX_SAFE_INTEGER + 1
+    )));
+    assert!(p.seen.is_empty());
+}
