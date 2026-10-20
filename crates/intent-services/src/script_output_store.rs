@@ -18,6 +18,7 @@
 //! - IDs are percent-encoded into a single safe path segment, so no ID can
 //!   name `.`/`..` or contain a separator and escape the root.
 
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -38,9 +39,9 @@ const SCAN_CHUNK: usize = 64 * 1024;
 /// Identifies one run's log: the decoded workspace, script and run IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RunKey {
-    pub workspace_id: String,
-    pub script_id: String,
-    pub run_id: String,
+    pub workspace: String,
+    pub script: String,
+    pub run: String,
 }
 
 /// The trailing lines of a run's log plus its total line count, using the
@@ -245,9 +246,9 @@ impl ScriptOutputStore {
             for (script_dir, script_id) in decoded_children(&ws_dir, true, &mut report) {
                 for (path, run_id) in decoded_children(&script_dir, false, &mut report) {
                     let key = RunKey {
-                        workspace_id: workspace_id.clone(),
-                        script_id: script_id.clone(),
-                        run_id,
+                        workspace: workspace_id.clone(),
+                        script: script_id.clone(),
+                        run: run_id,
                     };
                     let modified = match fs::metadata(&path).and_then(|m| m.modified()) {
                         Ok(t) => t,
@@ -430,7 +431,7 @@ fn tail_lines(file: &mut File, n: usize) -> io::Result<String> {
     let mut cut = 0u64;
     let mut buf = vec![0u8; SCAN_CHUNK];
     'scan: while pos > 0 {
-        let step = (pos.min(SCAN_CHUNK as u64)) as usize;
+        let step = usize::try_from(pos.min(SCAN_CHUNK as u64)).expect("chunk fits in usize");
         pos -= step as u64;
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut buf[..step])?;
@@ -458,7 +459,7 @@ fn count_newlines(file: &mut File) -> io::Result<usize> {
         if n == 0 {
             return Ok(count);
         }
-        count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+        count += buf[..n].iter().fold(0, |c, &b| c + usize::from(b == b'\n'));
     }
 }
 
@@ -569,7 +570,7 @@ pub(crate) fn encode_segment(id: &str) -> Result<String> {
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
     if out.len() > MAX_SEGMENT_BYTES {

@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -122,7 +123,10 @@ fn invalid_id_yields_disabled_writer() {
 fn tail_matches_legacy_last_n_lines_model() {
     let (_dir, store) = store(1 << 20);
     let mut w = store.open_writer("ws", "s", "r");
-    let body: String = (0..1000).map(|i| format!("row {i}\n")).collect();
+    let body = (0..1000).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "row {i}");
+        s
+    });
     w.append(body.as_bytes());
     let tail = store.tail("ws", "s", "r", 3).unwrap().unwrap();
     assert_eq!(tail.text, "row 998\nrow 999\n");
@@ -164,7 +168,10 @@ fn paginate_matches_in_memory_helper_across_pages() {
         String::new(),
         "only".to_string(),
         "a\nb\n\n  \n".to_string(),
-        (0..137).map(|i| format!("line {i}\n")).collect::<String>(),
+        (0..137).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "line {i}");
+            s
+        }),
         "x\n\ny\n".to_string(),
     ];
     for (n, body) in cases.iter().enumerate() {
@@ -320,7 +327,7 @@ fn sweep_deletes_expired_keeps_live_and_fresh() {
         10 * day,
     );
 
-    let report = store.sweep(7 * day, |key| key.run_id == "live");
+    let report = store.sweep(7 * day, |key| key.run == "live");
     assert_eq!(
         report,
         SweepReport {
@@ -360,9 +367,9 @@ fn sweep_passes_decoded_ids_to_live_check() {
     assert_eq!(
         seen,
         vec![RunKey {
-            workspace_id: "ws/1".into(),
-            script_id: "a b".into(),
-            run_id: "r.1".into()
+            workspace: "ws/1".into(),
+            script: "a b".into(),
+            run: "r.1".into()
         }]
     );
 }

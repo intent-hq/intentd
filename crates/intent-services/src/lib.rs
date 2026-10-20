@@ -241,7 +241,7 @@ mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
 // Wired into `script_ops` by the follow-up output-to-disk change.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 mod script_output_store;
 mod search_ops;
 mod sentry_ops;
