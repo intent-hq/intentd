@@ -2545,6 +2545,17 @@ impl Services {
         self
     }
 
+    /// Test seam: park every script launch before its PTY spawns and its
+    /// output log opens (including service auto-restarts).
+    #[cfg(test)]
+    pub(crate) fn with_script_before_spawn_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.before_spawn = Some(park);
+        self
+    }
+
     /// Test seam: park workspace deletion after its scripts stop, before the
     /// script output folder is deleted.
     #[cfg(test)]

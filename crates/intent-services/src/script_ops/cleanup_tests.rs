@@ -586,7 +586,7 @@ async fn expiry_sweep_keeps_the_current_run_through_a_service_auto_restart() {
         .services
         .clone()
         .with_script_too_fast_ms(0)
-        .with_script_supervise_park(park.clone());
+        .with_script_before_spawn_park(park.clone());
     let ws = h.ws.as_str().to_string();
     let svc = create_simple(
         &h,
@@ -606,7 +606,7 @@ async fn expiry_sweep_keeps_the_current_run_through_a_service_auto_restart() {
     let run = wait_for_log(&h.services, &h.ws, &svc).await;
 
     // The first attempt exits; the supervisor backs off and respawns under
-    // the same run, parking before the new attempt is recorded.
+    // the same run, parking before the new attempt spawns or writes.
     tokio::time::timeout(LIVENESS, park.entered.notified())
         .await
         .expect("the service auto-restarts");
