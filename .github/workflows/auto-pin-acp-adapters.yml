@@ -44,6 +44,10 @@ jobs:
       || github.event.pull_request.head.ref == 'auto/codex-acp-pin'
       || github.event.pull_request.head.ref == 'auto/claude-agent-acp-pin'
     uses: ./.github/workflows/runner-route.yml
+    with:
+      # Each adapter leg reads its own slot (see runner-route.yml).
+      slot_jobs: >-
+        [{"key":"pin","label":"ubuntu-24.04","legs":["codex","claude-code"],"events":["schedule","workflow_dispatch"]}]
     permissions:
       contents: read
       actions: read
@@ -52,7 +56,7 @@ jobs:
 
   pin:
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.slots || '{}')[format('pin-{0}', matrix.adapter)] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     # Manual runs must use trusted main too; never execute a branch's script
     # with the publication token. The checkout resolves main afresh.

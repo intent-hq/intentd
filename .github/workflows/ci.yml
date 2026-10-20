@@ -64,6 +64,7 @@ jobs:
       LINUX_SIZE: '16'
     outputs:
       runners: ${{ steps.decide.outputs.runners }}
+      slots: ${{ steps.decide.outputs.slots }}
       linux_labels: ${{ steps.heavy.outputs.linux_labels }}
       check_labels: ${{ steps.heavy.outputs.check_labels }}
       linux_burst: ${{ steps.heavy.outputs.linux_burst }}
@@ -77,6 +78,23 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
+          # Pooled jobs that start together once routing finishes; each reads
+          # outputs.slots[key] (see runner-route.yml for the fields). The
+          # heavy Rust jobs list pull_request only: the merge queue keeps them
+          # on GitHub-hosted larger runners (see the `heavy` step below).
+          # Minutes are typical PR / merge-queue durations. release-fast-path
+          # (release branches only) and the gate keep the `runners` mapping.
+          SLOT_JOBS: >-
+            [
+            {"key":"check","label":"gh-linux-8x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
+            {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
+            {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
+            {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
+            ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
@@ -105,6 +123,8 @@ jobs:
             };
             const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
             const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
+            // Free slots per Linux pool: online slots (capped by the threshold) minus jobs queued or running on them.
+            const free = {};
             const pr = context.payload?.pull_request;
             const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
             try {
@@ -144,10 +164,12 @@ jobs:
                 const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
                 burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
-                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}`;
+                if (!native) free[key] = burst[key] ? 0 : limit - depth;
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${free[key]}`}`;
               }
             } catch (error) {
               for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
+              for (const key of Object.keys(free)) free[key] = 0;
             }
             // Keys are the GitHub-hosted fallback labels jobs ask for; values are
             // the self-hosted fleet labels, or the key itself when the fleet bursts.
@@ -160,19 +182,51 @@ jobs:
               macos: ['macos-26-xlarge'],
               intel: ['macos-latest-large'],
             };
+            // Free slots go to the caller's listed jobs one at a time: Rust-compiling
+            // jobs first (they reuse the slot's local cache), then the longest, then
+            // list order. Listed jobs that do not fit, or that skip this event, get
+            // their hosted label directly; matrix legs are ranked separately.
+            // Concurrent runs read the same free count before either job is queued,
+            // so a pool may briefly run a job or two over its slot count.
+            let requests = [];
+            try {
+              requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
+            } catch (error) {
+              core.info(`slot list unreadable (${error.message}); listed jobs use hosted labels`);
+            }
+            const slots = {};
+            const granted = Object.fromEntries(Object.keys(free).map(k => [k, 0]));
+            const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
+            for (const r of ranked) {
+              const key = Object.keys(free).find(k => hosted[k].includes(r.label));
+              const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
+              if (key && runs && free[key] > 0) {
+                free[key] -= 1;
+                granted[key] += 1;
+                slots[r.key] = fleets[key];
+              } else slots[r.key] = [r.label];
+            }
+            // Unlisted jobs (single-job workflows, jobs that start after the listed
+            // ones) use a pool only while a slot is still free.
+            for (const key of Object.keys(free)) {
+              burst[key] = free[key] <= 0;
+              if (granted[key]) reasons[key] += ` granted=${granted[key]}`;
+            }
             const mapping = {};
             for (const [key, labels] of Object.entries(hosted)) {
               for (const label of labels) mapping[label] = burst[key] ? [label] : fleets[key];
             }
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
             core.setOutput('runners', JSON.stringify(mapping));
+            core.setOutput('slots', JSON.stringify(slots));
             core.setOutput('linux_labels', JSON.stringify(mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`]));
             core.setOutput('check_labels', JSON.stringify(mapping['gh-linux-8x']));
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # The heavy Rust jobs (check, coverage-*, daemon-lifecycle) are the only
-      # readers of linux_labels / check_labels / linux_burst. In the merge
+      # The heavy Rust jobs (check and coverage-changed through `slots`, which
+      # list pull_request only; the other coverage-* jobs and daemon-lifecycle
+      # through linux_labels) all stay hosted in the merge queue. In the merge
       # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
       # sized for 16 CPUs, and the route decision is made before any of them
       # is queued, so all would land on the two 8-CPU intent-cache slots and
@@ -205,7 +259,7 @@ jobs:
   pr-static:
     needs: route
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-static'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -252,7 +306,7 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["gh-linux-8x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.
@@ -1256,7 +1310,7 @@ jobs:
     # Skipped on release-metadata PRs for the same reason as `check`.
     needs: [route, release-fast-path]
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-changed'] || fromJSON('["gh-linux-16x"]') }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
@@ -1503,7 +1557,7 @@ jobs:
           retention-days: 7
   pr-title:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-title'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1555,7 +1609,7 @@ jobs:
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['conflict-markers'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1634,7 +1688,7 @@ jobs:
   # Both the self-hosted Linux fleet and the GitHub-hosted fallback provide dpkg-deb / tar+xz.
   deb-packaging:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['deb-packaging'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs after queueing and on main pushes.
     if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
@@ -1682,7 +1736,7 @@ jobs:
   # the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs on same-repo PRs (so a change to these scripts is proven before
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job.
@@ -1875,7 +1929,8 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-24.04", "windows-2025"]' || '["ubuntu-24.04"]') }}
         node: [22, 24]
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    # Linux legs read their own slot; the Windows leg keeps the native mapping.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots || '{}')[format('pi-session-paths-{0}', matrix.node)] || fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 10
     env:
       PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
