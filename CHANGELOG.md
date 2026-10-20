@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.16] - 2026-10-20
+
+### 🧪 Testing
+
+- *(intent-services)* Run the pinned Claude adapter in CI against a stand-in CLI ([#2521](https://github.com/intent-hq/intentd/pull/2521))
+
+
 ## [0.11.15] - 2026-10-19
 
 ### 🐛 Bug Fixes
