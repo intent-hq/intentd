@@ -147,15 +147,20 @@ the tab to register). For the three capture ops the whole pipeline — mount, wa
 the page to finish loading, capture — is bounded by one request deadline, so the op
 is designed not to outlive the request; `navigate` runs only the mount step with no
 deadline (its mount wait has its own cap), never waits for the page to settle, and
-does no origin check; `snapshot` does not go through the mount path at all. A mount
-on demand against a not-in-view workspace succeeds with the same additive `warning`
-string. When a mount, settle, or paint cannot happen, the op fails as an
+does no origin check; `snapshot` and the session actions (`startSession`,
+`startCapture`, `captureStep`, `startTrace`) run the same mount step under the request
+deadline, without the settle or origin check. A workspace that is not open in any
+window (its tab was closed, or it was not reopened since a restart) is hosted in the
+background by an open app window on the same host — no workspace tab, navigation, or
+focus — so tab ops and captures work without opening it. Captures also keep painting
+while the app window is minimized or covered by other apps. A mount on demand against
+a not-in-view workspace succeeds with the same additive `warning` string. When a mount, settle, or paint cannot happen, the op fails as an
 action-result error (`success: false`, `error` naming the cause and remedy) with an
 additive structured `errorCode`: `workspace-not-visible` (the tab could not be
-mounted while the workspace is not displayed in any window — either no window hosts
-it at all, or a background window hosts it but the offscreen mount wait ran out at
-its cap; retry shortly or `listTabs`, and open the workspace in a window if it is
-open nowhere), `deadline-exhausted` (capture ops only: the request deadline ran out
+mounted while the workspace is not displayed in any window — either no app window is
+connected to its host to host it at all, or a background window hosts it but the
+offscreen mount wait ran out at its cap; retry shortly or `listTabs`, and open an
+Intent window if none is open), `deadline-exhausted` (capture ops only: the request deadline ran out
 at a named stage — retry), `still-loading` (capture ops only: the page was still
 loading after the bounded wait — retry, or `snapshot` with `waitFor: { networkIdle }`
 first), `navigated-away` (capture ops only, and only checked right after a mount on
