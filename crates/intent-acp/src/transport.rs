@@ -425,10 +425,13 @@ impl Drop for FenceArmGuard<'_> {
     }
 }
 
-/// Just the id of an outbound request line.
+/// The id of an outbound line, and whether it is a request. Only our own
+/// requests (`method` + `id`) can carry a fence; a result/error response to
+/// an agent request reuses the agent's id and must never claim one.
 #[derive(serde::Deserialize)]
 struct LineId {
     id: Option<i64>,
+    method: Option<serde::de::IgnoredAny>,
 }
 
 /// JSON-RPC error a fenced request receives when it is withheld.
@@ -457,7 +460,11 @@ impl WriteFences {
         if self.count.load(Ordering::SeqCst) == 0 {
             return false;
         }
-        let Some(id) = serde_json::from_str::<LineId>(line).ok().and_then(|l| l.id) else {
+        let Some(id) = serde_json::from_str::<LineId>(line)
+            .ok()
+            .filter(|l| l.method.is_some())
+            .and_then(|l| l.id)
+        else {
             return false;
         };
         let revoked = self
@@ -3011,5 +3018,42 @@ mod write_fence_tests {
             0,
             "the writer consumed both fences"
         );
+    }
+
+    /// A queued response to an agent request that happens to reuse the
+    /// numeric id of a fenced stop can neither consume nor be withheld by the
+    /// stop's fence: the response is written and the stop is withheld.
+    #[tokio::test]
+    async fn a_response_reusing_a_fenced_request_id_never_claims_its_fence() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let colliding = conn.next_id.load(Ordering::SeqCst);
+        conn.respond_result(json!(colliding), json!({ "collision": "response" }))
+            .await
+            .unwrap();
+        let fence = Arc::new(AtomicBool::new(false));
+        let stop = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&fence));
+            tokio::spawn(async move {
+                conn.request_fenced("stop/colliding", json!({}), Duration::from_secs(30), fence)
+                    .await
+            })
+        };
+        // timing-guard: let the fenced stop reach the queue behind the response
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(
+            written.contains("\"collision\":\"response\""),
+            "the response was withheld: {written}"
+        );
+        assert!(
+            !written.contains("stop/colliding"),
+            "the fenced stop was written: {written}"
+        );
+        assert!(matches!(stop.await.unwrap(), Err(AcpError::Rpc(_))));
     }
 }
