@@ -131,9 +131,6 @@ pub(crate) struct ManagedScript {
     cancellation: Option<&'static str>,
     /// Terminal result awaiting the owned finalizer; never cleared by a waiter.
     pending_result: Option<intent_core::ScriptLastRun>,
-    /// When this entry's last command run durably settled (`run_id`
-    /// consumed); feeds [`CommandScriptActivity::last_settled_at`].
-    run_settled_at: Option<Instant>,
 }
 
 /// Process-wide monotonic counter behind [`ManagedScript::generation`]. Every
@@ -165,24 +162,29 @@ pub struct CommandScriptActivity {
     pub last_settled_at: Option<Instant>,
 }
 
-/// [`CommandScriptActivity`] over `registry`, under one registry lock.
-pub(crate) fn command_activity(registry: &ScriptRegistry) -> CommandScriptActivity {
-    let guard = registry
+/// [`CommandScriptActivity`] over `registry` (one registry lock) plus the
+/// registry-wide settlement stamp in `locks`.
+pub(crate) fn command_activity(
+    registry: &ScriptRegistry,
+    locks: &ScriptLocks,
+) -> CommandScriptActivity {
+    let in_flight = registry
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut activity = CommandScriptActivity::default();
-    for m in guard.values().filter(|m| m.def.mode == ScriptMode::Command) {
-        if m.run_id.is_some()
-            || matches!(
-                m.state.status,
-                ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
-            )
-        {
-            activity.in_flight += 1;
-        }
-        activity.last_settled_at = activity.last_settled_at.max(m.run_settled_at);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|m| {
+            m.def.mode == ScriptMode::Command
+                && (m.run_id.is_some()
+                    || matches!(
+                        m.state.status,
+                        ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
+                    ))
+        })
+        .count();
+    CommandScriptActivity {
+        in_flight,
+        last_settled_at: locks.command_settled_at(),
     }
-    activity
 }
 
 /// Shared async locks for workspace bootstrap and script definition updates.
@@ -202,6 +204,10 @@ pub(crate) struct ScriptLocks {
     /// Workspaces being deleted: launch admission, service auto-restart and
     /// output logs are refused until the deletion finishes or fails.
     closing: Arc<Mutex<HashSet<WorkspaceId>>>,
+    /// When the most recent command run settled, registry-wide: kept here
+    /// rather than on the entry so removing or recreating a finished script
+    /// cannot erase it (and so skip the idle update grace).
+    command_settled_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ScriptLocks {
@@ -222,6 +228,24 @@ impl ScriptLocks {
         } else {
             set.remove(workspace_id);
         }
+    }
+
+    /// See [`CommandScriptActivity::last_settled_at`].
+    pub(crate) fn command_settled_at(&self) -> Option<Instant> {
+        *self
+            .command_settled_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a command run settlement now; monotonic.
+    pub(crate) fn mark_command_settled(&self) {
+        let now = Instant::now();
+        let mut at = self
+            .command_settled_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *at = (*at).max(Some(now));
     }
 
     /// Resolve (or create) the lock for a workspace.
@@ -691,7 +715,6 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
-                run_settled_at: None,
             },
         );
         self.emit_changed_locked(&workspace_id, &def.id, change)
@@ -804,7 +827,6 @@ impl ScriptManager {
                     run_generation: None,
                     cancellation: None,
                     pending_result: None,
-                    run_settled_at: None,
                 }
             };
             self.scripts.lock().unwrap().insert(key.clone(), managed);
@@ -881,7 +903,6 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
-                run_settled_at: None,
             },
         );
         Ok(())
@@ -970,7 +991,6 @@ impl ScriptManager {
                 run_generation: None,
                 cancellation: None,
                 pending_result: None,
-                run_settled_at: None,
             },
         );
         self.emit_changed_locked(workspace_id, script_id, change)
@@ -1205,7 +1225,6 @@ impl ScriptManager {
                                         run_generation: None,
                                         cancellation: None,
                                         pending_result: None,
-                                        run_settled_at: None,
                                     },
                                 );
                                 self.emit_changed_locked(workspace_id, &id, "created").await;
@@ -5983,9 +6002,22 @@ mod tests {
             // timing-guard: poll interval for the observable settlement, deadline-bounded.
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        assert!(
-            settled.last_settled_at.is_some(),
-            "settlement stamps the end of the run"
+        let settled_at = settled
+            .last_settled_at
+            .expect("settlement stamps the end of the run");
+        // Removing the finished script must not erase the stamp, or the
+        // idle update grace after it would be skipped.
+        h.services
+            .script_remove(h.ws.clone(), cmd.clone())
+            .await
+            .expect("remove finished command");
+        assert_eq!(
+            h.services.command_script_activity(),
+            CommandScriptActivity {
+                in_flight: 0,
+                last_settled_at: Some(settled_at),
+            },
+            "the settlement stamp outlives the registry entry"
         );
         h.services
             .script_stop(h.ws.clone(), svc)

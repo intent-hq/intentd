@@ -2986,7 +2986,7 @@ impl Services {
     /// for `system.status` and a 1 s poll.
     #[must_use]
     pub fn command_script_activity(&self) -> CommandScriptActivity {
-        script_ops::command_activity(&self.scripts)
+        script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
