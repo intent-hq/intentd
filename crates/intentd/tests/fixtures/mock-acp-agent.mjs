@@ -410,6 +410,45 @@ function modelDefaultEffort(behavior) {
   return behavior.modelSelection?.thinking?.[effectiveModel]?.current ?? 'high';
 }
 
+// Provider worker reports (PROTOCOL §5.5b), driven by `behavior.asyncTasks`:
+// `{ spawnOn, command?, autoCompleteOn?, completeAfterMs? }`. A prompt
+// containing `spawnOn` streams a backgrounded Bash tool call (mixed +
+// metadata-only AIR markers) and an `async_task_spawned` report; when it also
+// contains `autoCompleteOn`, the task is reported completed `completeAfterMs`
+// later — BETWEEN turns. `_session/async_task/stop` stops a running
+// task (state frame first, then `{ stopped: true }`), logging each request to
+// MOCK_AGENT_STOP_LOG.
+const asyncTasks = new Map();
+const AIR_BACKGROUNDED = { jetbrains: { air: { asyncTasks: { backgrounded: true } } } };
+function maybeSpawnAsyncTask(behavior, params) {
+  const workers = behavior.asyncTasks;
+  if (!workers || typeof workers.spawnOn !== 'string' || !extractPromptText(params).includes(workers.spawnOn)) {
+    return;
+  }
+  const sessionId = (params && params.sessionId) || SESSION_ID;
+  const taskId = `bg-${asyncTasks.size + 1}`;
+  const toolCallId = `tool-${taskId}`;
+  const command = workers.command || 'sleep 300';
+  const update = (u) => note('session/update', { sessionId, update: u });
+  update({ sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute', status: 'in_progress',
+    rawInput: { command, run_in_background: true } });
+  update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+    rawOutput: `Command running in background with ID: ${taskId}`, _meta: AIR_BACKGROUNDED });
+  update({ sessionUpdate: 'tool_call_update', toolCallId, _meta: AIR_BACKGROUNDED });
+  asyncTasks.set(taskId, 'running');
+  update({ sessionUpdate: 'async_task_spawned', asyncTaskId: taskId, name: command, taskType: 'shell',
+    canStop: true, showInTranscript: true, toolCallId });
+  const autoComplete = typeof workers.autoCompleteOn === 'string'
+    && extractPromptText(params).includes(workers.autoCompleteOn);
+  if (autoComplete && Number.isFinite(workers.completeAfterMs)) {
+    setTimeout(() => {
+      if (asyncTasks.get(taskId) !== 'running') return;
+      asyncTasks.set(taskId, 'completed');
+      update({ sessionUpdate: 'async_task_state_update', asyncTaskId: taskId, state: 'completed', toolCallId });
+    }, workers.completeAfterMs);
+  }
+}
+
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
@@ -447,6 +486,7 @@ async function handlePrompt(id, params) {
   } catch {
     behavior = {};
   }
+  maybeSpawnAsyncTask(behavior, params);
   if (behavior.sandboxPolicy) {
     const policy = behavior.sandboxPolicy;
     const allowed = policy.allowedByMode?.[sandboxMode] || policy.allowed;
@@ -1084,11 +1124,20 @@ async function dispatch(msg) {
       // makes the daemon's resume path (`session/load`) reachable for the
       // poisoned-session e2e (monorepo#940). Default stays false so existing
       // tests keep the no-resume behavior.
+      if (process.env.MOCK_AGENT_INIT_LOG) {
+        try {
+          fs.appendFileSync(process.env.MOCK_AGENT_INIT_LOG,
+            JSON.stringify({ clientCapabilities: msg.params?.clientCapabilities ?? null }) + '\n');
+        } catch (err) {
+          log(`init log write failed: ${err.message}`);
+        }
+      }
       return result(msg.id, {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: behavior.loadSession === true || behavior.advertiseLoadSession === true,
         },
+        ...(behavior.agentInfo ? { agentInfo: behavior.agentInfo } : {}),
       });
     case 'authenticate':
       return result(msg.id, {});
@@ -1362,6 +1411,21 @@ async function dispatch(msg) {
         result(pendingPromptIds.shift(), { stopReason: 'cancelled' });
       }
       return;
+    case '_session/async_task/stop': {
+      const p = msg.params || {};
+      if (process.env.MOCK_AGENT_STOP_LOG) {
+        try {
+          fs.appendFileSync(process.env.MOCK_AGENT_STOP_LOG, JSON.stringify(p) + '\n');
+        } catch (err) {
+          log(`stop log write failed: ${err.message}`);
+        }
+      }
+      if (asyncTasks.get(p.asyncTaskId) !== 'running') return result(msg.id, { stopped: false });
+      asyncTasks.set(p.asyncTaskId, 'stopped');
+      note('session/update', { sessionId: p.sessionId, update: {
+        sessionUpdate: 'async_task_state_update', asyncTaskId: p.asyncTaskId, state: 'stopped' } });
+      return result(msg.id, { stopped: true });
+    }
     default:
       if (msg.id !== undefined)
         send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `no ${msg.method}` } });

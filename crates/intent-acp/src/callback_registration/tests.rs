@@ -1625,3 +1625,40 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
         .is_err());
     assert!(!receipt.is_current());
 }
+
+/// PROTOCOL §5.5b: a provider that requests workers sends the AIR
+/// async-tasks extension merged beside the callback offer; one that does not
+/// sends no `jetbrains` key at all (codex-acp would switch formats on it).
+#[tokio::test]
+async fn initialize_requests_async_tasks_only_for_opted_in_providers() {
+    for (requests, expected) in [
+        (
+            true,
+            json!({ "air": { "version": 1, "capabilities": ["asyncTasks"] } }),
+        ),
+        (false, Value::Null),
+    ] {
+        let (conn, mut peer) = pair(64 * 1024);
+        let mut provider = config();
+        provider.requests_agent_workers = requests;
+        let run = tokio::spawn(async move {
+            handshake_with_callbacks(conn, &provider, CallbackOffer::V1)
+                .await
+                .unwrap()
+        });
+        let request = peer.read().await;
+        let meta = &request["params"]["clientCapabilities"]["_meta"];
+        assert_eq!(meta["jetbrains"], expected, "requests={requests}");
+        assert_eq!(
+            meta[META_KEY],
+            json!({ "version": 1 }),
+            "callback offer kept"
+        );
+        peer.reply(
+            &request,
+            json!({ "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [] }),
+        )
+        .await;
+        run.await.unwrap();
+    }
+}

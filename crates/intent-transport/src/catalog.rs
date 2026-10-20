@@ -93,6 +93,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.unsubscribe",
     "agent.update",
     "agent.wakeOrCreate",
+    "agent.workers.list",
+    "agent.workers.stop",
     "client.list",
     "comment.add",
     "comment.delete",
@@ -448,6 +450,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 /// drafts and the host-only `browser.*Tab*` registry reports).
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -605,6 +608,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.summary", "Read: a short summary of an agent's work. Workspace-scoped."),
     ("agent.unsubscribe", "Client boot: drops an agent subscription."),
     ("agent.update", "Steer: updates agent metadata (name, background flag). No host reach."),
+    ("agent.workers.list", "Read: provider-reported background worker snapshot of an agent (§5.5b); labels and states only, no output or paths. Workspace-scoped."),
+    ("agent.workers.stop", "Steer: asks the provider to stop one background worker of an agent, like agent.stop for a turn (§5.5b). Agent-scoped, no host reach."),
+    ("agent.workers.subscribe", "Read: per-connection channel of complete agent.workers.list snapshots (§5.5b). Same scope as agent.workers.list."),
     ("chat.subscribe", "Client boot: the chat channel fast path the desktop renders conversations from. Workspace-scoped; delivery narrowed by the event allowlist."),
     ("chat.unsubscribe", "Client boot: drops a chat channel subscription."),
     ("client.hello", "Client boot: binds logical device metadata. The principal comes only from admission; roster visibility and browser hosting authority are independent."),

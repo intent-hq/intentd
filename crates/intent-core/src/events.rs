@@ -171,6 +171,14 @@ pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 // `publish_agent_event`).
 pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
 
+// Provider worker observations (PROTOCOL §5.5b). Transient (broadcast, never
+// persisted — `event.query` has no rows) complete `WorkerSnapshot` replacement
+// `{ workspaceId, agentId, provider, acpSessionId, connectionGeneration,
+// support, continuity, asOf, truncated, workers }` emitted when the bounded
+// projection of an agent's provider-reported background workers changes. It
+// never opens a turn, triggers completion watches or changes agent status.
+pub const AGENT_WORKERS_CHANGED: &str = "agent:workers-changed";
+
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
 // refresh deltas over Electron IPC (`workspace:background-enrichment-complete`,
 // renderer-only); a wire backend instead emits `pr:*` WorkspaceEvents so the
@@ -619,6 +627,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_RESOLVED,
     AGENT_SESSION_STATS_CHANGED,
     AGENT_ATTENTION_REQUESTED,
+    AGENT_WORKERS_CHANGED,
     PR_LINKED,
     PR_UPDATED,
     PR_UNLINKED,
@@ -893,6 +902,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_TOOL_CALL, "Agent stream: a recorded tool call; transcript content the guest reads through the conversation."),
     (AGENT_UPDATED, "Agent lifecycle: agent row fields changed."),
     (AGENT_USER_MESSAGE_SENT, "Agent stream: a human message reached an agent; conversation content."),
+    (AGENT_WORKERS_CHANGED, "Agent lifecycle: provider-reported background worker snapshot (§5.5b); labels and states only, no output or paths. Same projection agent.workers.list serves."),
     (CHANGES_AGENT_LOCKS, "Changes: which agent holds which file lock; workspace-relative paths."),
     (CHANGES_GIT_STATUS, "Changes: working-tree status counters of the workspace repo."),
     (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),

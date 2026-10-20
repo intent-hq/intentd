@@ -315,6 +315,10 @@ pub(crate) struct ConnSubs {
     /// `note.presence` lease — declared after `subs` so the forwarders'
     /// lease guards drop first.
     presence: presence::PresenceConn,
+    /// IDs of `agent.workers.subscribe` subscriptions (§5.5b), for the
+    /// per-connection cap; entries torn down via `events.unsubscribe` are
+    /// pruned against `subs` before counting.
+    worker_subs: HashSet<String>,
 }
 
 impl Drop for ConnSubs {
@@ -1031,6 +1035,15 @@ async fn process_captured_frame(
             )
             .await;
         }
+        if let Some(req) = crate::agent_workers::classify(value) {
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_workers_subscribe(req, api, bus, out_tx, subs),
+            )
+            .await;
+        }
         if let Some(fast_path) = events::classify(value) {
             return panic_guard::guard_send(
                 &method,
@@ -1295,6 +1308,128 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
             .await
             .is_ok(),
         None => !out_tx.is_closed(),
+    }
+}
+
+/// `agent.workers.subscribe` (§5.5b): authorize via the list read, admit
+/// within the per-connection cap, ack, push the seq-0 snapshot, then one
+/// complete snapshot per change. The bus subscription is taken BEFORE the
+/// seq-0 read so no change is missed, and every later push re-reads the
+/// projection instead of forwarding event data, so a push is never older than
+/// one already sent. Returns `false` when the outbound channel is closed.
+async fn handle_workers_subscribe(
+    req: crate::agent_workers::WorkersSubscribe,
+    api: &Arc<dyn WorkspaceApi>,
+    bus: &EventBus,
+    out_tx: &OutboundSender,
+    subs: &mut ConnSubs,
+) -> bool {
+    let crate::agent_workers::WorkersSubscribe { id, params } = req;
+    let reply = |code: i32, message: &str, data_code: &str| {
+        events::error_frame_with_data(&id.echo, code, message, &json!({ "code": data_code }))
+    };
+    let ids = crate::router::wire_id(&params, "workspaceId")
+        .zip(crate::router::wire_id(&params, "agentId"));
+    let Some((workspace_id, agent_id)) = ids else {
+        let frame = reply(
+            -32602,
+            "workspaceId and agentId must be nonempty strings of at most 256 bytes without control characters",
+            "invalid-params",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    };
+    let (workspace_id, agent_id) = (
+        WorkspaceId::from(workspace_id),
+        AgentId::from(agent_id.as_str()),
+    );
+    let subscription = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_WORKERS_CHANGED.to_string()],
+        workspace_id: Some(workspace_id.0.clone()),
+        batch_window: None,
+        collaborator_only: crate::context::is_non_administrator_caller(),
+        ..Default::default()
+    });
+    let snapshot = match api
+        .agent_workers_list(workspace_id.clone(), agent_id.clone())
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            let frame = match e {
+                intent_core::Error::InvalidParams(m) | intent_core::Error::InvalidInput(m) => {
+                    reply(-32602, &m, "invalid-params")
+                }
+                intent_core::Error::NotFound(_) | intent_core::Error::Forbidden(_) => {
+                    reply(-32602, "Agent not found", "not-found")
+                }
+                other => events::error_frame(&id.echo, -32603, &other.to_string()),
+            };
+            return !id.present || out_tx.send_priority(frame).await.is_ok();
+        }
+    };
+    subs.worker_subs.retain(|sub| subs.subs.contains_key(sub));
+    if subs.worker_subs.len() >= crate::agent_workers::MAX_WORKER_SUBSCRIPTIONS {
+        let frame = reply(
+            -32602,
+            "Too many agent.workers subscriptions on this connection",
+            "capacity",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    }
+    let subscription_id = events::next_subscription_id();
+    if id.present {
+        let ack = events::success_frame(&id.echo, &json!({ "subscriptionId": subscription_id }));
+        if out_tx.send_priority(ack).await.is_err() {
+            return false;
+        }
+    }
+    let initial = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send_bulk(initial).await.is_err() {
+        return false;
+    }
+    let handle = spawn_forwarder(forward_workers(
+        subscription,
+        Arc::clone(api),
+        workspace_id,
+        agent_id,
+        subscription_id.clone(),
+        out_tx.clone(),
+    ));
+    subs.insert(subscription_id.clone(), handle, None, None);
+    subs.worker_subs.insert(subscription_id);
+    true
+}
+
+/// Push a fresh complete snapshot whenever the selected agent's projection
+/// changes. Ends when the connection closes or the read is refused (the agent
+/// is gone or the caller lost access).
+async fn forward_workers(
+    mut subscription: Subscription,
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    subscription_id: String,
+    out_tx: OutboundSender,
+) {
+    let mut seq = 0_u64;
+    while let Some(batch) = subscription.recv().await {
+        if !batch
+            .iter()
+            .any(|e| e.data.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str()))
+        {
+            continue;
+        }
+        let Ok(snapshot) = api
+            .agent_workers_list(workspace_id.clone(), agent_id.clone())
+            .await
+        else {
+            return;
+        };
+        seq += 1;
+        let frame = subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot);
+        if out_tx.send_bulk(frame).await.is_err() {
+            return;
+        }
     }
 }
 

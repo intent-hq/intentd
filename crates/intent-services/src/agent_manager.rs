@@ -3663,7 +3663,11 @@ impl AgentManager {
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+        // §5.5b: worker reports bypass the turn router (and the idle wake
+        // listener) into this outer connection's own generation.
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel::<intent_acp::workers::WorkerFrame>();
         let hooks = ConnectionHooks {
+            workers: Some(worker_tx),
             auth_required_stdout_marker: (opts.provider.id == "antigravity")
                 .then_some(crate::antigravity::AUTH_REQUIRED_MARKER),
             requests: Some(req_tx),
@@ -3743,6 +3747,14 @@ impl AgentManager {
         // (a respawn installed a newer child with its own watcher).
         let child_pid = child.id();
         let connection = Arc::new(connection);
+        self.begin_worker_generation(
+            &workspace_id,
+            &agent_id,
+            opts.profile_env
+                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
+            &connection,
+            worker_rx,
+        );
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
             Arc::new(crate::PtyTerminalHost::with_shell_mode(
@@ -4118,6 +4130,63 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
+        let started = self.start_session_opened(agent_id, cwd, provider).await?;
+        let workers = self.services.agent_workers();
+        if let Some(generation) = workers.current_generation(agent_id) {
+            if let Some(snapshot) = workers.bind_session(agent_id, &generation, &started.session_id)
+            {
+                self.services.publish_workers_snapshot(snapshot);
+            }
+        }
+        Ok(started)
+    }
+
+    /// Start a §5.5b worker generation for a freshly spawned outer connection
+    /// and drain its diverted worker reports until the reader closes, which
+    /// marks the generation disconnected.
+    fn begin_worker_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        provider: &str,
+        connection: &Arc<Connection>,
+        mut frames: mpsc::UnboundedReceiver<intent_acp::workers::WorkerFrame>,
+    ) {
+        let generation = Uuid::new_v4().to_string();
+        let snapshot = self.services.agent_workers().begin(
+            crate::agent_workers::Scope {
+                workspace_id: workspace_id.clone(),
+                agent_id: agent_id.clone(),
+                provider: provider.to_owned(),
+                acp_session_id: None,
+                connection_generation: Some(generation.clone()),
+            },
+            &crate::agent_workers::AdapterIdentity::default(),
+            false,
+            Arc::downgrade(connection),
+        );
+        self.services.publish_workers_snapshot(snapshot);
+        let services = self.services.clone();
+        let agent = agent_id.clone();
+        intent_core::spawn_daemon(async move {
+            while let Some(frame) = frames.recv().await {
+                if let Some(snapshot) = services.agent_workers().ingest(&agent, &generation, &frame)
+                {
+                    services.publish_workers_snapshot(snapshot);
+                }
+            }
+            if let Some(snapshot) = services.agent_workers().disconnect(&agent, &generation) {
+                services.publish_workers_snapshot(snapshot);
+            }
+        });
+    }
+
+    async fn start_session_opened(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<StartedSession> {
         let (
             conn,
             runtime,
@@ -4185,6 +4254,22 @@ impl AgentManager {
             negotiated.map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
         let callbacks = negotiated.callbacks;
         let handshake = negotiated.ordinary;
+        {
+            let workers = self.services.agent_workers();
+            if let Some(generation) = workers.current_generation(agent_id) {
+                let info = serde_json::to_value(&handshake.initialize.agent_info).ok();
+                let identity =
+                    crate::agent_workers::AdapterIdentity::from_initialize(info.as_ref());
+                if let Some(snapshot) = workers.negotiate(
+                    agent_id,
+                    &generation,
+                    &identity,
+                    provider.requests_agent_workers,
+                ) {
+                    self.services.publish_workers_snapshot(snapshot);
+                }
+            }
+        }
 
         // Per the ACP schema, http/sse `McpServer` entries are only valid when
         // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
@@ -6045,6 +6130,11 @@ impl AgentManager {
             if !repository_origin::is_current(&self.handles, agent_id, original) {
                 return (false, None);
             }
+        }
+        // §5.5b: the provider tree (and every worker in it) goes with the
+        // handle, so its worker generation is released, not left unknown.
+        if let Some(snapshot) = self.services.agent_workers().release(agent_id) {
+            self.services.publish_workers_snapshot(snapshot);
         }
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush

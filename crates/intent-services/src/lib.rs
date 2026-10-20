@@ -58,6 +58,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod agent_workers;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -536,6 +537,8 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Provider worker observations per live agent generation (§5.5b).
+    agent_workers: Arc<agent_workers::AgentWorkers>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -1639,6 +1642,7 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
+            agent_workers: Arc::new(agent_workers::AgentWorkers::default()),
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             queue_submission_order: Arc::new(AtomicU64::new(0)),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
@@ -15628,6 +15632,60 @@ pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     };
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish change event");
+    }
+}
+
+impl Services {
+    /// §5.5b ownership: the agent must exist in `workspace_id` and the caller
+    /// must be able to read it; an absent agent, an agent of another workspace
+    /// and an unauthorized caller are the same `not-found`. Returns the
+    /// agent's configured provider for a no-session snapshot.
+    async fn authorize_agent_workers(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<String> {
+        let not_found = || Error::NotFound(format!("agent {agent_id}"));
+        let session = self
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .map_err(|_| not_found())?;
+        if session.workspace_id != *workspace_id {
+            return Err(not_found());
+        }
+        self.require_member(workspace_id)
+            .await
+            .map_err(|e| match e {
+                Error::Forbidden(_) => not_found(),
+                other => other,
+            })?;
+        Ok(session.provider.unwrap_or_default())
+    }
+
+    /// The §5.5b worker projections.
+    pub(crate) fn agent_workers(&self) -> &agent_workers::AgentWorkers {
+        &self.agent_workers
+    }
+
+    /// Broadcast a changed `WorkerSnapshot` as the transient
+    /// `agent:workers-changed` event (§5.5b): never persisted, never a wake.
+    pub(crate) fn publish_workers_snapshot(&self, snapshot: serde_json::Value) {
+        let Some(workspace_id) = snapshot["workspaceId"].as_str().map(WorkspaceId::from) else {
+            return;
+        };
+        let event = NewEvent {
+            workspace_id,
+            timestamp: now_iso(),
+            event_type: intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            actor: intent_core::EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: snapshot,
+        };
+        let _ = publish_event_transient(self.event_bus.as_ref(), &event);
     }
 }
 
@@ -31518,6 +31576,73 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_queue_op(agent_id, workspace_id).await
+        })
+    }
+
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let provider = self
+                .authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            Ok(self.agent_workers.snapshot(&agent_id).unwrap_or_else(|| {
+                agent_workers::Projection::no_session(workspace_id, agent_id, provider)
+                    .snapshot(agent_workers::now_ms())
+            }))
+        })
+    }
+
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            for (name, value) in [
+                ("connectionGeneration", &connection_generation),
+                ("asyncTaskId", &async_task_id),
+            ] {
+                if !agent_workers::valid_wire_id(value) {
+                    return Err(Error::InvalidParams(format!(
+                        "{name} must be a nonempty string of at most 256 bytes without control characters"
+                    )));
+                }
+            }
+            self.authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            // Same authority as `agent.stop`; read access alone never stops.
+            self.require_agent_member(&agent_id).await?;
+            let not_found = || Error::NotFound(format!("worker {async_task_id}"));
+            let declined = serde_json::json!({ "asyncTaskId": async_task_id, "stopped": false });
+            let target = self
+                .agent_workers
+                .stop_target(&agent_id, &connection_generation, &async_task_id)
+                .ok_or_else(not_found)?;
+            let (connection, session_id) = match target {
+                agent_workers::StopTarget::Decline => return Ok(declined),
+                agent_workers::StopTarget::ConnectionGone => {
+                    return Err(Error::ProviderRequest(
+                        "the provider connection ended before the stop was sent".into(),
+                    ))
+                }
+                agent_workers::StopTarget::Forward {
+                    connection,
+                    session_id,
+                } => (connection, session_id),
+            };
+            let answer =
+                intent_acp::workers::request_stop(&connection, &session_id, &async_task_id)
+                    .await
+                    .map_err(|e| Error::ProviderRequest(e.to_string()))?;
+            Ok(serde_json::json!({
+                "asyncTaskId": async_task_id,
+                "stopped": answer.get("stopped") == Some(&serde_json::Value::Bool(true)),
+            }))
         })
     }
 

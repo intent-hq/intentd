@@ -423,6 +423,11 @@ pub struct ConnectionHooks {
     pub requests: Option<mpsc::UnboundedSender<IncomingRequest>>,
     /// Sink for agent notifications (streaming router).
     pub notifications: Option<mpsc::UnboundedSender<IncomingNotification>>,
+    /// Sink for provider worker reports (PROTOCOL §5.5b). When set, worker
+    /// `session/update`s and metadata-only backgrounded markers are diverted
+    /// here (or dropped) and never reach `notifications`. The reader drops
+    /// the sender when stdout closes, which is the consumer's disconnect.
+    pub workers: Option<mpsc::UnboundedSender<crate::workers::WorkerFrame>>,
     /// Case-insensitive substrings that mark an auth failure on stderr.
     pub auth_error_patterns: Vec<String>,
     /// When set, every stderr line is also appended to
@@ -615,6 +620,7 @@ fn dispatch(
     title_controls: &TitleControls,
     requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
     notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
+    workers: Option<&mpsc::UnboundedSender<crate::workers::WorkerFrame>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
     client_request_seq: &AtomicU64,
@@ -672,6 +678,18 @@ fn dispatch(
                             return;
                         }
                     }
+                }
+            }
+            if let (Some(sink), "session/update") = (workers, method.as_str()) {
+                // Worker reports are never turn content; diverting them here
+                // also keeps them out of the idle wake listener (§5.5b).
+                match crate::workers::route(&params) {
+                    crate::workers::Routing::Worker => {
+                        let _ = sink.send(crate::workers::frame(&params));
+                        return;
+                    }
+                    crate::workers::Routing::Marker => return,
+                    crate::workers::Routing::Forward => {}
                 }
             }
             if let Some(tx) = notifications {
@@ -807,6 +825,7 @@ impl Connection {
         let client_req_seq_reader = Arc::clone(&client_request_seq);
         let requests = hooks.requests;
         let notifications = hooks.notifications;
+        let workers = hooks.workers;
         let auth_marker = hooks.auth_required_stdout_marker;
         let auth_required_reader = Arc::clone(&auth_required);
         let auth_error_reader = Arc::clone(&auth_error);
@@ -848,6 +867,7 @@ impl Connection {
                             &title_controls_reader,
                             requests.as_ref(),
                             notifications.as_ref(),
+                            workers.as_ref(),
                             &seq_reader,
                             &notify_reader,
                             &client_req_seq_reader,
@@ -2573,5 +2593,107 @@ mod cancel_on_timeout_tests {
             .await
             .is_err();
         assert!(quiet, "unexpected line after the request: {extra}");
+    }
+}
+
+#[cfg(test)]
+mod worker_routing_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn write_line(agent: &mut tokio::io::DuplexStream, value: &Value) {
+        let mut line = serde_json::to_vec(value).unwrap();
+        line.push(b'\n');
+        agent.write_all(&line).await.unwrap();
+        agent.flush().await.unwrap();
+    }
+
+    fn update(update: Value) -> Value {
+        let mut frame = json!({ "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "s-1" } });
+        frame["params"]["update"] = update;
+        frame
+    }
+
+    /// PROTOCOL §5.5b: with a worker sink wired, worker reports reach only the
+    /// sink, metadata-only markers reach nothing, and everything else (a mixed
+    /// marker included) still reaches the turn router in order.
+    #[tokio::test]
+    async fn reader_diverts_worker_reports_and_markers_from_the_turn_router() {
+        let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+        let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let conn = Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                workers: Some(worker_tx),
+                ..ConnectionHooks::default()
+            },
+        );
+        let marker_meta =
+            json!({ "jetbrains": { "air": { "asyncTasks": { "backgrounded": true } } } });
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": "t-1", "taskType": "shell" }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c-1", "_meta": marker_meta }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c-1", "status": "completed", "_meta": marker_meta }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "async_task_state_update", "asyncTaskId": "t-1", "state": "completed" }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }))).await;
+
+        let first = worker_rx.recv().await.expect("spawn diverted");
+        assert_eq!(first.session_id.as_deref(), Some("s-1"));
+        assert_eq!(first.update["asyncTaskId"], "t-1");
+        let second = worker_rx.recv().await.expect("state diverted");
+        assert_eq!(second.update["state"], "completed");
+        assert!(second.received_at_ms >= first.received_at_ms);
+
+        let mixed = note_rx.recv().await.expect("mixed marker forwarded");
+        assert_eq!(mixed.params["update"]["status"], "completed");
+        let chunk = note_rx.recv().await.expect("ordinary update forwarded");
+        assert_eq!(
+            chunk.params["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert!(
+            note_rx.try_recv().is_err(),
+            "no worker frame or bare marker reached the turn router"
+        );
+
+        drop(a2c_agent);
+        assert!(
+            worker_rx.recv().await.is_none(),
+            "stdout close drops the worker sink"
+        );
+        drop(conn);
+    }
+
+    /// Without a worker sink (providers that never requested the extension)
+    /// the reader forwards everything unchanged.
+    #[tokio::test]
+    async fn reader_without_worker_sink_forwards_everything() {
+        let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+        let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let _conn = Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                ..ConnectionHooks::default()
+            },
+        );
+        write_line(
+            &mut a2c_agent,
+            &update(json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": "t-1" })),
+        )
+        .await;
+        let forwarded = note_rx.recv().await.expect("forwarded");
+        assert_eq!(
+            forwarded.params["update"]["sessionUpdate"],
+            "async_task_spawned"
+        );
     }
 }
