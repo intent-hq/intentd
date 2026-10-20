@@ -1207,6 +1207,15 @@ pub struct MergeRequirements {
     /// field existed still parse (without phantom diff lines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_ejection: Option<MergeQueueEjection>,
+    /// The PR's place in the merge queue (`{ position, queueSize?, state?,
+    /// enqueuedAt?, estimatedTimeToMerge? }`), present only alongside
+    /// `is_in_merge_queue: Some(true)` when the host reported the entry.
+    /// Informational only: the monitor's diff never compares it and the
+    /// wake checklist never prints it, so queue movement wakes no agent;
+    /// agents read it on request (`ws.pr.snapshot` / `ws.pr.monitors`).
+    /// Serde-defaulted so persisted baselines predating it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue: Option<intent_sourcecontrol::MergeQueueEntry>,
 }
 
 /// The checklist word for a rollup check's state.
@@ -1466,6 +1475,19 @@ pub(crate) fn merge_requirements(
         merge_queue_ejection: signals
             .and_then(|s| s.merge_queue_removal.as_ref())
             .and_then(|r| MergeQueueEjection::from_removal(r, state)),
+        merge_queue: signals.and_then(queued_merge_queue_entry),
+    }
+}
+
+/// The probe's merge-queue entry, only while the host also reports the PR
+/// queued: a stale or inconsistent entry never outlives `isInMergeQueue`.
+pub(crate) fn queued_merge_queue_entry(
+    signals: &MergeRequirementSignals,
+) -> Option<intent_sourcecontrol::MergeQueueEntry> {
+    if signals.is_in_merge_queue == Some(true) {
+        signals.merge_queue_entry.clone()
+    } else {
+        None
     }
 }
 
@@ -2747,6 +2769,7 @@ mod tests {
             }),
             is_in_merge_queue: None,
             merge_queue_removal: None,
+            merge_queue_entry: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(3));
 
@@ -2805,6 +2828,7 @@ mod tests {
             branch_rules: None,
             is_in_merge_queue: None,
             merge_queue_removal: None,
+            merge_queue_entry: None,
         };
         let req = merge_requirements(&p, Some(&signals), &[], &agg(1, 0), Some(0));
 

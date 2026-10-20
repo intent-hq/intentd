@@ -137,6 +137,9 @@ pub(crate) fn qualified_review_snapshot(
     if let Some(queued) = signals.is_in_merge_queue {
         requirements["isInMergeQueue"] = json!(queued);
     }
+    if let Some(entry) = super::queued_merge_queue_entry(signals) {
+        requirements["mergeQueue"] = json!(entry);
+    }
     if let Some(ejection) = signals
         .merge_queue_removal
         .as_ref()

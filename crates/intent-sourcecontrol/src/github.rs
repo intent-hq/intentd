@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
     PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
     PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
@@ -1081,6 +1081,13 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $ch
       headRefOid
       mergeStateStatus
       isInMergeQueue
+      mergeQueueEntry {
+        position
+        state
+        enqueuedAt
+        estimatedTimeToMerge
+        mergeQueue { entries { totalCount } }
+      }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
         nodes {
           ... on RemovedFromMergeQueueEvent {
@@ -1140,17 +1147,32 @@ const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
         }
       }";
 
+/// The merge-queue entry selection of [`MERGE_REQUIREMENTS_QUERY`] and
+/// [`PR_OBSERVATION_QUERY`], verbatim, so the schema fallback can strip it:
+/// the PR's queue position, entry state, enqueue time, the host's
+/// time-to-merge estimate and the queue's size, in the same round trip
+/// (`null` while the PR is not queued; measured `rateLimit.cost` stays 1).
+const MERGE_QUEUE_ENTRY_SELECTION: &str = "
+      mergeQueueEntry {
+        position
+        state
+        enqueuedAt
+        estimatedTimeToMerge
+        mergeQueue { entries { totalCount } }
+      }";
+
 /// A per-PR `query` ([`MERGE_REQUIREMENTS_QUERY`] or
 /// [`PR_OBSERVATION_QUERY`], which embed the selections verbatim) minus the
-/// merge-queue selections (`isInMergeQueue` and the removal-event timeline
-/// items), for hosts whose GraphQL schema predates merge queues (older
+/// merge-queue selections (`isInMergeQueue`, the queue-entry selection and
+/// the removal-event timeline items), for hosts whose GraphQL schema predates merge queues (older
 /// GHES): GraphQL rejects the WHOLE query on an unknown field, so the read
 /// retries once with this selection and the signals degrade to `None`
 /// instead of failing the entire checklist. A schema lacking
-/// `isInMergeQueue` also lacks `RemovedFromMergeQueueEvent`, so both go
-/// together.
+/// `isInMergeQueue` also lacks `mergeQueueEntry` and
+/// `RemovedFromMergeQueueEvent`, so all three go together.
 fn without_merge_queue_selections(query: &str) -> String {
     query
+        .replace(MERGE_QUEUE_ENTRY_SELECTION, "")
         .replace("\n      isInMergeQueue", "")
         .replace(MERGE_QUEUE_TIMELINE_SELECTION, "")
 }
@@ -1195,6 +1217,13 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       updatedAt
       mergeStateStatus
       isInMergeQueue
+      mergeQueueEntry {
+        position
+        state
+        enqueuedAt
+        estimatedTimeToMerge
+        mergeQueue { entries { totalCount } }
+      }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
         nodes {
           ... on RemovedFromMergeQueueEvent {
@@ -1373,6 +1402,7 @@ fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
             .and_then(|p| p.get("isInMergeQueue"))
             .and_then(Value::as_bool),
         merge_queue_removal: parse_merge_queue_removal(pr),
+        merge_queue_entry: parse_merge_queue_entry(pr),
     }
 }
 
@@ -1459,12 +1489,42 @@ fn parse_observed_threads(pr: &Value) -> Option<ReviewThreadTally> {
 /// limit (a `RATE_LIMIT` envelope maps onto [`Error::RateLimited`], never
 /// `Api`), network — stays a hard failure.
 fn merge_queue_field_unsupported(err: &Error) -> bool {
+    // Case-insensitive: covers `isInMergeQueue`, `mergeQueueEntry`, the
+    // nested `MergeQueueEntry` / `MergeQueue` types (a host lacking one of
+    // the entry's fields names its type), `RemovedFromMergeQueueEvent`, and
+    // a field error whose `path` runs through the entry selection.
     matches!(
         err,
-        Error::Api(msg) if msg.contains("isInMergeQueue")
-            || msg.contains("RemovedFromMergeQueueEvent")
-            || msg.contains("REMOVED_FROM_MERGE_QUEUE_EVENT")
+        Error::Api(msg) if {
+            let msg = msg.to_ascii_lowercase();
+            msg.contains("mergequeue") || msg.contains("merge_queue")
+        }
     )
+}
+
+/// Extract the PR's merge-queue entry from the probe's `mergeQueueEntry`
+/// selection. `None` when the PR is not queued (`null`), the host does not
+/// report the selection (schema fallback), or the node lacks a usable
+/// `position`; every other key degrades to `None` on its own.
+fn parse_merge_queue_entry(pr: Option<&Value>) -> Option<MergeQueueEntry> {
+    let entry = pr?.get("mergeQueueEntry")?;
+    let position = u32::try_from(entry.get("position")?.as_u64()?).ok()?;
+    Some(MergeQueueEntry {
+        position,
+        queue_size: entry
+            .pointer("/mergeQueue/entries/totalCount")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok()),
+        state: entry
+            .get("state")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase),
+        enqueued_at: entry
+            .get("enqueuedAt")
+            .and_then(Value::as_str)
+            .map(String::from),
+        estimated_time_to_merge: entry.get("estimatedTimeToMerge").and_then(Value::as_u64),
+    })
 }
 
 /// Extract the PR's latest merge-queue removal event from the probe's
@@ -3040,10 +3100,16 @@ mod tests {
         ] {
             assert!(fallback.contains(kept), "fallback keeps {kept}");
         }
+        assert!(!fallback.contains("mergeQueueEntry"));
+        assert!(
+            MERGE_REQUIREMENTS_QUERY.contains(MERGE_QUEUE_ENTRY_SELECTION),
+            "the entry strip target must match the primary query verbatim"
+        );
         assert_eq!(
             fallback.lines().count(),
             MERGE_REQUIREMENTS_QUERY.lines().count()
                 - 1
+                - MERGE_QUEUE_ENTRY_SELECTION.matches('\n').count()
                 - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
             "exactly the merge-queue lines removed"
         );
@@ -3067,13 +3133,16 @@ mod tests {
             assert!(PR_OBSERVATION_QUERY.contains(probe_selection));
         }
         assert!(PR_OBSERVATION_QUERY.contains(MERGE_QUEUE_TIMELINE_SELECTION));
+        assert!(PR_OBSERVATION_QUERY.contains(MERGE_QUEUE_ENTRY_SELECTION));
         let fallback = without_merge_queue_selections(PR_OBSERVATION_QUERY);
         assert!(!fallback.contains("isInMergeQueue"));
+        assert!(!fallback.contains("mergeQueueEntry"));
         assert!(!fallback.contains("timelineItems"));
         assert_eq!(
             fallback.lines().count(),
             PR_OBSERVATION_QUERY.lines().count()
                 - 1
+                - MERGE_QUEUE_ENTRY_SELECTION.matches('\n').count()
                 - MERGE_QUEUE_TIMELINE_SELECTION.matches('\n').count(),
         );
     }
@@ -3215,6 +3284,24 @@ mod tests {
                 .into(),
         );
         assert!(merge_queue_field_unsupported(&item_type));
+        let entry = Error::Api(
+            "GraphQL Error: Field 'mergeQueueEntry' doesn't exist on type 'PullRequest'".into(),
+        );
+        assert!(merge_queue_field_unsupported(&entry));
+        // A host with the entry but without one of its nested fields names
+        // the nested type instead.
+        let nested = Error::Api(
+            "GraphQL Error: Field 'estimatedTimeToMerge' doesn't exist on type 'MergeQueueEntry'"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&nested));
+        // A field-level denial on the selection carries its path.
+        let denied = Error::Api(
+            "GraphQL Error: 1 GraphQL Error\n1: Resource not accessible by personal access token \
+             (path: [Key(\"repository\"), Key(\"pullRequest\"), Key(\"mergeQueueEntry\")])"
+                .into(),
+        );
+        assert!(merge_queue_field_unsupported(&denied));
 
         // Any other failure — auth, rate limit, unrelated API error — stays
         // a hard failure rather than triggering the degraded retry.
@@ -3366,8 +3453,17 @@ mod tests {
                 at: "2026-08-27T00:00:00Z".into(),
                 reason: Some("failed_checks".into()),
             }),
+            merge_queue_entry: Some(MergeQueueEntry {
+                position: 2,
+                queue_size: Some(3),
+                state: Some("queued".into()),
+                enqueued_at: None,
+                estimated_time_to_merge: Some(600),
+            }),
         };
         let wire = serde_json::to_value(&signals).unwrap();
+        assert_eq!(wire["mergeQueueEntry"]["position"], 2);
+        assert_eq!(wire["mergeQueueEntry"]["estimatedTimeToMerge"], 600);
         assert_eq!(wire["mergeStateStatus"], "BLOCKED");
         assert_eq!(wire["isInMergeQueue"], true);
         assert_eq!(wire["mergeQueueRemoval"]["at"], "2026-08-27T00:00:00Z");
@@ -3392,6 +3488,7 @@ mod tests {
         let wire = serde_json::to_value(MergeRequirementSignals::default()).unwrap();
         assert!(wire.get("isInMergeQueue").is_none());
         assert!(wire.get("mergeQueueRemoval").is_none());
+        assert!(wire.get("mergeQueueEntry").is_none());
 
         // A persisted payload predating the removal field still parses.
         let old: MergeRequirementSignals = serde_json::from_value(json!({
@@ -3403,6 +3500,99 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.merge_queue_removal, None);
+        assert_eq!(old.merge_queue_entry, None);
+    }
+
+    #[test]
+    fn parses_merge_queue_entry() {
+        // The live GitHub shape (intent-hq/intentd#2534, 2026-10-20).
+        let pr = json!({
+            "isInMergeQueue": true,
+            "mergeQueueEntry": {
+                "position": 2,
+                "state": "AWAITING_CHECKS",
+                "enqueuedAt": "2026-10-20T03:50:26Z",
+                "estimatedTimeToMerge": 2254,
+                "mergeQueue": { "entries": { "totalCount": 3 } }
+            }
+        });
+        assert_eq!(
+            parse_merge_queue_entry(Some(&pr)),
+            Some(MergeQueueEntry {
+                position: 2,
+                queue_size: Some(3),
+                state: Some("awaiting_checks".into()),
+                enqueued_at: Some("2026-10-20T03:50:26Z".into()),
+                estimated_time_to_merge: Some(2254),
+            })
+        );
+        // The full signal parse carries it.
+        let data = json!({ "repository": { "pullRequest": pr } });
+        assert_eq!(
+            parse_merge_requirement_signals(&data)
+                .merge_queue_entry
+                .map(|e| e.position),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn merge_queue_entry_degrades_per_key() {
+        // No estimate yet and no queue size: position alone survives.
+        let sparse = json!({ "mergeQueueEntry": { "position": 1, "estimatedTimeToMerge": null } });
+        assert_eq!(
+            parse_merge_queue_entry(Some(&sparse)),
+            Some(MergeQueueEntry {
+                position: 1,
+                queue_size: None,
+                state: None,
+                enqueued_at: None,
+                estimated_time_to_merge: None,
+            })
+        );
+        // Not queued (`null`), selection absent (schema fallback), no PR,
+        // or an unusable position: no entry.
+        assert_eq!(
+            parse_merge_queue_entry(Some(&json!({ "mergeQueueEntry": null }))),
+            None
+        );
+        assert_eq!(parse_merge_queue_entry(Some(&json!({}))), None);
+        assert_eq!(parse_merge_queue_entry(None), None);
+        for bad in [json!("2"), json!(-1), json!(1.5), json!(u64::MAX)] {
+            let pr = json!({ "mergeQueueEntry": { "position": bad } });
+            assert_eq!(parse_merge_queue_entry(Some(&pr)), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn merge_queue_entry_serializes_camel_case_and_omits_unknowns() {
+        let wire = serde_json::to_value(MergeQueueEntry {
+            position: 2,
+            queue_size: Some(3),
+            state: Some("queued".into()),
+            enqueued_at: Some("2026-10-20T03:50:26Z".into()),
+            estimated_time_to_merge: Some(2254),
+        })
+        .unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "position": 2,
+                "queueSize": 3,
+                "state": "queued",
+                "enqueuedAt": "2026-10-20T03:50:26Z",
+                "estimatedTimeToMerge": 2254
+            })
+        );
+        let sparse = serde_json::to_value(MergeQueueEntry {
+            position: 1,
+            queue_size: None,
+            state: None,
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+        })
+        .unwrap();
+        assert_eq!(sparse, json!({ "position": 1 }));
     }
 
     #[test]

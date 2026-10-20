@@ -349,6 +349,14 @@ In **Home → Workspaces**, PR badges update as Intent observes changes.
 are running. You do not need to open the workspace or hover over the PR to
 receive these updates.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/ui/tooltip/GitHubLinkCard.svelte; src/lib/components/chat/MonitoredPrsRow.svelte; src/lib/components/workspace/sidebar/sidebar-changes-utils.ts; src/lib/utils/merge-queue.ts. -->
+
+For a queued GitHub PR, the PR link hover card, the chat **Monitoring PR** row,
+and the sidebar PR tooltip also show its place in the queue (for example,
+**2nd of 3**) and GitHub's estimated time to merge when GitHub provides one.
+Home badges show only **Queued**. Agents see the position when they request a
+PR snapshot; queue movement alone does not wake them.
+
 In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
 open status groups. Collapse a group to hide its checks. **Code** lists changed

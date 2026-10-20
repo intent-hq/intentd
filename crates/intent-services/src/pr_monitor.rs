@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use intent_core::events::{
     PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_EMITTED,
-    PR_MONITOR_REGISTERED,
+    PR_MONITOR_REFRESHED, PR_MONITOR_REGISTERED,
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
@@ -1201,6 +1201,8 @@ async fn poll_pr(
                     let queue = observation.signals.is_in_merge_queue;
                     entry.snapshot.merge_queue_reported = queue;
                     entry.snapshot.requirements.is_in_merge_queue = queue.filter(|&q| q);
+                    entry.snapshot.requirements.merge_queue =
+                        pr_ops::queued_merge_queue_entry(&observation.signals);
                 }
                 Some(entry.clone())
             }
@@ -1848,6 +1850,10 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
         // the PR queued (never null).
         if let Some(queued) = r.is_in_merge_queue {
             last["isInMergeQueue"] = json!(queued);
+        }
+        // Same presence rule: the queue position only while queued.
+        if let Some(entry) = &r.merge_queue {
+            last["mergeQueue"] = serde_json::to_value(entry).expect("serialize");
         }
         // Same presence rule: only when the host reported an ejection event.
         if let Some(ejection) = &r.merge_queue_ejection {
@@ -3736,6 +3742,11 @@ impl Services {
         let poll_activity = previous
             .as_ref()
             .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
+        // Informational queue movement since the last poll (position, size,
+        // entry state, estimate): never a change line, only a UI re-read hint.
+        let queue_moved = previous
+            .as_ref()
+            .is_some_and(|prev| prev.requirements.merge_queue != fresh.requirements.merge_queue);
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -3839,6 +3850,12 @@ impl Services {
                 Some(json!({ "changes": updated.pending_changes })),
             )
             .await;
+        } else if queue_moved {
+            // Queue movement is informational: no change line, no wake.
+            // The UI-only re-read hint keeps the displayed position current
+            // (agent-owned subscriptions can never receive it).
+            self.emit_pr_monitor_event(PR_MONITOR_REFRESHED, &updated, None)
+                .await;
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an
@@ -4746,6 +4763,7 @@ mod tests {
     mod ancestry_regression;
     mod compact_required_checks;
     mod home_queue_regression;
+    mod merge_queue_position;
     mod qualified_isolation;
     mod qualified_recovery;
     mod quota_regression;
@@ -4854,6 +4872,9 @@ mod tests {
         /// The host's merge-queue report on the probe signals (`None` is
         /// a host not reporting it).
         in_merge_queue: Option<bool>,
+        /// The host's merge-queue entry (position, estimate) on the probe
+        /// signals; `None` while not queued or not reported.
+        merge_queue_entry: Option<intent_sourcecontrol::MergeQueueEntry>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -4934,6 +4955,7 @@ mod tests {
                 updated_at: None,
                 folded: None,
                 in_merge_queue: None,
+                merge_queue_entry: None,
             }
         }
     }
@@ -4988,6 +5010,7 @@ mod tests {
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
+                merge_queue_entry: self.merge_queue_entry.clone(),
             }
         }
     }
@@ -5800,6 +5823,7 @@ mod tests {
                 rules_known: true,
                 is_in_merge_queue: None,
                 merge_queue_ejection: None,
+                merge_queue: None,
             },
             ejection_tracked: true,
             checks_unobserved: false,
