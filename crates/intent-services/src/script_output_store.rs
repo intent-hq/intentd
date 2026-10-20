@@ -12,7 +12,11 @@
 //!   reader and the live `script:output` stream keep going.
 //! - Past the cap the oldest bytes are dropped and the newest kept: the file is
 //!   compacted to its newest half (realigned to a line start when possible)
-//!   before the chunk that would overflow it is appended.
+//!   before the chunk that would overflow it is appended. Compaction writes a
+//!   sibling temp file and renames it over the log, so a concurrent read keeps
+//!   its open handle on a complete (old) file and a fresh open sees the
+//!   complete new one: readers never see a log shrink mid-read, and neither
+//!   side ever waits on a lock.
 //! - Reads stream the file and hold at most the requested lines (plus one line
 //!   at a time), never the whole log.
 //! - IDs are percent-encoded into a single safe path segment, so no ID can
@@ -395,7 +399,7 @@ impl RunOutputWriter {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        let result = write_capped(file, &mut self.len, self.cap, chunk);
+        let result = write_capped(&self.path, file, &mut self.len, self.cap, chunk);
         if let Err(e) = result {
             tracing::warn!(path = %self.path.display(), error = %e, "script output log write failed; disabling log for this run");
             self.file = None;
@@ -403,9 +407,16 @@ impl RunOutputWriter {
     }
 }
 
-/// Append `chunk` to `file` (opened read + append, size `*len`) without ever
-/// exceeding `cap` bytes.
-fn write_capped(file: &mut File, len: &mut u64, cap: u64, chunk: &[u8]) -> io::Result<()> {
+/// Append `chunk` to the log at `path` (open as `file`, read + append, size
+/// `*len`) without ever exceeding `cap` bytes. Compaction replaces `*file`
+/// with the handle of the renamed-in log (see [`replace_log`]).
+fn write_capped(
+    path: &Path,
+    file: &mut File,
+    len: &mut u64,
+    cap: u64,
+    chunk: &[u8],
+) -> io::Result<()> {
     let chunk_len = chunk.len() as u64;
     if *len + chunk_len <= cap {
         file.write_all(chunk)?;
@@ -426,12 +437,40 @@ fn write_capped(file: &mut File, len: &mut u64, cap: u64, chunk: &[u8]) -> io::R
         chunk
     };
     kept.extend_from_slice(chunk);
-    file.set_len(0)?;
-    // Append mode writes at the (now zero) end regardless of the cursor.
-    file.write_all(&kept)?;
-    file.flush()?;
+    *file = replace_log(path, &kept)?;
     *len = kept.len() as u64;
     Ok(())
+}
+
+/// Atomically replace the log at `path` with `contents` and return a read +
+/// append handle on the new log. The bytes go to a fresh sibling temp file
+/// (never through a symlink) that is then renamed over `path`, so the log is
+/// never observed truncated or partially written: an already-open reader keeps
+/// reading the complete old file through its handle and a new open sees the
+/// complete new one. On Windows, std opens files with `FILE_SHARE_DELETE` and
+/// `fs::rename` uses POSIX rename semantics, so replacing a log that readers
+/// (or the old writer handle) hold open works there too. The temp name has no
+/// `.log` suffix, so a sweep never mistakes it for a run log.
+fn replace_log(path: &Path, contents: &[u8]) -> io::Result<File> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| io::Error::other("script output log has no file name"))?;
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{name}.{}-{seq}.compact", std::process::id()));
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).read(true).append(true);
+    let mut file = no_follow(opts).open(&tmp)?;
+    let result = file
+        .write_all(contents)
+        .and_then(|()| file.flush())
+        .and_then(|()| fs::rename(&tmp, path));
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(file)
 }
 
 /// The newest `budget` bytes of a `len`-byte file, starting after the first
@@ -557,9 +596,7 @@ fn open_append(root: &Path, path: &Path, cap: u64) -> io::Result<(File, u64)> {
     if len > cap {
         // Reopened under a smaller cap: keep the newest bytes now.
         let kept = newest_bytes_at_line_start(&mut file, len, cap)?;
-        file.set_len(0)?;
-        file.write_all(&kept)?;
-        file.flush()?;
+        file = replace_log(path, &kept)?;
         len = kept.len() as u64;
     }
     Ok((file, len))

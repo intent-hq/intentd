@@ -563,3 +563,96 @@ fn workspace_ids_lists_decoded_workspace_folders_only() {
     ids.sort();
     assert_eq!(ids, vec!["ws-1".to_string(), "ws/odd.id".to_string()]);
 }
+
+/// Hammer `tail` and `paginate` from another thread while `mutate` keeps
+/// compacting the log. The log is never empty after the first fill, so every
+/// read must succeed with some content: no `UnexpectedEof` from a file that
+/// shrank mid-read and no spurious empty result.
+fn assert_reads_survive_compaction(
+    store: &ScriptOutputStore,
+    mutate: impl FnOnce(&std::sync::atomic::AtomicBool) + Send,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = AtomicBool::new(false);
+    let (reads, failures) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let mut reads = 0usize;
+            let mut failures = Vec::new();
+            while !done.load(Ordering::Acquire) || reads < 200 {
+                reads += 1;
+                match store.tail("ws", "s", "r", 100) {
+                    Ok(Some(t)) if !t.text.trim().is_empty() => {}
+                    other => failures.push(format!("tail: {other:?}")),
+                }
+                match store.paginate("ws", "s", "r", Some(50), None) {
+                    Ok(page) if page["items"].as_array().is_some_and(|i| !i.is_empty()) => {}
+                    other => failures.push(format!("paginate: {other:?}")),
+                }
+            }
+            (reads, failures)
+        });
+        mutate(&done);
+        done.store(true, Ordering::Release);
+        reader.join().unwrap()
+    });
+    assert!(
+        failures.is_empty(),
+        "{} of {reads} live reads failed during compaction; first: {}",
+        failures.len(),
+        failures[0]
+    );
+}
+
+#[test]
+fn live_reads_never_see_append_compaction_mid_rewrite() {
+    let (_dir, store) = store(64 * 1024);
+    let line = format!("{}\n", "x".repeat(63));
+    let mut w = store.open_writer("ws", "s", "r");
+    let chunk = line.repeat(64);
+    for _ in 0..16 {
+        w.append(chunk.as_bytes());
+    }
+    assert_reads_survive_compaction(&store, |_| {
+        // Each 4 KiB chunk past the cap compacts to the newest half.
+        for _ in 0..20_000 {
+            w.append(chunk.as_bytes());
+        }
+    });
+    assert!(w.is_enabled());
+    assert!(w.len() <= 64 * 1024);
+    assert_eq!(fs::metadata(w.path()).unwrap().len(), w.len());
+}
+
+#[test]
+fn live_reads_never_see_reopen_compaction_mid_rewrite() {
+    let (dir, small) = store(32 * 1024);
+    let big = ScriptOutputStore::new(dir.path(), 1 << 20);
+    let line = format!("{}\n", "y".repeat(63));
+    let chunk = line.repeat(1024);
+    big.open_writer("ws", "s", "r").append(chunk.as_bytes());
+    assert_reads_survive_compaction(&small, |_| {
+        for _ in 0..1_000 {
+            // Regrow past the small cap, then reopen under it (compacts).
+            big.open_writer("ws", "s", "r").append(chunk.as_bytes());
+            let w = small.open_writer("ws", "s", "r");
+            assert!(w.is_enabled());
+            assert!(w.len() <= 32 * 1024);
+        }
+    });
+}
+
+#[test]
+fn compaction_leaves_no_temp_files_behind() {
+    let (_dir, store) = store(1024);
+    let mut w = store.open_writer("ws", "s", "r");
+    for i in 0..200 {
+        w.append(format!("line {i}\n").as_bytes());
+    }
+    let dir = store.script_dir("ws", "s").unwrap();
+    let names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec!["r.log".to_string()]);
+    assert!(read_all(&store, "ws", "s", "r").ends_with("line 199\n"));
+}
