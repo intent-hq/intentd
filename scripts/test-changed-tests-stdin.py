@@ -6,6 +6,9 @@ and every temporary path it made through mktemp. Only those paths are checked.
 A host-wide library preload (Datadog's /etc/ld.so.preload launcher, for one)
 writes its own files into TMPDIR from every process, so "the fixtures folder
 is empty" would fail on such a host for files this suite does not own.
+The trade-off: a temporary path made without mktemp (a direct "$TMPDIR/name"
+write, Python's tempfile) is not tracked, so the suite and the script under
+test create every temporary path through mktemp.
 """
 
 import contextlib
@@ -27,17 +30,19 @@ def recording_mktemp(directory, manifest):
     """A mktemp first on PATH that logs each path the real one prints.
 
     The suite links `command -v mktemp` into its stub bin dir and runs the
-    script under test with PATH set to that dir alone, so the wrapper uses only
-    Bash built-ins and the real mktemp's absolute path.
+    script under test with PATH set to that dir alone, so the wrapper names
+    bash and the real mktemp by absolute path and otherwise uses built-ins.
+    A path from a relative template is logged against the caller's cwd.
     """
-    real = shutil.which("mktemp")
-    if real is None:
-        raise AssertionError("mktemp is not on PATH; the suite needs it")
+    real, bash = shutil.which("mktemp"), shutil.which("bash")
+    if real is None or bash is None:
+        raise AssertionError("mktemp and bash must be on PATH; the suite needs them")
     wrapper = directory / "mktemp"
     wrapper.write_text(
-        "#!/usr/bin/env bash\n"
+        f"#!{bash}\n"
         f"out=$({shlex.quote(real)} \"$@\") || exit\n"
-        f"printf '%s\\n' \"$out\" >>{shlex.quote(str(manifest))}\n"
+        'case $out in /*) logged=$out ;; *) logged=$PWD/$out ;; esac\n'
+        f"printf '%s\\n' \"$logged\" >>{shlex.quote(str(manifest))}\n"
         "printf '%s\\n' \"$out\"\n"
     )
     wrapper.chmod(0o755)

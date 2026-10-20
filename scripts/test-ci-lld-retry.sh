@@ -13,38 +13,30 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 script="$here/ci-lld-retry.sh"
 tmp=$(mktemp -d)
-decoy=""
-cleanup() {
-  if [ -n "$decoy" ]; then kill "$decoy" 2>/dev/null || true; fi
-  rm -rf "$tmp"
-}
-trap cleanup EXIT
+trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/objs" "$tmp/bin"
 
-# The wrapper's diagnostics print host-wide state (live processes, the kernel
-# log). On a shared host another process's command line can hold both
-# `cargo` and `::error::`, which would fail the "no ::error::" assertions
-# below for reasons this suite does not own. Stub both commands so the
-# output only carries what this suite creates; the pgrep stub logs its argv
-# so the suite still proves the wrapper asks for cargo/rustc processes.
-cat >"$tmp/bin/pgrep" <<'EOF'
+# The wrapper's diagnostics print host-wide state: live processes, the kernel
+# log and, when set, the shared CARGO_TARGET_DIR. On a shared host another
+# process's command line can hold both `cargo` and `::error::`, which would
+# fail the "no ::error::" assertions below for reasons this suite does not
+# own. Stub pgrep and dmesg and drop CARGO_TARGET_DIR so that output is fixed
+# text; the pgrep stub logs its argv and prints a marker line, so scenario 2
+# still proves the wrapper asks for cargo/rustc processes and that the real
+# pgrep never ran.
+cat >"$tmp/bin/pgrep" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >>"$PGREP_CALLS"
 echo "4242 stub-cargo-process"
-EOF
-cat >"$tmp/bin/dmesg" <<'EOF'
+STUB
+cat >"$tmp/bin/dmesg" <<'STUB'
 #!/usr/bin/env bash
 echo "stub kernel log line"
-EOF
+STUB
 chmod +x "$tmp/bin/pgrep" "$tmp/bin/dmesg"
+unset CARGO_TARGET_DIR
 export PATH="$tmp/bin:$PATH" PGREP_CALLS="$tmp/pgrep-calls"
 : >"$PGREP_CALLS"
-
-# A process of our own that a real `pgrep -af 'cargo|rustc'` would report
-# with `::error::` in its command line: without the stub above, scenario 2
-# fails on every run, so the isolation is checked on any host.
-(exec -a "cargo-decoy ::error:: test-ci-lld-retry" sleep 300) </dev/null >/dev/null 2>&1 &
-decoy=$!
 
 # Fake cargo: appends one line per call to $CALLS; behaviour for call N is
 # read from $PLAN/N (missing = succeed). Each plan file holds an exit code
