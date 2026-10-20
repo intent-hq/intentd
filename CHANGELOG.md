@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.18] - 2026-10-20
+
+### 🧪 Testing
+
+- *(agents)* Budget the turn-start future sizes ([#2535](https://github.com/intent-hq/intentd/pull/2535))
+
+
 ## [0.11.17] - 2026-10-20
 
 ### 🐛 Bug Fixes
