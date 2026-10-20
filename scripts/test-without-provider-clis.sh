@@ -144,8 +144,9 @@ for dir in "${dirs[@]}"; do
   done
 done
 # auggie's install record (~/.augment/auggie-path): the first non-blank line
-# names the binary discovery runs (auggie_marker_path_with_home).
-if [[ -f "$HOME/.augment/auggie-path" ]]; then
+# names the binary discovery runs (auggie_marker_path_with_home). An
+# unreadable record names nothing, as in discovery (read_to_string().ok()).
+if [[ -f "$HOME/.augment/auggie-path" && -r "$HOME/.augment/auggie-path" ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
     line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [[ -n "$line" ]]; then
