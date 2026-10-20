@@ -164,21 +164,22 @@ fn close_paren(chars: &[char], open: usize) -> usize {
 }
 
 /// Does the `Duration` ending at `j` go on to be scaled at runtime —
-/// `.mul_f64(…)` / `.mul_f32(…)`, or `* <non-literal>` (`* multiplier`)?
-/// `* 2` is still a fixed budget.
+/// `.mul_f64(<factor>)` / `.mul_f32(<factor>)` or `* <factor>`, where the
+/// factor starts with an identifier (`timeout_multiplier()`, `m`)? A literal
+/// factor (`* 2`, `.mul_f64(1.0)`) leaves the budget fixed.
 fn is_scaled_after(chars: &[char], j: usize) -> bool {
+    let non_literal = |k: usize| {
+        chars
+            .get(skip_whitespace(chars, k))
+            .is_some_and(|c| c.is_alphabetic() || *c == '_')
+    };
     let by_method = ["mul_f64", "mul_f32"].iter().any(|method| {
         [".", method, "("]
             .iter()
             .try_fold(j, |k, token| expect(chars, k, token))
-            .is_some()
+            .is_some_and(non_literal)
     });
-    let by_operand = expect(chars, j, "*").is_some_and(|k| {
-        chars
-            .get(skip_whitespace(chars, k))
-            .is_some_and(|c| c.is_alphabetic() || *c == '_')
-    });
-    by_method || by_operand
+    by_method || expect(chars, j, "*").is_some_and(non_literal)
 }
 
 /// The identifier ending just before `j` (skipping whitespace back).
@@ -999,9 +1000,11 @@ fn t() {
     timeout(Duration::from_secs(5) * 2, f);
     timeout(Duration::from_millis(u64::from(n)).mul_f64(m), f);
     timeout(Duration::from_millis(u64::from(n)) + Duration::from_secs(1), f);
+    timeout(Duration::from_secs(5).mul_f64(1.0), f);
+    timeout(Duration::from_secs(5).mul_f32( 2.5 ), f);
 }
 ";
-    assert_eq!(lines_in(src), vec![5, 7]);
+    assert_eq!(lines_in(src), vec![5, 7, 8, 9]);
 }
 
 #[test]
