@@ -18695,6 +18695,7 @@ pub(crate) mod pr {
                 }),
                 is_in_merge_queue: None,
                 merge_queue_removal: None,
+                merge_queue_entry: None,
             }),
             ..Default::default()
         })
