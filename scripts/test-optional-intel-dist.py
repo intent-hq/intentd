@@ -3,6 +3,11 @@
 
 Requires the version of dist pinned by dist-workspace.toml. No GitHub writes or
 native compilation; all generated artifacts live in a disposable local clone.
+
+Crates are fetched once up front, with retries, and every dist call then runs
+with CARGO_NET_OFFLINE=true so a crates.io blip cannot fail a dist step (runs
+39394522385 and 39355882408). scripts/test-optional-intel-dist-network.py
+covers that handling offline.
 """
 import json
 import os
@@ -10,10 +15,36 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEL = 'x86_64-apple-darwin'
+FETCH = ['cargo', 'fetch', '--locked']
+
+
+def fetch_dependencies(root, env, attempts=4, sleep=time.sleep):
+    """Download the locked crates, retrying transient network failures with backoff.
+
+    HTTP/2 multiplexing is off: it caused the crates.io "HTTP2 framing layer" error.
+    """
+    env = {**env, 'CARGO_NET_RETRY': '10', 'CARGO_HTTP_MULTIPLEXING': 'false'}
+    env.pop('CARGO_NET_OFFLINE', None)
+    for attempt in range(1, attempts + 1):
+        if subprocess.run(FETCH, cwd=root, env=env).returncode == 0:
+            return
+        if attempt < attempts:
+            sleep(5 * 2 ** (attempt - 1))
+    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {attempts} attempts; the network '
+                     '(crates.io) is unavailable, not the cargo-dist behaviour under test. Re-run the job.')
+
+
+def offline_env(env):
+    return {**env, 'CARGO_NET_OFFLINE': 'true'}
+
+
+def run_dist(root, env, *args):
+    return json.loads(subprocess.check_output(['dist', *args, '--output-format=json'], cwd=root, env=env))
 
 
 def main():
@@ -26,9 +57,11 @@ def main():
         shutil.copy(ROOT / 'dist-workspace.toml', root / 'dist-workspace.toml')
         shutil.copy(ROOT / 'scripts/optional-intel-release.py', root / 'scripts/optional-intel-release.py')
         env = {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'}
+        fetch_dependencies(root, env)
+        env = offline_env(env)
 
         def dist(*args):
-            return json.loads(subprocess.check_output(['dist', *args, '--output-format=json'], cwd=root, env=env))
+            return run_dist(root, env, *args)
 
         artifacts = root / 'target/distrib'
         manifest = dist('build', '--artifacts=lies')
@@ -72,7 +105,7 @@ def main():
         # Reapply the customization to real generated YAML, not only an
         # already-customized fixture. Existing unrelated customizations are
         # outside this script's ownership.
-        subprocess.run(['dist', 'generate'], cwd=root, check=True)
+        subprocess.run(['dist', 'generate'], cwd=root, env=env, check=True)
         shutil.copy(ROOT / 'scripts/configure-optional-intel-release.py', root / 'scripts/configure-optional-intel-release.py')
         customize = ['python3', '-I', '-B', 'scripts/configure-optional-intel-release.py']
         subprocess.run(customize, cwd=root, check=True)
