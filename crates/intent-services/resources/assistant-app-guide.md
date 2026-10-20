@@ -258,10 +258,9 @@ Changes you make in the form are kept when you switch repositories.
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
-workspace for that repository, and shows the model and reasoning effort it will use
-while that agent stays selected. The
-new workspace opens as a tab at the end of the top tab strip, and the current
-workspace stays selected.
+workspace for that repository, and uses that agent's last model and reasoning
+effort while it stays selected. The new workspace opens as a tab at the end of
+the top tab strip, and the current workspace stays selected.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
