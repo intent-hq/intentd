@@ -1331,6 +1331,68 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
     .await;
 }
 
+/// intent-hq/intent#7449: a GitHub workspace inserted with repository
+/// metadata gets an unresolved historical primary selection from the insert
+/// trigger. A repo-less read must still resolve its own GitHub fetch remote,
+/// while ambiguous, unmappable and missing remotes keep refusing.
+#[intent_test_macros::daemon_test]
+async fn implicit_github_read_resolves_unresolved_historical_selection_from_fetch_remotes() {
+    let git = GitFixture::with_repository_metadata("actual", "repository").await;
+    let services = Services::new(git.store.clone());
+    let root = git.root();
+    intent_core::caller::with_caller(Caller::Daemon, async {
+        assert!(matches!(
+            SelectionFacts::read(&services, &root)
+                .await
+                .ok()
+                .and_then(|facts| facts.saved().ok()),
+            Some(SavedReviewSelection::UnresolvedHistorical { .. })
+        ));
+        let read = || async {
+            CapturedReview::capture(&services, git.workspace.id.clone(), 4)
+                .read(&services)
+                .await
+        };
+        assert!(read().await.is_err(), "no remote");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Actual/Repository.git",
+            ],
+        );
+        let Ok(ReadOutcome::Github(repo)) = read().await else {
+            panic!("repo-less read of a GitHub workspace must use its fetch remote");
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "other",
+                "https://github.com/private/other.git",
+            ],
+        );
+        assert!(read().await.is_err(), "ambiguous GitHub remotes");
+        git.git(&git.path, &["remote", "remove", "other"]);
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "unmapped",
+                "https://unknown.test/private/repo.git",
+            ],
+        );
+        assert!(read().await.is_err(), "unmappable remote");
+    })
+    .await;
+}
+
 #[intent_test_macros::daemon_test]
 async fn live_request_retirement_while_real_http_is_held_denies_later_private_delivery() {
     let server = ReadServer::new().await;

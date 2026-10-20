@@ -213,6 +213,31 @@ fn target(
     }
 }
 
+/// Implicit (repo-less, non-addressed) reads only: a GitHub workspace inserted
+/// with repository metadata has an unresolved historical primary selection
+/// (intent-hq/intent#7449), which would otherwise refuse every repo-less
+/// read. Treat it as Automatic, resolving the fetch remotes, but accept only a
+/// GitHub result; anything else keeps the original refusal, so managed
+/// (GitLab) reads and their revalidation are unchanged.
+fn implicit_github_target(
+    observed: &RepositoryObservedRoot,
+    saved: &SavedReviewSelection,
+) -> Option<intent_core::RepositoryTarget> {
+    if !matches!(saved, SavedReviewSelection::UnresolvedHistorical { .. }) {
+        return None;
+    }
+    match resolve_review_selection(&SavedReviewSelection::Automatic, &observed.remotes, None)
+        .outcome
+    {
+        ReviewSelectionOutcome::Resolved { target, .. }
+            if target.provider == RepositoryProvider::Github =>
+        {
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
 fn selected_target(
     observed: &RepositoryObservedRoot,
     selection: &SelectionFacts,
@@ -401,12 +426,16 @@ impl CapturedReview {
         if SelectionFacts::read(services, &root_id).await? != selection {
             return Err(AdmissionError::BindingChanged);
         }
-        let selected = selected_target(
+        let selected = match selected_target(
             &observed,
             &selection,
             self.explicit.as_ref(),
             self.settled.as_ref().ok(),
-        )?;
+        ) {
+            Ok(selected) => selected,
+            Err(error) if self.addressed || self.explicit.is_some() => return Err(error),
+            Err(error) => implicit_github_target(&observed, &selection.saved()?).ok_or(error)?,
+        };
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
                 .project_path
