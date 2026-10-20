@@ -45,5 +45,6 @@ pub use barrier::Barrier;
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
 pub use timeout::{
-    scale_test_timeout, test_timeout, MAX_TIMEOUT_MULTIPLIER, TIMEOUT_MULTIPLIER_ENV,
+    scale_test_timeout, test_timeout, test_timeout_multiplier, timeout_multiplier,
+    MAX_TIMEOUT_MULTIPLIER, TIMEOUT_MULTIPLIER_ENV,
 };

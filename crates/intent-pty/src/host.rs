@@ -1280,15 +1280,10 @@ mod tests {
     }
 
     /// Deadline scale factor for slow environments (coverage runs export
-    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
-    /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
+    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`), from the shared
+    /// [`intentd_test_support::test_timeout_multiplier`].
     fn timeout_multiplier() -> f64 {
-        std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|m| m.is_finite())
-            .unwrap_or(1.0)
-            .max(1.0)
+        intentd_test_support::test_timeout_multiplier()
     }
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.

@@ -15,5 +15,8 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
+
 [lints]
 workspace = true

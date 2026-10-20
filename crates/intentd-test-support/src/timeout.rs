@@ -8,7 +8,7 @@
 //! merge queue until intentd#2514 scaled it. `fixed_deadline_lint` now fails
 //! on a fixed test deadline that bypasses this helper.
 //!
-//! Five crates used to carry private copies of this function with slightly
+//! Six test modules used to carry private copies of this function with slightly
 //! different rules; they now delegate here.
 
 use std::time::Duration;
@@ -31,18 +31,33 @@ pub fn test_timeout(base: Duration) -> Duration {
     scale_test_timeout(base, multiplier.as_deref())
 }
 
-/// `base` stretched by `multiplier`: unset, unparsable, or non-finite means
-/// 1x; values below 1 are raised to 1 (a budget is never shortened); values
-/// above [`MAX_TIMEOUT_MULTIPLIER`] are capped; a product the clock cannot
-/// represent saturates to [`Duration::MAX`] instead of panicking.
+/// The stretch factor `INTENTD_TEST_TIMEOUT_MULTIPLIER` currently asks for,
+/// under the rules of [`timeout_multiplier`] — for a test that scales a
+/// budget itself (`base.mul_f64(test_timeout_multiplier())`).
 #[must_use]
-pub fn scale_test_timeout(base: Duration, multiplier: Option<&str>) -> Duration {
-    let multiplier = multiplier
+pub fn test_timeout_multiplier() -> f64 {
+    timeout_multiplier(std::env::var(TIMEOUT_MULTIPLIER_ENV).ok().as_deref())
+}
+
+/// The stretch factor for a multiplier setting: unset, unparsable, or
+/// non-finite means 1; values below 1 are raised to 1 (a budget is never
+/// shortened); values above [`MAX_TIMEOUT_MULTIPLIER`] are capped.
+#[must_use]
+pub fn timeout_multiplier(setting: Option<&str>) -> f64 {
+    setting
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .unwrap_or(1.0)
-        .clamp(1.0, MAX_TIMEOUT_MULTIPLIER);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier).unwrap_or(Duration::MAX)
+        .clamp(1.0, MAX_TIMEOUT_MULTIPLIER)
+}
+
+/// `base` stretched by [`timeout_multiplier`]`(multiplier)`; a product the
+/// clock cannot represent saturates to [`Duration::MAX`] instead of
+/// panicking.
+#[must_use]
+pub fn scale_test_timeout(base: Duration, multiplier: Option<&str>) -> Duration {
+    Duration::try_from_secs_f64(base.as_secs_f64() * timeout_multiplier(multiplier))
+        .unwrap_or(Duration::MAX)
 }
 
 #[cfg(test)]

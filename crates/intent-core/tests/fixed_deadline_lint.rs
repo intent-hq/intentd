@@ -19,14 +19,17 @@
 //! - **What is test code:** every file under `crates/*/tests/`, and inside
 //!   `crates/*/src/`: files named `tests.rs` / `*_tests.rs`, anything under a
 //!   `tests/` directory, files reached through a `#[cfg(test)] mod name;`
-//!   declaration (and that module's directory), and every `#[cfg(test)]`
-//!   item. Production code is never scanned.
+//!   declaration (and that module's directory, and any `mod` a test file
+//!   declares in turn), and every `#[cfg(test)]` or `#[cfg(all(…, test,
+//!   …))]` item. Production code — including `cfg(any(test, …))` items,
+//!   which also build outside tests — is never scanned.
 //! - **What counts:** on comment- and literal-blanked text (so quoted
 //!   examples never count), a `Duration::from_*(` path — `std::time::` /
 //!   `tokio::time::` qualified or not, any whitespace or line breaks between
-//!   tokens — used directly as (a) the first argument of a call named one of
-//!   [`DEADLINE_CALLS`] (`tokio::time::timeout`, `recv_timeout`, …; a
-//!   `fn timeout(` definition is not a call), or (b) the operand of an
+//!   tokens — not scaled afterwards (`.mul_f64(m)`, `* m`) and used directly
+//!   as (a) the budget argument of a call named in [`DEADLINE_CALLS`]
+//!   (`tokio::time::timeout`, `recv_timeout`, `Condvar::wait_timeout`'s
+//!   second argument, …; a `fn timeout(` definition is not a call), or (b) the operand of an
 //!   `Instant::now() + …` / `Instant::now().checked_add(…)` deadline.
 //! - **Marker:** a standalone `// fixed-deadline: allow — <reason>` on the
 //!   line above the hit, or above the first line of its statement, exempts it
@@ -38,13 +41,15 @@
 //!   only ratchets down: a file over its entry (or absent) fails naming every
 //!   line; a file under its entry, or an entry whose file is gone, fails
 //!   naming the exact line to write.
-//!   To regenerate it after a bulk conversion, run the lint with
-//!   `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1`, then review the diff: it
-//!   must only lower or remove lines.
+//!   To rewrite it after a bulk conversion, run the lint with
+//!   `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1`; update mode refuses to raise
+//!   or add an entry, or to record a malformed marker.
 //! - **Limits:** a fixed budget behind a `const` or a local binding
 //!   (`const WAIT: Duration = Duration::from_secs(5); timeout(WAIT, …)`) is
-//!   not seen, and a call is matched by name only, so a method also called
-//!   `timeout` (a client builder's) counts too — wrap or mark it.
+//!   not seen; a call is matched by name only, so a method also called
+//!   `timeout` (a client builder's) counts too — wrap or mark it; and a
+//!   `#[cfg(test)] mod x;` nested inside an inline `mod a { … }` resolves as
+//!   if declared at file level.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -58,12 +63,16 @@ use intentd_test_support::source_lint::{
 /// Opt-out tag: `// fixed-deadline: allow — <reason>`.
 const TAG: &str = "fixed-deadline";
 
-/// Calls whose first argument is a wall-clock budget.
-const DEADLINE_CALLS: &[&str] = &[
-    "timeout",
-    "recv_timeout",
-    "wait_timeout",
-    "wait_with_timeout",
+/// Calls taking a wall-clock budget, with the 0-based argument positions it
+/// may sit at: `Condvar::wait_timeout(guard, budget)` /
+/// `wait_timeout_while(guard, budget, f)` take it second, a child-process
+/// `wait_timeout(budget)` first.
+const DEADLINE_CALLS: &[(&str, &[usize])] = &[
+    ("timeout", &[0]),
+    ("recv_timeout", &[0]),
+    ("wait_timeout", &[0, 1]),
+    ("wait_timeout_while", &[1]),
+    ("wait_with_timeout", &[0]),
 ];
 
 const BASELINE_FILE: &str = "crates/intent-core/tests/fixed_deadline_baseline.txt";
@@ -113,7 +122,63 @@ fn is_duration_literal(chars: &[char], j: usize) -> bool {
     let [.., ty, ctor] = segments.as_slice() else {
         return false;
     };
-    ty == "Duration" && ctor.starts_with("from_") && expect(chars, j, "(").is_some()
+    if ty != "Duration" || !ctor.starts_with("from_") {
+        return false;
+    }
+    let Some(open) = expect(chars, j, "(") else {
+        return false;
+    };
+    !is_scaled_after(chars, close_paren(chars, open))
+}
+
+/// Start index of each top-level argument of the call whose `(` ends just
+/// before `open` (nested `(…)`, `[…]`, `{…}` respected).
+fn argument_starts(chars: &[char], open: usize) -> Vec<usize> {
+    let mut starts = vec![open];
+    let mut depth = 0usize;
+    for (j, c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => starts.push(j + 1),
+            _ => {}
+        }
+    }
+    starts
+}
+
+/// Index just past the `)` closing the `(` that ends just before `open`.
+fn close_paren(chars: &[char], open: usize) -> usize {
+    let mut depth = 1usize;
+    let mut j = open;
+    while j < chars.len() && depth > 0 {
+        match chars[j] {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Does the `Duration` ending at `j` go on to be scaled at runtime —
+/// `.mul_f64(…)` / `.mul_f32(…)`, or `* <non-literal>` (`* multiplier`)?
+/// `* 2` is still a fixed budget.
+fn is_scaled_after(chars: &[char], j: usize) -> bool {
+    let by_method = ["mul_f64", "mul_f32"].iter().any(|method| {
+        [".", method, "("]
+            .iter()
+            .try_fold(j, |k, token| expect(chars, k, token))
+            .is_some()
+    });
+    let by_operand = expect(chars, j, "*").is_some_and(|k| {
+        chars
+            .get(skip_whitespace(chars, k))
+            .is_some_and(|c| c.is_alphabetic() || *c == '_')
+    });
+    by_method || by_operand
 }
 
 /// The identifier ending just before `j` (skipping whitespace back).
@@ -143,9 +208,15 @@ fn deadline_offsets(chars: &[char]) -> Vec<usize> {
             i += 1;
             continue;
         };
-        let hit = if DEADLINE_CALLS.contains(&word.as_str()) {
+        let call = DEADLINE_CALLS.iter().find(|(name, _)| *name == word);
+        let hit = if let Some((_, positions)) = call {
             word_before(chars, i) != "fn"
-                && expect(chars, end, "(").is_some_and(|j| is_duration_literal(chars, j))
+                && expect(chars, end, "(").is_some_and(|open| {
+                    argument_starts(chars, open)
+                        .iter()
+                        .enumerate()
+                        .any(|(n, j)| positions.contains(&n) && is_duration_literal(chars, *j))
+                })
         } else if word == "Instant" {
             let now = ["::", "now", "(", ")"]
                 .iter()
@@ -168,6 +239,62 @@ fn deadline_offsets(chars: &[char]) -> Vec<usize> {
     out
 }
 
+/// Rewrites every `#[cfg(all(…, test, …))]` attribute in blanked `chars` to
+/// a padded `#[cfg(test)]` (length and newlines preserved), so
+/// [`cfg_test_items`] — which matches only the bare form — finds those test
+/// modules too. `any(…)` / `not(…)` predicates are left alone: they also
+/// compile outside tests.
+fn normalize_cfg_all_test(chars: &mut [char]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let head = (chars[i] == '#')
+            .then(|| {
+                ["#", "[", "cfg", "(", "all", "("]
+                    .iter()
+                    .try_fold(i, |j, token| expect(chars, j, token))
+            })
+            .flatten();
+        let Some(args_start) = head else {
+            i += 1;
+            continue;
+        };
+        let args_end = close_paren(chars, args_start);
+        let args: String = chars[args_start..args_end.saturating_sub(1)]
+            .iter()
+            .collect();
+        let mut depth = 0usize;
+        let mut has_test = false;
+        let mut current = String::new();
+        for c in args.chars().chain(std::iter::once(',')) {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    has_test |= current.trim() == "test";
+                    current.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(c);
+        }
+        let Some(end) = [")", "]"]
+            .iter()
+            .try_fold(args_end, |j, token| expect(chars, j, token))
+        else {
+            i += 1;
+            continue;
+        };
+        if has_test {
+            let mut replacement = "#[cfg(test)]".chars();
+            for c in chars[i..end].iter_mut().filter(|c| **c != '\n') {
+                *c = replacement.next().unwrap_or(' ');
+            }
+        }
+        i = end;
+    }
+}
+
 /// A fixed deadline with no reasoned marker: its 1-based line and text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Deadline {
@@ -178,16 +305,42 @@ struct Deadline {
 }
 
 /// What one source file contributes: its unmarked deadlines in test code,
-/// and the out-of-line `#[cfg(test)]` modules it declares.
+/// and the out-of-line modules whose files are test code too.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Scan {
     deadlines: Vec<Deadline>,
-    /// `(name, Some(path attr))` per `#[cfg(test)] mod name;`.
+    /// `(name, Some(path attr))` per out-of-line test module: every
+    /// `#[cfg(test)] mod name;`, plus every `mod name;` of a whole test file.
     test_mods: Vec<(String, Option<String>)>,
 }
 
-fn line_of(chars: &[char], offset: usize) -> usize {
-    chars[..offset].iter().filter(|c| **c == '\n').count() + 1
+/// Every plain `mod name;` declaration in blanked `chars`: the char range of
+/// the item (from after the previous `;` / `{` / `}` through its `;`, so it
+/// covers any `#[path = "…"]`) and the name.
+fn out_of_line_mods(chars: &[char]) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word = is_ident(chars[i]) && (i == 0 || !is_ident(chars[i - 1]));
+        let Some((word, end)) = at_word.then(|| ident_at(chars, i)).flatten() else {
+            i += 1;
+            continue;
+        };
+        if word == "mod" {
+            let name_at = skip_whitespace(chars, end);
+            if let Some((name, after)) = ident_at(chars, name_at) {
+                if let Some(semi) = expect(chars, after, ";") {
+                    let start = chars[..i]
+                        .iter()
+                        .rposition(|c| matches!(c, ';' | '{' | '}'))
+                        .map_or(0, |b| b + 1);
+                    out.push((start, semi, name));
+                }
+            }
+        }
+        i = end;
+    }
+    out
 }
 
 /// The `#[path = "…"]` value inside `[start, end)` of `src`, if any.
@@ -209,7 +362,18 @@ fn path_attr(chars: &[char], literals: &[Literal], start: usize, end: usize) -> 
 /// `#[cfg(test)]` items.
 fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
     let lexed = lex(src);
-    let chars: Vec<char> = lexed.blanked.chars().collect();
+    let mut chars: Vec<char> = lexed.blanked.chars().collect();
+    normalize_cfg_all_test(&mut chars);
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            chars
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c == '\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    let line_of = |offset: usize| line_starts.partition_point(|start| *start <= offset);
     let items = cfg_test_items(&chars);
     let in_test = |offset: usize| {
         whole_file_is_test
@@ -229,7 +393,7 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
         .into_iter()
         .filter(|offset| in_test(*offset))
         .filter_map(|offset| {
-            let line = line_of(&chars, offset);
+            let line = line_of(offset);
             let consulted = [marker(line), marker(statement_line(&chars, offset))];
             if consulted.contains(&Marker::WithReason) {
                 return None;
@@ -241,7 +405,7 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
             })
         })
         .collect();
-    let test_mods = items
+    let mut test_mods: Vec<(String, Option<String>)> = items
         .iter()
         .filter_map(|item| {
             let name = item.out_of_line_mod.clone()?;
@@ -251,6 +415,14 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
             ))
         })
         .collect();
+    if whole_file_is_test {
+        for (start, end, name) in out_of_line_mods(&chars) {
+            let entry = (name, path_attr(&chars, &lexed.literals, start, end));
+            if !test_mods.contains(&entry) {
+                test_mods.push(entry);
+            }
+        }
+    }
     Scan {
         deadlines,
         test_mods,
@@ -292,9 +464,20 @@ fn display_rel(rel: &Path) -> String {
         .join("/")
 }
 
-/// Unmarked fixed deadlines per scanned file (zero-count files included),
-/// keyed by workspace-relative path.
-fn scan_tree(root: &Path) -> BTreeMap<String, Vec<Deadline>> {
+/// What [`scan_tree`] found.
+struct Tree {
+    /// Unmarked fixed deadlines per scanned file (zero-count files
+    /// included), keyed by workspace-relative path.
+    deadlines: BTreeMap<String, Vec<Deadline>>,
+    /// Files scanned whole as test code, workspace-relative.
+    whole: BTreeSet<String>,
+}
+
+/// Scans every crate: `tests/` files and conventional `src/` test files
+/// whole, other `src/` files for their `#[cfg(test)]` items, then — until
+/// nothing changes — promotes to whole every `src/` file an out-of-line test
+/// module resolves to (including modules declared by a promoted file).
+fn scan_tree(root: &Path) -> Tree {
     let crates_dir = root.join("crates");
     let mut krates: Vec<PathBuf> = fs::read_dir(&crates_dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
@@ -302,19 +485,19 @@ fn scan_tree(root: &Path) -> BTreeMap<String, Vec<Deadline>> {
         .filter(|path| path.is_dir())
         .collect();
     krates.sort();
-    let mut whole = BTreeSet::new();
+    let mut pending = Vec::new();
     let mut partial = Vec::new();
     for krate in &krates {
         let tests = krate.join("tests");
         if tests.is_dir() {
-            whole.extend(rust_files(&tests));
+            pending.extend(rust_files(&tests));
         }
         let src = krate.join("src");
         if src.is_dir() {
             for file in rust_files(&src) {
                 let rel = file.strip_prefix(&src).expect("under src").to_path_buf();
                 if is_conventional_test_file(&rel) {
-                    whole.insert(file);
+                    pending.push(file);
                 } else {
                     partial.push(file);
                 }
@@ -325,29 +508,51 @@ fn scan_tree(root: &Path) -> BTreeMap<String, Vec<Deadline>> {
         fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()))
     };
     let mut scans: BTreeMap<PathBuf, Scan> = BTreeMap::new();
-    let mut test_targets = Vec::new();
+    let mut targets = Vec::new();
+    let mut sources = BTreeMap::new();
     for file in &partial {
-        let scan = scan_source(&read(file), false);
+        let src = read(file);
+        let scan = scan_source(&src, false);
         for (name, path) in &scan.test_mods {
-            test_targets.extend(test_mod_targets(file, name, path.as_deref()));
+            targets.extend(test_mod_targets(file, name, path.as_deref()));
         }
         scans.insert(file.clone(), scan);
+        sources.insert(file.clone(), src);
     }
-    for file in &partial {
-        if test_targets.iter().any(|target| file.starts_with(target)) {
-            scans.insert(file.clone(), scan_source(&read(file), true));
+    let mut whole = BTreeSet::new();
+    loop {
+        pending.extend(
+            partial
+                .iter()
+                .filter(|file| !whole.contains(*file))
+                .filter(|file| targets.iter().any(|target| file.starts_with(target)))
+                .cloned(),
+        );
+        if pending.is_empty() {
+            break;
+        }
+        for file in std::mem::take(&mut pending) {
+            if !whole.insert(file.clone()) {
+                continue;
+            }
+            let scan = match sources.get(&file) {
+                Some(src) => scan_source(src, true),
+                None => scan_source(&read(&file), true),
+            };
+            for (name, path) in &scan.test_mods {
+                targets.extend(test_mod_targets(&file, name, path.as_deref()));
+            }
+            scans.insert(file, scan);
         }
     }
-    for file in &whole {
-        scans.insert(file.clone(), scan_source(&read(file), true));
+    let rel = |file: &Path| display_rel(file.strip_prefix(root).expect("under root"));
+    Tree {
+        deadlines: scans
+            .into_iter()
+            .map(|(file, scan)| (rel(&file), scan.deadlines))
+            .collect(),
+        whole: whole.iter().map(|file| rel(file)).collect(),
     }
-    scans
-        .into_iter()
-        .map(|(file, scan)| {
-            let rel = display_rel(file.strip_prefix(root).expect("under root"));
-            (rel, scan.deadlines)
-        })
-        .collect()
 }
 
 /// Parses the baseline: `<path> <count>` per line, blank lines and `#`
@@ -449,14 +654,30 @@ fn fixed_test_deadlines_use_the_timeout_multiplier() {
         .unwrap_or_else(|e| panic!("read {BASELINE_FILE}: {e}"));
     let baseline =
         parse_baseline(&baseline_text).unwrap_or_else(|e| panic!("{BASELINE_FILE}: {e}"));
-    let deadlines = scan_tree(&root);
-    assert!(
-        deadlines.contains_key("crates/intent-store/src/tests/note_pages.rs")
-            && deadlines.contains_key("crates/intent-services/src/test_support.rs"),
-        "test-code discovery lost a known test file; scanned {} files",
-        deadlines.len()
-    );
+    let Tree { deadlines, whole } = scan_tree(&root);
+    for known in [
+        "crates/intent-store/src/tests/note_pages.rs",
+        "crates/intent-services/src/test_support.rs",
+        "crates/intentd/tests/common/mod.rs",
+    ] {
+        assert!(
+            whole.contains(known),
+            "test-code discovery no longer scans {known} as test code; {} files scanned whole",
+            whole.len()
+        );
+    }
     if std::env::var_os("INTENTD_UPDATE_FIXED_DEADLINE_BASELINE").is_some() {
+        let raised: Vec<String> = deadlines
+            .iter()
+            .filter(|(path, found)| found.len() > baseline.get(*path).copied().unwrap_or(0))
+            .map(|(path, found)| format!("{path} {}", found.len()))
+            .collect();
+        let malformed = deadlines.values().flatten().any(|d| d.marker_malformed);
+        assert!(
+            raised.is_empty() && !malformed,
+            "update mode only lowers {BASELINE_FILE}; fix these first:\n{}",
+            report(&deadlines, &baseline)
+        );
         let header = baseline_text.lines().take_while(|l| l.starts_with('#'));
         let entries = deadlines
             .iter()
@@ -519,9 +740,13 @@ fn t() {
         + std::time::Duration::from_secs(10);
     let deadline = Instant::now().checked_add(Duration::from_secs(1));
     timeout ( Duration :: from_secs_f64 ( 0.5 ) , f);
+    let (g, _) = cv.wait_timeout(lock(&m, [1, 2]), Duration::from_secs(5)).unwrap();
+    let (g, _) = cv.wait_timeout_while(g, Duration::from_secs(5), |s| !*s).unwrap();
+    cv.wait_timeout(g, test_timeout(Duration::from_secs(5)));
+    timeout(f, Duration::from_secs(5));
 }
 ";
-    assert_eq!(lines_in(src), vec![2, 3, 4, 8, 9, 10, 11, 13, 14]);
+    assert_eq!(lines_in(src), vec![2, 3, 4, 8, 9, 10, 11, 13, 14, 15, 16]);
 }
 
 #[test]
@@ -730,4 +955,80 @@ fn report_follows_the_ratchet() {
     }
     assert!(!report.contains("equal.rs"), "{report}");
     assert!(!report.contains("clean.rs"), "{report}");
+}
+
+#[test]
+fn cfg_all_test_items_are_test_code_but_cfg_any_test_is_not() {
+    let src = "\
+#[cfg(all(test, unix))]
+mod unix_tests {
+    fn t() { timeout(Duration::from_secs(5), f); }
+}
+#[cfg(all(unix, test))]
+fn helper() { timeout(Duration::from_secs(5), f); }
+#[cfg(all(
+    test,
+    any(unix, windows)
+))]
+mod multi_line {
+    fn t() { timeout(Duration::from_secs(5), f); }
+}
+#[cfg(any(test, feature = \"fixtures\"))]
+fn shared() { timeout(Duration::from_secs(5), f); }
+#[cfg(not(test))]
+fn prod() { timeout(Duration::from_secs(5), f); }
+#[cfg(all(not(test), unix))]
+fn prod_unix() { timeout(Duration::from_secs(5), f); }
+#[cfg(all(testing, unix))]
+fn other() { timeout(Duration::from_secs(5), f); }
+";
+    let found = scan_source(src, false).deadlines;
+    assert_eq!(
+        found.iter().map(|d| d.line).collect::<Vec<_>>(),
+        vec![3, 6, 12]
+    );
+}
+
+#[test]
+fn a_budget_scaled_at_runtime_is_not_fixed() {
+    let src = "\
+fn t() {
+    timeout(Duration::from_secs(10).mul_f64(timeout_multiplier()), f);
+    rx.recv_timeout(Duration::from_secs(10).mul_f32(m));
+    let deadline = Instant::now() + Duration::from_secs(10) * multiplier;
+    timeout(Duration::from_secs(5) * 2, f);
+    timeout(Duration::from_millis(u64::from(n)).mul_f64(m), f);
+    timeout(Duration::from_millis(u64::from(n)) + Duration::from_secs(1), f);
+}
+";
+    assert_eq!(lines_in(src), vec![5, 7]);
+}
+
+#[test]
+fn a_whole_test_file_makes_its_out_of_line_modules_test_code() {
+    let src = "\
+mod helpers;
+#[path = \"shared/fixtures.rs\"]
+pub(crate) mod fixtures;
+mod inline { }
+use some::module;
+";
+    assert_eq!(
+        scan_source(src, true).test_mods,
+        vec![
+            ("helpers".to_string(), None),
+            (
+                "fixtures".to_string(),
+                Some("shared/fixtures.rs".to_string())
+            ),
+        ]
+    );
+    assert_eq!(scan_source(src, false).test_mods, vec![]);
+    assert_eq!(
+        test_mod_targets(Path::new("crates/a/src/bus_tests.rs"), "helpers", None),
+        vec![
+            PathBuf::from("crates/a/src/bus_tests/helpers.rs"),
+            PathBuf::from("crates/a/src/bus_tests/helpers"),
+        ]
+    );
 }
