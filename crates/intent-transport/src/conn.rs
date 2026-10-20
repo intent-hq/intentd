@@ -404,6 +404,20 @@ impl ConnSubs {
         true
     }
 
+    /// Drop `agent.workers.subscribe` entries whose forwarder has ended,
+    /// from both the registry and the per-connection worker cap (§5.5b).
+    fn reclaim_finished_workers(&mut self) {
+        let subs = &mut self.subs;
+        self.worker_subs.retain(|id| match subs.get(id) {
+            Some(live) if !live.handle.is_finished() => true,
+            Some(_) => {
+                subs.remove(id);
+                false
+            }
+            None => false,
+        });
+    }
+
     /// Whether a registered forwarder has exited on its own (`None` for an
     /// unknown id). Test probe for the membership teardown paths.
     #[cfg(test)]
@@ -1373,12 +1387,10 @@ pub(crate) async fn handle_workers_subscribe(
             return !id.present || out_tx.send_priority(frame).await.is_ok();
         }
     };
-    // A forwarder that ended (agent gone, access lost) no longer counts.
-    subs.worker_subs.retain(|sub| {
-        subs.subs
-            .get(sub)
-            .is_some_and(|live| !live.handle.is_finished())
-    });
+    // Reclaim every worker subscription whose forwarder ended (agent gone,
+    // access lost): its registry entry and its capacity slot. The registry
+    // therefore never holds more than the cap of ended worker entries.
+    subs.reclaim_finished_workers();
     if subs.worker_subs.len() >= crate::agent_workers::MAX_WORKER_SUBSCRIPTIONS {
         let frame = reply(
             -32602,

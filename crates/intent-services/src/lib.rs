@@ -31625,7 +31625,7 @@ impl WorkspaceApi for Services {
                 .agent_workers
                 .stop_target(&agent_id, &connection_generation, &async_task_id)
                 .ok_or_else(not_found)?;
-            let (connection, session_id) = match target {
+            let (connection, session_id, fence) = match target {
                 agent_workers::StopTarget::Decline => return Ok(declined),
                 agent_workers::StopTarget::ConnectionGone => {
                     return Err(Error::ProviderRequest(
@@ -31635,7 +31635,8 @@ impl WorkspaceApi for Services {
                 agent_workers::StopTarget::Forward {
                     connection,
                     session_id,
-                } => (connection, session_id),
+                    fence,
+                } => (connection, session_id, fence),
             };
             // Last check before the write: the deciding generation must still
             // be this agent's current one. A retired generation's connection is
@@ -31652,7 +31653,7 @@ impl WorkspaceApi for Services {
                 ));
             }
             let answer =
-                intent_acp::workers::request_stop(&connection, &session_id, &async_task_id)
+                intent_acp::workers::request_stop(&connection, &session_id, &async_task_id, fence)
                     .await
                     .map_err(|e| Error::ProviderRequest(e.to_string()))?;
             Ok(serde_json::json!({

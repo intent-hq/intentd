@@ -3852,6 +3852,7 @@ impl AgentManager {
         // the install is refused here (fresh child killed below); handle
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
+        let mut worker_rx = Some(worker_rx);
         let fenced = {
             let closed = self.admission_closed.lock().unwrap();
             let retired = self.retired.lock().unwrap();
@@ -3871,6 +3872,21 @@ impl AgentManager {
                             Arc::downgrade(&repository_origin),
                         ),
                     );
+                    // §5.5b: the worker generation starts atomically with the
+                    // install, under the same locks a teardown fence takes, so
+                    // a concurrent stop/detach either never sees this handle
+                    // or releases this generation after it exists. Reports
+                    // buffer in the channel until the drain starts.
+                    if let Some(frames) = worker_rx.take() {
+                        self.begin_worker_generation(
+                            &workspace_id,
+                            &agent_id,
+                            opts.profile_env
+                                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
+                            worker_connection.clone(),
+                            frames,
+                        );
+                    }
                     None
                 } else {
                     Some(handle)
@@ -3886,17 +3902,6 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
-        // §5.5b: only an installed handle gets a worker generation (a fenced
-        // spawn must not leave a projection behind for a deleted agent).
-        // Reports buffer in the channel until the drain starts.
-        self.begin_worker_generation(
-            &workspace_id,
-            &agent_id,
-            opts.profile_env
-                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
-            worker_connection,
-            worker_rx,
-        );
         // Proactive dead-child detection (monorepo#764): watch the installed
         // child for an unexpected exit so an idle agent's death is reaped
         // (handle + registry) as it happens, not just at the next prompt.

@@ -190,11 +190,13 @@ pub async fn request_stop(
     conn: &Connection,
     session_id: &str,
     async_task_id: &str,
+    fence: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> AcpResult<Value> {
-    conn.request_timeout(
+    conn.request_fenced(
         STOP_METHOD,
         json!({ "sessionId": session_id, "asyncTaskId": async_task_id }),
         STOP_TIMEOUT,
+        fence,
     )
     .await
 }

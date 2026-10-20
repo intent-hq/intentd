@@ -239,6 +239,11 @@ mod channel_tests {
                 reply["result"]["subscriptionId"].is_string(),
                 "slot {n} free: {reply}"
             );
+            assert_eq!(
+                subs.forwarder_finished(&sub_id),
+                None,
+                "the ended forwarder's registry entry is reclaimed"
+            );
         }
         drop(subs);
     }

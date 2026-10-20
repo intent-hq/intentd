@@ -10,6 +10,7 @@
 //! ones, and nothing but a provider frame ever changes a row.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use intent_acp::transport::Connection;
@@ -495,6 +496,15 @@ impl Projection {
 struct Entry {
     projection: Projection,
     connection: Weak<Connection>,
+    /// Revoked when this generation disconnects, is replaced or released;
+    /// a stop request carries it to the connection's writer (§5.5b).
+    fence: Arc<AtomicBool>,
+}
+
+impl Entry {
+    fn revoke(&self) {
+        self.fence.store(true, Ordering::SeqCst);
+    }
 }
 
 /// What [`AgentWorkers::stop_target`] resolved.
@@ -503,6 +513,9 @@ pub(crate) enum StopTarget {
     Forward {
         connection: Arc<Connection>,
         session_id: String,
+        /// The generation's write fence: if it is revoked before the
+        /// request is written, nothing is sent.
+        fence: Arc<AtomicBool>,
     },
     /// The deciding generation's connection is gone: send nothing.
     ConnectionGone,
@@ -534,13 +547,17 @@ impl AgentWorkers {
         let agent_id = scope.agent_id.clone();
         let mut projection = Projection::new(scope, identity, negotiated);
         let snapshot = projection.snapshot(now_ms());
-        self.lock().insert(
+        let replaced = self.lock().insert(
             agent_id,
             Entry {
                 projection,
                 connection,
+                fence: Arc::new(AtomicBool::new(false)),
             },
         );
+        if let Some(old) = replaced {
+            old.revoke();
+        }
         snapshot
     }
 
@@ -617,9 +634,14 @@ impl AgentWorkers {
 
     /// Mark `generation`'s connection disconnected. Returns the changed snapshot.
     pub(crate) fn disconnect(&self, agent_id: &AgentId, generation: &str) -> Option<Value> {
-        self.with_generation(agent_id, generation, |p| {
-            p.disconnect().then(|| p.snapshot(now_ms()))
-        })
+        let mut entries = self.lock();
+        let entry = entries.get_mut(agent_id)?;
+        if entry.projection.generation() != Some(generation) {
+            return None;
+        }
+        entry.revoke();
+        let p = &mut entry.projection;
+        p.disconnect().then(|| p.snapshot(now_ms()))
     }
 
     /// Release an agent's projection (its live session was disposed: the
@@ -627,6 +649,7 @@ impl AgentWorkers {
     /// replacement no-session snapshot for subscribers.
     pub(crate) fn release(&self, agent_id: &AgentId) -> Option<Value> {
         let entry = self.lock().remove(agent_id)?;
+        entry.revoke();
         let s = entry.projection.scope;
         Some(Projection::no_session(s.workspace_id, s.agent_id, s.provider).snapshot(now_ms()))
     }
@@ -654,11 +677,12 @@ impl AgentWorkers {
         {
             StopDecision::Decline => Some(StopTarget::Decline),
             StopDecision::Forward { session_id } => Some(match entry.connection.upgrade() {
-                Some(connection) => StopTarget::Forward {
+                Some(connection) if !entry.fence.load(Ordering::SeqCst) => StopTarget::Forward {
                     connection,
                     session_id,
+                    fence: Arc::clone(&entry.fence),
                 },
-                None => StopTarget::ConnectionGone,
+                _ => StopTarget::ConnectionGone,
             }),
         }
     }

@@ -16,7 +16,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -402,6 +402,65 @@ pub struct IncomingRequest {
     pub params: Value,
 }
 
+/// Write-time fences keyed by request id ([`Connection::request_fenced`]).
+#[derive(Default)]
+struct WriteFences {
+    by_id: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+    count: AtomicUsize,
+}
+
+/// Just the id of an outbound request line.
+#[derive(serde::Deserialize)]
+struct LineId {
+    id: Option<i64>,
+}
+
+/// JSON-RPC error a fenced request receives when it is withheld.
+const FENCED_WRITE_CODE: i64 = -32000;
+
+impl WriteFences {
+    fn arm(&self, id: i64, fence: Arc<AtomicBool>) {
+        if self.by_id.lock().unwrap().insert(id, fence).is_none() {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn disarm(&self, id: i64) {
+        if self.by_id.lock().unwrap().remove(&id).is_some() {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether `line` is a fenced request whose fence is revoked; if so its
+    /// pending caller is failed. Ordinary lines are not parsed unless a
+    /// fenced request is outstanding.
+    fn revoked_at_write(&self, line: &str, pending: &PendingMap) -> bool {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let Some(id) = serde_json::from_str::<LineId>(line).ok().and_then(|l| l.id) else {
+            return false;
+        };
+        let revoked = self
+            .by_id
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|fence| fence.load(Ordering::SeqCst));
+        if revoked {
+            if let Some(request) = pending.lock().unwrap().remove(&id) {
+                let _ = request.sender.send(Err(JsonRpcError {
+                    code: FENCED_WRITE_CODE,
+                    message: "request withheld: its write fence was revoked before the write"
+                        .into(),
+                    data: None,
+                }));
+            }
+        }
+        revoked
+    }
+}
+
 /// A notification from the agent (`session/update`, …). For M3.3 this is a
 /// plumbing hook; the streaming router lands in M3.4.
 #[derive(Debug, Clone)]
@@ -750,6 +809,10 @@ pub struct Connection {
     pub(crate) codex_sandboxes: Mutex<HashMap<String, crate::codex_sandbox::CodexSandbox>>,
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
+    /// Write-time fences of outstanding fenced requests, by request id
+    /// ([`Connection::request_fenced`]). The writer consults this only while
+    /// [`WriteFences::count`] is nonzero, so ordinary traffic pays one load.
+    write_fences: Arc<WriteFences>,
     pending: PendingMap,
     config_options: SessionConfigOptions,
     session_titles: watch::Receiver<SessionTitles>,
@@ -802,9 +865,17 @@ impl Connection {
         // Writer task: drain whole lines to stdin, one at a time.
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(WRITER_CHANNEL_CAPACITY);
         let review_writer = review_monitoring.clone();
+        let write_fences = Arc::new(WriteFences::default());
+        let fences_writer = Arc::clone(&write_fences);
+        let pending_writer = Arc::clone(&pending);
         tasks.push(tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = writer_rx.recv().await {
+                // A fenced request whose fence was revoked while it waited in
+                // this queue is never written; its caller gets an error now.
+                if fences_writer.revoked_at_write(&line, &pending_writer) {
+                    continue;
+                }
                 if stdin.write_all(line.as_bytes()).await.is_err() {
                     break;
                 }
@@ -969,6 +1040,7 @@ impl Connection {
             callback_routes: Arc::new(CallbackToolRoutes::default()),
             codex_sandboxes: Mutex::new(HashMap::new()),
             writer_tx,
+            write_fences,
             pending,
             config_options,
             session_titles,
@@ -1089,6 +1161,36 @@ impl Connection {
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.request_with_id(id, method, params, timeout).await
+    }
+
+    /// [`Connection::request_timeout`] bound to a revocable write fence: the
+    /// request is refused when `fence` is already set, and the writer drops
+    /// it instead of writing it when `fence` is set while it waits in the
+    /// outbound queue. Either way nothing reaches the agent and the caller
+    /// gets an error (PROTOCOL §5.5b stop).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] when the fence is already revoked,
+    /// [`AcpError::Rpc`] when it is revoked before the write, and otherwise
+    /// the errors of [`Connection::request_timeout`].
+    pub async fn request_fenced(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        fence: Arc<AtomicBool>,
+    ) -> AcpResult<Value> {
+        if fence.load(Ordering::SeqCst) {
+            return Err(AcpError::Transport(
+                "write fence revoked before the request was queued".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.write_fences.arm(id, fence);
+        let result = self.request_with_id(id, method, params, timeout).await;
+        self.write_fences.disarm(id);
+        result
     }
 
     pub(crate) async fn initialize_recipient(
@@ -2694,6 +2796,127 @@ mod worker_routing_tests {
         assert_eq!(
             forwarded.params["update"]["sessionUpdate"],
             "async_task_spawned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_fence_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::AsyncReadExt;
+
+    /// A connection whose agent-side stdin is a tiny pipe nobody reads yet,
+    /// so the writer task blocks on the first large line.
+    fn blocked_writer() -> (
+        Arc<Connection>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(64);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        (Arc::new(conn), c2a_agent, a2c_agent)
+    }
+
+    async fn read_until(agent: &mut tokio::io::DuplexStream, needle: &str) -> String {
+        let mut seen = String::new();
+        let mut buf = [0_u8; 1024];
+        // Read until the needle has arrived and the line holding it is complete.
+        while !(seen.contains(needle) && seen.ends_with('\n')) {
+            let n = tokio::time::timeout(Duration::from_secs(5), agent.read(&mut buf))
+                .await
+                .expect("agent stdin read timed out")
+                .unwrap();
+            assert!(n > 0, "stdin closed before {needle}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        seen
+    }
+
+    /// PROTOCOL §5.5b stop: a fence revoked while the request waits in the
+    /// outbound queue means the line is never written and the caller fails
+    /// at once; later traffic still flows.
+    #[tokio::test]
+    async fn a_fence_revoked_while_queued_withholds_the_write() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let fence = Arc::new(AtomicBool::new(false));
+        let request = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&fence));
+            tokio::spawn(async move {
+                conn.request_fenced(
+                    "_session/async_task/stop",
+                    json!({}),
+                    Duration::from_secs(30),
+                    fence,
+                )
+                .await
+            })
+        };
+        // timing-guard: let the fenced request reach the queue behind the blocked writer
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(written.contains("bulk/first"));
+        assert!(
+            !written.contains("_session/async_task/stop"),
+            "the withheld line was written: {written}"
+        );
+        match request.await.unwrap() {
+            Err(AcpError::Rpc(err)) => assert_eq!(err.code, FENCED_WRITE_CODE),
+            other => panic!("expected a withheld write, got {other:?}"),
+        }
+        assert!(!conn.has_pending_requests());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_fence_is_refused_before_queueing_and_an_open_one_writes() {
+        let (conn, mut agent_in, mut agent_out) = blocked_writer();
+        let revoked = Arc::new(AtomicBool::new(true));
+        assert!(matches!(
+            conn.request_fenced(
+                "_session/async_task/stop",
+                json!({}),
+                Duration::from_secs(5),
+                revoked
+            )
+            .await,
+            Err(AcpError::Transport(_))
+        ));
+        let open = Arc::new(AtomicBool::new(false));
+        let request = {
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                conn.request_fenced(
+                    "_session/async_task/stop",
+                    json!({ "asyncTaskId": "t" }),
+                    Duration::from_secs(5),
+                    open,
+                )
+                .await
+            })
+        };
+        let written = read_until(&mut agent_in, "_session/async_task/stop").await;
+        let id: Value = serde_json::from_str(written.trim().lines().last().unwrap()).unwrap();
+        agent_out
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({ "jsonrpc": "2.0", "id": id["id"], "result": { "stopped": true } })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.await.unwrap().unwrap(), json!({ "stopped": true }));
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            0,
+            "fence disarmed after the answer"
         );
     }
 }

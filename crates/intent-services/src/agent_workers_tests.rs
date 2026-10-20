@@ -653,3 +653,47 @@ fn an_invalid_receipt_time_records_no_tombstone() {
     )));
     assert!(p.seen.is_empty());
 }
+
+#[tokio::test]
+async fn a_stop_fence_is_revoked_by_disconnect_replacement_and_release() {
+    let workers = AgentWorkers::default();
+    let agent = AgentId::from("agent-A");
+    let conn = connection();
+    let fence_of = |workers: &AgentWorkers| match workers.stop_target(&agent, "generation-A", "w") {
+        Some(StopTarget::Forward { fence, .. }) => fence,
+        _ => panic!("expected a forwardable stop"),
+    };
+    let start = |workers: &AgentWorkers| {
+        workers.begin(
+            scope("codex"),
+            &identity("codex"),
+            true,
+            Arc::downgrade(&conn),
+        );
+        workers.ingest(&agent, "generation-A", &frame(spawn("w"), 1000));
+    };
+
+    start(&workers);
+    let fence = fence_of(&workers);
+    assert!(!fence.load(Ordering::SeqCst));
+    workers.disconnect(&agent, "generation-A");
+    assert!(fence.load(Ordering::SeqCst), "disconnect revokes");
+
+    start(&workers);
+    let fence = fence_of(&workers);
+    workers.begin(
+        Scope {
+            connection_generation: Some("generation-B".into()),
+            ..scope("codex")
+        },
+        &identity("codex"),
+        true,
+        Arc::downgrade(&conn),
+    );
+    assert!(fence.load(Ordering::SeqCst), "replacement revokes");
+
+    start(&workers);
+    let fence = fence_of(&workers);
+    workers.release(&agent);
+    assert!(fence.load(Ordering::SeqCst), "release revokes");
+}
