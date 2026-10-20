@@ -92,7 +92,8 @@ jobs:
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
             {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
-            {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]}
+            {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
             ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
@@ -184,12 +185,12 @@ jobs:
             // Free slots go to the caller's listed jobs one at a time: Rust-compiling
             // jobs first (they reuse the slot's local cache), then the longest, then
             // list order. Listed jobs that do not fit, or that skip this event, get
-            // their hosted label directly; matrix shards are ranked separately.
+            // their hosted label directly; matrix legs are ranked separately.
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
             try {
-              requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => j.shards ? Array.from({length: j.shards}, (_, n) => ({...j, key: `${j.key}-${n + 1}`})) : [j]);
+              requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
             } catch (error) {
               core.info(`slot list unreadable (${error.message}); listed jobs use hosted labels`);
             }
@@ -1907,7 +1908,8 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-24.04", "windows-2025"]' || '["ubuntu-24.04"]') }}
         node: [22, 24]
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    # Linux legs read their own slot; the Windows leg keeps the native mapping.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots || '{}')[format('pi-session-paths-{0}', matrix.node)] || fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 10
     env:
       PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js

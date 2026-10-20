@@ -7,6 +7,7 @@ hand-maintained approximation of cargo-dist's flags or cross compiler choices.
 """
 import argparse
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 import runpy
@@ -129,7 +130,28 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
 # No cache archives, retention permissions, publication or notifications.
 # Compare actual compiler hits and build duration before claiming a speedup.
 ''' + yaml.dump(doc, Dumper=Dumper, sort_keys=False, width=110)
-    return runpy.run_path(str(ROOT / 'scripts/configure-runner-routing.py'))['configure'](output)
+    routed = runpy.run_path(str(ROOT / 'scripts/configure-runner-routing.py'))['configure'](output)
+    return fit_sitter_slots(routed, sitter_strategy['matrix']['include'])
+
+
+def fit_sitter_slots(text, rows):
+    """Give each heavy Linux sitter leg its own slot so parallel legs never share one free slot."""
+    legs = [row['target'] for row in rows if row['os'] in ('gh-linux-8x', 'gh-linux-16x')]
+    labels = {row['os'] for row in rows if row['target'] in legs}
+    if len(labels) != 1:
+        raise ValueError('sitter Linux legs must share one hosted label; review the slot list')
+    slot_jobs = json.dumps([{'key': 'sitter', 'label': labels.pop(), 'rust': True, 'minutes': 20, 'legs': legs}],
+                           separators=(',', ':'))
+    route = '  runner-route:\n    uses: ./.github/workflows/runner-route.yml\n'
+    old = "    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}\n    timeout-minutes: 30\n"
+    new = ("    runs-on: ${{ contains(matrix.os, 'gh-linux') && fromJSON(needs.runner-route.outputs.slots || '{}')"
+           "[format('sitter-{0}', matrix.target)] || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os]"
+           " || matrix.os }}\n    timeout-minutes: 30\n")
+    if text.count(route) != 1 or text.count(old) != 1:
+        raise ValueError('release-cache routing changed; review the sitter slot list')
+    text = text.replace(route, route + '    with:\n      # Each heavy Linux sitter leg reads its own slot (see runner-route.yml).\n'
+                        '      slot_jobs: >-\n        ' + slot_jobs + '\n')
+    return text.replace(old, new)
 
 
 def main():

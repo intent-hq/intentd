@@ -641,6 +641,19 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(job=job_id):
                 self.assertIn("needs.route.outputs.slots", self.workflow["jobs"][job_id]["runs-on"])
 
+    def test_merge_queue_fits_fast_jobs_and_pi_legs_to_free_slots(self):
+        # Three free fast slots and four listed fast jobs: release-scripts (longest) and both
+        # Linux pi-session-paths legs get them; deb-packaging and unlisted jobs go hosted.
+        result = run_route(self.workflow, org=[small_slot()] * 3, eventName="merge_group")
+        slots = json.loads(result["outputs"]["slots"])
+        on_pool = sorted(k for k, v in slots.items() if v == SMALL)
+        self.assertEqual(on_pool, ["pi-session-paths-22", "pi-session-paths-24", "release-scripts"])
+        self.assertEqual(slots["deb-packaging"], ["ubuntu-24.04"])
+        self.assertEqual(json.loads(result["outputs"]["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
+        runs_on = self.workflow["jobs"]["pi-session-paths"]["runs-on"]
+        self.assertIn("format('pi-session-paths-{0}', matrix.node)", runs_on)
+        self.assertTrue(runs_on.startswith("${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots"))
+
     def test_pr_fits_heavy_rust_jobs_to_free_slots(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         busy = {"status": "in_progress", "labels": CACHE, "created_at": "2099-01-01T00:00:00Z"}
