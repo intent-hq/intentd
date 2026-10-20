@@ -149,6 +149,44 @@ fn next_generation() -> u64 {
 /// globally unique; this registry does not permit duplicate public definitions.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
 
+/// Command-mode run activity for the idle update handshake (see
+/// [`crate::Services::command_script_activity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandScriptActivity {
+    /// Command runs in flight: admitted and not yet durably settled, or with
+    /// a live process. A run stays in flight after its process exits until
+    /// its result is persisted, so a restart never races the settlement.
+    pub in_flight: usize,
+    /// When the most recent command run settled, so a run that starts and
+    /// ends between two samples still restarts an idle grace.
+    pub last_settled_at: Option<Instant>,
+}
+
+/// [`CommandScriptActivity`] over `registry` (one registry lock) plus the
+/// registry-wide settlement stamp in `locks`.
+pub(crate) fn command_activity(
+    registry: &ScriptRegistry,
+    locks: &ScriptLocks,
+) -> CommandScriptActivity {
+    let in_flight = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|m| {
+            m.def.mode == ScriptMode::Command
+                && (m.run_id.is_some()
+                    || matches!(
+                        m.state.status,
+                        ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
+                    ))
+        })
+        .count();
+    CommandScriptActivity {
+        in_flight,
+        last_settled_at: locks.command_settled_at(),
+    }
+}
+
 /// Shared async locks for workspace bootstrap and script definition updates.
 /// Bootstrap is workspace-scoped; updates use the durable script id across
 /// all workspaces, matching the store's primary key and legacy owner moves.
@@ -166,6 +204,10 @@ pub(crate) struct ScriptLocks {
     /// Workspaces being deleted: launch admission, service auto-restart and
     /// output logs are refused until the deletion finishes or fails.
     closing: Arc<Mutex<HashSet<WorkspaceId>>>,
+    /// When the most recent command run settled, registry-wide: kept here
+    /// rather than on the entry so removing or recreating a finished script
+    /// cannot erase it (and so skip the idle update grace).
+    command_settled_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ScriptLocks {
@@ -186,6 +228,24 @@ impl ScriptLocks {
         } else {
             set.remove(workspace_id);
         }
+    }
+
+    /// See [`CommandScriptActivity::last_settled_at`].
+    pub(crate) fn command_settled_at(&self) -> Option<Instant> {
+        *self
+            .command_settled_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a command run settlement now; monotonic.
+    pub(crate) fn mark_command_settled(&self) {
+        let now = Instant::now();
+        let mut at = self
+            .command_settled_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *at = (*at).max(Some(now));
     }
 
     /// Resolve (or create) the lock for a workspace.
@@ -5885,6 +5945,84 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["timedOut"], true);
+    }
+
+    /// The idle update handshake's busy probe: only an in-flight command-mode
+    /// run counts — a running service and a finished command run do not.
+    #[intent_test_macros::daemon_test]
+    async fn command_script_activity_counts_only_in_flight_command_runs() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        assert_eq!(h.services.command_script_activity().in_flight, 0);
+
+        let svc = create_simple(&h, "svc", SERVICE_CMD, ScriptMode::Service).await;
+        h.services
+            .script_start(h.ws.clone(), svc.clone())
+            .await
+            .expect("start service");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == svc.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        assert_eq!(
+            h.services.command_script_activity().in_flight,
+            0,
+            "a running service never holds off an update"
+        );
+
+        let cmd = create_simple(&h, "check", "sleep 3600", ScriptMode::Command).await;
+        h.services
+            .script_start(h.ws.clone(), cmd.clone())
+            .await
+            .expect("start command");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "running"
+        })
+        .await;
+        assert_eq!(h.services.command_script_activity().in_flight, 1);
+
+        assert_eq!(h.services.command_script_activity().last_settled_at, None);
+        h.services
+            .script_stop(h.ws.clone(), cmd.clone())
+            .await
+            .expect("stop command");
+        await_state(&mut sub, LIVENESS, |v| {
+            v["data"]["scriptId"] == cmd.as_str() && v["data"]["status"] == "exited"
+        })
+        .await;
+        // The run stays in flight until its result durably settles; then it
+        // no longer counts and the settlement is stamped.
+        let deadline = Instant::now() + LIVENESS;
+        let settled = loop {
+            let activity = h.services.command_script_activity();
+            if activity.in_flight == 0 {
+                break activity;
+            }
+            assert!(Instant::now() < deadline, "command run never settled");
+            // timing-guard: poll interval for the observable settlement, deadline-bounded.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let settled_at = settled
+            .last_settled_at
+            .expect("settlement stamps the end of the run");
+        // Removing the finished script must not erase the stamp, or the
+        // idle update grace after it would be skipped.
+        h.services
+            .script_remove(h.ws.clone(), cmd.clone())
+            .await
+            .expect("remove finished command");
+        assert_eq!(
+            h.services.command_script_activity(),
+            CommandScriptActivity {
+                in_flight: 0,
+                last_settled_at: Some(settled_at),
+            },
+            "the settlement stamp outlives the registry entry"
+        );
+        h.services
+            .script_stop(h.ws.clone(), svc)
+            .await
+            .expect("stop service");
     }
 
     /// Regression (monorepo#1155): a second `script.run` while the script is

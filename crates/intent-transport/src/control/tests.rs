@@ -70,6 +70,8 @@ impl FakeControl {
                     last_requested_at: Some("2026-09-15T14:00:00Z".to_string()),
                     next_eligible_at: Some("2026-09-15T15:00:00Z".to_string()),
                     restart_pending: true,
+                    running_scripts: 2,
+                    restart_deferred_until: Some("2026-09-15T16:30:00Z".to_string()),
                 },
             },
             shutdown_called: AtomicBool::new(false),
@@ -199,6 +201,8 @@ fn status_json_local_vs_remote_locality() {
             "lastRequestedAt": "2026-09-15T14:00:00Z",
             "nextEligibleAt": "2026-09-15T15:00:00Z",
             "restartPending": true,
+            "runningScripts": 2,
+            "restartDeferredUntil": "2026-09-15T16:30:00Z",
         })
     );
 
@@ -305,6 +309,8 @@ fn status_json_uds_only_has_no_port_or_fingerprint() {
             "lastRequestedAt": Value::Null,
             "nextEligibleAt": Value::Null,
             "restartPending": false,
+            "runningScripts": 0,
+            "restartDeferredUntil": Value::Null,
         })
     );
     assert!(v["host"].get("deviceKind").is_none());
