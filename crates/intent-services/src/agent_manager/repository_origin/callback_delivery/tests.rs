@@ -8666,7 +8666,8 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 .find(|r| r["method"] == "initialize")
                 .unwrap()["params"]["clientCapabilities"]["_meta"];
             assert_eq!(
-                meta.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                meta.as_object()
+                    .map(|m| m.keys().cloned().collect::<Vec<_>>()),
                 Some(vec!["jetbrains".to_string()]),
                 "{meta}"
             );
