@@ -407,3 +407,147 @@ fn cap_is_clamped_and_adjustable() {
     w.append(b"abcdefgh");
     assert_eq!(read_all(&store, "ws", "s", "r"), "efgh");
 }
+
+#[test]
+fn paginate_never_buffers_a_huge_line_it_does_not_return() {
+    let (_dir, store) = store(1 << 26);
+    let mut body = vec![b'x'; 8 * 1024 * 1024];
+    body.extend_from_slice(b"\nsmall\n");
+    store.open_writer("ws", "s", "r").append(&body);
+    let file = File::open(store.run_path("ws", "s", "r").unwrap()).unwrap();
+    let (page, peak) = paginate_file(file, Some(1), None).unwrap();
+    assert_eq!(page["items"], serde_json::json!(["small"]));
+    assert!(
+        peak <= SCAN_CHUNK,
+        "buffered {peak} bytes for an unreturned line"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_folders_below_root_are_never_followed() {
+    let (dir, store) = store(1024);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(store.root()).unwrap();
+    std::os::unix::fs::symlink(&outside, store.root().join("linked")).unwrap();
+
+    let mut w = store.open_writer("linked", "s", "r");
+    w.append(b"escaped");
+    assert!(
+        !w.is_enabled(),
+        "writer through a symlinked workspace folder"
+    );
+    assert!(
+        !outside.join("s").exists(),
+        "nothing created outside the root"
+    );
+
+    fs::create_dir_all(store.workspace_dir("ws").unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, store.script_dir("ws", "s").unwrap()).unwrap();
+    let mut w = store.open_writer("ws", "s", "r");
+    w.append(b"escaped");
+    assert!(!w.is_enabled(), "writer through a symlinked script folder");
+    assert!(!outside.join("r.log").exists());
+
+    fs::write(outside.join("r.log"), b"secret\n").unwrap();
+    assert!(
+        store.tail("ws", "s", "r", 10).is_err(),
+        "read through a symlinked folder"
+    );
+    assert!(store.paginate("ws", "s", "r", None, None).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_log_file_is_never_followed() {
+    let (dir, store) = store(1024);
+    let target = dir.path().join("target.txt");
+    fs::write(&target, b"secret\n").unwrap();
+    let path = store.run_path("ws", "s", "r").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let mut w = store.open_writer("ws", "s", "r");
+    w.append(b"escaped");
+    assert!(!w.is_enabled());
+    assert_eq!(fs::read(&target).unwrap(), b"secret\n");
+    assert!(store.tail("ws", "s", "r", 10).is_err());
+    assert!(store.paginate("ws", "s", "r", None, None).is_err());
+}
+
+#[test]
+fn reopen_under_a_smaller_cap_truncates_to_newest_bytes() {
+    let (_dir, mut store) = store(131_072);
+    let body = (0..30_000).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "{i:05}");
+        s
+    });
+    let body = &body.as_bytes()[body.len() - 131_072..];
+    store.open_writer("ws", "s", "r").append(body);
+    store.set_max_bytes_per_run(65_536);
+    let w = store.open_writer("ws", "s", "r");
+    let on_disk = fs::metadata(w.path()).unwrap().len();
+    assert!(on_disk <= 65_536, "reopened log is {on_disk} bytes");
+    assert_eq!(on_disk, w.len());
+    let text = read_all(&store, "ws", "s", "r");
+    assert!(text.ends_with("29999\n"), "newest bytes kept");
+    assert!(text.len() > 60_000, "kept close to the cap: {}", text.len());
+}
+
+#[test]
+fn paginate_blank_trim_matches_lossy_trim_for_unicode_and_invalid_bytes() {
+    let (_dir, store) = store(1 << 22);
+    let mut straddle = vec![b'a'; SCAN_CHUNK - 1];
+    straddle.extend_from_slice("\u{00A0}\n".as_bytes());
+    straddle.extend_from_slice(&vec![b' '; SCAN_CHUNK + 3]);
+    straddle.extend_from_slice("\n\u{3000}\u{00A0}\n".as_bytes());
+    let mut long_blank = b"x\n".to_vec();
+    long_blank.extend_from_slice(&vec![b'\t'; SCAN_CHUNK * 2 + 1]);
+    long_blank.push(b'\n');
+    let cases: Vec<Vec<u8>> = vec![
+        "a\n\u{00A0}\n\u{2003}\u{3000}\n".into(),
+        "a\n\u{0085}\n".into(),
+        b"a\n\xff\n \n".to_vec(),
+        b"a\n\xe3\x80\n".to_vec(),
+        b"a\n \xc2".to_vec(),
+        b"a\n\xc0\xa0\n".to_vec(),
+        b"a\n\xed\xa0\x80\n".to_vec(),
+        "\u{1F600}\n\u{FEFF}\n".into(),
+        b"a\r\n\r\n\x0b\x0c\n".to_vec(),
+        straddle,
+        long_blank,
+    ];
+    for (n, body) in cases.iter().enumerate() {
+        let run = format!("u{n}");
+        store.open_writer("ws", "s", &run).append(body);
+        let text = String::from_utf8_lossy(body);
+        for limit in [Some(1), Some(2), None] {
+            let got = store.paginate("ws", "s", &run, limit, None).unwrap();
+            assert_eq!(
+                got,
+                paginate_text_lines(&text, limit, None),
+                "case {n} limit {limit:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_never_reaches_through_a_symlinked_folder() {
+    let (dir, store) = store(1024);
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(outside.join("s")).unwrap();
+    fs::write(outside.join("s").join("r.log"), b"keep").unwrap();
+    fs::create_dir_all(store.root()).unwrap();
+    std::os::unix::fs::symlink(&outside, store.root().join("linked")).unwrap();
+    assert!(store.delete_run("linked", "s", "r").is_err());
+    assert!(store.delete_script("linked", "s").is_err());
+    store.delete_workspace("linked").unwrap();
+    assert!(
+        !store.root().join("linked").exists(),
+        "the link itself is removed"
+    );
+    assert_eq!(fs::read(outside.join("s").join("r.log")).unwrap(), b"keep");
+}

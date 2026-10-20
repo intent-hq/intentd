@@ -16,11 +16,13 @@
 //! - Reads stream the file and hold at most the requested lines (plus one line
 //!   at a time), never the whole log.
 //! - IDs are percent-encoded into a single safe path segment, so no ID can
-//!   name `.`/`..` or contain a separator and escape the root.
+//!   name `.`/`..` or contain a separator and escape the root. Symlinks below
+//!   the root are never followed: a symlinked folder or log is an error (the
+//!   root itself may be a symlink, e.g. a relocated data dir).
 
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -146,7 +148,7 @@ impl ScriptOutputStore {
                 return RunOutputWriter::disabled(PathBuf::new(), self.max_bytes_per_run);
             }
         };
-        match open_append(&path) {
+        match open_append(&self.root, &path, self.max_bytes_per_run) {
             Ok((file, len)) => RunOutputWriter {
                 path,
                 file: Some(file),
@@ -162,7 +164,9 @@ impl ScriptOutputStore {
 
     /// Whether the run's log exists.
     pub(crate) fn exists(&self, workspace_id: &str, script_id: &str, run_id: &str) -> Result<bool> {
-        Ok(self.run_path(workspace_id, script_id, run_id)?.is_file())
+        let path = self.run_path(workspace_id, script_id, run_id)?;
+        check_below_root(&self.root, &path, Walk::Read).map_err(|e| io_err(&path, &e))?;
+        Ok(fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()))
     }
 
     /// The last `max_lines` lines (at least 1) of a run's log and its total
@@ -175,7 +179,7 @@ impl ScriptOutputStore {
         max_lines: usize,
     ) -> Result<Option<TailText>> {
         let path = self.run_path(workspace_id, script_id, run_id)?;
-        let Some(mut file) = open_read(&path)? else {
+        let Some(mut file) = open_read(&self.root, &path)? else {
             return Ok(None);
         };
         let text = tail_lines(&mut file, max_lines.max(1)).map_err(|e| io_err(&path, &e))?;
@@ -197,10 +201,12 @@ impl ScriptOutputStore {
         token: Option<&str>,
     ) -> Result<Value> {
         let path = self.run_path(workspace_id, script_id, run_id)?;
-        let Some(file) = open_read(&path)? else {
+        let Some(file) = open_read(&self.root, &path)? else {
             return Ok(crate::pagination::paginate_text_lines("", limit, token));
         };
-        paginate_file(file, limit, token).map_err(|e| io_err(&path, &e))
+        paginate_file(file, limit, token)
+            .map(|(page, _)| page)
+            .map_err(|e| io_err(&path, &e))
     }
 
     /// Delete one run's log. A missing log is not an error.
@@ -211,19 +217,21 @@ impl ScriptOutputStore {
         run_id: &str,
     ) -> Result<()> {
         let path = self.run_path(workspace_id, script_id, run_id)?;
-        ignore_missing(fs::remove_file(&path)).map_err(|e| io_err(&path, &e))
+        check_below_root(&self.root, &path, Walk::Delete)
+            .and_then(|()| ignore_missing(fs::remove_file(&path)))
+            .map_err(|e| io_err(&path, &e))
     }
 
     /// Delete every log of one script. A missing folder is not an error.
     pub(crate) fn delete_script(&self, workspace_id: &str, script_id: &str) -> Result<()> {
         let dir = self.script_dir(workspace_id, script_id)?;
-        ignore_missing(fs::remove_dir_all(&dir)).map_err(|e| io_err(&dir, &e))
+        remove_tree(&self.root, &dir)
     }
 
     /// Delete every log of one workspace. A missing folder is not an error.
     pub(crate) fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
         let dir = self.workspace_dir(workspace_id)?;
-        ignore_missing(fs::remove_dir_all(&dir)).map_err(|e| io_err(&dir, &e))
+        remove_tree(&self.root, &dir)
     }
 
     /// Delete every log last modified more than `max_age` ago, except those
@@ -393,34 +401,133 @@ fn newest_bytes_at_line_start(file: &mut File, len: u64, budget: u64) -> io::Res
     })
 }
 
-fn open_append(path: &Path) -> io::Result<(File, u64)> {
-    let parent = path.parent().unwrap_or(path);
-    fs::create_dir_all(parent)?;
+/// How [`check_below_root`] treats the components between the root and a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Create missing folders; the final component must not be a symlink.
+    Create,
+    /// Stop at the first missing folder; the final component must not be a symlink.
+    Read,
+    /// Stop at the first missing folder; the final component may be a symlink
+    /// (removing a link never touches its target).
+    Delete,
+}
+
+/// Refuse to traverse a symlink (or non-folder) at any component between
+/// `root` and `path`. The root itself may be a symlink.
+fn check_below_root(root: &Path, path: &Path, walk: Walk) -> io::Result<()> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::other("path is outside the script output root"))?;
+    if walk == Walk::Create {
+        fs::create_dir_all(root)?;
+    }
+    let parts: Vec<_> = rel.components().collect();
+    let mut cur = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        cur.push(part);
+        let last = i + 1 == parts.len();
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                if last && walk == Walk::Delete {
+                    return Ok(());
+                }
+                return Err(io::Error::other(format!(
+                    "refusing to follow symlink {}",
+                    cur.display()
+                )));
+            }
+            Ok(m) if !last && !m.is_dir() => {
+                return Err(io::Error::other(format!(
+                    "{} is not a folder",
+                    cur.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if last || walk != Walk::Create {
+                    return Ok(());
+                }
+                match fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        // Lost a creation race: re-check what now exists.
+                        let m = fs::symlink_metadata(&cur)?;
+                        if m.file_type().is_symlink() || !m.is_dir() {
+                            return Err(io::Error::other(format!(
+                                "{} is not a folder",
+                                cur.display()
+                            )));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Open options that refuse a symlinked final component (`O_NOFOLLOW`).
+fn no_follow(mut opts: OpenOptions) -> OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts
+}
+
+/// Open a run's log for append (creating folders, never through a symlink)
+/// and enforce `cap` on what is already there. Returns the file and its size.
+fn open_append(root: &Path, path: &Path, cap: u64) -> io::Result<(File, u64)> {
     let open = || {
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(path)
+        check_below_root(root, path, Walk::Create)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).append(true);
+        no_follow(opts).open(path)
     };
     // A concurrent sweep may prune the freshly created (still empty) folder.
-    let file = match open() {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(parent)?;
-            open()?
-        }
+    let mut file = match open() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => open()?,
         other => other?,
     };
-    let len = file.metadata()?.len();
+    let mut len = file.metadata()?.len();
+    if len > cap {
+        // Reopened under a smaller cap: keep the newest bytes now.
+        let kept = newest_bytes_at_line_start(&mut file, len, cap)?;
+        file.set_len(0)?;
+        file.write_all(&kept)?;
+        file.flush()?;
+        len = kept.len() as u64;
+    }
     Ok((file, len))
 }
 
-fn open_read(path: &Path) -> Result<Option<File>> {
-    match File::open(path) {
+fn open_read(root: &Path, path: &Path) -> Result<Option<File>> {
+    check_below_root(root, path, Walk::Read).map_err(|e| io_err(path, &e))?;
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    match no_follow(opts).open(path) {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(io_err(path, &e)),
     }
+}
+
+/// Remove a folder tree below the root without traversing a symlinked parent.
+/// `remove_dir_all` itself never follows symlinks inside the tree, and a
+/// symlinked `dir` is removed as a link.
+fn remove_tree(root: &Path, dir: &Path) -> Result<()> {
+    check_below_root(root, dir, Walk::Delete)
+        .and_then(|()| match fs::symlink_metadata(dir) {
+            Ok(m) if m.file_type().is_symlink() => fs::remove_file(dir),
+            Ok(_) => fs::remove_dir_all(dir),
+            Err(e) => Err(e),
+        })
+        .or_else(|e| ignore_missing(Err(e)))
+        .map_err(|e| io_err(dir, &e))
 }
 
 /// The trailing `n` `'\n'`-delimited lines, read backwards in chunks.
@@ -463,50 +570,150 @@ fn count_newlines(file: &mut File) -> io::Result<usize> {
     }
 }
 
-/// Stream `file` twice: once to count lines up to the last non-blank one
-/// (mirroring `paginate_text_lines`' trailing-blank trim), once to collect the
-/// page window.
-fn paginate_file(mut file: File, limit: Option<i64>, token: Option<&str>) -> io::Result<Value> {
+/// Stream `file` twice in fixed-size chunks: once to count lines up to the
+/// last non-blank one (mirroring `paginate_text_lines`' trailing-blank trim),
+/// once to copy out only the page window's lines. Also returns the largest
+/// line buffer held, which is only ever a returned line.
+fn paginate_file(
+    mut file: File,
+    limit: Option<i64>,
+    token: Option<&str>,
+) -> io::Result<(Value, usize)> {
     let mut kept_len = 0usize;
-    for_each_line(&mut file, |index, line| {
-        if !line.trim().is_empty() {
-            kept_len = index + 1;
+    let mut probe = BlankProbe::default();
+    scan_lines(&mut file, |index, event| {
+        match event {
+            LineEvent::Bytes(bytes) => probe.feed(bytes),
+            LineEvent::End => {
+                if !probe.finish() {
+                    kept_len = index + 1;
+                }
+            }
         }
         true
     })?;
     let win = crate::pagination::page_window(kept_len, limit, token);
     let mut items: Vec<String> = Vec::with_capacity(win.end - win.start);
+    let mut peak = 0usize;
     if win.end > win.start {
         file.seek(SeekFrom::Start(0))?;
-        for_each_line(&mut file, |index, line| {
-            if index >= win.start && index < win.end {
-                items.push(line.to_owned());
+        let mut line = Vec::new();
+        scan_lines(&mut file, |index, event| {
+            if index < win.start {
+                return true;
             }
-            index + 1 < win.end
+            match event {
+                LineEvent::Bytes(bytes) => {
+                    line.extend_from_slice(bytes);
+                    true
+                }
+                LineEvent::End => {
+                    peak = peak.max(line.len());
+                    items.push(String::from_utf8_lossy(&line).into_owned());
+                    line.clear();
+                    index + 1 < win.end
+                }
+            }
         })?;
     }
     items.reverse();
-    Ok(json!({ "items": items, "nextToken": win.next_token }))
+    Ok((json!({ "items": items, "nextToken": win.next_token }), peak))
 }
 
-/// Visit every `split('\n')` line (lossily decoded) with its index until `f`
-/// returns false. Holds one line in memory at a time.
-fn for_each_line(file: &mut File, mut f: impl FnMut(usize, &str) -> bool) -> io::Result<()> {
-    let mut reader = BufReader::with_capacity(SCAN_CHUNK, file);
-    let mut raw = Vec::new();
+/// One step of [`scan_lines`]: a piece of the current line, or its end.
+enum LineEvent<'a> {
+    Bytes(&'a [u8]),
+    End,
+}
+
+/// Walk every `split('\n')` line (index from 0) in `SCAN_CHUNK` reads,
+/// reporting each line as zero or more byte pieces followed by `End`, until
+/// `f` returns false. The final (possibly empty) segment is always ended.
+/// Never buffers a line.
+fn scan_lines(file: &mut File, mut f: impl FnMut(usize, LineEvent<'_>) -> bool) -> io::Result<()> {
+    let mut buf = vec![0u8; SCAN_CHUNK];
     let mut index = 0usize;
     loop {
-        raw.clear();
-        let n = reader.read_until(b'\n', &mut raw)?;
-        let ended = raw.last() == Some(&b'\n');
-        if ended {
-            raw.pop();
-        }
-        // `split('\n')` always yields a final (possibly empty) segment.
-        if !f(index, &String::from_utf8_lossy(&raw)) || n == 0 || !ended {
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            f(index, LineEvent::End);
             return Ok(());
         }
-        index += 1;
+        let mut rest = &buf[..n];
+        while let Some(i) = rest.iter().position(|&b| b == b'\n') {
+            if i > 0 && !f(index, LineEvent::Bytes(&rest[..i])) {
+                return Ok(());
+            }
+            if !f(index, LineEvent::End) {
+                return Ok(());
+            }
+            index += 1;
+            rest = &rest[i + 1..];
+        }
+        if !rest.is_empty() && !f(index, LineEvent::Bytes(rest)) {
+            return Ok(());
+        }
+    }
+}
+
+/// Streaming equivalent of `String::from_utf8_lossy(line).trim().is_empty()`:
+/// a line is blank iff it is valid UTF-8 made only of whitespace (any invalid
+/// byte decodes to U+FFFD, which is not whitespace). Holds at most one
+/// partial UTF-8 sequence (4 bytes).
+#[derive(Default)]
+struct BlankProbe {
+    non_blank: bool,
+    pending: [u8; 4],
+    pending_len: usize,
+    want: usize,
+}
+
+impl BlankProbe {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.non_blank {
+                return;
+            }
+            if self.want == 0 {
+                match b {
+                    b'\t' | b'\x0b' | b'\x0c' | b'\r' | b' ' => {}
+                    0x00..=0x7f => self.non_blank = true,
+                    0xc2..=0xdf => self.start(b, 2),
+                    0xe0..=0xef => self.start(b, 3),
+                    0xf0..=0xf4 => self.start(b, 4),
+                    _ => self.non_blank = true,
+                }
+                continue;
+            }
+            self.pending[self.pending_len] = b;
+            self.pending_len += 1;
+            if self.pending_len == self.want {
+                let whitespace = std::str::from_utf8(&self.pending[..self.want])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .is_some_and(char::is_whitespace);
+                self.non_blank = !whitespace;
+                self.want = 0;
+                self.pending_len = 0;
+            }
+        }
+    }
+
+    fn start(&mut self, lead: u8, want: usize) {
+        self.pending[0] = lead;
+        self.pending_len = 1;
+        self.want = want;
+    }
+
+    /// Whether the line just ended was blank; resets for the next line.
+    fn finish(&mut self) -> bool {
+        let blank = !self.non_blank && self.want == 0;
+        *self = Self::default();
+        blank
     }
 }
 
