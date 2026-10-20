@@ -13,8 +13,38 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 script="$here/ci-lld-retry.sh"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/objs"
+decoy=""
+cleanup() {
+  if [ -n "$decoy" ]; then kill "$decoy" 2>/dev/null || true; fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+mkdir -p "$tmp/objs" "$tmp/bin"
+
+# The wrapper's diagnostics print host-wide state (live processes, the kernel
+# log). On a shared host another process's command line can hold both
+# `cargo` and `::error::`, which would fail the "no ::error::" assertions
+# below for reasons this suite does not own. Stub both commands so the
+# output only carries what this suite creates; the pgrep stub logs its argv
+# so the suite still proves the wrapper asks for cargo/rustc processes.
+cat >"$tmp/bin/pgrep" <<'EOF'
+#!/usr/bin/env bash
+echo "$*" >>"$PGREP_CALLS"
+echo "4242 stub-cargo-process"
+EOF
+cat >"$tmp/bin/dmesg" <<'EOF'
+#!/usr/bin/env bash
+echo "stub kernel log line"
+EOF
+chmod +x "$tmp/bin/pgrep" "$tmp/bin/dmesg"
+export PATH="$tmp/bin:$PATH" PGREP_CALLS="$tmp/pgrep-calls"
+: >"$PGREP_CALLS"
+
+# A process of our own that a real `pgrep -af 'cargo|rustc'` would report
+# with `::error::` in its command line: without the stub above, scenario 2
+# fails on every run, so the isolation is checked on any host.
+(exec -a "cargo-decoy ::error:: test-ci-lld-retry" sleep 300) </dev/null >/dev/null 2>&1 &
+decoy=$!
 
 # Fake cargo: appends one line per call to $CALLS; behaviour for call N is
 # read from $PLAN/N (missing = succeed). Each plan file holds an exit code
@@ -86,6 +116,9 @@ assert_contains "$tmp/out.s2" "missing object: $tmp/objs/intent_core-3f1a.rcgu.o
 assert_contains "$tmp/out.s2" "--- ls -la $tmp/objs" s2
 assert_contains "$tmp/out.s2" "neighbour.o" s2
 assert_contains "$tmp/out.s2" "--- pgrep -af 'cargo|rustc'" s2
+assert_contains "$tmp/out.s2" "4242 stub-cargo-process" s2
+[ "$(cat "$PGREP_CALLS")" = "-af cargo|rustc" ] || fail "s2: expected one 'pgrep -af cargo|rustc' call, got: $(cat "$PGREP_CALLS")"
+assert_contains "$tmp/out.s2" "stub kernel log line" s2
 assert_contains "$tmp/out.s2" "::warning::rust-lld could not open an object" s2
 assert_not_contains "$tmp/out.s2" "::error::" s2
 
