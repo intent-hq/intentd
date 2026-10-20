@@ -73,7 +73,7 @@ class ReviewBundleTests(unittest.TestCase):
         destination = moved / self.contract.identity
         runtime.archive.verify_install(self.contract, destination)
         result = subprocess.run([str(destination / "bin/review-containment"), "--version"],
-                                env={"PATH": "/usr/bin:/bin"}, capture_output=True,
+                                env={"PATH": "/usr/bin:/bin"}, capture_output=True,  # env-policy: no-python-child: bundled bubblewrap
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "bubblewrap 0.9.0")
@@ -104,7 +104,7 @@ class ReviewBundleTests(unittest.TestCase):
                "DISABLE_AUTOUPDATER": "1", "DD_INJECTION_ENABLED": "false",
                "DD_TRACE_ENABLED": "false", "DD_INJECT_NATIVE": "never"}
         with (self.root / "adapter.stderr").open("wb") as stderr:
-            child = subprocess.Popen([str(launcher)], cwd=home, env=env,
+            child = subprocess.Popen([str(launcher)], cwd=home, env=env,  # env-policy: no-python-child: bundled node adapter
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                                      start_new_session=True)
             try:

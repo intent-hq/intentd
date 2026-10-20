@@ -19,7 +19,8 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, and personal device pairing are currently experimental.
+Multiplayer, Collaboration, personal device pairing, and provider profiles are
+currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
@@ -59,7 +60,7 @@ Open Settings and use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
-| Appearance | Theme, colors, language, and fonts | `/settings?tab=display#theme` |
+| Appearance | Theme, colors, language, fonts, and chat display (such as Collapse tool activity) | `/settings?tab=display#theme` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
@@ -117,24 +118,62 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/SettingsSidebarNav.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
 the workspace creation form where offered. Available choices depend on configured
-providers; diagnose a missing provider in **Providers**. Do not promise a default
-change will switch an existing agent. Specialist entries appear
+providers; diagnose a missing provider in **Providers**. Changing a default provider
+or model affects new agents only; each existing agent keeps its own provider, model
+and reasoning level until changed in its own model picker. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
 `/settings?tab=specialists&view=create-specialist#create-specialist`; select an
 existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+**Provider profiles (experimental; Codex and Claude Code only).** Describe them
+only when the user asks. To turn them on, use the command menu action **Enable
+experimental provider profiles** (**Disable experimental provider profiles** turns
+them off), or, if asked, propose `labs.providerProfiles` with `ws.app.settings.propose`.
+A profile runs the installed
+CLI with its own environment variables, for example a work and a personal account
+or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
+choose **Add profile**: enter a name and environment variables (literal values,
+**Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
+the provider host user's home folder (`~user` stays literal). The user signs in or
+prepares that account outside Intent. Credentials inherited from the environment can still
+apply: for a Claude Code profile that should use another account (or none), set
+inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
+**Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
+custom base URL from the environment; for a different endpoint, give the profile
+its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
+**Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
+appears as its own model-picker group, such as **Codex · Work**; with profiles,
+the original configuration is **Codex · Default**. Each profile has its own **Fast
+mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
+never follows the Default setting. Delegated agents follow their
+explicit, specialist, or default selection, never the parent's profile.
+
+Switching a conversation to another profile, even with the same model, applies on
+the next message: a turn in progress finishes first, then a fresh provider session
+starts with the conversation history. Editing a profile's environment never
+interrupts or restarts anything. Running sessions keep their settings and show
+**Using earlier settings**; new provider processes, including ones restarted after
+idling or a crash, use the saved settings. To refresh existing conversations,
+restart Intent when the app runs the daemon on this computer, otherwise restart
+intentd on the provider host; reconnecting alone does not apply the edit. Remove a
+profile from the same view, after changing any default, specialist, or quick-action
+setting that selects it. Conversations keep their history, and their next message
+asks for another model (**Choose another model to continue**), as does a profile
+whose provider is disabled. Intent never switches them to another account.
+
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
 available on the current connection.
 
-<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts. -->
+<!-- Sources: packages/cloudlands-fe/src/features/settings/MobileSettings.svelte; packages/cloudlands-fe/src/lib/components/settings/{DevicesSettings,DeviceRow,WebSocketApiSettings}.svelte; packages/cloudlands-fe/src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; packages/intentd/crates/intentd/src/main.rs (`intentd pair --host`). -->
 
 ## Find the mobile pairing QR code
 
@@ -164,7 +203,9 @@ with **Test connection** inside its editing panel. Workspaces and agents belong 
 host, so identify the intended device before explaining missing work or changing
 host settings. **Mobile** follows the active connection and its permissions; do not
 describe a remote connection's QR as belonging to the local desktop. To pair the
-local machine, connect to it first. Enabling access, changing listening addresses,
+local machine, connect to it first. For intentd running in WSL on the same Windows
+PC, add a device with host `localhost`; `intentd pair --host localhost` in WSL prints
+the port and token. Enabling access, changing listening addresses,
 and configuring a tunnel are separate choices from displaying pairing information.
 Read current state and respect the user's requested scope.
 
@@ -191,7 +232,13 @@ checking the desktop daemon. **Back to Home** keeps saved credentials.
 
 ## Start or continue work
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail}.svelte; src/features/home/home.css. -->
+Legacy workspace import has been retired. Settings no longer offers the Data import
+section, and a fresh daemon does not discover or import old Electron workspace
+directories. Workspaces already stored in the daemon remain available.
+
+<!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -200,13 +247,32 @@ workspace's preview header shows its repository. Local repositories show their n
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; messages/en.json. -->
+The PR badge in list and board views prioritizes draft PRs, then open PRs
+(including conflicted or queued PRs), then merged and closed PRs. Within the same
+state, it shows the most recently updated available PR. Home's shortened PR list
+keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
+includes the other linked PRs, even when their details are not loaded.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; messages/en.json. -->
 
 Open **New workspace** (`/workspace/new`), select a repository, describe the work,
 and choose **Create workspace**. The workspace groups working files, notes, and
 agent conversations. Resolve any displayed repository, Git, or provider setup
 error before retrying. If creation succeeded but sending the first message failed,
 use the form's retry instruction instead of creating a second workspace.
+Selecting a repository restores the agent setup last used to create a workspace
+there: **Single agent** or **Agent orchestration**, the agent, provider, model, and
+reasoning effort. A repository with no saved setup uses the most recent setup.
+Changes you make in the form are kept when you switch repositories.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/proposals/ProposalCard.svelte; src/lib/components/chat/proposals/proposal-repo-agent.ts; src/store/renderer/slices/workspace-operations/sagas/workspace-operations-saga.ts; src/store/renderer/slices/tab-state/sagas/proposal-workspace-tab-saga.ts; messages/en.json. -->
+
+An agent can suggest a follow-up workspace as a card in its conversation. Review
+it and choose **Create workspace** on the card, or ask the agent to apply it.
+Unless the agent named one, the card starts with the agent last used in New
+workspace for that repository, and uses that agent's last model and reasoning
+effort while it stays selected. The new workspace opens as a tab at the end of
+the top tab strip, and the current workspace stays selected.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
@@ -295,6 +361,14 @@ In **Home → Workspaces**, PR badges update as Intent observes changes.
 are running. You do not need to open the workspace or hover over the PR to
 receive these updates.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/ui/tooltip/GitHubLinkCard.svelte; src/lib/components/chat/MonitoredPrsRow.svelte; src/lib/components/workspace/sidebar/sidebar-changes-utils.ts; src/lib/utils/merge-queue.ts. -->
+
+For a queued GitHub PR, the PR link hover card, the chat **Monitoring PR** row,
+and the sidebar PR tooltip also show its place in the queue (for example,
+**2nd of 3**) and GitHub's estimated time to merge when GitHub provides one.
+Home badges show only **Queued**. Agents see the position when they request a
+PR snapshot; queue movement alone does not wake them.
+
 In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
 open status groups. Collapse a group to hide its checks. **Code** lists changed
@@ -319,6 +393,17 @@ actions. **Start workspace** opens the existing creation form with the qualified
 item; it does not automatically check out the MR source head. The separate
 **Linear issues** section is unchanged.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
+
+Clicking a GitHub pull request link opens the link menu (when **GitHub link
+behavior** is **Show choices**, the default). If another workspace worked on that
+PR, the last menu item is **Open in original workspace**, which opens it; with
+several such workspaces it opens a submenu of their names, most recent first.
+Archived workspaces are included, and the submenu marks them **Archived**. Intent
+links a PR to a workspace when it discovers the PR on that workspace's branch or
+one of its submodules; PRs seen only before this feature shipped are not linked
+until Intent sees them again.
+
 ## Home Workspaces
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
@@ -333,6 +418,10 @@ groups. In list view, **Status** groups workspace statuses in this order:
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
+
+Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
+**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
+activity first within the pinned and unpinned groups.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
@@ -425,13 +514,23 @@ After confirming recovery, the agent can clear its warning while a release or
 scheduled check is still pending. A recorded blocker notice can remain in the
 conversation after the current warning clears.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
+
 Follow specific recovery guidance when shown: **Retry with [model]** uses the
 offered available model; **Retry on [provider]** switches away from a provider
-whose usage limit was reached. For sign-in errors, run the displayed CLI login
-command; signing in to the Claude desktop app does not sign in its CLI. For
-**Agent session corrupted**, retry starts a fresh session and carries over the
-conversation history. Do not promise a model or provider switch unless the UI
-offers it; inspect **Settings → Providers** for setup problems.
+whose usage limit was reached. For sign-in errors, including an expired Claude
+OAuth login, run the displayed CLI login command on the host running the agent,
+complete sign-in, then retry. Signing in to the Claude desktop app does not sign
+in its CLI. For **Agent session corrupted**, retry starts a fresh session and
+carries over the conversation history. Do not promise a model or provider switch
+unless the UI offers it; inspect **Settings → Providers** for setup problems.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/provider_auth.rs; packages/intentd/crates/intent-core/src/{path_utils.rs,cli_env.rs}. -->
+
+Claude authentication checks also use exported credentials from the execution
+host's login shell, including `CLAUDE_CODE_OAUTH_TOKEN`. Restart that host's
+daemon after changing shell exports so it reloads them; an existing daemon
+environment value takes precedence. Never paste tokens into chat.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{pi_cli.rs,agent_manager.rs,pi_mcp_wrapper.cmd}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
@@ -441,6 +540,20 @@ If Pi works in a terminal but fails in Intent, copy the conversation's failure
 details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
+
+## Missed display updates
+
+<!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
+
+When the app and connected daemon support recovery, detected gaps in state
+updates trigger a refresh of affected visible data. Inactive cached views refresh
+when next used. Recovery respects current access; it does not repeat commands or
+replay notifications, chat transcripts, or terminal output. Temporary terminal
+directory, title, and command indicators may clear until live updates resume.
+
+Older daemons retain their existing reconnect and refresh behavior; do not promise
+recovery from a missed final update. If a view stays stale, use its refresh action
+where available or reconnect, and check the app and daemon versions.
 
 ## Restore workspace browser use
 
@@ -502,7 +615,10 @@ available actions. Never construct links from guessed IDs or claim completion fr
 this static guide.
 
 Workspace file links open a file panel. Markdown files open in a read-only preview
-that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+that renders Mermaid diagrams. For files in the main workspace checkout, relative image paths such as
+`charts/chart.png` resolve from the Markdown file's folder and cannot reach
+outside the workspace; files from other registered repositories do not resolve them.
+Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
@@ -512,7 +628,9 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 
 ## Daemon lifecycle from the terminal
 

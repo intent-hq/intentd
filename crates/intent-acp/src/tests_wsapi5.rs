@@ -880,6 +880,9 @@ async fn workspace_emit_notification_reports_unavailable_in_port() {
 /// `name`, `status`, and `is_responding` matter to the archive guardrail.
 fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) -> AgentLite {
     AgentLite {
+        digest_truncated: false,
+        last_agent_response_truncated: false,
+        last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
         id: AgentId::from_string(id),
@@ -924,9 +927,13 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        using_earlier_profile_settings: false,
+        provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
         metadata: AgentMetadata {
+            attention_request_reason_truncated: false,
+            completion_report_truncated: false,
             is_background: false,
             specialist: None,
             created_by_agent_id: None,

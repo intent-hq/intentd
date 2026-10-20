@@ -52,8 +52,21 @@ env:
   MIRROR_REPO: intent-hq/intentd-releases
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    with:
+      # The two republish jobs can run together after mirror; each reads its own slot.
+      slot_jobs: >-
+        [{"key":"republish-beta","label":"ubuntu-24.04"},{"key":"republish-stable","label":"ubuntu-24.04"}]
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   mirror:
-    runs-on: depot-ubuntu-24.04
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     outputs:
       kind: ${{ steps.validate.outputs.kind }}
@@ -142,9 +155,9 @@ jobs:
   # from publication, promotion and cleanup (see header).
   # Channel manifests are daemon-only, so both jobs are gated on kind=daemon.
   republish-beta:
-    needs: mirror
+    needs: [mirror, runner-route]
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'beta' || inputs.republish == 'both') }}
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.slots || '{}')['republish-beta'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -192,9 +205,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   republish-stable:
-    needs: mirror
+    needs: [mirror, runner-route]
     if: ${{ needs.mirror.outputs.kind == 'daemon' && (inputs.republish == 'stable' || inputs.republish == 'both') }}
-    runs-on: depot-ubuntu-24.04
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.slots || '{}')['republish-stable'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

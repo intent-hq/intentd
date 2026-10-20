@@ -9,7 +9,7 @@ use intent_core::{
     AgentId, Error, Note, NoteId, NoteVersionAuthor, TaskMetadata, TaskStatus, WorkspaceId,
 };
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq)]
 struct Snapshot {
@@ -178,7 +178,7 @@ async fn linked_metadata_rejects_stale_missing_wrong_agent_and_workspace_without
         // A no-op must not enter the anchor finalizer at all.
         let pause = Arc::new(FinalizerPause::default());
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
+            super::wait(),
             FINALIZER_PAUSE.scope(
                 pause,
                 store.update_note_metadata_if_agent_linked(&prepared, revision, &owner),
@@ -284,7 +284,7 @@ async fn linked_metadata_cancellation_rolls_back_note_index_and_anchor_epochs() 
         Arc::clone(&pause),
         store.update_note_metadata_if_agent_linked(&prepared, note.rev, &agent),
     ));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(super::wait(), async {
         tokio::select! {
             result = &mut write => panic!("write finished before finalizer: {result:?}"),
             () = pause.entered.notified() => {},
@@ -299,7 +299,7 @@ async fn linked_metadata_cancellation_rolls_back_note_index_and_anchor_epochs() 
     assert_eq!(snapshot(&store, &note).await, before);
     drop(write);
     tokio::time::timeout(
-        Duration::from_secs(5),
+        super::wait(),
         sqlx::query("BEGIN IMMEDIATE; ROLLBACK").execute(store.write_pool()),
     )
     .await

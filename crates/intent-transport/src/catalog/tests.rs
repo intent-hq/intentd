@@ -191,16 +191,21 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
+// Legacy workspace import removal (15.0): -1 fast-path method.
+// PR workspace lookup (`prWorkspaceLookup: 1`): +1 router method.
+// Named provider profiles (§5.54): +4 router methods.
 // Startup status (14.1): +1 fast-path method.
-// Scoped repository pages and child Git policy (14.2): +8 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 443;
+// Scoped repository pages and child Git policy (15.1): +8 router methods.
+const EXPECTED_TOTAL_METHODS: usize = 448;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 386;
+/// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
+/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
+const EXPECTED_ROUTER_METHODS: usize = 391;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 57;
@@ -209,7 +214,7 @@ const EXPECTED_FASTPATH_METHODS: usize = 57;
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 6;
+const EXPECTED_NOTIFICATIONS: usize = 7;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -590,6 +595,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
     "file-tracking.getAgentLocks",
@@ -778,6 +784,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -866,7 +876,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "stats.getUsage",
     "system.capabilities",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -909,6 +918,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.export.finalize",
     "workspace.export.read",
     "workspace.export.start",
+    "workspace.findByPullRequest",
     "workspace.findRepositories",
     "workspace.generateSetupScript",
     "workspace.get",
@@ -1344,6 +1354,10 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "principal.list",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1401,7 +1415,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "specialist.delete",
     "specialist.edit",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
     "system.startupStatus",
@@ -1594,6 +1607,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
+        "events.fence",
         "events.subscribe",
         "chat.subscribe",
         "workspace.subscribe",
@@ -2031,6 +2045,16 @@ mod unbound_owner_only_methods {
             (
                 "scriptMonitor.cancelRun",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
+            ),
+            (
+                "providers.profiles.create",
+                json!({ "baseProviderId": "codex", "name": "n" }),
+            ),
+            ("providers.profiles.delete", json!({ "profileId": "p1" })),
+            ("providers.profiles.list", json!({})),
+            (
+                "providers.profiles.update",
+                json!({ "profileId": "p1", "name": "n" }),
             ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
@@ -2579,6 +2603,10 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.update",
         "mcp.testConnection",
         "pairing.getInfo",
+        "providers.profiles.create",
+        "providers.profiles.delete",
+        "providers.profiles.list",
+        "providers.profiles.update",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",
@@ -2606,7 +2634,6 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "specialist.delete",
         "specialist.edit",
         "system.gitCredential",
-        "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
         "system.startupStatus",

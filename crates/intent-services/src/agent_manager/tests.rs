@@ -137,7 +137,7 @@ fn usage_origin_uses_trusted_delivery_origin_before_opaque_metadata() {
 /// panic) also covers `-wal`/`-shm` sidecars, and a background task that
 /// lazily reopens a pool connection after drop cannot recreate the file at
 /// the TMPDIR root. Set `INTENTD_TEST_KEEP_TMP` (non-empty) to keep the dir.
-struct TempDb {
+pub(super) struct TempDb {
     path: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -2381,7 +2381,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     assert_eq!(ev.data["reason"], "slots", "slot-cap resume reason");
 }
 
-async fn manager() -> (TempDb, AgentManager) {
+pub(super) async fn manager() -> (TempDb, AgentManager) {
     let (tmp, mgr, _bus) = manager_with_bus().await;
     (tmp, mgr)
 }
@@ -2463,7 +2463,7 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.worker_finish_pause.lock().unwrap() = Some(pause.clone());
     mgr.send_message(
@@ -2712,7 +2712,10 @@ fn mock_handle() -> AgentHandle {
         antigravity_profile: None,
         session_mcp_servers: Vec::new(),
         spawned_model: None,
+        session_open_filled_model: None,
         spawned_provider: "auggie".to_string(),
+        spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+        _activation: None,
         thought_level: None,
         config_options: None,
         confirmed_effort: None,
@@ -4731,24 +4734,15 @@ fn seed_repo() -> TempRepo {
     TempRepo { dir, _guard: guard }
 }
 
-/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
-/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
-/// edited file, with the agent's stats and lazy blob SHAs.
-#[tokio::test]
-async fn agent_file_change_records_tracked_change_and_diff() {
-    use intent_acp::SinkEvent;
-    use intent_core::{
-        events::FILE_CHANGED, now_iso, ActorType, EventActor, Workspace, WorkspaceActivity,
-        WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
-
-    let repo = seed_repo();
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.expect("open store");
-
-    let ws_id = WorkspaceId::from("ws-ft");
+/// A local workspace row whose worktree is `worktree`, for the file-change
+/// sink tests.
+fn file_tracking_workspace(
+    ws_id: &intent_core::WorkspaceId,
+    worktree: &std::path::Path,
+) -> intent_core::Workspace {
+    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
     let ts = now_iso();
-    let ws = Workspace {
+    Workspace {
         id: ws_id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
@@ -4768,7 +4762,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         repository_path: None,
         repository_owner: None,
         repository_name: None,
-        worktree_path: Some(repo.dir.display().to_string()),
+        worktree_path: Some(worktree.display().to_string()),
         scope: None,
         skip_worktree: false,
         setup_script: None,
@@ -4795,7 +4789,23 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         disk_usage: None,
         pending_delete_at: None,
         membership: None,
-    };
+    }
+}
+
+/// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
+/// sink records both the diff (§17.3) and the attribution row (§17.4) for the
+/// edited file, with the agent's stats and lazy blob SHAs.
+#[tokio::test]
+async fn agent_file_change_records_tracked_change_and_diff() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let ws_id = WorkspaceId::from("ws-ft");
+    let ws = file_tracking_workspace(&ws_id, &repo.dir);
     store.insert_workspace(&ws).await.unwrap();
 
     let bus = EventBus::new(store.clone());
@@ -4845,6 +4855,49 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diffs[0].hunks_json.contains("CHANGED"),
         "extracted hunks carry the new line"
     );
+}
+
+/// Regression (intent-hq/intent#7266): an agent `file:changed` for an
+/// untracked git-ignored path records neither an attribution row nor a diff —
+/// it can never be committed, so the row would stay `unstaged` forever.
+#[tokio::test]
+async fn agent_file_change_to_git_ignored_path_records_nothing() {
+    use intent_acp::SinkEvent;
+    use intent_core::{events::FILE_CHANGED, ActorType, EventActor, WorkspaceId};
+
+    let repo = seed_repo();
+    std::fs::write(repo.dir.join(".gitignore"), ".dev/\n").unwrap();
+    std::fs::create_dir_all(repo.dir.join(".dev")).unwrap();
+    std::fs::write(repo.dir.join(".dev/scratch.json"), "{}\n").unwrap();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::from("ws-ft-ign");
+    store
+        .insert_workspace(&file_tracking_workspace(&ws_id, &repo.dir))
+        .await
+        .unwrap();
+
+    let sink = BusEventSink::new(EventBus::new(store.clone()));
+    sink.publish(SinkEvent {
+        workspace_id: ws_id.clone(),
+        event_type: FILE_CHANGED.to_string(),
+        actor: EventActor {
+            actor_type: ActorType::Agent,
+            id: Some("agent-1".to_string()),
+            name: Some("Agent".to_string()),
+            ..Default::default()
+        },
+        session_id: Some("agent-1".to_string()),
+        data: serde_json::json!({
+            "path": ".dev/scratch.json",
+            "relativePath": ".dev/scratch.json",
+            "action": "create",
+        }),
+    })
+    .await;
+
+    assert!(store.list_tracked_changes(&ws_id).await.unwrap().is_empty());
+    assert!(store.list_diffs(&ws_id).await.unwrap().is_empty());
 }
 
 const MGR_ACP_SID: &str = "mgr-acp-new";
@@ -5036,7 +5089,10 @@ fn track_mock_agent_inner(
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -5194,7 +5250,10 @@ fn track_mock_agent_prompt_rpc_error_inner(
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: spawned_provider.to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command(spawned_provider),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9195,7 +9254,10 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -9291,7 +9353,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → `interrupt` would fall back to the kill path).
     mgr.services
@@ -10394,7 +10456,7 @@ async fn stop_zero_output_then_follow_up_redelivers_stopped_message_and_attachme
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the stop on the keep-alive interrupt path.
     mgr.services
         .store
@@ -10527,7 +10589,7 @@ async fn stop_with_streamed_output_does_not_redeliver_on_follow_up() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-stop-progress")
@@ -11107,7 +11169,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // A live `acpSessionId` keeps the preemption on the keep-alive interrupt
     // path (no session → the preemption would be skipped).
     mgr.services
@@ -11306,7 +11368,7 @@ async fn transfer_human_runtime_force_and_handback_keep_original_author() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     let sent = intent_core::with_caller(
         caller,
         mgr.send_queued_message_now(id.clone(), ws, entry.id.clone()),
@@ -11478,7 +11540,7 @@ async fn interrupt_send_message_zero_output_delivers_combined_prompt() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-zero")
@@ -11752,7 +11814,7 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     // Keep the preemption on the keep-alive interrupt path (no session →
     // `interrupt` would fall back to the kill path).
     mgr.services
@@ -11904,7 +11966,7 @@ async fn duplicate_interrupt_send_same_message_id_preempts_once() {
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".to_string();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-int-dup")
@@ -13975,6 +14037,439 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     mgr.stop(&id).await;
     mock.abort();
     let _ = mock.await;
+}
+
+/// A completed turn published `agent:idle` and persisted its response, but
+/// its worker still holds the busy slot in the post-turn tail. A graceful
+/// shutdown in that window must not record the finished turn as interrupted:
+/// the next startup sweep would deliver a second automatic continuation.
+/// Reproduces the compaction-restart schedule with explicit barriers.
+#[tokio::test]
+async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-idle-shutdown");
+    let id = AgentId::from("idle-shutdown");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        session.messages.iter().filter(|m| m.role == "user").count(),
+        1,
+        "the completed turn's request is durable before shutdown"
+    );
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a settled turn must not be recorded for startup recovery"
+    );
+    // The aborted worker never ran `end_turn`; shutdown must persist the
+    // settled status, or the next startup heal treats it as a crashed turn.
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert!(!stored.is_active);
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// The later half of the same window: `end_turn` has released the slot but
+/// its `RuntimeIdle` write is blocked when shutdown aborts the worker. The
+/// agent is outside the shutdown snapshot, yet its persisted `Active` status
+/// would make the next startup heal record and resume the finished turn.
+#[tokio::test]
+async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-release-shutdown");
+    let id = AgentId::from("release-shutdown");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    // Take the only writer, so end_turn stops after its synchronous release.
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases the slot before awaiting the writer");
+    assert_eq!(
+        mgr.workers.lock().unwrap().len(),
+        1,
+        "worker is still registered while its idle write waits"
+    );
+    let shutdown = {
+        let mgr = mgr.clone();
+        intent_core::spawn_daemon(async move { mgr.shutdown().await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while !mgr.workers.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown takes the aborted worker");
+    writer.rollback().await.unwrap();
+    timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown completes")
+        .unwrap();
+
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::RuntimeIdle,
+        "shutdown persists the settled turn's idle status"
+    );
+    assert_eq!(
+        mgr.services.heal_stale_agent_sessions().await.unwrap(),
+        0,
+        "next startup heal must not resurrect the settled turn"
+    );
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Control: input that became ready behind a settled turn is not delivered
+/// by the aborted worker. Rehydration never kicks a drain, so the agent must
+/// stay recoverable; startup recovery's continuation also drains the queue.
+#[tokio::test]
+async fn shutdown_settled_turn_with_ready_queue_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-ready-queue");
+    let id = AgentId::from("settled-ready-queue");
+    let (mock, _release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "ready behind the settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    assert!(mgr.services.has_ready_to_send(&id));
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the parked worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "undelivered ready input must keep the agent recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Window 2 for every `end_turn` caller, not only prompt workers: a turn
+/// whose release completed but whose `RuntimeIdle` write was aborted must
+/// not look like a crash at the next startup.
+#[tokio::test]
+async fn shutdown_finishes_aborted_end_turn_idle_write() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-aborted-end-turn");
+    let id = AgentId::from("aborted-end-turn");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    let active = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(active.status, AgentStatus::Active);
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    let ending = {
+        let mgr = mgr.clone();
+        let id = id.clone();
+        intent_core::spawn_daemon(async move { mgr.end_turn(&id).await })
+    };
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    ending.abort();
+    assert!(ending.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::RuntimeIdle);
+    assert_eq!(mgr.services.heal_stale_agent_sessions().await.unwrap(), 0);
+    assert!(mgr
+        .services
+        .store
+        .get_interrupted_agent(&id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A pending idle write never overwrites a status written after it — a
+/// later stop, failure or delete owns the session row.
+#[tokio::test]
+async fn shutdown_pending_idle_write_preserves_later_status() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-pending-idle-later");
+    let id = AgentId::from("pending-idle-later");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let writer = mgr.services.store.write_pool().begin().await.unwrap();
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), async {
+        while mgr.is_busy(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("end_turn releases before awaiting the writer");
+    let worker = mgr.workers.lock().unwrap().remove(&id).expect("worker");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    writer.rollback().await.unwrap();
+    mgr.services
+        .store
+        .set_agent_session_status(&ws, &id, AgentStatus::Error, false, &now_iso(), None)
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "shutdown must not overwrite a later status"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Start one real turn and park its worker after the terminal `agent:idle`,
+/// holding the busy slot at the post-turn drain barrier.
+async fn park_after_settled_turn(
+    mgr: &Arc<AgentManager>,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> (JoinHandle<()>, tokio::sync::oneshot::Sender<()>) {
+    use intent_core::events::AGENT_IDLE;
+
+    seed_agent(mgr, ws, id).await;
+    let mock = track_mock_agent(mgr, id, true);
+    mgr.start_session(id, PathBuf::from("/tmp/ws"), &test_provider())
+        .await
+        .unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_IDLE.into()],
+        batch_window: None,
+        ..Default::default()
+    });
+    let (reached, release) = mgr.services.queue_drain_commit_pause.arm();
+    let sent = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "settled turn".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false);
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("worker reached post-turn drain barrier")
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let batch = sub.recv().await.expect("event subscription open");
+            if batch
+                .iter()
+                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("completed turn published idle");
+    assert!(mgr.is_busy(id));
+    assert!(mgr.turn_settled(id), "terminal idle marks the held slot");
+    (mock, release)
+}
+
+/// Control: the settled mark covers only the finished turn. Once the same
+/// worker drains new input, a shutdown before that work completes must still
+/// leave the agent recoverable.
+#[tokio::test]
+async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let mgr = Arc::new(mgr);
+    mgr.services.attach_agent_manager(&mgr);
+    let ws = WorkspaceId::from("ws-settled-new-work");
+    let id = AgentId::from("settled-new-work");
+    let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
+    let queued = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "drained follow-up".into(),
+            None,
+            super::TurnOptions {
+                origin: MessageOrigin::User,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true, "held slot queues the follow-up");
+    let pause = Arc::new(super::TurnStartPause::default());
+    *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
+    release.send(()).unwrap();
+    timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .expect("worker drains the follow-up into a new turn");
+    assert!(mgr.is_busy(&id));
+    assert!(!mgr.turn_settled(&id), "new work clears the settled mark");
+
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown aborts the draining worker");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "unfinished drained work must remain recoverable"
+    );
+    mock.abort();
+    let _ = mock.await;
+}
+
+/// Control: the settled mark lives only while its holder owns the slot, and
+/// an unmarked claimed turn stays recoverable.
+#[tokio::test]
+async fn settled_mark_lives_only_with_the_held_slot() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-settled-slot");
+    let id = AgentId::from("settled-slot");
+    seed_agent(&mgr, &ws, &id).await;
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(mgr.turn_settled(&id));
+    mgr.release_in_flight_slot(&id);
+    assert!(!mgr.turn_settled(&id), "release retires the mark");
+    mgr.mark_turn_settled_if_slot_held(&id);
+    assert!(!mgr.turn_settled(&id), "only a slot holder can be marked");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert!(!mgr.turn_settled(&id));
+    timeout(Duration::from_secs(10), mgr.shutdown())
+        .await
+        .expect("shutdown completes");
+    assert!(
+        mgr.services
+            .store
+            .get_interrupted_agent(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "a claimed, unfinished turn must remain recoverable"
+    );
+}
+
+/// A pending idle write belongs to one `end_turn` call: a later claim
+/// supersedes it, and a stale call's completion never retires a newer entry.
+#[tokio::test]
+async fn pending_idle_write_is_owned_by_its_end_turn_call() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let ws = WorkspaceId::from("ws-idle-write-token");
+    let id = AgentId::from("idle-write-token");
+    seed_agent(&mgr, &ws, &id).await;
+    let pending = |mgr: &AgentManager| mgr.pending_idle_writes.lock().unwrap().get(&id).cloned();
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.end_turn(&id).await;
+    assert_eq!(pending(&mgr), None, "a completed write retires its entry");
+
+    assert!(mgr.try_begin(&id, &ws).await);
+    let (_, older) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let older = older.expect("recorded");
+    assert!(pending(&mgr).is_some());
+    assert!(mgr.try_begin(&id, &ws).await);
+    assert_eq!(
+        pending(&mgr),
+        None,
+        "a new claim supersedes the pending write"
+    );
+    let (_, newer) = mgr.release_slot_sync_inner(&id, true).unwrap().unwrap();
+    let newer = newer.expect("recorded");
+    mgr.finish_idle_write(&id, older);
+    assert_eq!(
+        pending(&mgr),
+        Some((ws.clone(), newer)),
+        "a stale completion keeps the newer entry"
+    );
+    mgr.finish_idle_write(&id, newer);
+    assert_eq!(pending(&mgr), None);
 }
 
 #[tokio::test]
@@ -16535,9 +17030,33 @@ async fn pre_output_transport_failure_redrives_silently_once() {
 /// not re-emit).
 #[tokio::test]
 async fn auth_required_prompt_failure_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": 401, "message": "Unauthorized"
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn claude_expired_oauth_prompt_surfaces_login_remedy_end_to_end() {
+    assert_auth_prompt_failure_surfaces_login_remedy(json!({
+        "code": -32603,
+        "message": "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "data": {"errorKind": "authentication_failed"},
+    }))
+    .await;
+}
+
+async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json::Value) {
+    struct ClearMockAuth;
+    impl Drop for ClearMockAuth {
+        fn drop(&mut self) {
+            crate::provider_auth::seed_auth_verdict_for_tests("mock", None);
+        }
+    }
+    let _cleanup = ClearMockAuth;
     let script = mock_agent_script();
     let behavior = json!({
-        "promptRpcError": { "code": 401, "message": "Unauthorized" },
+        "promptRpcError": rpc_error,
         "response": "unreached",
     })
     .to_string();
@@ -18335,7 +18854,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     mgr.services
         .store
         .set_acp_session_id(&ws, &id, "acp-img-failure")
@@ -18471,7 +18990,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         .unwrap()
         .get_mut(&id)
         .unwrap()
-        .spawned_provider = "node".into();
+        .align_with_mock_for_test();
     mgr.start_session(
         &id,
         tmp.path.parent().unwrap().to_path_buf(),
@@ -21465,7 +21984,10 @@ mod harness_wake_tests {
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "auggie".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("auggie"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -22927,6 +23449,7 @@ mod model_change_notice_tests {
     fn resolved(provider_id: &str, model: Option<&str>) -> ResolvedSpawn {
         ResolvedSpawn {
             provider: *intent_providers::provider_config(provider_id),
+            selection: crate::provider_profiles::canonical_selection(provider_id),
             model: model.map(str::to_string),
             reasoning_effort: None,
             cwd: std::env::temp_dir(),
@@ -27949,5 +28472,345 @@ fn qualified_monitor_redelivery_withholds_private_envelope() {
         message.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
         message.content = json!([{"type":"text","text":"GitHub monitor update"}]);
         assert!(super::redelivery_prepend(&[message], None, None).is_some());
+    }
+}
+
+/// Turn-start routing for named provider profiles (PROTOCOL §5.54): a profile
+/// runs on its base installation under its own selection identity, a switch
+/// between profiles (or a profile and Default) never reuses the other's
+/// process or native session, and a missing profile or disabled base needs an
+/// explicit replacement instead of the disabled-provider re-home.
+mod profile_routing_tests {
+    use super::*;
+
+    /// Seed `id` in its own workspace (`seed_agent` inserts the workspace).
+    async fn session_on(mgr: &AgentManager, id: &AgentId, provider: &str) -> WorkspaceId {
+        let ws = WorkspaceId::from(format!("ws-{}", id.0).as_str());
+        let ws = &ws;
+        seed_agent(mgr, ws, id).await;
+        mgr.services
+            .store
+            .set_agent_session_model(ws, id, "same-model", Some(provider), &now_iso())
+            .await
+            .unwrap();
+        ws.clone()
+    }
+
+    fn replacement_reason(err: &Error) -> String {
+        let Error::ProviderProfile(failure) = err else {
+            panic!("expected provider-profile-replacement-required, got {err:?}");
+        };
+        assert_eq!(
+            failure.data["code"], "provider-profile-replacement-required",
+            "{err:?}"
+        );
+        failure.data["reason"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_profile_runs_on_its_base_installation_under_its_own_selection() {
+        let (_tmp, mgr) = manager().await;
+        // Codex and Claude Code are npx-only; the test marker keeps this pure
+        // resolution independent of the host's Node/npx.
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        for base in ["codex", "claude-code"] {
+            settings.providers.paths.insert(
+                base.to_string(),
+                crate::agent_ops::TEST_RUNNABLE_PATH.to_string(),
+            );
+        }
+        for (provider, base) in [
+            ("codex@pwork", "codex"),
+            ("claude-code@pwork", "claude-code"),
+            ("codex", "codex"),
+        ] {
+            let id = AgentId::from(format!("a-pr1-{base}-{}", provider.len()).as_str());
+            session_on(&mgr, &id, provider).await;
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            let resolved = resolve_spawn(&session, None, &settings, None).unwrap();
+            assert_eq!(resolved.provider.id, base, "{provider}");
+            assert_eq!(resolved.selection, provider, "{provider}");
+            assert_eq!(resolved.model.as_deref(), Some("same-model"));
+        }
+    }
+
+    #[test]
+    fn a_profile_switch_never_reuses_the_live_process() {
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        for base in ["codex", "claude-code"] {
+            let command = intent_providers::provider_config(base).command;
+            let live = |selection: &str, target: &str| {
+                super::super::spawn_identity_changed(
+                    Some("same-model"),
+                    command,
+                    selection,
+                    &resolved(target),
+                )
+            };
+            let (work, personal) = (format!("{base}@pwork"), format!("{base}@ppersonal"));
+            assert!(!live(base, base), "{base}");
+            assert!(!live(&work, &work), "{base}");
+            assert!(live(base, &work), "{base}: Default → Work");
+            assert!(live(&work, base), "{base}: Work → Default");
+            assert!(live(&work, &personal), "{base}: Work → Personal");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_switch_commits_the_reference_as_the_native_session_owner() {
+        let (_tmp, mgr) = manager().await;
+        let (ws, id) = (WorkspaceId::from("ws-pr2"), AgentId::from("a-pr2"));
+        seed_agent(&mgr, &ws, &id).await;
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("same-model".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex"))
+            .await;
+        mgr.maybe_persist_model_change_notice(&id, &ws, &resolved("codex@pwork"))
+            .await;
+        let (_, owner) = mgr
+            .services
+            .store
+            .get_agent_session_last_turn_model(&ws, &id)
+            .await
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some("codex@pwork"));
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1, "same model, new profile is a switch");
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["fromProvider"], "codex");
+        assert_eq!(md["toProvider"], "codex@pwork");
+    }
+
+    /// The notice text names a profile by its saved name, never by its
+    /// internal reference; a profile that no longer exists reads as removed.
+    /// The metadata keeps the references for routing.
+    #[intent_test_macros::daemon_test]
+    async fn a_profile_switch_notice_text_uses_readable_profile_labels() {
+        let root = crate::test_support::test_tempdir("profile-switch-notice-");
+        let store = Store::open(&root.path().join("a.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store)
+            .with_event_bus(bus.clone())
+            .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+        let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+        let (ws, id) = (WorkspaceId::from("ws-pr3"), AgentId::from("a-pr3"));
+        seed_agent(&mgr, &ws, &id).await;
+        let work = services
+            .provider_profiles_create_impl(
+                json!({ "baseProviderId": "claude-code", "name": "Work" }),
+            )
+            .await
+            .unwrap()["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let resolved = |provider: &str| ResolvedSpawn {
+            provider: *intent_providers::provider_config(provider),
+            selection: crate::provider_profiles::canonical_selection(provider),
+            model: Some("opus".into()),
+            reasoning_effort: None,
+            cwd: std::env::temp_dir(),
+            provider_binary: None,
+            extra_env: std::collections::BTreeMap::default(),
+            npx_fallback_binary: None,
+            npx_fallback_package: None,
+            unsloth_endpoint: None,
+        };
+        for selection in ["claude-code", work.as_str(), "claude-code@pgone"] {
+            mgr.maybe_persist_model_change_notice(&id, &ws, &resolved(selection))
+                .await;
+        }
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap();
+        let texts: Vec<String> = messages
+            .iter()
+            .map(|m| m.content[0]["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Model changed from claude-code:opus to claude-code (Work):opus.".to_string(),
+                "Model changed from claude-code (Work):opus to claude-code (removed profile):opus."
+                    .to_string(),
+            ]
+        );
+        let md = messages[0].metadata.as_ref().unwrap();
+        assert_eq!(md["toProvider"], work);
+        assert_eq!(
+            messages[1].metadata.as_ref().unwrap()["toProvider"],
+            "claude-code@pgone"
+        );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn missing_or_disabled_profiles_require_replacement_instead_of_rehoming() {
+        let (_tmp, mgr) = manager().await;
+        let mut settings = intent_core::settings_file::SettingsFile::default();
+        settings.model.default_provider = Some("auggie".into());
+
+        let gone = AgentId::from("a-pr3-gone");
+        let ws = session_on(&mgr, &gone, "codex@pgone").await;
+        let session = mgr.services.store.get_agent_session(&gone).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&gone, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "profile-missing");
+
+        let created = mgr
+            .services
+            .provider_profiles_create_impl(json!({ "baseProviderId": "codex", "name": "Work" }))
+            .await
+            .unwrap();
+        let reference = created["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let work = AgentId::from("a-pr3-work");
+        let ws = session_on(&mgr, &work, &reference).await;
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let (kept, rehomed) = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap();
+        assert!(!rehomed);
+        assert_eq!(kept.provider.as_deref(), Some(reference.as_str()));
+
+        settings.providers.enabled = Some(std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            false,
+        )]));
+        let session = mgr.services.store.get_agent_session(&work).await.unwrap();
+        let err = mgr
+            .rehome_if_provider_disabled(&work, &ws, session, &settings)
+            .await
+            .unwrap_err();
+        assert_eq!(replacement_reason(&err), "provider-disabled");
+        let after = mgr.services.store.get_agent_session(&work).await.unwrap();
+        assert_eq!(
+            after.provider.as_deref(),
+            Some(reference.as_str()),
+            "never moved to the app default"
+        );
+        let messages = mgr
+            .services
+            .store
+            .get_agent_messages(&work, None)
+            .await
+            .unwrap();
+        assert!(messages.is_empty(), "no provider_rehomed notice");
+    }
+    /// The real spawn path registers a profile child with the settings it
+    /// read, an edit marks it as running on earlier settings without
+    /// touching it, and tearing the child down (idle reap / crash cleanup /
+    /// respawn all drop the handle) unregisters it.
+    #[cfg(unix)]
+    #[intent_test_macros::daemon_test]
+    async fn a_spawned_profile_child_is_tracked_until_teardown() {
+        use std::os::unix::fs::PermissionsExt;
+        for base in ["codex", "claude-code"] {
+            let root = crate::test_support::test_tempdir("profile-activation-spawn-");
+            let store = Store::open(&root.path().join("a.db")).await.unwrap();
+            let bus = EventBus::new(store.clone());
+            let services = Services::new(store)
+                .with_event_bus(bus.clone())
+                .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+            let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+            let ws = WorkspaceId::from("ws-activation");
+            let id = AgentId::from("a-activation");
+            seed_agent(&mgr, &ws, &id).await;
+            let created = services
+                .provider_profiles_create_impl(json!({
+                    "baseProviderId": base, "name": "Work",
+                    "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "one" }],
+                }))
+                .await
+                .unwrap();
+            let (profile_id, reference) = (
+                created["profile"]["id"].as_str().unwrap().to_string(),
+                created["profile"]["providerRef"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            let profile = services
+                .resolve_profile_env(&reference)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // A stand-in adapter that just stays alive until killed.
+            let adapter = root.path().join("adapter");
+            std::fs::write(&adapter, "#!/bin/sh\nread -r request\nsleep 60\n").unwrap();
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut provider = *intent_providers::find_provider("pi").unwrap();
+            provider.mcp_via_pi_extension = false;
+            let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+            opts.npx_fallback_binary = Some(&adapter);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.profile_env = Some(&profile);
+            mgr.create_agent(
+                id.clone(),
+                ws.clone(),
+                "Work",
+                "implementor",
+                root.path().to_owned(),
+                &opts,
+            )
+            .await
+            .unwrap();
+            let activation = services.profile_activation();
+            assert_eq!(
+                activation.live_fingerprint(&id, &reference).as_deref(),
+                Some(profile.fingerprint()),
+                "{base}"
+            );
+
+            services
+                .provider_profiles_update_impl(
+                    profile_id.clone(),
+                    json!({ "env": [{ "key": "PROFILE_MARK", "kind": "set", "value": "two" }] }),
+                )
+                .await
+                .unwrap();
+            assert!(mgr.handle_is_live(&id), "{base}: Save restarts nothing");
+            assert!(activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 1);
+
+            mgr.kill_child_only(&id).await;
+            assert!(!activation.uses_earlier_settings(&id), "{base}");
+            assert_eq!(activation.running_processes(&profile_id), 0, "{base}");
+            assert_eq!(activation.live_fingerprint(&id, &reference), None);
+        }
     }
 }

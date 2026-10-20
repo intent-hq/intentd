@@ -50,6 +50,13 @@ impl OutboundFrame {
     pub(crate) fn private(owner: Arc<dyn RepositoryPrivateOutput>) -> Self {
         Self(Frame::Private(PrivateOutput::new(owner)))
     }
+    /// Public recovery controls may carry receipts; private payloads never do.
+    pub(crate) fn public_text(&self) -> Option<&str> {
+        match &self.0 {
+            Frame::Public(text) => Some(text),
+            Frame::Private(_) => None,
+        }
+    }
     pub(crate) fn is_private(&self) -> bool {
         matches!(self.0, Frame::Private(_))
     }
@@ -387,5 +394,90 @@ mod tests {
             assert!(send.await.is_err());
         }
         assert!(!socket.flushed);
+    }
+    #[tokio::test]
+    async fn recovery_private_uds_write_keeps_authority_and_cancels_backpressure() {
+        let owner = owner();
+        let frame = OutboundFrame::private(owner.clone());
+        let (tx, mut rx) = crate::conn::outbound_channel();
+        tx.bulk_sender().send(frame).await.unwrap();
+        let frame = rx.recv().await.unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        assert!(
+            tx.recovery
+                .prepare_frame(&frame)
+                .finish(async { frame.write_uds(&mut writer).await.is_ok() })
+                .await
+        );
+        let mut bytes = vec![0; owner.frame.len() + 1];
+        reader.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, format!("{}\n", owner.frame).as_bytes());
+        let (mut held, mut tail) = tokio::io::duplex(1);
+        {
+            let send = tx
+                .recovery
+                .prepare_frame(&frame)
+                .finish(async { frame.write_uds(&mut held).await.is_ok() });
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            assert!(!owner.inside.load(Ordering::Acquire));
+            tx.recovery.close();
+            assert!(!send.await);
+        }
+        drop(held);
+        let mut remainder = Vec::new();
+        tail.read_to_end(&mut remainder).await.unwrap();
+        assert_eq!(
+            remainder, b"{",
+            "only the byte admitted before cancellation may leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_private_wss_write_cancels_without_flushing_queued_bytes() {
+        let owner = owner();
+        let frame = OutboundFrame::private(owner.clone());
+        let (tx, mut rx) = crate::conn::outbound_channel();
+        let mut socket = Socket {
+            owner: owner.clone(),
+            pending: false,
+            sent: 0,
+            flushed: false,
+        };
+        assert!(
+            tx.recovery
+                .prepare_frame(&frame)
+                .finish(async { frame.write_wss(&mut socket).await.is_ok() })
+                .await
+        );
+        assert!(socket.flushed);
+        socket.pending = true;
+        socket.flushed = false;
+        tx.send_bulk("later public frame".into()).await.unwrap();
+        {
+            let send = tx
+                .recovery
+                .prepare_frame(&frame)
+                .finish(async { frame.write_wss(&mut socket).await.is_ok() });
+            tokio::pin!(send);
+            assert!(futures::poll!(&mut send).is_pending());
+            assert!(!owner.inside.load(Ordering::Acquire));
+            tx.recovery.close();
+            assert!(!send.await);
+        }
+        assert!(!socket.flushed);
+        assert!(tx.recovery.is_closed());
+        let queued = rx.recv().await.unwrap();
+        socket.pending = false;
+        assert!(
+            !tx.recovery
+                .prepare_frame(&queued)
+                .finish(async { queued.write_wss(&mut socket).await.is_ok() })
+                .await
+        );
+        assert!(
+            !socket.flushed,
+            "later traffic must not flush canceled private bytes"
+        );
     }
 }

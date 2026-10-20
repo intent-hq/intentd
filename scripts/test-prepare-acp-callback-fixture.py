@@ -302,6 +302,38 @@ class ProvisionerTests(unittest.TestCase):
         with patch.dict(os.environ, {"NODE_OPTIONS": "--import /untrusted"}):
             self.refused(self.fixture.prepare, match="injection")
 
+    def run_main(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(PREP.sys, "argv", argv), patch.object(PREP.sys, "stdout", stdout), \
+                patch.object(PREP.sys, "stderr", stderr), patch.object(PREP.signal, "signal"):
+            code = PREP.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_injected_node_options_refusal_prints_exact_rerun_command(self):
+        script = str(Path(PREP.__file__).resolve())
+        cache = str(self.root / "cache dir")
+        argv = ["scripts/prepare-acp-callback-fixture.py", "--offline", "--cache-dir", cache]
+        tracer = "--require /opt/datadog/dd-trace/init.js"
+        with patch.dict(os.environ, {"NODE_OPTIONS": tracer}):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.splitlines()), 1, stderr)
+        self.assertIn("callback fixture: NODE_OPTIONS injection is not supported", stderr)
+        self.assertIn("NODE_OPTIONS is set in this shell", stderr)
+        rerun = PREP.shlex.join(["env", "-u", "NODE_OPTIONS", PREP.sys.executable, "-I", "-B", "-S",
+                                 script, "--offline", "--cache-dir", cache])
+        self.assertTrue(stderr.rstrip("\n").endswith(rerun), stderr)
+        self.assertNotIn(tracer, stderr)
+        self.assertFalse(Path(cache).exists())
+
+    def test_other_refusals_do_not_suggest_clearing_node_options(self):
+        argv = ["prepare-acp-callback-fixture.py", "--offline", "--cache-dir", str(self.root / "empty")]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("cache missing", stderr)
+        self.assertNotIn("env -u NODE_OPTIONS", stderr)
+
     def test_isolated_environment_drops_credentials_and_injected_configuration(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "synthetic", "NPM_TOKEN": "synthetic", "NPM_CONFIG_REGISTRY": "https://invalid", "NODE_OPTIONS": "--import invalid"}):
             env = PREP.environment(self.root)

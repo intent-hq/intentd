@@ -371,6 +371,12 @@ pub(crate) struct AcpSessionOpened {
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
     pub config_options: Option<Value>,
+    /// The model id the session-open fill persisted onto a session spawned
+    /// without one (`fill_identity_from_session_open`) — exactly what the
+    /// child runs. The manager records it as the handle's spawned model.
+    /// `None` when nothing was filled (or the fill lost to a concurrent
+    /// write).
+    pub filled_model: Option<String>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -1524,9 +1530,17 @@ pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
+        let id = id.trim();
+        // A profile reference is kept verbatim, even when it is malformed or
+        // its profile is gone: the selection gate then fails it with
+        // `provider-profile-replacement-required` instead of reading it as
+        // unset or running the base's Default account (PROTOCOL §5.54).
+        if crate::provider_profiles::is_qualified_ref(id) {
+            return Some(id.to_string());
+        }
         // Accept the candidate only when it names a registered provider
         // (whitespace-trimmed, so padded settings values still resolve).
-        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
     })
 }
 
@@ -1556,6 +1570,54 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// [`resolve_provider_id`] reduced to the base provider id: a named profile
+/// reference (`<base>@<profileId>`, PROTOCOL §5.54) runs its base provider's
+/// adapter, so provider-keyed protocol shaping (session `_meta`, usage
+/// semantics, orchestrator tooling) keys on the base. Selection identity and
+/// native-session ownership keep the full reference.
+pub(crate) fn resolve_base_provider_id(
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> Option<String> {
+    resolve_provider_id(provider, configured_default)
+        .map(|id| intent_providers::base_provider_id(&id).to_owned())
+}
+
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id; a profile reference is
+/// kept as-is) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`]. A store
+/// read error is returned, never treated as "no last turn".
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Option<String>> {
+    // A store error must not read as "never ran": falling through to the
+    // current default would pin exactly the wrong provider permanently.
+    let (_, last_turn) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await?;
+    // A named profile reference (`<base>@<profileId>`, PROTOCOL §5.54) is
+    // kept as-is: the session ran that profile, not its base's Default.
+    let last_turn = last_turn.map(|raw| raw.trim().to_string()).and_then(|raw| {
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            Some(raw)
+        } else {
+            intent_providers::find_provider_or_legacy_alias(&raw).map(|p| p.id.to_string())
+        }
+    });
+    Ok(last_turn.or_else(|| derived_default_provider(&services.effective_settings())))
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -1694,9 +1756,61 @@ fn prompt_size_error(e: &AcpError) -> Option<Error> {
 /// turn. Everything else keeps the existing opaque
 /// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
 /// method name, e.g. `session/new`).
+#[cfg(test)]
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    map_acp_session_error_for(context, e, &AuthOwner::bare(provider_id))
+}
+
+/// Whose auth verdict a runtime failure belongs to (PROTOCOL §5.54): the
+/// session's selection — a bare provider id, or a named profile reference
+/// with the saved settings it runs under. A profile failure demotes only that
+/// profile's verdict, never the base provider's Default verdict or another
+/// profile's.
+pub(crate) struct AuthOwner {
+    selection: String,
+    profile: Option<intent_acp::ProfileEnv>,
+}
+
+impl AuthOwner {
+    #[cfg(test)]
+    fn bare(provider_id: &str) -> Self {
+        Self {
+            selection: provider_id.to_owned(),
+            profile: None,
+        }
+    }
+
+    fn demote(&self) {
+        match &self.profile {
+            Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+            None => crate::provider_auth::demote_auth_verdict(&self.selection),
+        }
+    }
+}
+
+impl Services {
+    /// The [`AuthOwner`] of a resolved selection. A profile whose saved
+    /// settings cannot be read demotes nothing (and never the Default).
+    pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
+        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
+            Box::pin(self.resolve_profile_env(selection))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        AuthOwner {
+            selection: selection.to_owned(),
+            profile,
+        }
+    }
+}
+
+fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> Error {
+    let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
-        crate::provider_auth::demote_auth_verdict(provider_id);
+        owner.demote();
         return crate::host_execution::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
@@ -2695,6 +2809,82 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` from what the provider reports at
+    /// session open — the model select's `currentValue`, a selectable option
+    /// id (never the D13 display name, monorepo#1534, and never the adapter's
+    /// floating `"default"` alias: no concrete model is known then and the
+    /// column stays NULL) — so a session created without a resolvable model
+    /// (cold catalog cache, legacy row) ends up pinned to what it runs.
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten.
+    /// Returns the model that actually landed, which the manager records as
+    /// the child's spawned model (no respawn, no `model_changed` row). A NULL
+    /// `reasoning_effort` is filled at the turn boundary from the level the
+    /// provider confirmed instead (`AgentManager::maybe_persist_effort_change_notice`).
+    /// Best-effort: failures are logged, never propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| {
+                !m.trim().is_empty()
+                    && !m.contains(char::is_whitespace)
+                    && !m.eq_ignore_ascii_case("default")
+            });
+        let model = model?;
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                Some(&model),
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                // Report what actually landed: a column a concurrent write
+                // set first keeps that writer's value.
+                let landed = match self.store.get_agent_session(&stored.id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
+                        return None;
+                    }
+                };
+                let filled_model =
+                    (landed.model.as_deref() == Some(model.as_str())).then_some(model);
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?landed.model,
+                    field = "model",
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": stored.id.0, "modelId": landed.model }),
+                )
+                .await;
+                filled_model
+            }
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+                None
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -2845,11 +3035,15 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
+        let selection = resolve_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        // Protocol shaping keys on the base; auth failures belong to the
+        // selection (a profile never demotes the Default verdict).
+        let provider_id = intent_providers::base_provider_id(&selection).to_owned();
+        let owner = self.auth_owner(&selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
@@ -2887,7 +3081,7 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/new", &e, &owner))?;
         if let Some(native) = native {
             native
                 .bind_response(&opened.response.session_id.0)
@@ -2927,7 +3121,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(PreparedAcpSession {
             response: opened.response,
@@ -3076,6 +3270,24 @@ impl Services {
         })
     }
 
+    /// Record the profile settings a just-opened native session belongs to
+    /// (no-op for a bare selection).
+    async fn bind_profile_native_session(&self, stored: &AgentSession) {
+        let Some(selection) = resolve_provider_id(
+            stored.provider.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
+        ) else {
+            return;
+        };
+        if let Some(fingerprint) = self
+            .profile_process_fingerprint(&stored.id, &selection)
+            .await
+        {
+            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                .await;
+        }
+    }
+
     async fn finish_created_acp_session(
         &self,
         prepared: PreparedAcpSession,
@@ -3089,10 +3301,11 @@ impl Services {
         } = prepared;
         // On CAS loss the provider metadata belongs to the losing candidate.
         // Preserve the winner's usage, effective model and effort metadata.
-        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+        let (modes, thought_level, filled_model) = if canonical == resp.session_id.0.as_ref() {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3107,9 +3320,13 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            (resp.modes, thought_level)
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
+            (resp.modes, thought_level, filled_model)
         } else {
-            (None, None)
+            (None, None, None)
         };
         AcpSessionOpened {
             config_options: (canonical == resp.session_id.0.as_ref())
@@ -3118,6 +3335,7 @@ impl Services {
             session_id: canonical,
             modes,
             thought_level,
+            filled_model,
         }
     }
 
@@ -3299,17 +3517,43 @@ impl Services {
             .get_agent_session_last_turn_model(&workspace_id, agent_id)
             .await?;
         if let Some(owner) = last_turn_provider {
-            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            // A profile reference is its own owner: a native session never
+            // crosses profiles or a profile and Default (PROTOCOL §5.54).
+            let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
                 );
                 return Ok(None);
             }
         }
+        // A profile's native session also belongs to the settings it was
+        // opened under: after an edit takes effect (account or home may
+        // differ) recreate with Intent history instead of loading it.
+        if let Some(fingerprint) =
+            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
+        {
+            if !Self::native_session_bound_to(&stored, &fingerprint) {
+                tracing::info!(
+                    agent = %agent_id,
+                    provider = %provider_id,
+                    "profile settings changed: skipping session/load of the earlier settings' session"
+                );
+                return Ok(None);
+            }
+        }
+        let owner = self.auth_owner(&provider_id).await;
+        let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
         let is_orchestrator = self
@@ -3397,7 +3641,7 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -3406,7 +3650,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
@@ -3437,11 +3681,15 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
+            filled_model,
         }
     }
 
@@ -4528,12 +4776,17 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((_, _, provider, _)) => resolve_provider_id(
+                    Ok((_, _, provider, _)) => match resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
-                    )
+                    ) {
+                        Some(provider_id) => {
+                            self.auth_owner(&provider_id).await.demote();
+                            Some(provider_id)
+                        }
+                        None => None,
+                    }
                     .map(|provider_id| {
-                        crate::provider_auth::demote_auth_verdict(&provider_id);
                         crate::host_execution::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
@@ -4774,6 +5027,12 @@ impl Services {
                 // correct if the daemon is killed immediately after the event.
                 self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
                     .await;
+                // Observable idle means this turn is complete. The worker keeps
+                // its slot through the post-turn tail; graceful shutdown must
+                // not record that tail as an interrupted turn.
+                if let Some(manager) = self.agent_manager() {
+                    manager.mark_turn_settled_if_slot_held(agent_id);
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }
@@ -5595,7 +5854,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((_, _, provider, _)) => resolve_provider_id(
+            Ok((_, _, provider, _)) => resolve_base_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -5656,7 +5915,7 @@ impl Services {
             .await
         {
             Ok((_, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(
+                let provider_id = resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -5795,7 +6054,7 @@ impl Services {
         // below).
         let provider_id = prev_readable
             .then(|| {
-                resolve_provider_id(
+                resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )

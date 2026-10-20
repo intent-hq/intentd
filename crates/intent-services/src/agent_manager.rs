@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1139,6 +1139,11 @@ impl BusEventSink {
         let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
             return;
         };
+        // A git-ignored untracked path can never be committed, so a row for
+        // it would sit in `unstaged` forever (intent-hq/intent#7266).
+        if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+            return;
+        }
 
         // Diff compute is best-effort: a missing repo / clean worktree still
         // records the attribution row (with zero stats) so provenance is kept.
@@ -2567,7 +2572,19 @@ struct AgentHandle {
     /// env config) — passing servers they'd ignore is avoided for wire parity.
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
+    /// The model the session-open fill persisted onto a session spawned
+    /// without one (`AcpSessionOpened::filled_model`): the fill's own landed
+    /// value, taken by `adopt_filled_model` on the spawn path.
+    session_open_filled_model: Option<String>,
     spawned_provider: String,
+    /// The selection identity the child was spawned under: the canonical
+    /// provider id, or the named profile reference whose overlay it carries.
+    /// A different selection never reuses this child (PROTOCOL §5.54).
+    spawned_selection: String,
+    /// Activation registration of a child started under a named profile
+    /// (the saved settings fingerprint it read at start); dropping the
+    /// handle unregisters it (PROTOCOL §5.54 activation).
+    _activation: Option<crate::profile_activation::ActivationLease>,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
     /// the adapter is believed to be on — updated on every successful
@@ -2588,6 +2605,16 @@ struct AgentHandle {
     /// The per-agent idle-notification listener (monorepo#855), installed by
     /// `create_agent` after the handle lands; aborted when the handle drops.
     wake_listener: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl AgentHandle {
+    /// Test seam: mark a tracked mock child as spawned for the `mock`
+    /// provider (executable `node`, selection `mock`).
+    fn align_with_mock_for_test(&mut self) {
+        "node".clone_into(&mut self.spawned_provider);
+        "mock".clone_into(&mut self.spawned_selection);
+    }
 }
 
 impl Drop for AgentHandle {
@@ -2897,6 +2924,20 @@ pub struct AgentManager {
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
     auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// Slot holders that published the terminal `agent:idle` of a completed
+    /// turn and have dequeued no new work since. `agent:idle` precedes the
+    /// worker's post-turn tail and its `end_turn`, so busy-slot membership
+    /// alone cannot tell graceful shutdown that the turn is still unfinished.
+    /// Set by [`AgentManager::mark_turn_settled_if_slot_held`]; cleared by
+    /// every slot claim and release and by a drain dequeue.
+    settled_turns: Mutex<HashSet<AgentId>>,
+    /// `end_turn` calls that released their slot but have not yet persisted
+    /// `RuntimeIdle`, keyed by agent with the slot workspace and a per-call
+    /// token. The release is synchronous and the write awaits, so an aborted
+    /// caller would otherwise leave the session `Active` for the next
+    /// startup heal to record as a crashed turn. Shutdown finishes them.
+    pending_idle_writes: Mutex<HashMap<AgentId, (WorkspaceId, u64)>>,
+    next_idle_write: AtomicU64,
     /// Armed by [`AgentManager::arm_send_now_handback_gate`]; see
     /// [`HandbackGate`].
     #[cfg(test)]
@@ -3012,6 +3053,9 @@ impl AgentManager {
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            settled_turns: Mutex::new(HashSet::new()),
+            pending_idle_writes: Mutex::new(HashMap::new()),
+            next_idle_write: AtomicU64::new(0),
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
@@ -3665,12 +3709,15 @@ impl AgentManager {
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
-            let context = crate::installed_cli::InstalledContext::discover(cli)
-                .await
-                .map_err(Error::InvalidInput)?;
-            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
-                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
-            context.apply(&mut prepared.command);
+            // A named profile resolves before account lookup; the spawn layer
+            // applies the same overlay to the prepared command.
+            let context = crate::installed_cli::InstalledContext::discover_for(
+                cli,
+                spawn_opts.profile_env.cloned().map(Arc::new),
+            )
+            .await
+            .map_err(Error::InvalidInput)?;
+            let prepared = prepare_installed_launch(&context, &spawn_opts)?;
             let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
@@ -3728,6 +3775,19 @@ impl AgentManager {
             }
         });
 
+        // The child read the profile's saved settings now; track it until
+        // it is torn down so earlier-settings state stays accurate.
+        let activation = match opts.profile_env {
+            // Boxed: keeps the spawn future's stack frame unchanged.
+            Some(profile) => {
+                Box::pin(
+                    self.services
+                        .register_profile_process(&workspace_id, &agent_id, profile),
+                )
+                .await
+            }
+            None => None,
+        };
         let handle = AgentHandle {
             repository_origin: repository_origin.clone(),
             execution: RuntimeHandle::local(LocalResources {
@@ -3750,9 +3810,15 @@ impl AgentManager {
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
+            spawned_selection: opts
+                .profile_env
+                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref)
+                .to_string(),
+            _activation: activation,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -4648,6 +4714,9 @@ impl AgentManager {
         if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.config_options.clone_from(&opened.config_options);
             crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+            handle
+                .session_open_filled_model
+                .clone_from(&opened.filled_model);
         }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
@@ -4696,6 +4765,7 @@ impl AgentManager {
         agent_id: &AgentId,
         session_id: &str,
         provider: &str,
+        selection: &str,
         original: &OriginalTurn,
     ) -> Result<()> {
         let Some((conn, mut options)) = self
@@ -4713,14 +4783,11 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let enabled = self
-            .services
-            .effective_settings()
-            .providers
-            .fast_mode
-            .get(provider)
-            .copied()
-            .unwrap_or(false);
+        // A named profile reads its own entry, never the base provider's.
+        let enabled = crate::fast_mode::preference(
+            &self.services.effective_settings().providers.fast_mode,
+            selection,
+        );
         crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
         if let Some(handle) = self
             .handles
@@ -5270,7 +5337,8 @@ impl AgentManager {
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let provider_id = match &session {
-            Ok(s) => session_provider_id(s, configured_default.as_deref()),
+            Ok(s) => session_provider_id(s, configured_default.as_deref())
+                .map(|id| intent_providers::base_provider_id(&id).to_owned()),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -6311,6 +6379,7 @@ impl AgentManager {
         });
         let provider_kills_on_interrupt = session_provider
             .as_deref()
+            .map(intent_providers::base_provider_id)
             .and_then(intent_providers::find_provider)
             .is_some_and(|p| p.kills_child_on_interrupt)
             // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
@@ -6899,6 +6968,9 @@ impl AgentManager {
         // slot it kept is cleared like any other orphan.
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
+        // A new claim's own end supersedes any earlier release's pending
+        // idle write. (`settled_turns` cannot survive a release.)
+        self.pending_idle_writes.lock().unwrap().remove(agent_id);
         busy.insert(agent_id.clone());
         let admission = TurnAdmission(self.next_admission.fetch_add(1, AtomicOrdering::Relaxed));
         self.turn_admissions
@@ -7182,11 +7254,25 @@ impl AgentManager {
     /// `busy` guard is dropped — the registry lock is never nested under it.
     #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
+        self.release_slot_sync_inner(agent_id, false)
+            .map(|removed| removed.map(|(workspace_id, _)| workspace_id))
+    }
+
+    /// [`Self::release_slot_sync`], optionally recording a pending
+    /// `RuntimeIdle` write under the same `busy` critical section, so no
+    /// claim can interleave between the release and the record.
+    #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
+    fn release_slot_sync_inner(
+        &self,
+        agent_id: &AgentId,
+        record_idle_write: bool,
+    ) -> Option<Option<(WorkspaceId, Option<u64>)>> {
         let removed = {
             let mut busy = self.busy.lock().unwrap();
             if !busy.remove(agent_id) {
                 return None;
             }
+            self.settled_turns.lock().unwrap().remove(agent_id);
             self.turn_admissions.lock().unwrap().remove(agent_id);
             if busy.is_empty() {
                 *self.idle_since.lock().unwrap() = Some(Instant::now());
@@ -7196,7 +7282,18 @@ impl AgentManager {
             // failure releasing before spawn) must not leak the notice into a
             // later unrelated turn.
             self.auto_unarchived.lock().unwrap().remove(agent_id);
-            self.agent_ws.lock().unwrap().remove(agent_id)
+            let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+            workspace_id.map(|workspace_id| {
+                let token = record_idle_write.then(|| {
+                    let token = self.next_idle_write.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.pending_idle_writes
+                        .lock()
+                        .unwrap()
+                        .insert(agent_id.clone(), (workspace_id.clone(), token));
+                    token
+                });
+                (workspace_id, token)
+            })
         };
         self.registry.wake_waiter_if_idle(agent_id);
         Some(removed)
@@ -7223,19 +7320,56 @@ impl AgentManager {
         }
     }
 
+    /// Record that the current slot holder completed its turn and published
+    /// its terminal `agent:idle`. Decided under the `busy` lock (lock order
+    /// busy → `settled_turns`, matching [`Self::claim_slot_sync`]); claims and
+    /// releases clear it under the same lock, so it never outlives the slot.
+    pub(crate) fn mark_turn_settled_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if busy.contains(agent_id) {
+            self.settled_turns.lock().unwrap().insert(agent_id.clone());
+        }
+    }
+
+    /// The slot holder dequeued new work: shutdown must again treat it as
+    /// interrupted. Synchronous, so a worker abort cannot land between
+    /// taking the work and clearing the mark.
+    fn clear_turn_settled(&self, agent_id: &AgentId) {
+        self.settled_turns.lock().unwrap().remove(agent_id);
+    }
+
+    fn turn_settled(&self, agent_id: &AgentId) -> bool {
+        self.settled_turns.lock().unwrap().contains(agent_id)
+    }
+
+    /// Retire this call's pending idle write. A later release replaces the
+    /// entry with its own token, so a stale write never retires a newer one.
+    fn finish_idle_write(&self, agent_id: &AgentId, token: u64) {
+        let mut pending = self.pending_idle_writes.lock().unwrap();
+        if pending
+            .get(agent_id)
+            .is_some_and(|(_, current)| *current == token)
+        {
+            pending.remove(agent_id);
+        }
+    }
+
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
-        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
+        let Some(released) = self.release_slot_sync_inner(agent_id, true) else {
             return;
         };
-        if let Some(workspace_id) = workspace_id {
+        if let Some((workspace_id, token)) = released {
             self.services.agent_activity_end(&workspace_id);
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;
+            if let Some(token) = token {
+                self.finish_idle_write(agent_id, token);
+            }
         }
     }
 
@@ -9913,7 +10047,9 @@ impl AgentManager {
         resolved: &ResolvedSpawn,
     ) {
         let to_model = resolved.model.as_deref();
-        let to_provider = resolved.provider.id;
+        // The selection, not the base id: a profile switch is a provider
+        // change, and `last_turn_provider` names the native session's owner.
+        let to_provider = resolved.selection.as_str();
         let (from_model, from_provider) = match self
             .services
             .store
@@ -9942,9 +10078,18 @@ impl AgentManager {
                 )
                 .await;
         if changed && !announced {
-            let label = |provider: &str, model: Option<&str>| match model {
-                Some(m) => format!("{provider}:{m}"),
-                None => format!("{provider} (default model)"),
+            // A profile reads as `<base> (<profile name>)`, never as its
+            // internal reference; the metadata keeps the references.
+            let profiles = self.services.provider_profiles.profiles().ok();
+            let label = |provider: &str, model: Option<&str>| {
+                let provider = crate::provider_profiles::readable_selection(
+                    provider,
+                    profiles.as_deref().map(Vec::as_slice),
+                );
+                match model {
+                    Some(m) => format!("{provider}:{m}"),
+                    None => format!("{provider} (default model)"),
+                }
             };
             let from_label = label(
                 from_provider.as_deref().unwrap_or(""),
@@ -9999,6 +10144,76 @@ impl AgentManager {
         }
     }
 
+    /// Adopt the model the session-open fill persisted for a session spawned
+    /// without one. The value is the fill's own landed model, recorded on the
+    /// live handle (`session_open_filled_model`) — never re-read from the
+    /// row, so a racing `agent.setModel` is not mistaken for an applied
+    /// model. Only a model `resolve_spawn` itself would pass is adopted (a
+    /// provider that always spawns on its default — the E2E mock — must not
+    /// see a phantom mismatch that respawns every turn). Sets the handle's
+    /// `spawned_model` and `resolved.model`; when the last committed turn ran
+    /// the same provider on its default (`last_turn_model` NULL) the baseline
+    /// moves to the adopted id too, so the provider default → its concrete id
+    /// is not announced as a model change. Returns the landed fill (the model
+    /// now stored on the row), adopted or not. Best-effort.
+    async fn adopt_filled_model(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+        workspace: Option<&intent_core::Workspace>,
+        settings: &intent_core::settings_file::SettingsFile,
+        resolved: &mut ResolvedSpawn,
+    ) -> Option<String> {
+        let filled = self
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .and_then(|h| h.session_open_filled_model.take())?;
+        if resolved.model.is_some() {
+            return Some(filled);
+        }
+        let probe = AgentSession {
+            model: Some(filled.clone()),
+            ..session.clone()
+        };
+        let Some(model) =
+            resolve_spawn(&probe, workspace, settings, self.chief_cwd_root.as_deref())
+                .ok()
+                .and_then(|r| r.model)
+        else {
+            return Some(filled);
+        };
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.spawned_model = Some(model.clone());
+        }
+        if let Ok((None, Some(prev))) = self
+            .services
+            .store
+            .get_agent_session_last_turn_model(workspace_id, agent_id)
+            .await
+        {
+            if intent_providers::provider_config(&prev).id == resolved.provider.id {
+                if let Err(e) = self
+                    .services
+                    .store
+                    .set_agent_session_last_turn_model(
+                        workspace_id,
+                        agent_id,
+                        Some(&model),
+                        resolved.provider.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to rebase last-turn model");
+                }
+            }
+        }
+        resolved.model = Some(model);
+        Some(filled)
+    }
+
     /// Commit a confirmed effort at the successful turn boundary, never a
     /// picker update. SQL NULL is an unobserved baseline; JSON effort:null is
     /// Auto. The system row is excluded from provider history replay.
@@ -10036,10 +10251,24 @@ impl AgentManager {
             model: resolved.model.clone(),
         };
         if let Some(from) = &previous {
-            let same = match (&from.effort, &state.effort) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                (None, None) => true,
-                _ => false,
+            // Compare the EFFECTIVE level: Auto resolves to the provider's
+            // default value, so Auto → that same explicit level (e.g. the
+            // session-open fill pinning the provider's current level) is not
+            // a change.
+            let effective = |e: &intent_store::AgentTurnEffort| {
+                e.effort
+                    .clone()
+                    .or_else(|| Some(e.default_value.clone()).filter(|d| !d.is_empty()))
+            };
+            let same = if from.effort.is_none() && state.effort.is_none() {
+                // Auto → Auto is never a change, whatever the default did.
+                true
+            } else {
+                match (effective(from), effective(&state)) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+                    (None, None) => true,
+                    _ => false,
+                }
             };
             if !same {
                 let content = json!([{"type":"text", "text": format!(
@@ -10081,6 +10310,76 @@ impl AgentManager {
                 .await
             {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to commit last-turn effort");
+            }
+        }
+    }
+
+    /// Every session carries a concrete reasoning level: a session that ran
+    /// this turn on Auto (no stored effort) is pinned to the level the
+    /// provider confirmed for it — its explicit selection, else its known
+    /// default — never the adapter's `"default"` sentinel. Fill-only, so a
+    /// concurrent effort change wins, and it lands only while the row still
+    /// carries the provider/model this turn ran (`expected_*`), so a model
+    /// switch racing the turn never inherits the old model's level. The
+    /// store marks the level Auto-pinned (`reasoning_effort_auto`), and the
+    /// effective-level comparison keeps Auto → that same level silent on the
+    /// next turn.
+    async fn fill_confirmed_effort(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+        expected_provider: Option<&str>,
+        expected_model: Option<&str>,
+    ) {
+        if resolved.reasoning_effort.is_some() {
+            return;
+        }
+        let applied = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|h| h.confirmed_effort.clone());
+        let Some(level) = applied
+            .and_then(|a| a.selection.or(Some(a.default_value)))
+            .filter(|level| !level.trim().is_empty() && !level.eq_ignore_ascii_case("default"))
+        else {
+            return;
+        };
+        match self
+            .services
+            .store
+            .fill_agent_session_effort_if_identity(
+                workspace_id,
+                agent_id,
+                &level,
+                expected_provider,
+                expected_model,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    reasoning_effort = %level,
+                    field = "reasoning_effort",
+                    "legacy session repaired"
+                );
+                self.services.invalidate_agent_list_cache(workspace_id);
+                self.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_UPDATED,
+                        json!({ "agentId": agent_id.0, "reasoningEffort": level }),
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "fill confirmed effort failed");
             }
         }
     }
@@ -10173,6 +10472,76 @@ impl AgentManager {
         }
     }
 
+    /// Turn-start repair of a legacy session whose `provider` column is NULL
+    /// (written before every create pinned its provider). The provider comes
+    /// from [`crate::agent_session::legacy_session_provider`]: the provider
+    /// its last committed turn actually ran, else the settings default in
+    /// effect now (a session that never ran). Persisted through the
+    /// compare-and-set [`intent_store::Store::pin_agent_session_provider_if_null`],
+    /// so a concurrent `agent.setModel` that pinned a provider first wins and
+    /// the fresh row is used instead. The effective spawn identity of a
+    /// session that last ran on the pinned provider is unchanged, so no
+    /// respawn and no `model_changed` row follow. Emits `agent:updated` so
+    /// clients re-read the projection. With nothing to pin onto the session
+    /// is returned unchanged and `resolve_spawn` raises its own loud error.
+    async fn pin_legacy_session_provider(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: AgentSession,
+    ) -> Result<AgentSession> {
+        if session
+            .provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
+            return Ok(session);
+        }
+        let provider = match crate::agent_session::legacy_session_provider(
+            &self.services,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(session),
+            Err(e) => {
+                // Never pin on a failed read: this turn resolves as before
+                // and the next turn retries the repair.
+                tracing::warn!(agent = %agent_id, error = %e, "legacy provider repair skipped");
+                return Ok(session);
+            }
+        };
+        let landed = self
+            .services
+            .store
+            .pin_agent_session_provider_if_null(workspace_id, agent_id, &provider, &now_iso())
+            .await?;
+        if !landed {
+            return self.services.store.get_agent_session(agent_id).await;
+        }
+        tracing::info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            field = "provider",
+            "legacy session repaired"
+        );
+        self.services.invalidate_agent_list_cache(workspace_id);
+        self.services
+            .publish_agent_mutation_event(
+                workspace_id,
+                agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": agent_id.0, "providerId": provider }),
+            )
+            .await;
+        Ok(AgentSession {
+            provider: Some(provider),
+            ..session
+        })
+    }
+
     /// Turn-start disabled-provider gate (intent-hq/intent#5737). When the
     /// session's effective provider — what `resolve_spawn` would run:
     /// `session.provider` (legacy aliases normalized through
@@ -10228,6 +10597,15 @@ impl AgentManager {
         ) else {
             return Ok((session, false));
         };
+        // A named profile is never re-homed: a missing profile or a disabled
+        // base provider needs an explicit replacement before this turn, and
+        // never moves the conversation to the app default or the base's
+        // Default account (PROTOCOL §5.54). Bare selections keep the re-home.
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            self.services
+                .ensure_provider_ref_selectable_in(&raw, &settings.providers)?;
+            return Ok((session, false));
+        }
         let current = intent_providers::provider_config(&raw).id;
         if !crate::agent_ops::provider_is_disabled(current, settings.providers.enabled.as_ref()) {
             return Ok((session, false));
@@ -10432,6 +10810,15 @@ impl AgentManager {
             .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();
+        // Legacy provider repair: every session pins its provider at create,
+        // so a NULL column is a pre-pin row. Pin it once onto the provider its
+        // last turn ran (else the current default) BEFORE the disabled gate
+        // and `resolve_spawn`, so the session stops following
+        // `model.defaultProvider` changes from this turn on.
+        // Boxed: keeps the repair's state off `ensure_started`'s future (the
+        // deep send/interrupt paths otherwise overflow the test stack).
+        let session =
+            Box::pin(self.pin_legacy_session_provider(agent_id, workspace_id, session)).await?;
         // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
         // a provider the user switched off in Settings > Agents never spawns
         // it — re-home onto the usable default (persisted before
@@ -10457,10 +10844,12 @@ impl AgentManager {
                     // Compare the session's currently-resolved model/provider against
                     // the values the child was spawned with. A mismatch means
                     // agent.setModel was called while the child was live.
-                    let model_changed =
-                        handle.spawned_model.as_deref() != resolved.model.as_deref();
-                    let provider_changed = handle.spawned_provider != resolved.provider.command;
-                    model_changed || provider_changed
+                    spawn_identity_changed(
+                        handle.spawned_model.as_deref(),
+                        &handle.spawned_provider,
+                        &handle.spawned_selection,
+                        &resolved,
+                    )
                 } else {
                     false
                 }
@@ -10511,8 +10900,22 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id, &original)
-                        .await?;
+                    Box::pin(self.fill_confirmed_effort(
+                        agent_id,
+                        workspace_id,
+                        &resolved,
+                        session.provider.as_deref(),
+                        session.model.as_deref(),
+                    ))
+                    .await;
+                    self.apply_fast_mode(
+                        agent_id,
+                        &acp,
+                        resolved.provider.id,
+                        &resolved.selection,
+                        &original,
+                    )
+                    .await?;
                     return Ok(StartedSession {
                         session_id: acp,
                         turn: original,
@@ -10643,7 +11046,16 @@ impl AgentManager {
                 "no provider binary resolved; launching the bare command from the daemon PATH"
             );
         }
+        // A named profile's saved overlay, read fresh for this new process
+        // (it re-checks the profile still exists and its base is enabled).
+        // Boxed: keeps this turn-start future's stack frame unchanged.
+        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+            Box::pin(self.services.resolve_selected_profile(&resolved.selection)).await?
+        } else {
+            None
+        };
         let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.profile_env = profile_env.as_deref();
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
         opts.reasoning_effort = resolved.reasoning_effort.as_deref();
@@ -10736,6 +11148,20 @@ impl AgentManager {
                 return Err(error);
             }
         };
+        // A session spawned on the provider default (no stored model) had its
+        // `model` filled at session open from the provider's current option
+        // id (`fill_identity_from_session_open`). The child runs exactly that
+        // model, so adopt it as the resolved identity: the notice/commit
+        // below and the next turn's respawn comparison see the same id.
+        let filled_model = Box::pin(self.adopt_filled_model(
+            agent_id,
+            workspace_id,
+            &session,
+            workspace.as_ref(),
+            &settings,
+            &mut resolved,
+        ))
+        .await;
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -10748,10 +11174,21 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        // The row now carries the session-open fill (if one landed) instead
+        // of the turn-start NULL model.
+        Box::pin(self.fill_confirmed_effort(
+            agent_id,
+            workspace_id,
+            &resolved,
+            session.provider.as_deref(),
+            filled_model.as_deref().or(session.model.as_deref()),
+        ))
+        .await;
         self.apply_fast_mode(
             agent_id,
             &acp_session_id.session_id,
             resolved.provider.id,
+            &resolved.selection,
             &acp_session_id.turn,
         )
         .await?;
@@ -10843,6 +11280,34 @@ impl AgentManager {
             let _ = worker.await;
         }
         self.services.persist_shutdown_drains().await;
+        // Finish `end_turn` writes aborted after their release: the agent is
+        // outside `in_flight`, and a persisted `Active` would make the next
+        // startup heal record its completed turn as a crash. Only a status
+        // still in flight is rewritten (a later stop, failure or delete wins),
+        // and undelivered ready input keeps the crash path's recovery.
+        let pending_idle: Vec<(AgentId, WorkspaceId)> = self
+            .pending_idle_writes
+            .lock()
+            .unwrap()
+            .drain()
+            .filter(|(id, _)| !in_flight.iter().any(|(busy, _)| busy == id))
+            .map(|(id, (workspace_id, _))| (id, workspace_id))
+            .collect();
+        for (id, workspace_id) in &pending_idle {
+            if self.services.has_ready_to_send(id) {
+                continue;
+            }
+            match self.services.store.get_agent_session_status(id).await {
+                Ok(status) if crate::is_stale_in_flight_status(status) => {
+                    self.persist_status(id, workspace_id, AgentStatus::RuntimeIdle, false)
+                        .await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read status for a pending idle write");
+                }
+            }
+        }
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
         let now = intent_core::now_iso();
@@ -10866,11 +11331,20 @@ impl AgentManager {
             self.services
                 .flush_pinned_turn_on_interruption(id, InterruptReason::DaemonShutdown, None)
                 .await;
+            // Workers are joined, so the mark is final. A holder that already
+            // published its completed turn's `agent:idle` and admitted no new
+            // work is only finishing post-turn bookkeeping: recording it would
+            // make the next startup deliver a second continuation.
+            if self.turn_settled(id) && !self.services.has_ready_to_send(id) {
+                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no interrupted_agent row");
+                continue;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
-            // shutdown in that window may read Pending. Busy-set membership is authoritative:
-            // if the agent is in busy, it's mid-turn regardless of the persisted status.
+            // shutdown in that window may read Pending. Busy-set membership without a
+            // settled mark is authoritative: the agent is mid-turn regardless of the
+            // persisted status.
             let prev_status = match self.services.store.get_agent_session_status(id).await {
                 Ok(status) => status,
                 Err(e) => {
@@ -12232,6 +12706,13 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
 /// [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
     provider: ProviderConfig,
+    /// The selection identity the session runs under
+    /// ([`crate::provider_profiles::canonical_selection`]): the canonical
+    /// provider id, or the profile reference `<base>@<profileId>` whose
+    /// overlay the spawn applies. Process reuse, the model-change notice and
+    /// native-session ownership compare this, so a switch between profiles
+    /// (or a profile and Default) always starts a fresh process.
+    selection: String,
     model: Option<String>,
     /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
     /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
@@ -12396,6 +12877,10 @@ fn resolve_spawn(
         crate::agent_session::derived_default_provider(settings).as_deref(),
     )
     .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
+    let selection = crate::provider_profiles::canonical_selection(&provider_id);
+    // A profile shares its base provider's installation, paths and launch
+    // configuration; only the environment overlay differs.
+    let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
     // Whitespace-bearing ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
     // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
@@ -12523,6 +13008,7 @@ fn resolve_spawn(
             ..*base
         };
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             // Config-option E2E providers must track the selected model so
             // live switches exercise the same respawn path as real providers.
@@ -12566,6 +13052,7 @@ fn resolve_spawn(
                 ));
             }
             return Ok(ResolvedSpawn {
+                selection: selection.clone(),
                 provider,
                 model,
                 reasoning_effort,
@@ -12597,6 +13084,7 @@ fn resolve_spawn(
                 "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
             return Ok(ResolvedSpawn {
+                selection: selection.clone(),
                 provider,
                 model,
                 reasoning_effort,
@@ -12613,8 +13101,17 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
+        // Test-only: the `agent_ops::TEST_RUNNABLE_PATH` marker stands in for
+        // a host npx so pure resolution tests do not depend on Node/npx.
+        #[cfg(test)]
+        let npx = npx.or_else(|| {
+            (read_provider_path_setting(settings, provider.id).as_deref()
+                == Some(crate::agent_ops::TEST_RUNNABLE_PATH))
+            .then(|| std::path::PathBuf::from("npx"))
+        });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             model,
             reasoning_effort,
@@ -12654,6 +13151,7 @@ fn resolve_spawn(
 
     Ok(ResolvedSpawn {
         provider,
+        selection,
         model,
         reasoning_effort,
         cwd,
@@ -12702,6 +13200,48 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
+/// Whether a live child no longer matches the session's resolved spawn
+/// identity and must be replaced before the next turn: a different model, a
+/// different provider executable, or a different selection — a switch
+/// between named profiles, or a profile and Default, is never served by the
+/// other configuration's process even when the model and executable match
+/// (PROTOCOL §5.54).
+fn spawn_identity_changed(
+    spawned_model: Option<&str>,
+    spawned_provider: &str,
+    spawned_selection: &str,
+    resolved: &ResolvedSpawn,
+) -> bool {
+    spawned_model != resolved.model.as_deref()
+        || spawned_provider != resolved.provider.command
+        || spawned_selection != resolved.selection
+}
+
+/// Test seam: the canonical selection of a handle spawned with `command`.
+#[cfg(test)]
+pub(crate) fn test_selection_for_command(command: &str) -> String {
+    intent_providers::ACP_PROVIDERS
+        .iter()
+        .rev()
+        .find(|p| p.command == command)
+        .map_or(command, |p| p.id)
+        .to_string()
+}
+
+/// Build a persistent installed-CLI launch: the spawn layer's command (provider
+/// env, Intent wiring, the profile overlay over captured credentials), frozen
+/// to the installed context, which re-asserts the selected executable and
+/// enforced policy.
+fn prepare_installed_launch(
+    context: &crate::installed_cli::InstalledContext,
+    spawn_opts: &SpawnOptions<'_>,
+) -> Result<intent_acp::spawn::PreparedProvider> {
+    let mut prepared = intent_acp::spawn::prepare_provider(spawn_opts)
+        .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+    context.apply(&mut prepared.command);
+    Ok(prepared)
+}
+
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
@@ -12730,6 +13270,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
+    spawn_opts.profile_env = opts.profile_env;
     spawn_opts
 }
 
@@ -13629,6 +14170,7 @@ async fn run_message_worker(
                 .services
                 .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
+                mgr.clear_turn_settled(&agent_id);
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
@@ -13650,6 +14192,7 @@ async fn run_message_worker(
             }
         }
         if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
+            mgr.clear_turn_settled(&agent_id);
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
@@ -14704,7 +15247,10 @@ async fn retry_spawn_owned(
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        match mgr.ensure_started_owned(agent_id, workspace_id).await {
+        // Boxed: the turn-start future (spawn, session open, identity
+        // repairs) is large; inlining it into the turn worker's future
+        // overflows the stack on deep send/interrupt paths.
+        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
@@ -18740,9 +19286,12 @@ mod dead_child_respawn_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         }
@@ -18931,7 +19480,8 @@ mod disabled_provider_rehome_tests {
 
     /// Manager over a temp store with a settings registry wired and NO
     /// seeded session — each test seeds its own row.
-    async fn registry_manager() -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
+    pub(super) async fn registry_manager(
+    ) -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
         let db_dir = crate::tests::test_tempdir("intentd-rehome-");
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
@@ -18957,7 +19507,7 @@ mod disabled_provider_rehome_tests {
         )
     }
 
-    fn set(mgr: &AgentManager, path: &str, value: Value) {
+    pub(super) fn set(mgr: &AgentManager, path: &str, value: Value) {
         mgr.services
             .settings_registry()
             .expect("registry wired")
@@ -20262,6 +20812,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20311,6 +20862,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -23070,5 +23622,198 @@ mod agent_retry_tests {
 mod effort_notice_tests;
 
 #[cfg(all(test, unix))]
+#[path = "agent_manager/legacy_identity_tests.rs"]
+mod legacy_identity_tests;
+
+#[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+#[cfg(test)]
+#[path = "agent_manager/future_size_tests.rs"]
+mod future_size_tests;
+
+/// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
+/// command carries the profile over inherited and captured values, never over
+/// Intent's wiring, executable selection or enforced policy.
+#[cfg(all(test, unix))]
+mod profile_launch_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    #[test]
+    fn persistent_launch_applies_profile_but_never_over_intent_wiring() {
+        for (base, cli, account_var) in [
+            ("codex", InstalledCli::Codex, "CODEX_HOME"),
+            ("claude-code", InstalledCli::Claude, "CLAUDE_CONFIG_DIR"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                vec![
+                    ("PROFILE_LAUNCH_TOKEN".into(), Some("work".into())),
+                    (
+                        account_var.into(),
+                        Some(work.to_string_lossy().into_owned()),
+                    ),
+                    ("LOGNAME".into(), None),
+                    ("INTENT_TEST_WIRING".into(), Some("profile".into())),
+                ],
+            );
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.profile_env = Some(&profile);
+            opts.extra_env
+                .insert("INTENT_TEST_WIRING".into(), "intent".into());
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let command = &prepared.command;
+            assert_eq!(
+                env(command, "PROFILE_LAUNCH_TOKEN"),
+                Some("work".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, account_var),
+                Some(work.into_os_string()),
+                "{base}"
+            );
+            assert!(env(command, "LOGNAME").is_none(), "{base}");
+            assert_eq!(
+                env(command, "INTENT_TEST_WIRING"),
+                Some("intent".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, cli.path_env()),
+                Some(context.runtime.path().as_os_str().to_owned()),
+                "{base}"
+            );
+            if cli == InstalledCli::Codex {
+                assert_eq!(
+                    env(command, "CODEX_CONFIG"),
+                    Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+                );
+            }
+            assert!(std::env::var_os("PROFILE_LAUNCH_TOKEN").is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_spawn_options_keep_the_profile() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let profile = intent_acp::ProfileEnv::new("codex@work", "f1", Vec::new());
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let rebuilt = rebuild_spawn_opts(&opts, None, None, None);
+        assert_eq!(rebuilt.profile_env, Some(&profile));
+    }
+}
+
+/// Every key a profile may save reaches the persistent launch and the probe
+/// paths unchanged, even when Intent injects its own git wiring.
+#[cfg(all(test, unix))]
+mod profile_reach_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+        "INITIAL_AGENT_MODE",
+        "CORP_GATEWAY_TOKEN",
+        "LANG",
+    ];
+
+    #[test]
+    fn every_non_reserved_profile_key_reaches_launch_and_probes_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(repo.path()).unwrap();
+        let mut config = git.config().unwrap();
+        config.set_str("user.name", "Intent Wiring").unwrap();
+        config
+            .set_str("user.email", "wiring@example.invalid")
+            .unwrap();
+        for (base, cli) in [
+            ("codex", InstalledCli::Codex),
+            ("claude-code", InstalledCli::Claude),
+        ] {
+            let allowed: Vec<&str> = CANDIDATES
+                .iter()
+                .copied()
+                .filter(|k| crate::provider_profiles::reserved_key_reason(k, base).is_none())
+                .collect();
+            assert_eq!(
+                allowed.contains(&"INITIAL_AGENT_MODE"),
+                base == "claude-code"
+            );
+            let value = |k: &str| format!("profile-{k}");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                allowed
+                    .iter()
+                    .map(|k| ((*k).to_owned(), Some(value(k))))
+                    .collect(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.cwd = Some(repo.path());
+            opts.profile_env = Some(&profile);
+            inject_git_identity_env(&mut opts.extra_env, Some(repo.path()));
+            inject_git_credential_env(&mut opts.extra_env, Some(repo.path()), true);
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let mut auth_probe = tokio::process::Command::new(context.runtime.path());
+            context.apply(&mut auth_probe);
+            let mut model_probe = tokio::process::Command::new("unused");
+            context.apply_isolated(&mut model_probe);
+            for key in &allowed {
+                let expected = Some(OsString::from(value(key)));
+                assert_eq!(env(&prepared.command, key), expected, "{base} launch {key}");
+                assert_eq!(env(&auth_probe, key), expected, "{base} auth {key}");
+                assert_eq!(env(&model_probe, key), expected, "{base} model {key}");
+            }
+        }
+    }
+}

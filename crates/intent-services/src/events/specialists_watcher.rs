@@ -29,7 +29,7 @@ use super::bus::EventBus;
 use super::linked_watch::{uncovered_directories, ScopedLinkedWatches};
 use super::root_watch::{watch_root, RootWatch};
 use super::shared_watch::{watch_tiers, SharedWatchHub, TierWatch};
-use crate::specialists::{claude_agents, SpecialistsService};
+use crate::specialists::{claude_agents, default_user_dir, SpecialistsService};
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -253,25 +253,13 @@ fn is_md(path: &Path) -> bool {
             .is_ok_and(|metadata| metadata.is_symlink())
 }
 
-/// Default user-tier specialists directory (`~/.intent/specialists/`).
-fn default_user_dir() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".intent").join("specialists"))
-}
-
 /// The project-tier specialists directory, relative to the workspace root.
-const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
+pub(super) const PROJECT_TIERS: &[&str] = &[".intent/specialists", ".claude/agents"];
 
 /// The project-tier specialists directory for a workspace.
 #[cfg(test)]
 fn project_dir(workspace_path: &Path) -> PathBuf {
     workspace_path.join(".intent").join("specialists")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Fingerprint the resolved specialist set for a workspace: a hash of the

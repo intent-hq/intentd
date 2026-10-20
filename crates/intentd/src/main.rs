@@ -37,8 +37,6 @@ mod command_evidence;
 mod doctor_codex;
 mod exact_update;
 mod git_credential;
-mod import;
-mod legacy_import;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -193,35 +191,6 @@ enum Command {
         #[arg(long)]
         connect: String,
     },
-    /// Migrate an existing Intent (Electron) install into intentd's `SQLite` store
-    /// (§9.7): read `<dir>/workspaces.json` and each workspace's `.workspace/`
-    /// entities and idempotently upsert them. Read-only toward the source.
-    Import {
-        /// Path to the Intent `userData` directory to import from.
-        #[arg(long)]
-        from: PathBuf,
-    },
-    /// Import legacy per-directory Intent workspaces
-    /// (`<root>/<id>/.workspace/workspace.json`) into the `SQLite` store. Scans
-    /// `~/intent/workspaces`, `~/intent`, and `~/.workspaces` by default;
-    /// idempotent (ids already in the DB are skipped) and read-only toward the
-    /// source. The same module backs the automatic first-boot import in `serve`.
-    ImportLegacy {
-        /// Scan only these directories instead of the default legacy roots
-        /// (repeatable: `--root a --root b`; each must exist).
-        #[arg(long)]
-        root: Vec<PathBuf>,
-        /// Legacy Electron app-level dir holding `config.json` /
-        /// `repo-registry.json`; defaults to the platform userData dir.
-        #[arg(long)]
-        app_dir: Option<PathBuf>,
-        /// Print the per-workspace plan without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Update rows whose workspace id already exists instead of skipping.
-        #[arg(long)]
-        force: bool,
-    },
     /// Print everything a client needs to pair with this daemon: the LAN
     /// pairing QR code, then labeled URL (`intent://pair?…` payload URI),
     /// bearer token, and TLS certificate fingerprint lines — each with a short
@@ -234,7 +203,10 @@ enum Command {
     /// multi-select bind-address picker (persisted to `server.bindAddress`:
     /// a single IP as a string, several as a list), or unattended with
     /// `--yes` (keeps the persisted bind address; default loopback);
-    /// non-interactive runs without `--yes` refuse instead.
+    /// non-interactive runs without `--yes` refuse instead. `--host` names
+    /// the address clients dial instead, which also pairs a loopback-only
+    /// daemon (e.g. `--host localhost` for the Windows app and a daemon in
+    /// WSL).
     Pair {
         /// Also write the QR code as a PNG image to this path.
         #[arg(long, value_name = "PATH")]
@@ -252,7 +224,7 @@ enum Command {
         /// effective posture. Never re-pairs (no new token, no QR); requires
         /// a running daemon. Reads the selection from stdin (one line), so
         /// it also works piped.
-        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate"])]
+        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate", "host"])]
         select_endpoints: bool,
         /// Mint and persist a NEW bearer token (replacing the old one) before
         /// printing, via `server.rotateToken` — only after the listener is
@@ -261,6 +233,16 @@ enum Command {
         /// token is fixed by its `INTENTD_AUTH_TOKEN` env var.
         #[arg(long)]
         rotate: bool,
+        /// Host clients should dial — an IP or hostname — used in place of
+        /// the addresses the daemon advertises. Prints the URL, token, and
+        /// fingerprint even when the listener is bound to loopback only, for
+        /// clients that reach this machine through a local forward on the
+        /// same port: e.g. `--host localhost` when the Intent Windows app
+        /// connects to an intentd running in WSL. Takes an IP address or a
+        /// hostname only — the port always comes from the daemon. The value
+        /// is not checked for reachability.
+        #[arg(long, value_name = "HOST", value_parser = parse_pair_host)]
+        host: Option<String>,
     },
     /// Daemon-backed git credential helper (monorepo#884): speaks the
     /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
@@ -447,24 +429,21 @@ async fn async_main(cli: Cli) -> ExitCode {
                     }
                 }
             }
-            Command::Import { from } => to_exit(cmd_import(&from).await),
-            Command::ImportLegacy {
-                root,
-                app_dir,
-                dry_run,
-                force,
-            } => to_exit(cmd_import_legacy(root, app_dir, dry_run, force).await),
             Command::Pair {
                 png,
                 svg,
                 yes,
                 select_endpoints,
                 rotate,
+                host,
             } => {
                 if select_endpoints {
                     to_exit(cmd_pair_select_endpoints().await)
                 } else {
-                    to_exit(cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate).await)
+                    to_exit(
+                        cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate, host.as_deref())
+                            .await,
+                    )
                 }
             }
             Command::GitCredential { operation } => cmd_git_credential(&operation).await,
@@ -1128,82 +1107,237 @@ async fn cmd_pair_select_endpoints() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print the full pairing credentials (§5.2/§5.3): the LAN pairing QR code,
-/// then labeled URL / Token / Fingerprint lines, each with a one-line usage
-/// note. Queries `pairing.getInfo` over UDS — so every value comes from the
-/// exact same hosts/fingerprint/token sources the daemon serves via
-/// `server.pairingInfo` — and renders the `intent://pair?…` payload URI as a
-/// QR code in half-height unicode blocks. When external connections (the WSS
-/// listener) are disabled, offers to enable them (prompt, or unattended via
-/// `yes`) through `settings.update` and retries the query — the interactive
-/// path also asks WHERE to listen ([`prompt_listen_targets`]: a multi-select
-/// over interfaces plus an exclusive all-interfaces 0.0.0.0 entry and the
-/// tailcat tunnel, persisted to `server.bindAddress` / `server.tunnel.*` in
-/// the same batch), while `--yes`/unattended keeps the persisted values
-/// (default: loopback, tunnel off). `rotate` mints a
-/// new token via [`rotate_pairing_token`] — only AFTER the listener is
-/// confirmed up (pairing info is obtainable), so a declined enable prompt (or
-/// a non-TTY run without `--yes`) never invalidates existing clients' tokens
-/// while exiting without a usable payload. The token is never logged via
-/// `tracing`; all credential lines go to stdout.
+/// Validate an `intentd pair --host` value: a bare IP literal (IPv6 without
+/// brackets, as `pairing.getInfo` advertises it) or a DNS hostname (ASCII
+/// letters, digits, `-`, dot-separated non-empty labels). Everything else is
+/// rejected up front because it would build a payload clients cannot dial: a
+/// comma splits the comma-separated `host=` list, and `host:port`, `[::1]`,
+/// or a URL would be combined with the payload's own `port=`.
+fn parse_pair_host(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("host must not be empty".to_string());
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(value.to_string());
+    }
+    if value.contains(',') {
+        return Err("host must be a single host (no commas)".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("host must not contain whitespace".to_string());
+    }
+    let valid_hostname = value.trim_end_matches('.').split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    if !valid_hostname {
+        return Err(
+            "host must be an IP address or a hostname, without a port, brackets, or scheme \
+             (the port comes from the daemon)"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
+}
+
+/// True for hosts only the pairing machine itself (or its local forwards,
+/// e.g. Windows → WSL) can dial: `localhost` and loopback IP literals.
+fn is_loopback_pair_host(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The pairing material `intentd pair` prints, from either source:
+/// `pairing.getInfo` (daemon-advertised hosts) or `server.pairingInfo` plus
+/// an operator-chosen `--host`.
+struct PairingPayload {
+    uri: String,
+    token: String,
+    fingerprint: String,
+    tc_address: Option<String>,
+    /// `Some((host, port))` only for `--host`, which prints them as their own
+    /// lines for the desktop app's manual host/port/token form.
+    host_port: Option<(String, u16)>,
+}
+
+/// Enable external connections for pairing when the listener is down:
+/// `--yes` (or an unattended run) keeps the persisted server.bindAddress /
+/// server.tunnel.* (default: loopback, tunnel off); otherwise a consent
+/// prompt, then the listen-target picker.
+async fn enable_listener_for_pairing(socket: &Path, yes: bool) -> anyhow::Result<()> {
+    let changes = if yes {
+        Vec::new()
+    } else {
+        if !confirm_enable_wss()? {
+            anyhow::bail!(
+                "pairing requires external connections to be enabled — enable them \
+                 later with `intentd pair --yes` or via server.wsApi.enabled in \
+                 config.toml"
+            );
+        }
+        // Multi-select pre-checked from the persisted state; an unchanged
+        // selection writes nothing so the stored shapes stay untouched.
+        let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
+        let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
+        let current = current_bind_addresses(socket).await;
+        let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
+        listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
+    };
+    enable_wss_listener(socket, &changes).await
+}
+
+/// The one fetch sequence both `intentd pair` sources share, so their
+/// ordering cannot drift: query `method`; when `listener_down` says the WSS
+/// listener is off, run the enable flow and query again; fail on an error
+/// or a listener that is STILL down; only then rotate (so a failed enable
+/// never invalidates existing clients' tokens) and re-query so the result
+/// carries the new token. Returns the `result` object.
+async fn fetch_pairing_result(
+    socket: &Path,
+    method: &str,
+    yes: bool,
+    rotate: bool,
+    listener_down: fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    let mut response = rpc_call(socket, method, json!({})).await?;
+    if listener_down(&response) {
+        enable_listener_for_pairing(socket, yes).await?;
+        response = rpc_call(socket, method, json!({})).await?;
+    }
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("{method} failed: {}", rpc_error_text(error));
+    }
+    if listener_down(&response) {
+        anyhow::bail!("{method} failed: the external-connection listener is not running");
+    }
+    if rotate {
+        rotate_pairing_token(socket).await?;
+        response = rpc_call(socket, method, json!({})).await?;
+        if let Some(error) = response.get("error") {
+            anyhow::bail!("{method} failed: {}", rpc_error_text(error));
+        }
+    }
+    Ok(response["result"].clone())
+}
+
+/// A required string field of a pairing result, or a "malformed" error
+/// naming the method.
+fn pairing_str_field(result: &Value, method: &str, name: &str) -> anyhow::Result<String> {
+    result[name]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("malformed {method} result: missing `{name}`"))
+}
+
+/// Default `intentd pair`: the daemon's `pairing.getInfo` payload, whose
+/// hosts are the daemon-advertised dialable set (loopback never included).
+async fn pairing_payload_from_get_info(
+    socket: &Path,
+    yes: bool,
+    rotate: bool,
+) -> anyhow::Result<PairingPayload> {
+    const METHOD: &str = "pairing.getInfo";
+    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+        response.get("error").is_some_and(is_listener_down_error)
+    })
+    .await?;
+    Ok(PairingPayload {
+        uri: pairing_str_field(&result, METHOD, "uri")?,
+        token: pairing_str_field(&result, METHOD, "token")?,
+        fingerprint: pairing_str_field(&result, METHOD, "fingerprint")?,
+        tc_address: result["tcAddress"].as_str().map(str::to_string),
+        host_port: None,
+    })
+}
+
+/// `intentd pair --host <HOST>` (intent-hq/intent#7243): pair through an
+/// operator-chosen host instead of the daemon-advertised set, so a
+/// loopback-only daemon reached through a local forward (the Windows app →
+/// an intentd in WSL via `localhost`) can be paired. Reads
+/// `server.pairingInfo` — local-only, the same token/fingerprint/port sources
+/// as `pairing.getInfo`, but no dialable-route check — whose `port: null` is
+/// the listener-down signal. The payload is built with the daemon's own
+/// [`intent_transport::pairing::build_pairing_uri`].
+async fn pairing_payload_for_host(
+    socket: &Path,
+    host: &str,
+    yes: bool,
+    rotate: bool,
+) -> anyhow::Result<PairingPayload> {
+    const METHOD: &str = "server.pairingInfo";
+    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+        response.get("error").is_none() && response["result"]["port"].is_null()
+    })
+    .await?;
+    let port = result["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .ok_or_else(|| anyhow::anyhow!("malformed {METHOD} result: invalid `port`"))?;
+    let token = pairing_str_field(&result, METHOD, "token")?;
+    let fingerprint = pairing_str_field(&result, METHOD, "certFingerprint")?;
+    let tc_address = result["tcAddress"].as_str().map(str::to_string);
+    let uri = intent_transport::pairing::build_pairing_uri(
+        &[host.to_string()],
+        port,
+        &fingerprint,
+        &token,
+        tc_address.as_deref(),
+    );
+    Ok(PairingPayload {
+        uri,
+        token,
+        fingerprint,
+        tc_address,
+        host_port: Some((host.to_string(), port)),
+    })
+}
+
+/// Print the full pairing credentials (§5.2/§5.3): the pairing QR code, then
+/// labeled URL / Token / Fingerprint lines, each with a one-line usage note,
+/// and renders the `intent://pair?…` payload URI as a QR code in half-height
+/// unicode blocks. Without `host` it queries `pairing.getInfo` over UDS, so
+/// the hosts are the daemon-advertised dialable set; with `host` it reads
+/// `server.pairingInfo` and builds the payload for that host
+/// ([`pairing_payload_for_host`]), so a loopback-only daemon can be paired —
+/// either way token/fingerprint/port come from the sources the daemon serves.
+/// Both go through [`fetch_pairing_result`]: when external connections (the
+/// WSS listener) are disabled, it offers to enable them (prompt, or
+/// unattended via `yes`) through `settings.update` and retries the query —
+/// the interactive path also asks WHERE to listen ([`prompt_listen_targets`]:
+/// a multi-select over interfaces plus an exclusive all-interfaces 0.0.0.0
+/// entry and the tailcat tunnel, persisted to `server.bindAddress` /
+/// `server.tunnel.*` in the same batch), while `--yes`/unattended keeps the
+/// persisted values (default: loopback, tunnel off). `rotate` mints a new
+/// token via [`rotate_pairing_token`] — only AFTER the listener is confirmed
+/// up, so a declined enable prompt (or a non-TTY run without `--yes`) never
+/// invalidates existing clients' tokens while exiting without a usable
+/// payload. The token is never logged via `tracing`; all credential lines go
+/// to stdout.
 async fn cmd_pair(
     png: Option<&Path>,
     svg: Option<&Path>,
     yes: bool,
     rotate: bool,
+    host: Option<&str>,
 ) -> anyhow::Result<()> {
     let config = resolve_config()?;
-    let mut response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-    if response.get("error").is_some_and(is_listener_down_error) {
-        // Interactive path: consent prompt, then the listen-target picker.
-        // `--yes` (or an unattended run) skips both and keeps the persisted
-        // server.bindAddress / server.tunnel.* (default: loopback, tunnel
-        // off).
-        let changes = if yes {
-            Vec::new()
-        } else {
-            if !confirm_enable_wss()? {
-                anyhow::bail!(
-                    "pairing requires external connections to be enabled — enable them \
-                     later with `intentd pair --yes` or via server.wsApi.enabled in \
-                     config.toml"
-                );
-            }
-            // Multi-select pre-checked from the persisted state; an
-            // unchanged selection writes nothing so the stored shapes stay
-            // untouched.
-            let tunnel_enabled =
-                current_bool_setting(&config.socket_path, "server.tunnel.enabled").await?;
-            let tunnel_only =
-                current_bool_setting(&config.socket_path, "server.tunnel.only").await?;
-            let current = current_bind_addresses(&config.socket_path).await;
-            let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
-            listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
-        };
-        enable_wss_listener(&config.socket_path, &changes).await?;
-        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-    }
-    if let Some(error) = response.get("error") {
-        anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-    }
-    if rotate {
-        rotate_pairing_token(&config.socket_path).await?;
-        // Re-fetch so the printed payload embeds the NEW token.
-        response = rpc_call(&config.socket_path, "pairing.getInfo", json!({})).await?;
-        if let Some(error) = response.get("error") {
-            anyhow::bail!("pairing.getInfo failed: {}", rpc_error_text(error));
-        }
-    }
-    let result = &response["result"];
-    let uri = result["uri"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `uri`"))?;
-    let token = result["token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("malformed pairing.getInfo result: missing `token`"))?;
-    let fingerprint = result["fingerprint"].as_str().ok_or_else(|| {
-        anyhow::anyhow!("malformed pairing.getInfo result: missing `fingerprint`")
-    })?;
+    let payload = match host {
+        None => pairing_payload_from_get_info(&config.socket_path, yes, rotate).await?,
+        Some(host) => pairing_payload_for_host(&config.socket_path, host, yes, rotate).await?,
+    };
+    let PairingPayload {
+        uri,
+        token,
+        fingerprint,
+        tc_address,
+        host_port,
+    } = payload;
 
     let code = qrcode::QrCode::new(uri.as_bytes())
         .map_err(|e| anyhow::anyhow!("cannot encode pairing payload as a QR code: {e}"))?;
@@ -1213,15 +1347,30 @@ async fn cmd_pair(
         .build();
     println!("{art}");
     println!();
-    println!("  Scan with the Intent iOS app to pair this device automatically.");
+    match &host_port {
+        // A loopback host is only dialable from this machine and its local
+        // forwards (e.g. the Windows app → WSL), never from a phone.
+        Some((host, _)) if is_loopback_pair_host(host) => println!(
+            "  {host} only works for clients on this machine or reaching it through a \
+             local forward (e.g. Windows → WSL) — not for the Intent iOS app."
+        ),
+        _ => println!("  Scan with the Intent iOS app to pair this device automatically."),
+    }
     println!();
     println!("URL:         {uri}");
     println!("             Same payload as the QR code — paste it into a client that can't scan.");
+    if let Some((host, port)) = &host_port {
+        println!("Host:        {host}");
+        println!("Port:        {port}");
+        println!(
+            "             Host and port to enter in the desktop app's remote-connection dialog."
+        );
+    }
     println!("Token:       {token}");
     println!("             Bearer token — enter it (with host + port) in the desktop app's remote-connection dialog.");
     println!("Fingerprint: {fingerprint}");
     println!("             TLS certificate fingerprint — confirm the client shows this exact value before trusting the connection.");
-    if let Some(tc) = result["tcAddress"].as_str() {
+    if let Some(tc) = &tc_address {
         println!("Tunnel:      {tc}");
         println!("             Tailcat tunnel address — reachable from other networks; embedded in the QR payload as tc=.");
     }
@@ -1278,121 +1427,6 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     intent_core::write_private(path, bytes)
-}
-
-/// Migrate a legacy Intent `userData` dir into intentd's `SQLite` store (§9.7).
-/// Opens (creating + migrating) the configured DB, runs the idempotent import,
-/// and prints the per-domain summary. Exits non-zero on a hard source failure.
-async fn cmd_import(from: &Path) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let store = Store::open(&config.db_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let summary = import::run(&store, from).await?;
-    println!("{summary}");
-    Ok(())
-}
-
-/// Import legacy per-directory Intent workspaces into the configured `SQLite`
-/// store. `--root` (repeatable) narrows the scan to explicit directories
-/// (each must exist); otherwise the default legacy roots are scanned. The
-/// first-boot completion marker does not gate explicit CLI runs. A
-/// non-dry-run run without manifest compatibility failures rewrites the marker;
-/// `--force` only controls whether existing workspace rows are updated.
-/// Per-workspace problems are soft (reported, exit 0); only an unusable
-/// explicit `--root` or a store-open failure exits non-zero. A dry-run
-/// against a not-yet-created DB removes the freshly created DB file
-/// afterwards, so a later `serve` still sees a fresh DB and the first-boot
-/// auto-import still fires. Empty resolved roots (legacy import disabled)
-/// exit early without opening the store or writing the marker.
-async fn cmd_import_legacy(
-    roots: Vec<PathBuf>,
-    app_dir: Option<PathBuf>,
-    dry_run: bool,
-    force: bool,
-) -> anyhow::Result<()> {
-    let config = resolve_config()?;
-    std::fs::create_dir_all(&config.data_dir)?;
-    let roots = if roots.is_empty() {
-        legacy_import::default_roots()
-    } else {
-        for dir in &roots {
-            if !dir.is_dir() {
-                anyhow::bail!("--root is not a directory: {}", dir.display());
-            }
-        }
-        roots
-    };
-    // Empty resolved roots (e.g. `INTENTD_LEGACY_IMPORT_ROOTS=""` or the
-    // hermetic test harness) mean "legacy import disabled": return before
-    // touching the store so no app-level blobs land and no completion marker
-    // is written — consistent with `decide_first_boot_import`.
-    if roots.is_empty() {
-        println!("legacy import disabled: no legacy roots to scan");
-        return Ok(());
-    }
-    let app_dir = app_dir.or_else(legacy_import::default_app_dir);
-    let db_existed = config.db_path.exists();
-    let store = Store::open(&config.db_path)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let report = legacy_import::run(
-        &store,
-        &legacy_import::Options {
-            roots,
-            dry_run,
-            force,
-            assets_root: Some(config.data_dir.join("assets")),
-            app_dir,
-            // Offline CLI: no daemon, no live subscribers — no events. A
-            // running daemon learns about the rows via `system.importLegacy`
-            // or its next boot, both of which publish.
-            event_bus: None,
-            setup_states: None,
-            stopping: None,
-        },
-    )
-    .await?;
-    println!("{report}");
-    if !dry_run {
-        // Keep the persisted failure summary in sync: a clean run (e.g. the
-        // documented `--force` retry) clears any stale row from a prior run.
-        legacy_import::persist_failure_summary(&store, &report).await;
-        if !report.has_compatibility_failures() {
-            // Marker write failure is a warning, not a command failure — the
-            // import itself completed (mirrors the first-boot hook in `serve`).
-            // Without the marker a later run/first-boot may re-import, which is
-            // safe: the import is idempotent.
-            if let Err(e) = legacy_import::write_completion_marker(&store).await {
-                eprintln!(
-                    "warning: import completed but the completion marker could not \
-                     be written ({e}); a later run or first boot may re-import \
-                     (idempotent, existing rows are skipped)"
-                );
-            }
-        }
-    } else if !db_existed {
-        // Dry-run on a fresh install: don't leave behind the DB file that
-        // `Store::open` just created, or the first-boot auto-import in
-        // `serve` (gated on DB-file existence) would silently never fire.
-        store.close().await;
-        for suffix in ["", "-wal", "-shm"] {
-            let mut path = config.db_path.as_os_str().to_owned();
-            path.push(suffix);
-            let path = PathBuf::from(path);
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "warning: could not remove {} ({e}); delete it manually or the \
-                         first-boot auto-import in `serve` will not fire",
-                        path.display()
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn cmd_mcp_bridge(connect: &str) -> anyhow::Result<()> {
@@ -1612,9 +1646,16 @@ fn install_panic_hook() {
             "PANIC: daemon panicked"
         );
 
-        // Also write to stderr so it's visible in immediate context
-        eprintln!("PANIC at {location}: {message}");
-        eprintln!("Backtrace:\n{backtrace}");
+        // Also write to stderr so it's visible in immediate context. Ignore
+        // write errors: `eprintln!` panics on a closed stderr pipe, and a
+        // panic inside the panic hook aborts the whole daemon
+        // (intent-hq/intent#7119).
+        {
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "PANIC at {location}: {message}");
+            let _ = writeln!(stderr, "Backtrace:\n{backtrace}");
+        }
 
         // Chain the default hook to preserve standard Rust panic formatting
         default_hook(panic_info);
@@ -1700,9 +1741,19 @@ async fn cmd_serve(
     // endpoint, retaining pending signals until normal startup completes.
     #[cfg(unix)]
     {
-        bootstrap.staged_restart_signal = Some(tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::user_defined2(),
-        )?);
+        use tokio::signal::unix::{signal, SignalKind};
+        let kind = SignalKind::user_defined2();
+        // Exercise the real registration error before protected startup endpoints exist.
+        #[cfg(debug_assertions)]
+        let kind = if std::env::var_os("INTENTD_TEST_STAGED_RESTART_SIGNAL_ERROR").is_some() {
+            SignalKind::from_raw(-1)
+        } else {
+            kind
+        };
+        bootstrap.staged_restart_signal = Some(
+            signal(kind)
+                .map_err(|e| anyhow::anyhow!("failed to install the SIGUSR2 handler: {e}"))?,
+        );
     }
     let dispatch = bootstrap.dispatch.clone();
     let cancellation = bootstrap.cancellation.clone();
@@ -1925,9 +1976,6 @@ async fn cmd_serve_owned(
             }
         }
     }
-    // Snapshot DB-file existence before `Store::open` creates it: the one-time
-    // legacy workspace import below fires only on a truly fresh database.
-    let db_existed = config.db_path.exists();
     #[cfg(all(unix, debug_assertions))]
     startup::preparing_test_gate().await?;
     let store = prepared
@@ -1985,58 +2033,7 @@ async fn cmd_serve_owned(
     // The event bus shares the store with the services surface so subscribers
     // see the same durable event log that future mutations will publish to.
     let bus = EventBus::new(store.clone());
-    // Serializes import runs: shared between the first-boot background task
-    // below and the `system.importLegacy` RPC (via DaemonControl), so the two
-    // can never interleave workspace inserts — without the lock both could
-    // observe a missing row before either inserts it, turning the loser's
-    // idempotent skip into a spurious `insert failed` failure-summary entry.
-    let legacy_import_lock = Arc::new(tokio::sync::Mutex::new(()));
-    let legacy_import_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Per-workspace setup-stage map shared by the services surface and the
-    // legacy importer (both the first-boot task and `system.importLegacy`),
-    // so an imported row reads `skipped` from `ws.workspace.details()`.
     let workspace_setup_states = WorkspaceSetupStates::default();
-    // First-boot legacy workspace import: the eligibility decision (fresh DB
-    // / marker state) is made synchronously here, but the import itself runs
-    // in a spawned background task concurrently with the transports coming up
-    // — `serve` never awaits it, so a large legacy tree no longer delays
-    // first boot. `decide_first_boot_import` persists a pending marker before
-    // the run starts; a daemon killed mid-import resumes on the next boot
-    // (the importer is idempotent). A concurrent `system.importLegacy` RPC —
-    // a concurrency window the inline pre-transport import never had — is
-    // serialized behind `legacy_import_lock`. Shutdown stops admission between
-    // workspaces and joins the admitted unit before closing the store. A partial
-    // run keeps its pending marker so the next boot resumes idempotently.
-    let legacy_import_handle = {
-        let roots = legacy_import::default_roots();
-        match legacy_import::decide_first_boot_import(&store, db_existed, &roots).await {
-            legacy_import::FirstBootDecision::Skip => None,
-            decision => {
-                let store = store.clone();
-                let assets_root = Some(config.data_dir.join("assets"));
-                let app_dir = legacy_import::default_app_dir();
-                let event_bus = Some(bus.clone());
-                let setup_states = Some(workspace_setup_states.clone());
-                let lock = legacy_import_lock.clone();
-                let stopping = legacy_import_stopping.clone();
-                let resumed = decision == legacy_import::FirstBootDecision::Resume;
-                Some(intent_core::spawn_daemon(async move {
-                    let _guard = lock.lock().await;
-                    legacy_import::run_first_boot_import(
-                        &store,
-                        roots,
-                        assets_root,
-                        app_dir,
-                        event_bus,
-                        setup_states,
-                        resumed,
-                        Some(stopping),
-                    )
-                    .await;
-                }))
-            }
-        }
-    };
     // Hold a store handle for the §10.2 retention sweep before the store is
     // moved into the services surface below.
     let retention_store = store.clone();
@@ -2109,7 +2106,6 @@ async fn cmd_serve_owned(
     // The services surface publishes CRUD change events onto the same bus that
     // transport subscriptions read, so a mutation on one connection streams to
     // subscribers on another (§10).
-    let legacy_import_store = store.clone();
     let assets_root = config.data_dir.join("assets");
 
     // Suspend/wake detector (clock-skew): infers host sleep/resume with no OS
@@ -2127,14 +2123,18 @@ async fn cmd_serve_owned(
         });
 
     let services = Services::new(store)
-        .with_assets_root(assets_root.clone())
+        .with_assets_root(assets_root)
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
+        // Named provider profile metadata lives next to config.toml (§5.54).
+        .with_provider_profiles_dir(&config.data_dir)
         .with_event_bus(bus.clone())
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
         .with_settings_registry(settings_registry.clone())
         .with_hooks_max_per_agent(config.hooks_max_per_agent);
+    // Remove secrets journaled by an interrupted profile create/delete.
+    services.sweep_provider_profile_secrets().await;
     #[cfg(feature = "repository-test-fixtures")]
     let fixture_installed = match initialize_gitlab_test_transports(&services).await {
         Ok(installed) => installed,
@@ -2523,6 +2523,11 @@ async fn cmd_serve_owned(
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = startup_work.spawn(|| services.spawn_agent_locks_loop());
+    // Stale tracked-change sweep (intent-hq/intent#7266): shortly after
+    // startup and then periodically, delete working-stage attribution rows
+    // whose path git reports clean (ignored, deleted, reverted, committed
+    // outside the daemon). Aborted on clean shutdown.
+    let tracked_changes_sweep = startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -2712,12 +2717,6 @@ async fn cmd_serve_owned(
         route_info: route_info.clone(),
         workspaces_disk,
         watch_health,
-        legacy_import_store,
-        legacy_import_assets_root: assets_root,
-        legacy_import_lock: legacy_import_lock.clone(),
-        legacy_import_stopping: legacy_import_stopping.clone(),
-        legacy_import_bus: bus.clone(),
-        legacy_import_setup_states: workspace_setup_states.clone(),
         settings_registry: settings_registry.clone(),
         sitter_pid_path: config.data_dir.join("sitter").join("sitter.pid"),
         exact_update: exact_update::ExactUpdate::default(),
@@ -2838,7 +2837,6 @@ async fn cmd_serve_owned(
     let (startup_stop, startup_stopping) =
         tokio::sync::watch::channel(boot_error.is_some() || bootstrap.cancellation.stopping());
     let shutdown = {
-        let legacy_import_stopping = legacy_import_stopping.clone();
         let manager = manager.clone();
         let rpc_limiter = rpc_limiter.clone();
         let host_exec_runtime = host_exec_runtime.clone();
@@ -2855,7 +2853,6 @@ async fn cmd_serve_owned(
                 () = cancellation.stopped() => {}
                 () = notify.notified() => tracing::info!("shutdown requested via system.shutdown"),
             }
-            legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
             rpc_limiter.begin_shutdown();
             manager.begin_shutdown();
             host_exec_runtime.begin_shutdown();
@@ -3088,7 +3085,6 @@ async fn cmd_serve_owned(
     bootstrap.stop_local_listener().await;
     let cleanup = shutdown::Phase::start("cleanup");
     // Also covers listener startup failure, where the signal future did not run.
-    legacy_import_stopping.store(true, std::sync::atomic::Ordering::SeqCst);
     rpc_limiter.begin_shutdown();
     services.begin_settings_shutdown();
     manager.begin_shutdown();
@@ -3190,6 +3186,8 @@ async fn cmd_serve_owned(
     let _ = auto_commit_loop.await;
     agent_locks_loop.abort();
     let _ = agent_locks_loop.await;
+    tracked_changes_sweep.abort();
+    let _ = tracked_changes_sweep.await;
     execution_context_loop.abort();
     let _ = execution_context_loop.await;
     if let Some(reap_task) = reap_task {
@@ -3220,12 +3218,6 @@ async fn cmd_serve_owned(
             phase.failed();
             tracing::error!(%error, "native retirement failed during shutdown");
         }
-    }
-
-    // Stop the background first-boot legacy import (if still running) before
-    // closing the store; the pending marker makes the next boot resume it.
-    if let Some(handle) = legacy_import_handle {
-        let _ = handle.await;
     }
 
     // Stop the periodic WAL checkpoint task before closing the store.
@@ -3265,8 +3257,8 @@ async fn cmd_serve_owned(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Live daemon control surface backing `system.status`, `system.shutdown`, and
-/// `system.importLegacy` (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
+/// Live daemon control surface backing `system.status` and `system.shutdown`
+/// (§5.7) plus runtime WSS listener control (§5.12). Built post-bind so the
 /// resolved WSS `port`/`fingerprint` are real (not guessed); `client_count`/agent
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
@@ -3296,20 +3288,6 @@ struct DaemonControl {
     /// Watch-coverage handle for `system.status` (intent-hq/intent#3708);
     /// snapshots `None` until the backgrounded watcher registry attaches.
     watch_health: intent_services::WatchHealth,
-    /// Live store and asset destination shared with Services for legacy import.
-    legacy_import_store: Store,
-    legacy_import_assets_root: PathBuf,
-    /// Prevent overlapping import runs from racing workspace inserts/copies.
-    /// Shared with the first-boot background import task, which acquires it
-    /// for its whole run, so the RPC and the boot import never interleave.
-    legacy_import_lock: Arc<tokio::sync::Mutex<()>>,
-    legacy_import_stopping: Arc<std::sync::atomic::AtomicBool>,
-    /// Event bus for `workspace:created` publishes on imported rows, so live
-    /// subscribers learn about workspaces the importer writes through `Store`.
-    legacy_import_bus: EventBus,
-    /// Setup-state map shared with `Services`, so imported rows record
-    /// `skipped` alongside their `workspace:setup:completed` publish.
-    legacy_import_setup_states: WorkspaceSetupStates,
     /// Settings registry backing the `system.gitCredential` gate + token
     /// source (monorepo#884).
     settings_registry: Arc<intent_services::SettingsRegistry>,
@@ -4413,6 +4391,9 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 }
 
 impl SystemControl for DaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
         self.startup.clone()
     }
@@ -4499,7 +4480,7 @@ impl SystemControl for DaemonControl {
             arch: std::env::consts::ARCH.to_string(),
             has_display: detect_has_display(),
             max_agents: self.manager.registry().cap(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: self.daemon_version().to_string(),
             build_commit: intent_transport::BUILD_COMMIT.map(str::to_string),
             uptime_seconds: self.start_time.elapsed().as_secs(),
             local_ips,
@@ -4582,70 +4563,6 @@ impl SystemControl for DaemonControl {
 
     fn request_exact_update(&self, target: &str) -> Result<(), String> {
         self.exact_update.start(&self.sitter_pid_path, target)
-    }
-
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let _guard = self.legacy_import_lock.lock().await;
-            let report = legacy_import::run(
-                &self.legacy_import_store,
-                &legacy_import::Options {
-                    roots: legacy_import::default_roots(),
-                    dry_run: false,
-                    force,
-                    assets_root: Some(self.legacy_import_assets_root.clone()),
-                    app_dir: legacy_import::default_app_dir(),
-                    event_bus: Some(self.legacy_import_bus.clone()),
-                    setup_states: Some(self.legacy_import_setup_states.clone()),
-                    stopping: Some(self.legacy_import_stopping.clone()),
-                },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-            // Keep the persisted failure summary in sync: a clean run (e.g.
-            // the documented `--force` retry) clears any stale row.
-            legacy_import::persist_failure_summary(&self.legacy_import_store, &report).await;
-            let compatibility_failures = report.has_compatibility_failures();
-            let marker_written = if compatibility_failures {
-                false
-            } else {
-                match legacy_import::write_completion_marker(&self.legacy_import_store).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "legacy import RPC marker write failed");
-                        false
-                    }
-                }
-            };
-            let skip_summary: Vec<Value> = report
-                .entries
-                .iter()
-                .filter_map(|entry| match &entry.outcome {
-                    legacy_import::Outcome::Skipped(reason) => {
-                        Some(json!({ "id": &entry.id, "reason": reason }))
-                    }
-                    _ => None,
-                })
-                .take(20)
-                .collect();
-            Ok(json!({
-                "imported": report.imported(),
-                "updated": report.updated(),
-                "skipped": report.skipped(),
-                "notes": report.notes_imported(),
-                "comments": report.comments_imported(),
-                "agents": report.agent_sessions_imported(),
-                "assets": report.assets_imported(),
-                "skipSummary": skip_summary,
-                "compatibilityFailures": compatibility_failures,
-                "markerWritten": marker_written,
-            }))
-        })
     }
 
     fn git_credential(
@@ -5837,6 +5754,16 @@ fn spawn_staged_restart_watcher(
     cancellation: startup::Cancellation,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
+        // Hold consumption of the bootstrap receiver while the regression proves
+        // operational readiness and queues a signal before this task proceeds.
+        #[cfg(debug_assertions)]
+        if let Some(path) = std::env::var_os("INTENTD_TEST_STAGED_RESTART_WATCHER_GATE") {
+            use tokio::io::AsyncReadExt;
+            let mut gate = tokio::net::UnixStream::connect(path)
+                .await
+                .expect("staged restart watcher test gate");
+            gate.read_u8().await.expect("release restart watcher");
+        }
         // A staged update may wait through indexing, but must never interrupt
         // initialization or outrank a stop already latched during startup.
         tokio::select! {
@@ -10094,6 +10021,59 @@ for line in sys.stdin:
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
         assert!(should_resume_on_start(false, false, R::Auto, false));
         assert!(!should_resume_on_start(false, false, R::Auto, true));
+    }
+
+    #[test]
+    fn parse_pair_host_accepts_single_hosts_and_rejects_list_breakers() {
+        for ok in [
+            "localhost",
+            "127.0.0.1",
+            "my-box.local",
+            "my-box.local.",
+            "::1",
+            "fd00::7",
+            "wsl-host-01",
+        ] {
+            assert_eq!(parse_pair_host(ok).as_deref(), Ok(ok));
+        }
+        for bad in [
+            "",
+            "a,b",
+            "local host",
+            "host\t",
+            "\nhost",
+            "localhost:9000",
+            "[::1]",
+            "wss://box",
+            "box/ws",
+            "-box",
+            "box..local",
+            "bad_host",
+        ] {
+            assert!(parse_pair_host(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_loopback_pair_host_matches_localhost_and_loopback_ips() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+        ] {
+            assert!(is_loopback_pair_host(host), "{host}");
+        }
+        for host in [
+            "192.168.1.10",
+            "my-box.local",
+            "localhost.example",
+            "fd00::7",
+        ] {
+            assert!(!is_loopback_pair_host(host), "{host}");
+        }
     }
 
     #[test]

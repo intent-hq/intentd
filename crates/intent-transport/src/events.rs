@@ -36,6 +36,10 @@ pub(crate) struct MembershipGate {
 }
 
 impl MembershipGate {
+    pub(crate) fn clear(&mut self) {
+        self.verdicts.clear();
+    }
+
     const TTL: Duration = Duration::from_secs(30);
 
     /// A gate for the current request's caller, or `None` when the caller is
@@ -238,6 +242,10 @@ pub(crate) struct IdInfo {
 
 /// A classified fast-path request awaiting handling by the connection task.
 pub(crate) enum FastPath {
+    Fence {
+        id: IdInfo,
+        params: Map<String, Value>,
+    },
     Subscribe {
         id: IdInfo,
         params: Map<String, Value>,
@@ -254,6 +262,7 @@ pub(crate) struct SubscribeParams {
     pub event_types: Vec<String>,
     pub workspace_id: Option<String>,
     pub replace_group: Option<String>,
+    pub loss_recovery: bool,
 }
 
 /// Global, monotonic subscription id counter (`ws-sub-<n>`). Mirrors the TS
@@ -295,6 +304,7 @@ pub(crate) fn classify(value: &Value) -> Option<FastPath> {
         .cloned()
         .unwrap_or_default();
     match method {
+        "events.fence" => Some(FastPath::Fence { id, params }),
         "events.subscribe" => Some(FastPath::Subscribe { id, params }),
         "events.unsubscribe" => Some(FastPath::Unsubscribe { id, params }),
         _ => None,
@@ -306,6 +316,18 @@ pub(crate) fn classify(value: &Value) -> Option<FastPath> {
 pub(crate) fn parse_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<SubscribeParams, String> {
+    let loss_recovery = match params.get("lossRecovery") {
+        None => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        Some(_) => return Err("lossRecovery must be 1".into()),
+    };
+    if loss_recovery
+        && params
+            .get("workspaceId")
+            .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+    {
+        return Err("workspaceId must be a nonempty string".into());
+    }
     let event_types = match params.get("eventTypes") {
         Some(Value::Array(arr)) if !arr.is_empty() => arr
             .iter()
@@ -315,6 +337,7 @@ pub(crate) fn parse_subscribe_params(
         _ => return Err("eventTypes must be a non-empty array of event type strings".to_string()),
     };
     Ok(SubscribeParams {
+        loss_recovery,
         event_types,
         workspace_id: opt_str(params, "workspaceId"),
         replace_group: opt_str(params, "replaceGroup"),

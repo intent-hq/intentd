@@ -20,8 +20,8 @@ use crate::model::{
     LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
     NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
+    ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
@@ -361,6 +361,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Workspaces linked to the pull request at `url`
+    /// (`workspace.findByPullRequest`, PROTOCOL §5.1 "Pull request workspace
+    /// lookup"): most recently linked first, archived included, narrowed to the
+    /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
+    /// pull-request URL.
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
+        let _ = url;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
             ))
         })
     }
@@ -6478,6 +6495,102 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::providers_catalog not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.list` (PROTOCOL §5.54): `{ profiles, revision }`,
+    /// optionally filtered by `baseProviderId`. Env values are masked.
+    /// Administrator-only.
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = base_provider_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId`, `name` and optional `env`; returns
+    /// `{ profile, revision }` and emits `providers:profiles-changed`.
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name` and
+    /// complete `env` list; returns `{ profile, revision, activation }`.
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (profile_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.delete` (PROTOCOL §5.54): `{ profileId, revision }`;
+    /// refused with `provider-profile-in-use` while saved settings select it.
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = profile_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
+    /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
+    /// with that profile's saved environment. `Some(ref)` checks one profile
+    /// (a missing one fails with `provider-profile-replacement-required`);
+    /// `None` sweeps every saved profile (`includeProfiles: true`). Returns a
+    /// JSON array.
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerTestPrompt` for a named profile reference (PROTOCOL
+    /// §5.54): the live probe runs with that profile's saved environment and
+    /// promotes or demotes only its verdict. A missing profile fails with
+    /// `provider-profile-replacement-required`.
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, model, node_max_old_space_mb);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_test_prompt not implemented".to_string(),
             ))
         })
     }

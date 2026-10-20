@@ -789,6 +789,7 @@ fn merge_requirements(
         rules_known: true,
         is_in_merge_queue: None,
         merge_queue_ejection: None,
+        merge_queue: None,
     }
 }
 

@@ -558,7 +558,10 @@ pub struct BranchRules {
 /// The PR's latest merge-queue removal event (GitHub GraphQL
 /// `RemovedFromMergeQueueEvent` timeline item): when the queue ejected the PR
 /// and why. Monotonic — a new ejection produces a new event with a later
-/// `at`; the host never retracts one.
+/// `at`; the host never retracts one. This is the raw event: GitHub also
+/// records one (reason `merged`) when the queue *lands* the PR, so consumers
+/// project it through intent-services' `MergeQueueEjection::from_removal`,
+/// which drops merge removals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeQueueRemoval {
@@ -567,6 +570,32 @@ pub struct MergeQueueRemoval {
     /// The host's removal reason (e.g. `failed_checks`); `None` when the
     /// host does not report one.
     pub reason: Option<String>,
+}
+
+/// The PR's place in the host's merge queue (GitHub GraphQL
+/// `PullRequest.mergeQueueEntry`), reported only while the PR is queued.
+/// Informational: consumers display it but never diff it, so queue movement
+/// alone is not a PR change. Every key but `position` is presence-detected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeQueueEntry {
+    /// 1-based place in the queue; `1` is next to merge.
+    pub position: u32,
+    /// Entries currently in the queue, this one included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_size: Option<u32>,
+    /// The host's raw entry state word, lowercased (GitHub: `queued`,
+    /// `awaiting_checks`, `mergeable`, `unmergeable`, `locked`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// When the PR entered the queue (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueued_at: Option<String>,
+    /// The host's estimate, in whole seconds, of how long until this entry
+    /// merges, as reported. GitHub recomputes it on queue events rather than
+    /// counting it down, so it is a duration estimate, not a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_time_to_merge: Option<u64>,
 }
 
 /// Per-PR merge-requirement signals a host can report beyond the plain
@@ -606,6 +635,10 @@ pub struct MergeRequirementSignals {
     /// not report it (no merge-queue support) or the PR was never ejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_removal: Option<MergeQueueRemoval>,
+    /// The PR's place in the merge queue while it is queued. `None` when
+    /// the PR is not queued or the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_queue_entry: Option<MergeQueueEntry>,
 }
 
 /// Tallies of a pull request's inline review threads: the total number of

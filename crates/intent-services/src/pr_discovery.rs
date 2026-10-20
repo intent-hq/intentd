@@ -3,6 +3,9 @@
 //! A list is authoritative only after every page succeeds. Single-flight slots
 //! also remember failures for a window: a broken repository never falls back
 //! to a request per branch. Lists never enter the richer PR-detail cache.
+//! A repository whose open PRs exceed the page cap is remembered as
+//! oversized; its workspaces then query their own heads instead
+//! (intent-hq/intent#7187).
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,12 +22,80 @@ use crate::{pr_ops, Services};
 
 pub(crate) const WINDOW: Duration = Duration::from_secs(180);
 const MAX_PAGES: usize = 10;
+/// How long an oversized repository skips the capped repository-wide list
+/// before checking again whether it now fits.
+const OVERSIZED_RECHECK: Duration = Duration::from_secs(3600);
 const REPOSITORIES: usize = 128;
 const RECORDS: usize = 512;
 /// Actual HTTP attempts, including retry and redirect hops, per window.
 const ATTEMPTS: usize = 128;
 const LIST_RESERVATION: usize = MAX_PAGES * 4;
 const RECORD_RESERVATION: usize = 4;
+/// The local admission denial: this window's background budget is spent.
+/// Not a forge failure, so sweeps summarize it per repository
+/// ([`DeferralTally`]) instead of logging it once per consumer.
+const BUDGET_DEFERRED: &str = "background PR refresh deferred by request budget";
+
+/// True when a source-control read was deferred by the local request budget.
+pub(crate) fn is_budget_deferral_sc(error: &Error) -> bool {
+    matches!(error, Error::Api(message) if message == BUDGET_DEFERRED)
+}
+
+/// [`is_budget_deferral_sc`] after [`pr_ops::map_sc_err`] flattened it into
+/// the service error (`Internal("source control api error: …")`).
+pub(crate) fn is_budget_deferral(error: &crate::Error) -> bool {
+    matches!(error, crate::Error::Internal(message) if *message == unknown(BUDGET_DEFERRED).to_string())
+}
+
+/// Budget deferrals seen by one background sweep, per repository. One
+/// deferral sits in the repository's shared listing slot for the window, so
+/// every root and workspace of that repository receives the same error; the
+/// sweep logs one WARN per repository instead (intent-hq/intent#7264),
+/// mirroring the one-WARN-per-pause rate-limit path (monorepo#2961).
+#[derive(Default)]
+pub(crate) struct DeferralTally {
+    repos: HashMap<RepoRef, (usize, usize)>,
+}
+
+impl DeferralTally {
+    pub(crate) fn workspace(&mut self, repo: Option<RepoRef>) {
+        if let Some(repo) = repo {
+            self.repos.entry(repo).or_default().0 += 1;
+        }
+    }
+
+    pub(crate) fn root(&mut self, repo: Option<RepoRef>) {
+        if let Some(repo) = repo {
+            self.repos.entry(repo).or_default().1 += 1;
+        }
+    }
+
+    /// One WARN per deferred repository, in a stable order. `deferred_reads`
+    /// drains every deferred background read [`Discovery`] answered since the
+    /// previous summary, including follow-ons (relink discovery, stale-pool
+    /// re-fetch) that do not fail their root or workspace.
+    pub(crate) fn log(self, discovery: &Discovery) {
+        let mut repos: HashMap<RepoRef, (usize, usize, usize)> = self
+            .repos
+            .into_iter()
+            .map(|(repo, (workspaces, roots))| (repo, (workspaces, roots, 0)))
+            .collect();
+        for (repo, reads) in discovery.take_deferred_reads() {
+            repos.entry(repo).or_default().2 += reads;
+        }
+        let mut repos: Vec<_> = repos.into_iter().collect();
+        repos.sort_by_cached_key(|(repo, _)| repo.identity_key());
+        for (repo, (workspaces, roots, deferred_reads)) in repos {
+            tracing::warn!(
+                repo = %format_args!("{}/{}", repo.owner, repo.name),
+                workspaces,
+                roots,
+                deferred_reads,
+                "pr refresh: background refresh deferred by request budget; retrying next sweep"
+            );
+        }
+    }
+}
 
 tokio::task_local! { static FORCE_AFTER: Instant; }
 tokio::task_local! { static AUTOMATIC_MAX_AGE: Duration; }
@@ -68,6 +139,16 @@ struct Key {
     scope: CacheScope,
     repo: RepoRef,
     number: Option<u64>,
+    /// Open PRs of one head branch, forks included: the oversized-repository
+    /// path. Costed and capped like a single record read.
+    head: Option<String>,
+}
+
+impl Key {
+    /// The repository-wide open-PR listing.
+    fn is_listing(&self) -> bool {
+        self.number.is_none() && self.head.is_none()
+    }
 }
 
 #[derive(Default)]
@@ -106,6 +187,8 @@ impl Index {
 #[derive(Clone)]
 enum Value {
     Listing(Arc<Index>),
+    /// The repository has more open PRs than the page cap can list.
+    Oversized,
     Record(Arc<PullRequest>),
 }
 
@@ -170,7 +253,7 @@ impl Budget {
         // Allow at least one scheduled retry even with a slower user setting.
         // Default cadence retains the existing thirty-minute abandonment limit.
         let expires_at = now + (WINDOW * 10).max(retry_interval.saturating_mul(2));
-        let cost = if key.number.is_none() {
+        let cost = if key.is_listing() {
             LIST_RESERVATION
         } else {
             RECORD_RESERVATION
@@ -222,7 +305,7 @@ impl Budget {
                 {
                     state.pending.push_back((key.clone(), cost, expires_at));
                 }
-                return Err(unknown("background PR refresh deferred by request budget"));
+                return Err(unknown(BUDGET_DEFERRED));
             }
         }
         Ok(Arc::new(Lease {
@@ -240,6 +323,9 @@ pub(crate) struct Discovery {
     slots: Slots,
     budget: Arc<Mutex<Budget>>,
     concurrent: Arc<tokio::sync::Semaphore>,
+    // Background reads answered with a budget deferral (fresh or shared from
+    // the slot) since the last sweep summary drained them, per repository.
+    deferred_reads: Arc<Mutex<HashMap<RepoRef, usize>>>,
 }
 
 impl Default for Discovery {
@@ -248,6 +334,7 @@ impl Default for Discovery {
             slots: Arc::default(),
             budget: Arc::default(),
             concurrent: Arc::new(tokio::sync::Semaphore::new(4)),
+            deferred_reads: Arc::default(),
         }
     }
 }
@@ -257,23 +344,49 @@ fn unknown(message: &str) -> Error {
 }
 
 impl Discovery {
+    fn note_deferred_read(&self, repo: &RepoRef) {
+        *self
+            .deferred_reads
+            .lock()
+            .unwrap()
+            .entry(repo.clone())
+            .or_default() += 1;
+    }
+
+    fn take_deferred_reads(&self) -> HashMap<RepoRef, usize> {
+        std::mem::take(&mut *self.deferred_reads.lock().unwrap())
+    }
+
+    /// A successful listing started after `started` supersedes a record:
+    /// the repository-wide list, or a head list that observed this PR.
     fn newer_listing(&self, key: &Key, started: Instant) -> bool {
-        if key.number.is_none() {
+        let Some(number) = key.number else {
             return false;
-        }
+        };
         let slots = self.slots.lock().unwrap();
-        let Some((_, slot)) = slots.get(&Key {
-            number: None,
-            ..key.clone()
-        }) else {
-            return false;
+        let newer = |slot: &Slot, head: bool| {
+            let Ok(entry) = slot.entry.try_lock() else {
+                return false;
+            };
+            entry.as_ref().is_some_and(|entry| {
+                entry.started > started
+                    && match &entry.result {
+                        Ok(Value::Listing(index)) if head => index
+                            .branches
+                            .values()
+                            .flatten()
+                            .any(|pr| pr.number == number),
+                        Ok(Value::Listing(_)) => true,
+                        _ => false,
+                    }
+            })
         };
-        let Ok(entry) = slot.entry.try_lock() else {
-            return false;
-        };
-        entry
-            .as_ref()
-            .is_some_and(|entry| entry.started > started && entry.result.is_ok())
+        slots.iter().any(|(other, (_, slot))| {
+            other.scope == key.scope
+                && other.repo == key.repo
+                && other.number.is_none()
+                && newer(slot, other.head.is_some())
+        })
     }
     pub(crate) fn last_attempt(
         &self,
@@ -287,6 +400,7 @@ impl Discovery {
             scope,
             repo: repo.clone(),
             number: Some(number),
+            head: None,
         })?;
         let Ok(entry) = slot.entry.try_lock() else {
             return Some(Instant::now());
@@ -329,17 +443,12 @@ impl Discovery {
             *at = now;
             return Ok(slot.clone());
         }
-        let is_list = key.number.is_none();
+        let is_list = key.is_listing();
         let cap = if is_list { REPOSITORIES } else { RECORDS };
-        if slots
-            .keys()
-            .filter(|k| k.number.is_none() == is_list)
-            .count()
-            >= cap
-        {
+        if slots.keys().filter(|k| k.is_listing() == is_list).count() >= cap {
             let oldest = slots
                 .iter()
-                .filter(|(k, (_, s))| k.number.is_none() == is_list && Arc::strong_count(s) == 1)
+                .filter(|(k, (_, s))| k.is_listing() == is_list && Arc::strong_count(s) == 1)
                 .min_by_key(|(_, (at, _))| *at)
                 .map(|(k, _)| k.clone());
             let Some(oldest) = oldest else {
@@ -413,6 +522,18 @@ impl Discovery {
                 }
             }
         }
+        // An oversized marker carries no PR data, so neither invalidation nor
+        // an explicit refresh needs the capped list again; the per-head reads
+        // that replace it refresh normally.
+        if let Some(cached) = entry.as_ref() {
+            if matches!(cached.result, Ok(Value::Oversized))
+                && key.scope.is_current()
+                && cached.started.elapsed() < OVERSIZED_RECHECK
+            {
+                record_reuse(operation, Reuse::CacheHit);
+                return Ok(Value::Oversized);
+            }
+        }
         if let Some(cached) = entry.as_ref() {
             if cached.revision == revision
                 && !(force_after.is_some() && cached.background_deferred)
@@ -424,6 +545,9 @@ impl Discovery {
                     .is_none_or(|at| cached.finished.is_some_and(|finished| finished >= at))
             {
                 record_reuse(operation, Reuse::CacheHit);
+                if cached.background_deferred && cached.result.is_err() {
+                    self.note_deferred_read(&key.repo);
+                }
                 return cached.result.clone();
             }
         }
@@ -484,6 +608,15 @@ impl Discovery {
                         .await
                         .map(|pr| Value::Record(Arc::new(pr)));
                 }
+                if let Some(head) = &key.head {
+                    let mut index = Index::default();
+                    for pr in sc.list_open_prs_by_head(&key.repo, head).await? {
+                        if pr.state == PrState::Open && pr.source_branch == *head {
+                            index.branches.entry(head.clone()).or_default().push(pr);
+                        }
+                    }
+                    return Ok(Value::Listing(Arc::new(index)));
+                }
                 let mut index = Index::default();
                 let mut cursor = None;
                 let mut seen = HashSet::new();
@@ -526,7 +659,7 @@ impl Discovery {
                     }
                     cursor = Some(next);
                 }
-                Err(unknown("open PR pagination budget exhausted"))
+                Ok(Value::Oversized)
             })
             .await;
             // A refused retry can still return a real 429/500 response. Only
@@ -535,8 +668,17 @@ impl Discovery {
             result
         }
         .await;
+        // Up-front and mid-lease budget denials are one condition for every
+        // consumer of this slot: report both as BUDGET_DEFERRED.
+        let result = match result {
+            Err(_) if background_deferred => Err(unknown(BUDGET_DEFERRED)),
+            other => other,
+        };
         if !key.scope.is_current() || revision != slot.revision.load(Ordering::SeqCst) {
             return Err(unknown("PR refresh invalidated during fetch"));
+        }
+        if background_deferred && result.is_err() {
+            self.note_deferred_read(&key.repo);
         }
         *entry = Some(Entry {
             started,
@@ -572,6 +714,7 @@ impl Services {
                         scope: scope.clone(),
                         repo: repo.clone(),
                         number: None,
+                        head: None,
                     },
                 )
                 .await
@@ -596,22 +739,45 @@ impl Services {
         let Some(scope) = sc.cache_scope() else {
             return pr_ops::discover_matching_open_pr(sc, repo, branch, base, exclude).await;
         };
-        let Value::Listing(index) = self
-            .pr_discovery
-            .read(
-                self,
-                sc,
-                Key {
-                    scope,
-                    repo: repo.clone(),
-                    number: None,
-                },
-            )
-            .await?
-        else {
-            unreachable!()
+        let key = |head: Option<String>| Key {
+            scope: scope.clone(),
+            repo: repo.clone(),
+            number: None,
+            head,
         };
-        let Some(pr) = index.matching(branch, base, exclude) else {
+        let pr = match self.pr_discovery.read(self, sc, key(None)).await? {
+            Value::Listing(index) => index.matching(branch, base, exclude),
+            Value::Oversized => {
+                // Same precedence as the full list: the workspace branch
+                // first, then its baseRef candidates.
+                let mut index = Index::default();
+                let mut heads = pr_ops::base_ref_match_candidates(base);
+                if !branch.is_empty() {
+                    heads.retain(|head| head != branch);
+                    heads.insert(0, branch.to_string());
+                }
+                for head in heads {
+                    let Value::Listing(page) =
+                        self.pr_discovery.read(self, sc, key(Some(head))).await?
+                    else {
+                        unreachable!()
+                    };
+                    for (name, prs) in &page.branches {
+                        index
+                            .branches
+                            .entry(name.clone())
+                            .or_default()
+                            .extend(prs.iter().cloned());
+                    }
+                    if index.matching(branch, None, exclude).is_some() {
+                        break;
+                    }
+                }
+                index.matching(branch, base, exclude)
+            }
+            Value::Record(_) => unreachable!(),
+        };
+        let Some(pr) = pr else {
             return Ok(None);
         };
         // A detail read, shared per number, supplies mergeability and confirms
@@ -641,6 +807,7 @@ impl Services {
                     scope,
                     repo: repo.clone(),
                     number: Some(number),
+                    head: None,
                 },
             )
             .await?
@@ -666,7 +833,27 @@ mod tests {
             scope: scope.clone(),
             repo: RepoRef::new("o", format!("r{repo}")),
             number,
+            head: None,
         }
+    }
+
+    /// The sweep classifies a deferral after it crossed the service-error
+    /// boundary; a reworded mapping must not silently restore the per-root
+    /// WARN fan-out (intent-hq/intent#7264).
+    #[test]
+    fn budget_deferral_is_classified_on_both_sides_of_the_error_mapping() {
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        budget.lock().unwrap().available = 0;
+        let denied = Budget::reserve(&budget, &key(&scope(), 0, None), WINDOW)
+            .err()
+            .expect("an exhausted budget defers background work");
+        assert!(is_budget_deferral_sc(&denied), "{denied:?}");
+        let mapped = pr_ops::map_sc_err(denied);
+        assert!(is_budget_deferral(&mapped), "{mapped:?}");
+
+        let other = unknown("PR refresh timed out");
+        assert!(!is_budget_deferral_sc(&other));
+        assert!(!is_budget_deferral(&pr_ops::map_sc_err(other)));
     }
 
     #[test]

@@ -2,12 +2,6 @@ name: Windows CI disk cleanup
 on:
   schedule:
     - cron: "45 11,23 * * *"
-  pull_request:
-    paths:
-      - .github/workflows/windows-prune.yml
-      - .github/workflows/macos-prune.yml
-      - scripts/windows-ci-cleanup.py
-      - scripts/test-windows-ci-cleanup.py
   workflow_dispatch:
     inputs:
       apply:
@@ -19,6 +13,11 @@ on:
         type: boolean
         default: false
   workflow_call:
+    secrets:
+      INTENT_SCCACHE_TOKEN:
+        required: false
+      CI_QUEUE_READ_TOKEN:
+        required: false
     inputs:
       apply:
         type: boolean
@@ -32,9 +31,18 @@ concurrency:
   group: windows-ci-disk-maintenance-${{ github.event_name == 'pull_request' && github.ref || '5090pc' }}
   cancel-in-progress: false
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   safety-tests:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: depot-windows-2022
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['windows-2022'] || fromJSON('["windows-2022"]') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -72,12 +80,14 @@ jobs:
         if: inputs.apply && inputs.verify_build
         shell: cmd
         run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         if: inputs.apply && inputs.verify_build
         shell: powershell
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python -I -B scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python -I -B scripts/setup-sccache.py
       - name: Resolve pinned Rust channel
         if: inputs.apply && inputs.verify_build
         id: toolchain

@@ -16,6 +16,9 @@ fn list(capture: &Value, context: &Value) -> Value {
 #[derive(Default)]
 struct HelperControl(AtomicUsize);
 impl intent_transport::SystemControl for HelperControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> intent_transport::SystemStatus {
         panic!("helper control does not supply daemon status")
     }
@@ -27,13 +30,6 @@ impl intent_transport::SystemControl for HelperControl {
     }
     fn request_update(&self) -> Result<(), String> {
         Err("helper control has no updater".into())
-    }
-    fn import_legacy(
-        &self,
-        _: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
-    {
-        Box::pin(async { Err("helper control has no importer".into()) })
     }
     fn git_credential(
         &self,

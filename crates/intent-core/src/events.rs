@@ -287,6 +287,10 @@ pub const HOOK_EXPIRED: &str = "hook:expired";
 pub const PR_MONITOR_REGISTERED: &str = "prMonitor:registered";
 pub const PR_MONITOR_CHANGED: &str = "prMonitor:changed";
 pub const PR_MONITOR_EMITTED: &str = "prMonitor:emitted";
+/// UI-only: a poll changed only the informational merge-queue entry of the
+/// monitor's `lastSnapshot` (pending set unchanged), so UI clients re-read
+/// `prMonitor.list`. Never a wake; off-limits to agent-owned subscriptions.
+pub const PR_MONITOR_REFRESHED: &str = "prMonitor:refreshed";
 pub const PR_MONITOR_COMPLETED: &str = "prMonitor:completed";
 pub const PR_MONITOR_CANCELLED: &str = "prMonitor:cancelled";
 
@@ -465,6 +469,13 @@ pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
 // values redacted (presence/placeholder only) so every connected client stays
 // in sync without leaking secrets.
 pub const SETTINGS_CHANGED: &str = "settings:changed";
+
+// Provider profile events (PROTOCOL §5.54/§6.5). Emitted once per committed
+// `providers.profiles.*` mutation (exactly one profile each); global like
+// `settings:changed` (empty workspace id) and administrator-only. The payload
+// `{ revision, change, profileId, profile?, envChanged? }` never carries
+// environment keys or values.
+pub const PROVIDERS_PROFILES_CHANGED: &str = "providers:profiles-changed";
 
 // GitHub auth events (new in intentd; PROTOCOL §5.27). Emitted by the
 // daemon-owned device-flow poller on terminal transitions (authorized /
@@ -653,6 +664,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     PR_MONITOR_REGISTERED,
     PR_MONITOR_CHANGED,
     PR_MONITOR_EMITTED,
+    PR_MONITOR_REFRESHED,
     PR_MONITOR_COMPLETED,
     PR_MONITOR_CANCELLED,
     TEST_STARTED,
@@ -701,6 +713,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
+    PROVIDERS_PROFILES_CHANGED,
     GITHUB_AUTH_CHANGED,
     SOURCE_CONTROL_AUTH_CHANGED,
     IDENTITY_AUTH_CHANGED,
@@ -920,6 +933,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_CHANGED, "PR monitor: pending PR changes recorded; PR checklist state."),
     (PR_MONITOR_COMPLETED, "PR monitor: the PR merged/closed; PR identity."),
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
+    (PR_MONITOR_REFRESHED, "PR monitor: only the merge-queue position/estimate changed (UI re-read hint); PR identity."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
     (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
     (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),

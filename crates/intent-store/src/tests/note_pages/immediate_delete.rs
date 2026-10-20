@@ -248,7 +248,7 @@ async fn immediate_delete_anchor_failure_rolls_back_parent_and_child() {
 #[tokio::test]
 async fn immediate_delete_cancel_during_child_finalization_rolls_back() {
     use crate::note_annotation_repo::{FinalizerPause, FINALIZER_PAUSE};
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
     let (store, _tmp, parent) = setup("parent").await;
     let child = child(&store, &parent).await;
     let before = store
@@ -263,7 +263,7 @@ async fn immediate_delete_cancel_during_child_finalization_rolls_back() {
     tokio::select! {
         result = &mut delete => panic!("delete finished before finalizer: {result:?}"),
         () = pause.entered.notified() => {},
-        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("delete never reached finalizer"),
+        () = tokio::time::sleep(super::wait()) => panic!("delete never reached finalizer"),
     }
     assert!(
         !pause
@@ -276,7 +276,7 @@ async fn immediate_delete_cancel_during_child_finalization_rolls_back() {
     );
     drop(delete);
     tokio::time::timeout(
-        Duration::from_secs(5),
+        super::wait(),
         sqlx::query("BEGIN IMMEDIATE; ROLLBACK").execute(store.write_pool()),
     )
     .await

@@ -232,6 +232,9 @@ impl FixtureMetadata {
     }
 }
 impl intent_transport::SystemControl for FixtureMetadata {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn services(&self) -> intent_transport::control::SystemServices {
         intent_transport::control::SystemServices::StatusOnly
     }
@@ -268,14 +271,6 @@ impl intent_transport::SystemControl for FixtureMetadata {
     fn request_update(&self) -> Result<(), String> {
         self.unsupported();
         Err("metadata fixture has no updater".into())
-    }
-    fn import_legacy(
-        &self,
-        _: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>>
-    {
-        self.unsupported();
-        Box::pin(async { Err("metadata fixture has no importer".into()) })
     }
     fn git_credential(
         &self,
@@ -4407,7 +4402,6 @@ async fn native_fixture_metadata_unsupported_matches_absent() {
             ("system.requestUpdate", json!({})),
             ("system.requestUpdate", json!({"targetVersion":"1.2.3"})),
             ("system.requestUpdate", json!({"targetVersion":42})),
-            ("system.importLegacy", json!({"force":true})),
             (
                 "system.gitCredential",
                 json!({"protocol":"https","host":"github.com"}),

@@ -3382,6 +3382,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: BTreeMap::default(),
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
@@ -6352,6 +6353,9 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
 struct BusyDaemonControl;
 
 impl SystemControl for BusyDaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -6409,14 +6413,6 @@ impl SystemControl for BusyDaemonControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Ok(())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,
@@ -19372,9 +19368,10 @@ async fn wss_workspace_transfer_plan_round_trip() {
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
     assert_eq!(manifest["formatVersion"], 2, "{resp}");
-    assert!(
-        manifest["creatingIntentdVersion"].is_string(),
-        "manifest records the creating daemon version: {resp}"
+    assert_eq!(
+        manifest["creatingIntentdVersion"],
+        intent_core::transfer::CREATING_INTENTD_VERSION,
+        "export records the version import requires: {resp}"
     );
     assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
     let tables = manifest["tables"].as_array().expect("tables array");
@@ -20617,11 +20614,10 @@ async fn wss_workspace_import_lifecycle() {
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
-    // Manifest must carry the exact intentd version (workspace-synchronized
-    // crate versions make CARGO_PKG_VERSION valid here).
+    // Manifest must carry the exact version the importer checks.
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -20892,7 +20888,8 @@ async fn wss_workspace_import_lifecycle() {
     );
     let msg = rejected["error"]["message"].as_str().expect("message");
     assert!(
-        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        msg.contains("0.0.1-elsewhere")
+            && msg.contains(intent_core::transfer::CREATING_INTENTD_VERSION),
         "error names both versions: {msg}"
     );
 
@@ -21287,7 +21284,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -22501,6 +22498,9 @@ struct WatchHealthControl {
 }
 
 impl SystemControl for WatchHealthControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -22558,14 +22558,6 @@ impl SystemControl for WatchHealthControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Err("not supported in this test".to_string())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,

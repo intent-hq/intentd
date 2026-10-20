@@ -1615,6 +1615,12 @@ mod tests {
             json!({"claude":true}),
             json!({"auggie":false}),
             json!({"unknown":true}),
+            json!({"auggie@p1":true}),
+            json!({"codex@":true}),
+            json!({"codex@Work":true}),
+            json!({"Codex@p1":true}),
+            json!({"codex@p1@p2":true}),
+            json!({"claude-code@ p1":true}),
         ] {
             assert!(reg
                 .apply(&[
@@ -1628,6 +1634,16 @@ mod tests {
         assert!(reg
             .apply(&set("providers.fastMode.codex", json!(true)))
             .is_err());
+        // Named-profile references of Fast mode capable bases are keys too.
+        let with_profiles = json!({"claude-code":true,"claude-code@p1":false,"codex@work-2":true});
+        reg.apply(&set("providers.fastMode", with_profiles.clone()))
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .get("providers.fastMode"),
+            Some(with_profiles)
+        );
         reg.apply(&set("providers.fastMode", Value::Null)).unwrap();
         assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
         assert_eq!(

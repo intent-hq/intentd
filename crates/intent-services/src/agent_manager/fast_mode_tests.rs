@@ -17,6 +17,25 @@ async fn fixture(
     tempfile::TempDir,
     super::tests::EnvGuard,
 ) {
+    let (mgr, id, dir, cli_env, _) = fixture_with(provider, model, fail_off, false).await;
+    (mgr, id, dir, cli_env)
+}
+
+/// [`fixture`], optionally running the agent under a named profile of
+/// `provider`; returns the session's selection (the profile reference or
+/// the bare provider id).
+async fn fixture_with(
+    provider: &str,
+    model: &str,
+    fail_off: bool,
+    with_profile: bool,
+) -> (
+    AgentManager,
+    AgentId,
+    tempfile::TempDir,
+    super::tests::EnvGuard,
+    String,
+) {
     let dir = test_tempdir("fast-mode-runtime-");
     let cli_env = crate::test_support::installed_cli_env(
         dir.path(),
@@ -35,7 +54,19 @@ async fn fixture(
         .unwrap();
     let services = Services::new(store.clone())
         .with_event_bus(bus.clone())
-        .with_settings_registry(registry);
+        .with_settings_registry(registry)
+        .with_secret_store(Arc::new(crate::settings::InMemorySecretStore::default()));
+    let selection = if with_profile {
+        services
+            .provider_profiles_create_impl(json!({ "baseProviderId": provider, "name": "Work" }))
+            .await
+            .unwrap()["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        provider.to_owned()
+    };
     let mgr = AgentManager::new(services, Arc::new(BusEventSink::new(bus)), 4);
     let ws = WorkspaceId::from("ws-1");
     let mut w = workspace(&ws);
@@ -43,14 +74,14 @@ async fn fixture(
     store.insert_workspace(&w).await.unwrap();
     let id = AgentId::from("fast-agent");
     let mut s = session(&id, &ws, None);
-    s.provider = Some(provider.into());
+    s.provider = Some(selection.clone());
     s.model = Some(model.into());
     s.reasoning_effort = Some("high".into());
     s.is_background = true;
     s.parent_agent_id = Some(AgentId::from("parent"));
     store.insert_agent_session(&s).await.unwrap();
-    spawn_fixture(&mgr, &id, provider, model, &dir).await;
-    (mgr, id, dir, cli_env)
+    spawn_fixture_as(&mgr, &id, &selection, model, &dir).await;
+    (mgr, id, dir, cli_env, selection)
 }
 
 async fn spawn_fixture(
@@ -60,11 +91,24 @@ async fn spawn_fixture(
     model: &str,
     dir: &tempfile::TempDir,
 ) {
+    spawn_fixture_as(mgr, id, provider, model, dir).await;
+}
+
+async fn spawn_fixture_as(
+    mgr: &AgentManager,
+    id: &AgentId,
+    selection: &str,
+    model: &str,
+    dir: &tempfile::TempDir,
+) {
     // Explicit resolved binary isolates even Codex, whose production npx-only
     // policy deliberately ignores providers.paths adapter overrides.
-    let config = intent_providers::find_provider(provider).unwrap();
+    let config =
+        intent_providers::find_provider(intent_providers::base_provider_id(selection)).unwrap();
+    let profile = mgr.services.resolve_profile_env(selection).await.unwrap();
     let script = dir.path().join("adapter.mjs");
     let mut opts = SpawnOptions::new(config);
+    opts.profile_env = profile.as_ref();
     opts.provider_binary = Some(&script);
     opts.model = Some(model);
     opts.cwd = Some(dir.path());
@@ -78,6 +122,14 @@ async fn spawn_fixture(
     )
     .await
     .unwrap();
+}
+
+fn preferences(mgr: &AgentManager, map: Value) {
+    mgr.services
+        .settings_registry()
+        .unwrap()
+        .apply(&[("providers.fastMode".into(), map)])
+        .unwrap();
 }
 
 fn preference(mgr: &AgentManager, provider: &str, value: bool) {
@@ -230,6 +282,7 @@ async fn fast_mode_absent_option_allows_off_then_rechecks_eligible_model() {
         &id,
         "fast-session",
         "claude-code",
+        "claude-code",
         &mgr.capture_turn(&id).unwrap(),
     )
     .await
@@ -351,4 +404,32 @@ async fn fast_mode_notification_adds_control_and_clears_inherited_fast_before_wa
     );
     assert_eq!(state["controls"], json!(["off"]));
     mgr.stop(&id).await;
+}
+
+/// A profile reads only its own `providers.fastMode` entry: the base
+/// provider's (Default profile's) value never applies to it, and a profile
+/// with no entry runs with Fast mode / the service tier off.
+#[intent_test_macros::daemon_test]
+async fn fast_mode_profile_uses_its_own_entry_never_the_default() {
+    for provider in ["claude-code", "codex"] {
+        let (mgr, id, _dir, _cli_env, reference) =
+            fixture_with(provider, "supported", false, true).await;
+        assert!(
+            reference.starts_with(&format!("{provider}@")),
+            "{reference}"
+        );
+        let first = turn(&mgr, &id).await;
+        for (map, expected) in [
+            (json!({ provider: true }), false),
+            (json!({ provider: false, reference.clone(): true }), true),
+            (json!({ provider: true, reference.clone(): false }), false),
+            (json!({ reference.clone(): true }), true),
+        ] {
+            preferences(&mgr, map.clone());
+            let state = turn(&mgr, &id).await;
+            assert_eq!(state["pid"], first["pid"], "{provider}: unchanged adapter");
+            assert_eq!(state["fastMode"], expected, "{provider}: {map}");
+        }
+        mgr.stop(&id).await;
+    }
 }

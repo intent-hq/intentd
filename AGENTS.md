@@ -75,6 +75,7 @@ only on `intent-services`, never on `intent-store`.
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
 | writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, file walker); "Gates → source lints" below |
+| CI release / workflow scripts (`scripts/test-*` in ci.yml's `release-scripts` job) | `make test-release-scripts` (from `packages/intentd`; `make -C packages/intentd test-release-scripts` at the monorepo root) runs every test that job runs, in CI order, and skips suites that need CI-only tooling (release-plz, sccache, cargo-dist) with "SKIP <suite>: needs <X>" — a skipped suite is unverified, so install the tool when your change touches it; run it before pushing a change to `.github/workflows/*.yml` or `scripts/` (CI Gate's job list is pinned by `test-retire-obsolete-merge-runs-workflow.py`, intentd#2499) |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
 
 ## Performance — the RPC cost contract
@@ -222,9 +223,9 @@ standalone clone they exit 2 and name the monorepo command):
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
 make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
-make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's pull_request coverage-changed job
+make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
-scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on every PR
+scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
 ```
 
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
@@ -262,6 +263,7 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `agent_hidden_field_egress_lint` | a `mcp_server/bindings/` file that reads session/event rows (`AgentLite` / `Event`, `agent_get(` / `agent_list(` / `event_query(` …) without a `SCRUBBED_BINDINGS` row (scrubs with `strip_agent_hidden_fields` + `EGRESS_REGISTRY` entries), or an `intent-services` fn copying `.data` wholesale into `json!` without a `WAKE_METADATA_BUILDERS` row; allowlist rows and registry entries are cross-checked for staleness | `HAND_PICKED_BINDINGS` / `SAFE_DATA_COPIES` rows in the lint (reason required) |
 | `queue_entry_egress_lint` | a non-test `queue_snapshot(` / `queue_snapshot_preview(` call whose enclosing fn, or an `event_type: <const>` publish of any const whose string value in `crates/intent-core/src/events.rs` starts with `agent:queue:` (the watched set is derived from that file, so a new `agent:queue:*` constant is watched without editing the lint) whose const, is named by no `REGISTERED_EGRESS` row (the row maps it to a `QueueSurface` variant in `crates/intent-core/src/queue_visibility_contract.rs`, so the contract harnesses drive it); outside `events.rs`, any other reference to a watched const (helper argument, local binding, `json!` value, comparison; `use` items excepted) or an `"agent:queue:*"` string literal whose enclosing fn is named by no `Key::Fn` row; a variant no row claims, or a row naming a variant / fn / const that no longer exists, also fails (multiplayer queue visibility, intentd#2068) | `// queue-egress: allow — <reason>` on the line above the call / reference or its statement, only when no entry leaves the daemon (a consumer matching on the type) |
 | `source_lint_discovery_lint` | a `*_lint.rs` file the glob does not select, a ci.yml `check` job with no non-comment `run:` line invoking the glob, or a `*_lint.rs` file defining its own `fn lex(` / `markers_by_line(` / `blank_cfg_test_items(` / `cfg_test_item_ranges(` / `split_statements(` instead of importing `intentd_test_support::source_lint` (the #2073 fixes had to be re-applied per private copy) | `// source-lint-scaffolding: allow — <reason>` on the line above the definition; none for the first two rules |
+| `transfer_version_source_lint` | `CARGO_PKG_VERSION` within 20 lines of the transfer manifest's `creating_intentd_version` / `creatingIntentdVersion` field outside `crates/intent-core/src/transfer.rs` — crate versions can drift in a release, so export, the import check and test manifests must all use `intent_core::transfer::CREATING_INTENTD_VERSION` | none |
 | `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump

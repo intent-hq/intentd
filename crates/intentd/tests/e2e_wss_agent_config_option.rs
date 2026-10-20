@@ -491,14 +491,15 @@ async fn workspace_initial_agent_effort_reaches_first_prompt_over_wss() {
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         )
         .await;
+        // Every session carries a concrete level: one created on Auto is
+        // pinned after its first turn to the level the provider confirmed.
         assert_eq!(
             got["agent"]["reasoningEffort"].as_str(),
-            expected,
+            Some(expected.unwrap_or(applied)),
             "persisted: {got}"
         );
         if expected.is_none() {
             assert!(agent.get("reasoningEffort").is_none(), "{created}");
-            assert!(got["agent"].get("reasoningEffort").is_none(), "{got}");
         }
     }
 }

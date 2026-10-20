@@ -108,6 +108,16 @@ class MetadataTests(Fixture):
         self.replace('crates/intentd/Cargo.toml', 'path = "../intent-core"', 'features = ["extra"], path = "../intent-core"')
         self.classify(False)
 
+    def test_version_bump_with_stale_lockfile_rejected(self):
+        # Without the lockfile bump every `--locked` build fails; the PR CI
+        # fast path skips `check`, so the classifier must refuse it.
+        self.bump()
+        self.replace('Cargo.lock', 'name = "intentd"\nversion = "0.9.135"', 'name = "intentd"\nversion = "0.9.134"')
+        self.classify(False)
+        # Lockfile left out of the diff entirely.
+        self.git('checkout', self.base, '--', 'Cargo.lock')
+        self.classify(False)
+
     def test_external_lock_version_rejected(self):
         self.bump()
         self.replace('Cargo.lock', 'name = "external"\nversion = "0.9.134"', 'name = "external"\nversion = "0.9.135"')

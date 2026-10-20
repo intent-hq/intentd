@@ -30,6 +30,8 @@ mod note_index_profile;
 mod note_line_attribution;
 mod note_pages;
 mod note_search;
+mod pull_request_workspace;
+mod write_acquire_retry;
 
 #[tokio::test]
 async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {
@@ -11087,4 +11089,212 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         store.read_pool().close().await;
         store.write_pool().close().await;
     }
+}
+
+/// 0162 backfills legacy rows' NULL / blank provider, model and reasoning
+/// effort from the identity their last turn ran under — fill-only, skipping
+/// rows without evidence, legacy provider aliases, malformed JSON, the
+/// `"default"` alias and any model/effort from a provider the session has
+/// since left — and replaying it changes nothing.
+#[tokio::test]
+async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
+    // (id, provider, model, effort, last_turn_provider, last_turn_model, last_turn_effort)
+    type Seed = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::from("ws-0162");
+    store
+        .insert_workspace(&sample_workspace(&ws, "0162", false))
+        .await
+        .expect("insert workspace");
+    let seeds: [Seed; 10] = [
+        (
+            "agent-legacy",
+            None,
+            None,
+            None,
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":null,"default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-blank",
+            Some(""),
+            Some(" "),
+            Some(""),
+            Some("claude-code"),
+            Some("opus"),
+            Some(
+                r#"{"effort":"high","default_value":"medium","provider":"claude-code","model":"opus"}"#,
+            ),
+        ),
+        (
+            "agent-effort-only-evidence",
+            None,
+            Some("m"),
+            None,
+            None,
+            None,
+            Some(r#"{"effort":null,"default_value":"low","provider":"grok","model":null}"#),
+        ),
+        ("agent-no-evidence", None, None, None, None, None, None),
+        (
+            "agent-alias",
+            None,
+            Some("m"),
+            None,
+            Some("default"),
+            None,
+            Some(r#"{"effort":null,"default_value":"default","provider":"default","model":null}"#),
+        ),
+        (
+            "agent-set",
+            Some("auggie"),
+            Some("sonnet"),
+            Some("low"),
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":"max","default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-bad-json",
+            None,
+            Some("m"),
+            None,
+            None,
+            None,
+            Some("not json"),
+        ),
+        (
+            "agent-moved",
+            Some("claude-code"),
+            None,
+            None,
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":"xhigh","default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-compound",
+            None,
+            None,
+            None,
+            Some("codex"),
+            Some("codex:gpt-5"),
+            None,
+        ),
+        (
+            "agent-default-model",
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            Some("default"),
+            None,
+        ),
+    ];
+    for (id, provider, model, effort, ltp, ltm, lte) in seeds {
+        let mut s = sample_agent_session(&AgentId::from(id), &ws);
+        s.provider = provider.map(str::to_string);
+        s.model = model.map(str::to_string);
+        s.reasoning_effort = effort.map(str::to_string);
+        store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        sqlx::query(
+            "UPDATE agent_session SET last_turn_provider=?, last_turn_model=?, \
+             last_turn_effort=? WHERE id=?",
+        )
+        .bind(ltp)
+        .bind(ltm)
+        .bind(lte)
+        .bind(id)
+        .execute(store.write_pool())
+        .await
+        .expect("seed last turn");
+    }
+
+    let migration = crate::MIGRATOR
+        .migrations
+        .iter()
+        .find(|m| m.version == 162)
+        .expect("migration 0162 present");
+    let sql: String = migration
+        .sql
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let replay = || async {
+        for statement in sql.split(';') {
+            let body = statement.trim();
+            // The column ALTER already ran at open; replay the data backfill.
+            if !body.is_empty() && !body.starts_with("ALTER TABLE") {
+                sqlx::query(body)
+                    .execute(store.write_pool())
+                    .await
+                    .expect("run migration statement");
+            }
+        }
+    };
+    replay().await;
+    let read = || async {
+        let mut rows = Vec::new();
+        for (id, ..) in seeds {
+            let row = sqlx::query(
+                "SELECT provider, model, reasoning_effort, reasoning_effort_auto \
+                 FROM agent_session WHERE id=?",
+            )
+            .bind(id)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("read");
+            rows.push((
+                id,
+                row.get::<Option<String>, _>("provider"),
+                row.get::<Option<String>, _>("model"),
+                row.get::<Option<String>, _>("reasoning_effort"),
+                row.get::<i64, _>("reasoning_effort_auto"),
+            ));
+        }
+        rows
+    };
+    let first = read().await;
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        first,
+        vec![
+            // An Auto turn's default is flagged as Auto-pinned (1); an
+            // explicit selection is not (0).
+            ("agent-legacy", s("codex"), s("gpt-6-astra"), s("max"), 1),
+            ("agent-blank", s("claude-code"), s("opus"), s("high"), 0),
+            ("agent-effort-only-evidence", s("grok"), s("m"), s("low"), 1),
+            ("agent-no-evidence", None, None, None, 0),
+            ("agent-alias", None, s("m"), None, 0),
+            ("agent-set", s("auggie"), s("sonnet"), s("low"), 0),
+            ("agent-bad-json", None, s("m"), None, 0),
+            // Provider since moved: the old provider's model/effort never
+            // carries over.
+            ("agent-moved", s("claude-code"), None, None, 0),
+            ("agent-compound", s("codex"), s("gpt-5"), None, 0),
+            ("agent-default-model", s("claude-code"), None, None, 0),
+        ]
+    );
+    replay().await;
+    assert_eq!(read().await, first, "idempotent");
 }
