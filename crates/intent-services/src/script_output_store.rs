@@ -681,10 +681,10 @@ impl BlankProbe {
             if self.want == 0 {
                 match b {
                     b'\t' | b'\x0b' | b'\x0c' | b'\r' | b' ' => {}
-                    0x00..=0x7f => self.non_blank = true,
                     0xc2..=0xdf => self.start(b, 2),
                     0xe0..=0xef => self.start(b, 3),
                     0xf0..=0xf4 => self.start(b, 4),
+                    // Other ASCII, stray continuation bytes, invalid leads.
                     _ => self.non_blank = true,
                 }
                 continue;
