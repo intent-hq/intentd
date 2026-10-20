@@ -6160,22 +6160,33 @@ fn spawn_stream_retention_loop(
 /// Log one retention tick's freelist drain: freed pages, chunk pacing, and
 /// the remaining backlog with a ticks-to-drain estimate, so a large
 /// freelist (intent-hq/intent#7448: 15.9 GB) is visible in the daemon log.
-/// Silent when nothing was freed (an empty freelist, or a database still in
-/// `auto_vacuum = NONE`; a failed chunk is warned about by the drain).
+/// A backlog the drain cannot touch (`NothingFreed`: the database is still
+/// in `auto_vacuum = NONE`, e.g. after a failed activation VACUUM) is logged
+/// too. Silent when the freelist was already empty or the first chunk failed
+/// (the drain warns about failures itself).
 async fn log_incremental_vacuum_drain(
     store: &Store,
     drain: &intent_services::retention::VacuumDrainOutcome,
 ) {
-    if drain.pages_freed == 0 {
+    let remaining = drain.freelist_remaining.unwrap_or(0);
+    if drain.pages_freed == 0 && remaining == 0 {
         return;
     }
-    let remaining = drain.freelist_remaining.unwrap_or(0);
     let page_size = store
         .page_size()
         .await
         .unwrap_or(4096)
         .max(0)
         .cast_unsigned();
+    let freelist_bytes = remaining.saturating_mul(page_size);
+    if drain.stop == intent_services::retention::VacuumDrainStop::NothingFreed {
+        tracing::info!(
+            freelist_pages = remaining,
+            freelist_bytes,
+            "incremental vacuum freed nothing; freelist backlog is not reclaimable (auto_vacuum not INCREMENTAL?)"
+        );
+        return;
+    }
     tracing::info!(
         pages_freed = drain.pages_freed,
         chunks = drain.chunks,
@@ -6183,7 +6194,7 @@ async fn log_incremental_vacuum_drain(
         max_chunk_ms = drain.max_chunk.as_millis(),
         ms_per_page = drain.ms_per_page.map(|ms| format!("{ms:.3}")),
         freelist_pages = remaining,
-        freelist_bytes = remaining.saturating_mul(page_size),
+        freelist_bytes,
         ticks_to_drain = drain.ticks_to_drain(),
         stop = ?drain.stop,
         "incremental vacuum released freelist pages"

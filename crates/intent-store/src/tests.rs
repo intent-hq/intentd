@@ -4010,7 +4010,7 @@ async fn retention_delete_query_plan_uses_index() {
 
 /// Disk-space reclamation: a freshly created database is in
 /// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
-/// on the freelist, and bounded `Store::incremental_vacuum` calls actually
+/// on the freelist, and bounded `Store::incremental_vacuum_chunk` calls actually
 /// release them (freelist shrinks, logical `page_count` drops).
 #[tokio::test]
 async fn incremental_vacuum_releases_freelist_pages() {
@@ -4071,7 +4071,11 @@ async fn incremental_vacuum_releases_freelist_pages() {
     );
 
     // A bounded call frees at most `max_pages` per invocation.
-    let freed_bounded = store.incremental_vacuum(8).await.expect("bounded vacuum");
+    let freed_bounded = store
+        .incremental_vacuum_chunk(8)
+        .await
+        .expect("bounded vacuum")
+        .pages_freed;
     assert!(
         freed_bounded > 0 && freed_bounded <= 8,
         "bounded incremental_vacuum should free 1..=8 pages (got {freed_bounded})"
@@ -4079,9 +4083,10 @@ async fn incremental_vacuum_releases_freelist_pages() {
 
     // Draining the rest empties the freelist and shrinks the logical DB size.
     let freed_rest = store
-        .incremental_vacuum(1_000_000)
+        .incremental_vacuum_chunk(1_000_000)
         .await
-        .expect("drain vacuum");
+        .expect("drain vacuum")
+        .pages_freed;
     assert_eq!(
         freed_bounded + freed_rest,
         freelist_after_delete.cast_unsigned(),
@@ -4160,7 +4165,17 @@ async fn incremental_vacuum_chunk_reports_freed_and_remaining() {
         matches!(reacquired, Ok(Ok(_))),
         "the chunk must hand the write connection back to the pool"
     );
+    drop(reacquired);
     assert!(store.page_size().await.expect("page_size") > 0);
+
+    // `PRAGMA incremental_vacuum(0)` means "the whole freelist" to SQLite;
+    // the chunk clamps it to a single page instead.
+    let zero = store.incremental_vacuum_chunk(0).await.expect("zero chunk");
+    assert_eq!(
+        zero.pages_freed, 1,
+        "a 0-page request must free exactly 1 page"
+    );
+    assert!(zero.freelist_remaining > 0);
 }
 
 /// One-time activation (monorepo#720 finding 1): a legacy database created
@@ -4269,9 +4284,10 @@ async fn activate_incremental_vacuum_converts_legacy_none_db() {
         "churn deletes should leave pages on the freelist"
     );
     let freed = store
-        .incremental_vacuum(1_000_000)
+        .incremental_vacuum_chunk(1_000_000)
         .await
-        .expect("incremental vacuum");
+        .expect("incremental vacuum")
+        .pages_freed;
     assert!(
         freed > 0,
         "incremental_vacuum should release pages after activation (got {freed})"

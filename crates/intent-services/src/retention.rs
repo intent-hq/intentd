@@ -211,6 +211,8 @@ impl VacuumDrainPolicy {
 /// `previous` chunk. A non-positive or non-finite cost (a chunk too fast to
 /// time) grows by the cap. Only the `min_pages` floor can project past the
 /// budget — when a single page costs more than `hold_budget / min_pages`.
+/// The result is never 0 (`min_pages` is floored at 1): `SQLite` reads
+/// `PRAGMA incremental_vacuum(0)` as "the whole freelist".
 #[must_use]
 pub fn vacuum_chunk_pages(
     ms_per_page: f64,
@@ -219,6 +221,7 @@ pub fn vacuum_chunk_pages(
     min_pages: u32,
     max_pages: u32,
 ) -> u32 {
+    let min_pages = min_pages.max(1);
     let max_pages = max_pages.max(min_pages);
     let ceiling = previous
         .max(1)
@@ -250,10 +253,10 @@ pub struct VacuumPacer {
 impl VacuumPacer {
     #[must_use]
     pub fn new(policy: VacuumDrainPolicy) -> Self {
-        let next_pages = policy.probe_chunk_pages.clamp(
-            policy.min_chunk_pages,
-            policy.max_chunk_pages.max(policy.min_chunk_pages),
-        );
+        let min_pages = policy.min_chunk_pages.max(1);
+        let next_pages = policy
+            .probe_chunk_pages
+            .clamp(min_pages, policy.max_chunk_pages.max(min_pages));
         Self {
             policy,
             next_pages,
@@ -271,6 +274,15 @@ impl VacuumPacer {
     #[must_use]
     pub fn ms_per_page(&self) -> Option<f64> {
         self.ms_per_page
+    }
+
+    /// Projected hold of the next chunk at the current estimate (zero
+    /// before the first measurement).
+    #[must_use]
+    pub fn projected_next_hold(&self) -> StdDuration {
+        self.ms_per_page.map_or(StdDuration::ZERO, |ms| {
+            StdDuration::from_secs_f64(f64::from(self.next_pages) * ms / 1000.0)
+        })
     }
 
     /// Feed one finished chunk (`pages_freed` pages in `elapsed`) and resize
@@ -332,13 +344,18 @@ pub struct VacuumDrainOutcome {
 
 impl VacuumDrainOutcome {
     /// Ticks still needed to empty the freelist at this drain's rate:
-    /// `Some(0)` when nothing remains, `None` when it is unknown (no pages
-    /// freed this tick, or the freelist could not be read).
+    /// `Some(0)` when nothing remains, `None` when it is unknown — no pages
+    /// freed, the freelist unread, or a drain cut short by an error (its
+    /// partial rate would wildly overstate the estimate).
     #[must_use]
     pub fn ticks_to_drain(&self) -> Option<u64> {
-        match self.freelist_remaining? {
-            0 => Some(0),
-            remaining if self.pages_freed > 0 => Some(remaining.div_ceil(self.pages_freed)),
+        let remaining = self.freelist_remaining?;
+        match self.stop {
+            VacuumDrainStop::Drained => Some(0),
+            VacuumDrainStop::Budget if remaining == 0 => Some(0),
+            VacuumDrainStop::Budget if self.pages_freed > 0 => {
+                Some(remaining.div_ceil(self.pages_freed))
+            }
             _ => None,
         }
     }
@@ -351,39 +368,35 @@ impl VacuumDrainOutcome {
 /// the (FIFO-fair) pool and the drain pauses for the previous chunk's
 /// duration (at least `policy.min_pause`), so writes queued during a chunk
 /// run before the next one. Stops when the freelist is empty, a chunk frees
-/// nothing, a chunk fails, or `policy.drain_budget` would be exceeded.
+/// nothing, a chunk fails, or the next pause plus the next chunk's
+/// projected hold would exceed `policy.drain_budget`.
 pub async fn run_incremental_vacuum_drain(
     store: &Store,
     policy: VacuumDrainPolicy,
 ) -> VacuumDrainOutcome {
     let started = std::time::Instant::now();
     let mut pacer = VacuumPacer::new(policy);
-    let mut outcome = VacuumDrainOutcome {
-        pages_freed: 0,
-        chunks: 0,
-        active: StdDuration::ZERO,
-        max_chunk: StdDuration::ZERO,
-        freelist_remaining: None,
-        ms_per_page: None,
-        stop: VacuumDrainStop::Error,
-    };
-    outcome.stop = loop {
+    let mut chunks = 0u32;
+    let mut pages_freed = 0u64;
+    let mut active = StdDuration::ZERO;
+    let mut max_chunk = StdDuration::ZERO;
+    let mut freelist_remaining = None;
+    let stop = loop {
+        chunks += 1;
         let chunk = match store
             .incremental_vacuum_chunk(pacer.next_chunk_pages())
             .await
         {
             Ok(chunk) => chunk,
             Err(e) => {
-                outcome.chunks += 1;
                 tracing::warn!(error = %e, "incremental vacuum failed");
                 break VacuumDrainStop::Error;
             }
         };
-        outcome.chunks += 1;
-        outcome.pages_freed += chunk.pages_freed;
-        outcome.active += chunk.elapsed;
-        outcome.max_chunk = outcome.max_chunk.max(chunk.elapsed);
-        outcome.freelist_remaining = Some(chunk.freelist_remaining);
+        pages_freed += chunk.pages_freed;
+        active += chunk.elapsed;
+        max_chunk = max_chunk.max(chunk.elapsed);
+        freelist_remaining = Some(chunk.freelist_remaining);
         if chunk.freelist_remaining == 0 {
             break VacuumDrainStop::Drained;
         }
@@ -392,13 +405,22 @@ pub async fn run_incremental_vacuum_drain(
         }
         pacer.record(chunk.pages_freed, chunk.elapsed);
         let pause = chunk.elapsed.max(policy.min_pause);
-        if started.elapsed() + pause >= policy.drain_budget {
+        // Stop unless the pause AND the next chunk's projected hold both fit,
+        // so a slow floor-sized chunk cannot overrun the budget.
+        if started.elapsed() + pause + pacer.projected_next_hold() >= policy.drain_budget {
             break VacuumDrainStop::Budget;
         }
         tokio::time::sleep(pause).await;
     };
-    outcome.ms_per_page = pacer.ms_per_page();
-    outcome
+    VacuumDrainOutcome {
+        pages_freed,
+        chunks,
+        active,
+        max_chunk,
+        freelist_remaining,
+        ms_per_page: pacer.ms_per_page(),
+        stop,
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +428,7 @@ mod tests {
     use super::*;
     use intent_core::{EventActor, WorkspaceId};
     use intent_store::NewEvent;
+    use sqlx::ConnectOptions;
 
     const BUDGET: StdDuration = StdDuration::from_millis(250);
 
@@ -447,6 +470,31 @@ mod tests {
     }
 
     #[test]
+    fn chunk_is_never_zero_pages() {
+        // `PRAGMA incremental_vacuum(0)` would release the whole freelist.
+        assert_eq!(vacuum_chunk_pages(1_000.0, BUDGET, 64, 0, 2000), 1);
+        let pacer = VacuumPacer::new(VacuumDrainPolicy {
+            probe_chunk_pages: 0,
+            min_chunk_pages: 0,
+            max_chunk_pages: 0,
+            ..VacuumDrainPolicy::for_tick_interval(StdDuration::from_secs(3600))
+        });
+        assert_eq!(pacer.next_chunk_pages(), 1);
+    }
+
+    #[test]
+    fn projected_next_hold_tracks_estimate() {
+        let mut pacer = VacuumPacer::new(VacuumDrainPolicy::for_tick_interval(
+            StdDuration::from_secs(3600),
+        ));
+        assert_eq!(pacer.projected_next_hold(), StdDuration::ZERO);
+        pacer.record(32, StdDuration::from_millis(160));
+        // 5 ms/page -> 50 pages -> 250 ms.
+        assert_eq!(pacer.next_chunk_pages(), 50);
+        assert_eq!(pacer.projected_next_hold(), StdDuration::from_millis(250));
+    }
+
+    #[test]
     fn zero_or_invalid_cost_grows_by_the_cap() {
         assert_eq!(vacuum_chunk_pages(0.0, BUDGET, 32, 8, 2000), 64);
         assert_eq!(vacuum_chunk_pages(f64::NAN, BUDGET, 32, 8, 2000), 64);
@@ -485,19 +533,26 @@ mod tests {
 
     #[test]
     fn ticks_to_drain_estimate() {
-        let outcome = |freed, remaining| VacuumDrainOutcome {
+        use VacuumDrainStop::{Budget, Drained, Error, NothingFreed};
+        let outcome = |freed, remaining, stop| VacuumDrainOutcome {
             pages_freed: freed,
             chunks: 1,
             active: StdDuration::ZERO,
             max_chunk: StdDuration::ZERO,
             freelist_remaining: remaining,
             ms_per_page: None,
-            stop: VacuumDrainStop::Budget,
+            stop,
         };
-        assert_eq!(outcome(50_000, Some(3_883_407)).ticks_to_drain(), Some(78));
-        assert_eq!(outcome(10, Some(0)).ticks_to_drain(), Some(0));
-        assert_eq!(outcome(0, Some(10)).ticks_to_drain(), None);
-        assert_eq!(outcome(10, None).ticks_to_drain(), None);
+        assert_eq!(
+            outcome(50_000, Some(3_883_407), Budget).ticks_to_drain(),
+            Some(78)
+        );
+        assert_eq!(outcome(10, Some(0), Drained).ticks_to_drain(), Some(0));
+        assert_eq!(outcome(0, Some(10), Budget).ticks_to_drain(), None);
+        assert_eq!(outcome(0, Some(10), NothingFreed).ticks_to_drain(), None);
+        assert_eq!(outcome(10, None, Error).ticks_to_drain(), None);
+        // A partial rate from an errored drain is not an estimate.
+        assert_eq!(outcome(32, Some(3_883_407), Error).ticks_to_drain(), None);
     }
 
     /// Open a store whose file already holds `blobs` × 64 KiB of deleted
@@ -639,9 +694,24 @@ mod tests {
                 (outcome, std::time::Instant::now())
             }
         });
-        // Wait until the drain has actually started releasing pages.
+        // Wait until the drain has actually started releasing pages. Poll
+        // through an independent read-only connection (a WAL reader sees each
+        // committed chunk) so the probe never competes for the write pool.
+        let mut probe = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("vacuum.db"))
+            .read_only(true)
+            .connect()
+            .await
+            .expect("probe connection");
         tokio::time::timeout(StdDuration::from_secs(30), async {
-            while store.freelist_count().await.expect("freelist") == before {
+            loop {
+                let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(&mut probe)
+                    .await
+                    .expect("probe freelist");
+                if freelist < before {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
@@ -671,10 +741,14 @@ mod tests {
             write_done < drain_done,
             "the write must not wait for the whole drain ({outcome:?})"
         );
+        // A 4-page chunk on this small file takes milliseconds, so the write
+        // waits at most one short chunk; 2 s is pure scheduler headroom for
+        // a loaded CI host, still far below the multi-second holds of #7448.
         assert!(
-            write_done - write_started < StdDuration::from_secs(5),
-            "write took {:?}",
-            write_done - write_started
+            write_done - write_started < StdDuration::from_secs(2),
+            "write took {:?} (max chunk {:?})",
+            write_done - write_started,
+            outcome.max_chunk
         );
     }
 }

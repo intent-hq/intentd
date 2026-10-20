@@ -612,17 +612,13 @@ impl Store {
     /// Number of pages on the database freelist (`PRAGMA freelist_count`):
     /// pages emptied by deletes that have not yet been reclaimed. On an
     /// incremental-auto-vacuum database these are the pages
-    /// [`Self::incremental_vacuum`] can release back to the filesystem.
+    /// [`Self::incremental_vacuum_chunk`] can release back to the filesystem.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
-        sqlx::query("PRAGMA freelist_count")
-            .fetch_one(&self.write_pool)
-            .await
-            .map(|row| row.get::<i64, _>(0))
-            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
+        freelist_count_on(&self.write_pool).await
     }
 
     /// Total number of pages in the database file (`PRAGMA page_count`).
@@ -641,7 +637,7 @@ impl Store {
     /// until a full `VACUUM` rebuilds the file. This method checks
     /// `PRAGMA auto_vacuum`; when it reports NONE it runs `VACUUM` on the
     /// write pool so the recorded incremental setting takes effect and
-    /// [`Self::incremental_vacuum`] can release freelist pages from then on.
+    /// [`Self::incremental_vacuum_chunk`] can release freelist pages from then on.
     ///
     /// Intended to run once during daemon startup, after [`Store::open`] and
     /// before any listener serves: at that point the single write connection
@@ -698,59 +694,39 @@ impl Store {
             .map_err(|e| Error::Internal(format!("page_size failed: {e}")))
     }
 
-    /// Release up to `max_pages` freelist pages back to the filesystem via
-    /// `PRAGMA incremental_vacuum(N)`. Only effective when the database has
-    /// `auto_vacuum = INCREMENTAL` (a no-op otherwise — see [`connect_write`]
-    /// for the activation story). Returns the number of pages actually freed.
-    ///
-    /// The per-page cost grows with the database (4–7 ms/page on a 33 GB
-    /// file, intent-hq/intent#7448), so a fixed `max_pages` does NOT bound
-    /// how long the single-connection write pool is held; periodic callers
-    /// should use [`Self::incremental_vacuum_chunk`] with a time-paced chunk
-    /// size instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if the database operation fails.
-    pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
-        self.incremental_vacuum_chunk(max_pages)
-            .await
-            .map(|chunk| chunk.pages_freed)
-    }
-
-    /// One bounded `PRAGMA incremental_vacuum(max_pages)` step, run with the
+    /// One bounded `PRAGMA incremental_vacuum(N)` step, run with the
     /// freelist reads on a single acquired write connection (one pool
     /// acquisition per chunk), which is returned to the pool before this
-    /// method returns so queued writers can run between chunks. `elapsed`
-    /// times only the vacuum statement — the caller paces the next chunk
-    /// from it.
+    /// method returns so queued writers can run between chunks. Only
+    /// effective when the database has `auto_vacuum = INCREMENTAL` (a no-op
+    /// otherwise — see [`connect_write`] for the activation story).
+    ///
+    /// `max_pages` is clamped to `1..=i32::MAX`: `SQLite` reads `N <= 0` (and
+    /// an `N` that does not fit an `i32`) as "release the whole freelist",
+    /// which on a large database holds the single-connection write pool for
+    /// hours. Even a bounded `N` does not bound the hold — the per-page cost
+    /// grows with the database (4–7 ms/page on a 33 GB file,
+    /// intent-hq/intent#7448) — so periodic callers size `N` from the
+    /// measured `elapsed` (see `intent_services::retention`).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the acquisition or any statement fails.
     pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
+        let pages = max_pages.clamp(1, i32::MAX.cast_unsigned());
         let mut conn = self
             .write_pool
             .acquire()
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum acquire failed: {e}")))?;
-        let freelist = |row: sqlx::sqlite::SqliteRow| row.get::<i64, _>(0);
-        let before = sqlx::query("PRAGMA freelist_count")
-            .fetch_one(&mut *conn)
-            .await
-            .map(freelist)
-            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))?;
+        let before = freelist_count_on(&mut *conn).await?;
         let started = std::time::Instant::now();
-        sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
+        sqlx::query(&format!("PRAGMA incremental_vacuum({pages})"))
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
         let elapsed = started.elapsed();
-        let after = sqlx::query("PRAGMA freelist_count")
-            .fetch_one(&mut *conn)
-            .await
-            .map(freelist)
-            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))?;
+        let after = freelist_count_on(&mut *conn).await?;
         drop(conn);
         Ok(VacuumChunk {
             pages_freed: (before - after).max(0).cast_unsigned(),
@@ -837,6 +813,16 @@ impl Store {
     }
 }
 
+/// `PRAGMA freelist_count` on any executor — the pool for
+/// [`Store::freelist_count`], or the connection a vacuum chunk already holds.
+async fn freelist_count_on<'e>(executor: impl sqlx::SqliteExecutor<'e>) -> Result<i64> {
+    sqlx::query("PRAGMA freelist_count")
+        .fetch_one(executor)
+        .await
+        .map(|row| row.get::<i64, _>(0))
+        .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
+}
+
 /// Outcome of one [`Store::incremental_vacuum_chunk`] step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VacuumChunk {
@@ -902,7 +888,7 @@ impl MigrationStatus {
 /// deletes (retention sweeps) accumulate on the freelist forever and the file
 /// only ever grows. sqlx applies the `auto_vacuum` pragma before
 /// `journal_mode`, so a **new** database is created in incremental mode and
-/// [`Store::incremental_vacuum`] can release freelist pages in bounded slices.
+/// [`Store::incremental_vacuum_chunk`] can release freelist pages in bounded slices.
 /// On an **existing** database created without `auto_vacuum` the pragma is
 /// recorded but inert until a one-time `VACUUM` rebuilds the file. The daemon
 /// performs that activation automatically at startup — `intentd serve` calls
@@ -981,7 +967,7 @@ async fn connect_write_owned(
 /// database file, established at creation by [`connect_write`] ([`Store::open`]
 /// opens the write pool first) or by the startup activation VACUUM
 /// ([`Store::activate_incremental_vacuum`]), and only
-/// [`Store::incremental_vacuum`] (write pool) ever acts on it. Setting it per
+/// [`Store::incremental_vacuum_chunk`] (write pool) ever acts on it. Setting it per
 /// read connection re-executed `PRAGMA auto_vacuum = INCREMENTAL` on every
 /// fresh pool connection, which surfaced as slow-statement WARNs inside hot
 /// read RPCs under load and amplified write-pool contention
