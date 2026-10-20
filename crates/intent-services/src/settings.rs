@@ -1536,6 +1536,13 @@ fn memory_budget_max_mb() -> f64 {
 /// clients a value is settable that the write path refuses. Clamping keeps the
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
+/// A catalog byte bound as a number; the bounds are far below 2^53, so the
+/// conversion is exact.
+#[expect(clippy::cast_precision_loss)]
+fn bytes_bound(bytes: u64) -> f64 {
+    bytes as f64
+}
+
 // MiB counts above 2^53 do not occur; loss-free in f64.
 #[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
@@ -2403,6 +2410,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(0.0),
             None,
             72.0,
+        ),
+        number(
+            "scripts.outputRetentionHours",
+            "Script output retention hours",
+            "Saved script run logs on disk older than this many hours are deleted, except the current run of a running script (0 disables the sweep; max 87600; applies live at each hourly sweep, no restart required)",
+            "scripts",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+        ),
+        number(
+            "scripts.outputMaxBytesPerRun",
+            "Script output max bytes per run",
+            "Largest on-disk log kept for one script run; past it the oldest output is dropped (64 KiB-1 GiB; applies to runs started after the change)",
+            "scripts",
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            )),
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX,
+            )),
+            bytes_bound(intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN),
         ),
         number(
             "workspaceApi.maxOutputChars",
@@ -6627,6 +6658,97 @@ mod tests {
     /// registered in `KNOWN_PATHS`; its description states that the sweep
     /// shrinks stored payloads older than N days to the replay preview and
     /// that 0 disables it. The live accessor maps 0 to `None`.
+    /// `scripts.outputRetentionHours` and `scripts.outputMaxBytesPerRun` are
+    /// catalog entries in `KNOWN_PATHS` with the `intent_core` bounds and
+    /// defaults, so `settings.get` / `settings.update` accept them.
+    #[tokio::test]
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    async fn script_output_settings_are_in_catalog_and_round_trip() {
+        use intent_core::config::{
+            DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX, SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+        };
+        let bounds = [
+            (
+                "scripts.outputRetentionHours",
+                0.0,
+                f64::from(SCRIPT_OUTPUT_RETENTION_HOURS_MAX),
+                f64::from(DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+            ),
+            (
+                "scripts.outputMaxBytesPerRun",
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN as f64,
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX as f64,
+                DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN as f64,
+            ),
+        ];
+        for (path, min, max, default) in bounds {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.category, "scripts");
+            assert!(!def.sensitive && !def.read_only);
+            assert!(
+                matches!(def.ty, SettingType::Number { min: Some(lo), max: Some(hi) } if lo == min && hi == max),
+                "{path}: {:?}",
+                def.ty
+            );
+            assert_eq!(def.default_value, Some(json!(default)));
+            assert!(KNOWN_PATHS.contains(&path), "{path} not in KNOWN_PATHS");
+            assert!(def.validate(&json!(max + 1.0)).is_err());
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let mut notices = registry.subscribe();
+
+        let got = svc.get("scripts.outputRetentionHours").await.expect("get");
+        assert_eq!(got["value"], json!(168.0));
+        assert_eq!(got["origin"], json!("default"));
+        svc.update(&json!([
+            { "path": "scripts.outputRetentionHours", "value": 0 },
+            { "path": "scripts.outputMaxBytesPerRun", "value": 1_048_576 },
+        ]))
+        .await
+        .expect("update");
+        assert!(notices.has_changed().expect("registry alive"));
+        let changed = notices.borrow_and_update().changed.clone();
+        for path in [
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+        ] {
+            assert!(changed.contains(path), "{path} notice: {changed:?}");
+        }
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(intent_core::config::script_output_retention_hours(&live), 0);
+        assert_eq!(
+            intent_core::config::script_output_max_bytes_per_run(&live),
+            1_048_576
+        );
+        let got = svc.get("scripts.outputMaxBytesPerRun").await.expect("get");
+        assert_eq!(got["value"], json!(1_048_576.0));
+        assert_eq!(got["origin"], json!("file"));
+        let err = svc
+            .update(&json!([{ "path": "scripts.outputMaxBytesPerRun", "value": 0 }]))
+            .await
+            .expect_err("0 is below the cap minimum");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     #[test]
     fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
         let def = find_definition("agents.toolPayloadRetentionDays")

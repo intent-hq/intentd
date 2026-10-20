@@ -694,6 +694,16 @@ impl ScriptManager {
         {
             return Err(Error::InvalidParams("script launch was cancelled".into()));
         }
+        let mut spec = spec;
+        let run = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(ws.clone(), id.into()))
+            .and_then(|m| m.state.run_id.clone());
+        if let Some(run) = run {
+            spec.output_sink = self.open_output_sink(ws, id, &run).await;
+        }
         let pty = self.pty.spawn(spec)?;
         if let Some(m) = self
             .scripts

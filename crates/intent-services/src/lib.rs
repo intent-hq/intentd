@@ -240,6 +240,8 @@ mod rtk;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
+mod script_output_cleanup;
+mod script_output_store;
 mod search_ops;
 mod sentry_ops;
 mod settings;
@@ -902,6 +904,10 @@ pub struct Services {
     /// Shared across clones and manager views: bootstrap serializes per
     /// workspace; definition replacement serializes per durable script id.
     script_locks: script_ops::ScriptLocks,
+    /// On-disk per-run script output logs (`<data_dir>/script-output`). The
+    /// composition root points it at the daemon data dir; until then it uses a
+    /// per-instance temp dir so unconfigured instances never share logs.
+    script_output: script_output_store::ScriptOutputStore,
     /// The `script.*` too-fast-exit floor in milliseconds
     /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
@@ -1702,6 +1708,10 @@ impl Services {
             daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
+            script_output: script_output_store::ScriptOutputStore::new(
+                &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
+                intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+            ),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
@@ -2509,6 +2519,7 @@ impl Services {
             self.script_parks.clone(),
         )
         .with_settings(self.settings_registry.clone())
+        .with_output_store(self.script_output.clone())
         .with_tasks(self.store_tasks.clone())
         .with_owner_services(self.clone())
     }
@@ -2531,6 +2542,28 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam: park every script launch before its PTY spawns and its
+    /// output log opens (including service auto-restarts).
+    #[cfg(test)]
+    pub(crate) fn with_script_before_spawn_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.before_spawn = Some(park);
+        self
+    }
+
+    /// Test seam: park workspace deletion after its scripts stop, before the
+    /// script output folder is deleted.
+    #[cfg(test)]
+    pub(crate) fn with_script_workspace_closed_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.workspace_closed = Some(park);
         self
     }
 
@@ -4712,6 +4745,22 @@ impl Services {
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
         self
+    }
+
+    /// Store script output logs under `<data_dir>/script-output` (one file
+    /// per run). Composition-root only — call before the surface is shared.
+    #[must_use]
+    pub fn with_script_output_dir(mut self, data_dir: &Path) -> Self {
+        self.script_output = script_output_store::ScriptOutputStore::new(
+            data_dir,
+            intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        );
+        self
+    }
+
+    /// The on-disk script output store.
+    pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
+        &self.script_output
     }
 
     /// Load named provider profile metadata from
@@ -17915,6 +17964,10 @@ impl Services {
             services
                 .cancel_script_monitors(&id, None, "workspace-deleted")
                 .await?;
+            // Refuse new script launches, auto-restarts and output logs, and
+            // stop the running scripts, so nothing writes a log after the
+            // output folder is deleted below. Held until this delete returns.
+            let _scripts_closed = services.script_manager().close_workspace(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -18181,6 +18234,9 @@ impl Services {
                 }
                 Err(e) => return Err(e),
             }
+            // The row is gone and its scripts are stopped: delete its on-disk
+            // script output (best-effort; the startup orphan sweep retries).
+            services.delete_workspace_script_output(&id).await;
             // Cancel any pending debounced lastActivity derivation
             // (monorepo#3623): the timer must not outlive the workspace —
             // it would fire against the deleted row and log a spurious
@@ -20954,6 +21010,7 @@ impl WorkspaceApi for Services {
                 paginate.unwrap_or(false),
                 page_token.as_ref(),
             )
+            .await
         })
     }
 

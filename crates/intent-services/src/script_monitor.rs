@@ -130,7 +130,13 @@ impl Services {
         intent_core::spawn_daemon(async move {
             let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                sweep.tick().await;
+                // Shutdown closes the settings task group before the store
+                // closes; stop here so no tick writes to a closing store.
+                tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    _ = sweep.tick() => {}
+                }
                 let completions = services
                     .script_locks
                     .monitor_completions
@@ -180,6 +186,10 @@ impl Services {
                     }
                 }
             }
+            services
+                .script_locks
+                .monitor_maintenance
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
 

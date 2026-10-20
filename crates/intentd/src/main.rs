@@ -2128,6 +2128,8 @@ async fn cmd_serve_owned(
         .with_models_cache_dir(&config.data_dir.clone())
         // Named provider profile metadata lives next to config.toml (§5.54).
         .with_provider_profiles_dir(&config.data_dir)
+        // Script output logs, one file per run (`<data_dir>/script-output`).
+        .with_script_output_dir(&config.data_dir)
         .with_event_bus(bus.clone())
         .with_workspace_setup_states(workspace_setup_states.clone())
         .with_reverse_dispatch(reverse_registry.clone())
@@ -2528,6 +2530,11 @@ async fn cmd_serve_owned(
     // whose path git reports clean (ignored, deleted, reverted, committed
     // outside the daemon). Aborted on clean shutdown.
     let tracked_changes_sweep = startup_work.spawn(|| services.spawn_tracked_changes_sweep_loop());
+    // Script output cleanup: at startup delete the on-disk output of
+    // workspaces that no longer exist, then hourly delete run logs older than
+    // `scripts.outputRetentionHours` (read live; `0` disables), keeping the
+    // current run of any running script. Aborted on clean shutdown.
+    let script_output_sweep = startup_work.spawn(|| services.spawn_script_output_sweep_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -3188,6 +3195,8 @@ async fn cmd_serve_owned(
     let _ = agent_locks_loop.await;
     tracked_changes_sweep.abort();
     let _ = tracked_changes_sweep.await;
+    script_output_sweep.abort();
+    let _ = script_output_sweep.await;
     execution_context_loop.abort();
     let _ = execution_context_loop.await;
     if let Some(reap_task) = reap_task {

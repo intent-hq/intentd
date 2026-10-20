@@ -232,3 +232,50 @@ fn resolve_env_overrides_for_idle_and_retention_take_precedence() {
     std::env::remove_var("INTENTD_DATA_DIR");
     std::env::remove_var("INTENTD_CONFIG");
 }
+
+#[test]
+fn script_output_retention_env_override_is_read_live() {
+    use intent_core::config::{
+        script_output_retention_hours, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+        SCRIPT_OUTPUT_RETENTION_HOURS_ENV, SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+    };
+    use intent_core::settings_file::SettingsFile;
+
+    let _g = env_lock();
+    std::env::remove_var(SCRIPT_OUTPUT_RETENTION_HOURS_ENV);
+    assert_eq!(
+        SCRIPT_OUTPUT_RETENTION_HOURS_ENV,
+        "INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS"
+    );
+
+    let mut settings = SettingsFile::default();
+    assert_eq!(
+        script_output_retention_hours(&settings),
+        DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS
+    );
+    // A live snapshot change is picked up on the next call (no restart).
+    settings.scripts.output_retention_hours = 12;
+    assert_eq!(script_output_retention_hours(&settings), 12);
+
+    // The env override wins over the file value, including `0` (disabled).
+    std::env::set_var(SCRIPT_OUTPUT_RETENTION_HOURS_ENV, "48");
+    assert_eq!(script_output_retention_hours(&settings), 48);
+    std::env::set_var(SCRIPT_OUTPUT_RETENTION_HOURS_ENV, " 0 ");
+    assert_eq!(script_output_retention_hours(&settings), 0);
+
+    // Garbage or out-of-range overrides fall through to the file value.
+    for bad in [
+        "nope".to_string(),
+        "-5".to_string(),
+        (SCRIPT_OUTPUT_RETENTION_HOURS_MAX + 1).to_string(),
+    ] {
+        std::env::set_var(SCRIPT_OUTPUT_RETENTION_HOURS_ENV, &bad);
+        assert_eq!(
+            script_output_retention_hours(&settings),
+            12,
+            "override {bad:?}"
+        );
+    }
+
+    std::env::remove_var(SCRIPT_OUTPUT_RETENTION_HOURS_ENV);
+}

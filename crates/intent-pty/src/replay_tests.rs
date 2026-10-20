@@ -19,6 +19,7 @@ fn output(fanout: &Arc<Mutex<Fanout>>, bytes: &[u8]) {
     read_loop(
         Box::new(Cursor::new(bytes.to_vec())),
         fanout,
+        None,
         #[cfg(windows)]
         &writer,
     );
