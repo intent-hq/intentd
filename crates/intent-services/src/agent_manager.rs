@@ -13066,10 +13066,10 @@ fn resolve_spawn(
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
-    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // (`npx_only_honors_path_override`; none today) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
-    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for codex/pi — is ignored.
+    // directly in place of the pinned npx spawn (monorepo#4352); otherwise
+    // any override is ignored. Tests use `test_support::provider_installed`.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =

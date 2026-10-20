@@ -426,6 +426,14 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # CI is the guard against host-dependent tests: a test that relies on
+      # an installed provider CLI passes locally and fails here only while
+      # runners have none. Fail loudly if a runner image starts shipping one.
+      # Locally: scripts/test-without-provider-clis.sh (intentd#2462).
+      - name: No provider CLIs on the runner
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: cargo test -p intent-providers --lib -- --ignored --exact provider_cli_guard::no_provider_cli_visible
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
       # (coverage-e2e / coverage-all are merge_group-only; PRs run only
@@ -440,14 +448,6 @@ jobs:
       # it currently fails deterministically even in an isolated, serial,
       # non-instrumented run (times out at uds_concurrent_dispatch.rs:63), so
       # it stays skipped everywhere until STAB-42 is fixed.
-      # CI is the guard against host-dependent tests: a test that relies on
-      # an installed provider CLI passes locally and fails here only while
-      # runners have none. Fail loudly if a runner image starts shipping one.
-      # Locally: scripts/test-without-provider-clis.sh (intentd#2462).
-      - name: No provider CLIs on the runner
-        env:
-          INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test -p intent-providers --lib -- --ignored --exact provider_cli_guard::no_provider_cli_visible
       - name: Coverage-skipped tests (STAB-40/43)
         # Armed bound-caller seam, as on the coverage jobs' run steps (see
         # coverage-e2e) and on this job's other `cargo test` steps (Source

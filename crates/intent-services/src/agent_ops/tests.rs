@@ -158,12 +158,7 @@ pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    // An empty user specialists tier: the default reads the developer's
-    // `~/.intent/specialists/`, whose `codingAgent` pins (e.g. a verifier
-    // on codex) made specialist tests depend on the host's installed CLIs.
-    let services = Services::new(store)
-        .with_settings_registry(registry)
-        .with_specialist_dirs(Some(tmp.path.with_extension("user-specialists")), None);
+    let services = Services::new(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -9649,8 +9644,8 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 async fn set_model_bare_model_with_explicit_provider_id() {
     let (tmp, svc, ws) = setup().await;
     // The cross-provider switch below runs the availability gate against the
-    // target, so pin claude-code to a deterministic executable rather than
-    // depending on whether the test host happens to have it installed.
+    // target, so mark claude-code installed rather than depending on whether
+    // the test host happens to have npx and the claude CLI.
     crate::test_support::provider_installed::mark_on(&svc, &["claude-code"]);
     #[cfg(unix)]
     let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");

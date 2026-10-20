@@ -35,6 +35,13 @@
 //! The disabled gate, the cached-auth gate and feature gating
 //! (`requires_env_var` / `requires_feature_code`) still run for real.
 //!
+//! Only those two seams honor the marker. Discovery surfaces
+//! (`host.providerDiscovery`, the discovery cache, default-provider healing)
+//! still report the host's real installation: a test driving them must not
+//! depend on a provider being installed. Providers that honor
+//! `providers.paths` (auggie, grok, opencode, …) are not markable; point them
+//! at an executable (e.g. `/bin/sh`) instead.
+//!
 //! # Guard
 //!
 //! `scripts/test-without-provider-clis.sh <command>` runs tests with every
@@ -56,8 +63,9 @@ pub(crate) fn is_marked(paths: &BTreeMap<String, String>, provider_id: &str) -> 
 /// Mark each base provider installed in a `providers.paths` map.
 ///
 /// # Panics
-/// When a name is a profile reference or not a registered provider: mark
-/// the base provider, which covers all of its profiles.
+/// When a name is a profile reference (mark the base provider, which covers
+/// all of its profiles), not a registered provider, or a provider that
+/// honors `providers.paths` (use an executable override for it).
 pub(crate) fn mark(paths: &mut BTreeMap<String, String>, bases: &[&str]) {
     for base in bases {
         assert_eq!(
@@ -65,9 +73,11 @@ pub(crate) fn mark(paths: &mut BTreeMap<String, String>, bases: &[&str]) {
             *base,
             "mark the base provider; it covers every profile of it"
         );
+        let provider = intent_providers::find_provider(base)
+            .unwrap_or_else(|| panic!("{base} is not a registered provider"));
         assert!(
-            intent_providers::find_provider(base).is_some(),
-            "{base} is not a registered provider"
+            provider.npx_only_package.is_some() && !provider.npx_only_honors_path_override,
+            "{base} honors providers.paths: point it at an executable instead"
         );
         paths.insert((*base).to_string(), MARKER.to_string());
     }
@@ -131,6 +141,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "honors providers.paths")]
+    fn rejects_a_provider_that_honors_path_overrides() {
+        marked(&["auggie"]);
+    }
+
+    #[test]
     fn a_marked_provider_counts_as_installed() {
         let providers = marked(&["codex", "claude-code"]);
         for id in ["codex", "codex@work", "claude-code"] {
@@ -150,6 +166,9 @@ mod tests {
 
     #[test]
     fn the_auth_gate_still_applies() {
+        // The verdict cache is process-wide: like the crate's other
+        // verdict-seeding tests this relies on nextest's process-per-test
+        // isolation (`make test`, CI).
         let providers = marked(&["claude-code"]);
         crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(false));
         let result =
@@ -164,7 +183,10 @@ mod tests {
         // Cortex is gated off unless INTENTD_ENABLE_CORTEX is set; the
         // marker replaces only the installation check.
         assert!(std::env::var_os("INTENTD_ENABLE_CORTEX").is_none());
-        let providers = marked(&["cortex"]);
+        let mut providers = ProvidersSettings::default();
+        providers
+            .paths
+            .insert("cortex".to_string(), MARKER.to_string());
         let err = crate::agent_ops::ensure_provider_available("agent.create", "cortex", &providers)
             .expect_err("gated provider rejected");
         assert!(err.to_string().contains("INTENTD_ENABLE_CORTEX"), "{err}");
