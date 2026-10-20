@@ -99,25 +99,9 @@ def sccache_rule(root):
     return f'sccache >= {pinned}', check
 
 
-def preload_rule(root):
-    preload = Path(os.environ.get('RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE', '/etc/ld.so.preload'))
-
-    def check():
-        if os.environ.get('LD_PRELOAD'):
-            return 'LD_PRELOAD is set'
-        try:
-            if preload.read_text().strip():
-                return f'{preload} is not empty'
-        except OSError:
-            pass
-        return None
-    return 'a host without a global library preload, which writes files into TMPDIR', check
-
-
 # Suites that depend on the host itself rather than on a tool CI installs.
 HOST_RULES = {
     'test-release-cache-smoke.py': sccache_rule,
-    'test-changed-tests-stdin.py': preload_rule,
 }
 
 

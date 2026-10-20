@@ -32756,6 +32756,7 @@ impl WorkspaceApi for Services {
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,
                     entry.snapshot.merge_queue_reported,
+                    entry.snapshot.requirements.merge_queue.as_ref(),
                 ),
             }))
         })

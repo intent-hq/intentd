@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.19] - 2026-10-20
+
+### 🚀 Features
+
+- *(pr)* Carry merge-queue position and time-to-merge estimate ([#2542](https://github.com/intent-hq/intentd/pull/2542))
+
+### 📚 Documentation
+
+- *(assistant-guide)* The proposal card no longer shows the agent setup ([#2538](https://github.com/intent-hq/intentd/pull/2538))
+
+
 ## [0.11.18] - 2026-10-20
 
 ### 🧪 Testing
