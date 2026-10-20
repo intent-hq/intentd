@@ -124,7 +124,7 @@ def thread_sizing_violations(workflow):
             errors.append(f"{job_id}: do not hardcode NEXTEST_TEST_THREADS; size it from nproc")
         sizing = [s for s in steps if s.get("name") == THREAD_STEP]
         if (len(sizing) != 1 or steps.index(sizing[0]) != 0 or sizing[0].get("run") != THREAD_RUN
-                or sizing[0].get("shell") != "bash" or sizing[0].get("if") or sizing[0].get("continue-on-error")):
+                or sizing[0].get("shell") != "bash" or "if" in sizing[0] or sizing[0].get("continue-on-error")):
             errors.append(f"{job_id}: the first step must size NEXTEST_TEST_THREADS from nproc")
         for step in steps:
             if step.get("name") == THREAD_STEP:
@@ -318,7 +318,7 @@ class CiPolicyTests(unittest.TestCase):
             first_test = min(steps.index(step) for name, _, step in test_steps(self.workflow) if name == job_id)
             self.assertEqual(steps[0]["name"], THREAD_STEP)
             self.assertLess(0, first_test)
-        for mutation in ("hardcoded-job", "missing", "late", "step-override", "fixed-run", "skipped", "cli-flag"):
+        for mutation in ("hardcoded-job", "missing", "late", "step-override", "fixed-run", "skipped", "skipped-bool", "cli-flag"):
             for job_id in COVERAGE_JOBS:
                 with self.subTest(job=job_id, mutation=mutation):
                     workflow = copy.deepcopy(self.workflow)
@@ -339,6 +339,8 @@ class CiPolicyTests(unittest.TestCase):
                         sizing["run"] = 'echo "NEXTEST_TEST_THREADS=16" >> "$GITHUB_ENV"\n'
                     elif mutation == "skipped":
                         sizing["if"] = "false"
+                    elif mutation == "skipped-bool":
+                        sizing["if"] = False
                     else:
                         test_step["run"] += "\ncargo nextest run --test-threads 16\n"
                     self.assertTrue(thread_sizing_violations(workflow))
