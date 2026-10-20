@@ -9,13 +9,35 @@ Run: python3 -I -B scripts/test-release-scripts-local.py   (needs PyYAML)
 import os
 from pathlib import Path
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 LOADER_PATH = ('LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH')
+# Where the caller's PyYAML may live besides the system site.
+IMPORT_PATH = ('PYTHONPATH',)
+
+
+def child_env(bin_dir, home, preload, **extra_env):
+    """Environment for a child runner: stub-only PATH, fixture HOME.
+
+    The loader path is forwarded so a toolcache python3 still starts
+    (intentd#2490). The fixture HOME would move Python's user site, so the
+    caller's user base is pinned and PYTHONPATH forwarded: a PyYAML installed
+    with `pip install --user` (or reached through PYTHONPATH) must stay
+    importable for the runner. `extra_env` overrides any of these.
+    """
+    environ = {key: os.environ[key] for key in LOADER_PATH + IMPORT_PATH if key in os.environ}
+    environ.update(PATH=str(bin_dir), HOME=str(home), RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(preload))
+    user_base = os.environ.get('PYTHONUSERBASE') or site.getuserbase()
+    if user_base:
+        environ['PYTHONUSERBASE'] = user_base
+    environ.update(extra_env)
+    return environ
 RUNNER = Path(__file__).resolve().with_name('release-scripts-local.py')
 
 CI = '''\
@@ -89,15 +111,40 @@ class RunnerTests(unittest.TestCase):
         target.write_text(f'#!/usr/bin/env bash\necho "{version}"\n')
         target.chmod(0o755)
 
+    RUNNER_FLAGS = ('-B',)  # No -I/-s: they drop the user site the runner may need for PyYAML.
+
     def run_runner(self, *args, **extra_env):
-        # A minimal PATH isolates the stub tools; the loader path is forwarded so a
-        # toolcache python3 still starts (intentd#2490).
-        environ = {key: os.environ[key] for key in LOADER_PATH if key in os.environ}
-        environ.update(PATH=str(self.bin), HOME=str(self.temp),
-                       RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(self.preload), **extra_env)
-        # No -I: a user-site PyYAML must stay importable for the runner.
-        return subprocess.run([sys.executable, '-B', str(RUNNER), '--root', str(self.root), *args],
-                              env=environ, capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, *self.RUNNER_FLAGS, str(RUNNER), '--root', str(self.root), *args],
+                              env=child_env(self.bin, self.temp, self.preload, **extra_env),
+                              capture_output=True, text=True, timeout=60)
+
+    USER_SITE_PROBE = ('import site, sys; print(bool(site.ENABLE_USER_SITE), '
+                       'site.getusersitepackages() in sys.path, site.getusersitepackages())')
+
+    def probe_user_site(self, flags, env):
+        probe = subprocess.run([sys.executable, *flags, '-c', self.USER_SITE_PROBE],
+                               env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        enabled, on_path, path = probe.stdout.split(maxsplit=2)
+        return enabled, on_path, path.strip()
+
+    def test_child_runner_sees_the_same_user_site_as_a_plain_run(self):
+        # Reference: this interpreter run plainly in the caller's environment, as
+        # `make test-release-scripts` runs the runner. A virtual environment
+        # disables the user site there too, so only a difference is a failure.
+        plain_env = dict(os.environ)
+        plain_env.pop('PYTHONNOUSERSITE', None)
+        expected = self.probe_user_site((), plain_env)
+        actual = self.probe_user_site(self.RUNNER_FLAGS, child_env(self.bin, self.temp, self.preload))
+        self.assertEqual(actual, expected, 'the fixture env changes where the runner finds user-site packages')
+
+    def test_child_env_forwards_import_path_and_accepts_overrides(self):
+        with unittest.mock.patch.dict(os.environ, {'PYTHONPATH': '/fixture/py', 'LD_LIBRARY_PATH': '/fixture/lib'}):
+            environ = child_env(self.bin, self.temp, self.preload, PYTHONUSERBASE='/override', HOME='/h')
+        self.assertEqual(environ['PYTHONPATH'], '/fixture/py')
+        self.assertEqual(environ['LD_LIBRARY_PATH'], '/fixture/lib')
+        self.assertEqual(environ['PYTHONUSERBASE'], '/override')
+        self.assertEqual(environ['HOME'], '/h')
 
     def test_runs_every_test_line_in_ci_order_and_fails_on_a_real_failure(self):
         result = self.run_runner()

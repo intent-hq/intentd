@@ -68,6 +68,8 @@ mod auto_commit;
 pub mod browser_ops;
 mod browser_tabs;
 mod capability;
+#[cfg(all(test, unix))]
+mod claude_adapter_contract;
 mod clone_ops;
 pub mod codex_diagnostics;
 mod codex_session_title;
