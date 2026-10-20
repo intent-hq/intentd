@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.17] - 2026-10-20
+
+### 🐛 Bug Fixes
+
+- *(pr)* Don't report a merged queue removal as mergeQueueEjection ([#2530](https://github.com/intent-hq/intentd/pull/2530))
+
+### 📚 Documentation
+
+- *(guide)* Mention Collapse tool activity under Appearance settings ([#2522](https://github.com/intent-hq/intentd/pull/2522))
+
+### ⚡ Performance
+
+- Batch note page index descriptor writes ([#2387](https://github.com/intent-hq/intentd/pull/2387))
+
+
 ## [0.11.16] - 2026-10-20
 
 ### 🧪 Testing
