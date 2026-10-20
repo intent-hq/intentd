@@ -41,6 +41,13 @@ const REQUIRE_ENV: &str = "INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT";
 const FAKE_CLI: &str = include_str!("../tests/fixtures/fake_claude_cli.mjs");
 const REPLY: &str = "contract-reply-7d1c";
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-stage `initialize` / `session/new` budget for the real adapter. The
+/// production 4s `initialize` limit is right for users but not for CI: on the
+/// hosted `gh-linux-8x` runners these four tests cold-start Node together and
+/// the passing runs already took 3.4–4.5s, so roughly one run in six timed out
+/// on `initialize` (intentd merge-group run 39386342220). The budget only
+/// bounds a hang; it changes nothing the contract asserts.
+const STARTUP_BUDGET: Duration = Duration::from_secs(30);
 const MISSING: &str = "<missing value>";
 /// Inherited variables the adapter, SDK or CLI read; cleared so the host's
 /// own Claude/Anthropic configuration cannot change what the contract sees.
@@ -241,6 +248,7 @@ async fn complete(adapter: &Path, prompt: &str, meta: Option<Value>) -> Observed
         vec![adapter.join("dist/index.js").display().to_string()],
     )
     .cwd(project)
+    .setup_budget(STARTUP_BUDGET)
     .env("CLAUDE_CODE_EXECUTABLE", &fake)
     .env("INTENT_FAKE_CLAUDE_LOG", &log)
     .env("INTENT_FAKE_CLAUDE_REPLY", REPLY)

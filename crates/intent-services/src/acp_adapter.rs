@@ -65,6 +65,9 @@ const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// underlying CLI while creating the session, which alone takes ~10s even
 /// with a warm npx cache — a flat 10s budget times out right at the wire.
 const NPX_SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(20);
+/// Slack the overall setup cap leaves past the per-stage sum when a test
+/// widens the stage budgets (see [`AcpAdapterCommand::setup_budget`]).
+const SETUP_BUDGET_GRACE: Duration = Duration::from_secs(2);
 
 /// The daemon-wide ephemeral-adapter concurrency bound: a counting semaphore
 /// plus the limit it was built with (kept for the queue-timeout diagnostic,
@@ -200,6 +203,9 @@ pub(crate) struct AcpAdapterCommand {
     via_npx: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
+    /// Test-only widening of the `initialize` / `session/new` budgets (see
+    /// [`Self::setup_budget`]); always `None` in production launches.
+    setup_budget: Option<Duration>,
 }
 
 impl AcpAdapterCommand {
@@ -409,6 +415,7 @@ impl AcpAdapterCommand {
             cwd: None,
             via_npx: true,
             npx_launch_root: None,
+            setup_budget: None,
         }
     }
 
@@ -426,6 +433,7 @@ impl AcpAdapterCommand {
             cwd: None,
             via_npx: false,
             npx_launch_root: None,
+            setup_budget: None,
         }
     }
 
@@ -433,6 +441,17 @@ impl AcpAdapterCommand {
     #[cfg(all(test, unix))]
     pub(crate) fn npx_launch_root(mut self, root: PathBuf) -> Self {
         self.npx_launch_root = Some(root);
+        self
+    }
+
+    /// Give `initialize` and `session/new` `per_stage` each (and the overall
+    /// setup cap their sum plus a grace) instead of the production budgets.
+    /// Real-adapter tests use this so a CPU-starved CI runner cold-starting
+    /// Node does not trip the 4s production `initialize` limit; production
+    /// launches never set it.
+    #[cfg(test)]
+    pub(crate) fn setup_budget(mut self, per_stage: Duration) -> Self {
+        self.setup_budget = Some(per_stage);
         self
     }
 
@@ -502,7 +521,9 @@ impl AcpAdapterCommand {
 
     /// Per-request `initialize` budget for this launch.
     pub(crate) fn initialize_timeout(&self) -> Duration {
-        if self.via_npx {
+        if let Some(per_stage) = self.setup_budget {
+            per_stage
+        } else if self.via_npx {
             NPX_INITIALIZE_TIMEOUT
         } else {
             INITIALIZE_TIMEOUT
@@ -511,7 +532,9 @@ impl AcpAdapterCommand {
 
     /// Per-request `session/new` budget for this launch.
     pub(crate) fn session_new_timeout(&self) -> Duration {
-        if self.via_npx {
+        if let Some(per_stage) = self.setup_budget {
+            per_stage
+        } else if self.via_npx {
             NPX_SESSION_NEW_TIMEOUT
         } else {
             SESSION_NEW_TIMEOUT
@@ -522,7 +545,9 @@ impl AcpAdapterCommand {
     /// launch. The one-shot runner bounds its `session/prompt` phase
     /// separately with the caller's timeout.
     pub(crate) fn setup_timeout(&self) -> Duration {
-        if self.via_npx {
+        if let Some(per_stage) = self.setup_budget {
+            per_stage * 2 + SETUP_BUDGET_GRACE
+        } else if self.via_npx {
             NPX_OVERALL_TIMEOUT
         } else {
             OVERALL_TIMEOUT
@@ -1109,6 +1134,60 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32
 /// These build their own [`AdapterSlots`] rather than touching the process
 /// global, so they say nothing about — and are unaffected by — whatever the
 /// rest of the binary installed.
+#[cfg(test)]
+mod setup_budget_tests {
+    use super::*;
+
+    fn budgets(cmd: &AcpAdapterCommand) -> [Duration; 3] {
+        [
+            cmd.initialize_timeout(),
+            cmd.session_new_timeout(),
+            cmd.setup_timeout(),
+        ]
+    }
+
+    /// Production launches keep the real-user budgets: the override exists
+    /// for slow test runners only and must not leak into either launch kind.
+    #[test]
+    fn production_launches_keep_their_budgets() {
+        let resolved = AcpAdapterCommand::binary(PathBuf::from("adapter"), Vec::new());
+        assert_eq!(
+            budgets(&resolved),
+            [
+                Duration::from_secs(4),
+                Duration::from_secs(10),
+                Duration::from_secs(15)
+            ]
+        );
+        let npx = AcpAdapterCommand::npx(PathBuf::from("npx"), "@scope/adapter@1.0.0");
+        assert_eq!(
+            budgets(&npx),
+            [
+                NPX_INITIALIZE_TIMEOUT,
+                NPX_SESSION_NEW_TIMEOUT,
+                NPX_OVERALL_TIMEOUT
+            ]
+        );
+    }
+
+    /// The override widens both stages, and the overall cap covers their sum
+    /// so it cannot cut a slow-but-healthy setup short.
+    #[test]
+    fn setup_budget_widens_every_setup_stage() {
+        let per_stage = Duration::from_secs(30);
+        for cmd in [
+            AcpAdapterCommand::binary(PathBuf::from("adapter"), Vec::new()),
+            AcpAdapterCommand::npx(PathBuf::from("npx"), "@scope/adapter@1.0.0"),
+        ] {
+            let cmd = cmd.setup_budget(per_stage);
+            assert_eq!(
+                budgets(&cmd),
+                [per_stage, per_stage, Duration::from_secs(62)]
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod slot_tests {
     use super::*;
