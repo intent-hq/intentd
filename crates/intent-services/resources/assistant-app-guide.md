@@ -287,14 +287,15 @@ events** header that may need expanding. Expanding the row shows the task type
 and when Intent first saw it. If the row has a **…** menu, **Stop** ends that
 task without interrupting the agent; the row shows **Stopping…** and disappears
 once the agent reports it stopped. Rows that end on their own disappear too.
-**Connection lost** means Intent cannot currently confirm the task, not that it
-stopped. If the app has lost its connection to Intent, the task may still be
-running and the row returns to **Running** after the app reconnects; wait for
-that fresh status before saying the task ended. If the app is connected and the
-row still shows Connection lost, the agent's process has ended and its tasks
-with it: an idle agent is closed after **Settings → Advanced → Agent backend →
-Idle reap minutes** (10 by default; Off disables it), or sooner under memory
-pressure. Such a row has no Stop and clears the next time the agent starts.
+**Connection lost** means Intent can no longer observe the task, so whether it
+is still running is unknown; it is not proof that the task stopped. After the
+app reconnects to Intent, the row returns to **Running** if fresh status shows
+the task still running. If it stays Connection lost, the agent's connection ended, most often
+because an idle agent was closed after **Settings → Advanced → Agent backend →
+Idle reap minutes** (10 by default; Off disables it) or under memory pressure,
+and the task has probably ended with it. Before telling the user it stopped,
+confirm independently, for example by checking whether the dev server still
+responds. Such a row has no Stop and clears the next time the agent starts.
 Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
