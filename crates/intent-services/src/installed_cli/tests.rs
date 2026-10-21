@@ -668,14 +668,24 @@ impl Drop for DetachedCleanup {
 enum FixtureIdentity {
     /// The child exited before identity readiness.
     Exited,
-    /// `/proc/<pid>/exe` does not name the fixture binary yet. `posix_spawn`
-    /// is vfork-based, and Linux wakes the parent before exec swaps in the
-    /// child's new address space, so until then environ is the spawning test
-    /// process's own environment and proves nothing about the child.
-    Starting,
+    /// `/proc/<pid>/exe` (carried for diagnostics) does not name the fixture
+    /// binary yet. `posix_spawn` is vfork-based, and Linux wakes the parent
+    /// before exec swaps in the child's new address space, so until then
+    /// environ is the spawning test process's own environment and proves
+    /// nothing about the child.
+    Starting(PathBuf),
     /// The fixture image is installed, so environ is the child's own (it is
     /// empty until exec has copied the environment into place).
     Started(Vec<u8>),
+}
+
+/// The canonical fixture binary: what `/proc/<pid>/exe` reports once exec
+/// has installed it. Spawning by this path keeps spawn and gate in agreement.
+#[cfg(target_os = "linux")]
+fn fixture_sleep_exe() -> &'static Path {
+    static EXE: std::sync::LazyLock<PathBuf> =
+        std::sync::LazyLock::new(|| std::fs::canonicalize("/bin/sleep").unwrap());
+    &EXE
 }
 
 /// Observe the child's exec state before its environment. Exec never
@@ -686,7 +696,7 @@ fn observe_fixture_identity(pid: u32, fixture_exe: &Path) -> Result<FixtureIdent
     let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map_err(|e| format!("read owned fixture executable: {e}"))?;
     if exe != fixture_exe {
-        return Ok(FixtureIdentity::Starting);
+        return Ok(FixtureIdentity::Starting(exe));
     }
     std::fs::read(format!("/proc/{pid}/environ"))
         .map(FixtureIdentity::Started)
@@ -703,13 +713,17 @@ fn wait_detached_identity_ready(
     let mut home = b"HOME=".to_vec();
     home.extend_from_slice(root.as_os_str().as_bytes());
     let deadline = std::time::Instant::now() + timeout;
+    // Name the startup phase only if exec was never observed, so a late
+    // empty environ cannot hide a child that spent the deadline before exec.
+    let mut pre_exec_image = None;
+    let mut exec_observed = false;
     loop {
-        let pending = match observe()? {
+        match observe()? {
             FixtureIdentity::Exited => {
                 return Err("owned fixture child exited before identity readiness".into());
             }
             // Pre-exec reads show the parent's environment: retry, never judge.
-            FixtureIdentity::Starting => "owned fixture child startup timed out before exec",
+            FixtureIdentity::Starting(exe) => pre_exec_image = Some(exe),
             FixtureIdentity::Started(bytes) => {
                 if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
                     return Ok(());
@@ -717,11 +731,17 @@ fn wait_detached_identity_ready(
                 if !bytes.is_empty() {
                     return Err("owned fixture child has an unexpected HOME".into());
                 }
-                "owned fixture child identity readiness timed out"
+                exec_observed = true;
             }
-        };
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(pending.into());
+            return Err(match pre_exec_image {
+                Some(exe) if !exec_observed => format!(
+                    "owned fixture child startup timed out before exec; image still {}",
+                    exe.display()
+                ),
+                _ => "owned fixture child identity readiness timed out".into(),
+            });
         }
         // timing-guard: bounded fixture readiness polling, not capture retries.
         std::thread::sleep(Duration::from_millis(1));
@@ -729,10 +749,37 @@ fn wait_detached_identity_ready(
 }
 
 #[cfg(target_os = "linux")]
+fn observe_owned_fixture(
+    child: &mut intentd_test_support::GuardedChild,
+) -> Result<FixtureIdentity, String> {
+    observe_owned_fixture_with(child, |child| {
+        observe_fixture_identity(child.id(), fixture_sleep_exe())
+    })
+}
+
+/// Bracket one observation with exit checks. A child that exits mid-read
+/// loses `/proc/<pid>/exe`, so an exit observed afterwards takes precedence
+/// over the read's error; a live child's read error is still reported.
+#[cfg(target_os = "linux")]
+fn observe_owned_fixture_with(
+    child: &mut intentd_test_support::GuardedChild,
+    observe: impl FnOnce(&mut intentd_test_support::GuardedChild) -> Result<FixtureIdentity, String>,
+) -> Result<FixtureIdentity, String> {
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(FixtureIdentity::Exited);
+    }
+    let identity = observe(child);
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        Ok(FixtureIdentity::Exited)
+    } else {
+        identity
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
-    let fixture_exe = std::fs::canonicalize("/bin/sleep").unwrap();
     let mut child = intentd_test_support::GuardedChild::spawn(
-        std::process::Command::new("/bin/sleep")
+        std::process::Command::new(fixture_sleep_exe())
             .arg("120")
             .env("HOME", root),
     )
@@ -741,15 +788,7 @@ fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
     // freshly exec'd fixture can transiently expose an empty environ.
     // Establish fixture readiness before testing the strict capture operation.
     let ready = wait_detached_identity_ready(root, Duration::from_secs(3), || {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Ok(FixtureIdentity::Exited);
-        }
-        let identity = observe_fixture_identity(child.id(), &fixture_exe)?;
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            Ok(FixtureIdentity::Exited)
-        } else {
-            Ok(identity)
-        }
+        observe_owned_fixture(&mut child)
     });
     if let Err(error) = ready {
         let kill = child.kill();
@@ -780,8 +819,8 @@ fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
 fn installed_cli_detached_identity_readiness_retries_reads_before_exec() {
     let root = Path::new("/owned-fixture");
     let mut observations = [
-        FixtureIdentity::Starting,
-        FixtureIdentity::Starting,
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
         FixtureIdentity::Started(Vec::new()),
         FixtureIdentity::Started(b"HOME=/owned-fixture\0".to_vec()),
     ]
@@ -812,11 +851,39 @@ fn installed_cli_detached_identity_readiness_times_out_before_exec() {
     let mut calls = 0;
     let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
         calls += 1;
-        Ok(FixtureIdentity::Starting)
+        Ok(FixtureIdentity::Starting(PathBuf::from(
+            "/parent-test-binary",
+        )))
     })
     .unwrap_err();
-    assert_eq!(error, "owned fixture child startup timed out before exec");
+    assert_eq!(
+        error,
+        "owned fixture child startup timed out before exec; image still /parent-test-binary"
+    );
     assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_timeout_names_environ_after_exec() {
+    let mut calls = 0;
+    let error = wait_detached_identity_ready(
+        Path::new("/owned-fixture"),
+        Duration::from_millis(20),
+        || {
+            calls += 1;
+            Ok(if calls == 1 {
+                FixtureIdentity::Starting(PathBuf::from("/parent-test-binary"))
+            } else {
+                FixtureIdentity::Started(Vec::new())
+            })
+        },
+    );
+    assert_eq!(
+        error.unwrap_err(),
+        "owned fixture child identity readiness timed out"
+    );
+    assert!(calls > 1);
 }
 
 #[cfg(target_os = "linux")]
@@ -851,12 +918,11 @@ fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors(
 #[test]
 fn installed_cli_detached_identity_observation_defers_pre_exec_environ() {
     let pid = std::process::id();
-    let fixture_exe = std::fs::canonicalize("/bin/sleep").unwrap();
-    assert_eq!(
-        observe_fixture_identity(pid, &fixture_exe),
-        Ok(FixtureIdentity::Starting)
-    );
     let own_exe = std::fs::read_link("/proc/self/exe").unwrap();
+    assert_eq!(
+        observe_fixture_identity(pid, fixture_sleep_exe()),
+        Ok(FixtureIdentity::Starting(own_exe.clone()))
+    );
     let ungated = observe_fixture_identity(pid, &own_exe).unwrap();
     assert!(matches!(&ungated, FixtureIdentity::Started(bytes) if !bytes.is_empty()));
     let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
@@ -864,6 +930,38 @@ fn installed_cli_detached_identity_observation_defers_pre_exec_environ() {
     })
     .unwrap_err();
     assert_eq!(error, "owned fixture child has an unexpected HOME");
+}
+
+// Drives the composed observation the fixture uses on a real child: a
+// settled child reports its own HOME, and an exit during the read (which
+// makes /proc/<pid>/exe unreadable) is reported as an exit, not an error.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_owned_observation_settles_and_reports_exit() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut home = b"HOME=".to_vec();
+    home.extend_from_slice(root.path().as_os_str().as_bytes());
+    let settled = observe_owned_fixture(&mut child).unwrap();
+    assert!(
+        matches!(&settled, FixtureIdentity::Started(bytes)
+            if bytes.split(|byte| *byte == 0).any(|entry| entry == home)),
+        "settled fixture did not report its own HOME: {settled:?}"
+    );
+    let mut read = None;
+    let exited = observe_owned_fixture_with(&mut child, |child| {
+        detached_identity_zombie(child);
+        let identity = observe_fixture_identity(child.id(), fixture_sleep_exe());
+        read = Some(identity.clone());
+        identity
+    });
+    child.wait().unwrap();
+    assert!(
+        read.unwrap().is_err(),
+        "an exited child's executable should be unreadable"
+    );
+    assert_eq!(exited, Ok(FixtureIdentity::Exited));
 }
 
 #[cfg(target_os = "linux")]
