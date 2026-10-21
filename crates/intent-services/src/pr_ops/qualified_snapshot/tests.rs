@@ -480,6 +480,30 @@ fn queue_ejection_fields_and_deadline_are_only_present_when_observed() {
     );
 }
 
+/// Regression (cloudlands-fe#3524): the qualified snapshot shares the
+/// checklist's ejection rule — a `merged` removal is never an ejection.
+#[test]
+fn queue_removal_reason_merged_is_not_an_ejection() {
+    let mut o = observation();
+    for reason in ["merged", "MERGED"] {
+        o.signals.merge_queue_removal = Some(MergeQueueRemoval {
+            at: "2026-10-19T17:57:04Z".into(),
+            reason: Some(reason.into()),
+        });
+        assert!(project(&o)["requirements"]
+            .get("mergeQueueEjection")
+            .is_none());
+    }
+    o.signals.merge_queue_removal = Some(MergeQueueRemoval {
+        at: "2026-10-19T17:57:04Z".into(),
+        reason: Some("failed_checks".into()),
+    });
+    assert_eq!(
+        project(&o)["requirements"]["mergeQueueEjection"],
+        json!({"at":"2026-10-19T17:57:04Z","reason":"failed_checks"})
+    );
+}
+
 #[test]
 fn live_check_attempts_and_required_failures_share_the_legacy_pure_fold() {
     let mut o = observation();

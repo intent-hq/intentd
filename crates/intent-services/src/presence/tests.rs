@@ -9,16 +9,10 @@ fn cursor(head: u64) -> Value {
 }
 
 /// `base` scaled for slow environments (coverage runs export
-/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`): the multiplier is never below 1.0,
-/// non-finite values are ignored, and an unrepresentable product saturates
-/// to `Duration::MAX`, so no value of the variable can panic here.
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`) via the shared
+/// [`intentd_test_support::test_timeout`].
 fn scaled_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Poll `cond` until it holds, failing with `what` if it has not within
@@ -315,7 +309,8 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         .and_then(|v| v.get_mut(&principal))
         .expect("the member is viewing the note")
         .throttle
-        .last_publish = Some(Instant::now() + Duration::from_secs(60));
+        .last_publish =
+        Some(Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60)));
     with_caller(
         caller.clone(),
         services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2)),

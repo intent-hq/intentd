@@ -112,21 +112,23 @@ mod tests {
         );
         let weak = Arc::downgrade(&large);
         assert!(sender.send(large).is_ok());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), subscription.changed())
-                .await
-                .unwrap()
-        );
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            subscription.changed()
+        )
+        .await
+        .unwrap());
         assert!(
             weak.upgrade().is_none(),
             "neither the worker nor its unread watch retains the Event"
         );
         drop(sender);
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(10), subscription.changed())
-                .await
-                .unwrap()
-        );
+        assert!(!tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            subscription.changed()
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -139,10 +141,13 @@ mod tests {
         }
         drop(sender);
         // Wait for actual worker settlement before consuming the coalesced bit.
-        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(subscription.changed().await);
         assert!(!subscription.changed().await);
     }
@@ -171,10 +176,13 @@ mod tests {
         }
         assert!(weak.upgrade().is_none());
         drop(sender);
-        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             subscription.changed().await,
             "lag itself must trigger refresh"
@@ -200,10 +208,13 @@ mod tests {
             );
             assert!(sender.send(event(workspace, event_type, json!({}))).is_ok());
             drop(sender);
-            tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                &mut subscription.handle,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(subscription.changed().await, expected);
             assert!(!subscription.changed().await);
         }
@@ -240,10 +251,13 @@ mod tests {
             )))
             .is_ok());
         drop(sender);
-        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(weak.upgrade().is_none());
         assert!(!subscription.changed().await);
     }
@@ -255,11 +269,14 @@ mod tests {
             InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
         assert_eq!(sender.receiver_count(), 1);
         drop(subscription);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while sender.receiver_count() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while sender.receiver_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(sender.send(event("ws", "note:updated", json!({}))).is_err());

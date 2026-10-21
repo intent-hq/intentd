@@ -897,10 +897,13 @@ async fn prompt_turn_streams_events_and_accumulates() {
     // after the first instead of hard-coding exactly one.
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:idle") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let mut seen_activity = false;
@@ -1125,10 +1128,13 @@ async fn abnormal_stop_reason_persists_finish_reason_on_row_and_stream_end() {
 
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:idle") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
 
@@ -1195,10 +1201,13 @@ async fn zero_output_abnormal_stop_reason_persists_empty_marker_row() {
 
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:idle") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
 
@@ -1274,10 +1283,13 @@ async fn prompt_turn_activity_preview_clips_partial_line_and_digest() {
 
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:idle") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
 
@@ -1376,10 +1388,13 @@ async fn agent_idle_payload_carries_agent_name_and_completion_report() {
         .await
         .expect("turn completes");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription open");
     let idle = batch
         .iter()
         .find(|e| e.event_type == "agent:idle")
@@ -1511,7 +1526,7 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
 
     // The bounded drain empties the burst and cannot hang.
     timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         Services::drain_replay_notifications(&mut replay_rx, &agent_id, Some(&workspace_id)),
     )
     .await
@@ -1552,10 +1567,13 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
 
     let mut events = Vec::new();
     while events.len() < 9 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -1620,10 +1638,13 @@ async fn tool_call_then_update_persists_use_and_result_blocks() {
     // status, chunk, tool_call, tool_call_update, stream:end, idle.
     let mut events = Vec::new();
     while events.len() < 6 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
 
@@ -1724,20 +1745,23 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
     };
     // Wait for the completing update to route: the live transcript's
     // tool_result block flips to the slim placeholder once staged.
-    let mid = timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(slot) = services.live_turn(&agent_id) {
-                if slot
-                    .blocks
-                    .iter()
-                    .any(|b| b["outputTruncated"] == json!(true))
-                {
-                    break slot.message_id;
+    let mid = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if let Some(slot) = services.live_turn(&agent_id) {
+                    if slot
+                        .blocks
+                        .iter()
+                        .any(|b| b["outputTruncated"] == json!(true))
+                    {
+                        break slot.message_id;
+                    }
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("the completed tool's block becomes a placeholder mid-turn");
 
@@ -1759,11 +1783,14 @@ async fn heavy_tool_output_prestages_mid_turn_and_final_append_adopts() {
 
     // Release the turn: the final append adopts the staged row.
     release.send(()).expect("mock alive");
-    timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("prompt turn ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("prompt turn ok");
 
     let messages = store
         .get_agent_messages(&agent_id, None)
@@ -2102,10 +2129,13 @@ async fn status_only_update_keeps_title_name_and_input_on_event() {
     // status, chunk, tool_call, tool_call_update, stream:end, idle.
     let mut events = Vec::new();
     while events.len() < 6 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let tool_events: Vec<_> = events
@@ -2164,10 +2194,13 @@ async fn richer_title_update_is_merged_into_block_and_event() {
     // status, tool_call, richer update, completing update, stream:end, idle.
     let mut events = Vec::new();
     while events.len() < 6 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let tool_events: Vec<_> = events
@@ -2624,17 +2657,20 @@ async fn status_only_workspace_api_attaches_registered_batch() {
             services
                 .route_notification(&terminal, &agent_id, &workspace_id, &mut transcript)
                 .await;
-            let event = timeout(Duration::from_secs(2), async {
-                loop {
-                    for event in sub.recv().await.expect("subscription open") {
-                        if event.event_type == "agent:tool:call"
-                            && event.data["status"] != "started"
-                        {
-                            return event;
+            let event = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                async {
+                    loop {
+                        for event in sub.recv().await.expect("subscription open") {
+                            if event.event_type == "agent:tool:call"
+                                && event.data["status"] != "started"
+                            {
+                                return event;
+                            }
                         }
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("terminal tool event");
             assert!(event.data.get("output").is_none());
@@ -2866,10 +2902,13 @@ async fn turn_end_attachments_append_trailing_blocks_and_leftovers_drop() {
     // reach it without a refetch.
     let mut end_event = None;
     while end_event.is_none() {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         end_event = batch
             .into_iter()
             .find(|e| e.event_type == "agent:stream:end");
@@ -2931,10 +2970,13 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         )
         .await
         .expect("turn 1 completes");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("raise event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("raise event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -2979,10 +3021,13 @@ async fn question_tail_at_turn_end_raises_then_retires_needs_attention() {
         )
         .await
         .expect("turn 2 completes");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("retire event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("retire event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -3180,10 +3225,13 @@ fn marker_sub(bus: &EventBus, workspace_id: &WorkspaceId) -> crate::events::Subs
 }
 
 async fn assert_only_marker_event(sub: &mut crate::events::Subscription, expected: &str) {
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("marker event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("marker event delivered")
+    .expect("subscription open");
     let markers: Vec<&str> = batch
         .iter()
         .filter_map(|event| event.data["pendingQuestionsMessageId"].as_str())
@@ -3235,9 +3283,12 @@ async fn old_answer_cannot_clear_newer_pending_marker() {
                 .await
         })
     };
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("old answer reached clear window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("old answer reached clear window");
 
     let newer = services
         .agent_append_message_op(
@@ -3281,9 +3332,12 @@ async fn older_question_completion_cannot_overwrite_newer_marker() {
                 .await
         })
     };
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("older question reached marker window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("older question reached marker window");
 
     let newer = services
         .agent_append_message_op(
@@ -3327,9 +3381,12 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
                 .await
         })
     };
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("question reached the pre-lock marker window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("question reached the pre-lock marker window");
 
     let question = bus
         .store()
@@ -3457,10 +3514,13 @@ async fn append_message_op_answer_row_retires_needs_attention() {
         .await
         .expect("appendMessage succeeds");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("retire event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("retire event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -3491,10 +3551,13 @@ async fn append_message_op_question_row_raises_needs_attention() {
         .await
         .expect("appendMessage succeeds");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("raise event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("raise event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -3540,10 +3603,13 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
         )
         .await
         .expect("replaceMessages succeeds");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("retire event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("retire event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -3558,10 +3624,13 @@ async fn replace_messages_op_moves_needs_attention_both_ways() {
         )
         .await
         .expect("replaceMessages succeeds");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("raise event delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("raise event delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data,
@@ -3626,10 +3695,13 @@ async fn stale_anonymous_tool_update_is_dropped_not_persisted() {
     // status, chunk, stream:end, idle — and NO agent:tool:call for the stale update.
     let mut events = Vec::new();
     while events.len() < 4 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     assert!(
@@ -3716,10 +3788,13 @@ async fn open_acp_session_persists_id() {
     // `session-create` status hint fires ahead of the `session/new` wire call
     // (STAT-1 / PROTOCOL §7) so the FE spinner can render "Creating session…"
     // while the provider spins up the session.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription open");
     let status = batch
         .iter()
         .find(|e| e.event_type == "agent:stream:status")
@@ -4087,10 +4162,13 @@ async fn resume_acp_session_emits_session_load_status() {
         .expect("resume yields opened session");
     assert_eq!(opened.session_id, ACP_SID);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription open");
     let status = batch
         .iter()
         .find(|e| e.event_type == "agent:stream:status")
@@ -4121,10 +4199,13 @@ async fn recreate_acp_session_emits_session_create_status() {
         .expect("recreate session");
     assert_eq!(opened.session_id, ACP_SID);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription open");
     let status = batch
         .iter()
         .find(|e| e.event_type == "agent:stream:status")
@@ -4359,10 +4440,13 @@ async fn truncation_cap_exhaustion_logs_terminal_outcome_and_idles() {
         .any(|event: &Event| event.event_type == "agent:idle")
     {
         events.extend(
-            timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("idle timed out")
-                .expect("subscription open"),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("idle timed out")
+            .expect("subscription open"),
         );
     }
     let idle = events
@@ -4682,10 +4766,13 @@ async fn streaming_terminal_failure_persists_error_before_publishing_events() {
     // Read the store the moment agent:failed lands: the persisted Error must
     // already be visible.
     'observed: loop {
-        let batch = timeout(Duration::from_secs(10), sub.recv())
-            .await
-            .expect("agent:failed within 10s")
-            .expect("bus open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.recv(),
+        )
+        .await
+        .expect("agent:failed within 10s")
+        .expect("bus open");
         for event in batch {
             if event.event_type == "agent:failed" {
                 break 'observed;
@@ -4895,7 +4982,7 @@ async fn assert_explicit_cancellation_is_not_recovered(
         connect_with_prompt_rpc_error_code(error.clone(), updates);
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -4958,10 +5045,13 @@ async fn assert_explicit_cancellation_is_not_recovered(
         .any(|e: &Event| e.event_type == "agent:stream:end")
     {
         events.extend(
-            timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("terminal stream event arrives")
-                .expect("subscription open"),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("terminal stream event arrives")
+            .expect("subscription open"),
         );
     }
     assert!(!events
@@ -5101,7 +5191,7 @@ async fn assert_output_free_fetch_failure_retries(error_message: &str) {
         connect_with_failing_prompts_then_success(2, error_message, prompt_updates());
 
     let stop = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5157,7 +5247,7 @@ async fn transient_provider_fetch_failure_exhausts_bounded_retries() {
         connect_with_failing_prompts_then_success(10, FETCH_EPIPE_UNAVAILABLE, Vec::new());
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5206,7 +5296,7 @@ async fn terminal_provider_error_fails_fast_without_retry() {
     );
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5247,7 +5337,7 @@ async fn transient_fetch_failure_after_streamed_output_is_not_retried() {
         connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5317,7 +5407,7 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
         connect_with_prompt_rpc_error(prompt_updates(), FETCH_EPIPE_UNAVAILABLE);
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5412,10 +5502,13 @@ async fn post_output_transient_fetch_failure_raises_blocker_attention() {
     // card.
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:failed") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let attention_idx = events
@@ -5451,7 +5544,7 @@ async fn post_output_non_transient_error_raises_no_attention() {
         connect_with_prompt_rpc_error(prompt_updates(), "provider rejected the request: boom");
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5485,10 +5578,13 @@ async fn post_output_non_transient_error_raises_no_attention() {
     assert_eq!(messages[0].role, "assistant");
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:failed") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     assert!(
@@ -5541,7 +5637,7 @@ async fn backoff_late_output_blocker_reason_reports_dispatched_attempt() {
     release_error_tx.send(()).expect("mock alive");
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5680,7 +5776,7 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
     let conn = Connection::new(c2a_client, a2c_client, None, hooks);
 
     let err = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -5741,10 +5837,13 @@ async fn transient_fetch_failure_after_client_request_is_not_retried() {
     );
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:failed") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let attention_idx = events
@@ -6082,9 +6181,12 @@ async fn suspend_late_enrollment_persists_after_early_close() {
             intent_acp::AcpError::Transport("Connection reset by peer".into()),
         )
         .await;
-    timeout(Duration::from_secs(5), services.shutdown_store_writers())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        services.shutdown_store_writers(),
+    )
+    .await
+    .unwrap();
     bus.shutdown().await.unwrap();
     store.close().await;
     let reopened = Store::open(&tmp.path).await.unwrap();
@@ -6560,10 +6662,13 @@ async fn wait_for_status_phase(
             }
         }
         events.extend(
-            timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .unwrap_or_else(|_| panic!("timed out waiting for status phase {phase:?}"))
-                .expect("subscription open"),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for status phase {phase:?}"))
+            .expect("subscription open"),
         );
     }
 }
@@ -6586,10 +6691,13 @@ async fn wait_for_event_type(
             }
         }
         events.extend(
-            timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .unwrap_or_else(|_| panic!("timed out waiting for event {event_type:?}"))
-                .expect("subscription open"),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for event {event_type:?}"))
+            .expect("subscription open"),
         );
     }
 }
@@ -6646,11 +6754,14 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
     wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
     // Release the held response: the turn still resolves normally.
     release_end.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("stalls never fail the turn");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("stalls never fail the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -6838,11 +6949,14 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
     // backoff. The update flips any_update_received in the backoff drain,
     // abandoning the retry, so the turn settles with the attempt's error.
     release_error_tx.send(()).expect("mock alive");
-    timeout(Duration::from_secs(5), turn)
-        .await
-        .expect("turn settles")
-        .expect("worker task")
-        .expect_err("abandoned retry surfaces the attempt's error");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        turn,
+    )
+    .await
+    .expect("turn settles")
+    .expect("worker task")
+    .expect_err("abandoned retry surfaces the attempt's error");
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
@@ -7064,11 +7178,14 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
     wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
     // Release the held response: the turn still resolves normally.
     release_end.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("stalls never fail the turn");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("stalls never fail the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -7130,11 +7247,14 @@ async fn unclosed_tool_call_below_ceiling_emits_no_stalled() {
     // Resolve the turn without ever closing the tool call.
     release_close.send(()).expect("mock alive");
     release_end.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("suppression never fails the turn");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("suppression never fails the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -7208,11 +7328,14 @@ async fn unclosed_tool_call_past_ceiling_emits_stalled() {
     // Advisory only: releasing the held response resolves the turn normally.
     release_close.send(()).expect("mock alive");
     release_end.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("the ceiling advisory never fails the turn");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("the ceiling advisory never fails the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -7276,7 +7399,7 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
 
     let started = std::time::Instant::now();
     let err = timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -7341,10 +7464,13 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
 
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:failed") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -7415,7 +7541,7 @@ async fn open_tool_call_stall_with_cancelled_in_label_stays_terminal() {
         connect_tool_silence(vec![tool_call], Vec::new());
 
     let err = timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -7617,11 +7743,14 @@ async fn streaming_tool_call_past_open_tool_terminal_threshold_is_not_terminated
     // heart-beating every 30ms.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     release_end_tx.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("a streaming tool call is never failed as a provider stall");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("a streaming tool call is never failed as a provider stall");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -7698,7 +7827,7 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
     let (conn, mut note_rx, _agent) = connect_silent(vec![chunk("Thinking "), chunk("hard")]);
 
     let err = timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         services.run_connection_prompt_turn(
             &conn,
             &mut note_rx,
@@ -7784,10 +7913,13 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
     // Event order: stalled advisory → agent:attention-requested → agent:failed.
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:failed") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -7824,6 +7956,467 @@ async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_
         events.iter().any(|e| e.event_type == "agent:stream:end"),
         "terminal stream:end emitted: {types:?}"
     );
+}
+
+/// Drive one tool-free provider-stall turn on `agent_id` (intent#5395) so
+/// the daemon raises its provider-stall blocker, then return the agent to
+/// idle. Callers must hold an `EnvGuard` lowering the stall thresholds.
+async fn raise_stall_blocker_via_failed_turn(
+    services: &Services,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+) {
+    services.set_test_busy(agent_id, true);
+    let (conn, mut note_rx, _agent) = connect_silent(vec![]);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            agent_id,
+            workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-stall"),
+        ),
+    )
+    .await
+    .expect("the provider stall ends the turn")
+    .expect_err("the provider stall fails the turn");
+    services.set_test_busy(agent_id, false);
+    let _ = services.take_pending_terminal_error(agent_id);
+    let stored = services.store.get_agent_session(agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert!(
+        stored
+            .attention_request_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("provider stall")),
+        "the stall raised its blocker: {:?}",
+        stored.attention_request_reason
+    );
+}
+
+/// Run one later turn on a fresh mock connection; returns the turn result.
+async fn run_follow_up_turn(
+    services: &Services,
+    agent_id: &AgentId,
+    workspace_id: &WorkspaceId,
+    connection: (
+        Connection,
+        mpsc::UnboundedReceiver<IncomingNotification>,
+        JoinHandle<()>,
+    ),
+) -> intent_core::Result<intent_acp::session::StopReason> {
+    let (conn, mut note_rx, _agent) = connection;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        services.run_connection_prompt_turn(
+            &conn,
+            &mut note_rx,
+            agent_id,
+            workspace_id,
+            ACP_SID,
+            vec![text_block("continue")],
+            Some("turn-follow-up"),
+        ),
+    )
+    .await
+    .expect("the follow-up turn settles")
+}
+
+fn attention_cleared_events(events: &[Event], agent_id: &AgentId) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            e.event_type == "agent:updated"
+                && e.data["agentId"] == json!(agent_id.0)
+                && e.data["attentionRequestCleared"] == json!(true)
+        })
+        .count()
+}
+
+async fn drain_events(sub: &mut crate::events::bus::Subscription) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        sub.recv(),
+    )
+    .await
+    {
+        events.extend(batch);
+    }
+    events
+}
+
+/// Regression for intent-hq/intent#7182: a daemon-raised provider-stall
+/// blocker clears when the same agent next completes a turn successfully —
+/// an automatic (non-user) turn on a top-level foreground agent, which the
+/// turn-begin clear never touches — emitting the usual `agent:updated`
+/// `attentionRequestCleared: true` ahead of `agent:idle`. RED at the parent
+/// SHA: the blocker stayed pending across the successful turn.
+#[tokio::test]
+async fn daemon_stall_blocker_clears_after_later_successful_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the follow-up turn succeeds");
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none() && stored.attention_request_reason.is_none(),
+        "the stall blocker is cleared after a successful turn: {:?}",
+        stored.attention_request_reason
+    );
+    let events = drain_events(&mut sub).await;
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        attention_cleared_events(&events, &agent_id),
+        1,
+        "one attentionRequestCleared event: {types:?}"
+    );
+    let cleared_idx = events
+        .iter()
+        .position(|e| e.data["attentionRequestCleared"] == json!(true))
+        .unwrap();
+    let idle_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:idle")
+        .unwrap_or_else(|| panic!("agent:idle emitted: {types:?}"));
+    assert!(cleared_idx < idle_idx, "cleared before idle: {types:?}");
+
+    // A later blocker the agent raises itself is not cleared by the next
+    // successful turn.
+    services
+        .agent_request_attention_op(
+            workspace_id.clone(),
+            "blocker".into(),
+            "agent-owned blocker".into(),
+            Some(agent_id.clone()),
+        )
+        .await
+        .unwrap();
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("second follow-up succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.attention_request_reason.as_deref(),
+        Some("agent-owned blocker")
+    );
+}
+
+/// intent-hq/intent#7182: a later FAILED or CANCELLED turn does not clear the
+/// daemon stall blocker; only a successful completion does.
+#[tokio::test]
+async fn daemon_stall_blocker_survives_later_failed_and_cancelled_turns() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let stall_reason = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .unwrap()
+        .attention_request_reason;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    run_follow_up_turn(
+        &services,
+        &agent_id,
+        &workspace_id,
+        connect_with_prompt_rpc_error(vec![], "provider exploded"),
+    )
+    .await
+    .expect_err("the follow-up turn fails");
+    let _ = services.take_pending_terminal_error(&agent_id);
+    run_follow_up_turn(
+        &services,
+        &agent_id,
+        &workspace_id,
+        connect_with_prompt_result(vec![], json!({ "stopReason": "cancelled" })),
+    )
+    .await
+    .expect("a cancelled turn resolves");
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(stored.attention_request_reason, stall_reason);
+    let events = drain_events(&mut sub).await;
+    assert_eq!(
+        attention_cleared_events(&events, &agent_id),
+        0,
+        "failed/cancelled turns must not clear the stall blocker"
+    );
+
+    // The blocker survives the failures: the next successful turn clears it.
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the later turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(stored.attention_request_kind.is_none());
+}
+
+/// intent-hq/intent#7182: agent-raised blockers and discussions keep today's
+/// clearing rules — a successful turn clears neither, including when the
+/// agent's own request replaced a pending daemon stall blocker.
+#[tokio::test]
+async fn successful_turn_leaves_agent_blockers_and_discussions_pending() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    // Agent-raised blocker with no stall history.
+    services
+        .agent_request_attention_op(
+            workspace_id.clone(),
+            "blocker".into(),
+            "need credentials".into(),
+            Some(agent_id.clone()),
+        )
+        .await
+        .unwrap();
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(
+        stored.attention_request_reason.as_deref(),
+        Some("need credentials")
+    );
+
+    // A discussion that replaced a daemon stall blocker survives.
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    services
+        .agent_request_attention_op(
+            workspace_id.clone(),
+            "discussion".into(),
+            "which option?".into(),
+            Some(agent_id.clone()),
+        )
+        .await
+        .unwrap();
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("discussion"));
+    assert_eq!(
+        stored.attention_request_reason.as_deref(),
+        Some("which option?")
+    );
+
+    // An agent blocker that replaced a daemon stall blocker survives too.
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    services
+        .agent_request_attention_op(
+            workspace_id.clone(),
+            "blocker".into(),
+            "agent replacement blocker".into(),
+            Some(agent_id.clone()),
+        )
+        .await
+        .unwrap();
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(
+        stored.attention_request_reason.as_deref(),
+        Some("agent replacement blocker")
+    );
+    let events = drain_events(&mut sub).await;
+    assert_eq!(
+        attention_cleared_events(&events, &agent_id),
+        0,
+        "no attention request was cleared"
+    );
+}
+
+/// intent-hq/intent#7182 restart path: the stall blocker is recognised from
+/// its persisted reason, so a blocker raised before a daemon restart is still
+/// cleared by the agent's first successful turn on the restarted daemon.
+#[tokio::test]
+async fn daemon_stall_blocker_clears_after_restart_on_next_successful_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let store = services.store.clone();
+    drop(services);
+    let restarted = Services::new(store).with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    run_follow_up_turn(&restarted, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the follow-up turn succeeds after restart");
+
+    let stored = restarted.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "the persisted stall blocker clears after restart: {:?}",
+        stored.attention_request_reason
+    );
+    let events = drain_events(&mut sub).await;
+    assert_eq!(attention_cleared_events(&events, &agent_id), 1);
+}
+
+/// intent-hq/intent#7182 review: an EMPTY harness wake is not a successful
+/// turn (`recover_empty_harness_wake` treats it as a failed no-op), so it
+/// leaves the stall blocker pending; a non-empty wake then clears it.
+#[tokio::test]
+async fn empty_harness_wake_keeps_stall_blocker_and_nonempty_wake_clears_it() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let stall_reason = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .unwrap()
+        .attention_request_reason;
+
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("   "),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    assert!(outcome.empty_response, "whitespace-only wake is empty");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(
+        stored.attention_request_reason, stall_reason,
+        "an empty wake must not clear the stall blocker"
+    );
+
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("back to work"),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    assert!(!outcome.empty_response);
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "a successful wake clears the stall blocker"
+    );
+}
+
+/// intent-hq/intent#7182 review: a clear cancelled mid-flight (here while
+/// waiting on the attention gate) loses nothing — recognition reads the
+/// persisted row, so the next successful turn still clears the blocker.
+#[tokio::test]
+async fn cancelled_stall_blocker_clear_retries_on_next_successful_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+
+    let gate = services.attention_mutation_gates.for_agent(&agent_id);
+    let held = gate.lock().await;
+    // fixed-deadline: allow — the clear must still be parked on the held gate when this window ends; its length is the cancellation point under test
+    let cancelled = timeout(
+        Duration::from_millis(100),
+        services.clear_daemon_stall_blocker_after_success(&workspace_id, &agent_id),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the clear was cancelled on the gate");
+    drop(held);
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a cancelled clear leaves the blocker pending"
+    );
+
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the follow-up turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "the next successful turn clears the blocker after a cancelled clear"
+    );
+}
+
+/// intent-hq/intent#7182: the daemon stall-blocker reason prefixes are
+/// reserved — an agent cannot raise a request that would later be mistaken
+/// for a daemon stall blocker and auto-cleared.
+#[tokio::test]
+async fn agent_raised_attention_rejects_reserved_stall_prefixes() {
+    // The member gate needs a bound caller; the agent tool path binds one.
+    intent_core::with_caller(intent_core::Caller::Daemon, async {
+        use intent_core::WorkspaceApi;
+        let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+        for reason in [
+            format!(
+                "{}spoofed",
+                crate::agent_session::PROVIDER_STALL_BLOCKER_PREFIX
+            ),
+            format!(
+                "{}spoofed",
+                crate::agent_session::UNSOLICITED_STALL_BLOCKER_PREFIX
+            ),
+        ] {
+            let err = services
+                .agent_request_attention(
+                    workspace_id.clone(),
+                    "blocker".into(),
+                    reason.clone(),
+                    Some(agent_id.clone()),
+                )
+                .await
+                .expect_err("reserved prefix rejected");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{reason}: {err}"
+            );
+        }
+        let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+        assert!(stored.attention_request_kind.is_none());
+        services
+            .agent_request_attention(
+                workspace_id.clone(),
+                "blocker".into(),
+                "an ordinary agent blocker".into(),
+                Some(agent_id.clone()),
+            )
+            .await
+            .expect("ordinary reasons are accepted");
+    })
+    .await;
 }
 
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
@@ -7959,11 +8552,14 @@ async fn dropped_anonymous_tool_update_does_not_suppress_stall() {
     wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
     release_close.send(()).expect("mock alive");
     release_end.send(()).expect("mock alive");
-    timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("stalls never fail the turn");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("stalls never fail the turn");
 }
 
 /// Turn correlation (monorepo#1022): the failure-arm `agent:failed` emitted by
@@ -8103,10 +8699,13 @@ async fn detached_turn_end_usage_bookkeeping_still_lands() {
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     // The detached task persists the snapshot and emits the event; await it.
-    let batch = timeout(Duration::from_secs(5), sub.recv())
-        .await
-        .expect("tokenUsage-changed delivered")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("tokenUsage-changed delivered")
+    .expect("subscription open");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "workspace:tokenUsage-changed")
@@ -8190,9 +8789,12 @@ async fn shutdown_retains_turn_bookkeeping_after_handle_leaves_chain() {
     };
     release.send(()).unwrap();
     if !returned_early {
-        tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drain,
+        )
+        .await
+        .unwrap();
     }
     assert!(
         !returned_early,
@@ -8499,7 +9101,13 @@ async fn open_session_resolves_effective_model_for_null_model() {
         .await
         .expect("open session");
     let stored = bus.store().get_agent_session(&session.id).await.unwrap();
-    assert_eq!(stored.model, None, "NULL model stays NULL");
+    // The session-open fill never pins the adapter's floating `default`
+    // alias (no concrete model is known), and never the D13 display name,
+    // which stays a stats-only resolution (monorepo#1534).
+    assert_eq!(
+        stored.model, None,
+        "the default alias is not a concrete model"
+    );
     let (_, resolved, _, _) = bus
         .store()
         .get_agent_session_token_usage(&ws, &session.id)
@@ -8769,10 +9377,13 @@ async fn session_open_persists_effort_levels_and_emits_on_change_only() {
     // session-create status hints, so scan batches until it shows up).
     let updated = 'found: {
         for _ in 0..5 {
-            let batch = timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("recv timed out")
-                .expect("subscription open");
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
             if let Some(e) = batch.iter().find(|e| e.event_type == "agent:updated") {
                 break 'found e.clone();
             }
@@ -8798,10 +9409,13 @@ async fn session_open_persists_effort_levels_and_emits_on_change_only() {
         .await;
     let mut saw_flush = false;
     while !saw_flush {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         assert!(
             !batch.iter().any(|e| e.event_type == "agent:updated"),
             "unchanged set must not re-emit agent:updated"
@@ -8846,10 +9460,13 @@ async fn session_open_without_selector_clears_persisted_effort_levels() {
     );
     let updated = 'found: {
         for _ in 0..5 {
-            let batch = timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("recv timed out")
-                .expect("subscription open");
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
             if let Some(e) = batch.iter().find(|e| e.event_type == "agent:updated") {
                 break 'found e.clone();
             }
@@ -8912,10 +9529,13 @@ async fn cas_losing_recreate_leaves_effort_levels_untouched() {
         .await;
     let mut saw_flush = false;
     while !saw_flush {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         assert!(
             !batch.iter().any(|e| e.event_type == "agent:updated"),
             "CAS loser must not emit agent:updated"
@@ -9310,22 +9930,28 @@ async fn normal_zero_output_turn_end_leaves_the_pinned_slot_to_the_teardown_flus
         })
     };
     // The slot opens at turn start; the gate holds the turn there.
-    timeout(Duration::from_secs(2), async {
-        while services.live_turn(&agent_id).is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while services.live_turn(&agent_id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("the turn opens its live slot");
     // The teardown path pins…
     services.pin_live_turn(&agent_id);
     // …and the turn completes normally with zero blocks.
     release.send(()).expect("mock alive");
-    let stop = timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("turn completes")
-        .expect("worker task")
-        .expect("prompt turn ok");
+    let stop = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        turn,
+    )
+    .await
+    .expect("turn completes")
+    .expect("worker task")
+    .expect("prompt turn ok");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
 
     let slot = services
@@ -9609,10 +10235,13 @@ async fn tool_only_turn_emits_throttled_activity_with_last_tool_use() {
 
     let mut events: Vec<Event> = Vec::new();
     while !events.iter().any(|e| e.event_type == "agent:idle") {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         events.extend(batch);
     }
 
@@ -10949,10 +11578,13 @@ async fn chunk_delta_event_carries_media_for_the_completing_chunk() {
     }
     let mut deltas: Vec<Event> = Vec::new();
     while deltas.len() < 2 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription open");
         deltas.extend(
             batch
                 .into_iter()

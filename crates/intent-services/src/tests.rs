@@ -3933,7 +3933,7 @@ async fn set_content_retry_exhaustion_conflicts_without_writing() {
     .expect("arm trigger");
 
     let r = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
         svc.set_note_content(
             ws.clone(),
             id.clone(),
@@ -10517,10 +10517,13 @@ mod change_event_parity {
 
     /// Receive exactly one published event, serialized to its wire JSON.
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -13002,7 +13005,8 @@ mod change_event_parity {
         // `archived: true` is skipped because the row was unarchived before
         // its fenced re-read — no stale archived delta after the unarchive.
         let mut lifecycle = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while lifecycle.len() < 3 {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
                 .await
@@ -13194,7 +13198,8 @@ mod change_event_parity {
         // Lifecycle/membership deltas in order: removal (inside the fence),
         // the unarchive, the re-add — and no `archived: true` afterwards.
         let mut lifecycle = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while lifecycle.len() < 3 {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
                 .await
@@ -13289,7 +13294,7 @@ mod change_event_parity {
             .await
             .expect("stale full-row write");
         let card = tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             h.services.update_workspace(
                 h.ws.clone(),
                 WorkspaceUpdate {
@@ -13343,7 +13348,8 @@ mod change_event_parity {
         // Deltas: the card update, the removal, then the archive's own
         // `archived: true`; never an `archived: false`.
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while !seen
             .iter()
             .any(|c: &serde_json::Value| c["archived"] == json!(true))
@@ -14255,9 +14261,12 @@ mod change_event_parity {
         let services = h.services.clone();
         let ws_id = h.ws.clone();
         let task = intent_core::spawn_daemon(async move { services.mark_seen(ws_id).await });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("mark_seen reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("mark_seen reaches the attention write window");
 
         // Concurrent mutation while mark_seen sits parked before its write.
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
@@ -14300,9 +14309,12 @@ mod change_event_parity {
         let ws_id = h.ws.clone();
         let task =
             intent_core::spawn_daemon(async move { services.dismiss_attention(ws_id).await });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("dismiss_attention reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("dismiss_attention reaches the attention write window");
 
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
         concurrent.title = "renamed while parked".to_string();
@@ -14345,9 +14357,12 @@ mod change_event_parity {
                 .raise_attention(&ws_id, WorkspaceAttention::Unread)
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("raise_attention reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("raise_attention reaches the attention write window");
 
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
         concurrent.title = "renamed while parked".to_string();
@@ -16991,9 +17006,12 @@ mod change_event_parity {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("task.update parks before its parent write");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("task.update parks before its parent write");
 
         // Another caller completes the task inside the window; materialization
         // rewrites the linked line to `[x]`.
@@ -17005,11 +17023,14 @@ mod change_event_parity {
         );
 
         park.release.notify_one();
-        let r = tokio::time::timeout(Duration::from_secs(2), writer)
-            .await
-            .expect("writer finishes")
-            .expect("writer task")
-            .expect("task.update");
+        let r = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            writer,
+        )
+        .await
+        .expect("writer finishes")
+        .expect("writer task")
+        .expect("task.update");
 
         assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
         assert_eq!(
@@ -17084,10 +17105,13 @@ mod mcp_callback {
         assert_eq!(persisted.content, "# A\nbody\n\nmore");
 
         // Event fired on the same bus the FE transport pushes from.
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert!(batch.iter().any(|e| e.event_type == NOTE_UPDATED));
     }
 
@@ -17585,10 +17609,13 @@ mod drafts_events {
             .expect("set draft");
         assert!(updated.is_some(), "a non-empty set stores a draft");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -17611,10 +17638,13 @@ mod drafts_events {
             .drafts_clear(ws.clone(), agent.clone(), client.clone())
             .await
             .expect("clear draft");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -17662,10 +17692,13 @@ mod drafts_events {
             .expect("set draft");
         assert!(updated.is_some(), "empty text with attachments persists");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -18696,6 +18729,7 @@ pub(crate) mod pr {
                 }),
                 is_in_merge_queue: None,
                 merge_queue_removal: None,
+                merge_queue_entry: None,
             }),
             ..Default::default()
         })
@@ -19249,7 +19283,8 @@ pub(crate) mod pr {
             user_code: "WXYZ-9876".into(),
             verification_uri: "https://github.com/login/device".into(),
             interval: 5,
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+            deadline: tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
             phase: crate::github_auth_ops::FlowPhase::Pending,
         };
         let id = seeded.wire_id();
@@ -19346,7 +19381,8 @@ pub(crate) mod pr {
                 user_code: "WXYZ-9876".into(),
                 verification_uri: "https://github.com/login/device".into(),
                 interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                deadline: tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
                 phase: crate::github_auth_ops::FlowPhase::Denied,
             });
         }
@@ -19390,7 +19426,8 @@ pub(crate) mod pr {
                 user_code: "WXYZ-9876".into(),
                 verification_uri: "https://github.com/login/device".into(),
                 interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                deadline: tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
                 phase: crate::github_auth_ops::FlowPhase::Pending,
             });
         }
@@ -22505,7 +22542,7 @@ pub(crate) mod pr {
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             svc.refresh_git_root_pr(root, &sc_dyn),
         )
         .await
@@ -23081,9 +23118,12 @@ pub(crate) mod pr {
             let svc = svc.clone();
             async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("pulls.get reaches the miss→fetch window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("pulls.get reaches the miss→fetch window");
         assert!(forge.seen_get_pr.lock().unwrap().is_empty());
 
         // The concurrent fill (another on-demand reader or a sweep) stores
@@ -24319,7 +24359,7 @@ pub(crate) mod pr {
         .await;
         let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(200));
         let created = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
             svc.create_workspace(
                 intent_core::WorkspaceCreate {
                     title: Some("PR ws hung forge".to_string()),
@@ -26531,7 +26571,8 @@ mod file_tracking {
 
     /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
     async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
         while !cond() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -27891,10 +27932,13 @@ mod file_tracking {
 
         let root = git_root_row(&ws_id, &secondary.dir);
         let stored = svc.register_git_root(&root).await.unwrap();
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("registered event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("registered event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:registered");
         assert_eq!(batch[0].data["gitRoot"]["id"], stored.id.as_str());
 
@@ -27903,10 +27947,13 @@ mod file_tracking {
         again.registered_by_agent_ids = vec![AgentId("agent-2".into())];
         let merged = svc.register_git_root(&again).await.unwrap();
         assert_eq!(merged.id, stored.id, "merged into the existing row");
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("updated event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("updated event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:updated");
         assert_eq!(
             batch[0].data["gitRoot"]["registeredByAgentIds"],
@@ -27914,10 +27961,13 @@ mod file_tracking {
         );
 
         svc.unregister_git_root(&stored.id).await.unwrap();
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("unregistered event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("unregistered event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:unregistered");
         assert_eq!(batch[0].data["gitRootId"], stored.id.as_str());
         assert_eq!(batch[0].data["path"], stored.path);
@@ -29929,10 +29979,13 @@ mod search_adapters {
     }
 
     async fn recv_event(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         serde_json::to_value(&batch[0]).expect("serialize")
     }
 
@@ -31341,9 +31394,12 @@ mod rules {
             .await
             .expect("update");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), recv(&mut sub))
-            .await
-            .expect("event delivered");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            recv(&mut sub),
+        )
+        .await
+        .expect("event delivered");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["type"], "settings:changed");
         let changes = ev["data"]["changes"].as_array().expect("changes");
@@ -33138,7 +33194,8 @@ mod known_repo {
         )
         .await
         .expect("update repository path");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         loop {
             let updated = store
                 .get_workspace(&path_update_id)
@@ -34773,6 +34830,62 @@ mod worktree_provisioning {
         assert_eq!(ws2.branch, "aw/auth-fix-2");
     }
 
+    /// `workspace.create`'s initial agent pins the settings default provider
+    /// on its row, so a later `model.defaultProvider` change never moves the
+    /// workspace's first conversation (a NULL provider is a legacy row).
+    #[intent_test_macros::daemon_test]
+    async fn create_initial_agent_pins_the_default_provider() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set default provider");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-initpin-repo");
+        let root = unique_dir("intentd-initpin-root");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("pin the provider".to_string()),
+                        model: Some("sonnet4.5".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("codex"),
+            )])
+            .expect("change default provider");
+        let sessions = store.list_agent_sessions(&ws.id).await.expect("sessions");
+        let initial = sessions
+            .iter()
+            .find(|s| s.is_initial_agent())
+            .expect("initial agent");
+        assert_eq!(initial.provider.as_deref(), Some("auggie"));
+        assert_eq!(initial.model.as_deref(), Some("sonnet4.5"));
+    }
+
     /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
     #[intent_test_macros::daemon_test]
     async fn create_keeps_explicit_branch_untouched() {
@@ -35463,12 +35576,15 @@ mod setup_lifecycle_events {
     /// spawn succeeded and the script is parked there).
     #[cfg(unix)]
     async fn wait_for_barrier(barrier: &Barrier) {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !barrier.entered() {
-                // timing-guard: poll interval for the barrier's arrival file
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            async {
+                while !barrier.entered() {
+                    // timing-guard: poll interval for the barrier's arrival file
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
         .await
         .expect("setup script reached the barrier");
     }
@@ -35526,10 +35642,13 @@ mod setup_lifecycle_events {
     /// Receive one setup event (generous timeout: script paths cross a PTY
     /// spawn + reap poll), serialized to wire JSON.
     async fn recv_setup(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(20), sub.recv())
-            .await
-            .expect("setup event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            sub.recv(),
+        )
+        .await
+        .expect("setup event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event per delivery");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -39956,7 +40075,8 @@ mod repo_warm_cache {
     /// Await the warm's detached completion: poll until the cache slot for
     /// `owner/repo` exists AND a follow-up warm is accepted (flag cleared).
     async fn wait_for_warm_completion(svc: &Services, root: &std::path::Path, url: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(30));
         loop {
             match svc.repo_warm_cache(url.to_string()).await {
                 Ok(v) => {
@@ -40038,7 +40158,9 @@ mod repo_warm_cache {
             })
             .await
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap();
 
         let v = svc
             .repo_warm_cache(url.clone())
@@ -40846,10 +40968,13 @@ mod browser_client_pin {
         );
 
         // `workspace:updated` carries the self-sufficient delta.
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["type"], "workspace:updated");
         assert_eq!(
@@ -40881,10 +41006,13 @@ mod browser_client_pin {
                 "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
             })
         );
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["data"]["changes"], json!({ "browserClientId": null }));
         assert_eq!(svc.get_workspace(ws).await.unwrap().browser_client_id, None);
@@ -40941,10 +41069,13 @@ mod browser_client_pin {
 
         let mut deltas: Vec<Value> = Vec::new();
         while deltas.len() < ROUNDS {
-            let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .expect("all deltas delivered")
-                .expect("subscription open");
+            let batch = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .expect("all deltas delivered")
+            .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).unwrap();
                 assert_eq!(ev["type"], "workspace:updated");
@@ -41200,10 +41331,13 @@ mod browser_routing {
         });
         let mut out = Vec::new();
         while out.len() < want {
-            let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("event delivered")
-                .expect("subscription open");
+            let batch = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).unwrap();
                 if ev["type"]
@@ -41809,9 +41943,12 @@ mod browser_routing {
                 .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(2), dispatch.started.notified())
-            .await
-            .expect("claim dispatched");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            dispatch.started.notified(),
+        )
+        .await
+        .expect("claim dispatched");
         assert_eq!(
             dispatch.targets.lock().unwrap().as_slice(),
             [ReverseTarget::Pinned(ClientId::from_string("desktop-a"))]
@@ -42508,10 +42645,13 @@ mod last_activity_events {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty(), "expected at least one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -42526,7 +42666,8 @@ mod last_activity_events {
     /// which routinely fires well past its nominal window on loaded runners
     /// (monorepo#2585).
     async fn wait_for_persisted_last_activity(h: &Harness) -> String {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if let Some(persisted) = h
                 .store
@@ -42552,7 +42693,8 @@ mod last_activity_events {
     /// — so an assertion that follows genuinely runs after the derivation
     /// instead of racing it behind a fixed sleep (monorepo#2585).
     async fn wait_for_debounce_settled(h: &Harness) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             let pending = h
                 .services
@@ -42635,7 +42777,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires after the debounce window, takes the
         // NotFound arm, and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42730,7 +42873,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires after the debounce window, takes the
         // suppressed path, and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42805,7 +42949,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42957,7 +43102,8 @@ mod last_activity_events {
         // unconditional timed drain raced the debounce timer here: under
         // package load the window expired while the drain was still consuming,
         // which discarded the very event asserted below (intent#4886).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         let mut updated: Option<Value> = None;
         while updated.is_none() {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
@@ -44211,10 +44357,13 @@ mod idle_workspace_archived_stamp {
     }
 
     async fn recv_idle(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("agent:idle delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("agent:idle delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty());
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -44317,10 +44466,13 @@ mod turn_token_usage {
     }
 
     async fn recv_usage_event(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("tokenUsage-changed delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("tokenUsage-changed delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty());
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -47505,9 +47657,12 @@ mod delete_grace_window {
             .schedule_workspace_delete(h.ws.clone(), 60_000)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), h.services.shutdown_store_writers())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            h.services.shutdown_store_writers(),
+        )
+        .await
+        .unwrap();
         h.bus.shutdown().await.unwrap();
         h.services.store.close().await;
         let reopened = Store::open(&h.tmp.path).await.unwrap();
@@ -47734,10 +47889,13 @@ mod delete_grace_window {
             .schedule_workspace_delete(h.ws.clone(), 60_000)
             .await
             .expect("schedule");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "workspace:delete-scheduled");
         assert_eq!(
@@ -47749,10 +47907,13 @@ mod delete_grace_window {
             .cancel_workspace_delete(h.ws.clone())
             .await
             .expect("cancel");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("cancelled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("cancelled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "workspace:delete-cancelled");
         assert_eq!(ev["data"], serde_json::json!({ "workspaceId": h.ws.0 }));
@@ -48158,20 +48319,23 @@ mod agent_delete_grace_window {
             .await
             .unwrap();
         let held = h.services.store.write_pool().acquire().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while h
-                .services
-                .pending_agent_deletes
-                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
-                    workspace_id: h.ws.clone(),
-                    agent_id: h.agent.clone(),
-                })
-                .unwrap()
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while h
+                    .services
+                    .pending_agent_deletes
+                    .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                        workspace_id: h.ws.clone(),
+                        agent_id: h.agent.clone(),
+                    })
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("timer claimed its cascade");
         let shutdown = h.services.shutdown_store_writers();
@@ -48183,9 +48347,12 @@ mod agent_delete_grace_window {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                &mut shutdown,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,
@@ -48436,10 +48603,13 @@ mod agent_delete_grace_window {
             .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
             .await
             .expect("schedule");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "agent:delete-scheduled");
         assert_eq!(
@@ -48455,10 +48625,13 @@ mod agent_delete_grace_window {
             .agent_cancel_delete_op(h.agent.clone(), None)
             .await
             .expect("cancel");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("cancelled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("cancelled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "agent:delete-cancelled");
         assert_eq!(
@@ -48521,9 +48694,12 @@ mod agent_delete_grace_window {
             .await
             .expect("schedule");
         // Drain the schedule event so the assertions below start clean.
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered");
 
         h.services
             .delete_workspace(h.ws.clone())
@@ -49293,10 +49469,13 @@ mod derived_workspace_unread {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -49697,9 +49876,12 @@ mod derived_workspace_unread {
                 .agent_mark_seen_op(ws_id, AgentId::from("agent-a"), last_a)
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("settle reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("settle reaches the attention write window");
 
         // New unread session lands while the settle sits parked between its
         // probe (which saw "all seen") and its write.
@@ -49935,18 +50117,24 @@ mod derived_workspace_unread {
         // entry: neither has probed yet, so neither can early-return on the
         // other's still-pending write.
         for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(10), entry.entered.notified())
-                .await
-                .expect("retire reaches the settle entry");
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                entry.entered.notified(),
+            )
+            .await
+            .expect("retire reaches the settle entry");
         }
         entry.release.notify_one();
         entry.release.notify_one();
         // Both probes now see every session retired, so both settles reach
         // the attention-write window: neither has cleared yet.
         for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(10), park.entered.notified())
-                .await
-                .expect("settle reaches the attention write window");
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                park.entered.notified(),
+            )
+            .await
+            .expect("settle reaches the attention write window");
         }
         park.release.notify_one();
         park.release.notify_one();
@@ -50606,7 +50794,7 @@ mod idempotency_serialization {
         cp.started.recv().await.expect("held op in flight");
 
         let other = tokio::time::timeout(
-            Duration::from_secs(30),
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
             with_idempotency(
                 &race.inflight,
                 &store,

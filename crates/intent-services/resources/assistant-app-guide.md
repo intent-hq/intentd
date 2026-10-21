@@ -60,7 +60,7 @@ Open Settings and use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
-| Appearance | Theme, colors, language, and fonts | `/settings?tab=display#theme` |
+| Appearance | Theme, colors, language, fonts, and chat display (such as Collapse tool activity) | `/settings?tab=display#theme` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
@@ -70,6 +70,18 @@ Open Settings and use these sidebar labels (English labels shown):
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ConnectionsSettings,GitLabAuthConnection,GitLabChildGitSetting}.svelte; messages/en.json. -->
+
+When explicitly asked about experimental GitLab terminal access, open **Connections
+→ Accounts → GitLab → Use GitLab account for terminal Git**. Only the connected
+host's owner can change this choice, and the daemon must support it. It defaults
+off for a new account or instance. Wait for the saved acknowledgement; an unavailable
+status does not mean off. Use **Refresh** to check the current choice after an error.
+Intent's own authorized Git operations work with this off. Enabling it lets terminal
+and agent Git commands request credentials for that account and full instance; it
+does not sign in `glab`. The GitLab section can remain visible for a configured
+account even when Labs is off; do not infer permission or readiness from visibility.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
@@ -90,8 +102,28 @@ suggest an Apple Silicon build for an Intel Mac.
 
 <!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
 
+## Anonymous update statistics
+
+Update checks go through `updates.intentapp.dev`, which counts them (platform,
+version, channel, install source, check trigger, country; no IDs, IPs not stored)
+and redirects to the GitHub release; if it is unreachable, updates come straight
+from GitHub. The desktop app's switch is **Settings → General → Updates → Share
+anonymous update statistics** (on by default). For standalone intentd, set `DO_NOT_TRACK=1`,
+`INTENTD_DISABLE_TELEMETRY=1`, or `telemetry = false` in
+`<data-dir>/sitter/config.toml`.
+
+On the stable channel, standalone intentd checks for updates automatically at most
+once per UTC day (at startup if it has not checked that day, otherwise within the
+first hour after midnight UTC) and restarts into an update once no agent turn is
+running, forcing the restart only after 24 hours. Alpha and beta still check
+hourly when idle. `intentd update` always checks immediately.
+
+<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,updater.rs,config.rs,supervisor.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
+
 ## Manage Assistant chats
 
+A new Assistant chat names itself during its first reply; until then the chat list
+previews the first message. A name the user sets by renaming the chat is kept.
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
 Use `ws.app.chats.list` to identify it and read only the relevant conversation slice.
 Ask which chat they mean if several match. Apply a rename or deletion only when
@@ -102,7 +134,7 @@ Deletion uses the app's 15-second undo window. Report the deletion as scheduled;
 `ws.app.chats.cancelDelete` can undo it before the returned deadline. It cannot
 recover a chat after deletion has completed.
 
-<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/chats.rs; packages/cloudlands-fe/src/lib/components/chat/assistant-thread-rename.svelte.ts; packages/cloudlands-fe/src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; packages/cloudlands-fe/src/features/agent/utils/pending-agent-deletions.ts. -->
+<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/chats.rs; packages/intentd/crates/intent-services/src/agent_manager.rs; packages/cloudlands-fe/src/store/renderer/slices/sidebar-nav/chief-thread-title.ts; packages/cloudlands-fe/src/lib/components/chat/assistant-thread-rename.svelte.ts; packages/cloudlands-fe/src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; packages/cloudlands-fe/src/features/agent/utils/pending-agent-deletions.ts. -->
 
 ## Choose a model or change agent behavior
 
@@ -111,8 +143,9 @@ recover a chat after deletion has completed.
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
 the workspace creation form where offered. Available choices depend on configured
-providers; diagnose a missing provider in **Providers**. Do not promise a default
-change will switch an existing agent. Specialist entries appear
+providers; diagnose a missing provider in **Providers**. Changing a default provider
+or model affects new agents only; each existing agent keeps its own provider, model
+and reasoning level until changed in its own model picker. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
 `/settings?tab=specialists&view=create-specialist#create-specialist`; select an
 existing specialist to edit its behavior. Global defaults and a specialist's
@@ -128,8 +161,9 @@ CLI with its own environment variables, for example a work and a personal accoun
 or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
 choose **Add profile**: enter a name and environment variables (literal values,
 **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` to choose an account; the user signs in or prepares that
-account outside Intent. Credentials inherited from the environment can still
+`CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
+the provider host user's home folder (`~user` stays literal). The user signs in or
+prepares that account outside Intent. Credentials inherited from the environment can still
 apply: for a Claude Code profile that should use another account (or none), set
 inherited variables such as `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY` to
 **Unset** in that profile. Codex signed in with a ChatGPT account may ignore a
@@ -137,7 +171,9 @@ custom base URL from the environment; for a different endpoint, give the profile
 its own `CODEX_HOME` whose Codex configuration sets it. Saving does not prove sign-in: the status shows
 **Configured**, **Checking…**, **Ready**, or **Not signed in**. Each profile
 appears as its own model-picker group, such as **Codex · Work**; with profiles,
-the original configuration is **Codex · Default**. Delegated agents follow their
+the original configuration is **Codex · Default**. Each profile has its own **Fast
+mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
+never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
 
 Switching a conversation to another profile, even with the same model, applies on
@@ -272,10 +308,9 @@ Changes you make in the form are kept when you switch repositories.
 An agent can suggest a follow-up workspace as a card in its conversation. Review
 it and choose **Create workspace** on the card, or ask the agent to apply it.
 Unless the agent named one, the card starts with the agent last used in New
-workspace for that repository, and shows the model and reasoning effort it will use
-while that agent stays selected. The
-new workspace opens as a tab at the end of the top tab strip, and the current
-workspace stays selected.
+workspace for that repository, and uses that agent's last model and reasoning
+effort while it stays selected. The new workspace opens as a tab at the end of
+the top tab strip, and the current workspace stays selected.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
@@ -292,6 +327,26 @@ When an agent monitors a GitHub pull request, its conversation shows the monitor
 PR and its latest status. Required checks that are still running or failing can
 block merging. If monitoring is paused or information is unavailable, wait for a
 fresh status before treating the PR as ready.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts} (connection-drop demotion); packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager}.rs; packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
+
+When a Claude Code agent starts work in the background, such as a dev server
+command, its conversation shows a row for it marked **Running**. When the
+conversation has several events, they are grouped under a **Subscribed to N
+events** header that may need expanding. Expanding the row shows the task type
+and when Intent first saw it. If the row has a **…** menu, **Stop** ends that
+task without interrupting the agent; the row shows **Stopping…** and disappears
+once the agent reports it stopped. Rows that end on their own disappear too.
+**Connection lost** means Intent can no longer observe the task, so whether it
+is still running is unknown; it is not proof that the task stopped. After the
+app reconnects to Intent, the row returns to **Running** if fresh status shows
+the task still running. If it stays Connection lost, the agent's connection ended, most often
+because an idle agent was closed after **Settings → Advanced → Agent backend →
+Idle reap minutes** (10 by default; Off disables it) or under memory pressure,
+and the task has probably ended with it. Before telling the user it stopped,
+confirm independently, for example by checking whether the dev server still
+responds. Such a row has no Stop and clears the next time the agent starts.
+Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
 
@@ -310,13 +365,19 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/script_monitor.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-services/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
-or edit its full definition. Output is temporary and may no longer be available after a restart. Script watches show
+or edit its full definition. Output from each script's latest run is saved and
+stays available after a restart or archive. Saved output is cleared 7 days (by
+default) after it was last written, when you delete the script, or when you delete
+the workspace, which also stops its scripts. Output of a script that is still running
+is never cleared by age. Very long runs keep only their most recent output. Script watches show
 only active monitors and disappear when they finish, trigger, expire, or are
-cancelled; completion notices remain in the agent conversation.
+cancelled; completion notices remain in the agent conversation. An automatic
+background update waits for running one-off (command) scripts to finish, for up
+to 90 minutes, before restarting; long-running service scripts do not delay it.
 
 To delete a saved script, use **Delete script** beside its play/edit controls in
 the bottom bar, or open the script panel's **…** menu and choose **Delete script**
@@ -357,20 +418,45 @@ title in the conversation header. The title field uses the available header widt
 Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
 select conversations and cannot be edited there.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 
 In **Home → Workspaces**, PR badges update as Intent observes changes.
 **Queued** means the PR is in the merge queue, including while queue checks
 are running. You do not need to open the workspace or hover over the PR to
 receive these updates.
 
-In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/ui/tooltip/GitHubLinkCard.svelte; src/lib/components/chat/MonitoredPrsRow.svelte; src/lib/components/workspace/sidebar/sidebar-changes-utils.ts; src/lib/utils/merge-queue.ts. -->
+
+For a queued GitHub PR, the PR link hover card, the chat **Monitoring PR** row,
+and the sidebar PR tooltip also show its place in the queue (for example,
+**2nd of 3**) and GitHub's estimated time to merge when GitHub provides one.
+Home badges show only **Queued**. Agents see the position when they request a
+PR snapshot; queue movement alone does not wake them.
+
+In **Home → Pull requests**, select a PR to open its preview. If the PR is linked
+to a workspace, double-click the row to open that workspace directly. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
 open status groups. Collapse a group to hide its checks. **Code** lists changed
 files with their directory paths. Search by filename or path, then click a file to
 expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeIntegrations,HomeRepositorySummary,HomeReviewConversation}.svelte; src/features/home/{home-repository-discovery-saga,home-integrations-saga,home-review-threads}.ts; messages/en.json. -->
+
+For the experimental GitLab review flow, open **Home → Pull requests**. The inner
+list is labeled **Merge requests** for GitLab alone or **Pull and merge requests**
+with both forges. It reads selected, known repositories through the current
+connection. **Closed / merged** includes merged and unmerged-closed MRs. Use
+**Load more** when offered, including after an empty filtered page. **Summary**
+shows the qualified project, description, available checks and approvals, merge
+requirements, and discussions with replies. Restricted, unknown, partial or
+unsupported information does not establish merge readiness. **Review head** and
+**Note diff head** distinguish the current review from a note's code position.
+The GitLab preview has no **Code** tab. Use **Review on GitLab** for provider-side
+actions. **Start workspace** opens the existing creation form with the qualified
+item; it does not automatically check out the MR source head. The separate
+**Linear issues** section is unchanged.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
 
@@ -385,9 +471,13 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
 
-In **Home → Workspaces**, open **View options → Group by** in either list or board
+In **Home → Workspaces**, click a list row or board card to select it and show its
+preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
+workspace directly.
+
+Open **View options → Group by** in either list or board
 view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
 **Done & idle** groups. The **PR ready** board column appears only when matching
 workspaces remain visible. In list view, **Status** groups workspace statuses in
@@ -400,6 +490,10 @@ this order:
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
+
+Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
+**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
+activity first within the pinned and unpinned groups.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
@@ -485,12 +579,13 @@ details**. These are counts of recorded notices, not total attempts or proof tha
 all failures belong to the same request. A historical notice alone does not mean
 the agent is still failing; check the current status and latest response.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op, clear_daemon_stall_blocker_after_success); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
 
 A current blocker warning means an agent reported a problem that prevents work.
 After confirming recovery, the agent can clear its warning while a release or
-scheduled check is still pending. A recorded blocker notice can remain in the
-conversation after the current warning clears.
+scheduled check is still pending. A blocker Intent raised because the provider
+stalled clears on its own after the agent's next successful turn. A recorded
+blocker notice can remain in the conversation after the current warning clears.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
 
@@ -518,6 +613,20 @@ If Pi works in a terminal but fails in Intent, copy the conversation's failure
 details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/providers/components/ProviderCliVersionToast.svelte; src/features/providers/utils/provider-cli-warnings.ts; src/store/renderer/slices/host-requirements/sagas/provider-cli-requirements-saga.ts. Daemon: packages/intentd/crates/intent-services/src/{bundled_cli.rs,installed_cli.rs,provider_cli.rs}. -->
+
+When the daemon host's Codex or Claude Code CLI is older than Intent requires,
+Intent runs its own bundled copy of that CLI instead, downloading it with npm on
+first use. Sessions keep using the installed CLI's sign-in and settings. The host
+owner sees a warning that Intent is using its bundled CLI (older apps show
+**CLI is out of date**). Updating the installed CLI makes Intent switch back to
+it. For Codex, **Update** runs `codex update` in a terminal on the daemon host;
+follow its output until it finishes. If the button is missing or the command
+fails, update the CLI with the tool that installed it. If the bundled download
+fails (for example, offline or without npm), Codex launches report the
+installed version, the required minimum, and the download error; Claude Code
+keeps using the installed CLI.
 
 ## Missed display updates
 
@@ -563,6 +672,17 @@ In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
+
+When testing experimental GitLab context suggestions, choose **GL Issues** or
+**GL MRs** in workspace creation or the workspace context picker. Search the
+selected projects; **Use link** accepts an explicit project URL where offered.
+**Refresh** and **Load more** operate on that selection. Unsupported filters and
+partial results remain explicit. Selecting an item attaches its qualified context;
+it does not automatically check out the MR's source branch. Availability depends
+on the current connection, repository access and supported daemon.
+
 When a supported note deletion offers **Undo**, it cancels a pending deletion during
 the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the
@@ -582,7 +702,10 @@ available actions. Never construct links from guessed IDs or claim completion fr
 this static guide.
 
 Workspace file links open a file panel. Markdown files open in a read-only preview
-that renders Mermaid diagrams. Use the diagram's **View source** action to inspect
+that renders Mermaid diagrams. For files in the main workspace checkout, relative image paths such as
+`charts/chart.png` resolve from the Markdown file's folder and cannot reach
+outside the workspace; files from other registered repositories do not resolve them.
+Use the diagram's **View source** action to inspect
 its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
@@ -592,7 +715,9 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
-<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts. -->
+Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 
 ## Daemon lifecycle from the terminal
 

@@ -454,6 +454,7 @@ fn build_inner(
         auth_required_stdout_marker: None,
         requests: Some(req_tx),
         notifications: Some(note_tx),
+        workers: None,
         auth_error_patterns: auth_patterns,
         stderr_log_dir: None,
         agent_id: None,

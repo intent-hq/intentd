@@ -255,9 +255,10 @@ async fn prompt_exchange(
             .unwrap();
         frame
     };
-    let (result, frame) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(request, peer)
-    })
+    let (result, frame) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async { tokio::join!(request, peer) },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -373,10 +374,13 @@ async fn context_output_actual_settings_publication_order_and_origin_only_revisi
         });
         publication.reached().await;
         final_hold.resume();
-        let result = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             result.to_string().contains(FACTS),
             mode != "auth",
@@ -442,10 +446,13 @@ async fn context_output_busy_snapshot_and_optional_provider_fence_omit_without_w
         });
         held.reached().await;
         gate.resume();
-        let result = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(result.to_string().contains("ordinary-complete"), "{result}");
         assert!(!result.to_string().contains(FACTS), "{result}");
         held.release();
@@ -806,10 +813,13 @@ async fn context_output_actual_outer_settings_writers_release_metadata_before_sn
         });
         hold.reached().await;
         gate.resume();
-        let reply = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             reply
                 .to_string()
@@ -1009,10 +1019,13 @@ async fn context_output_shared_provider_poison_refuses_required_but_omits_option
         .join()
         .is_err());
         gate.resume();
-        let reply = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!reply.to_string().contains(FACTS));
         if required {
             assert!(
@@ -1065,10 +1078,13 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
         held.reached().await;
         final_gate.resume();
         if mode == "optional-busy" {
-            let reply = tokio::time::timeout(Duration::from_secs(15), &mut task)
-                .await
-                .unwrap()
-                .unwrap();
+            let reply = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                &mut task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(reply.to_string().contains("mixed-lock-result"), "{reply}");
             assert!(!reply.to_string().contains(FACTS));
             held.resume();
@@ -1085,10 +1101,13 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
             }
             held.resume();
             holder.await.unwrap();
-            let reply = tokio::time::timeout(Duration::from_secs(15), task)
-                .await
-                .unwrap()
-                .unwrap();
+            let reply = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             if mode == "shared-retired" {
                 assert!(
                     reply

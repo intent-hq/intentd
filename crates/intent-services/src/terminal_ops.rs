@@ -230,14 +230,47 @@ async fn default_cwd(
 /// spawn actually uses: the helpers already configured there are re-added
 /// behind intentd's, so a repository-local one stays reachable
 /// (monorepo#3059).
+/// The configured full GitLab root also receives a helper entry. Its owner-only
+/// policy is checked on every request, so already-running terminals observe
+/// later enable/disable/refresh without carrying a daemon token in their env.
 pub(crate) fn git_credential_env(
     settings: Option<&SettingsRegistry>,
     cwd: Option<&Path>,
 ) -> Vec<(String, String)> {
-    if !expose_git_credential(settings) {
+    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
         return Vec::new();
     }
-    credential_pairs(cwd)
+    let github = if expose_git_credential(settings) {
+        credential_pairs(cwd)
+    } else {
+        Vec::new()
+    };
+    let Some(settings) = settings else {
+        return github;
+    };
+    let config = settings.snapshot().effective.source_control.gitlab.clone();
+    let Ok(instance) = crate::source_control_auth_ops::repository_owner::logical_instance(&config)
+    else {
+        return github;
+    };
+    let Some(intentd) = crate::daemon_exe_path() else {
+        return github;
+    };
+    let inherited = github
+        .iter()
+        .find(|(key, _)| key == intent_git::auth::GIT_CONFIG_PARAMETERS_ENV)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok());
+    let gitlab = intent_git::auth::daemon_gitlab_helper_env(
+        &intentd,
+        instance.as_str(),
+        inherited.as_deref(),
+    );
+    if gitlab.is_empty() {
+        github
+    } else {
+        gitlab
+    }
 }
 
 /// All git env pairs injected under the caller's overlay for a spawn in
@@ -1154,9 +1187,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         drop(held);
-        tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drain,
+        )
+        .await
+        .unwrap();
         bus.shutdown().await.unwrap();
         let events = store
             .query_events(&intent_store::EventQuery::default())
@@ -1405,13 +1441,25 @@ mod tests {
         )));
     }
 
-    /// The gate short-circuits injection: no registry and setting-off both
-    /// yield no pairs.
+    /// The GitHub gate suppresses its helper only. GitLab remains registered
+    /// for its full root, with credential release gated by the owner policy.
     #[test]
     fn git_credential_env_respects_gate() {
+        let _env = crate::agent_manager::tests::EnvGuard::apply(&[(
+            intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
+            None,
+        )]);
         assert!(git_credential_env(None, None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
-        assert!(git_credential_env(Some(&off), None).is_empty());
+        let pairs = git_credential_env(Some(&off), None);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, intent_git::auth::GIT_CONFIG_PARAMETERS_ENV);
+        let parameters = &pairs[0].1;
+        assert!(!parameters.contains("credential.https://github.com.helper="));
+        assert!(parameters.contains("credential.https://gitlab.com.helper="));
+        assert!(parameters.contains("credential.https://gitlab.com.useHttpPath=true"));
+        assert!(parameters.contains("http.https://gitlab.com.followRedirects=false"));
+        assert!(parameters.contains("git-credential"));
     }
 
     /// Gate on ⇒ exactly the single daemon-backed helper pair: the

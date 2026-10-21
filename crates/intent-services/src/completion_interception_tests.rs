@@ -330,8 +330,11 @@ mod tests {
         );
 
         // Assert: sandbox:cow:merged event was emitted
-        let merged_event =
-            tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
+        let merged_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            merged_sub.recv(),
+        )
+        .await;
         assert!(
             merged_event.is_ok(),
             "sandbox:cow:merged event should be emitted"
@@ -937,7 +940,7 @@ mod tests {
         let caller =
             intent_core::spawn_daemon(async move { owner.sweep_merge_pending_sandboxes().await });
         timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             services.sandbox_merge_marked.notified(),
         )
         .await
@@ -962,20 +965,26 @@ mod tests {
         let owner = services.clone();
         let mut drain =
             intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-        let pending = timeout(Duration::from_secs(5), async {
-            tokio::select! {
-                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
-                result = &mut drain => { result.unwrap(); false }
-            }
-        })
+        let pending = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                tokio::select! {
+                    point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+                    result = &mut drain => { result.unwrap(); false }
+                }
+            },
+        )
         .await
         .unwrap();
         let _ = release.send(());
         if pending {
-            timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         }
         assert!(pending, "shutdown discarded marked merge cleanup and event");
         bus.shutdown().await.unwrap();
@@ -1033,8 +1042,11 @@ mod tests {
             repo_path.join("swept.txt").exists(),
             "Swept commit should land in canonical"
         );
-        let merged_event =
-            tokio::time::timeout(std::time::Duration::from_secs(1), merged_sub.recv()).await;
+        let merged_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            merged_sub.recv(),
+        )
+        .await;
         assert!(
             merged_event.is_ok(),
             "sandbox:cow:merged event should be emitted by the sweep"

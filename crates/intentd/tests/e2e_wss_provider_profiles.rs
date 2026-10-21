@@ -648,13 +648,6 @@ async fn provider_profile_selection_surfaces_over_wss() {
 
     // An agent on the profile: no activation state while nothing runs, and
     // after removal its next turn needs an explicit replacement.
-    ok(
-        &mut ws,
-        7,
-        "settings.update",
-        json!({ "changes": [{ "path": "providers.paths", "value": { "codex": "/bin/sh" } }] }),
-    )
-    .await;
     let workspace = ok(
         &mut ws,
         8,

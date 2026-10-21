@@ -16,6 +16,7 @@ use intentd_sitter::cli::Channel;
 use intentd_sitter::manifest::TARGET_TRIPLE;
 use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME};
 use intentd_sitter::state::{self, SitterState};
+use intentd_sitter::telemetry::{CheckTrigger, InstallSource, UpdateEndpoint};
 use intentd_sitter::updater::{UpdateError, UpdateOutcome, Updater};
 
 /// Minimal single-purpose HTTP/1.1 fixture server: serves a fixed
@@ -199,7 +200,9 @@ fn happy_path_downloads_verifies_installs_and_updates_state() {
     let base_url = serve_release("0.2.0", b"#!/bin/sh\necho fake daemon 0.2.0\n", false);
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::Installed {
@@ -238,7 +241,9 @@ fn sha256_mismatch_is_rejected_and_nothing_installed() {
     let base_url = serve_release("0.2.0", b"evil bytes", true);
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::Sha256Mismatch { .. }),
         "expected Sha256Mismatch, got {err:?}"
@@ -257,7 +262,9 @@ fn invalid_manifest_version_is_rejected_and_nothing_installed() {
     let base_url = serve_release("../not-semver", b"evil bytes", false);
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::InvalidManifestVersion { .. }),
         "expected InvalidManifestVersion, got {err:?}"
@@ -274,7 +281,9 @@ fn network_down_is_a_soft_failure() {
     let base_url = unreachable_base();
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::Network { .. }),
         "expected Network, got {err:?}"
@@ -289,7 +298,9 @@ fn http_error_status_is_a_soft_failure() {
     let base_url = serve(HashMap::new()); // every path 404s
 
     let updater = Updater::with_base_url(paths, &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::HttpStatus { status, .. } if status.as_u16() == 404),
         "expected HttpStatus 404, got {err:?}"
@@ -305,7 +316,9 @@ fn noop_when_manifest_is_equal_or_older() {
         let base_url = serve_release(manifest_version, b"newer bytes", false);
 
         let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-        let outcome = updater.check_and_install(Channel::Stable).unwrap();
+        let outcome = updater
+            .check_and_install(Channel::Stable, CheckTrigger::Manual)
+            .unwrap();
         assert_eq!(
             outcome,
             UpdateOutcome::AlreadyCurrent {
@@ -334,7 +347,9 @@ fn reinstalls_when_state_points_at_a_missing_binary() {
     let base_url = serve_release("0.2.0", b"restored daemon", false);
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::Installed {
@@ -355,7 +370,9 @@ fn channel_recovers_missing_newer_binary_from_older_release() {
     let updater = Updater::with_base_url(paths.clone(), base).unwrap();
 
     assert_eq!(
-        updater.check_and_install(Channel::Stable).unwrap(),
+        updater
+            .check_and_install(Channel::Stable, CheckTrigger::Manual)
+            .unwrap(),
         UpdateOutcome::Installed {
             version: "1.2.0".into(),
             previous: Some("1.3.0".into()),
@@ -381,7 +398,9 @@ fn unknown_manifest_schema_is_a_soft_failure() {
     let base_url = serve(routes);
 
     let updater = Updater::with_base_url(paths, &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::Manifest(_)),
         "expected Manifest, got {err:?}"
@@ -400,7 +419,9 @@ fn missing_platform_entry_is_a_soft_failure() {
     let base_url = serve(routes);
 
     let updater = Updater::with_base_url(paths, &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     assert!(
         matches!(err, UpdateError::NoPlatformEntry { .. }),
         "expected NoPlatformEntry, got {err:?}"
@@ -438,7 +459,7 @@ fn omitted_platform_keeps_installed_daemon_and_state_without_architecture_fallba
     )]));
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
     assert!(matches!(
-        updater.check_and_install(Channel::Stable),
+        updater.check_and_install(Channel::Stable, CheckTrigger::Manual),
         Err(UpdateError::NoPlatformEntry { .. })
     ));
     assert_eq!(fs::read(&paths.state_path).unwrap(), previous_state);
@@ -459,7 +480,9 @@ fn prune_keeps_current_and_one_previous_version() {
     let base_url = serve_release("0.3.0", b"daemon 0.3.0", false);
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::Installed {
@@ -503,7 +526,9 @@ fn primary_base_is_preferred_when_both_bases_serve() {
     let fallback = serve_release("0.2.0", b"daemon from fallback", false);
 
     let updater = Updater::with_base_urls(paths.clone(), [primary, fallback]).unwrap();
-    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::Installed {
@@ -534,7 +559,9 @@ fn falls_back_to_second_base_when_primary_manifest_fetch_fails() {
         let fallback = serve_release("0.2.0", b"daemon from fallback", false);
 
         let updater = Updater::with_base_urls(paths.clone(), [primary, fallback]).unwrap();
-        let outcome = updater.check_and_install(Channel::Stable).unwrap();
+        let outcome = updater
+            .check_and_install(Channel::Stable, CheckTrigger::Manual)
+            .unwrap();
         assert_eq!(
             outcome,
             UpdateOutcome::Installed {
@@ -559,7 +586,9 @@ fn all_bases_failing_reports_the_last_error() {
     let fallback = serve(HashMap::new());
 
     let updater = Updater::with_base_urls(paths.clone(), [primary, fallback.clone()]).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     match err {
         UpdateError::HttpStatus { url, status } => {
             assert_eq!(status.as_u16(), 404);
@@ -661,7 +690,9 @@ fn losing_an_install_race_keeps_the_concurrent_winners_state() {
     });
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let outcome = updater.check_and_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::AlreadyCurrent {
@@ -690,7 +721,9 @@ fn force_install_still_overwrites_a_concurrent_newer_install() {
     });
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let outcome = updater.force_install(Channel::Stable).unwrap();
+    let outcome = updater
+        .force_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap();
     assert_eq!(
         outcome,
         UpdateOutcome::Installed {
@@ -711,7 +744,9 @@ fn with_base_url_means_exactly_one_base_and_never_falls_back() {
     let base_url = serve(HashMap::new());
 
     let updater = Updater::with_base_url(paths.clone(), &base_url).unwrap();
-    let err = updater.check_and_install(Channel::Stable).unwrap_err();
+    let err = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Manual)
+        .unwrap_err();
     match err {
         UpdateError::HttpStatus { url, status } => {
             assert_eq!(status.as_u16(), 404);
@@ -915,4 +950,245 @@ fn exact_install_reports_a_concurrent_newer_winner_without_downgrading() {
     );
     assert!(paths.daemon_binary("1.3.0").exists());
     assert!(!paths.daemon_binary("1.2.0").exists());
+}
+
+// ---- update-check endpoint (updates.intentapp.dev) → GitHub fallback ----
+
+/// How the stub update-check endpoint answers.
+#[derive(Clone)]
+enum Endpoint {
+    NotFound,
+    /// Holds the connection open past the client timeout.
+    Slow,
+    /// 302 to `Location`.
+    Redirect(String),
+    /// 200 with a manifest body: a proxying (compromised) endpoint.
+    Serve(Vec<u8>),
+}
+
+/// `(request target, User-Agent)` per request the stub endpoint received.
+type RequestLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// Stub endpoint recording each request's target and `User-Agent`.
+fn serve_endpoint(behaviour: Endpoint) -> (String, RequestLog) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let behaviour = behaviour.clone();
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    return;
+                }
+                let mut user_agent = String::new();
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(_) if header != "\r\n" && !header.is_empty() => {
+                            if let Some((name, value)) = header.split_once(':') {
+                                if name.eq_ignore_ascii_case("user-agent") {
+                                    user_agent = value.trim().to_string();
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                log.lock().unwrap().push((target, user_agent));
+                let (head, body) = match behaviour {
+                    Endpoint::NotFound => ("404 Not Found".to_string(), b"nope".to_vec()),
+                    Endpoint::Slow => {
+                        // timing-guard: simulates a slow endpoint; the client times out long before this
+                        thread::sleep(std::time::Duration::from_secs(5));
+                        ("200 OK".to_string(), Vec::new())
+                    }
+                    Endpoint::Redirect(location) => {
+                        (format!("302 Found\r\nLocation: {location}"), Vec::new())
+                    }
+                    Endpoint::Serve(body) => ("200 OK".to_string(), body),
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    (base_url, seen)
+}
+
+fn endpoint(base_url: &str) -> UpdateEndpoint {
+    UpdateEndpoint {
+        base_url: base_url.to_string(),
+        install_source: InstallSource::Script,
+        timeout: std::time::Duration::from_millis(500),
+    }
+}
+
+/// Run one check with `endpoint_url` in front of a local GitHub stand-in
+/// serving 0.2.0.
+fn install_with_endpoint(
+    endpoint_url: &str,
+    trigger: CheckTrigger,
+) -> (tempfile::TempDir, SitterPaths, UpdateOutcome) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let github = serve_release("0.2.0", b"fake daemon 0.2.0", false);
+    let updater = Updater::with_base_url(paths.clone(), &github)
+        .unwrap()
+        .with_update_endpoint(Some(endpoint(endpoint_url)));
+    let outcome = updater.check_and_install(Channel::Stable, trigger).unwrap();
+    (dir, paths, outcome)
+}
+
+fn assert_installed_from_github(outcome: &UpdateOutcome, paths: &SitterPaths) {
+    assert_eq!(
+        *outcome,
+        UpdateOutcome::Installed {
+            version: "0.2.0".to_string(),
+            previous: None,
+        }
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+}
+
+#[test]
+fn endpoint_down_installs_from_github_fallback() {
+    let (_dir, paths, outcome) = install_with_endpoint("http://127.0.0.1:1", CheckTrigger::Daily);
+    assert_installed_from_github(&outcome, &paths);
+    // A failed endpoint check is not recorded as today's check.
+    assert_eq!(state::load(&paths.state_path).last_check_day, None);
+}
+
+#[test]
+fn endpoint_404_installs_from_github_fallback() {
+    let (url, seen) = serve_endpoint(Endpoint::NotFound);
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Idle);
+    assert_installed_from_github(&outcome, &paths);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn slow_endpoint_installs_from_github_fallback() {
+    let (url, seen) = serve_endpoint(Endpoint::Slow);
+    let started = std::time::Instant::now();
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
+    assert_installed_from_github(&outcome, &paths);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn endpoint_request_carries_only_allowlisted_params_and_user_agent() {
+    let (url, seen) = serve_endpoint(Endpoint::NotFound);
+    let (_dir, paths, _) = install_with_endpoint(&url, CheckTrigger::Manual);
+    let seen = seen.lock().unwrap();
+    let (target, user_agent) = &seen[0];
+    assert_eq!(
+        *target,
+        format!(
+            "/channel/stable.json?p={TARGET_TRIPLE}&v={}&src=script&k=manual&d=1",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(
+        *user_agent,
+        format!(
+            "intentd-sitter/{} ({TARGET_TRIPLE})",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(state::load(&paths.state_path).last_check_day, None);
+}
+
+#[test]
+fn endpoint_redirect_to_another_host_falls_back_to_github() {
+    // Even a redirect to a server that serves a valid manifest is refused
+    // unless it is the official GitHub channel asset.
+    let decoy = serve_release("9.9.9", b"decoy daemon", false);
+    let (url, seen) = serve_endpoint(Endpoint::Redirect(format!(
+        "{decoy}/channel-stable/stable.json"
+    )));
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
+    assert_installed_from_github(&outcome, &paths);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn endpoint_redirect_to_another_repo_or_channel_falls_back_to_github() {
+    for location in [
+        "https://github.com/intent-hq/cloudlands-releases/releases/download/channel-stable/stable.json",
+        "https://github.com/intent-hq/intentd-releases/releases/download/channel-alpha/alpha.json",
+        "https://evil.example/channel-stable/stable.json",
+    ] {
+        let (url, seen) = serve_endpoint(Endpoint::Redirect(location.to_string()));
+        let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
+        assert_installed_from_github(&outcome, &paths);
+        assert_eq!(seen.lock().unwrap().len(), 1, "{location}");
+    }
+}
+
+#[test]
+fn endpoint_serving_a_manifest_itself_is_refused() {
+    // A compromised endpoint answering 200 with its own manifest (pointing
+    // at its own archive) must never be installed from.
+    let decoy = serve_release("9.9.9", b"decoy daemon", false);
+    let body = http_get(&format!("{decoy}/channel-stable/stable.json"));
+    let (url, _) = serve_endpoint(Endpoint::Serve(body));
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
+    assert_installed_from_github(&outcome, &paths);
+}
+
+#[test]
+fn config_opt_out_skips_the_endpoint() {
+    let (url, seen) = serve_endpoint(Endpoint::NotFound);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+    fs::write(&paths.config_path, "telemetry = false\n").unwrap();
+    let github = serve_release("0.2.0", b"fake daemon 0.2.0", false);
+    let updater = Updater::with_base_url(paths.clone(), &github)
+        .unwrap()
+        .with_update_endpoint(Some(endpoint(&url)));
+    let outcome = updater
+        .check_and_install(Channel::Stable, CheckTrigger::Daily)
+        .unwrap();
+    assert_installed_from_github(&outcome, &paths);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Plain HTTP GET of a local fixture URL (body only).
+fn http_get(url: &str) -> Vec<u8> {
+    let rest = url.strip_prefix("http://").unwrap();
+    let (host, path) = rest.split_once('/').unwrap();
+    let mut stream = TcpStream::connect(host).unwrap();
+    write!(
+        stream,
+        "GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    std::io::Read::read_to_end(&mut stream, &mut response).unwrap();
+    let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    response[split + 4..].to_vec()
 }

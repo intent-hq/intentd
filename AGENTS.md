@@ -75,6 +75,8 @@ only on `intent-services`, never on `intent-store`.
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
 | writing a source lint (`*_lint.rs`) | `crates/intentd-test-support/src/source_lint.rs` (lexer, markers, cfg(test) blanking, statement splitter, file walker); "Gates → source lints" below |
+| CI release / workflow scripts (`scripts/test-*` in ci.yml's `release-scripts` job) | `make test-release-scripts` (from `packages/intentd`; `make -C packages/intentd test-release-scripts` at the monorepo root) runs every test that job runs, in CI order, and skips suites that need CI-only tooling (release-plz, sccache, cargo-dist) with "SKIP <suite>: needs <X>" — a skipped suite is unverified, so install the tool when your change touches it; run it before pushing a change to `.github/workflows/*.yml` or `scripts/` (CI Gate's job list is pinned by `test-retire-obsolete-merge-runs-workflow.py`, intentd#2499) |
+| a test that needs a provider "installed", or passes locally but fails on CI with "not installed" | `crates/intent-services/src/test_support/provider_installed.rs` (mark a provider installed; Codex and Claude Code ignore `providers.paths` overrides, so `/bin/sh` overrides do nothing); `scripts/test-without-provider-clis.sh <command>` runs tests with every provider CLI hidden, the way CI's runners lack them (Linux, needs `bwrap`; CI's `check` job asserts its runners have none) |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
 
 ## Performance — the RPC cost contract
@@ -222,6 +224,7 @@ standalone clone they exit 2 and name the monorepo command):
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
 make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
@@ -229,7 +232,10 @@ scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same chan
 
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
+`cargo nextest run --workspace --show-progress none` — except that raw nextest leaves
+the callback fixture the `make` targets set unset, so intent-acp/intent-services callback
+tests fail in bulk (95 bogus failures while fixing #2559); run those via `make test-select`
+(Linux x64 only, like the fixture). Saved `ws.script` runs are
 PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
 environment (all three) and `--show-progress none` on the nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
@@ -255,6 +261,7 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `event_type_lint` | a `note:` / `task:` / `workspace:` / `agent:` string literal outside test code not in `intent_core::events::ALL_EVENT_TYPES`; add the type there, regenerate the golden `crates/intent-core/tests/goldens/event_types.json` with `INTENTD_UPDATE_GOLDENS=1`, and emit via the constant | `// event-type-lint: allow — <reason>` on the line above |
 | `running_turn_rule_lint` | an or-pattern outside test code and `crates/intent-core/src/model.rs` spelling exactly `AgentStatus::Pending \| Active \| Processing` (any order, `Self::` / qualified paths, `matches!` or match arm), or a string literal in non-test `crates/intent-store/src/**` containing both `'active'` and `'Processing'` (a hand-written SQL status list) — a fifth copy of the running-turn rule #2058 consolidated onto `AgentStatus::is_running_turn`; call the method, or generate the SQL list from `AgentStatus::ALL` filtered by it as `delegated_counts_sql` does | `// running-turn: allow — <reason>` on the line above the pattern / literal or its statement |
 | `fixed_sleep_lint` | `thread::sleep(` / `time::sleep(` / shell `sleep <n>` under `crates/*/tests/**` (intent-hq/intentd#1924); wait on an observable event instead | `// timing-guard: <reason>` on the line or the line above; `crates/intent-core/tests/fixed_sleep_baseline.txt` (`<path> <count>`) |
+| `fixed_deadline_lint` | a literal `Duration::from_*(…)` (not scaled by a non-literal `.mul_f64(m)` / `* m`) used as the budget of `timeout(` / `recv_timeout(` / `wait_timeout(` (either argument, for `Condvar`) / `wait_timeout_while(` / `wait_with_timeout(`, or added to `Instant::now()`, in test code (`crates/*/tests/**`, plus `#[cfg(test)]` / `#[cfg(all(test, …))]` items, `tests.rs` / `*_tests.rs` files, `tests/` dirs and test-module files under `src/`) — it ignores `INTENTD_TEST_TIMEOUT_MULTIPLIER` and flakes on slow coverage runners (intentd#2514); wrap it in `intentd_test_support::test_timeout(…)` | `// fixed-deadline: allow — <reason>` on the line above; `crates/intent-core/tests/fixed_deadline_baseline.txt` (`<path> <count>`; `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1` only lowers it) |
 | `raw_child_lint` | a test file naming `std::process::Child` as a type instead of holding an `intentd_test_support::GuardedChild` (borrows and `use` paths are not hits) | `// raw-child: allow — <reason>` on the line above; the lint's `BASELINE` |
 | `tmp_hygiene_lint` | a raw `PathBuf::from("/tmp")` / `Path::new("/tmp")` / `temp_dir().join(..)` in test code instead of `test_tempdir` | trailing `// tmp-hygiene: allow — <reason>` |
 | `repo_cache_path_lint` | a literal `".repo-cache"` in test code instead of `intent_git::repo_cache::cache_root_for` / `cache_path_for` | trailing `// repo-cache-path: allow — <reason>` |

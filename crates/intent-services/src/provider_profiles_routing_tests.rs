@@ -53,14 +53,12 @@ impl Fixture {
             svc,
             ws,
         };
-        // Deterministic availability for both bases (no provider process is
-        // launched — Services has no agent manager). Codex and Claude Code
-        // are npx-only and ignore executable overrides, so the test-only
-        // marker keeps availability independent of the host's Node/npx.
-        let runnable = crate::agent_ops::TEST_RUNNABLE_PATH;
+        // Deterministic availability for both bases, independent of the
+        // host's Node/npx and provider CLIs (no provider process is
+        // launched — Services has no agent manager).
         fx.set(
             "providers.paths",
-            json!({ "codex": runnable, "claude-code": runnable }),
+            crate::test_support::provider_installed::paths_json(&["codex", "claude-code"]),
         );
         fx
     }

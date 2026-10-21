@@ -377,10 +377,13 @@ async fn publish_lifecycle(bus: &crate::EventBus, ws: &WorkspaceId, event_type: 
 }
 
 async fn recv_locks_event(sub: &mut crate::Subscription) -> serde_json::Value {
-    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-        .await
-        .expect("changes:agent-locks delivered")
-        .expect("subscription open");
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("changes:agent-locks delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1, "expected exactly one lock event");
     serde_json::to_value(&batch[0]).expect("serialize event")
 }

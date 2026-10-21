@@ -353,6 +353,7 @@ async fn routes_requests_and_notifications() {
     let hooks = ConnectionHooks {
         requests: Some(req_tx),
         notifications: Some(note_tx),
+        workers: None,
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
         auth_required_stdout_marker: None,

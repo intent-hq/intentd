@@ -309,9 +309,10 @@ async fn annotation_service_revocation_after_store_result_withholds_success_and_
                 .unwrap();
             boundary.release.notify_one();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(read, revoke)
-        })
+        let (result, ()) = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            async { tokio::join!(read, revoke) },
+        )
         .await
         .unwrap();
         assert!(
@@ -375,9 +376,10 @@ async fn demand_note_service_revocation_withholds_ready_and_preparing_results() 
                 .unwrap();
             boundary.release.notify_one();
         };
-        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(read, revoke)
-        })
+        let (result, ()) = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            async { tokio::join!(read, revoke) },
+        )
         .await
         .unwrap();
         assert!(

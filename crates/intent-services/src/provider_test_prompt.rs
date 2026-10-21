@@ -201,6 +201,10 @@ pub(crate) async fn provider_test_prompt_for<S: std::hash::BuildHasher>(
     ) {
         cmd = cmd.env(key, value);
     }
+    // A named profile reads its own `providers.fastMode` entry only.
+    let fast_mode_selection = profile
+        .as_ref()
+        .map_or_else(|| provider_id.to_owned(), |p| p.provider_ref().to_owned());
     let cmd = crate::complete_ops::apply_one_shot_launch_policy(provider, cmd)
         .with_profile(profile.clone());
     let cmd = match cmd.prepare_installed().await {
@@ -218,7 +222,7 @@ pub(crate) async fn provider_test_prompt_for<S: std::hash::BuildHasher>(
                         .ok()
                         .and_then(|v| {
                             v.get("value")
-                                .and_then(|m| m.get(provider_id))
+                                .and_then(|m| m.get(fast_mode_selection.as_str()))
                                 .and_then(Value::as_bool)
                         })
                         .unwrap_or(false),

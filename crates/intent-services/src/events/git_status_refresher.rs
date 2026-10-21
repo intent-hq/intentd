@@ -463,9 +463,12 @@ mod tests {
         let refresher =
             GitStatusRefresher::start(bus.clone(), api.clone(), Arc::new(GitStatusCache::new()));
         refresher.trigger(ws.id.clone());
-        timeout(Duration::from_secs(10), api.entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            api.entered.notified(),
+        )
+        .await
+        .unwrap();
         let late_trigger = refresher.trigger_tx.clone();
         let shutdown = refresher.shutdown();
         tokio::pin!(shutdown);
@@ -479,9 +482,12 @@ mod tests {
         let _ = late_trigger.send(ws.id.clone());
         api.release.notify_one();
         if !escaped {
-            timeout(Duration::from_secs(10), &mut shutdown)
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                &mut shutdown,
+            )
+            .await
+            .unwrap();
         }
         bus.shutdown().await.unwrap();
         store.close().await;

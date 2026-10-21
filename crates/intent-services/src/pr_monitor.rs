@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use intent_core::events::{
     PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_EMITTED,
-    PR_MONITOR_REGISTERED,
+    PR_MONITOR_REFRESHED, PR_MONITOR_REGISTERED,
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
@@ -597,8 +597,12 @@ impl SharedPrSnapshot {
             true
         } else {
             if requirements.merge_queue_ejection.is_none() {
-                requirements.merge_queue_ejection =
-                    previous.and_then(|p| p.requirements.merge_queue_ejection.clone());
+                // Never resurrect a held event that records a merge (a
+                // baseline persisted before merged removals were filtered,
+                // or a PR that has since merged).
+                requirements.merge_queue_ejection = previous
+                    .and_then(|p| p.requirements.merge_queue_ejection.clone())
+                    .filter(|e| !e.records_merge(&requirements.state));
             }
             // The hold carries the observation forward, so tracked-ness
             // carries with it; an untracked previous stays untracked until
@@ -1197,6 +1201,8 @@ async fn poll_pr(
                     let queue = observation.signals.is_in_merge_queue;
                     entry.snapshot.merge_queue_reported = queue;
                     entry.snapshot.requirements.is_in_merge_queue = queue.filter(|&q| q);
+                    entry.snapshot.requirements.merge_queue =
+                        pr_ops::queued_merge_queue_entry(&observation.signals);
                 }
                 Some(entry.clone())
             }
@@ -1844,6 +1850,10 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
         // the PR queued (never null).
         if let Some(queued) = r.is_in_merge_queue {
             last["isInMergeQueue"] = json!(queued);
+        }
+        // Same presence rule: the queue position only while queued.
+        if let Some(entry) = &r.merge_queue {
+            last["mergeQueue"] = serde_json::to_value(entry).expect("serialize");
         }
         // Same presence rule: only when the host reported an ejection event.
         if let Some(ejection) = &r.merge_queue_ejection {
@@ -3732,6 +3742,11 @@ impl Services {
         let poll_activity = previous
             .as_ref()
             .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
+        // Informational queue movement since the last poll (position, size,
+        // entry state, estimate): never a change line, only a UI re-read hint.
+        let queue_moved = previous
+            .as_ref()
+            .is_some_and(|prev| prev.requirements.merge_queue != fresh.requirements.merge_queue);
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -3835,6 +3850,12 @@ impl Services {
                 Some(json!({ "changes": updated.pending_changes })),
             )
             .await;
+        } else if queue_moved {
+            // Queue movement is informational: no change line, no wake.
+            // The UI-only re-read hint keeps the displayed position current
+            // (agent-owned subscriptions can never receive it).
+            self.emit_pr_monitor_event(PR_MONITOR_REFRESHED, &updated, None)
+                .await;
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an
@@ -4742,6 +4763,8 @@ mod tests {
     mod ancestry_regression;
     mod compact_required_checks;
     mod home_queue_regression;
+    mod implicit_repository;
+    mod merge_queue_position;
     mod qualified_isolation;
     mod qualified_recovery;
     mod quota_regression;
@@ -4850,6 +4873,9 @@ mod tests {
         /// The host's merge-queue report on the probe signals (`None` is
         /// a host not reporting it).
         in_merge_queue: Option<bool>,
+        /// The host's merge-queue entry (position, estimate) on the probe
+        /// signals; `None` while not queued or not reported.
+        merge_queue_entry: Option<intent_sourcecontrol::MergeQueueEntry>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -4930,6 +4956,7 @@ mod tests {
                 updated_at: None,
                 folded: None,
                 in_merge_queue: None,
+                merge_queue_entry: None,
             }
         }
     }
@@ -4984,6 +5011,7 @@ mod tests {
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
+                merge_queue_entry: self.merge_queue_entry.clone(),
             }
         }
     }
@@ -5797,6 +5825,7 @@ mod tests {
                 rules_known: true,
                 is_in_merge_queue: None,
                 merge_queue_ejection: None,
+                merge_queue: None,
             },
             ejection_tracked: true,
             checks_unobserved: false,
@@ -6356,6 +6385,42 @@ mod tests {
         let m = known.materialize(Some(&prev));
         assert_eq!(m.requirements.merge_queue_ejection, None);
         assert!(m.ejection_tracked);
+    }
+
+    /// Regression (cloudlands-fe#3524): a degraded probe never carries a
+    /// held event forward when it records a merge — a `merged` removal from
+    /// a baseline persisted before the filter existed, or any held event once
+    /// the PR itself has merged.
+    #[test]
+    fn materialize_never_holds_a_merge_as_an_ejection() {
+        let merged_removal = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:57:04Z".into(),
+                reason: Some("merged".into()),
+            });
+        });
+        let degraded = shared_from(&snapshot(|_| {}), false);
+        let m = degraded.materialize(Some(&merged_removal));
+        assert_eq!(m.requirements.merge_queue_ejection, None);
+        assert!(diff_snapshots(&merged_removal, &m)
+            .iter()
+            .all(|c| !c.starts_with("removed from the merge queue")));
+
+        let real = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        let degraded_merged =
+            shared_from(&snapshot(|s| s.requirements.state = "merged".into()), false);
+        assert_eq!(
+            degraded_merged
+                .materialize(Some(&real))
+                .requirements
+                .merge_queue_ejection,
+            None
+        );
     }
 
     #[test]
@@ -9292,9 +9357,12 @@ mod tests {
             let repo = repo.clone();
             async move { svc.serve_pr(&repo, 42).await }
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("serve_pr reaches the miss→fetch window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("serve_pr reaches the miss→fetch window");
         assert_eq!(forge.fetches(), 0, "parked before its own fetch");
 
         // The concurrent fill: another reader stores #42 while the first
@@ -10777,7 +10845,8 @@ mod tests {
         // The deferral is decided by the registration's one quota probe;
         // once that probe is counted, the next await is the gate section.
         async fn probed(forge: &StubForge, n: usize) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
             while forge.sub_fetches("rate_limit_status") < n {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -14565,7 +14634,8 @@ mod tests {
         // The owner learns why its watch stopped (store-only wake here: no
         // manager attached, so nothing can spawn a turn; the wake parks
         // behind the archived gate at most).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             let text = owner_messages(&svc, &owner).await;
             if text.contains("workspace was archived") {

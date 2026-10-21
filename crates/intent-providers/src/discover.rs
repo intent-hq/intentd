@@ -295,10 +295,11 @@ fn availability_for_with_npx(
     // OWNS it ([`ProviderConfig::primary_binary_provider_id`], matching
     // `resolve_spawn`: unsloth's opencode primary honors the `opencode`
     // key). npx-only providers only honor it when they opt in
-    // (`npx_only_honors_path_override`; claude-code) — `resolve_spawn` then
-    // exec's a valid override in place of the pinned npx spawn
-    // (monorepo#4352); pi and Codex keep npx-only semantics, so an override never
-    // flips its `installed`.
+    // (`npx_only_honors_path_override`) — `resolve_spawn` then exec's a
+    // valid override in place of the pinned npx spawn (monorepo#4352). No
+    // provider opts in today: Codex, Claude Code and pi keep npx-only
+    // semantics, so an override never flips their `installed` (tests use
+    // intent-services' `test_support::provider_installed` instead).
     let primary_override = if gated_off.is_some()
         || (provider.npx_only_package.is_some() && !provider.npx_only_honors_path_override)
     {

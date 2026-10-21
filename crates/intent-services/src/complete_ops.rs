@@ -75,9 +75,11 @@ fn compose_prompt(prompt: &str, system_prompt: Option<&str>) -> String {
 /// well would say it twice. Every other provider keeps the composed prompt
 /// and no `_meta`, exactly as before.
 ///
-/// Verified when introduced against `@agentclientprotocol/claude-agent-acp` 0.81.1
+/// First verified by hand against `@agentclientprotocol/claude-agent-acp` 0.81.1
 /// (`dist/acp-agent.js`, `session/new`) and its `@anthropic-ai/claude-agent-sdk`
-/// 0.3.280:
+/// 0.3.280; every pinned adapter is now checked mechanically by
+/// `claude_adapter_contract`, which runs the exact pin in CI (`check` job)
+/// against a stand-in Claude CLI and asserts each point below:
 /// - a string `_meta.systemPrompt` is passed to the SDK as `systemPrompt`
 ///   verbatim and REPLACES the `claude_code` preset (an object form would only
 ///   append to it);
@@ -610,6 +612,11 @@ impl Services {
         if let Err(err) = cmd.check_npx_version().await {
             return Ok(unavailable(err.to_string()));
         }
+        // Fast mode follows the selection: a named profile reads its own
+        // `providers.fastMode` entry, never the base provider's.
+        let fast_mode_selection = profile
+            .as_ref()
+            .map_or_else(|| provider_id.to_owned(), |p| p.provider_ref().to_owned());
         let cmd = match cwd {
             Some(dir) => cmd.cwd(dir),
             None => cmd,
@@ -648,12 +655,10 @@ impl Services {
             Some((
                 provider_id,
                 Box::pin(async {
-                    self.effective_settings()
-                        .providers
-                        .fast_mode
-                        .get(provider_id)
-                        .copied()
-                        .unwrap_or(false)
+                    crate::fast_mode::preference(
+                        &self.effective_settings().providers.fast_mode,
+                        &fast_mode_selection,
+                    )
                 }),
             )),
             cmd,
@@ -724,6 +729,55 @@ mod tests {
                 assert_eq!(state["fastMode"], enabled);
                 assert_eq!(state["model"], "supported");
                 assert_eq!(state["effort"], "high");
+            }
+        }
+    }
+
+    /// A one-shot under a named profile reads that profile's own
+    /// `providers.fastMode` entry, never the base provider's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fast_mode_complete_once_reads_the_profile_entry_only() {
+        use std::os::unix::fs::PermissionsExt;
+        for provider in ["claude-code", "codex"] {
+            let dir = crate::test_support::test_tempdir("fast-mode-complete-profile-");
+            let bin = dir.path().join("adapter.mjs");
+            std::fs::write(&bin, format!("#!/usr/bin/env node\nif(process.argv.includes('--version')){{console.log('11.0.0');process.exit(0);}}\nconst provider = {provider:?}; const failOff = false; const logPath = {};\n{}", json!(dir.path().join("calls.jsonl")), include_str!("../tests/fixtures/fast-mode.mjs"))).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let (_tmp, services) =
+                services_with_settings(&[("providers.paths", json!({provider:bin}))]).await;
+            let services = services.with_one_shot_npx(Some(bin));
+            let reference = format!("{provider}@work");
+            for (map, expected) in [
+                (json!({ provider: true }), false),
+                (json!({ provider: false, reference.clone(): true }), true),
+                (json!({ provider: true, reference.clone(): false }), false),
+            ] {
+                services
+                    .settings_registry()
+                    .unwrap()
+                    .apply(&[("providers.fastMode".into(), map.clone())])
+                    .unwrap();
+                let profile = std::sync::Arc::new(intent_acp::ProfileEnv::new(
+                    reference.as_str(),
+                    "f1",
+                    Vec::new(),
+                ));
+                let result = services
+                    .complete_once_via_acp(
+                        provider,
+                        "inspect",
+                        None,
+                        Some("supported"),
+                        None,
+                        30_000,
+                        &OneShotEffort::default(),
+                        Some(profile),
+                    )
+                    .await
+                    .unwrap();
+                let state: Value = serde_json::from_str(result["text"].as_str().unwrap()).unwrap();
+                assert_eq!(state["fastMode"], expected, "{provider}: {map}");
             }
         }
     }

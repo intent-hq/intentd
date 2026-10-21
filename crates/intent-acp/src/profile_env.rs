@@ -8,7 +8,9 @@
 //!
 //! 1. inherited daemon environment and captured login-shell credentials;
 //! 2. **the profile**: `set` replaces, `unset` removes (values are literal,
-//!    never shell-expanded);
+//!    never shell-expanded — except that the daemon expands a leading `~` /
+//!    `~/` of `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to its home directory
+//!    before building this overlay);
 //! 3. Intent's own launch wiring (provider env, session/bootstrap variables,
 //!    the selected executable, enforced configuration and `PATH`), which a
 //!    profile can never override.

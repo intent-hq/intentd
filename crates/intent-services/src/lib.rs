@@ -58,6 +58,9 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod agent_workers;
+/// The §5.5b wire-ID rule, shared by the transport's request validation.
+pub use intent_acp::workers::is_wire_id;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -67,7 +70,10 @@ mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod browser_tabs;
+mod bundled_cli;
 mod capability;
+#[cfg(all(test, unix))]
+mod claude_adapter_contract;
 mod clone_ops;
 pub mod codex_diagnostics;
 mod codex_session_title;
@@ -238,6 +244,9 @@ mod rtk;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
+mod script_output_cleanup;
+mod script_output_store;
+pub use script_ops::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
 mod settings;
@@ -537,6 +546,8 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Provider worker observations per live agent generation (§5.5b).
+    agent_workers: Arc<agent_workers::AgentWorkers>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -903,6 +914,10 @@ pub struct Services {
     /// Shared across clones and manager views: bootstrap serializes per
     /// workspace; definition replacement serializes per durable script id.
     script_locks: script_ops::ScriptLocks,
+    /// On-disk per-run script output logs (`<data_dir>/script-output`). The
+    /// composition root points it at the daemon data dir; until then it uses a
+    /// per-instance temp dir so unconfigured instances never share logs.
+    script_output: script_output_store::ScriptOutputStore,
     /// The `script.*` too-fast-exit floor in milliseconds
     /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
@@ -1222,6 +1237,7 @@ pub struct Services {
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_child_git_capacity: Arc<repository_native_wire::child_git::Capacity>,
     repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
@@ -1642,6 +1658,7 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
+            agent_workers: Arc::new(agent_workers::AgentWorkers::default()),
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             queue_submission_order: Arc::new(AtomicU64::new(0)),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
@@ -1705,6 +1722,10 @@ impl Services {
             daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
+            script_output: script_output_store::ScriptOutputStore::new(
+                &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
+                intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+            ),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
@@ -1767,6 +1788,7 @@ impl Services {
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
             repository_resource_capacity: Arc::default(),
+            repository_child_git_capacity: Arc::default(),
             repository_checkout_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
@@ -2513,6 +2535,7 @@ impl Services {
             self.script_parks.clone(),
         )
         .with_settings(self.settings_registry.clone())
+        .with_output_store(self.script_output.clone())
         .with_tasks(self.store_tasks.clone())
         .with_owner_services(self.clone())
     }
@@ -2535,6 +2558,28 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam: park every script launch before its PTY spawns and its
+    /// output log opens (including service auto-restarts).
+    #[cfg(test)]
+    pub(crate) fn with_script_before_spawn_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.before_spawn = Some(park);
+        self
+    }
+
+    /// Test seam: park workspace deletion after its scripts stop, before the
+    /// script output folder is deleted.
+    #[cfg(test)]
+    pub(crate) fn with_script_workspace_closed_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.workspace_closed = Some(park);
         self
     }
 
@@ -2945,6 +2990,18 @@ impl Services {
         self.script_manager().recover_monitors().await?;
         self.start_script_monitor_maintenance();
         self.script_manager().hydrate().await
+    }
+
+    /// Command-mode script runs in flight right now (admitted and not yet
+    /// durably settled, or with a live process) plus when the last one
+    /// settled. The idle update handshake counts these as busy so a staged
+    /// self-update does not kill a long check mid-run. Service-mode scripts
+    /// never count: they run indefinitely and an auto-start service is
+    /// restored after a restart. One registry lock, no I/O — cheap enough
+    /// for `system.status` and a 1 s poll.
+    #[must_use]
+    pub fn command_script_activity(&self) -> CommandScriptActivity {
+        script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
@@ -4757,6 +4814,22 @@ impl Services {
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
         self
+    }
+
+    /// Store script output logs under `<data_dir>/script-output` (one file
+    /// per run). Composition-root only — call before the surface is shared.
+    #[must_use]
+    pub fn with_script_output_dir(mut self, data_dir: &Path) -> Self {
+        self.script_output = script_output_store::ScriptOutputStore::new(
+            data_dir,
+            intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        );
+        self
+    }
+
+    /// The on-disk script output store.
+    pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
+        &self.script_output
     }
 
     /// Load named provider profile metadata from
@@ -15676,6 +15749,60 @@ pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     }
 }
 
+impl Services {
+    /// §5.5b ownership: the agent must exist in `workspace_id` and the caller
+    /// must be able to read it; an absent agent, an agent of another workspace
+    /// and an unauthorized caller are the same `not-found`. Returns the
+    /// agent's configured provider for a no-session snapshot.
+    async fn authorize_agent_workers(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<String> {
+        let not_found = || Error::NotFound(format!("agent {agent_id}"));
+        let session = self
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .map_err(|_| not_found())?;
+        if session.workspace_id != *workspace_id {
+            return Err(not_found());
+        }
+        self.require_member(workspace_id)
+            .await
+            .map_err(|e| match e {
+                Error::Forbidden(_) => not_found(),
+                other => other,
+            })?;
+        Ok(session.provider.unwrap_or_default())
+    }
+
+    /// The §5.5b worker projections.
+    pub(crate) fn agent_workers(&self) -> &agent_workers::AgentWorkers {
+        &self.agent_workers
+    }
+
+    /// Broadcast a changed `WorkerSnapshot` as the transient
+    /// `agent:workers-changed` event (§5.5b): never persisted, never a wake.
+    pub(crate) fn publish_workers_snapshot(&self, snapshot: serde_json::Value) {
+        let Some(workspace_id) = snapshot["workspaceId"].as_str().map(WorkspaceId::from) else {
+            return;
+        };
+        let event = NewEvent {
+            workspace_id,
+            timestamp: now_iso(),
+            event_type: intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            actor: intent_core::EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: snapshot,
+        };
+        let _ = publish_event_transient(self.event_bus.as_ref(), &event);
+    }
+}
+
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
@@ -17960,6 +18087,10 @@ impl Services {
             services
                 .cancel_script_monitors(&id, None, "workspace-deleted")
                 .await?;
+            // Refuse new script launches, auto-restarts and output logs, and
+            // stop the running scripts, so nothing writes a log after the
+            // output folder is deleted below. Held until this delete returns.
+            let _scripts_closed = services.script_manager().close_workspace(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -18226,6 +18357,9 @@ impl Services {
                 }
                 Err(e) => return Err(e),
             }
+            // The row is gone and its scripts are stopped: delete its on-disk
+            // script output (best-effort; the startup orphan sweep retries).
+            services.delete_workspace_script_output(&id).await;
             // Cancel any pending debounced lastActivity derivation
             // (monorepo#3623): the timer must not outlive the workspace —
             // it would fire against the deleted row and log a spurious
@@ -18548,6 +18682,24 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn gitlab_child_git_policy_get(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_get(self, query)
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_set(self, query)
+    }
+    fn gitlab_child_git_credential(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        repository_native_wire::child_git::credential(self, query)
+    }
     fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
         self.provider_preparation
             .enqueue(provider_ids, self.effective_settings());
@@ -18727,6 +18879,48 @@ impl WorkspaceApi for Services {
         query: intent_core::repository_request::RepositoryResourceBoundQuery,
     ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
         repository_native_wire::resource::release(self, query)
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryKnownSelection>>
+    {
+        repository_native_wire::resource::known::resolve(self, query)
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedCapture>>
+    {
+        repository_native_wire::resource::scoped::capture(self, query)
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedDetail>> {
+        repository_native_wire::resource::scoped::detail(self, query)
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::scoped::release(self, query)
+    }
+
+    fn repository_resource_list(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryResourceList>> {
+        repository_native_wire::resource::pages::list(self, query)
+    }
+
+    fn repository_resource_discussions(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryDiscussions>> {
+        repository_native_wire::resource::pages::discussions(self, query)
     }
 
     fn repository_context_capture(
@@ -20999,6 +21193,7 @@ impl WorkspaceApi for Services {
                 paginate.unwrap_or(false),
                 page_token.as_ref(),
             )
+            .await
         })
     }
 
@@ -31616,6 +31811,88 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let provider = self
+                .authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            Ok(self.agent_workers.snapshot(&agent_id).unwrap_or_else(|| {
+                agent_workers::Projection::no_session(workspace_id, agent_id, provider)
+                    .snapshot(agent_workers::now_ms())
+            }))
+        })
+    }
+
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            for (name, value) in [
+                ("connectionGeneration", &connection_generation),
+                ("asyncTaskId", &async_task_id),
+            ] {
+                if !intent_acp::workers::is_wire_id(value) {
+                    return Err(Error::InvalidParams(format!(
+                        "{name} must be a nonempty string of at most 256 bytes without control characters"
+                    )));
+                }
+            }
+            self.authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            // Same authority as `agent.stop`; read access alone never stops.
+            self.require_agent_member(&agent_id).await?;
+            let not_found = || Error::NotFound(format!("worker {async_task_id}"));
+            let declined = serde_json::json!({ "asyncTaskId": async_task_id, "stopped": false });
+            let target = self
+                .agent_workers
+                .stop_target(&agent_id, &connection_generation, &async_task_id)
+                .ok_or_else(not_found)?;
+            let (connection, session_id, fence) = match target {
+                agent_workers::StopTarget::Decline => return Ok(declined),
+                agent_workers::StopTarget::ConnectionGone => {
+                    return Err(Error::ProviderRequest(
+                        "the provider connection ended before the stop was sent".into(),
+                    ))
+                }
+                agent_workers::StopTarget::Forward {
+                    connection,
+                    session_id,
+                    fence,
+                } => (connection, session_id, fence),
+            };
+            // Last check before the write: the deciding generation must still
+            // be this agent's current one. A retired generation's connection is
+            // its own provider process's pipe, so a request already admitted
+            // can never reach a newer process (§5.5b).
+            if self
+                .agent_workers
+                .generation_for(&agent_id, &connection)
+                .as_deref()
+                != Some(connection_generation.as_str())
+            {
+                return Err(Error::ProviderRequest(
+                    "the worker's provider connection was replaced before the stop was sent".into(),
+                ));
+            }
+            let answer =
+                intent_acp::workers::request_stop(&connection, &session_id, &async_task_id, fence)
+                    .await
+                    .map_err(|e| Error::ProviderRequest(e.to_string()))?;
+            Ok(serde_json::json!({
+                "asyncTaskId": async_task_id,
+                "stopped": answer.get("stopped") == Some(&serde_json::Value::Bool(true)),
+            }))
+        })
+    }
+
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
@@ -31991,6 +32268,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The daemon's provider-stall blocker prefixes are reserved so an
+            // agent-raised request is never mistaken for one and auto-cleared
+            // by a later successful turn (intent-hq/intent#7182).
+            if crate::agent_session::is_daemon_stall_blocker_reason(reason.trim()) {
+                return Err(Error::InvalidParams(
+                    "reason uses a prefix reserved for daemon-raised provider-stall blockers"
+                        .to_string(),
+                ));
+            }
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
                 .await
         })
@@ -32817,6 +33103,7 @@ impl WorkspaceApi for Services {
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,
                     entry.snapshot.merge_queue_reported,
+                    entry.snapshot.requirements.merge_queue.as_ref(),
                 ),
             }))
         })

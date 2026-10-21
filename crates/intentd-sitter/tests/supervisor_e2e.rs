@@ -34,7 +34,7 @@ use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::{
     BACKOFF_CAP_ENV, BACKOFF_INITIAL_ENV, BACKOFF_RESET_ENV, CHECK_MAX_ENV, CHECK_MIN_ENV,
     GIVE_UP_AFTER_ENV, IDLE_RESTART_ENV, KILL_TIMEOUT_ENV, MANIFEST_BASE_URL_ENV,
-    RESTART_FOR_UPDATE_EXIT_CODE, UPDATE_RESTART_ENV,
+    RESTART_FOR_UPDATE_EXIT_CODE, STAGED_RESTART_AFTER_ENV, UPDATE_RESTART_ENV,
 };
 use intentd_test_support::{Barrier, GuardedChild};
 
@@ -631,8 +631,8 @@ fn forwards_args_verbatim_and_clean_exit_passes_through() {
     )])));
     let (base_url, requests) = serve_recording(routes);
 
-    // No timing overrides: the persisted schedule must use the real 12–24h
-    // jitter window (the sitter exits with the one-shot child long before).
+    // No timing overrides: the persisted schedule must use the real stable
+    // tick window (the sitter exits with the one-shot child long before).
     let mut sitter = sitter_command(dir.path(), &base_url)
         .args([
             "serve",
@@ -665,8 +665,8 @@ fn forwards_args_verbatim_and_clean_exit_passes_through() {
     let next = state.next_check_at.expect("next_check_at persisted");
     let delta_secs = (next - last).whole_seconds();
     assert!(
-        (12 * 3600..24 * 3600).contains(&delta_secs),
-        "next check jitter out of [12h,24h): {delta_secs}s"
+        (50 * 60..70 * 60).contains(&delta_secs),
+        "stable tick jitter out of [50m,70m): {delta_secs}s"
     );
 }
 
@@ -727,12 +727,13 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let base_url = serve(Arc::clone(&routes));
 
     let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHANNEL_ENV, "beta")
         .env(CHECK_MIN_ENV, "300")
         .env(CHECK_MAX_ENV, "301")
         .env(KILL_TIMEOUT_ENV, "5000")
@@ -752,7 +753,7 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
         let mut routes = routes.lock().unwrap();
         routes.insert(format!("/{asset}"), archive);
         routes.insert(
-            MANIFEST_PATH.to_string(),
+            BETA_MANIFEST_PATH.to_string(),
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
@@ -793,12 +794,13 @@ fn update_mid_run_respawn_sets_update_restart_env() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_env_script("0.1.0"));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let base_url = serve(Arc::clone(&routes));
 
     let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHANNEL_ENV, "beta")
         .env_remove(UPDATE_RESTART_ENV)
         .env(CHECK_MIN_ENV, "300")
         .env(CHECK_MAX_ENV, "301")
@@ -819,7 +821,7 @@ fn update_mid_run_respawn_sets_update_restart_env() {
         let mut routes = routes.lock().unwrap();
         routes.insert(format!("/{asset}"), archive);
         routes.insert(
-            MANIFEST_PATH.to_string(),
+            BETA_MANIFEST_PATH.to_string(),
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
@@ -1123,10 +1125,11 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
     let dir = tempfile::tempdir().unwrap();
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
-    // A fully installable beta 0.2.0 is on offer; the flag-pinned sitter
-    // must never even fetch its manifest.
+    // Pinned to beta (whose periodic checks keep running all day). A fully
+    // installable stable 0.2.0 is on offer; the flag-pinned sitter must
+    // never even fetch its manifest.
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let (base_url, requests) = serve_recording(Arc::clone(&routes));
@@ -1137,7 +1140,7 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
         let mut routes = routes.lock().unwrap();
         routes.insert(format!("/{asset}"), archive);
         routes.insert(
-            BETA_MANIFEST_PATH.to_string(),
+            MANIFEST_PATH.to_string(),
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
@@ -1146,7 +1149,7 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
         .env(CHECK_MIN_ENV, "100")
         .env(CHECK_MAX_ENV, "101")
         .env(KILL_TIMEOUT_ENV, "5000")
-        .args(["serve", "--sitter-channel=stable"])
+        .args(["serve", "--sitter-channel=beta"])
         .spawn()
         .unwrap();
     let log_path = daemon_log_path(dir.path());
@@ -1155,7 +1158,7 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
     });
 
     // Write the config pin mid-run, then let several more checks elapse.
-    fs::write(&paths.config_path, "channel = \"beta\"\n").unwrap();
+    fs::write(&paths.config_path, "channel = \"stable\"\n").unwrap();
     let checks_at_switch = requests.lock().unwrap().len();
     wait_until(
         "several more periodic checks",
@@ -1169,8 +1172,8 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
 
     let requests = requests.lock().unwrap();
     assert!(
-        requests.iter().all(|p| p == MANIFEST_PATH),
-        "flag-pinned sitter must never fetch beta.json: {requests:?}"
+        requests.iter().all(|p| p == BETA_MANIFEST_PATH),
+        "flag-pinned sitter must never fetch stable.json: {requests:?}"
     );
     let starts = read_or_empty(&log_path)
         .lines()
@@ -2153,7 +2156,7 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
     let release = Barrier::new(dir.path(), "release");
     preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let base_url = serve(Arc::clone(&routes));
@@ -2163,6 +2166,7 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
     // respawns without one.
     let mut sitter = spawn_guarded(
         sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
             .env_remove(UPDATE_RESTART_ENV)
             .env_remove(IDLE_RESTART_ENV)
             .env(CHECK_MIN_ENV, "3600000")
@@ -2186,7 +2190,7 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
         let mut routes = routes.lock().unwrap();
         routes.insert(format!("/{asset}"), archive);
         routes.insert(
-            MANIFEST_PATH.to_string(),
+            BETA_MANIFEST_PATH.to_string(),
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
@@ -2277,7 +2281,7 @@ fn sigusr2_when_already_current_signals_nothing_to_the_daemon() {
     let release = Barrier::new(dir.path(), "release");
     preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let (base_url, requests) = serve_recording(routes);
@@ -2285,6 +2289,7 @@ fn sigusr2_when_already_current_signals_nothing_to_the_daemon() {
     // Hour-long check interval: only the SIGUSR2 may trigger a check.
     let mut sitter = spawn_guarded(
         sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
             .env(CHECK_MIN_ENV, "3600000")
             .env(CHECK_MAX_ENV, "3600001")
             .env(KILL_TIMEOUT_ENV, "5000")
@@ -2340,7 +2345,7 @@ fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
     let release = Barrier::new(dir.path(), "release");
     preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let (base_url, hold, parked) = serve_holdable(Arc::clone(&routes));
@@ -2348,6 +2353,7 @@ fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
     // Hour-long check interval: only the signals may check.
     let mut sitter = spawn_guarded(
         sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
             .env_remove(UPDATE_RESTART_ENV)
             .env(CHECK_MIN_ENV, "3600000")
             .env(CHECK_MAX_ENV, "3600001")
@@ -2368,7 +2374,7 @@ fn sigusr1_during_an_idle_mode_check_escalates_it_to_restart_now() {
         let mut routes = routes.lock().unwrap();
         routes.insert(format!("/{asset}"), archive);
         routes.insert(
-            MANIFEST_PATH.to_string(),
+            BETA_MANIFEST_PATH.to_string(),
             manifest_json("0.2.0", &base_url, &asset, &sha),
         );
     }
@@ -2440,12 +2446,13 @@ fn periodic_check_force_restarts_a_staged_version_the_daemon_never_took() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &never_idle_script("0.1.0"));
     let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
-        MANIFEST_PATH.to_string(),
+        BETA_MANIFEST_PATH.to_string(),
         manifest_bare("0.1.0"),
     )])));
     let base_url = serve(Arc::clone(&routes));
 
     let mut sitter = sitter_command(dir.path(), &base_url)
+        .env(CHANNEL_ENV, "beta")
         .env_remove(UPDATE_RESTART_ENV)
         .env(CHECK_MIN_ENV, "300")
         .env(CHECK_MAX_ENV, "301")
@@ -2667,6 +2674,521 @@ fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
     assert_eq!(runs, 1, "one-shot subcommands must run exactly once");
     let stderr = read_or_empty(&stderr_path(dir.path()));
     assert!(!stderr.contains("respawning"), "stderr: {stderr}");
+}
+
+// ---- Stable channel: at most one successful automatic check per UTC day ----
+
+/// Record a successful automatic check at `at` in `state.json`, under the
+/// state lock and keeping every other field (what a check the sitter made
+/// earlier would have left behind).
+fn set_last_check_at(paths: &SitterPaths, at: time::OffsetDateTime) {
+    let _lock = state::lock(&paths.state_path).unwrap();
+    let mut s = state::load(&paths.state_path);
+    s.last_check_at = Some(at);
+    state::save(&paths.state_path, &s).unwrap();
+}
+
+/// The UTC day rolling over, without waiting for midnight: move the last
+/// successful automatic check back to yesterday.
+fn rewind_last_check_to_yesterday(paths: &SitterPaths) {
+    set_last_check_at(
+        paths,
+        time::OffsetDateTime::now_utc() - time::Duration::days(1),
+    );
+}
+
+/// Whether `state.json` records a successful automatic check today (UTC).
+fn checked_today(paths: &SitterPaths) -> bool {
+    state::load(&paths.state_path)
+        .last_check_at
+        .is_some_and(|at| at.date() == time::OffsetDateTime::now_utc().date())
+}
+
+/// Stage `version` exactly as a concurrent updater would: binary under
+/// `versions/`, named by `state.json`, every other field (the recorded
+/// check day included) kept.
+fn stage_version(paths: &SitterPaths, version: &str, script: &str) {
+    let bin = paths.daemon_binary(version);
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::write(&bin, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _lock = state::lock(&paths.state_path).unwrap();
+    let mut s = state::load(&paths.state_path);
+    s.current_version = Some(version.to_string());
+    state::save(&paths.state_path, &s).unwrap();
+}
+
+/// Publish a fully installable `version` (archive + manifest at `path`).
+fn publish(routes: &Routes, base_url: &str, path: &str, version: &str, script: &str) {
+    let archive = make_tar_xz(script.as_bytes());
+    let asset = format!("intentd-{TARGET_TRIPLE}.tar.xz");
+    let sha = sha256_hex(&archive);
+    let mut routes = routes.lock().unwrap();
+    routes.insert(format!("/{asset}"), archive);
+    routes.insert(
+        path.to_string(),
+        manifest_json(version, base_url, &asset, &sha),
+    );
+}
+
+/// Stable, already checked today: `serve` starts the installed daemon
+/// without any network request.
+#[test]
+fn stable_startup_skips_the_check_when_already_checked_today() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &args_dump_script());
+    set_last_check_at(&paths, time::OffsetDateTime::now_utc());
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["serve", "--sitter-channel=stable"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(read_or_empty(&daemon_log_path(dir.path())), "serve\n");
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no startup check once today's check is recorded: {:?}",
+        requests.lock().unwrap()
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("already checked for updates today"),
+        "stderr: {stderr}"
+    );
+}
+
+/// Stable, last checked yesterday (UTC): the startup check is due, runs,
+/// and records today.
+#[test]
+fn stable_startup_checks_when_the_last_check_was_yesterday() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &args_dump_script());
+    rewind_last_check_to_yesterday(&paths);
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["serve", "--sitter-channel=stable"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        [MANIFEST_PATH.to_string()]
+    );
+    assert!(checked_today(&paths), "the successful check is recorded");
+}
+
+/// Beta keeps today's cadence: the startup check always runs, even when a
+/// check is already recorded today, and the next periodic check is 12–24 h
+/// away.
+#[test]
+fn beta_startup_checks_even_when_already_checked_today() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &args_dump_script());
+    set_last_check_at(&paths, time::OffsetDateTime::now_utc());
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        BETA_MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = sitter_command(dir.path(), &base_url)
+        .args(["serve", "--sitter-channel=beta"])
+        .spawn()
+        .unwrap();
+    let status = wait_exit(&mut sitter, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        [BETA_MANIFEST_PATH.to_string()]
+    );
+    let state = state::load(&paths.state_path);
+    let delta_secs = (state.next_check_at.unwrap() - state.last_check_at.unwrap()).whole_seconds();
+    assert!(
+        (12 * 3600..24 * 3600).contains(&delta_secs),
+        "beta periodic jitter out of [12h,24h): {delta_secs}s"
+    );
+}
+
+/// Stable: a failed check (every base down) is not recorded, so the next
+/// tick retries; once one succeeds, later ticks make no request.
+#[test]
+fn stable_failed_check_is_not_recorded_and_the_next_tick_retries() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    // No manifest yet: every check 404s.
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "200")
+            .env(CHECK_MAX_ENV, "201")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=stable"]),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    // Startup failed and fell back; the ticks keep retrying.
+    wait_until(
+        "ticks to retry the failed check",
+        Duration::from_secs(15),
+        || requests.lock().unwrap().len() >= 3,
+    );
+    assert_eq!(
+        state::load(&paths.state_path).last_check_at,
+        None,
+        "a failed check must not count as today's check"
+    );
+
+    routes
+        .lock()
+        .unwrap()
+        .insert(MANIFEST_PATH.to_string(), manifest_bare("0.1.0"));
+    wait_until(
+        "a tick to succeed and record today",
+        Duration::from_secs(15),
+        || checked_today(&paths),
+    );
+    let after_success = requests.lock().unwrap().len();
+    // Several more 200 ms ticks elapse; none may fetch.
+    // timing-guard: negative assertion
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        after_success,
+        "no further check once today's succeeded"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+}
+
+/// Stable, already checked today: the daemon's idle request (SIGUSR2) makes
+/// no network request, but still hands an already-staged version to the
+/// daemon for its idle restart.
+#[test]
+fn stable_sigusr2_when_not_due_skips_the_network_but_applies_a_staged_version() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=stable"]),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    assert!(checked_today(&paths), "the startup check is today's check");
+    let startup_requests = requests.lock().unwrap().len();
+    let stderr = stderr_path(dir.path());
+
+    // Nothing staged: nothing fetched, nothing signaled.
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "the not-due SIGUSR2 to be logged",
+        Duration::from_secs(15),
+        || read_or_empty(&stderr).contains("SIGUSR2 received; already checked for updates today"),
+    );
+    assert_eq!(requests.lock().unwrap().len(), startup_requests);
+    assert!(!read_or_empty(&log_path).contains("usr2"));
+
+    // A concurrent updater staged 0.2.0: the next SIGUSR2 hands it over.
+    stage_version(&paths, "0.2.0", &idle_restart_script("0.2.0", &release));
+    send_signal(&sitter, "USR2");
+    wait_until(
+        "daemon 0.1.0 to receive SIGUSR2",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("usr2 0.1.0"),
+    );
+    release.release();
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        startup_requests,
+        "a not-due SIGUSR2 must never fetch"
+    );
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "usr2 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ]
+    );
+}
+
+/// Stable: the first tick after the UTC day rolls over checks, stages the
+/// new version, and asks the daemon to restart when idle — no SIGTERM.
+#[test]
+fn stable_daily_check_stages_the_update_and_restarts_when_idle() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    let release = Barrier::new(dir.path(), "release");
+    preinstall(&paths, "0.1.0", &idle_restart_script("0.1.0", &release));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(Arc::clone(&routes));
+
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "200")
+            .env(CHECK_MAX_ENV, "201")
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=stable"]),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    assert!(checked_today(&paths));
+    let startup_requests = requests.lock().unwrap().len();
+
+    publish(
+        &routes,
+        &base_url,
+        MANIFEST_PATH,
+        "0.2.0",
+        &idle_restart_script("0.2.0", &release),
+    );
+    rewind_last_check_to_yesterday(&paths);
+    let stderr = stderr_path(dir.path());
+    wait_until(
+        "the daily check to stage 0.2.0 and hand it to the daemon",
+        Duration::from_secs(15),
+        || {
+            read_or_empty(&log_path).contains("usr2 0.1.0")
+                && read_or_empty(&stderr).contains("asking daemon to restart when idle")
+        },
+    );
+    let staged = read_or_empty(&log_path);
+    assert!(
+        !staged.contains("term") && !staged.contains("start 0.2.0"),
+        "the staged daemon must be left running: {staged}"
+    );
+    assert_eq!(
+        state::load(&paths.state_path).current_version.as_deref(),
+        Some("0.2.0")
+    );
+    assert!(checked_today(&paths), "the daily check is recorded");
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(startup_requests)
+            .filter(|p| *p == MANIFEST_PATH)
+            .count(),
+        1,
+        "exactly one daily manifest check"
+    );
+
+    release.release();
+    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+        read_or_empty(&log_path).contains("start 0.2.0")
+    });
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "usr2 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ]
+    );
+}
+
+/// Stable: a staged update the daemon never takes (it never gets idle) is
+/// forced after the fallback window (24 h in production) with the usual
+/// graceful stop + respawn.
+#[test]
+fn stable_staged_update_forces_a_restart_after_the_fallback_window() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &never_idle_script("0.1.0"));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let base_url = serve(Arc::clone(&routes));
+
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "200")
+            .env(CHECK_MAX_ENV, "201")
+            .env(STAGED_RESTART_AFTER_ENV, "1500")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=stable"]),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+
+    publish(
+        &routes,
+        &base_url,
+        MANIFEST_PATH,
+        "0.2.0",
+        &never_idle_script("0.2.0"),
+    );
+    rewind_last_check_to_yesterday(&paths);
+    wait_until(
+        "daemon 0.1.0 to be asked to restart when idle",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("usr2 0.1.0"),
+    );
+    wait_until(
+        "the fallback to force 0.2.0",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("start 0.2.0"),
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+
+    let lines: Vec<String> = read_or_empty(&log_path).lines().map(String::from).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "start 0.1.0 update_restart=unset idle_restart=1".to_string(),
+            "usr2 0.1.0".to_string(),
+            "term 0.1.0".to_string(),
+            "start 0.2.0 update_restart=1 idle_restart=1".to_string(),
+            "term 0.2.0".to_string(),
+        ],
+        "idle hand-off first, forced restart only after the window"
+    );
+    let stderr = read_or_empty(&stderr_path(dir.path()));
+    assert!(
+        stderr.contains("staged intentd 0.2.0 was not taken within"),
+        "stderr: {stderr}"
+    );
+}
+
+/// Stable, already checked today: a manual check (SIGUSR1, what
+/// `intentd update` / `system.requestUpdate` send) still fetches at once,
+/// and does not count as the day's automatic check.
+#[test]
+fn stable_sigusr1_checks_even_when_already_checked_today() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
+    let marked = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap();
+    set_last_check_at(&paths, marked);
+    let routes: Routes = Arc::new(Mutex::new(HashMap::from([(
+        MANIFEST_PATH.to_string(),
+        manifest_bare("0.1.0"),
+    )])));
+    let (base_url, requests) = serve_recording(routes);
+
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=stable"]),
+    );
+    let log_path = daemon_log_path(dir.path());
+    wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("start 0.1.0")
+    });
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no startup check today"
+    );
+
+    let stderr = stderr_path(dir.path());
+    send_signal(&sitter, "USR1");
+    wait_until("the manual check", Duration::from_secs(15), || {
+        requests.lock().unwrap().len() == 1
+            && read_or_empty(&stderr).contains("intentd 0.1.0 is already current")
+    });
+    assert_eq!(
+        state::load(&paths.state_path).last_check_at,
+        Some(marked),
+        "a manual check is not the day's automatic check"
+    );
+
+    send_signal(&sitter, "TERM");
+    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
 }
 
 /// Routes serving a fully installable 0.2.0 release (manifest + archive):

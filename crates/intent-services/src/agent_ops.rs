@@ -410,6 +410,8 @@ mod tests_specialist_frontmatter;
 #[cfg(test)]
 mod tests_creation_preferences;
 #[cfg(test)]
+mod tests_identity_pin;
+#[cfg(test)]
 mod tests_specialist_provider;
 
 #[cfg(test)]
@@ -517,6 +519,11 @@ pub(crate) enum CreateModelSource {
 /// provider / model / effort gate has passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateModelAndEffort {
+    /// The effective provider the session spawns on, always pinned on the
+    /// row: an explicit caller / specialist provider, else the
+    /// settings-derived default at create time. A session never follows a
+    /// later `model.defaultProvider` change.
+    pub(crate) provider: String,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
 }
@@ -557,7 +564,8 @@ pub(crate) struct AgentCreatePlan {
     /// Canonical specialist id (alias already rewritten).
     pub(crate) specialist: Option<String>,
     pub(crate) model: Option<String>,
-    pub(crate) provider: Option<String>,
+    /// Always pinned (never inherited from a later default change).
+    pub(crate) provider: String,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) metadata: Option<Value>,
     pub(crate) delegation_depth: Option<i64>,
@@ -1173,15 +1181,6 @@ pub(crate) fn resolve_disabled_provider_rehome(
     Some(DisabledProviderRehome { provider, model })
 }
 
-/// Test-only `providers.paths` value marking a base provider installed for
-/// [`ensure_provider_available`]. Codex and Claude Code are npx-only and ignore
-/// path overrides, so without it their availability follows the host's
-/// Node/npx. Being settings data, it reaches every call site (including the
-/// `spawn_blocking` delegate resolver) per `Services` instance, without
-/// mutating process-global `PATH`. The disabled and auth gates still run.
-#[cfg(test)]
-pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
-
 /// Reject a known provider id that is disabled in settings, whose cached
 /// auth verdict is hard-false, or that the daemon's own provider discovery
 /// reports as unrunnable (not installed, or gated off by a missing env
@@ -1193,9 +1192,11 @@ pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
 /// with its own distinct message. Mirrors `resolve_spawn`'s override-aware resolution
 /// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
 /// by the same `providers.paths` settings, and aligns "installed" with what
-/// the spawn path can actually run: a provider whose only runnable path is
-/// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
-/// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
+/// the spawn path can actually run. npx-only providers (Codex, Claude Code,
+/// Pi) are installed only when npx resolves and, for Codex and Claude Code,
+/// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
+/// a `providers.paths` override changes neither. Tests mark a provider
+/// installed with `test_support::provider_installed`, never with an override.
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
@@ -1207,19 +1208,19 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    #[cfg(test)]
-    if providers
-        .paths
-        .get(intent_providers::base_provider_id(provider_id))
-        .is_some_and(|path| path == TEST_RUNNABLE_PATH)
-    {
-        return Ok(());
-    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
         &|key| providers.paths.get(key).cloned(),
     );
+    // Test-only: a provider marked by `test_support::provider_installed`
+    // counts as installed; feature gating still applies.
+    #[cfg(test)]
+    let availability = availability.map(|mut availability| {
+        availability.installed |=
+            crate::test_support::provider_installed::is_marked(&providers.paths, provider_id);
+        availability
+    });
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
@@ -4863,9 +4864,14 @@ impl Services {
         // provider (auggie), installed or not.
         let derived_default =
             crate::agent_session::derived_default_provider(&self.effective_settings());
-        if provider.is_none() && derived_default.is_none() {
+        // Every session pins its effective provider (caller / specialist
+        // pin → the settings-derived default at create time); a NULL
+        // provider column is a legacy row the turn-start repair handles.
+        let Some(effective_provider) =
+            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
+        else {
             return Err(crate::agent_session::no_default_provider_error(method));
-        }
+        };
         // monorepo#3178: the provider this session would spawn on must not be
         // one the user explicitly disabled in `providers.enabled` — fail fast
         // with the distinct "not enabled" -32602 before any session row is
@@ -4880,28 +4886,27 @@ impl Services {
         // Explicit/default-provider direct creates keep their existing
         // spawn-time installed-ness check. A derived specialist pin is
         // already checked by `plan_agent_create`, like delegation.
-        if let Some(p) =
-            crate::agent_session::resolve_provider_id(provider, derived_default.as_deref())
         {
+            let p = effective_provider.as_str();
             // A profile default (or explicit reference) must still name a
             // saved, enabled profile: never persist a session that would run
             // the base's Default account (PROTOCOL §5.54).
-            self.ensure_provider_ref_selectable(&p)?;
+            self.ensure_provider_ref_selectable(p)?;
             ensure_provider_enabled(
                 method,
-                &p,
+                p,
                 self.effective_settings().providers.enabled.as_ref(),
             )?;
             // A profile is gated on its own saved settings' verdict, never
             // the base provider's Default verdict.
-            let verdict = if crate::provider_profiles::is_qualified_ref(&p) {
-                Box::pin(self.resolve_profile_env(&p))
+            let verdict = if crate::provider_profiles::is_qualified_ref(p) {
+                Box::pin(self.resolve_profile_env(p))
                     .await?
                     .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
             } else {
-                crate::provider_auth::cached_auth_verdict(&p)
+                crate::provider_auth::cached_auth_verdict(p)
             };
-            ensure_provider_authenticated(method, &p, verdict)?;
+            ensure_provider_authenticated(method, p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
         // dynamic catalogs) must not be persisted: the spawn would feed the
@@ -4919,9 +4924,7 @@ impl Services {
         // until settings change; drop it to the CLI default instead
         // (session.model stays None).
         if let Some(m) = resolved_model.as_deref() {
-            let effective = provider
-                .or(derived_default.as_deref())
-                .expect("guarded above: provider or derived default present");
+            let effective = effective_provider.as_str();
             match ensure_bare_model_matches_provider(method, &self.cached_models(), effective, m) {
                 // A caller-supplied id must also be one the provider can
                 // resolve (intent-hq/intent#7121); derived defaults and models
@@ -4958,9 +4961,7 @@ impl Services {
             // pool (monorepo#4148).
             let services = self.clone();
             let specialist = specialist.map(str::to_string);
-            let effective_provider = provider
-                .map(str::to_string)
-                .or_else(|| derived_default.clone());
+            let effective_provider = Some(effective_provider.clone());
             let resolved_model = resolved_model.clone();
             let spec_wp = spec_wp.map(Path::to_path_buf);
             tokio::task::spawn_blocking(move || {
@@ -4998,7 +4999,21 @@ impl Services {
         } else {
             resolve_settings_default_reasoning_effort(self, model_source, resolved_model.as_deref())
         };
+        // A create that ends without a model (a dropped mismatched default,
+        // or nothing configured) still pins a concrete one when the
+        // provider's cached catalog names its `isDefault` row (the cache-only
+        // step 4 the resolver runs). Filled only AFTER the effort rungs and
+        // validation above, which keep running against the model as resolved
+        // so far (a specialist effort with no model evidence still passes). A
+        // cold cache leaves the model unset; the first session open then pins
+        // the provider's reported current model
+        // (`Services::fill_identity_from_session_open`).
+        let resolved_model = resolved_model.or_else(|| {
+            self.cached_models()
+                .cached_default_model(&effective_provider)
+        });
         Ok(CreateModelAndEffort {
+            provider: effective_provider,
             model: resolved_model,
             reasoning_effort,
         })
@@ -5298,8 +5313,9 @@ impl Services {
 
         // With neither caller choice supplied, honor the specialist's
         // provider before resolving its model/effort. Explicit model-only
-        // creates deliberately retain the settings-provider behavior, as
-        // they do in delegate. Persist the effective pin in the plan so
+        // creates deliberately resolve on the settings default provider, as
+        // they do in delegate — which the plan then pins on the row, like
+        // every other effective provider. Persist the effective pin so
         // spawn and previews use the same pair; reject unusable pins here,
         // before even workspace.create's workspace row can be written.
         let provider = if provider.is_none() && model.is_none() && specialist.is_some() {
@@ -5330,6 +5346,7 @@ impl Services {
         // model only via explicit agent.setModel. The provider / model /
         // reasoning-effort chain is the last `-32602` producer of the plan.
         let CreateModelAndEffort {
+            provider,
             model: resolved_model,
             reasoning_effort,
         } = self
@@ -5528,7 +5545,7 @@ impl Services {
             model: resolved_model,
             reasoning_effort,
             effort_levels: None,
-            provider,
+            provider: Some(provider),
             system_prompt: None,
             specialist,
             // Reference parity: `agent-factory.ts:435` persists `AgentStatus.Idle`
@@ -5721,18 +5738,24 @@ impl Services {
             // spawn would actually run — not the raw column: a legacy alias
             // (`acp`/`default`/`augment`) normalizes through `provider_config`
             // exactly as `resolve_spawn` and the ownership check above do, and
-            // a NULL column resolves to the settings-derived default. Comparing
-            // the raw column would treat an explicit `providerId` naming that
-            // same effective provider as a cross-provider switch and gate a
-            // same-provider model change — the very exemption above.
-            let current_effective = session
-                .provider
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .map(crate::provider_profiles::canonical_selection)
-                .or_else(|| {
-                    crate::agent_session::derived_default_provider(&self.effective_settings())
-                });
+            // a NULL column (a legacy row) resolves to the provider its last
+            // turn ran, else the settings-derived default
+            // (`legacy_session_provider`, the same rule the turn-start repair
+            // pins). Comparing the raw column would treat an explicit
+            // `providerId` naming that same effective provider as a
+            // cross-provider switch and gate a same-provider model change —
+            // the very exemption above.
+            let current_effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => Some(crate::provider_profiles::canonical_selection(p)),
+                None => {
+                    crate::agent_session::legacy_session_provider(
+                        self,
+                        &session.workspace_id,
+                        &agent_id,
+                    )
+                    .await?
+                }
+            };
             if current_effective.as_deref() != Some(pid.as_str()) {
                 ensure_provider_available(
                     "agent.setModel",
@@ -5749,28 +5772,30 @@ impl Services {
             // dynamic catalogs) is the same misroute vector (monorepo#607).
             // With neither set the session could never spawn — fail loudly
             // instead of validating against a positional default
-            // (monorepo#3044).
-            let derived;
-            let effective = if let Some(p) = session.provider.as_deref().filter(|p| !p.is_empty()) {
-                p
-            } else {
-                derived =
-                    crate::agent_session::derived_default_provider(&self.effective_settings())
-                        .ok_or_else(|| {
-                            crate::agent_session::no_default_provider_error("agent.setModel")
-                        })?;
-                derived.as_str()
+            // (monorepo#3044). A legacy session (NULL provider) validates
+            // against — and is pinned onto — the provider its last turn ran
+            // (`legacy_session_provider`), never left following the default.
+            let effective = match session.provider.as_deref().filter(|p| !p.is_empty()) {
+                Some(p) => p.to_string(),
+                None => crate::agent_session::legacy_session_provider(
+                    self,
+                    &session.workspace_id,
+                    &agent_id,
+                )
+                .await?
+                .ok_or_else(|| crate::agent_session::no_default_provider_error("agent.setModel"))?,
             };
             ensure_bare_model_matches_provider(
                 "agent.setModel",
                 &self.cached_models(),
-                effective,
+                &effective,
                 &model_id,
             )?;
-            None
+            Some(effective)
         };
-        // Reconcile the provider to the explicit providerId (models without
-        // one keep the session's provider). The
+        // Reconcile the provider to the explicit providerId, else pin the
+        // effective provider the model was just validated against (so a
+        // legacy NULL provider never survives a setModel). The
         // write goes through the narrow
         // `set_agent_session_model` — the ONE writer allowed to change
         // `provider` after first real use — because a cross-provider switch
@@ -5778,7 +5803,7 @@ impl Services {
         // `update_agent_session`'s immutability guard (monorepo#882); the
         // next turn then respawns the new provider's binary, opens a fresh
         // `session/new`, and replays history as `<supervisor>` XML.
-        let provider = model_provider.or(session.provider);
+        let provider = model_provider;
         let workspace_id = session.workspace_id;
         self.store
             .set_agent_session_model(
@@ -6820,6 +6845,11 @@ impl Services {
                     remember_specialist && is_manual_foreground_agent(&session),
                     obj.contains_key("notificationsMuted")
                         .then_some(session.notifications_muted),
+                    // An explicit effort choice — even the level an
+                    // Auto-pinned session already carries — clears the Auto
+                    // pin in this same write, so the next model switch keeps
+                    // it and no concurrent setModel can slip in between.
+                    obj.contains_key("reasoningEffort"),
                 )
                 .await?;
         }
@@ -10268,53 +10298,152 @@ impl Services {
             let Some(blocker_reason) = session.attention_request_reason.as_deref() else {
                 return Ok(result(false));
             };
-            let gate = self.attention_mutation_gates.for_agent(&caller);
-            let _guard = gate.lock().await;
             let saved_at = session.attention_request_timestamp.as_deref();
-            if !self.store.clear_blocker_request_if_matches(
-                &workspace_id, &caller, blocker_reason, saved_at, &now_iso(),
-            ).await? {
-                return Ok(result(false));
-            }
-            // Retire this blocker and older blocker raises only. Discussions
-            // and replacement generations remain independently actionable.
-            if let Ok(mut map) = self.deferred_attention.lock() {
-                if let Some(entries) = map.get_mut(&caller) {
-                    // The generation CAS succeeded while holding the raise
-                    // gate: every parked blocker precedes or is this request.
-                    // A newer raise cannot park until this guard is released.
-                    entries.retain(|entry| entry.meta_kind != "blocker-report");
-                    if entries.is_empty() { map.remove(&caller); }
+            let resolved = self
+                .clear_observed_blocker(&workspace_id, &caller, &session, blocker_reason, saved_at)
+                .await?;
+            Ok(result(resolved))
+        })
+        .await
+    }
+
+    /// Clear the blocker generation `(blocker_reason, saved_at)` observed on
+    /// `session` — the shared clearing path behind `ws.agent.resolveBlocker`
+    /// and the daemon's provider-stall auto-clear (intent-hq/intent#7182).
+    /// A replacement request (a newer blocker or a discussion) survives the
+    /// conditional write. On success: retires parked blocker surfacings,
+    /// emits `agent:updated` with `attentionRequestCleared: true`, resumes a
+    /// still-`blocked` linked task the agent is assigned to (terminal
+    /// statuses untouched), and recomputes the workspace displayStatus.
+    /// Returns whether the blocker was cleared.
+    async fn clear_observed_blocker(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller: &AgentId,
+        session: &AgentSession,
+        blocker_reason: &str,
+        saved_at: Option<&str>,
+    ) -> Result<bool> {
+        let workspace_id = workspace_id.clone();
+        let caller = caller.clone();
+        let gate = self.attention_mutation_gates.for_agent(&caller);
+        let _guard = gate.lock().await;
+        if !self
+            .store
+            .clear_blocker_request_if_matches(
+                &workspace_id,
+                &caller,
+                blocker_reason,
+                saved_at,
+                &now_iso(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        // Retire this blocker and older blocker raises only. Discussions
+        // and replacement generations remain independently actionable.
+        if let Ok(mut map) = self.deferred_attention.lock() {
+            if let Some(entries) = map.get_mut(&caller) {
+                // The generation CAS succeeded while holding the raise
+                // gate: every parked blocker precedes or is this request.
+                // A newer raise cannot park until this guard is released.
+                entries.retain(|entry| entry.meta_kind != "blocker-report");
+                if entries.is_empty() {
+                    map.remove(&caller);
                 }
             }
-            self.publish_agent_mutation_event(
-                &workspace_id, &caller, intent_core::events::AGENT_UPDATED,
-                json!({ "agentId": caller.0, "attentionRequestCleared": true }),
-            ).await;
-            // Read the current task, then condition its write on both that
-            // revision and the session link in one SQLite statement. A note
-            // transition or a session-only relink wins before the write.
-            let current = self.store.get_agent_session_summary(&caller).await?;
-            if current.task_note_id == session.task_note_id {
-                if let Some(note_id) = &session.task_note_id {
-                    if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
-                        if note.metadata.task.as_ref().is_some_and(|task| {
-                            task.status == intent_core::TaskStatus::Blocked
-                                && task.assigned_agent_ids.contains(&caller)
-                        }) {
-                            if let Err(e) = self.set_task_note_status_guarded(
-                                &workspace_id, note_id, intent_core::TaskStatus::InProgress,
-                                Some(note.rev), Some(caller.clone()), Some(caller.clone()),
-                            ).await {
-                                tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
-                            }
+        }
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": caller.0, "attentionRequestCleared": true }),
+        )
+        .await;
+        // Read the current task, then condition its write on both that
+        // revision and the session link in one SQLite statement. A note
+        // transition or a session-only relink wins before the write.
+        let current = self.store.get_agent_session_summary(&caller).await?;
+        if current.task_note_id == session.task_note_id {
+            if let Some(note_id) = &session.task_note_id {
+                if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                    if note.metadata.task.as_ref().is_some_and(|task| {
+                        task.status == intent_core::TaskStatus::Blocked
+                            && task.assigned_agent_ids.contains(&caller)
+                    }) {
+                        if let Err(e) = self
+                            .set_task_note_status_guarded(
+                                &workspace_id,
+                                note_id,
+                                intent_core::TaskStatus::InProgress,
+                                Some(note.rev),
+                                Some(caller.clone()),
+                                Some(caller.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
                         }
                     }
                 }
             }
-            self.maybe_emit_display_status_changed(&workspace_id).await;
-            Ok(result(true))
-        }).await
+        }
+        self.maybe_emit_display_status_changed(&workspace_id).await;
+        Ok(true)
+    }
+
+    /// Successful-turn hook (intent-hq/intent#7182): when the agent's
+    /// pending request is a daemon-raised provider-stall blocker — recognised
+    /// by its persisted reason, which starts with a daemon-reserved prefix
+    /// ([`crate::agent_session::is_daemon_stall_blocker_reason`]) — clear
+    /// that exact `(reason, savedAt)` generation through the
+    /// `resolveBlocker` path. Recognition reads the persisted row, so it
+    /// survives a daemon restart. Agent-raised blockers (whose reasons can
+    /// never carry the reserved prefixes) and discussions are untouched, and
+    /// the generation CAS leaves any newer request pending. Best-effort:
+    /// errors log and the turn proceeds.
+    pub(crate) async fn clear_daemon_stall_blocker_after_success(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let outcome = async {
+            let session = self.load_session_internal(agent_id).await?;
+            if session.workspace_id != *workspace_id
+                || session.attention_request_kind.as_deref() != Some("blocker")
+            {
+                return Ok(false);
+            }
+            let Some(reason) = session
+                .attention_request_reason
+                .as_deref()
+                .filter(|reason| crate::agent_session::is_daemon_stall_blocker_reason(reason))
+            else {
+                return Ok(false);
+            };
+            let _mutation = self.workspace_mutations.enter(workspace_id)?;
+            self.clear_observed_blocker(
+                workspace_id,
+                agent_id,
+                &session,
+                reason,
+                session.attention_request_timestamp.as_deref(),
+            )
+            .await
+        };
+        match crate::workspace_mutations::boxed(outcome).await {
+            Ok(true) => tracing::info!(
+                agent = %agent_id,
+                "provider-stall blocker cleared after a successful turn (intent#7182)"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "failed to clear provider-stall blocker after a successful turn (intent#7182)"
+            ),
+        }
     }
 
     /// Shared services op behind `ws.agent.requestDiscussion` /

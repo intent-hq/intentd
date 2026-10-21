@@ -22,7 +22,9 @@ import sys
 import tempfile
 import time
 
-from provider_cli_metadata import METADATA, package_snapshot, replace_package
+from provider_cli_metadata import (
+    METADATA, package_snapshot, registry_url, replace_package, runtime_spec,
+)
 
 
 REPO = "intent-hq/intentd"
@@ -298,7 +300,8 @@ def inspect_branch(head, base):
         previous = decode_json(git("show", f"{parent}:{METADATA}"))
         actual = decode_json(metadata)
         package = actual[ADAPTER.key]["package"]
-        expected = decode_json(replace_package(json.dumps(previous), ADAPTER.key, package))
+        expected = decode_json(replace_package(json.dumps(previous), ADAPTER.key, package,
+                                               actual[ADAPTER.key].get("runtime")))
         if actual != expected or package.get("name") != ADAPTER.package or package.get("version") != target:
             raise Refusal("Unexpected adapter metadata changes; preserving human edits.")
         expected_changes = "\n".join(sorted([expected_changes, f"M\t{METADATA}"]))
@@ -317,7 +320,7 @@ def inspect_branch(head, base):
     return current, target, previous_metadata_hash
 
 
-def make_commit(base, content, current, target, manifest, previous_metadata_hash=None):
+def make_commit(base, content, current, target, manifest, runtime, previous_metadata_hash=None):
     # A private index keeps staging and the caller's working tree untouched.
     with tempfile.TemporaryDirectory(prefix="acp-adapter-pin-") as directory:
         env = os.environ | {"GIT_INDEX_FILE": str(Path(directory) / "index")}
@@ -325,7 +328,7 @@ def make_commit(base, content, current, target, manifest, previous_metadata_hash
         git("read-tree", base, env=env)
         mode = git("ls-tree", base, CONFIG).split()[0]
         git("update-index", "--cacheinfo", f"{mode},{blob},{CONFIG}", env=env)
-        metadata = replace_package(git("show", f"{base}:{METADATA}"), ADAPTER.key, manifest)
+        metadata = replace_package(git("show", f"{base}:{METADATA}"), ADAPTER.key, manifest, runtime)
         metadata_blob = git("hash-object", "-w", "--stdin", input=metadata).strip()
         metadata_mode = git("ls-tree", base, METADATA).split()[0]
         git("update-index", "--cacheinfo", f"{metadata_mode},{metadata_blob},{METADATA}", env=env)
@@ -337,6 +340,34 @@ def make_commit(base, content, current, target, manifest, previous_metadata_hash
         }
         return git("-c", "commit.gpgsign=false", "commit-tree", tree, "-p", base,
                    input=message(current, target, previous_metadata_hash, package_metadata_hash), env=env).strip()
+
+
+def fetch_json(url):
+    return decode_json(run(
+        "curl", "--fail", "--silent", "--show-error", "--location",
+        "--max-time", "60", "--retry", "2", url,
+    ))
+
+
+def runtime_manifest(base, manifest):
+    """The exact runtime manifest a mapped adapter snapshots (e.g. the Claude
+    Agent SDK's claudeCodeVersion), or None when the mapping declares none."""
+    try:
+        metadata = git("show", f"{base}:{METADATA}")
+        spec = runtime_spec(metadata, ADAPTER.key, manifest)
+    except ValueError as error:
+        raise Refusal(f"{ADAPTER.package}@{manifest.get('version')} has no exact runtime "
+                      "dependency; update the adapter runtime mapping by hand.") from error
+    if spec is None:
+        return None
+    runtime = fetch_json(registry_url(*spec))
+    if not isinstance(runtime, dict) or (runtime.get("name"), runtime.get("version")) != spec:
+        raise Refusal(f"Registry response is not the expected {'@'.join(spec)} package.")
+    try:
+        replace_package(metadata, ADAPTER.key, manifest, runtime)
+    except ValueError as error:
+        raise Refusal(f"{'@'.join(spec)} does not declare an exact runtime CLI version.") from error
+    return runtime
 
 
 def node_floor(declared):
@@ -380,10 +411,7 @@ def main():
     base = fetch_main()
     content = config_at(base)
     current = read_pin(content)
-    manifest = decode_json(run(
-        "curl", "--fail", "--silent", "--show-error", "--location",
-        "--max-time", "60", "--retry", "2", ADAPTER.registry,
-    ))
+    manifest = fetch_json(ADAPTER.registry)
     if not isinstance(manifest, dict) or manifest.get("name") != ADAPTER.package:
         raise Refusal(f"Registry response is not the expected {ADAPTER.package} package.")
     try:
@@ -449,6 +477,7 @@ def main():
     # publication, but after the hold/human/withdrawn-version disarms above so
     # an unguarded npm latest never strands an armed proposal.
     check_engines(manifest)
+    runtime = runtime_manifest(base, manifest)
     if proposed == target and pr and metadata_matches:
         print(f"Rolling PR already proposes {target}; no commit, push, or PR edit needed.")
         if not pr.get("auto_merge"):
@@ -479,7 +508,7 @@ def main():
         raise Refusal("Rolling branch changed during this run; preserving concurrent edits.")
 
     commit = head if proposed == target else make_commit(
-        base, content, current, target, manifest, pr_metadata_hash(pr) if pr else None,
+        base, content, current, target, manifest, runtime, pr_metadata_hash(pr) if pr else None,
     )
     if commit != head:
         git("push", f"--force-with-lease={ADAPTER.ref}:{head}", "origin", f"{commit}:{ADAPTER.ref}")

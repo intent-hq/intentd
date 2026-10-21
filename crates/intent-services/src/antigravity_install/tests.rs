@@ -33,7 +33,7 @@ fn extraction_keeps_the_complete_bundle_and_rejects_unsafe_members() {
             &path,
             &target,
             &Cancellation::default(),
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5)),
         );
         if names == [SERVER, HARNESS] {
             result.unwrap();
@@ -66,7 +66,7 @@ fn extraction_rejects_archive_symlinks_and_corruption() {
             &path,
             &target,
             &Cancellation::default(),
-            Instant::now() + Duration::from_secs(5)
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5))
         ),
         Err(InstallError::InvalidArchive)
     );
@@ -76,7 +76,7 @@ fn extraction_rejects_archive_symlinks_and_corruption() {
             &path,
             &target,
             &Cancellation::default(),
-            Instant::now() + Duration::from_secs(5)
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5))
         ),
         Err(InstallError::InvalidArchive)
     );

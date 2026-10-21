@@ -34,14 +34,18 @@ permissions:
 env:
   # Number of intent-cache Linux runner slots: the route job bursts Linux
   # jobs to GitHub-hosted runners once this many intent-cache jobs are queued or running
-  # ahead of this run. Raise it when slots are added. Jobs still blocked on
+  # ahead of this run. Set the CI_LINUX_HEAVY_SLOTS org or repo variable when
+  # slots are added. Jobs still blocked on
   # `needs` are invisible to the jobs API, so only jobs already released to
   # the slots count. Bursted jobs don't carry the intent-cache label and
   # stop counting, so routing returns to the slots as they free up.
-  LINUX_BURST_THRESHOLD: 2
+  LINUX_BURST_THRESHOLD: ${{ vars.CI_LINUX_HEAVY_SLOTS || '2' }}
+  # Same for the xl pool (intent-cache-xl, 16 threads per slot), which serves
+  # gh-linux-16x jobs before they overflow to intent-cache; 0 disables it.
+  LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}
   # Same for the fast pool (intent-cache-small, one core per slot), which
   # serves the jobs that ask for a standard ubuntu-* label.
-  LINUX_SMALL_BURST_THRESHOLD: 6
+  LINUX_SMALL_BURST_THRESHOLD: ${{ vars.CI_LINUX_SMALL_SLOTS || '6' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue (push-to-main
@@ -64,6 +68,7 @@ jobs:
       LINUX_SIZE: '16'
     outputs:
       runners: ${{ steps.decide.outputs.runners }}
+      slots: ${{ steps.decide.outputs.slots }}
       linux_labels: ${{ steps.heavy.outputs.linux_labels }}
       check_labels: ${{ steps.heavy.outputs.check_labels }}
       linux_burst: ${{ steps.heavy.outputs.linux_burst }}
@@ -76,7 +81,25 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+          XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
           SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
+          # Pooled jobs that start together once routing finishes; each reads
+          # outputs.slots[key] (see runner-route.yml for the fields). The
+          # heavy Rust jobs list pull_request only: the merge queue keeps them
+          # on GitHub-hosted larger runners (see the `heavy` step below).
+          # Minutes are typical PR / merge-queue durations. release-fast-path
+          # (release branches only) and the gate keep the `runners` mapping.
+          SLOT_JOBS: >-
+            [
+            {"key":"check","label":"gh-linux-8x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
+            {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
+            {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
+            {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
+            ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
@@ -88,6 +111,8 @@ jobs:
             const fleets = {
               // Heavy jobs (compile Rust or run over ~5 minutes): 8 cores / 48 GB per slot.
               linux: ['self-hosted', 'linux', 'x64', 'intent-cache'],
+              // 16-core jobs: 16 threads per slot.
+              xl: ['self-hosted', 'linux', 'x64', 'intent-cache-xl'],
               // Fast jobs: 1 core / 3 GB per slot.
               small: ['self-hosted', 'linux', 'x64', 'intent-cache-small'],
               arm: ['self-hosted', 'Linux', 'ARM64'],
@@ -97,6 +122,7 @@ jobs:
             };
             const disabled = {
               linux: process.env.LINUX_RUNNER_DISABLED === 'true',
+              xl: process.env.LINUX_RUNNER_DISABLED === 'true',
               small: process.env.LINUX_RUNNER_DISABLED === 'true',
               arm: process.env.LINUX_RUNNER_DISABLED === 'true',
               windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
@@ -105,6 +131,8 @@ jobs:
             };
             const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
             const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
+            // Free slots per Linux pool: online slots (capped by the threshold) minus jobs queued or running on them.
+            const free = {};
             const pr = context.payload?.pull_request;
             const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
             try {
@@ -134,7 +162,7 @@ jobs:
                   }
                 }
               }
-              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), small: Number(process.env.SMALL_THRESHOLD || '6')};
+              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0'), small: Number(process.env.SMALL_THRESHOLD || '6')};
               if (Object.values(thresholds).some(n => !Number.isInteger(n) || n < 0)) throw new Error('invalid queue threshold');
               for (const [key, labels] of Object.entries(fleets)) {
                 const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase())));
@@ -144,14 +172,21 @@ jobs:
                 const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
                 burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
-                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}`;
+                if (!native) free[key] = burst[key] ? 0 : limit - depth;
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${free[key]}`}`;
               }
             } catch (error) {
               for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
+              for (const key of Object.keys(free)) free[key] = 0;
             }
             // Keys are the GitHub-hosted fallback labels jobs ask for; values are
             // the self-hosted fleet labels, or the key itself when the fleet bursts.
+            // A label listed under several pools takes the first with a free slot.
             const hosted = {
+              // 16-core jobs prefer xl slots and overflow to heavy slots before
+              // going hosted, so with no xl slot free they route as they did
+              // before xl existed. 8-core jobs never take an xl slot.
+              xl: ['gh-linux-16x'],
               // Larger runners carry the heavy jobs; standard runners the fast ones.
               linux: ['gh-linux-8x', 'gh-linux-16x'],
               small: ['ubuntu-22.04', 'ubuntu-24.04'],
@@ -160,19 +195,53 @@ jobs:
               macos: ['macos-26-xlarge'],
               intel: ['macos-latest-large'],
             };
+            // Free slots go to the caller's listed jobs one at a time: Rust-compiling
+            // jobs first (they reuse the slot's local cache), then the longest, then
+            // list order. Listed jobs that do not fit, or that skip this event, get
+            // their hosted label directly; matrix legs are ranked separately.
+            // Concurrent runs read the same free count before either job is queued,
+            // so a pool may briefly run a job or two over its slot count.
+            let requests = [];
+            try {
+              requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
+            } catch (error) {
+              core.info(`slot list unreadable (${error.message}); listed jobs use hosted labels`);
+            }
+            const slots = {};
+            const granted = Object.fromEntries(Object.keys(free).map(k => [k, 0]));
+            const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
+            for (const r of ranked) {
+              const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
+              const key = runs && Object.keys(hosted).find(k => k in free && hosted[k].includes(r.label) && free[k] > 0);
+              if (key) {
+                free[key] -= 1;
+                granted[key] += 1;
+                slots[r.key] = fleets[key];
+              } else slots[r.key] = [r.label];
+            }
+            // Unlisted jobs (single-job workflows, jobs that start after the listed
+            // ones) use a pool only while a slot is still free.
+            for (const key of Object.keys(free)) {
+              burst[key] = free[key] <= 0;
+              if (granted[key]) reasons[key] += ` granted=${granted[key]}`;
+            }
             const mapping = {};
             for (const [key, labels] of Object.entries(hosted)) {
-              for (const label of labels) mapping[label] = burst[key] ? [label] : fleets[key];
+              for (const label of labels) if (!mapping[label] || mapping[label][0] === label) mapping[label] = burst[key] ? [label] : fleets[key];
             }
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
             core.setOutput('runners', JSON.stringify(mapping));
-            core.setOutput('linux_labels', JSON.stringify(mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`]));
+            core.setOutput('slots', JSON.stringify(slots));
+            const linuxLabels = mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`];
+            core.setOutput('linux_labels', JSON.stringify(linuxLabels));
+            core.setOutput('linux_burst', String(linuxLabels[0] !== 'self-hosted'));
             core.setOutput('check_labels', JSON.stringify(mapping['gh-linux-8x']));
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
-            for (const key of ['linux', 'windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # The heavy Rust jobs (check, coverage-*, daemon-lifecycle) are the only
-      # readers of linux_labels / check_labels / linux_burst. In the merge
+            for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+      # The heavy Rust jobs (check and coverage-changed through `slots`, which
+      # list pull_request only; the other coverage-* jobs and daemon-lifecycle
+      # through linux_labels) all stay hosted in the merge queue. In the merge
       # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
       # sized for 16 CPUs, and the route decision is made before any of them
       # is queued, so all would land on the two 8-CPU intent-cache slots and
@@ -205,7 +274,7 @@ jobs:
   pr-static:
     needs: route
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-static'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -252,7 +321,7 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["gh-linux-8x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.
@@ -308,6 +377,27 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
+      # Real claude-agent-acp contract (claude_adapter_contract): the pinned
+      # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
+      # so every PR and merge-queue run installs the exact pin and checks that
+      # it still applies the utility-session settings Intent sends. Offline
+      # beyond the npm install: a stand-in replaces the Claude CLI, no account.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+      - name: Verify the Claude adapter pin provisioner offline
+        run: python3 -I -B -S scripts/test-prepare-claude-adapter-pin.py
+      - name: Install the pinned Claude adapter
+        run: |
+          set -euo pipefail
+          adapter=$(python3 -I -B -S scripts/prepare-claude-adapter-pin.py \
+            --cache-dir "$RUNNER_TEMP/claude-adapter-pin")
+          echo "INTENT_CLAUDE_ADAPTER_PIN_FIXTURE=$adapter" >> "$GITHUB_ENV"
+      - name: Real Claude adapter utility-session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
+        run: "cargo test -p intent-services --lib claude_adapter_contract::"
       # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
       # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
@@ -351,6 +441,14 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # CI is the guard against host-dependent tests: a test that relies on
+      # an installed provider CLI passes locally and fails here only while
+      # runners have none. Fail loudly if a runner image starts shipping one.
+      # Locally: scripts/test-without-provider-clis.sh (intentd#2462).
+      - name: No provider CLIs on the runner
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: cargo test -p intent-providers --lib -- --ignored --exact provider_cli_guard::no_provider_cli_visible
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
       # (coverage-e2e / coverage-all are merge_group-only; PRs run only
@@ -993,13 +1091,23 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core gh-linux-16x runner this merge-queue
-      # job runs on. Higher counts (32 and 64 on a 64-core host) made the
-      # latency-bound stress tests — e.g. e2e_wss_pool_contention_stress's
-      # <2s read assert — blow their wall-clock bounds under llvm-cov load on
-      # both nextest tries.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16). 16 is
+      # the 16-core gh-linux-16x burst runner; an intent-cache heavy slot is
+      # cpuset-pinned to 8 CPUs, where a fixed 16 oversubscribed 2x and timed
+      # out latency-bound tests. Higher counts (32 and 64 on a 64-core host)
+      # made the latency-bound stress tests — e.g.
+      # e2e_wss_pool_contention_stress's <2s read assert — blow their
+      # wall-clock bounds under llvm-cov load on both nextest tries, hence
+      # the cap.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -1127,13 +1235,21 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 matches the 16-core gh-linux-16x runner this merge-queue
-      # job runs on. Higher counts (32 and 64 on a 64-core host) thrashed
-      # SQLite/WAL and wall-clock-timeout tests hard enough that even the
-      # nextest retry failed: concurrent_writes_no_sqlite_busy hit "database
-      # is locked" on both tries, bridge/auto-commit timing tests timed out.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), as in
+      # coverage-e2e. The cap stays at 16 because higher counts (32 and 64
+      # on a 64-core host) thrashed SQLite/WAL and wall-clock-timeout tests
+      # hard enough that even the nextest retry failed:
+      # concurrent_writes_no_sqlite_busy hit "database is locked" on both
+      # tries, bridge/auto-commit timing tests timed out.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -1235,7 +1351,7 @@ jobs:
     # Skipped on release-metadata PRs for the same reason as `check`.
     needs: [route, release-fast-path]
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-changed'] || fromJSON('["gh-linux-16x"]') }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
@@ -1246,9 +1362,8 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Same value and rationale as coverage-e2e (matches the 16-core
-      # burst runner).
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), same
+      # rationale as coverage-e2e.
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
@@ -1261,6 +1376,14 @@ jobs:
       PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
@@ -1482,7 +1605,7 @@ jobs:
           retention-days: 7
   pr-title:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-title'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1534,7 +1657,7 @@ jobs:
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['conflict-markers'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1613,7 +1736,7 @@ jobs:
   # Both the self-hosted Linux fleet and the GitHub-hosted fallback provide dpkg-deb / tar+xz.
   deb-packaging:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['deb-packaging'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs after queueing and on main pushes.
     if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
@@ -1661,7 +1784,7 @@ jobs:
   # the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs on same-repo PRs (so a change to these scripts is proven before
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job.
@@ -1699,6 +1822,10 @@ jobs:
           python3 -B scripts/test-hosted-runners.py
           python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
+      - name: Test the local release-scripts runner (make test-release-scripts)
+        run: python3 -I -B scripts/test-release-scripts-local.py
+      - name: Test optional Intel cargo-dist network handling (offline)
+        run: python3 -I -B scripts/test-optional-intel-dist-network.py
       - name: Test optional Intel cargo-dist publication
         shell: bash
         run: |
@@ -1852,7 +1979,8 @@ jobs:
         os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-24.04", "windows-2025"]' || '["ubuntu-24.04"]') }}
         node: [22, 24]
     needs: [route]
-    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    # Linux legs read their own slot; the Windows leg keeps the native mapping.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots || '{}')[format('pi-session-paths-{0}', matrix.node)] || fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 10
     env:
       PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js

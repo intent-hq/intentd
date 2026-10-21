@@ -710,25 +710,31 @@ mod tests {
         }))).unwrap();
         let caller_runtime = runtime.clone();
         let caller = tokio::spawn(async move { caller_runtime.run(&services, args).await });
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        break pid;
+        let pid = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = pid.trim().parse::<i32>() {
+                            break pid;
+                        }
                     }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         // The caller disappearing must not detach the command from shutdown.
         caller.abort();
         let _ = caller.await;
         runtime.begin_shutdown();
-        tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            runtime.shutdown(),
+        )
+        .await
+        .unwrap();
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
         store.close().await;
     }

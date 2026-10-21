@@ -371,6 +371,12 @@ pub(crate) struct AcpSessionOpened {
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
     pub config_options: Option<Value>,
+    /// The model id the session-open fill persisted onto a session spawned
+    /// without one (`fill_identity_from_session_open`) — exactly what the
+    /// child runs. The manager records it as the handle's spawned model.
+    /// `None` when nothing was filled (or the fill lost to a concurrent
+    /// write).
+    pub filled_model: Option<String>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -896,6 +902,17 @@ impl Transcript {
     /// block), or `None` when the id was never seen. ACP `tool_call_update`s
     /// are name-less — the name only arrives on the first `tool_call` — so
     /// the completion-side registry claim resolves the name here.
+    /// The status recorded for a known tool call.
+    fn tool_status_for(&self, tool_call_id: &str) -> Option<&'static str> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        match self.blocks[i]["metadata"]["status"].as_str()? {
+            "completed" => Some("completed"),
+            "error" => Some("error"),
+            "started" => Some("started"),
+            _ => None,
+        }
+    }
+
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
@@ -1254,6 +1271,26 @@ pub(crate) fn open_tool_call_stall_ms() -> u64 {
     15 * 60 * 1000
 }
 
+/// Reason prefix of the daemon's terminal provider-stall blocker
+/// (intent-hq/intent#5395). Shared by the raise and by
+/// [`is_daemon_stall_blocker_reason`] so the two cannot drift; reserved —
+/// the agent-facing `reportBlocker` / `requestDiscussion` reject it.
+pub(crate) const PROVIDER_STALL_BLOCKER_PREFIX: &str = "Turn ended after a provider stall: ";
+
+/// Reason prefix of the daemon's blocker for a failed unsolicited (harness
+/// wake) provider turn. Shared and reserved like
+/// [`PROVIDER_STALL_BLOCKER_PREFIX`].
+pub(crate) const UNSOLICITED_STALL_BLOCKER_PREFIX: &str = "Unsolicited provider activity stopped: ";
+
+/// Whether a persisted blocker reason is a daemon-raised provider-stall
+/// blocker (intent-hq/intent#7182): prefix-anchored on the reserved daemon
+/// prefixes — the remainder carries per-stall details (durations, tool
+/// label, provider error) so a whole-string match is not possible.
+pub(crate) fn is_daemon_stall_blocker_reason(reason: &str) -> bool {
+    reason.starts_with(PROVIDER_STALL_BLOCKER_PREFIX)
+        || reason.starts_with(UNSOLICITED_STALL_BLOCKER_PREFIX)
+}
+
 /// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
 /// gone this many ms with zero `session/update` traffic AND no recorded tool
 /// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
@@ -1577,6 +1614,41 @@ pub(crate) fn resolve_base_provider_id(
 ) -> Option<String> {
     resolve_provider_id(provider, configured_default)
         .map(|id| intent_providers::base_provider_id(&id).to_owned())
+}
+
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id; a profile reference is
+/// kept as-is) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`]. A store
+/// read error is returned, never treated as "no last turn".
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Option<String>> {
+    // A store error must not read as "never ran": falling through to the
+    // current default would pin exactly the wrong provider permanently.
+    let (_, last_turn) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await?;
+    // A named profile reference (`<base>@<profileId>`, PROTOCOL §5.54) is
+    // kept as-is: the session ran that profile, not its base's Default.
+    let last_turn = last_turn.map(|raw| raw.trim().to_string()).and_then(|raw| {
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            Some(raw)
+        } else {
+            intent_providers::find_provider_or_legacy_alias(&raw).map(|p| p.id.to_string())
+        }
+    });
+    Ok(last_turn.or_else(|| derived_default_provider(&services.effective_settings())))
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -2768,6 +2840,82 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` from what the provider reports at
+    /// session open — the model select's `currentValue`, a selectable option
+    /// id (never the D13 display name, monorepo#1534, and never the adapter's
+    /// floating `"default"` alias: no concrete model is known then and the
+    /// column stays NULL) — so a session created without a resolvable model
+    /// (cold catalog cache, legacy row) ends up pinned to what it runs.
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten.
+    /// Returns the model that actually landed, which the manager records as
+    /// the child's spawned model (no respawn, no `model_changed` row). A NULL
+    /// `reasoning_effort` is filled at the turn boundary from the level the
+    /// provider confirmed instead (`AgentManager::maybe_persist_effort_change_notice`).
+    /// Best-effort: failures are logged, never propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| {
+                !m.trim().is_empty()
+                    && !m.contains(char::is_whitespace)
+                    && !m.eq_ignore_ascii_case("default")
+            });
+        let model = model?;
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                Some(&model),
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                // Report what actually landed: a column a concurrent write
+                // set first keeps that writer's value.
+                let landed = match self.store.get_agent_session(&stored.id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
+                        return None;
+                    }
+                };
+                let filled_model =
+                    (landed.model.as_deref() == Some(model.as_str())).then_some(model);
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?landed.model,
+                    field = "model",
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": stored.id.0, "modelId": landed.model }),
+                )
+                .await;
+                filled_model
+            }
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+                None
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -3184,7 +3332,7 @@ impl Services {
         } = prepared;
         // On CAS loss the provider metadata belongs to the losing candidate.
         // Preserve the winner's usage, effective model and effort metadata.
-        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+        let (modes, thought_level, filled_model) = if canonical == resp.session_id.0.as_ref() {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
@@ -3203,9 +3351,13 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            (resp.modes, thought_level)
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
+            (resp.modes, thought_level, filled_model)
         } else {
-            (None, None)
+            (None, None, None)
         };
         AcpSessionOpened {
             config_options: (canonical == resp.session_id.0.as_ref())
@@ -3214,6 +3366,7 @@ impl Services {
             session_id: canonical,
             modes,
             thought_level,
+            filled_model,
         }
     }
 
@@ -3559,11 +3712,15 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
+            filled_model,
         }
     }
 
@@ -4578,7 +4735,7 @@ impl Services {
         {
             let reason = match open_tool_call {
                 Some(label) => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with tool call {label} still open (open-tool terminal threshold \
                      {:?}; error class: provider stall). The tool call never reported completion \
                      and emitted nothing for the whole window, so the turn was failed instead of \
@@ -4587,7 +4744,7 @@ impl Services {
                     Duration::from_millis(open_tool_terminal_ms),
                 ),
                 None => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
                      provider stall). The provider is neither streaming nor running a tool, so the \
                      turn was failed instead of waiting for the idle timeout; the agent is stopping \
@@ -4596,6 +4753,8 @@ impl Services {
                     Duration::from_millis(stall_terminal_ms),
                 ),
             };
+            // The reserved reason prefix marks it daemon-raised, so the
+            // agent's next successful turn clears it (intent-hq/intent#7182).
             if let Err(raise_err) = self
                 .agent_request_attention_op(
                     workspace_id.clone(),
@@ -4806,6 +4965,14 @@ impl Services {
         // the redrive is still trying to resume it. On cap exhaustion the
         // flag is false and this arm fires as today (advisory fields
         // included), so watchers get exactly one idle per stall episode.
+        // A successful turn retires a daemon-raised provider-stall blocker
+        // (intent-hq/intent#7182) before the idle emit, so watchers woken by
+        // the idle observe the cleared state. A cancelled turn or an armed
+        // truncation redrive is not a successful completion.
+        if matches!(&result, Ok(stop) if *stop != StopReason::Cancelled) && !truncation_redrive {
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         match &result {
             Ok(_) if truncation_redrive => {
                 tracing::debug!(
@@ -5421,12 +5588,17 @@ impl Services {
                 error,
             )
             .await;
-            if let Err(raise_error) = self.agent_request_attention_op(
-                workspace_id.clone(),
-                "blocker".to_string(),
-                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
-                Some(agent_id.clone()),
-            ).await {
+            if let Err(raise_error) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    format!(
+                        "{UNSOLICITED_STALL_BLOCKER_PREFIX}{error}. Retry the agent to continue."
+                    ),
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
             Some(persisted)
@@ -5454,6 +5626,14 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if failure.is_none() && !empty_response {
+            // Successful wake turn: same stall-blocker retirement as the
+            // prompt-turn settlement (intent-hq/intent#7182). An empty wake is
+            // not a success — `recover_empty_harness_wake` handles it — so it
+            // leaves the stall blocker pending.
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         if let Some(error) = &failure {
             self.flush_deferred_attention(agent_id, workspace_id).await;
             self.publish_agent_event(
@@ -6178,7 +6358,14 @@ impl Services {
                 }
                 return false;
             }
-            MappedUpdate::ToolCall(tc) => {
+            MappedUpdate::ToolCall(mut tc) => {
+                // §5.5b: a backgrounded marker without an explicit status
+                // keeps the tool's recorded status (never reopens it).
+                if tc.keeps_status {
+                    if let Some(status) = transcript.tool_status_for(&tc.tool_call_id) {
+                        tc.status = status;
+                    }
+                }
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
                 // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit
