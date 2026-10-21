@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.21] - 2026-10-21
+
+### 🚀 Features
+
+- Add qualified GitLab repository pages and child Git policy ([#2431](https://github.com/intent-hq/intentd/pull/2431))
+
+
 ## [0.11.20] - 2026-10-21
 
 ### 🚀 Features
