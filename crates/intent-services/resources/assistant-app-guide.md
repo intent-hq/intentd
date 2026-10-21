@@ -310,6 +310,26 @@ PR and its latest status. Required checks that are still running or failing can
 block merging. If monitoring is paused or information is unavailable, wait for a
 fresh status before treating the PR as ready.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts} (connection-drop demotion); packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager}.rs; packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
+
+When a Claude Code agent starts work in the background, such as a dev server
+command, its conversation shows a row for it marked **Running**. When the
+conversation has several events, they are grouped under a **Subscribed to N
+events** header that may need expanding. Expanding the row shows the task type
+and when Intent first saw it. If the row has a **…** menu, **Stop** ends that
+task without interrupting the agent; the row shows **Stopping…** and disappears
+once the agent reports it stopped. Rows that end on their own disappear too.
+**Connection lost** means Intent can no longer observe the task, so whether it
+is still running is unknown; it is not proof that the task stopped. After the
+app reconnects to Intent, the row returns to **Running** if fresh status shows
+the task still running. If it stays Connection lost, the agent's connection ended, most often
+because an idle agent was closed after **Settings → Advanced → Agent backend →
+Idle reap minutes** (10 by default; Off disables it) or under memory pressure,
+and the task has probably ended with it. Before telling the user it stopped,
+confirm independently, for example by checking whether the dev server still
+responds. Such a row has no Stop and clears the next time the agent starts.
+Codex and other providers do not report background tasks.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
 
 Images sent to agents may be resized or re-encoded for provider delivery; original
