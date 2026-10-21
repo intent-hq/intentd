@@ -69,7 +69,7 @@ pub fn in_subprocess(test_name: &str) -> bool {
         .stderr(Stdio::from(log));
     let mut child = GuardedChild::spawn(&mut cmd).expect("spawn isolated WSS test");
     let status = child
-        .wait_with_timeout(Duration::from_secs(180))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(180)))
         .expect("wait for isolated WSS test")
         .expect("isolated WSS test timed out");
     assert!(

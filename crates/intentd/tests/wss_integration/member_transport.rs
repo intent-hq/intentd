@@ -6,15 +6,18 @@ use intent_transport::tunnel::Frame;
 use serde_json::json;
 
 async fn tunnel_frame(ws: &mut common::TlsWs) -> Frame {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Binary(bytes))) => return Frame::decode(&bytes).unwrap(),
-                Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
-                other => panic!("expected tunnel frame: {other:?}"),
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(bytes))) => return Frame::decode(&bytes).unwrap(),
+                    Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
+                    other => panic!("expected tunnel frame: {other:?}"),
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("tunnel frame")
 }
@@ -26,22 +29,25 @@ async fn send_tunnel(ws: &mut common::TlsWs, frame: Frame) {
 }
 
 async fn revoked_close(ws: &mut common::TlsWs) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(Some(frame)))) => {
-                    assert_eq!(
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        assert_eq!(
                         frame.code,
                         tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
                     );
-                    assert_eq!(frame.reason, "credential revoked");
-                    return;
+                        assert_eq!(frame.reason, "credential revoked");
+                        return;
+                    }
+                    Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
+                    other => panic!("revoked connection must close without more data: {other:?}"),
                 }
-                Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
-                other => panic!("revoked connection must close without more data: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("revoked connection close");
 }
@@ -146,10 +152,13 @@ async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
     revoked_close(&mut member.ws).await;
     revoked_close(&mut tunnel).await;
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), peer.read(&mut buf))
-            .await
-            .unwrap()
-            .unwrap(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            peer.read(&mut buf)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         0
     );
     send_tunnel(
@@ -160,10 +169,13 @@ async fn member_transport_tunnel_lifecycle_revocation_and_trust_guards() {
         },
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(5), other_peer.read_exact(&mut buf))
-        .await
-        .expect("another member's tunnel must survive")
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        other_peer.read_exact(&mut buf),
+    )
+    .await
+    .expect("another member's tunnel must survive")
+    .unwrap();
     assert_eq!(&buf, b"alive");
     other_peer.write_all(b"reply").await.unwrap();
     assert_eq!(
@@ -540,27 +552,30 @@ async fn member_transport_live_events_upgrade_and_workspace_deltas() {
 }
 
 async fn answer_reverse(ws: &mut common::TlsWs, method: &str, workspace: &WorkspaceId) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).unwrap();
-                    assert_eq!(frame["method"], method, "{frame}");
-                    assert_eq!(frame["params"]["workspaceId"], workspace.as_str());
-                    ws.send(Message::Text(
-                        json!({"jsonrpc":"2.0","id":frame["id"],"result":{"success":true}})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-                    return;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(frame["method"], method, "{frame}");
+                        assert_eq!(frame["params"]["workspaceId"], workspace.as_str());
+                        ws.send(Message::Text(
+                            json!({"jsonrpc":"2.0","id":frame["id"],"result":{"success":true}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        return;
+                    }
+                    Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
+                    other => panic!("expected reverse request: {other:?}"),
                 }
-                Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
-                other => panic!("expected reverse request: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("authenticated browser reverse request");
 }
@@ -625,20 +640,23 @@ async fn member_transport_browser_guest_first_ignores_other_member_change() {
     publish(&srv, &WorkspaceId::from(""), HOST_MEMBERS_CHANGED, json!({"principalId":member.principal.id,"hostRole":"member","action":"added","revision":1})).await;
     // Observe the forbidden transition without re-hello, which would mask it
     // by reapplying the correct per-request guest authority.
-    let guest_appeared = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut poll = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            poll.tick().await;
-            if srv
-                .reverse_registry
-                .live_clients()
-                .iter()
-                .any(|c| c.client_id.as_str() == guest_id)
-            {
-                break;
+    let guest_appeared = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                poll.tick().await;
+                if srv
+                    .reverse_registry
+                    .live_clients()
+                    .iter()
+                    .any(|c| c.client_id.as_str() == guest_id)
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_ok();
     assert_eq!(
@@ -732,16 +750,19 @@ async fn member_transport_browser_demotion_unbinds_and_keeps_default_controls() 
         member.call("principal.me", json!({})).await["result"]["hostRole"],
         "guest"
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while srv
-            .reverse_registry
-            .live_clients()
-            .iter()
-            .any(|c| c.client_id.as_str() == member_id)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while srv
+                .reverse_registry
+                .live_clients()
+                .iter()
+                .any(|c| c.client_id.as_str() == member_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("demoted member must leave the browser registry");
     assert_eq!(
@@ -778,16 +799,19 @@ async fn member_transport_browser_demotion_unbinds_and_keeps_default_controls() 
     );
     default_browser_round_trip(&srv, &mut owner, &WorkspaceId::chief()).await;
     drop(remaining);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while srv
-            .reverse_registry
-            .live_clients()
-            .iter()
-            .any(|c| c.client_id.as_str() == remaining_id)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while srv
+                .reverse_registry
+                .live_clients()
+                .iter()
+                .any(|c| c.client_id.as_str() == remaining_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("remaining member disconnects");
     assert_eq!(
@@ -833,11 +857,14 @@ async fn member_transport_browser_reverse_scope_and_live_upgrade() {
         member.call("principal.me", json!({})).await["result"]["hostRole"],
         "member"
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !srv.reverse_registry.is_connected() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !srv.reverse_registry.is_connected() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("live browser admission");
     let registry = srv.reverse_registry.clone();

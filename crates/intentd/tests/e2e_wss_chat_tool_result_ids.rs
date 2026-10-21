@@ -208,9 +208,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -543,7 +546,7 @@ async fn drive_turn(
     );
     let snap = wss_push_until(
         &mut chat,
-        tokio::time::Instant::now() + Duration::from_secs(30),
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30)),
     )
     .await;
     assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
@@ -568,7 +571,8 @@ async fn drive_turn(
 
     // One hard deadline across the whole turn (per-frame windows would reset on
     // heartbeats and hide a missing terminal reconcile).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     let mut live: Vec<Value> = Vec::new();
     loop {
         let frame = wss_push_until(&mut chat, deadline).await;

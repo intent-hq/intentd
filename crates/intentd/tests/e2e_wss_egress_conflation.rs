@@ -282,33 +282,36 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
     let mut received: Vec<u8> = Vec::with_capacity(expected.len());
     let mut data_frames = 0usize;
     let mut saw_exit = false;
-    timeout(Duration::from_secs(30), async {
-        while !saw_exit {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] != json!("events.event")
-                        || v["params"]["subscriptionId"] != json!(sub_id)
-                    {
-                        continue;
-                    }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("terminal:data") => {
-                            assert!(!saw_exit, "no data may follow the exit barrier");
-                            let chunk = event["data"]["chunk"].as_str().expect("chunk");
-                            received.extend_from_slice(&BASE64.decode(chunk).unwrap());
-                            data_frames += 1;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !saw_exit {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] != json!("events.event")
+                            || v["params"]["subscriptionId"] != json!(sub_id)
+                        {
+                            continue;
                         }
-                        Some("terminal:exit") => saw_exit = true,
-                        other => panic!("unexpected event type {other:?}"),
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("terminal:data") => {
+                                assert!(!saw_exit, "no data may follow the exit barrier");
+                                let chunk = event["data"]["chunk"].as_str().expect("chunk");
+                                received.extend_from_slice(&BASE64.decode(chunk).unwrap());
+                                data_frames += 1;
+                            }
+                            Some("terminal:exit") => saw_exit = true,
+                            other => panic!("unexpected event type {other:?}"),
+                        }
                     }
+                    Message::Close(_) => panic!("connection closed mid-stream"),
+                    _ => {}
                 }
-                Message::Close(_) => panic!("connection closed mid-stream"),
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("burst + exit not fully received in time");
 
@@ -535,17 +538,20 @@ async fn recovery_wss_stalled_bulk_deadline_closes_socket_and_discards_queued_ma
     }
     // The normal reader sees no marker while the bulk writer is held. Its
     // deadline must drop the socket out of band, without needing to open it.
-    timeout(Duration::from_secs(8), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                Some(Ok(Message::Text(text))) => {
-                    panic!("queued frame escaped cancellation: {text}")
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(8)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(text))) => {
+                        panic!("queued frame escaped cancellation: {text}")
+                    }
+                    Some(Ok(_)) => {}
                 }
-                Some(Ok(_)) => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("loss deadline must close the physical socket");
     release.send_replace(true);

@@ -76,7 +76,8 @@ fn lifecycle_output_fixture() {
             // Deliberately outlive the direct child while retaining its output.
             // The test releases us; the deadline also bounds failure cleanup.
             let release = std::env::var_os("INTENTD_LIFECYCLE_RELEASE").unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(5));
             while !std::path::Path::new(&release).exists() && std::time::Instant::now() < deadline {
                 // timing-guard: bounded fixture release polling
                 std::thread::sleep(Duration::from_millis(10));
@@ -137,7 +138,8 @@ fn lifecycle_capture_does_not_wait_for_inherited_output_eof() {
     std::fs::write(&release, "done").unwrap();
     assert!(result.unwrap().status.success());
     assert!(started.elapsed() < Duration::from_secs(3));
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     while !release.with_extension("done").exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -375,7 +377,7 @@ async fn detached_sitter_lifecycle_over_wss() {
                 common::hermetic_fixture_identity(&mut command, foreign.path());
                 let mut child = GuardedChild::spawn(&mut command).unwrap();
                 assert!(!child
-                    .wait_with_timeout(Duration::from_secs(5))
+                    .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .unwrap()
                     .expect("foreign control must fail promptly")
                     .success());
@@ -400,7 +402,8 @@ async fn detached_sitter_lifecycle_over_wss() {
         eprintln!("lifecycle: real WSS proof, restarted={restarted}");
         if restarted {
             invoke("restart");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(30));
             while !std::fs::read_to_string(data.join("intentd.pid"))
                 .is_ok_and(|pid| pid != first_pid)
             {
@@ -423,13 +426,17 @@ async fn detached_sitter_lifecycle_over_wss() {
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 701);
         assert_eq!(response["result"]["version"], env!("CARGO_PKG_VERSION"));
-        timeout(Duration::from_secs(5), ws.close(None))
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            ws.close(None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     invoke("stop");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while paths.pid_path.exists() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -452,7 +459,8 @@ async fn detached_sitter_lifecycle_over_wss() {
     });
     invoke("status");
     invoke("stop");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     while paths.pid_path.exists() {
         assert!(tokio::time::Instant::now() < deadline);
         // timing-guard: wait for the previous supervisor to release ownership
@@ -463,7 +471,7 @@ async fn detached_sitter_lifecycle_over_wss() {
     invalid.arg("--invalid-lifecycle-option");
     let mut failed = GuardedChild::spawn(&mut invalid).unwrap();
     assert!(!failed
-        .wait_with_timeout(Duration::from_secs(40))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(40)))
         .unwrap()
         .unwrap()
         .success());
@@ -514,7 +522,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         // shutdown of this endpoint. No guarded request may reach the daemon.
         for expected in [std::process::id().to_string(), "invalid".into(), "0".into()] {
             let rejected = timeout(
-                Duration::from_secs(10),
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
                 tokio::process::Command::new(&binary)
                     .args(["call", "system.shutdown"])
                     .env("INTENTD_DATA_DIR", data)
@@ -532,7 +540,7 @@ async fn detached_sitter_lifecycle_over_wss() {
             assert!(owner.wait_with_timeout(Duration::ZERO).unwrap().is_none());
         }
         let accepted = timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             tokio::process::Command::new(&binary)
                 .args(["call", "system.shutdown"])
                 .env("INTENTD_DATA_DIR", data)
@@ -548,7 +556,7 @@ async fn detached_sitter_lifecycle_over_wss() {
             "owned endpoint rejected shutdown: {accepted:?}"
         );
         assert!(owner
-            .wait_with_timeout(Duration::from_secs(10))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
             .unwrap()
             .unwrap()
             .success());
@@ -567,7 +575,8 @@ async fn detached_sitter_lifecycle_over_wss() {
             format!("http://{}", stalled.local_addr().unwrap()),
         );
         let mut booting = GuardedChild::spawn(&mut command).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !paths.pid_path.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -583,7 +592,7 @@ async fn detached_sitter_lifecycle_over_wss() {
             let mut waiting = GuardedChild::spawn(&mut restart).unwrap();
             assert!(
                 !waiting
-                    .wait_with_timeout(Duration::from_secs(5))
+                    .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .unwrap()
                     .unwrap()
                     .success(),
@@ -592,7 +601,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         }
         invoke("stop");
         let stopped = booting
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap();
         #[cfg(unix)]
@@ -615,7 +624,8 @@ async fn detached_sitter_lifecycle_over_wss() {
             .stdout(Stdio::null())
             .stderr(log_file);
         let mut recovering = GuardedChild::spawn(&mut command).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !std::fs::read_to_string(&log_path)
             .is_ok_and(|log| log.contains("respawning intentd in"))
         {
@@ -628,7 +638,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         }
         invoke("stop");
         let stopped = recovering
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap();
         #[cfg(unix)]
@@ -662,7 +672,7 @@ async fn detached_sitter_lifecycle_over_wss() {
         );
         invoke("stop");
         assert!(foreground
-            .wait_with_timeout(Duration::from_secs(10))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
             .unwrap()
             .unwrap()
             .success());
@@ -782,7 +792,8 @@ async fn local_status(
     _socket: &std::path::Path,
     log: &std::path::Path,
 ) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
         command
@@ -793,7 +804,12 @@ async fn local_status(
         if custom_config.exists() {
             command.env("INTENTD_CONFIG", custom_config);
         }
-        if let Ok(Ok(output)) = timeout(Duration::from_secs(5), command.output()).await {
+        if let Ok(Ok(output)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            command.output(),
+        )
+        .await
+        {
             if let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) {
                 if value["port"].as_u64().is_some() {
                     return json!({"result":value});
@@ -826,7 +842,7 @@ async fn windows_stop_confirms_graceful_exit_without_supervisor() {
     )
     .await;
     let output = timeout(
-        Duration::from_secs(20),
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
             .arg("stop")
             .env("INTENTD_DATA_DIR", dir.path())
@@ -841,7 +857,7 @@ async fn windows_stop_confirms_graceful_exit_without_supervisor() {
         "stop must confirm graceful shutdown: {output:?}"
     );
     assert!(daemon
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -899,7 +915,7 @@ async fn windows_stop_bounds_hung_rpc_and_only_terminates_owned_process() {
             drop(server);
         });
         let output = timeout(
-            Duration::from_secs(20),
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
             tokio::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
                 .arg("stop")
                 .env("INTENTD_DATA_DIR", dir.path())
@@ -914,7 +930,7 @@ async fn windows_stop_bounds_hung_rpc_and_only_terminates_owned_process() {
         assert_eq!(process.exited().unwrap(), owned);
         if owned {
             assert!(child
-                .wait_with_timeout(Duration::from_secs(2))
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(2)))
                 .unwrap()
                 .unwrap()
                 .success());

@@ -261,9 +261,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -587,17 +590,20 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     )
     .await;
     let id = stream["requestId"].as_str().unwrap();
-    let pid: i32 = timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_path) {
-                if let Ok(pid) = text.trim().parse() {
-                    break pid;
+    let pid: i32 = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        break pid;
+                    }
                 }
+                // timing-guard: wait for this child's observable PID publication.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // timing-guard: wait for this child's observable PID publication.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let _stream_cleanup = StreamCleanup(pid);
@@ -613,22 +619,25 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     ))
     .await
     .unwrap();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                if frame["id"] == 100 {
-                    assert_eq!(frame["jsonrpc"], "2.0");
-                    assert_eq!(frame["error"]["code"], -32602);
-                    assert!(frame["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("already active"));
-                    break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["id"] == 100 {
+                        assert_eq!(frame["jsonrpc"], "2.0");
+                        assert_eq!(frame["error"]["code"], -32602);
+                        assert!(frame["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("already active"));
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     for request in 2..50 {
@@ -656,34 +665,40 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     } else {
         "host.execStream stdin send pending"
     };
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if std::fs::read_to_string(&log_path)
-                .unwrap()
-                .contains(pending_message)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if std::fs::read_to_string(&log_path)
+                    .unwrap()
+                    .contains(pending_message)
+                {
+                    break;
+                }
+                // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
         uds_rpc(&socket, 60, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll the real daemon exit after shutdown was acknowledged.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll the real daemon exit after shutdown was acknowledged.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("request drain waited for stdin before cancelling its non-reading child");
     assert_eq!(
@@ -750,37 +765,43 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
         uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap();
-            assert!(
-                !log.contains("phase=\"wss_stop\""),
-                "main stopped WSS before joining the cancelled settings owner: {log}"
-            );
-            if log.contains("phase=\"request_drain\" state=\"completed\"") {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let log = std::fs::read_to_string(&log_path).unwrap();
+                assert!(
+                    !log.contains("phase=\"wss_stop\""),
+                    "main stopped WSS before joining the cancelled settings owner: {log}"
+                );
+                if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                    break;
+                }
+                assert!(daemon.child_mut().try_wait().unwrap().is_none());
+                // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(daemon.child_mut().try_wait().unwrap().is_none());
-            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     // The held hook has not even captured stop_generation. It could start a
     // fresh listener after final stop if main moved its settings join later.
     assert!(daemon.child_mut().try_wait().unwrap().is_none());
     start.write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let log = std::fs::read_to_string(&log_path).unwrap();
@@ -869,10 +890,13 @@ await import({});
         .unwrap();
     let mut start = BufReader::new(start);
     let mut pid = String::new();
-    timeout(Duration::from_secs(5), start.read_line(&mut pid))
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        start.read_line(&mut pid),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let child_identity: Value = serde_json::from_str(pid.trim()).unwrap();
     assert_eq!(
         child_identity[1],
@@ -886,36 +910,42 @@ await import({});
         uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap();
-            assert!(
-                !log.contains("phase=\"mcp_shutdown\""),
-                "MCP stop passed held enable: {log}"
-            );
-            if log.contains("phase=\"request_drain\" state=\"completed\"") {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let log = std::fs::read_to_string(&log_path).unwrap();
+                assert!(
+                    !log.contains("phase=\"mcp_shutdown\""),
+                    "MCP stop passed held enable: {log}"
+                );
+                if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                    break;
+                }
+                assert!(daemon.child_mut().try_wait().unwrap().is_none());
+                // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(daemon.child_mut().try_wait().unwrap().is_none());
-            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     // Child exists but is not registered in the hub until initialize completes.
     assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok());
     start.get_mut().write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -1106,18 +1136,21 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     ))
     .await
     .unwrap();
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let frame = wss_event(&mut sub, 20).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "script:state"
-                && event["data"]["scriptId"] == script_id
-                && event["data"]["status"] == "running"
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 20).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "script:state"
+                    && event["data"]["scriptId"] == script_id
+                    && event["data"]["status"] == "running"
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("script.run must be admitted and running before shutdown");
 
@@ -1143,17 +1176,20 @@ async fn graceful_shutdown_captures_interrupted_agents() {
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
     // daemon.child_mut().wait() is blocking, so we poll for process death.
-    let exit_ok = timeout(Duration::from_secs(10), async {
-        loop {
-            match daemon.child_mut().try_wait() {
-                Ok(Some(status)) => return status.success(),
-                Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+    let exit_ok = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match daemon.child_mut().try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("failed to wait for daemon: {e}"),
                 }
-                Err(e) => panic!("failed to wait for daemon: {e}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("daemon did not exit within timeout");
     // Graceful shutdown should exit 0.

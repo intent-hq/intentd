@@ -244,9 +244,12 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -1817,9 +1820,12 @@ async fn gitlab_revoke_without_a_connection_emits_nothing_over_wss() {
 
 /// Wait (bounded) for one of the mock's latches to wake.
 async fn await_latch(latch: &Notify, what: &str) {
-    timeout(Duration::from_secs(15), latch.notified())
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for the mock to {what}"));
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        latch.notified(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for the mock to {what}"));
 }
 
 async fn bind_startup_host(rpc: &mut Ws, mock: &MockGitlab, host: &str) {
@@ -1859,10 +1865,13 @@ async fn held_startup(
 
 async fn finish_startup(mock: &MockGitlab, task: tokio::task::JoinHandle<Value>) -> Value {
     mock.flags.release_start.notify_one();
-    timeout(Duration::from_secs(15), task)
-        .await
-        .expect("startup settled")
-        .unwrap()
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        task,
+    )
+    .await
+    .expect("startup settled")
+    .unwrap()
 }
 
 fn expect_superseded_startup(v: &Value) {
@@ -2719,15 +2728,18 @@ static INTERLEAVINGS: &[Case] = &[
 
 /// Poll the daemon's stderr log until it contains `marker`.
 async fn await_log_marker(log: &Path, marker: &str, what: &str) {
-    timeout(Duration::from_secs(15), async {
-        loop {
-            if std::fs::read_to_string(log).is_ok_and(|s| s.contains(marker)) {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if std::fs::read_to_string(log).is_ok_and(|s| s.contains(marker)) {
+                    return;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            // timing-guard: poll interval
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("{what}: daemon log never reported {marker:?}"));
 }
@@ -2879,10 +2891,13 @@ async fn run_interleaving(case: &'static Case) {
                     (case.holder, action),
                     (Holder::Refresh, Action::PatConnect(_))
                 ) {
-                    let v = timeout(Duration::from_secs(5), &mut handle)
-                        .await
-                        .expect("active writer refusal is immediate")
-                        .expect("PAT request");
+                    let v = timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        &mut handle,
+                    )
+                    .await
+                    .expect("active writer refusal is immediate")
+                    .expect("PAT request");
                     assert!(
                         v.get("error").is_some(),
                         "{name}: active writer admitted replacement: {v}"
@@ -2957,7 +2972,12 @@ async fn run_interleaving(case: &'static Case) {
                     assert!(v.get("error").is_none(), "{name}: unrelated update: {v}");
                 };
                 assert!(
-                    timeout(Duration::from_secs(5), unrelated).await.is_ok(),
+                    timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        unrelated
+                    )
+                    .await
+                    .is_ok(),
                     "{name}: unrelated settings traffic waited behind the credential gate"
                 );
                 assert_ne!(

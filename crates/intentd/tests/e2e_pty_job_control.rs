@@ -825,7 +825,7 @@ mod helper_tests {
     }
 
     fn poll_until(what: &str, mut ok: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !ok() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(SCAN_INTERVAL);

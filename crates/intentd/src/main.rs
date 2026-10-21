@@ -8341,30 +8341,42 @@ for line in sys.stdin:
         let start = intent_core::spawn_daemon(async move {
             owner.start(config, true).await;
         });
-        let (control, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (control, _) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let (read, mut write) = control.into_split();
         let mut reader = tokio::io::BufReader::new(read);
         let mut pid = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut pid))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            reader.read_line(&mut pid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let pid: i32 = pid.trim().parse().unwrap();
         let monitor = hub.spawn_health_monitor();
         hub.begin_background_shutdown();
         let mut shutdown = intent_core::spawn_daemon(settle_mcp_background(start, monitor));
-        let retained = tokio::time::timeout(Duration::from_millis(2200), &mut shutdown)
-            .await
-            .is_err();
+        let retained = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(2200)),
+            &mut shutdown,
+        )
+        .await
+        .is_err();
         let _ = write.write_all(b"x").await;
         if retained {
-            tokio::time::timeout(Duration::from_secs(5), shutdown)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                shutdown,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         }
         hub.shutdown().await;
         assert!(
@@ -8442,10 +8454,13 @@ for line in sys.stdin:
             .await
             .unwrap();
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), entering)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            entering,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut settlement = Box::pin(settle_startup_attachment_retention(sweep));
         let pending = poll_fn(|cx| Poll::Ready(settlement.as_mut().poll(cx).is_pending())).await;
         // Always release the physical writer before asserting the regression.
@@ -8994,7 +9009,8 @@ for line in sys.stdin:
                 Ok(child) => {
                     let child = StandInSitter(child);
                     let pid = child.id();
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    let deadline = std::time::Instant::now()
+                        + intentd_test_support::test_timeout(Duration::from_secs(10));
                     while !pid_is_sitter(pid, pid) {
                         assert!(
                             std::time::Instant::now() < deadline,
@@ -10375,10 +10391,13 @@ for line in sys.stdin:
             "the admitted operation is still owned and draining"
         );
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), sweep)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            sweep,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

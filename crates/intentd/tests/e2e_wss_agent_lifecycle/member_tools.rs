@@ -248,14 +248,17 @@ async fn member_provider_enablement_commits_safe_snapshots_over_wss_and_restart(
         ] {
             assert!(!frame.to_string().contains(secret), "{frame}");
         }
-        let owner_event = timeout(Duration::from_secs(10), async {
-            loop {
-                let frame = wss_event(&mut owner_observer, 10).await;
-                if frame["params"]["event"]["type"] == "host:execution-context-changed" {
-                    break frame;
+        let owner_event = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let frame = wss_event(&mut owner_observer, 10).await;
+                    if frame["params"]["event"]["type"] == "host:execution-context-changed" {
+                        break frame;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         assert_eq!(owner_event["params"]["event"], *event);
@@ -369,47 +372,50 @@ async fn member_ai_rejection_emits_safe_diagnostic_and_context_invalidation_over
         json!({"agentId":id,"workspaceId":ws,"content":"exercise classified auth rejection"}),
     )
     .await;
-    let invalidation = timeout(Duration::from_secs(30), async {
-        let (mut failed, mut invalidated) = (false, false);
-        let mut invalidation = Value::Null;
-        while !failed || !invalidated {
-            let frame = wss_event(&mut observer, 30).await;
-            let event = &frame["params"]["event"];
-            assert!(
-                !frame.to_string().contains("private-provider-response"),
-                "{frame}"
-            );
-            match event["type"].as_str().unwrap() {
-                "agent:failed" => {
-                    assert_eq!(event["workspaceId"], json!(ws));
-                    let auth = &event["data"]["executionAuthorization"];
-                    assert_eq!(auth["resource"], "ai");
-                    assert_eq!(auth["reason"], "rejected");
-                    assert_eq!(auth["providerId"], "mock");
-                    assert_eq!(auth["host"], Value::Null);
-                    assert_eq!(
-                        auth["recovery"],
-                        json!({"actor":"host-owner","action":"check-ai-authorization"})
-                    );
-                    assert!(event["data"]["error"]
-                        .as_str()
-                        .unwrap()
-                        .contains("connected host"));
-                    failed = true;
+    let invalidation = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let (mut failed, mut invalidated) = (false, false);
+            let mut invalidation = Value::Null;
+            while !failed || !invalidated {
+                let frame = wss_event(&mut observer, 30).await;
+                let event = &frame["params"]["event"];
+                assert!(
+                    !frame.to_string().contains("private-provider-response"),
+                    "{frame}"
+                );
+                match event["type"].as_str().unwrap() {
+                    "agent:failed" => {
+                        assert_eq!(event["workspaceId"], json!(ws));
+                        let auth = &event["data"]["executionAuthorization"];
+                        assert_eq!(auth["resource"], "ai");
+                        assert_eq!(auth["reason"], "rejected");
+                        assert_eq!(auth["providerId"], "mock");
+                        assert_eq!(auth["host"], Value::Null);
+                        assert_eq!(
+                            auth["recovery"],
+                            json!({"actor":"host-owner","action":"check-ai-authorization"})
+                        );
+                        assert!(event["data"]["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("connected host"));
+                        failed = true;
+                    }
+                    "host:execution-context-changed" => {
+                        assert_eq!(
+                            event["data"], before,
+                            "rejection invalidates without changing configured flags"
+                        );
+                        invalidation = event.clone();
+                        invalidated = true;
+                    }
+                    other => panic!("unexpected member event {other}"),
                 }
-                "host:execution-context-changed" => {
-                    assert_eq!(
-                        event["data"], before,
-                        "rejection invalidates without changing configured flags"
-                    );
-                    invalidation = event.clone();
-                    invalidated = true;
-                }
-                other => panic!("unexpected member event {other}"),
             }
-        }
-        invalidation
-    })
+            invalidation
+        },
+    )
     .await
     .expect("safe rejection and context invalidation");
     // Delivery must follow durable insertion, and killing the actual daemon
@@ -514,16 +520,19 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     wss_rpc(&mut sender,3,"agent.sendMessage",json!({"agentId":id,"workspaceId":ws,"content":"run shared work","messageMetadata":{"fromPrincipalId":"forged-owner"}})).await;
     sender.close(None).await.unwrap();
     drop(sender);
-    let permission = timeout(Duration::from_secs(30), async {
-        loop {
-            let event = wss_event(&mut observer, 30).await;
-            assert_ne!(event["params"]["event"]["type"], "settings:changed");
-            let e = &event["params"]["event"];
-            if e["type"] == "agent:permission:request" {
-                break e["data"].clone();
+    let permission = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let event = wss_event(&mut observer, 30).await;
+                assert_ne!(event["params"]["event"]["type"], "settings:changed");
+                let e = &event["params"]["event"];
+                if e["type"] == "agent:permission:request" {
+                    break e["data"].clone();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("member receives prompt after sender disconnects");
     let request = permission["requestId"].as_str().unwrap();
@@ -544,16 +553,19 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
     )
     .await;
     assert_eq!(resolved["resolved"], true);
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let event = wss_event(&mut observer, 30).await;
-            let e = &event["params"]["event"];
-            assert_ne!(e["type"], "agent:failed", "{event}");
-            if e["type"] == "agent:idle" {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let event = wss_event(&mut observer, 30).await;
+                let e = &event["params"]["event"];
+                assert_ne!(e["type"], "agent:failed", "{event}");
+                if e["type"] == "agent:idle" {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("shared work completes after initiating socket closes");
     let conversation = wss_rpc(
@@ -594,43 +606,46 @@ async fn member_prompt_survives_sender_disconnect_and_safe_context_events_over_w
         .fetch_one(store.read_pool())
         .await
         .unwrap();
-    let event = timeout(Duration::from_secs(10), async {
-        loop {
-            let frame = wss_event(&mut observer, 10).await;
-            let event = &frame["params"]["event"];
-            eprintln!("member context original update={update} event={event}");
-            assert_eq!(event["type"], "host:execution-context-changed", "{frame}");
-            let event_order: i64 = sqlx::query_scalar("SELECT rowid FROM event WHERE id = ?")
-                .bind(event["id"].as_str().unwrap())
-                .fetch_one(store.read_pool())
-                .await
-                .unwrap();
-            let safe = &event["data"];
-            assert_eq!(
-                safe.as_object()
-                    .unwrap()
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<std::collections::BTreeSet<_>>(),
-                [
-                    "defaultModelId",
-                    "defaultProviderId",
-                    "enabledProviderIds",
-                    "gitCredentialPolicy",
-                    "repositoryConnections"
-                ]
-                .into_iter()
-                .collect()
-            );
-            if event_order < update_order {
-                assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], false);
-                continue;
+    let event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let frame = wss_event(&mut observer, 10).await;
+                let event = &frame["params"]["event"];
+                eprintln!("member context original update={update} event={event}");
+                assert_eq!(event["type"], "host:execution-context-changed", "{frame}");
+                let event_order: i64 = sqlx::query_scalar("SELECT rowid FROM event WHERE id = ?")
+                    .bind(event["id"].as_str().unwrap())
+                    .fetch_one(store.read_pool())
+                    .await
+                    .unwrap();
+                let safe = &event["data"];
+                assert_eq!(
+                    safe.as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    [
+                        "defaultModelId",
+                        "defaultProviderId",
+                        "enabledProviderIds",
+                        "gitCredentialPolicy",
+                        "repositoryConnections"
+                    ]
+                    .into_iter()
+                    .collect()
+                );
+                if event_order < update_order {
+                    assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], false);
+                    continue;
+                }
+                assert!(event_order > update_order);
+                assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], true);
+                break frame;
             }
-            assert!(event_order > update_order);
-            assert_eq!(safe["gitCredentialPolicy"]["managedHelperEnabled"], true);
-            break frame;
-        }
-    })
+        },
+    )
     .await
     .expect("safe post-update event within the original bound");
     let safe = &event["params"]["event"]["data"];

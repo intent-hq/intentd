@@ -211,14 +211,17 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
             .output()
             .expect("run intentd stop")
     });
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "daemon did not exit after stop");
@@ -406,7 +409,8 @@ async fn booted_daemon_holds_at_most_the_inotify_instance_ceiling() {
     // Sample across a settle window rather than once: a late-created extra
     // watcher (a family that deferred its own creation past the markers)
     // must not slip in behind a single early read.
-    let settle_until = tokio::time::Instant::now() + Duration::from_secs(1);
+    let settle_until =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(1));
     loop {
         let instances = inotify_instances(daemon.child.id());
         assert!(

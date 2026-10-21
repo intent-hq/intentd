@@ -207,7 +207,8 @@ async fn rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send rpc");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next()).await.expect("rpc timeout") {
@@ -234,7 +235,8 @@ async fn ok(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 }
 
 async fn next_event(ws: &mut Ws, event_type: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next())

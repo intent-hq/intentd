@@ -211,22 +211,25 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// Await the next `subscription.push` frame for `sub_id`, skipping unrelated
 /// traffic (pings, other notifications).
 async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
-    timeout(Duration::from_secs(15), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("subscription.push")
-                        && v["params"]["subscriptionId"] == json!(sub_id)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("subscription.push")
+                            && v["params"]["subscriptionId"] == json!(sub_id)
+                        {
+                            return v;
+                        }
                     }
+                    Message::Close(_) => panic!("connection closed mid-stream"),
+                    _ => {}
                 }
-                Message::Close(_) => panic!("connection closed mid-stream"),
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscription.push timeout")
 }

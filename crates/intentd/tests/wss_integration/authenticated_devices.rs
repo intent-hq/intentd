@@ -155,37 +155,40 @@ async fn watch(client: &mut Guest) {
 }
 
 async fn own_event(client: &mut Guest, kind: &str, id: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match client.ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] != "events.event" {
-                        continue;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match client.ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        let event = &v["params"]["event"];
+                        if event["type"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with("client:"))
+                        {
+                            assert_eq!(
+                                event["data"]["principalId"],
+                                client.principal.id.as_str(),
+                                "guest saw another person"
+                            );
+                        }
+                        if event["type"] == kind && event["data"]["clientId"] == id {
+                            return event["data"].clone();
+                        }
                     }
-                    assert_eq!(v["jsonrpc"], "2.0");
-                    let event = &v["params"]["event"];
-                    if event["type"]
-                        .as_str()
-                        .is_some_and(|t| t.starts_with("client:"))
-                    {
-                        assert_eq!(
-                            event["data"]["principalId"],
-                            client.principal.id.as_str(),
-                            "guest saw another person"
-                        );
+                    Some(Ok(Message::Ping(bytes))) => {
+                        client.ws.send(Message::Pong(bytes)).await.unwrap();
                     }
-                    if event["type"] == kind && event["data"]["clientId"] == id {
-                        return event["data"].clone();
-                    }
+                    other => panic!("expected device event: {other:?}"),
                 }
-                Some(Ok(Message::Ping(bytes))) => {
-                    client.ws.send(Message::Pong(bytes)).await.unwrap();
-                }
-                other => panic!("expected device event: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("own device event")
 }
