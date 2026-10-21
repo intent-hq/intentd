@@ -69,6 +69,34 @@ fn should_answer_rejects_other_hosts_and_protocols() {
 }
 
 #[test]
+fn should_answer_gitlab_requires_path_and_defers_explicit_other_identity() {
+    let request = attrs(&[
+        ("protocol", "https"),
+        ("host", "gitlab.test:8443"),
+        ("path", "Forge/group/project.git"),
+    ]);
+    assert!(should_answer("get", &request));
+    for operation in ["store", "erase"] {
+        assert!(!should_answer(operation, &request));
+    }
+    for (key, value) in [
+        ("username", "alice"),
+        ("protocol", "ssh"),
+        ("path", ""),
+        ("path", "/Forge/group/project.git"),
+        ("path", "Forge/group/project.git?password=x"),
+        ("host", "user@gitlab.test"),
+    ] {
+        let mut changed = request.clone();
+        changed.insert(key.into(), value.into());
+        assert!(!should_answer("get", &changed));
+    }
+    let mut request = request;
+    request.insert("username".into(), "oauth2".into());
+    assert!(should_answer("get", &request));
+}
+
+#[test]
 fn should_answer_defers_to_explicit_url_identity() {
     // A remote URL that pins a username (https://alice@github.com/...) makes
     // git send `username=alice`; the helper must stay silent so the user's
@@ -86,6 +114,41 @@ fn should_answer_defers_to_explicit_url_identity() {
         ("username", intent_git::auth::TOKEN_USERNAME),
     ]);
     assert!(should_answer("get", &matching));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gitlab_helper_forwards_original_path_and_username_to_daemon_without_token_input() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut line = String::new();
+        BufReader::new(read).read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "system.gitCredential");
+        assert_eq!(request["params"]["protocol"], "https");
+        assert_eq!(request["params"]["host"], "gitlab.test:8443");
+        assert_eq!(request["params"]["path"], "Forge/group/project.git");
+        assert_eq!(request["params"]["username"], "oauth2");
+        assert_eq!(request["params"]["pid"], std::process::id());
+        assert!(request["params"].get("password").is_none());
+        write.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"credential\":{\"username\":\"oauth2\",\"password\":\"fixture-only\"}}}\n").await.unwrap();
+    });
+    let attrs = attrs(&[
+        ("protocol", "https"),
+        ("host", "gitlab.test:8443"),
+        ("path", "Forge/group/project.git"),
+        ("username", "oauth2"),
+    ]);
+    assert_eq!(
+        credential_for("get", &attrs, &socket, Duration::from_secs(2)).await,
+        Some(("oauth2".into(), "fixture-only".into()))
+    );
+    server.await.unwrap();
 }
 
 #[cfg(unix)]

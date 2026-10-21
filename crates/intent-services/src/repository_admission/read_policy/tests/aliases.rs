@@ -207,10 +207,15 @@ async fn unresolved_or_unanchored_aliases_refuse_before_any_qualified_acquisitio
                 )
                 .await;
                 let error = json_result(&reply);
-                assert!(error
-                    .as_str()
-                    .unwrap()
-                    .contains(crate::repository_read_source::REFUSAL));
+                let expected = if matches!(mode, "missing-anchor" | "missing-request") {
+                    "Addressed review monitoring unavailable"
+                } else {
+                    crate::repository_read_source::REFUSAL
+                };
+                assert!(
+                    error.as_str().unwrap().contains(expected),
+                    "{mode}: {error}"
+                );
                 assert!(!reply.to_string().contains("private/hidden"));
                 assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
                 assert!(!reply.to_string().contains("stored-pat"));
@@ -367,7 +372,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             gate.release.add_permits(1);
             let mut line = String::new();
             tokio::time::timeout(
-                Duration::from_secs(10),
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
                 BufReader::new(socket).read_line(&mut line),
             )
             .await

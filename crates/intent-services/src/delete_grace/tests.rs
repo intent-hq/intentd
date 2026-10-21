@@ -88,7 +88,9 @@ impl RepositoryLifecycleObserver for Probe {
         let callback = self.callback.lock().unwrap().take();
         if let Some((entered, release)) = callback {
             entered.notify_one();
-            release.recv_timeout(Duration::from_secs(10)).unwrap();
+            release
+                .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                .unwrap();
         }
         if self.reject.load(Ordering::SeqCst) {
             return Err(Error::Internal("fixture unknown begin".into()));
@@ -208,9 +210,9 @@ async fn zero_delay_claim_is_original_and_marker_is_removed_before_user_code() {
         .await
         .unwrap();
     assert_eq!(f.probe.state.lock().unwrap().begins, 2);
-    immediate.settle_confirmed();
+    immediate.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
-    claim.settle_confirmed();
+    claim.settle_confirmed().await.unwrap();
     assert!(!f.probe.blocked(&f.subject));
 }
 
@@ -303,7 +305,7 @@ async fn preparation_waiters_are_pinned_and_unrelated_keys_progress_during_retir
     drop(abandoned_waiter);
     let other = PendingDeleteSubject::Workspace(WorkspaceId::from("unrelated"));
     tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         f.registry.schedule_owned(other.clone(), 60_000, no_delete),
     )
     .await
@@ -405,7 +407,7 @@ async fn immediate_and_cascade_move_original_guard_without_settlement_or_reacqui
         .await
         .unwrap()
         .is_none());
-    immediate.settle_confirmed();
+    immediate.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
     drop(cascade); // Unknown work cannot be confirmed by another operation.
     let own = f
@@ -413,7 +415,7 @@ async fn immediate_and_cascade_move_original_guard_without_settlement_or_reacqui
         .take_for_immediate_delete(f.subject.clone())
         .await
         .unwrap();
-    own.settle_confirmed();
+    own.settle_confirmed().await.unwrap();
     assert!(f.probe.blocked(&f.subject));
 }
 
@@ -443,7 +445,7 @@ async fn claim_survives_response_ack_and_is_settled_only_by_original_background_
             intent_store::RepositoryWorkspaceDeleteDisposition::Committed
         );
         outcome.result.unwrap();
-        claim.settle_confirmed();
+        claim.settle_confirmed().await.unwrap();
     });
     assert!(!f.registry.cancel_owned(&f.subject).await.unwrap());
     assert!(f.probe.blocked(&f.subject));

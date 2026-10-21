@@ -103,23 +103,24 @@ async fn authorize(
         }
     }
 }
+// Delete guards bind canonical identity/revision and the child graph. Parser
+// readiness is not identity and must not prevent deletion of an unopened note.
 async fn identity(
     conn: &mut SqliteConnection,
     ws: &WorkspaceId,
     note: &NoteId,
 ) -> Result<Option<NoteDeleteIdentity>> {
-    let row = sqlx::query("SELECT n.rev,h.instance_id,h.generation,h.current_rev,h.indexed_rev FROM note n LEFT JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE n.workspace_id=? AND n.id=?")
+    let row = sqlx::query("SELECT n.rev,h.instance_id,h.generation,h.current_rev FROM note n LEFT JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE n.workspace_id=? AND n.id=?")
         .bind(ws.as_str()).bind(note.as_str()).fetch_optional(&mut *conn).await.map_err(|error| db(&error))?;
     row.map(|row| {
         let revision: i64 = row.try_get("rev").map_err(|error| db(&error))?;
         let instance: Option<String> = row.try_get("instance_id").map_err(|error| db(&error))?;
         let generation: Option<String> = row.try_get("generation").map_err(|error| db(&error))?;
         let current: Option<i64> = row.try_get("current_rev").map_err(|error| db(&error))?;
-        let indexed: Option<i64> = row.try_get("indexed_rev").map_err(|error| db(&error))?;
         let (Some(instance), Some(generation)) = (instance, generation) else {
             return Err(failure(NoteDeleteError::Unavailable));
         };
-        if current != Some(revision) || indexed != current || !valid_identifier(&generation) {
+        if current != Some(revision) || !valid_identifier(&generation) {
             return Err(failure(NoteDeleteError::Unavailable));
         }
         let source_revision = format!("r:{revision}:{generation}");
@@ -142,7 +143,7 @@ async fn children(
     ws: &WorkspaceId,
     note: &NoteId,
 ) -> Result<(usize, [u8; 32])> {
-    let rows = sqlx::query("SELECT n.id,n.rev,h.instance_id,h.generation,h.current_rev,h.indexed_rev FROM note n LEFT JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE n.workspace_id=? AND n.parent_id=? ORDER BY n.id LIMIT 257")
+    let rows = sqlx::query("SELECT n.id,n.rev,h.instance_id,h.generation,h.current_rev FROM note n LEFT JOIN note_page_head h ON h.workspace_id=n.workspace_id AND h.note_id=n.id WHERE n.workspace_id=? AND n.parent_id=? ORDER BY n.id LIMIT 257")
         .bind(ws.as_str()).bind(note.as_str()).fetch_all(&mut *conn).await.map_err(|error| db(&error))?;
     if rows.len() > MAX_CHILDREN {
         return Err(failure(NoteDeleteError::GraphLimit));
@@ -159,10 +160,8 @@ async fn children(
         }
         let revision: i64 = row.try_get("rev").map_err(|error| db(&error))?;
         let current: Option<i64> = row.try_get("current_rev").map_err(|error| db(&error))?;
-        let indexed: Option<i64> = row.try_get("indexed_rev").map_err(|error| db(&error))?;
         if !u64::try_from(revision).is_ok_and(|value| value <= MAX_SAFE_INTEGER)
             || current != Some(revision)
-            || indexed != current
         {
             return Err(failure(NoteDeleteError::GraphLimit));
         }
@@ -239,6 +238,12 @@ impl Store {
         guard: &NoteDeleteGuard,
         acquire_deadline: tokio::time::Instant,
     ) -> Result<NoteDeleteCommitOutcome> {
+        tokio::time::timeout_at(
+            acquire_deadline,
+            self.prepare_task_events(&request.workspace_id),
+        )
+        .await
+        .map_err(|_| Error::NoteDelete(NoteDeleteError::Unavailable))?;
         let mut conn = NoteWriteConnection::begin_before(self, acquire_deadline).await?;
         let result = async {
             if let Err(error) = authorize(&mut conn, authority, &request.workspace_id).await {
@@ -303,8 +308,13 @@ impl Store {
                     NoteDeleteReason::NoteChanged,
                 ));
             }
-            crate::note_page_index::rebuild_pending(&mut conn).await?;
             for child in child_ids {
+                crate::note_page_index::rebuild_one(
+                    &mut conn,
+                    request.workspace_id.as_str(),
+                    &child,
+                )
+                .await?;
                 crate::note_annotation_repo::rebuild_note_anchors(
                     &mut conn,
                     &request.workspace_id,

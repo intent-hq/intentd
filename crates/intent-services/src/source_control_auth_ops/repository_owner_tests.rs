@@ -201,9 +201,12 @@ impl Server {
         }
     }
     pub(crate) async fn entered(&self) {
-        timeout(Duration::from_secs(5), self.control.entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.control.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
 }
 struct Fixture {
@@ -756,7 +759,8 @@ async fn real_refresh_retains_in_flight_quota_and_ignores_old_token_rejection() 
         .directory
         .record_backoff(
             ticket.dispatch_stamp(),
-            std::time::Instant::now() + Duration::from_secs(3600)
+            std::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(3600))
         )
         .unwrap());
     assert!(f
@@ -785,7 +789,8 @@ async fn real_refresh_retains_in_flight_quota_and_ignores_old_token_rejection() 
         .directory
         .record_backoff(
             ticket.dispatch_stamp(),
-            std::time::Instant::now() + Duration::from_secs(7200)
+            std::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(7200))
         )
         .unwrap());
     let new_admission = f.admission(&server);
@@ -855,9 +860,12 @@ async fn cancelled_pat_persistence_retains_gate_and_publishes_from_original_owne
     let task = intent_core::spawn_daemon(async move {
         svc.gitlab_connect_pat(host, "pat-second".into()).await
     });
-    timeout(Duration::from_secs(5), paused.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        paused.entered.notified(),
+    )
+    .await
+    .unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert!(timeout(
@@ -874,12 +882,18 @@ async fn cancelled_pat_persistence_retains_gate_and_publishes_from_original_owne
         .is_err());
     assert_eq!(server.control.requests.lock().unwrap().len(), requests);
     paused.release();
-    timeout(Duration::from_secs(5), f.svc.shutdown_settings())
-        .await
-        .unwrap();
-    let _gate = timeout(Duration::from_secs(5), f.svc.gitlab_credential_gate.lock())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        f.svc.shutdown_settings(),
+    )
+    .await
+    .unwrap();
+    let _gate = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        f.svc.gitlab_credential_gate.lock(),
+    )
+    .await
+    .unwrap();
     assert_eq!(f.token().as_deref(), Some("pat-second"));
     let completed = f.directory.binding().unwrap();
     assert_eq!(completed.account.account_id, "43");
@@ -901,9 +915,12 @@ async fn abandoned_refresh_settles_only_from_the_actual_persistence_owner() {
         intent_core::spawn_daemon(
             async move { svc.stored_proof_token(&Target::Gitlab { host }).await },
         );
-    timeout(Duration::from_secs(5), paused.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        paused.entered.notified(),
+    )
+    .await
+    .unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(
@@ -918,9 +935,12 @@ async fn abandoned_refresh_settles_only_from_the_actual_persistence_owner() {
     .is_err());
     paused.release();
     {
-        let _gate = timeout(Duration::from_secs(5), f.svc.gitlab_credential_gate.lock())
-            .await
-            .unwrap();
+        let _gate = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            f.svc.gitlab_credential_gate.lock(),
+        )
+        .await
+        .unwrap();
         assert_eq!(f.token().as_deref(), Some("rotated"));
         assert_eq!(f.directory.binding().unwrap(), binding);
     }
@@ -1268,9 +1288,12 @@ async fn retirement_after_write_admission_cannot_recall_the_effect_or_publish_re
     let task = intent_core::spawn_daemon(async move {
         svc.gitlab_connect_pat(host, "pat-second".into()).await
     });
-    timeout(Duration::from_secs(5), paused.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        paused.entered.notified(),
+    )
+    .await
+    .unwrap();
     f.directory.retire().unwrap();
     paused.release();
     task.await.unwrap().unwrap();

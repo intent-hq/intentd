@@ -76,7 +76,12 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
-fn session(id: &str, ws: &WorkspaceId, status: AgentStatus, task: Option<&str>) -> AgentSession {
+pub(crate) fn session(
+    id: &str,
+    ws: &WorkspaceId,
+    status: AgentStatus,
+    task: Option<&str>,
+) -> AgentSession {
     let ts = now_iso();
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -371,10 +376,13 @@ async fn publish_lifecycle(bus: &crate::EventBus, ws: &WorkspaceId, event_type: 
 }
 
 async fn recv_locks_event(sub: &mut crate::Subscription) -> serde_json::Value {
-    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-        .await
-        .expect("changes:agent-locks delivered")
-        .expect("subscription open");
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("changes:agent-locks delivered")
+    .expect("subscription open");
     assert_eq!(batch.len(), 1, "expected exactly one lock event");
     serde_json::to_value(&batch[0]).expect("serialize event")
 }
@@ -403,4 +411,126 @@ fn task_note(ws: &WorkspaceId, id: &str, status: TaskStatus) -> Note {
         updated_at: ts,
         rev: 0,
     }
+}
+
+/// A git worktree for the lock-filter tests, seeded with one commit of
+/// `files` (added through the index, like `git add -f`).
+fn git_worktree(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = crate::tests::test_tempdir("intentd-alocks-git-");
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let mut index = repo.index().unwrap();
+    for (rel, contents) in files {
+        let full = dir.path().join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, contents).unwrap();
+        index.add_path(std::path::Path::new(rel)).unwrap();
+    }
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+        .unwrap();
+    dir
+}
+
+async fn setup_with_worktree(worktree: &std::path::Path) -> (TempDb, Services, WorkspaceId) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace(&ws_id);
+    ws.worktree_path = Some(worktree.to_string_lossy().to_string());
+    store.insert_workspace(&ws).await.unwrap();
+    (tmp, Services::new(store), ws_id)
+}
+
+/// Regression (intent-hq/intent#7266): only paths git still reports as
+/// changes lock — committed/reverted, ignored, and never-existing paths do
+/// not, and an agent whose rows are all such paths is not locked. The old
+/// side of a rename (folded into the new path by the rename-detecting
+/// status) still locks.
+#[tokio::test]
+async fn only_git_dirty_paths_lock() {
+    let dir = git_worktree(&[
+        (".gitignore", ".dev/\n"),
+        ("src/edited.rs", "a\n"),
+        ("src/clean.rs", "c\n"),
+        (
+            "src/old.rs",
+            "fn old() { /* body long enough to match */ }\n",
+        ),
+    ]);
+    std::fs::write(dir.path().join("src/edited.rs"), "b\n").unwrap();
+    std::fs::write(dir.path().join("src/untracked.rs"), "u\n").unwrap();
+    std::fs::create_dir_all(dir.path().join(".dev")).unwrap();
+    std::fs::write(dir.path().join(".dev/scratch.json"), "{}").unwrap();
+    std::fs::rename(dir.path().join("src/old.rs"), dir.path().join("src/new.rs")).unwrap();
+    let (_tmp, svc, ws) = setup_with_worktree(dir.path()).await;
+    let busy = session("agent-1", &ws, AgentStatus::Active, None);
+    let stale_only = session("agent-2", &ws, AgentStatus::Active, None);
+    svc.store().insert_agent_session(&busy).await.unwrap();
+    svc.store().insert_agent_session(&stale_only).await.unwrap();
+    for path in [
+        "src/edited.rs",
+        "src/untracked.rs",
+        "src/clean.rs",
+        "src/old.rs",
+        "src/new.rs",
+        ".dev/scratch.json",
+    ] {
+        track(&svc, &ws, "agent-1", path, "unstaged").await;
+    }
+    track(&svc, &ws, "agent-2", ".dev/other.json", "unstaged").await;
+    track(&svc, &ws, "agent-2", "src/clean.rs", "staged").await;
+
+    let snap = svc.compute_agent_locks(&ws).await;
+    assert_eq!(snap.locked_agent_ids, vec!["agent-1".to_string()]);
+    assert_eq!(
+        snap.locked_file_paths,
+        vec![
+            "src/edited.rs".to_string(),
+            "src/new.rs".to_string(),
+            "src/old.rs".to_string(),
+            "src/untracked.rs".to_string(),
+        ]
+    );
+}
+
+/// Paths inside a submodule are invisible to the superproject status (it
+/// lists only the gitlink), so they keep locking.
+#[tokio::test]
+async fn submodule_internal_paths_still_lock() {
+    let child = git_worktree(&[("lib.rs", "x\n")]);
+    let parent = git_worktree(&[("README.md", "r\n")]);
+    {
+        let repo = git2::Repository::open(parent.path()).unwrap();
+        let url = child.path().to_string_lossy().to_string();
+        let mut sm = repo
+            .submodule(&url, std::path::Path::new("sub"), true)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(parent.path().join("sub"));
+        git2::Repository::clone(&url, parent.path().join("sub")).unwrap();
+        sm.add_to_index(true).unwrap();
+        sm.add_finalize().unwrap();
+    }
+    std::fs::write(parent.path().join("sub/lib.rs"), "changed\n").unwrap();
+    let (_tmp, svc, ws) = setup_with_worktree(parent.path()).await;
+    let agent = session("agent-1", &ws, AgentStatus::Active, None);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    track(&svc, &ws, "agent-1", "sub/lib.rs", "unstaged").await;
+
+    let snap = svc.compute_agent_locks(&ws).await;
+    assert_eq!(snap.locked_file_paths, vec!["sub/lib.rs".to_string()]);
+}
+
+/// A worktree whose status cannot be read keeps the unfiltered behaviour.
+#[tokio::test]
+async fn unreadable_worktree_falls_back_to_unfiltered_locks() {
+    let not_a_repo = crate::tests::test_tempdir("intentd-alocks-norepo-");
+    let (_tmp, svc, ws) = setup_with_worktree(not_a_repo.path()).await;
+    let agent = session("agent-1", &ws, AgentStatus::Active, None);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    track(&svc, &ws, "agent-1", "src/a.rs", "unstaged").await;
+
+    let snap = svc.compute_agent_locks(&ws).await;
+    assert_eq!(snap.locked_file_paths, vec!["src/a.rs".to_string()]);
 }

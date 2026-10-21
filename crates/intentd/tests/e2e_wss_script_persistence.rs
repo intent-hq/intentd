@@ -914,14 +914,10 @@ async fn out_of_band_kill_reaches_exited_over_wss() {
     );
     assert_no_nulls(&exited, "exited status");
     let listed = wss_rpc(&mut ws, 200, "script.list", json!({ "workspaceId": ws_id })).await;
-    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
-    assert_eq!(entry["id"], "oob-1");
-    assert_eq!(entry["runtime"]["status"], "exited", "on list too: {entry}");
-    assert_eq!(
-        entry["runtime"]["exitCode"], exit_code,
-        "on list too: {entry}"
+    assert!(
+        listed["scripts"].as_array().unwrap().is_empty(),
+        "retired one-off is absent: {listed}"
     );
-    assert_no_nulls(entry, "listed entry");
 
     // The terminal transition is published as script:state with the same
     // exitCode the status read reported.
@@ -944,8 +940,8 @@ async fn out_of_band_kill_reaches_exited_over_wss() {
 
 /// A command script running when the daemon is `SIGKILL`ed hydrates on the next
 /// boot as the terminal `exited` / `exitCode: -1` / lost `error` reading —
-/// never `previouslyRunning` (service-only) — on both `script.status` and the
-/// `script.list` runtime; the reading is stable across another restart, and
+/// never `previouslyRunning` (service-only) — through known-ID `script.status`.
+/// Lists omit the retired script; the reading is stable across another restart, and
 /// `script.start` clears the terminal fields as the new run comes up.
 #[tokio::test]
 async fn lost_command_script_hydrates_exited_over_wss() {
@@ -971,7 +967,7 @@ async fn lost_command_script_hydrates_exited_over_wss() {
     drop(ws);
     stop(child); // SIGKILL — the running command never sees a stop.
 
-    // Boot #2: hydrated as the lost terminal reading on status and list.
+    // Boot #2: known-ID status retains the lost terminal reading; lists omit it.
     let (child, port, cfg) = boot(&data_dir).await;
     let mut ws = connect_ws(port, cfg).await;
     let st = wss_rpc(
@@ -984,10 +980,10 @@ async fn lost_command_script_hydrates_exited_over_wss() {
     assert_lost_command_state(&st, "boot #2 status");
     let listed = wss_rpc(&mut ws, 5, "script.list", json!({ "workspaceId": ws_id })).await;
     let scripts = listed["scripts"].as_array().expect("scripts array");
-    assert_eq!(scripts.len(), 1, "one hydrated script: {listed}");
-    assert_eq!(scripts[0]["id"], "lost-1");
-    assert_eq!(scripts[0]["mode"], "command");
-    assert_lost_command_state(&scripts[0]["runtime"], "boot #2 list runtime");
+    assert!(
+        scripts.is_empty(),
+        "retired scripts are not enumerated: {listed}"
+    );
     drop(ws);
     stop(child); // Kill again without touching the script.
 
@@ -1004,8 +1000,7 @@ async fn lost_command_script_hydrates_exited_over_wss() {
     .await;
     assert_lost_command_state(&st, "boot #3 status");
     let listed = wss_rpc(&mut ws, 7, "script.list", json!({ "workspaceId": ws_id })).await;
-    let entry = &listed["scripts"].as_array().expect("scripts array")[0];
-    assert_lost_command_state(&entry["runtime"], "boot #3 list runtime");
+    assert!(listed["scripts"].as_array().unwrap().is_empty());
 
     let restarted = wss_rpc(
         &mut ws,

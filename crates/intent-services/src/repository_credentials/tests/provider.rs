@@ -164,7 +164,7 @@ fn repo() -> RepoRef {
 }
 fn mr() -> Value {
     json!({"iid":4,"web_url":format!("{INSTANCE}/{PROJECT}/-/merge_requests/4"),
-        "title":"actual title","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
+        "title":"actual title","sha":"review-head","state":"opened","draft":false,"source_branch":"feature","target_branch":"main",
         "source_project_id":41,"target_project_id":41,"created_at":"2026-09-27T00:00:00Z","updated_at":"2026-09-27T00:00:00Z"})
 }
 fn project() -> Value {
@@ -499,7 +499,8 @@ async fn bound_fork_review_allows_corroborated_pipeline_project_follow_up() {
         if path.ends_with("/merge_requests/4") {
             let mut body = mr();
             body["source_project_id"] = json!(82);
-            body["head_pipeline"] = json!({"id":9,"project_id":82,"status":"success"});
+            body["head_pipeline"] =
+                json!({"id":9,"project_id":82,"status":"success","sha":"review-head"});
             Reply::ok(body)
         } else if path.ends_with("team%2Fsub%2Fproject") {
             Reply::ok(project())
@@ -531,7 +532,8 @@ async fn bound_pipeline_rejects_unrelated_or_unconfirmed_provenance_without_foll
             if path.ends_with("/merge_requests/4") {
                 let mut body = mr();
                 body["source_project_id"] = json!(82);
-                body["head_pipeline"] = json!({"id":9,"project_id":82,"status":"success"});
+                body["head_pipeline"] =
+                    json!({"id":9,"project_id":82,"status":"success","sha":"review-head"});
                 match case {
                     0 => body["head_pipeline"]["project_id"] = json!(99),
                     1 => body["source_project_id"] = Value::Null,
@@ -783,7 +785,8 @@ async fn bound_pipeline_proof_cannot_grant_another_project_pipeline_or_write() {
             if path.ends_with("/merge_requests/4") {
                 let mut body = mr();
                 body["source_project_id"] = json!(82);
-                body["head_pipeline"] = json!({"id":9,"project_id":82,"status":"success"});
+                body["head_pipeline"] =
+                    json!({"id":9,"project_id":82,"status":"success","sha":"review-head"});
                 Reply::ok(body)
             } else if path.ends_with("team%2Fsub%2Fproject") {
                 Reply::ok(project())
@@ -880,7 +883,8 @@ async fn bound_target_pipeline_keeps_optional_restrictions_separate_from_denial(
             if path.ends_with("/merge_requests/4") {
                 let mut body = mr();
                 body["source_project_id"] = json!(82);
-                body["head_pipeline"] = json!({"id":9,"project_id":41,"status":"success"});
+                body["head_pipeline"] =
+                    json!({"id":9,"project_id":41,"status":"success","sha":"review-head"});
                 return Reply::ok(body);
             }
             if path.ends_with("team%2Fsub%2Fproject") {
@@ -986,9 +990,12 @@ fn scheduled_provider(
     .unwrap()
 }
 async fn reached(pause: &Pause) {
-    tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1198,7 +1205,7 @@ async fn http_admission_429_during_refresh_keeps_original_quota_and_longest_dead
         .await
         .unwrap()
         .stamp;
-    let floor = Instant::now() + Duration::from_secs(300);
+    let floor = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(300));
     *server.handler.lock().unwrap() = Box::new(move |_, _| {
         test.directory.record_backoff(&prior, floor).unwrap();
         let ticket = test
@@ -1354,9 +1361,12 @@ async fn http_admission_detach_or_cancel_cannot_recall_a_request_already_seen() 
         }
         server.test.directory.retire().unwrap();
         pause.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), server.response_completed.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            server.response_completed.notified(),
+        )
+        .await
+        .unwrap();
         if cancel {
             // Dropping a sent future cannot prove that its effect was unsent.
             assert!(receive.await.is_err());
@@ -1423,7 +1433,8 @@ async fn http_admission_early_optional_quota_blocks_follow_up_without_auth_denia
 fn optional_quota_reply(path: &str, quota_at: usize) -> Reply {
     if path.ends_with("/merge_requests/4") {
         let mut review = mr();
-        review["head_pipeline"] = json!({"id":9,"project_id":41,"status":"success"});
+        review["head_pipeline"] =
+            json!({"id":9,"project_id":41,"status":"success","sha":"review-head"});
         return Reply::ok(review);
     }
     let (index, body) = if path.ends_with("team%2Fsub%2Fproject") {

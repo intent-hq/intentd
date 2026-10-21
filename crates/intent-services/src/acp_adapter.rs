@@ -65,6 +65,9 @@ const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(10);
 /// underlying CLI while creating the session, which alone takes ~10s even
 /// with a warm npx cache — a flat 10s budget times out right at the wire.
 const NPX_SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(20);
+/// Slack the overall setup cap leaves past the per-stage sum when a test
+/// widens the stage budgets (`AcpAdapterCommand::setup_budget`).
+const SETUP_BUDGET_GRACE: Duration = Duration::from_secs(2);
 
 /// The daemon-wide ephemeral-adapter concurrency bound: a counting semaphore
 /// plus the limit it was built with (kept for the queue-timeout diagnostic,
@@ -184,6 +187,9 @@ pub fn live_adapters() -> usize {
 pub(crate) struct AcpAdapterCommand {
     installed_cli: Option<intent_providers::installed_cli::InstalledCli>,
     installed: Option<Arc<PreparedInstalled>>,
+    /// The selected named profile, resolved into the installed context
+    /// before account lookup and source-home isolation (PROTOCOL §5.54).
+    profile: Option<Arc<intent_acp::ProfileEnv>>,
     program: PathBuf,
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
@@ -197,6 +203,10 @@ pub(crate) struct AcpAdapterCommand {
     via_npx: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
+    /// Test-only widening of the `initialize` / `session/new` budgets (see
+    /// [`Self::setup_budget`]). Compiled out of production builds.
+    #[cfg(test)]
+    setup_budget: Option<Duration>,
 }
 
 impl AcpAdapterCommand {
@@ -243,7 +253,8 @@ impl AcpAdapterCommand {
         if self.installed.is_some() {
             return Ok(self);
         }
-        let context = crate::installed_cli::InstalledContext::discover(cli).await?;
+        let context =
+            crate::installed_cli::InstalledContext::discover_for(cli, self.profile.clone()).await?;
         self.prepare_with_context(context).await
     }
 
@@ -251,10 +262,11 @@ impl AcpAdapterCommand {
         let cli = self
             .installed_cli
             .ok_or("catalog requires an installed CLI")?;
-        let context = crate::installed_cli::InstalledContext::discover(cli)
-            .await?
-            .with_catalog_fingerprint()
-            .await?;
+        let context =
+            crate::installed_cli::InstalledContext::discover_for(cli, self.profile.clone())
+                .await?
+                .with_catalog_fingerprint()
+                .await?;
         self.prepare_with_context(context).await
     }
 
@@ -262,6 +274,16 @@ impl AcpAdapterCommand {
         mut self,
         context: crate::installed_cli::InstalledContext,
     ) -> Result<Self, String> {
+        // A context discovered without this command's profile gets it here,
+        // before the account home is read for isolation.
+        let context = match (context.profile(), self.profile.clone()) {
+            (None, Some(profile)) => {
+                tokio::task::spawn_blocking(move || context.with_profile(Some(profile)))
+                    .await
+                    .map_err(|_| "installed CLI profile task failed")?
+            }
+            _ => context,
+        };
         let cli = context.runtime.cli();
         self.installed_cli = Some(cli);
         let context_for_home = context.clone();
@@ -301,10 +323,12 @@ impl AcpAdapterCommand {
                     npx_dir.clone(),
                     codex_home.clone(),
                 ));
-                let (identity, version) = context
-                    .observe_with_dependency(&command, Some(dependency))
-                    .await?;
-                context.validate_launch_version(&version)?;
+                // A confirmed-old installed CLI switches context and command
+                // to Intent's bundled copy before anything is launched.
+                let mut context = context;
+                let mut command = command;
+                let (identity, _) = context.select_launch(&command, Some(dependency)).await?;
+                context.apply_selection(&mut command);
                 let env = command
                     .as_std()
                     .get_envs()
@@ -381,6 +405,7 @@ impl AcpAdapterCommand {
                 _ => None,
             },
             installed: None,
+            profile: None,
             program: npx,
             args: vec![
                 NPX_NO_WORKSPACES_ARG.to_string(),
@@ -393,6 +418,8 @@ impl AcpAdapterCommand {
             cwd: None,
             via_npx: true,
             npx_launch_root: None,
+            #[cfg(test)]
+            setup_budget: None,
         }
     }
 
@@ -401,6 +428,7 @@ impl AcpAdapterCommand {
         Self {
             installed_cli: None,
             installed: None,
+            profile: None,
             program: bin,
             args,
             envs: Vec::new(),
@@ -409,6 +437,8 @@ impl AcpAdapterCommand {
             cwd: None,
             via_npx: false,
             npx_launch_root: None,
+            #[cfg(test)]
+            setup_budget: None,
         }
     }
 
@@ -417,6 +447,35 @@ impl AcpAdapterCommand {
     pub(crate) fn npx_launch_root(mut self, root: PathBuf) -> Self {
         self.npx_launch_root = Some(root);
         self
+    }
+
+    /// Widen `initialize` and `session/new` to at least `per_stage` each, and
+    /// the overall setup cap to at least their sum plus a grace; a budget
+    /// already larger (npx) is kept. Real-adapter tests use this so a
+    /// CPU-starved CI runner cold-starting Node does not trip the 4s
+    /// production `initialize` limit. Later requests that reuse the
+    /// `session/new` budget (model / effort application, Codex title confirm)
+    /// are widened too. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn setup_budget(mut self, per_stage: Duration) -> Self {
+        self.setup_budget = Some(per_stage);
+        self
+    }
+
+    /// `base` widened by the test-only [`Self::setup_budget`], if any.
+    #[cfg(test)]
+    fn widened(&self, base: Duration, per_stage: impl Fn(Duration) -> Duration) -> Duration {
+        self.setup_budget.map_or(base, |b| base.max(per_stage(b)))
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the test build, where `self` carries the override"
+    )]
+    fn widened(&self, base: Duration, _per_stage: impl Fn(Duration) -> Duration) -> Duration {
+        base
     }
 
     /// Append extra launch arguments after the ones already assembled.
@@ -455,6 +514,13 @@ impl AcpAdapterCommand {
         self
     }
 
+    /// Run this launch under a named profile's overlay (`None` = Default).
+    /// Must be set before installed preparation.
+    pub(crate) fn with_profile(mut self, profile: Option<Arc<intent_acp::ProfileEnv>>) -> Self {
+        self.profile = profile;
+        self
+    }
+
     /// Recognize the controlled browser helper's immediate auth signal.
     pub(crate) fn auth_required_marker(mut self, marker: &'static str) -> Self {
         self.auth_required_stdout_marker = Some(marker);
@@ -478,31 +544,36 @@ impl AcpAdapterCommand {
 
     /// Per-request `initialize` budget for this launch.
     pub(crate) fn initialize_timeout(&self) -> Duration {
-        if self.via_npx {
+        let base = if self.via_npx {
             NPX_INITIALIZE_TIMEOUT
         } else {
             INITIALIZE_TIMEOUT
-        }
+        };
+        self.widened(base, |b| b)
     }
 
     /// Per-request `session/new` budget for this launch.
     pub(crate) fn session_new_timeout(&self) -> Duration {
-        if self.via_npx {
+        let base = if self.via_npx {
             NPX_SESSION_NEW_TIMEOUT
         } else {
             SESSION_NEW_TIMEOUT
-        }
+        };
+        self.widened(base, |b| b)
     }
 
     /// Cap on the whole setup phase (`initialize` + `session/new`) for this
     /// launch. The one-shot runner bounds its `session/prompt` phase
     /// separately with the caller's timeout.
     pub(crate) fn setup_timeout(&self) -> Duration {
-        if self.via_npx {
+        let base = if self.via_npx {
             NPX_OVERALL_TIMEOUT
         } else {
             OVERALL_TIMEOUT
-        }
+        };
+        self.widened(base, |_| {
+            self.initialize_timeout() + self.session_new_timeout() + SETUP_BUDGET_GRACE
+        })
     }
 }
 
@@ -1081,6 +1152,72 @@ pub(crate) async fn reap_child(child: &mut tokio::process::Child, spawn_pid: u32
     sweep_escaped_descendants(&descendants).await;
 }
 
+#[cfg(test)]
+mod setup_budget_tests {
+    use super::*;
+
+    fn budgets(cmd: &AcpAdapterCommand) -> [Duration; 3] {
+        [
+            cmd.initialize_timeout(),
+            cmd.session_new_timeout(),
+            cmd.setup_timeout(),
+        ]
+    }
+
+    /// Production launches keep the real-user budgets: the override exists
+    /// for slow test runners only and must not leak into either launch kind.
+    #[test]
+    fn production_launches_keep_their_budgets() {
+        let resolved = AcpAdapterCommand::binary(PathBuf::from("adapter"), Vec::new());
+        assert_eq!(
+            budgets(&resolved),
+            [
+                Duration::from_secs(4),
+                Duration::from_secs(10),
+                Duration::from_secs(15)
+            ]
+        );
+        let npx = AcpAdapterCommand::npx(PathBuf::from("npx"), "@scope/adapter@1.0.0");
+        assert_eq!(
+            budgets(&npx),
+            [
+                Duration::from_secs(45),
+                Duration::from_secs(20),
+                Duration::from_secs(70)
+            ]
+        );
+    }
+
+    /// The override widens both stages, and the overall cap covers their sum
+    /// so it cannot cut a slow-but-healthy setup short.
+    #[test]
+    fn setup_budget_widens_every_setup_stage() {
+        let per_stage = Duration::from_secs(30);
+        let resolved =
+            AcpAdapterCommand::binary(PathBuf::from("adapter"), Vec::new()).setup_budget(per_stage);
+        assert_eq!(
+            budgets(&resolved),
+            [per_stage, per_stage, Duration::from_secs(62)]
+        );
+    }
+
+    /// The override never narrows: npx keeps its longer cold-install
+    /// `initialize` budget, and the overall cap still covers the stage sum.
+    #[test]
+    fn setup_budget_never_narrows_a_larger_budget() {
+        let npx = AcpAdapterCommand::npx(PathBuf::from("npx"), "@scope/adapter@1.0.0")
+            .setup_budget(Duration::from_secs(30));
+        assert_eq!(
+            budgets(&npx),
+            [
+                Duration::from_secs(45),
+                Duration::from_secs(30),
+                Duration::from_secs(77)
+            ]
+        );
+    }
+}
+
 /// Unit tests for the daemon-wide adapter bound itself (monorepo#2062).
 /// These build their own [`AdapterSlots`] rather than touching the process
 /// global, so they say nothing about — and are unaffected by — whatever the
@@ -1616,7 +1753,8 @@ exit 0
             let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
                 .await
                 .expect("spawn real npx");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(120));
             let started = loop {
                 if let Ok(s) = std::fs::read_to_string(&report) {
                     break s;
@@ -1739,7 +1877,8 @@ exit 0
         let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
             .await
             .expect("spawn real npx");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(120));
         let started = loop {
             if let Ok(s) = std::fs::read_to_string(&report) {
                 break s;
@@ -1997,7 +2136,8 @@ wait
 
         adapter.child.reap().await;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         assert_tree_then_dir_and_slot_released(
             grandchild,
             &npx_cwd,
@@ -2032,7 +2172,8 @@ wait
         assert!(!terminated.exists());
 
         let reaping = tokio::spawn(reap_adapter(adapter)); // caller-binding: allow — test-only bounded reap of a fake adapter; reaches no service layer
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !terminated.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -2050,7 +2191,8 @@ wait
             "reap task neither finished nor cancelled: {outcome:?}"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         assert_tree_then_dir_and_slot_released(
             grandchild,
             &npx_cwd,
@@ -2083,7 +2225,8 @@ wait
         parked.abort();
         assert!(parked.await.unwrap_err().is_cancelled());
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while grandchild_alive(grandchild) {
             assert!(
                 npx_cwd.is_dir(),

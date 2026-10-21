@@ -64,11 +64,14 @@ async fn assert_ordinary_launch(context: InstalledContext, root: &Path) {
         .await
         .unwrap()
         .child;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !root.join("launch-marker").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while !root.join("launch-marker").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     child.reap().await;
@@ -76,7 +79,7 @@ async fn assert_ordinary_launch(context: InstalledContext, root: &Path) {
 
 #[tokio::test]
 async fn installed_cli_launch_accepts_oversized_claude_config() {
-    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '99.0.0\\n'\n");
     let config = serde_json::json!({"history": "x".repeat(1024 * 1024)});
     std::fs::write(root.path().join(".claude.json"), config.to_string()).unwrap();
     let context = InstalledContext::from_inputs(
@@ -264,7 +267,7 @@ async fn claude_catalog_key(
 
 #[tokio::test]
 async fn installed_cli_claude_state_churn_keeps_catalog_identity() {
-    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '99.0.0\\n'\n");
     let context = context.with_catalog_fingerprint().await.unwrap();
     let (identity, _) = context
         .observe(&launch(&context, root.path()))
@@ -405,7 +408,15 @@ async fn installed_cli_ephemeral_isolation_uses_effective_home_before_env_overri
 /// or require a developer's installed CLI. The caller owns the fixture home.
 pub(crate) fn context_in(cli: InstalledCli, root: &Path) -> InstalledContext {
     std::fs::create_dir_all(root).unwrap();
-    executable(&root.join(cli.command()), "#!/bin/sh\nprintf '1.2.3\\n'\n");
+    // Current for both CLIs, so ordinary fixtures never select a bundled copy.
+    let version = match cli {
+        InstalledCli::Codex => "1.2.3",
+        InstalledCli::Claude => "99.0.0 (Claude Code)",
+    };
+    executable(
+        &root.join(cli.command()),
+        &format!("#!/bin/sh\nprintf '{version}\\n'\n"),
+    );
     let runtime = cli.resolve_in_dirs(&[root.to_owned()], false).unwrap();
     InstalledContext::from_inputs(
         runtime,
@@ -484,12 +495,12 @@ async fn installed_cli_version_timeout_reaps_process_group() {
 async fn installed_cli_prepared_catalog_rechecks_wrapper_before_launch() {
     use crate::acp_adapter::{spawn_adapter_in, AcpAdapterCommand, AdapterSlots};
     let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\ncat \"$HOME/version\"\n");
-    std::fs::write(root.path().join("version"), "1.2.3").unwrap();
+    std::fs::write(root.path().join("version"), "99.2.3").unwrap();
     let cmd = AcpAdapterCommand::binary("/bin/true".into(), vec![])
         .prepare_with_context(context)
         .await
         .unwrap();
-    std::fs::write(root.path().join("version"), "1.2.4").unwrap();
+    std::fs::write(root.path().join("version"), "99.2.4").unwrap();
     let error = spawn_adapter_in(&AdapterSlots::new(1), &cmd, Duration::from_secs(1))
         .await
         .err()
@@ -519,7 +530,7 @@ with staging.open('w') as output:
 os.replace(staging,root/'detached-pid')
 if controlled: (root/'publication-finished').touch()
 if os.environ['VERSION_MODE']!='success':time.sleep(120)
-print('2.0.0 (Claude Code)')
+print('99.0.0 (Claude Code)')
 ";
 
 // A pidfd can only signal the process we inspected, even if its numeric PID
@@ -539,6 +550,15 @@ impl DetachedCleanup {
         pid: i32,
         root: &Path,
         read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Self, String> {
+        Self::capture_with_poll(pid, root, read_identity, Self::poll_pidfd)
+    }
+
+    fn capture_with_poll(
+        pid: i32,
+        root: &Path,
+        read_identity: impl FnOnce(i32) -> std::io::Result<Vec<u8>>,
+        mut poll: impl FnMut(&std::os::fd::OwnedFd, i32) -> Result<bool, String>,
     ) -> Result<Self, String> {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
@@ -566,7 +586,14 @@ impl DetachedCleanup {
         // EACCES, ENOENT and an empty environment alone prove nothing. Check
         // after reading so an exit/PID reuse during that read cannot grant
         // signal authority from another process's environment.
-        let retired = Self::pidfd_retired(&fd)?;
+        let retired = poll(&fd, 0)?
+            || (identity
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                // Exit can deny environ access before the pidfd becomes readable.
+                // Bound that observation on this same handle; a timeout grants
+                // no identity or signal authority. Other read errors do not wait.
+                && poll(&fd, 100)?);
         match identity {
             Err(error)
                 if !matches!(
@@ -594,14 +621,18 @@ impl DetachedCleanup {
     }
 
     fn pidfd_retired(fd: &std::os::fd::OwnedFd) -> Result<bool, String> {
+        Self::poll_pidfd(fd, 0)
+    }
+
+    fn poll_pidfd(fd: &std::os::fd::OwnedFd, timeout_ms: i32) -> Result<bool, String> {
         use std::os::fd::AsRawFd;
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: poll points to one initialized descriptor and never blocks.
-        let result = if unsafe { libc::poll(&raw mut poll, 1, 0) } < 0 {
+        // SAFETY: poll points to one initialized descriptor; the caller bounds its wait.
+        let result = if unsafe { libc::poll(&raw mut poll, 1, timeout_ms) } < 0 {
             Err(std::io::Error::last_os_error())
         } else {
             Ok(poll.revents)
@@ -642,26 +673,97 @@ impl Drop for DetachedCleanup {
     }
 }
 
+/// One readiness observation of the owned fixture child.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FixtureIdentity {
+    /// The child exited before identity readiness.
+    Exited,
+    /// `/proc/<pid>/exe` (carried for diagnostics) does not name the fixture
+    /// binary yet. `posix_spawn` is vfork-based, and Linux wakes the parent
+    /// before exec swaps in the child's new address space, so until then
+    /// environ is the spawning test process's own environment and proves
+    /// nothing about the child.
+    Starting(PathBuf),
+    /// The fixture image is installed, so environ is the child's own (it is
+    /// empty until exec has copied the environment into place).
+    Started(Vec<u8>),
+}
+
+/// The canonical fixture binary: what `/proc/<pid>/exe` reports once exec
+/// has installed it. Spawning by this path keeps spawn and gate in agreement.
+#[cfg(target_os = "linux")]
+fn fixture_sleep_exe() -> &'static Path {
+    static EXE: std::sync::LazyLock<PathBuf> =
+        std::sync::LazyLock::new(|| std::fs::canonicalize("/bin/sleep").unwrap());
+    &EXE
+}
+
+/// Observe the child's exec state before its environment. Exec never
+/// reinstalls the old image, so once exe names the fixture binary every later
+/// environ read belongs to the fixture image.
+#[cfg(target_os = "linux")]
+fn observe_fixture_identity(pid: u32, fixture_exe: &Path) -> Result<FixtureIdentity, String> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map_err(|e| format!("read owned fixture executable: {e}"))?;
+    if exe != fixture_exe {
+        return Ok(FixtureIdentity::Starting(exe));
+    }
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(FixtureIdentity::Started)
+        .map_err(|e| format!("read owned fixture identity: {e}"))
+}
+
 #[cfg(target_os = "linux")]
 fn wait_detached_identity_ready(
     root: &Path,
     timeout: Duration,
-    mut observe: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+    observe: impl FnMut() -> Result<FixtureIdentity, String>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    wait_detached_identity_ready_until(root, || std::time::Instant::now() >= deadline, observe)
+}
+
+/// Readiness with the deadline injected as `expired`, consulted once after
+/// each pending observation, so controls never depend on the scheduler.
+#[cfg(target_os = "linux")]
+fn wait_detached_identity_ready_until(
+    root: &Path,
+    mut expired: impl FnMut() -> bool,
+    mut observe: impl FnMut() -> Result<FixtureIdentity, String>,
 ) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let mut home = b"HOME=".to_vec();
     home.extend_from_slice(root.as_os_str().as_bytes());
-    let deadline = std::time::Instant::now() + timeout;
+    // Name the startup phase only if exec was never observed, so a late
+    // empty environ cannot hide a child that spent the deadline before exec.
+    let mut pre_exec_image = None;
+    let mut exec_observed = false;
     loop {
-        let bytes = observe()?.ok_or("owned fixture child exited before identity readiness")?;
-        if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
-            return Ok(());
+        match observe()? {
+            FixtureIdentity::Exited => {
+                return Err("owned fixture child exited before identity readiness".into());
+            }
+            // Pre-exec reads show the parent's environment: retry, never judge.
+            FixtureIdentity::Starting(exe) => pre_exec_image = Some(exe),
+            FixtureIdentity::Started(bytes) => {
+                if bytes.split(|byte| *byte == 0).any(|entry| entry == home) {
+                    return Ok(());
+                }
+                if !bytes.is_empty() {
+                    return Err("owned fixture child has an unexpected HOME".into());
+                }
+                exec_observed = true;
+            }
         }
-        if !bytes.is_empty() {
-            return Err("owned fixture child has an unexpected HOME".into());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("owned fixture child identity readiness timed out".into());
+        if expired() {
+            return Err(match pre_exec_image {
+                Some(exe) if !exec_observed => format!(
+                    "owned fixture child startup timed out before exec; image still {}",
+                    exe.display()
+                ),
+                _ => "owned fixture child identity readiness timed out".into(),
+            });
         }
         // timing-guard: bounded fixture readiness polling, not capture retries.
         std::thread::sleep(Duration::from_millis(1));
@@ -669,26 +771,46 @@ fn wait_detached_identity_ready(
 }
 
 #[cfg(target_os = "linux")]
+fn observe_owned_fixture(
+    child: &mut intentd_test_support::GuardedChild,
+) -> Result<FixtureIdentity, String> {
+    observe_owned_fixture_with(child, |child| {
+        observe_fixture_identity(child.id(), fixture_sleep_exe())
+    })
+}
+
+/// Bracket one observation with exit checks. A child that exits mid-read
+/// loses `/proc/<pid>/exe`, so an exit observed afterwards takes precedence
+/// over the read's error; a live child's read error is still reported.
+#[cfg(target_os = "linux")]
+fn observe_owned_fixture_with(
+    child: &mut intentd_test_support::GuardedChild,
+    observe: impl FnOnce(&mut intentd_test_support::GuardedChild) -> Result<FixtureIdentity, String>,
+) -> Result<FixtureIdentity, String> {
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(FixtureIdentity::Exited);
+    }
+    let identity = observe(child);
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        Ok(FixtureIdentity::Exited)
+    } else {
+        identity
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
     let mut child = intentd_test_support::GuardedChild::spawn(
-        std::process::Command::new("/bin/sleep")
+        std::process::Command::new(fixture_sleep_exe())
             .arg("120")
             .env("HOME", root),
     )
     .unwrap();
-    // A live, newly spawned fixture can transiently expose an empty environ.
+    // spawn() can return before exec has installed the fixture image, and a
+    // freshly exec'd fixture can transiently expose an empty environ.
     // Establish fixture readiness before testing the strict capture operation.
     let ready = wait_detached_identity_ready(root, Duration::from_secs(3), || {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(format!("/proc/{}/environ", child.id()))
-            .map_err(|e| format!("read owned fixture identity: {e}"))?;
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            Ok(None)
-        } else {
-            Ok(Some(bytes))
-        }
+        observe_owned_fixture(&mut child)
     });
     if let Err(error) = ready {
         let kill = child.kill();
@@ -702,12 +824,42 @@ fn detached_identity_child(root: &Path) -> intentd_test_support::GuardedChild {
 #[test]
 fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
     let root = Path::new("/owned-fixture");
-    let mut observations = [Some(Vec::new()), Some(b"HOME=/owned-fixture\0".to_vec())].into_iter();
-    wait_detached_identity_ready(root, Duration::from_secs(3), || {
-        Ok(observations.next().unwrap())
-    })
+    let mut observations = [
+        FixtureIdentity::Started(Vec::new()),
+        FixtureIdentity::Started(b"HOME=/owned-fixture\0".to_vec()),
+    ]
+    .into_iter();
+    wait_detached_identity_ready_until(root, || false, || Ok(observations.next().unwrap()))
+        .unwrap();
+    assert!(observations.next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_retries_reads_before_exec() {
+    let root = Path::new("/owned-fixture");
+    let mut observations = [
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
+        FixtureIdentity::Started(Vec::new()),
+        FixtureIdentity::Started(b"HOME=/owned-fixture\0".to_vec()),
+    ]
+    .into_iter();
+    let mut expiry_checks = 0;
+    wait_detached_identity_ready_until(
+        root,
+        || {
+            expiry_checks += 1;
+            false
+        },
+        || Ok(observations.next().unwrap()),
+    )
     .unwrap();
     assert!(observations.next().is_none());
+    assert_eq!(
+        expiry_checks, 3,
+        "each pending observation consults the deadline"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -716,32 +868,137 @@ fn installed_cli_detached_identity_readiness_times_out_when_empty() {
     let mut calls = 0;
     let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
         calls += 1;
-        Ok(Some(Vec::new()))
+        Ok(FixtureIdentity::Started(Vec::new()))
     })
     .unwrap_err();
-    assert!(error.contains("timed out"));
+    assert_eq!(error, "owned fixture child identity readiness timed out");
     assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_times_out_before_exec() {
+    let mut calls = 0;
+    let error = wait_detached_identity_ready_until(
+        Path::new("/owned-fixture"),
+        || true,
+        || {
+            calls += 1;
+            Ok(FixtureIdentity::Starting(PathBuf::from(
+                "/parent-test-binary",
+            )))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "owned fixture child startup timed out before exec; image still /parent-test-binary"
+    );
+    assert_eq!(calls, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_readiness_timeout_names_environ_after_exec() {
+    let mut observations = [
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
+        FixtureIdentity::Started(Vec::new()),
+    ]
+    .into_iter();
+    let mut expiry_checks = 0;
+    let error = wait_detached_identity_ready_until(
+        Path::new("/owned-fixture"),
+        || {
+            expiry_checks += 1;
+            expiry_checks == 2
+        },
+        || Ok(observations.next().unwrap()),
+    );
+    assert_eq!(
+        error.unwrap_err(),
+        "owned fixture child identity readiness timed out"
+    );
+    assert!(observations.next().is_none());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors() {
     for observation in [
-        Ok(None),
-        Ok(Some(b"HOME=/other-fixture\0".to_vec())),
-        Ok(Some(b"NOT_HOME=/owned-fixture\0".to_vec())),
+        Ok(FixtureIdentity::Exited),
+        Ok(FixtureIdentity::Started(b"HOME=/other-fixture\0".to_vec())),
+        Ok(FixtureIdentity::Started(
+            b"NOT_HOME=/owned-fixture\0".to_vec(),
+        )),
         Err("permission denied".to_owned()),
     ] {
         let mut calls = 0;
-        assert!(
-            wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
+        assert!(wait_detached_identity_ready_until(
+            Path::new("/owned-fixture"),
+            || false,
+            || {
                 calls += 1;
                 observation.clone()
-            })
-            .is_err()
-        );
+            }
+        )
+        .is_err());
         assert_eq!(calls, 1);
     }
+}
+
+// The test process stands in for a child caught before exec: its image is
+// not the fixture binary and its environ is non-empty without the fixture
+// HOME. Only the exe gate keeps that read from being judged a wrong HOME.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observation_defers_pre_exec_environ() {
+    let pid = std::process::id();
+    let own_exe = std::fs::read_link("/proc/self/exe").unwrap();
+    assert_eq!(
+        observe_fixture_identity(pid, fixture_sleep_exe()),
+        Ok(FixtureIdentity::Starting(own_exe.clone()))
+    );
+    let ungated = observe_fixture_identity(pid, &own_exe).unwrap();
+    assert!(matches!(&ungated, FixtureIdentity::Started(bytes) if !bytes.is_empty()));
+    let error = wait_detached_identity_ready_until(
+        Path::new("/owned-fixture"),
+        || false,
+        || Ok(ungated.clone()),
+    )
+    .unwrap_err();
+    assert_eq!(error, "owned fixture child has an unexpected HOME");
+}
+
+// Drives the composed observation the fixture uses on a real child: a
+// settled child reports its own HOME, and an exit during the read (which
+// makes /proc/<pid>/exe unreadable) is reported as an exit, not an error.
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_owned_observation_settles_and_reports_exit() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut home = b"HOME=".to_vec();
+    home.extend_from_slice(root.path().as_os_str().as_bytes());
+    let settled = observe_owned_fixture(&mut child).unwrap();
+    assert!(
+        matches!(&settled, FixtureIdentity::Started(bytes)
+            if bytes.split(|byte| *byte == 0).any(|entry| entry == home)),
+        "settled fixture did not report its own HOME: {settled:?}"
+    );
+    let mut read = None;
+    let exited = observe_owned_fixture_with(&mut child, |child| {
+        detached_identity_zombie(child);
+        let identity = observe_fixture_identity(child.id(), fixture_sleep_exe());
+        read = Some(identity.clone());
+        identity
+    });
+    child.wait().unwrap();
+    assert!(
+        read.unwrap().is_err(),
+        "an exited child's executable should be unreadable"
+    );
+    assert_eq!(exited, Ok(FixtureIdentity::Exited));
 }
 
 #[cfg(target_os = "linux")]
@@ -800,6 +1057,154 @@ fn installed_cli_detached_identity_observes_exit_during_inspection() {
     });
     child.wait().unwrap();
     assert!(retired.unwrap().0.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_observes_exit_after_nonterminal_poll() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            if timeout > 0 {
+                // Deterministically complete the owned child's exit only after
+                // the initial nonterminal observation, without reusing its PID.
+                detached_identity_zombie(&mut child);
+            }
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        captured.unwrap().0.is_none(),
+        "retired child became a signal target"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(
+        polls[0].0, polls[1].0,
+        "exit observation must pin the same process"
+    );
+    assert_eq!(polls[0].1, 0);
+    assert_eq!(polls[1].1, 100);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_bounds_denied_exit_observation() {
+    use std::os::fd::AsRawFd;
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let mut unrelated = detached_identity_child(other.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut polls = Vec::new();
+    let captured = DetachedCleanup::capture_with_poll(
+        pid,
+        root.path(),
+        |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+        |fd, timeout| {
+            polls.push((fd.as_raw_fd(), timeout));
+            DetachedCleanup::poll_pidfd(fd, timeout)
+        },
+    );
+    let rejected = captured.is_err();
+    drop(captured);
+    let child_alive = child.try_wait().unwrap().is_none();
+    let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    assert!(rejected, "unverified live child acquired signal authority");
+    assert!(
+        child_alive && unrelated_alive,
+        "observation signaled a live child"
+    );
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0].0, polls[1].0);
+    assert_eq!([polls[0].1, polls[1].1], [0, 100]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_propagates_exit_observation_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for result in [
+        Err(std::io::Error::from_raw_os_error(libc::EINTR)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok(libc::POLLERR),
+        Ok(libc::POLLNVAL),
+        Ok(libc::POLLIN | libc::POLLERR),
+    ] {
+        let mut result = Some(result);
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+            |_, timeout| {
+                timeouts.push(timeout);
+                if timeout == 0 {
+                    Ok(false)
+                } else {
+                    DetachedCleanup::polled_retirement(result.take().unwrap())
+                }
+            },
+        );
+        outcomes.push((captured.is_err(), timeouts));
+        drop(captured);
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive, "poll errors must not grant signal authority");
+    for (rejected, timeouts) in outcomes {
+        assert!(rejected, "terminal observation hid a poll error");
+        assert_eq!(timeouts, [0, 100]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn installed_cli_detached_identity_does_not_wait_on_other_read_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let mut child = detached_identity_child(root.path());
+    let pid = i32::try_from(child.id()).unwrap();
+    let mut outcomes = Vec::new();
+    for errno in [libc::EIO, libc::ENOENT] {
+        let mut timeouts = Vec::new();
+        let captured = DetachedCleanup::capture_with_poll(
+            pid,
+            root.path(),
+            |_| Err(std::io::Error::from_raw_os_error(errno)),
+            |fd, timeout| {
+                timeouts.push(timeout);
+                DetachedCleanup::poll_pidfd(fd, timeout)
+            },
+        );
+        outcomes.push((captured.err(), timeouts));
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive);
+    for (error, timeouts) in outcomes {
+        assert!(error
+            .unwrap()
+            .starts_with("inspect detached child identity:"));
+        assert_eq!(timeouts, [0]);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -870,7 +1275,9 @@ fn installed_cli_detached_identity_cleanup_signals_only_verified_child() {
     let guard = DetachedCleanup::capture(pid, root.path()).unwrap();
     assert!(!guard.retired().unwrap());
     drop(guard);
-    let retired = child.wait_with_timeout(Duration::from_secs(3)).unwrap();
+    let retired = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(3)))
+        .unwrap();
     let unrelated_alive = unrelated.try_wait().unwrap().is_none();
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
@@ -941,11 +1348,16 @@ async fn detached_version_children_from(mode: &str, controlled: bool, body: &str
     command.env("VERSION_MODE", mode);
     let mut operation = tokio::spawn(async move { context.observe(&command).await.map(|_| ()) });
     let file = root.path().join("detached-pid");
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        while !file.exists() || (controlled && !root.path().join("publication-finished").exists()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let ready = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !file.exists()
+                || (controlled && !root.path().join("publication-finished").exists())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await;
     let child = ready.map_err(|e| e.to_string()).and_then(|()| {
         let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
@@ -972,12 +1384,15 @@ async fn detached_version_children_from(mode: &str, controlled: bool, body: &str
             .and_then(|(pid, _)| read_detached_publication(root.path(), *pid))
     });
     let cleaned = if let Ok((_, guard)) = &child {
-        tokio::time::timeout(Duration::from_secs(7), async {
-            while !guard.retired()? {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Ok::<_, String>(())
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(7)),
+            async {
+                while !guard.retired()? {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, String>(())
+            },
+        )
         .await
         .map_err(|error| error.to_string())
         .and_then(|result| result)
@@ -1058,11 +1473,14 @@ async fn ordinary_version_children(mode: &str) {
     command.args(["-c", "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; if [ \"$VERSION_MODE\" = success ]; then printf '1.2.3\\n'; else wait; fi"])
         .env("PID_FILE", &pid_file).env("VERSION_MODE", mode);
     let operation = tokio::spawn(version_output_uncontained(command));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !pid_file.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     let pid: i32 = std::fs::read_to_string(pid_file)
@@ -1081,21 +1499,24 @@ async fn ordinary_version_children(mode: &str) {
             assert!(result.unwrap_err().contains("timed out"));
         }
     }
-    let result = tokio::time::timeout(Duration::from_secs(7), async {
-        loop {
-            #[cfg(target_os = "linux")]
-            let live = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                !s.rsplit_once(") ")
-                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
-            });
-            #[cfg(not(target_os = "linux"))]
-            let live = unsafe { libc::kill(pid, 0) } == 0;
-            if !live {
-                break;
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(7)),
+        async {
+            loop {
+                #[cfg(target_os = "linux")]
+                let live = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    !s.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+                #[cfg(not(target_os = "linux"))]
+                let live = unsafe { libc::kill(pid, 0) } == 0;
+                if !live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await;
     if result.is_err() {
         unsafe {
@@ -1179,11 +1600,14 @@ async fn installed_cli_preparation_retains_actual_directories_on_owner_failure()
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>, root: &Path) {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !root.join("version-cwd").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while !root.join("version-cwd").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     let profile = PathBuf::from(std::fs::read_to_string(root.join("version-profile")).unwrap());
@@ -1192,11 +1616,14 @@ pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>,
     assert!(operation.await.unwrap_err().is_cancelled());
     assert!(profile.is_dir());
     assert!(cwd.is_dir());
-    tokio::time::timeout(Duration::from_secs(8), async {
-        while profile.exists() || cwd.exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(8)),
+        async {
+            while profile.exists() || cwd.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("actual profile and launch directory released after confirmed cleanup");
 }
@@ -1219,20 +1646,79 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
     cancel_version_owner(operation, root.path()).await;
 }
 
-#[tokio::test]
-async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_other_cli() {
-    let minimum = intent_providers::adapter_cli::requirement("codex")
+/// Seed a complete Intent-managed bundled CLI under `home` that reports
+/// `version`, so selection never runs npm or touches the developer's home.
+fn seed_bundled(home: &Path, cli: InstalledCli, version: &str) -> PathBuf {
+    let provider = match cli {
+        InstalledCli::Codex => "codex",
+        InstalledCli::Claude => "claude-code",
+    };
+    let bundled = intent_providers::adapter_cli::requirement(provider)
         .unwrap()
-        .minimum
-        .to_string();
-    for (cli, version, rejected) in [
-        (InstalledCli::Codex, "codex-cli 0.114.0", true),
-        (InstalledCli::Codex, minimum.as_str(), false),
-        (InstalledCli::Codex, "codex-cli 99.0.0", false),
-        (InstalledCli::Codex, "unknown", false),
-        (InstalledCli::Claude, "0.0.1", false),
+        .bundled
+        .unwrap();
+    let dir =
+        crate::bundled_cli::version_dir(&crate::bundled_cli::root_in(home).unwrap(), &bundled);
+    let bin = dir.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(cli.command());
+    executable(
+        &path,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] || exit 97\n[ \"${}\" = \"$0\" ] || exit 98\nprintf '%s\\n' '{version}'\n",
+            cli.path_env()
+        ),
+    );
+    std::fs::write(dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
+    path
+}
+
+fn bundled_version(provider: &str) -> String {
+    intent_providers::adapter_cli::requirement(provider)
+        .unwrap()
+        .bundled
+        .unwrap()
+        .version
+        .to_string()
+}
+
+#[tokio::test]
+async fn confirmed_old_codex_and_claude_launch_the_bundled_cli_instead() {
+    let codex = bundled_version("codex");
+    let claude = bundled_version("claude-code");
+    for (cli, old, bundled_output) in [
+        (
+            InstalledCli::Codex,
+            "codex-cli 0.114.0",
+            format!("codex-cli {codex}"),
+        ),
+        (
+            InstalledCli::Claude,
+            "1.0.128 (Claude Code)",
+            format!("{claude} (Claude Code)"),
+        ),
     ] {
-        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let (root, mut context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{old}'\n"));
+        let host = context.runtime.clone();
+        let bundled = seed_bundled(root.path(), cli, &bundled_output);
+        let mut command = launch(&context, root.path());
+        let (_, version) = context.select_launch(&command, None).await.unwrap();
+        assert_eq!(version, bundled_output);
+        assert_eq!(context.runtime.path(), bundled);
+        assert_eq!(context.replaced_host(), Some(&host));
+        // Before the selection is applied the launch still names the host CLI.
+        assert_eq!(env(&command, cli.path_env()), Some(host.path().into()));
+        context.apply_selection(&mut command);
+        assert_eq!(env(&command, cli.path_env()), Some(bundled.clone().into()));
+        assert_eq!(
+            env(&command, "HOME"),
+            Some(root.path().into()),
+            "env is preserved"
+        );
+
+        // The production launch preparation takes the same path.
+        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{old}'\n"));
+        seed_bundled(root.path(), cli, &bundled_output);
         let prepared = crate::acp_adapter::AcpAdapterCommand::binary(
             "/must-not-launch-adapter".into(),
             vec![],
@@ -1240,21 +1726,155 @@ async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_othe
         .cwd(root.path().to_owned())
         .prepare_with_context(context)
         .await;
-        if rejected {
-            let Err(error) = prepared else {
-                panic!("old Codex was accepted");
-            };
-            assert!(error.contains("0.114.0"), "{error}");
-            assert!(error.contains(&minimum), "{error}");
-            assert!(error.contains("Upgrade"), "{error}");
-        } else {
-            assert!(
-                prepared.is_ok(),
-                "{version}: {}",
-                prepared.err().unwrap_or_default()
-            );
-        }
+        assert!(
+            prepared.is_ok(),
+            "{old}: {}",
+            prepared.err().unwrap_or_default()
+        );
     }
+}
+
+#[tokio::test]
+async fn current_newer_and_unknown_versions_keep_the_installed_cli() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    let claude = bundled_version("claude-code");
+    let patch_lag = format!("{}.0 (Claude Code)", claude.rsplit_once('.').unwrap().0);
+    for (cli, version) in [
+        (InstalledCli::Codex, minimum.as_str()),
+        (InstalledCli::Codex, "codex-cli 99.0.0"),
+        (InstalledCli::Codex, "unknown"),
+        (InstalledCli::Claude, patch_lag.as_str()),
+        (InstalledCli::Claude, "unknown"),
+    ] {
+        let (root, mut context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let host = context.runtime.clone();
+        // Even a ready bundled copy is not used for a CLI that is not old.
+        seed_bundled(root.path(), cli, "99.0.0");
+        let command = launch(&context, root.path());
+        let (_, observed) = context.select_launch(&command, None).await.unwrap();
+        assert_eq!(observed, version);
+        assert_eq!(context.runtime, host);
+        assert!(context.replaced_host().is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_or_old_bundled_cli_reports_both_versions_and_the_reason() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    let spec = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .bundled
+        .unwrap()
+        .spec();
+    // No usable home: the install cannot be attempted, and nothing launches.
+    let root = tempfile::tempdir().unwrap();
+    executable(
+        &root.path().join("codex"),
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let mut context = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        BTreeMap::from([("PATH".into(), "/bin:/usr/bin".into())]),
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    let command = launch(&context, root.path());
+    let error = context
+        .select_launch(&command, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("0.114.0") && error.contains(&minimum),
+        "{error}"
+    );
+    assert!(error.contains("Upgrade Codex"), "{error}");
+    assert!(
+        error.contains(&spec) && error.contains("home directory"),
+        "{error}"
+    );
+
+    // A bundled copy that itself reports an old version is never launched.
+    let (root, mut context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    seed_bundled(root.path(), InstalledCli::Codex, "codex-cli 0.1.0");
+    let command = launch(&context, root.path());
+    let error = context
+        .select_launch(&command, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("0.1.0") && error.contains(&minimum),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn old_claude_keeps_the_installed_cli_when_the_bundled_copy_is_unavailable() {
+    // Claude had no launch minimum before the bundled fallback: an install
+    // failure (unit tests never install) must not block Claude launches.
+    let (root, mut context) = fixture(
+        InstalledCli::Claude,
+        "#!/bin/sh\nprintf '1.0.128 (Claude Code)'\n",
+    );
+    let host = context.runtime.clone();
+    let command = launch(&context, root.path());
+    let (_, version) = context.select_launch(&command, None).await.unwrap();
+    assert_eq!(version, "1.0.128 (Claude Code)");
+    assert_eq!(context.runtime, host);
+    assert!(context.replaced_host().is_none());
+
+    // Codex keeps its hard minimum and reports the install failure distinctly.
+    let (root, mut context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    let command = launch(&context, root.path());
+    let error = context.select_launch(&command, None).await.err().unwrap();
+    assert!(
+        matches!(error, LaunchSelectionError::BundledUnavailable(_)),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn bundled_catalog_key_differs_from_the_installed_cli_key() {
+    let codex = bundled_version("codex");
+    let (root, context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    seed_bundled(
+        root.path(),
+        InstalledCli::Codex,
+        &format!("codex-cli {codex}"),
+    );
+    let host = context.with_catalog_fingerprint().await.unwrap();
+    let command = launch(&host, root.path());
+    let (host_identity, _) = host.observe(&command).await.unwrap();
+    let mut selected = host.clone();
+    let (identity, _) = selected.select_launch(&command, None).await.unwrap();
+    let (host_key, bundled_key) = (host.key(&host_identity), selected.key(&identity));
+    assert!(
+        host_key.is_some() && bundled_key.is_some(),
+        "fingerprint survives the switch"
+    );
+    assert_ne!(host_key, bundled_key);
 }
 
 #[tokio::test]
@@ -1276,4 +1896,344 @@ async fn codex_real_old_runtime_is_rejected_before_adapter_start() {
     assert!(error.contains("0.114.0"), "{error}");
     assert!(error.contains(&requirement.minimum.to_string()), "{error}");
     println!("{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Named provider profiles (PROTOCOL §5.54): the overlay resolves before
+// account/home lookup, isolation and catalog fingerprinting.
+// ---------------------------------------------------------------------------
+
+fn profile(
+    reference: &str,
+    fingerprint: &str,
+    entries: &[(&str, Option<&str>)],
+) -> std::sync::Arc<intent_acp::ProfileEnv> {
+    std::sync::Arc::new(intent_acp::ProfileEnv::new(
+        reference,
+        fingerprint,
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+            .collect(),
+    ))
+}
+
+/// A context whose inherited env and captured shell credentials name the
+/// "personal" account, conflicting with every profile below.
+fn conflicting_context(cli: InstalledCli, root: &Path, body: &str) -> InstalledContext {
+    executable(&root.join(cli.command()), body);
+    let runtime = cli.resolve_in_dirs(&[root.to_owned()], false).unwrap();
+    let personal = root.join("personal");
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CODEX_HOME".into(), personal.as_os_str().to_owned()),
+        ("CLAUDE_CONFIG_DIR".into(), personal.as_os_str().to_owned()),
+        ("OPENAI_BASE_URL".into(), "https://personal.invalid".into()),
+    ]);
+    let captured = BTreeMap::from([
+        ("OPENAI_API_KEY".to_owned(), "personal-captured".to_owned()),
+        (
+            "ANTHROPIC_API_KEY".to_owned(),
+            "personal-captured".to_owned(),
+        ),
+    ]);
+    InstalledContext::from_inputs(
+        runtime,
+        &captured,
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn profile_overlay_beats_inherited_and_captured_before_home_lookup() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    assert_eq!(base.codex_home(), Some(root.path().join("personal")));
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+            ("OPENAI_BASE_URL", None),
+            ("EMPTY_SETTING", Some("")),
+        ],
+    )));
+    assert_eq!(context.codex_home(), Some(work.clone()));
+    let command = launch(&context, root.path());
+    assert_eq!(env(&command, "CODEX_HOME"), Some(work.into_os_string()));
+    assert_eq!(env(&command, "OPENAI_API_KEY"), Some("work-key".into()));
+    assert_eq!(env(&command, "EMPTY_SETTING"), Some(OsString::new()));
+    assert!(env(&command, "OPENAI_BASE_URL").is_none());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+    assert!(context.secret_values().contains(&"work-key".to_owned()));
+    assert!(std::env::var_os("EMPTY_SETTING").is_none());
+}
+
+#[test]
+fn profile_cannot_override_enforced_executable_or_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[
+                ("CODEX_PATH", Some("/profile/codex")),
+                ("CODEX_CONFIG", Some("profile-policy")),
+            ],
+        )));
+    let command = launch(&context, root.path());
+    assert_eq!(
+        env(&command, "CODEX_PATH"),
+        Some(context.runtime.path().as_os_str().to_owned())
+    );
+    assert_eq!(
+        env(&command, "CODEX_CONFIG"),
+        Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+    );
+}
+
+#[test]
+fn profile_custom_keys_survive_isolated_application() {
+    let root = tempfile::tempdir().unwrap();
+    let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")
+        .with_profile(Some(profile(
+            "codex@work",
+            "f1",
+            &[("WORK_GATEWAY_TOKEN", Some("gateway"))],
+        )));
+    let mut command = Command::new("unused");
+    context.apply_isolated(&mut command);
+    assert_eq!(env(&command, "WORK_GATEWAY_TOKEN"), Some("gateway".into()));
+}
+
+#[tokio::test]
+async fn profile_catalog_keys_never_cross_profiles_or_settings_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let identity = {
+        let (_dir, fixture) = fixture(InstalledCli::Codex, "#!/bin/sh\nprintf '1.2.3\\n'\n");
+        let command = launch(&fixture, root.path());
+        fixture.observe(&command).await.unwrap().0
+    };
+    let key = |p: Option<std::sync::Arc<intent_acp::ProfileEnv>>| {
+        let context = base.clone().with_profile(p);
+        let identity = identity.clone();
+        async move {
+            context
+                .with_catalog_fingerprint()
+                .await
+                .unwrap()
+                .key(&identity)
+                .unwrap()
+        }
+    };
+    let entries = [("OPENAI_API_KEY", Some("same"))];
+    let default = key(None).await;
+    let work = key(Some(profile("codex@work", "f1", &entries))).await;
+    let work_edited = key(Some(profile("codex@work", "f2", &entries))).await;
+    let personal = key(Some(profile("codex@personal", "f1", &entries))).await;
+    let all = [&default, &work, &work_edited, &personal];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    assert_eq!(work, key(Some(profile("codex@work", "f1", &entries))).await);
+}
+
+#[tokio::test]
+async fn claude_profile_config_dir_selects_fingerprinted_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(root.path().join("personal")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[
+            ("CLAUDE_CONFIG_DIR", Some(work.to_str().unwrap())),
+            ("ANTHROPIC_API_KEY", None),
+        ],
+    )));
+    let command = launch(&context, root.path());
+    assert!(env(&command, "ANTHROPIC_API_KEY").is_none());
+    assert_eq!(
+        env(&command, "CLAUDE_CONFIG_DIR"),
+        Some(work.clone().into())
+    );
+    let fingerprint = |c: InstalledContext| async move {
+        c.with_catalog_fingerprint().await.unwrap().context_key
+    };
+    let before = fingerprint(context.clone()).await;
+    std::fs::write(root.path().join("personal/.credentials.json"), "{}").unwrap();
+    assert_eq!(before, fingerprint(context.clone()).await);
+    std::fs::write(work.join(".credentials.json"), "{}").unwrap();
+    assert_ne!(before, fingerprint(context).await);
+}
+
+#[tokio::test]
+async fn profile_isolated_codex_home_is_seeded_from_the_profile_account() {
+    let root = tempfile::tempdir().unwrap();
+    for (account, auth) in [("personal", "personal-auth"), ("work", "work-auth")] {
+        std::fs::create_dir_all(root.path().join(account)).unwrap();
+        std::fs::write(root.path().join(account).join("auth.json"), auth).unwrap();
+    }
+    let work = root.path().join("work");
+    let context = conflicting_context(
+        InstalledCli::Codex,
+        root.path(),
+        "#!/bin/sh\ncat \"$CODEX_HOME/auth.json\" > \"$HOME/seeded\"\nprintf '%s' \"$OPENAI_API_KEY\" > \"$HOME/key\"\nprintf '1.2.3\\n'\n",
+    )
+    .with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[
+            ("CODEX_HOME", Some(work.to_str().unwrap())),
+            ("OPENAI_API_KEY", Some("work-key")),
+        ],
+    )));
+    let _cmd = crate::acp_adapter::AcpAdapterCommand::binary("/bin/true".into(), vec![])
+        .prepare_with_context(context)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("seeded")).unwrap(),
+        "work-auth"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("key")).unwrap(),
+        "work-key"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_profiles_launch_with_their_own_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let var = format!(
+        "PROFILE_TEST_{}",
+        uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+    );
+    let body =
+        format!("#!/bin/sh\nprintf '%s' \"${var}\" > \"$HOME/seen-${var}\"\nprintf '1.2.3\\n'\n");
+    let base = conflicting_context(InstalledCli::Codex, root.path(), &body);
+    let run = |who: &'static str| {
+        let context = base.clone().with_profile(Some(profile(
+            &format!("codex@{who}"),
+            "f1",
+            &[(var.as_str(), Some(who))],
+        )));
+        let root = root.path().to_owned();
+        async move {
+            let command = launch(&context, &root);
+            context.observe(&command).await.unwrap();
+        }
+    };
+    tokio::join!(run("work"), run("personal"));
+    for who in ["work", "personal"] {
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(format!("seen-{who}"))).unwrap(),
+            who
+        );
+    }
+    assert!(std::env::var_os(&var).is_none());
+}
+
+#[test]
+fn profile_codex_home_config_names_select_inherited_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    executable(&root.path().join("codex"), "#!/bin/sh\n");
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        work.join("config.toml"),
+        "[model_providers.corp]\nenv_key='CORP_API_KEY'\n",
+    )
+    .unwrap();
+    let inherited = BTreeMap::from([
+        (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+        ("PATH".into(), "/bin:/usr/bin".into()),
+        ("CORP_API_KEY".into(), "corp-secret".into()),
+    ]);
+    let base = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        inherited,
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    // The Default home declares nothing: its isolated probe drops the key.
+    let mut default_probe = Command::new("unused");
+    base.apply_isolated(&mut default_probe);
+    assert!(env(&default_probe, "CORP_API_KEY").is_none());
+    assert!(!base.secret_values().contains(&"corp-secret".to_owned()));
+
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(env(&probe, "CORP_API_KEY"), Some("corp-secret".into()));
+    assert!(context.secret_values().contains(&"corp-secret".to_owned()));
+    // Runs keep it too, so checks and runs agree.
+    assert_eq!(
+        env(&launch(&context, root.path()), "CORP_API_KEY"),
+        Some("corp-secret".into())
+    );
+}
+
+#[test]
+fn profile_codex_home_with_unreadable_config_keeps_existing_names() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(work.join("config.toml")).unwrap();
+    let context = base.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(context.codex_home(), Some(work));
+}
+
+#[test]
+fn profile_path_consumes_captured_shell_credentials_like_default() {
+    let root = tempfile::tempdir().unwrap();
+    let base = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    let context = base.clone().with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[("ANTHROPIC_BASE_URL", Some("https://work.invalid"))],
+    )));
+    // ANTHROPIC_API_KEY exists only in the captured login shell: the profile
+    // leaves it alone, so launches and probes see it exactly as Default does.
+    for command in [launch(&base, root.path()), launch(&context, root.path())] {
+        assert_eq!(
+            env(&command, "ANTHROPIC_API_KEY"),
+            Some("personal-captured".into())
+        );
+    }
+    let mut probe = Command::new("unused");
+    context.apply_isolated(&mut probe);
+    assert_eq!(
+        env(&probe, "ANTHROPIC_API_KEY"),
+        Some("personal-captured".into())
+    );
 }

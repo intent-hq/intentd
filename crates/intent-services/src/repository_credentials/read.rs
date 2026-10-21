@@ -3,8 +3,9 @@
 
 use intent_core::{RepositoryResourceKind, ReviewTarget};
 use intent_sourcecontrol::{
-    error::ProviderFailureKind, GitLabSourceControl, Issue, RateLimitStatus, RepoRef,
-    ReviewDetails, ReviewObservation, SourceControl,
+    error::ProviderFailureKind, GitLabSourceControl, Issue, IssueQuery, Page, PageParams, PrQuery,
+    PullRequest, RateLimitStatus, RepoRef, ReviewDetails, ReviewDiscussion, ReviewObservation,
+    SourceControl,
 };
 
 use super::acquire::BoundGitlabRequestCredentials;
@@ -102,6 +103,22 @@ impl RepositoryOutputBatch<'_> {
 }
 
 impl RepositoryReadScope {
+    /// Pagination metadata only. R still captures the caller/session/query and
+    /// revalidates every request. Actual binding changes cannot reuse a cursor;
+    /// a verified refresh on the same binding deliberately remains continuable.
+    fn pagination_scope(&self) -> String {
+        let binding = &self.admission.binding;
+        serde_json::json!([
+            "repository-read-v1",
+            binding.daemon_id,
+            binding.account.instance_base_url,
+            binding.account.account_id,
+            binding.scope.connection_id,
+            binding.scope.connection_generation
+        ])
+        .to_string()
+    }
+
     /// Allocation planning only. The two owner-facing entry points separately
     /// enforce required-nonempty versus a future proven ordinary output branch.
     pub(crate) fn prepare_output<'a>(
@@ -232,6 +249,40 @@ impl RepositoryReadScope {
         ) -> Result<()>
                   + Send),
     ) -> Result<()> {
+        self.with_response_target(
+            attribution,
+            &ResponseTarget::Resource(target.clone()),
+            action,
+        )
+    }
+
+    pub(crate) fn with_collection_response(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &RepositoryCollectionTarget,
+        action: &mut (dyn FnMut(
+            RepositoryResponseDisposition,
+            Option<&RepositorySecretRequest>,
+        ) -> Result<()>
+                  + Send),
+    ) -> Result<()> {
+        self.with_response_target(
+            attribution,
+            &ResponseTarget::Collection(target.clone()),
+            action,
+        )
+    }
+
+    fn with_response_target(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &ResponseTarget,
+        action: &mut (dyn FnMut(
+            RepositoryResponseDisposition,
+            Option<&RepositorySecretRequest>,
+        ) -> Result<()>
+                  + Send),
+    ) -> Result<()> {
         if !self.matches(&attribution.scope) || target != &attribution.target {
             return Err(RepositoryCredentialError::BoundaryMismatch);
         }
@@ -302,7 +353,7 @@ enum ResponseEvidence {
 
 pub(crate) struct RepositoryResponseAttribution {
     scope: RepositoryReadScope,
-    target: ReviewTarget,
+    target: ResponseTarget,
     evidence: ResponseEvidence,
 }
 
@@ -336,7 +387,7 @@ impl ReadReceiptSink {
     fn seal<T>(
         &self,
         scope: RepositoryReadScope,
-        target: ReviewTarget,
+        target: ResponseTarget,
         result: &intent_sourcecontrol::Result<T>,
     ) -> RepositoryResponseAttribution {
         let evidence = match result {
@@ -470,6 +521,16 @@ impl RepositoryReadOperation {
         .await
     }
 
+    pub(crate) async fn review_discussions(
+        self,
+        page: PageParams,
+    ) -> RepositoryProviderRead<Page<ReviewDiscussion>> {
+        self.perform(RepositoryResourceKind::MergeRequest, move |p, r, n| {
+            Box::pin(p.list_discussions(r, n, page))
+        })
+        .await
+    }
+
     pub(crate) async fn review_observation(self) -> RepositoryProviderRead<ReviewObservation> {
         self.perform(RepositoryResourceKind::MergeRequest, |p, r, n| {
             Box::pin(p.review_observation(r, n))
@@ -483,6 +544,7 @@ impl RepositoryReadOperation {
         call: impl for<'a> FnOnce(&'a GitLabSourceControl, &'a RepoRef, u64) -> ProviderFuture<'a, T>,
     ) -> RepositoryProviderRead<T> {
         let sink = Arc::new(ReadReceiptSink::default());
+        let cursor_scope = self.scope.pagination_scope();
         let provider = if self.target.kind == kind {
             BoundGitlabRequestCredentials::for_read(
                 self.scope.directory.clone(),
@@ -493,6 +555,7 @@ impl RepositoryReadOperation {
             )
             .map_err(intent_sourcecontrol::Error::from)
             .and_then(BoundGitlabRequestCredentials::into_provider)
+            .map(|provider| provider.with_pagination_scope(cursor_scope))
         } else {
             Err(RepositoryCredentialError::BoundaryMismatch.into())
         };
@@ -516,7 +579,176 @@ impl RepositoryReadOperation {
             }
             Err(error) => (Err(error), RateLimitStatus::default()),
         };
-        let attribution = Arc::new(sink.seal(self.scope, self.target, &result));
+        let attribution =
+            Arc::new(sink.seal(self.scope, ResponseTarget::Resource(self.target), &result));
+        RepositoryProviderRead {
+            result,
+            quota,
+            attribution,
+        }
+    }
+}
+
+/// Query owned before provider work. A managed call covers ONE admitted project;
+/// a repository set needs separate original admissions and response envelopes.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum RepositoryCollectionQuery {
+    Reviews(PrQuery),
+    Issues(IssueQuery),
+    FilteredIssues {
+        query: IssueQuery,
+        involvement: intent_sourcecontrol::IssueInvolvement,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryCollectionTarget {
+    repository: intent_core::RepositoryTarget,
+    query: RepositoryCollectionQuery,
+}
+
+impl RepositoryCollectionTarget {
+    pub(crate) fn repository(&self) -> &intent_core::RepositoryTarget {
+        &self.repository
+    }
+
+    pub(crate) fn kind(&self) -> RepositoryResourceKind {
+        match &self.query {
+            RepositoryCollectionQuery::Reviews(_) => RepositoryResourceKind::MergeRequest,
+            RepositoryCollectionQuery::Issues(_)
+            | RepositoryCollectionQuery::FilteredIssues { .. } => RepositoryResourceKind::Issue,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ResponseTarget {
+    Resource(ReviewTarget),
+    Collection(RepositoryCollectionTarget),
+}
+
+pub(crate) struct RepositoryCollectionReadOperation {
+    scope: RepositoryReadScope,
+    admission: RepositoryCredentialAdmission,
+    reader: Arc<dyn RepositorySecretReader>,
+    budget: Duration,
+    target: RepositoryCollectionTarget,
+}
+
+impl RepositoryCollectionReadOperation {
+    pub(crate) fn new(
+        directory: Arc<RepositoryConnectionDirectory>,
+        admission: RepositoryCredentialAdmission,
+        reader: Arc<dyn RepositorySecretReader>,
+        budget: Duration,
+        query: RepositoryCollectionQuery,
+    ) -> Result<Self> {
+        let scope = RepositoryReadScope::capture(directory, &admission)?;
+        let extras = match &query {
+            RepositoryCollectionQuery::Reviews(query) => &query.extra_repos,
+            RepositoryCollectionQuery::Issues(query)
+            | RepositoryCollectionQuery::FilteredIssues { query, .. } => &query.extra_repos,
+        };
+        if !extras.is_empty() {
+            return Err(RepositoryCredentialError::BoundaryMismatch);
+        }
+        let target = RepositoryCollectionTarget {
+            repository: admission.request.target.clone(),
+            query,
+        };
+        Ok(Self {
+            scope,
+            admission,
+            reader,
+            budget,
+            target,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &RepositoryCollectionTarget {
+        &self.target
+    }
+
+    pub(crate) async fn reviews(self) -> RepositoryProviderRead<Page<PullRequest>> {
+        let query = match &self.target.query {
+            RepositoryCollectionQuery::Reviews(query) => Some(query.clone()),
+            RepositoryCollectionQuery::Issues(_)
+            | RepositoryCollectionQuery::FilteredIssues { .. } => None,
+        };
+        self.perform(move |provider, repo| {
+            Box::pin(async move {
+                provider
+                    .list_prs(
+                        repo,
+                        query.ok_or(RepositoryCredentialError::BoundaryMismatch)?,
+                    )
+                    .await
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn issues(self) -> RepositoryProviderRead<Page<Issue>> {
+        let query = match &self.target.query {
+            RepositoryCollectionQuery::Issues(query) => Some((query.clone(), None)),
+            RepositoryCollectionQuery::FilteredIssues { query, involvement } => {
+                Some((query.clone(), Some(*involvement)))
+            }
+            RepositoryCollectionQuery::Reviews(_) => None,
+        };
+        self.perform(move |provider, repo| {
+            Box::pin(async move {
+                let (query, involvement) =
+                    query.ok_or(RepositoryCredentialError::BoundaryMismatch)?;
+                match involvement {
+                    Some(involvement) => {
+                        provider
+                            .list_issues_filtered(repo, query, involvement)
+                            .await
+                    }
+                    None => provider.list_issues(repo, query).await,
+                }
+            })
+        })
+        .await
+    }
+
+    async fn perform<T>(
+        self,
+        call: impl for<'a> FnOnce(&'a GitLabSourceControl, &'a RepoRef) -> ProviderFuture<'a, T>,
+    ) -> RepositoryProviderRead<T> {
+        let sink = Arc::new(ReadReceiptSink::default());
+        let cursor_scope = self.scope.pagination_scope();
+        let provider = BoundGitlabRequestCredentials::for_read(
+            self.scope.directory.clone(),
+            self.admission,
+            self.reader,
+            self.budget,
+            sink.clone(),
+        )
+        .map_err(intent_sourcecontrol::Error::from)
+        .and_then(BoundGitlabRequestCredentials::into_provider)
+        .map(|provider| provider.with_pagination_scope(cursor_scope));
+        let (result, quota) = match provider {
+            Ok(provider) => {
+                let (owner, name) = self
+                    .target
+                    .repository
+                    .project_path
+                    .rsplit_once('/')
+                    .expect("admitted project");
+                let repo = RepoRef {
+                    owner: owner.into(),
+                    name: name.into(),
+                };
+                let result = call(&provider, &repo).await;
+                let quota = provider.rate_limit_status().await.unwrap_or_default();
+                (result, quota)
+            }
+            Err(error) => (Err(error), RateLimitStatus::default()),
+        };
+        let attribution =
+            Arc::new(sink.seal(self.scope, ResponseTarget::Collection(self.target), &result));
         RepositoryProviderRead {
             result,
             quota,

@@ -42,6 +42,15 @@ permissions:
 # and marks the promoted version as Latest.
 on:
   pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'dist-workspace.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/*release*.yml'
+      - '.github/workflows/dist-*.yml'
+      - 'scripts/*release*'
+      - 'scripts/*dist*'
   push:
     tags:
       - 'v**[0-9]+.[0-9]+.[0-9]+*'
@@ -56,6 +65,14 @@ concurrency:
   queue: max
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     # LOCAL CUSTOMIZATION: fork PRs get no CI — external PRs are not accepted
@@ -64,7 +81,8 @@ jobs:
     # never runs any of this workflow's jobs. Tag pushes and same-repo PRs
     # are unaffected. Re-apply this after any `dist generate`.
     if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: "ubuntu-latest"
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -73,6 +91,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -101,6 +122,7 @@ jobs:
       - id: plan
         run: |
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          python3 scripts/optional-intel-release.py matrix plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -118,12 +140,8 @@ jobs:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
-      - plan
-    # LOCAL CUSTOMIZATION: the leading `needs.plan.result == 'success'` guard
-    # short-circuits the fromJson calls when plan was skipped (fork PR — see
-    # plan's comment), which would otherwise choke on plan's empty outputs.
-    # Re-apply this after any `dist generate`.
-    if: ${{ needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+      [plan, runner-route]
+    if: ${{ github.event_name != 'pull_request' && needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -137,12 +155,17 @@ jobs:
       # - 1 "global" task that builds universal installers
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
-    runs-on: ${{ matrix.runner }}
+    # LOCAL CUSTOMIZATION: only the isolated Intel Mac leg may fail.
+    continue-on-error: ${{ matrix.optional }}
+    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && matrix.runner || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
@@ -281,12 +304,13 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
-      - name: "Restore release compiler cache"
-        uses: "./.github/actions/release-rust-cache"
-        with:
-          "flavor": "daemon-dist"
-          "runner": "${{ matrix.runner }}"
-          "target": "${{ join(matrix.targets, ' ') }}"
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -328,13 +352,15 @@ jobs:
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
-      - plan
-      - build-local-artifacts
-    runs-on: "ubuntu-latest"
+      [plan, build-local-artifacts, runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -355,7 +381,8 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
+          dist build ${{ needs.plan.outputs.tag-flag }} $targets --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -374,17 +401,17 @@ jobs:
   # Determines if we should publish/announce
   host:
     needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
+      [plan, build-local-artifacts, build-global-artifacts, runner-route]
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "ubuntu-latest"
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -405,7 +432,8 @@ jobs:
       - id: host
         shell: bash
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
+          dist host ${{ needs.plan.outputs.tag-flag }} $targets --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -426,6 +454,7 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+          python3 scripts/optional-intel-release.py targets artifacts >/dev/null
       - name: Create GitHub Release
         env:
           # LOCAL CUSTOMIZATION of this cargo-dist-generated file: always
@@ -449,13 +478,9 @@ jobs:
 
   announce:
     needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
+      [plan, host, runner-route]
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "ubuntu-latest"
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -473,5 +498,6 @@ jobs:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
     permissions:
+      actions: read
       "contents": "write"
       "pull-requests": "read"

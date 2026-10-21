@@ -1573,6 +1573,60 @@ mod tests {
             .is_none());
     }
 
+    /// `workspace.findByPullRequest` is narrowed exactly like `workspace.list`:
+    /// with both fixture workspaces linked to one PR, a collaborator sees
+    /// only its member workspace and a non-member nothing; administrators,
+    /// agents and the daemon see both, most recently linked first. A non-PR
+    /// URL is `InvalidParams` for every caller.
+    #[tokio::test]
+    async fn find_by_pull_request_visibility_by_role() {
+        const PR: &str = "https://github.com/intent-hq/intentd/pull/7";
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        for ws in [&f.other_ws, &f.ws] {
+            sqlx::query("UPDATE workspace SET pr_url = ? WHERE id = ?")
+                .bind(PR)
+                .bind(ws.as_str())
+                .execute(f.services.store().write_pool())
+                .await
+                .expect("link workspace");
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        for role in ROLES {
+            let found: Vec<WorkspaceId> = f
+                .run(
+                    role,
+                    f.services
+                        .find_workspaces_by_pull_request(format!("{PR}/files")),
+                )
+                .await
+                .expect("workspace.findByPullRequest")
+                .into_iter()
+                .map(|w| w.id)
+                .collect();
+            match role {
+                Role::Owner | Role::Collaborator => {
+                    assert_eq!(found, std::slice::from_ref(&f.ws), "{role:?}");
+                }
+                Role::NonMember => assert!(found.is_empty(), "{role:?}: {found:?}"),
+                Role::Administrator | Role::Agent | Role::Daemon => {
+                    assert_eq!(found, [f.ws.clone(), f.other_ws.clone()], "{role:?}");
+                }
+            }
+            let bad = f
+                .run(
+                    role,
+                    f.services
+                        .find_workspaces_by_pull_request("https://github.com/o/r/issues/7".into()),
+                )
+                .await;
+            assert!(
+                matches!(bad, Err(Error::InvalidParams(_))),
+                "{role:?}: {bad:?}"
+            );
+        }
+    }
+
     /// `workspace.members.list` by the primary user whose cached row has no
     /// GitHub login spawns the same rate-limited background identity
     /// refresh `principal.me` does (intent-hq/intent#5534). The stub's
@@ -1604,7 +1658,7 @@ mod tests {
         let (services, primary, ws) = (&services, &primary, &ws);
         let list = |what: &'static str| async move {
             tokio::time::timeout(
-                Duration::from_secs(1),
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
                 with_caller(
                     Caller::Wire {
                         principal_id: primary.id.clone(),
@@ -1624,11 +1678,14 @@ mod tests {
         let first = list("first list").await;
         assert_eq!(first["members"][0]["principalId"], json!(primary.id.0));
         assert_eq!(first["members"][0]["login"], Value::Null);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while fetches() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while fetches() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("the refresh was spawned");
 
@@ -1657,15 +1714,18 @@ mod tests {
         // Open the gate: the detached refresh completes and persists the
         // identity; a later list carries it.
         gate.add_permits(1);
-        let attached = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let p = store.get_primary_principal().await.expect("primary");
-                if p.login.is_some() {
-                    break p;
+        let attached = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    let p = store.get_primary_principal().await.expect("primary");
+                    if p.login.is_some() {
+                        break p;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("the background refresh attaches the identity");
         assert_eq!(attached.login.as_deref(), Some("octocat"));
@@ -1783,10 +1843,13 @@ mod tests {
         let added = add(&f.outsider).await.expect("add");
         // owner + demoted primary + collaborator + the new guest
         assert_eq!(added, json!({ "added": true, "memberCount": 4 }));
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("event in time")
-            .expect("event batch");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("event in time")
+        .expect("event batch");
         let ev = batch
             .iter()
             .find(|e| e.data["changes"]["addedPrincipalId"] == json!(f.outsider.0))

@@ -38,11 +38,14 @@ impl FakeRuntime {
     }
 
     async fn wait_prompts(&self, count: usize) {
-        timeout(Duration::from_secs(5), async {
-            while self.prompts.lock().unwrap().len() < count {
-                self.entered.notified().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while self.prompts.lock().unwrap().len() < count {
+                    self.entered.notified().await;
+                }
+            },
+        )
         .await
         .expect("manager dispatches the expected prompt");
     }
@@ -148,7 +151,10 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "node".into(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -162,11 +168,14 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
 }
 
 async fn wait_idle(mgr: &AgentManager, id: &AgentId) {
-    timeout(Duration::from_secs(5), async {
-        while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("turn worker settles");
 }

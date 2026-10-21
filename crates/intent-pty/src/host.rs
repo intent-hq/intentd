@@ -172,6 +172,42 @@ pub struct SpawnSpec {
     /// Whether this PTY is surfaced through `terminal.list`. Script-owned PTYs
     /// set this false because scripts have their own list/runtime UI.
     pub listed: bool,
+    /// Optional lossless copy of the output: called on the reader thread with
+    /// every chunk, in order, before it reaches scrollback or subscribers.
+    pub output_sink: Option<OutputSink>,
+}
+
+/// Receives every output chunk of one PTY on its blocking reader thread, in
+/// order and before fan-out, so it never lags or drops like a live
+/// subscriber can. Blocking work (e.g. file writes) is fine here; it only
+/// slows that PTY's reader. The sink is dropped when the reader thread ends.
+#[derive(Clone)]
+pub struct OutputSink(Arc<Mutex<SinkFn>>);
+
+type SinkFn = dyn FnMut(&[u8]) + Send;
+
+impl OutputSink {
+    /// Wrap a chunk callback.
+    pub fn new(f: impl FnMut(&[u8]) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(f)))
+    }
+
+    fn write(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut f = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*f)(bytes);
+    }
+}
+
+impl std::fmt::Debug for OutputSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutputSink")
+    }
 }
 
 impl SpawnSpec {
@@ -188,6 +224,7 @@ impl SpawnSpec {
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             name: None,
             listed: true,
+            output_sink: None,
         }
     }
 }
@@ -416,7 +453,8 @@ impl PtyHost {
         let handle = {
             // ConPTY can request its startup reply while the child is attaching.
             let reader_writer = Arc::clone(&writer);
-            std::thread::spawn(move || read_loop(reader, &reader_fanout, &reader_writer))
+            let sink = spec.output_sink.clone();
+            std::thread::spawn(move || read_loop(reader, &reader_fanout, sink, &reader_writer))
         };
         let child = match pair.slave.spawn_command(cmd) {
             Ok(child) => child,
@@ -441,7 +479,10 @@ impl PtyHost {
         let pid = child.process_id();
         let killer = child.clone_killer();
         #[cfg(not(windows))]
-        let handle = std::thread::spawn(move || read_loop(reader, &reader_fanout));
+        let handle = {
+            let sink = spec.output_sink;
+            std::thread::spawn(move || read_loop(reader, &reader_fanout, sink))
+        };
 
         let cwd = spec
             .cwd
@@ -1043,8 +1084,15 @@ fn exit_watch_loop(session: &PtySession) {
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     fanout: &Arc<Mutex<Fanout>>,
+    sink: Option<OutputSink>,
     #[cfg(windows)] writer: &Arc<Mutex<Box<dyn Write + Send>>>,
 ) {
+    let publish = |bytes: &[u8]| {
+        if let Some(sink) = &sink {
+            sink.write(bytes);
+        }
+        publish_output(fanout, bytes);
+    };
     let mut buf = [0u8; READ_CHUNK];
     #[cfg(windows)]
     let mut handshake = conpty_startup::CursorHandshake::default();
@@ -1068,14 +1116,15 @@ fn read_loop(
                 let bytes = output.as_slice();
                 #[cfg(not(windows))]
                 let bytes = &buf[..n];
-                publish_output(fanout, bytes);
+                publish(bytes);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
     #[cfg(windows)]
-    publish_output(fanout, &handshake.finish());
+    publish(&handshake.finish());
+    drop(sink);
     let mut fanout = fanout.lock().unwrap();
     fanout.eof = true;
     fanout.eof_notify.notify_waiters();
@@ -1231,15 +1280,10 @@ mod tests {
     }
 
     /// Deadline scale factor for slow environments (coverage runs export
-    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`); never below 1.0, and non-finite
-    /// values (`inf`/`NaN`) are ignored so `Duration::mul_f64` cannot panic.
+    /// `INTENTD_TEST_TIMEOUT_MULTIPLIER`), from the shared
+    /// [`intentd_test_support::test_timeout_multiplier`].
     fn timeout_multiplier() -> f64 {
-        std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|m| m.is_finite())
-            .unwrap_or(1.0)
-            .max(1.0)
+        intentd_test_support::test_timeout_multiplier()
     }
 
     /// Drain a live receiver until `needle` is seen or the deadline passes.
@@ -1349,6 +1393,37 @@ mod tests {
 
         host.kill(named_id).await;
         host.kill(unnamed_id).await;
+    }
+
+    /// The output sink sees every byte, in order, even when scrollback keeps
+    /// only a small tail; the sink is released before EOF is signalled.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_sink_receives_every_byte_beyond_scrollback() {
+        let host = PtyHost::new();
+        let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let copy = Arc::clone(&seen);
+        let mut spec = SpawnSpec::new("s", "sh");
+        spec.args = vec!["-c".into(), "seq 1 20000".into()];
+        spec.scrollback_bytes = 1024;
+        spec.output_sink = Some(OutputSink::new(move |bytes| {
+            copy.lock().unwrap().extend_from_slice(bytes);
+        }));
+        let id = host.spawn(spec).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), host.wait_output_eof(id))
+            .await
+            .expect("reader reached EOF")
+            .unwrap();
+        assert_eq!(Arc::strong_count(&seen), 1, "sink dropped at EOF");
+        let text = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+        let expected = (1..=20000).fold(String::new(), |mut acc, n| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{n}\r\n");
+            acc
+        });
+        assert_eq!(text, expected);
+        assert!(host.scrollback(id).unwrap().len() <= 1024);
+        host.kill(id).await;
     }
 
     /// Hidden PTYs stay fully addressable by id while being omitted from the

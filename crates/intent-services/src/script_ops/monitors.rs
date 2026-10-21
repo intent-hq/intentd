@@ -157,18 +157,6 @@ impl ScriptManager {
             return Ok(json!({"ok":true,"monitor":row}));
         }
         let latest = self.store.latest_script_run(ws, id).await?;
-        let run = options
-            .run
-            .as_ref()
-            .or_else(|| latest.as_ref().map(|(run, _)| run));
-        if let Some(row) = rows.iter().rev().find(|m| {
-            m.agent_id == *agent
-                && m.script_id == id
-                && m.state == "completed"
-                && Some(&m.run_id) == run
-        }) {
-            return Ok(json!({"ok":true,"monitor":row}));
-        }
         let (run, result) = latest.ok_or_else(|| invalid("script has no accepted run"))?;
         if options.run.as_ref().is_some_and(|r| r != &run) {
             return Err(invalid("runId is unavailable"));
@@ -178,13 +166,15 @@ impl ScriptManager {
             .get_script_in_workspace(ws, id)
             .await?
             .ok_or_else(|| invalid("unknown script"))?;
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(7))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.store.prune_script_monitors(ws, &cutoff, true).await?;
+        if result.is_some() {
+            return Ok(
+                json!({"ok":false,"refused":true,"reason":"run-finished","scriptId":id,"runId":run}),
+            );
+        }
         let rows = self.store.script_monitors(ws, None).await?;
-        if rows.len() >= 1000 {
+        if self.store.script_monitor_reservations(ws).await? >= 1000 {
             return Err(invalid(
-                "workspace retained script monitor limit 1000 exhausted",
+                "workspace outstanding script monitor limit 1000 exhausted",
             ));
         }
         if rows
@@ -196,7 +186,7 @@ impl ScriptManager {
             return Err(invalid("owner active script monitor limit 5 exhausted"));
         }
         let created = self.monitor_now();
-        let mut row = ScriptMonitor {
+        let row = ScriptMonitor {
             monitor_id: uuid::Uuid::new_v4().to_string(),
             workspace_id: ws.clone(),
             agent_id: agent.clone(),
@@ -250,9 +240,6 @@ impl ScriptManager {
             },
         );
         self.emit_monitor(&row, "registered").await;
-        if let Some(result) = result {
-            self.complete_monitor(&mut row, result).await?;
-        }
         if let Some(services) = &self.owner_services {
             services.start_script_monitor_maintenance();
         }
@@ -323,12 +310,14 @@ impl ScriptManager {
         if row.state != "active" {
             return Ok(true);
         }
-        let committed = self
+        if let Err(error) = self
             .store
             .script_monitor(&row.workspace_id, &row.monitor_id)
-            .await?;
-        if committed.state != "active" {
-            *row = committed;
+            .await
+        {
+            if !matches!(error, Error::InvalidParams(_)) {
+                return Err(error);
+            }
             self.locks
                 .monitor_windows
                 .lock()
@@ -396,8 +385,12 @@ impl ScriptManager {
         ws: &WorkspaceId,
         agent: Option<&AgentId>,
         reason: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<AgentId>> {
         let _lane = self.locks.monitor_lane.lock().await;
+        let owners = self.store.script_notification_owners(ws, agent).await?;
+        if owners.is_empty() {
+            return Ok(owners);
+        }
         for mut row in self.store.script_monitors(ws, agent).await? {
             if row.state == "active" {
                 row.state = "cancelled".into();
@@ -414,7 +407,8 @@ impl ScriptManager {
                 .unwrap()
                 .remove(&row.monitor_id);
         }
-        Ok(())
+        self.store.suppress_script_notifications(ws, agent).await?;
+        Ok(owners)
     }
 
     pub(crate) async fn recover_monitors(&self) -> Result<()> {
@@ -490,7 +484,11 @@ impl ScriptManager {
     }
 
     pub(crate) async fn reconcile_monitor(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
-        let initial = self.store.script_monitor(ws, id).await?;
+        let initial = match self.store.script_monitor(ws, id).await {
+            Ok(row) => row,
+            Err(Error::InvalidParams(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         if initial.state == "active" {
             // A failed finalizer retains the observed result in the registry.
             // Retry before taking monitor_lane: finalization acquires locks in
@@ -517,7 +515,11 @@ impl ScriptManager {
             };
         }
         let _lane = self.locks.monitor_lane.lock().await;
-        let mut row = self.store.script_monitor(ws, id).await?;
+        let mut row = match self.store.script_monitor(ws, id).await {
+            Ok(row) => row,
+            Err(Error::InvalidParams(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         self.reconcile_locked(&mut row).await?;
         Ok(())
     }
@@ -549,18 +551,28 @@ impl ScriptManager {
         stop: bool,
     ) -> Result<Value> {
         let initial = self.store.script_monitor(ws, id).await?;
+        if owner.is_some_and(|a| a != &initial.agent_id) {
+            return Err(invalid("unknown monitor ID"));
+        }
         let definition = self.locks.definition_lock(&initial.script_id);
         let _definition = definition.lock().await;
         let lane = self.locks.monitor_lane.lock().await;
-        let mut row = self.store.script_monitor(ws, id).await?;
-        if owner.is_some_and(|a| a != &row.agent_id) {
-            return Err(invalid(&format!("monitor belongs to {}", row.agent_id)));
-        }
+        let mut row = match self.store.script_monitor(ws, id).await {
+            Ok(row) => row,
+            Err(Error::InvalidParams(_)) => {
+                return Ok(if stop {
+                    json!({"ok":true,"monitorId":id,"runStopped":false})
+                } else {
+                    json!({"ok":true,"monitorId":id})
+                })
+            }
+            Err(error) => return Err(error),
+        };
         if self.reconcile_locked(&mut row).await? {
             return Ok(if stop {
-                json!({"ok":true,"monitor":row,"runStopped":false})
+                json!({"ok":true,"monitorId":id,"runStopped":false})
             } else {
-                json!({"ok":true,"monitor":row})
+                json!({"ok":true,"monitorId":id})
             });
         }
         if !stop {
@@ -568,7 +580,7 @@ impl ScriptManager {
             row.reason = Some("unmonitored".into());
             row.settled_at = Some(now_iso());
             self.commit_monitor(&row).await?;
-            return Ok(json!({"ok":true,"monitor":row}));
+            return Ok(json!({"ok":true,"monitorId":id}));
         }
         let current = self
             .scripts
@@ -589,7 +601,7 @@ impl ScriptManager {
                 },
             )
             .await?;
-            return Ok(json!({"ok":true,"monitor":row,"runStopped":false}));
+            return Ok(json!({"ok":true,"monitorId":id,"runStopped":false}));
         }
         self.store
             .script_monitor_cancel_intent(ws, id, true)
@@ -642,7 +654,7 @@ impl ScriptManager {
             }
         };
         self.complete_monitor(&mut row, result).await?;
-        Ok(json!({"ok":true,"monitor":row,"runStopped":true}))
+        Ok(json!({"ok":true,"monitorId":id,"runStopped":true}))
     }
 
     pub(super) async fn monitor_gap(&self, ws: &WorkspaceId, id: &str, pty: PtyId) {
@@ -681,6 +693,16 @@ impl ScriptManager {
             .is_none_or(|m| m.generation != generation || m.stopped_by_user)
         {
             return Err(Error::InvalidParams("script launch was cancelled".into()));
+        }
+        let mut spec = spec;
+        let run = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(ws.clone(), id.into()))
+            .and_then(|m| m.state.run_id.clone());
+        if let Some(run) = run {
+            spec.output_sink = self.open_output_sink(ws, id, &run).await;
         }
         let pty = self.pty.spawn(spec)?;
         if let Some(m) = self

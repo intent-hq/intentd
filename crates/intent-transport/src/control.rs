@@ -1,9 +1,9 @@
 //! System control fast-path: `system.status`, `system.shutdown`,
-//! `system.importLegacy` (§5.7), `system.gitCredential` (monorepo#884), and
+//! `system.gitCredential` (monorepo#884), and
 //! `system.requestUpdate` (§5.7).
 //!
-//! These control methods surface live daemon state, request graceful shutdown,
-//! and run legacy import. They sit above the domain [`WorkspaceApi`] router because
+//! These control methods surface live daemon state and request graceful
+//! shutdown. They sit above the domain [`WorkspaceApi`] router because
 //! the data they expose (bound port, connected clients, active agents, the TLS
 //! fingerprint) and the action they take (tear down the listener) are
 //! transport/process concerns, not domain operations. The composition root
@@ -52,7 +52,7 @@ pub struct SystemStatus {
     pub has_display: bool,
     /// The `AgentManager` concurrency cap (resolved maxConcurrent incl. auto-detection).
     pub max_agents: usize,
-    /// The daemon crate version (`CARGO_PKG_VERSION`).
+    /// The `intentd` crate version (the binary's `CARGO_PKG_VERSION`).
     pub version: String,
     /// Source commit embedded at build time. `None` when the build environment
     /// cannot identify a commit (for example, a source archive without Git metadata).
@@ -177,7 +177,8 @@ pub struct SystemStatus {
 
 /// The idle-triggered update check state for `system.status`: the daemon
 /// asks its supervising sitter for an idle-mode update check (SIGUSR2) while
-/// no turn is in flight, and exits for a staged update only once idle.
+/// no turn is in flight and no command script runs, and exits for a staged
+/// update only once idle (the script wait is bounded).
 /// Timestamps are RFC 3339 UTC strings, `None` (null on the wire) when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdleUpdateCheckStatus {
@@ -193,8 +194,15 @@ pub struct IdleUpdateCheckStatus {
     /// the requester is disabled.
     pub next_eligible_at: Option<String>,
     /// The sitter staged a newer version: the daemon exits for the restart
-    /// at the next moment no turn is in flight.
+    /// at the next moment no turn is in flight and no command script runs.
     pub restart_pending: bool,
+    /// Command-mode script runs in flight right now. They count as busy for
+    /// the handshake: no idle request is sent and a staged restart waits for
+    /// them (bounded; see `restart_deferred_until`). Services never count.
+    pub running_scripts: usize,
+    /// While a staged restart is pending and held by running command
+    /// scripts: when the daemon stops waiting for them and restarts anyway.
+    pub restart_deferred_until: Option<String>,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -237,12 +245,22 @@ impl SystemServices {
 /// Lets a listener answer `system.status` from real state and trigger a
 /// graceful shutdown for `system.shutdown` without reaching into domain code.
 pub trait SystemControl: Send + Sync {
+    /// In-memory startup status, available only in the full daemon composition.
+    fn startup_status(&self) -> Option<intent_core::startup::StartupStatus> {
+        None
+    }
+
     /// Select the installed services. Existing providers retain their full surface.
     fn services(&self) -> SystemServices {
         SystemServices::Full
     }
     /// Snapshot the current daemon state.
     fn status(&self) -> SystemStatus;
+    /// The daemon binary's own version, advertised as `server.version` in
+    /// `client.hello` (intent-hq/intent#7256). Required so every composition
+    /// root states it: a library crate's `CARGO_PKG_VERSION` can lag the
+    /// `intentd` crate, because release-plz versions them separately.
+    fn daemon_version(&self) -> &str;
     /// Metadata-only compositions may await their original listener snapshot.
     /// Full providers keep the existing synchronous status dispatch below.
     fn metadata_status(&self) -> Pin<Box<dyn Future<Output = SystemStatus> + Send + '_>> {
@@ -283,11 +301,6 @@ pub trait SystemControl: Send + Sync {
     fn request_exact_update(&self, _target: &str) -> Result<(), String> {
         Err("exact-version updates are not supported".into())
     }
-    /// Import legacy workspaces into the daemon's live store.
-    fn import_legacy(
-        &self,
-        force: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
     /// Resolve the daemon-managed GitHub credential for the git-credential
     /// helper (monorepo#884): `Some((username, password))` when the
     /// `exposeGitCredentialToChildren` setting is on and a usable token
@@ -306,13 +319,12 @@ pub(crate) enum SystemMethod {
     RequestUpdate {
         target: Result<Option<String>, ()>,
     },
-    ImportLegacy {
-        force: Result<bool, ()>,
-    },
     GitCredential {
         pid: Option<u64>,
         protocol: Option<String>,
         host: Option<String>,
+        path: Option<String>,
+        username: Option<String>,
     },
 }
 
@@ -356,18 +368,6 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
             };
             SystemMethod::RequestUpdate { target }
         }
-        "system.importLegacy" => {
-            let force = match obj.get("params") {
-                None | Some(Value::Null) => Ok(false),
-                Some(Value::Object(params)) => match params.get("force") {
-                    None | Some(Value::Null) => Ok(false),
-                    Some(Value::Bool(force)) => Ok(*force),
-                    Some(_) => Err(()),
-                },
-                Some(_) => Err(()),
-            };
-            SystemMethod::ImportLegacy { force }
-        }
         "system.gitCredential" => {
             // Lenient pid extraction: it is audit-only metadata, so a missing
             // or non-numeric value degrades to `None` rather than erroring.
@@ -385,6 +385,8 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 pid,
                 protocol: text("protocol"),
                 host: text("host"),
+                path: text("path"),
+                username: text("username"),
             }
         }
         _ => return None,
@@ -393,6 +395,73 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
         method,
         id_present: id_member.is_some(),
         id_echo: id_member.cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The existing GitHub branch keeps its exact resolver and scope. Other HTTPS
+/// helpers may use only an explicit path through the original local owner.
+pub(crate) fn gitlab_credential_query(
+    req: &SystemRequest,
+) -> Option<intent_core::gitlab_child_git::GitlabChildGitCredentialQuery> {
+    let SystemMethod::GitCredential {
+        pid,
+        protocol,
+        host,
+        path,
+        username,
+    } = &req.method
+    else {
+        return None;
+    };
+    if git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+        return None;
+    }
+    let protocol = protocol.as_ref()?;
+    let host = host.as_ref()?;
+    let path = path.as_ref()?;
+    if !protocol.eq_ignore_ascii_case("https")
+        || host.len() > 2048
+        || path.len() > 4096
+        || username.as_ref().is_some_and(|s| s.len() > 256)
+    {
+        return None;
+    }
+    Some(
+        intent_core::gitlab_child_git::GitlabChildGitCredentialQuery {
+            pid: *pid,
+            protocol: protocol.clone(),
+            host: host.clone(),
+            path: path.clone(),
+            username: username.clone(),
+        },
+    )
+}
+
+/// Only called for actual UDS admission; the Services owner independently
+/// checks the captured local origin. The result uses ordinary private egress.
+pub(crate) async fn prepare_gitlab_credential(
+    req: SystemRequest,
+    query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    api: &dyn intent_core::WorkspaceApi,
+) -> Option<crate::router::PreparedReply> {
+    use intent_core::repository_request::RepositoryReadReplyKind;
+    let result = api.gitlab_child_git_credential(query).await;
+    if !req.id_present {
+        return None;
+    }
+    let (frame, kind) = match result {
+        Ok(result) => (
+            success_frame(&req.id_echo, &serde_json::json!(result)),
+            RepositoryReadReplyKind::Result,
+        ),
+        Err(error) => (
+            crate::router::delivery_error(&req.id_echo, error),
+            RepositoryReadReplyKind::ServiceError,
+        ),
+    };
+    Some(crate::router::PreparedReply {
+        frame,
+        service: Some((kind, req.id_echo)),
     })
 }
 
@@ -441,6 +510,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             "lastRequestedAt": status.idle_update_check.last_requested_at,
             "nextEligibleAt": status.idle_update_check.next_eligible_at,
             "restartPending": status.idle_update_check.restart_pending,
+            "runningScripts": status.idle_update_check.running_scripts,
+            "restartDeferredUntil": status.idle_update_check.restart_deferred_until,
         },
         "host": {
             "os": status.os,
@@ -558,7 +629,7 @@ pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
 /// for a notification, which gets no reply). `system.shutdown` triggers the
-/// graceful teardown before acknowledging; like `system.importLegacy` and
+/// graceful teardown before acknowledging; like
 /// `system.gitCredential` it is UDS-only, so remote (TCP/WSS) callers get
 /// -32001 and remote shutdown notifications are ignored. `system.gitCredential`
 /// returns `{ credential: { username, password } }` when a credential is
@@ -637,17 +708,6 @@ pub(crate) async fn handle(
             .request_update()
             .map(|()| json!({ "ok": true }))
             .map_err(|message| (-32603, message)),
-        SystemMethod::ImportLegacy { .. } if !is_uds => Err((
-            -32001,
-            "system.importLegacy is available over UDS only".to_string(),
-        )),
-        SystemMethod::ImportLegacy { force: Err(()) } => {
-            Err((-32602, "force must be a boolean".to_string()))
-        }
-        SystemMethod::ImportLegacy { force: Ok(force) } => control
-            .import_legacy(force)
-            .await
-            .map_err(|message| (-32603, message)),
         SystemMethod::GitCredential { .. } if !is_uds => Err((
             -32001,
             "system.gitCredential is available over UDS only".to_string(),
@@ -656,6 +716,7 @@ pub(crate) async fn handle(
             pid,
             protocol,
             host,
+            ..
         } => {
             // Defense in depth (monorepo#884): the daemon re-checks the
             // helper's scope gate, so an arbitrary local UDS caller cannot
@@ -701,7 +762,6 @@ mod registration_tests {
             "system.status",
             "system.shutdown",
             "system.requestUpdate",
-            "system.importLegacy",
             "system.gitCredential",
         ] {
             for id in [Some(json!(7)), None] {

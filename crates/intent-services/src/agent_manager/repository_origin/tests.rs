@@ -110,7 +110,10 @@ pub(super) fn handle(
             antigravity_profile: None,
             session_mcp_servers: vec![],
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "claude-agent-acp".into(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("claude-agent-acp"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -277,10 +280,13 @@ fn paused_session(
 }
 
 async fn arrived(receiver: tokio::sync::oneshot::Receiver<Value>) -> Value {
-    tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
-        .await
-        .expect("actual ACP request arrived")
-        .unwrap()
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        receiver,
+    )
+    .await
+    .expect("actual ACP request arrived")
+    .unwrap()
 }
 
 pub(super) fn callback(origin: &RepositoryOrigin) -> Option<RepositoryCallbackContext> {
@@ -693,10 +699,13 @@ async fn actual_teardown_retires_the_source_leaf_before_aborting_work() {
             }
         }
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), result)
-                .await
-                .unwrap()
-                .unwrap(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                result
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             "{action}"
         );
         assert!(!current(&callback.capture(), f.caller()).await, "{action}");
@@ -838,13 +847,17 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
     let dispatch = std::thread::spawn(move || {
         fence.dispatch(&mut move || {
             entered.send(()).unwrap();
-            held.recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
+            held.recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap();
             Ok(())
         })
     });
     inside
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let first_manager = f.manager.clone();
     let (first_done, first_result) = std::sync::mpsc::channel();
@@ -852,7 +865,8 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
         first_manager.begin_shutdown();
         first_done.send(()).unwrap();
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while !origin.state.lock().unwrap().retired {
         assert!(
             std::time::Instant::now() < deadline,
@@ -869,7 +883,9 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
         second_done.send(()).unwrap();
     });
     second_started
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let maps_free = f.manager.handles.try_lock().is_ok()
         && f.manager.stopping.try_lock().is_ok()
@@ -922,13 +938,16 @@ async fn removal_drains_retirement_without_holding_the_handles_map() {
         })
     });
     inside
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let handles = f.manager.handles.clone();
     let id = f.row.id.clone();
     let observed_origin = origin.clone();
     let removed = std::thread::spawn(move || take(&handles, &id, &origin, None));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while !observed_origin.state.lock().unwrap().retired {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1427,7 +1446,9 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
                 let _ = entered.send(());
                 // Never panic across SQLite's callback; test-side timeouts report
                 // a failed ordering and dropping the sender releases this worker.
-                let _ = resume.recv_timeout(std::time::Duration::from_secs(10));
+                let _ = resume.recv_timeout(intentd_test_support::test_timeout(
+                    std::time::Duration::from_secs(10),
+                ));
             }
         });
     drop(writer);
@@ -1450,10 +1471,13 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
         .connection()
         .unwrap();
     let control = async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), model_wait)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            model_wait,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             f.stored().await.acp_session_id.as_deref(),
             Some("original-A")
@@ -1524,10 +1548,13 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
         } else {
             Some((attempt, owner))
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), effort_wait)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            effort_wait,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(current(&fresh.capture(), f.caller()).await);
         effort_release.send(()).unwrap();
         (replacement, fresh, peer, pending_install)
@@ -1593,4 +1620,435 @@ async fn replaced_handle_late_metadata_completion_preserves_new_physical_owner()
 #[tokio::test]
 async fn same_handle_obsolete_metadata_completion_cannot_install_before_new_owner() {
     metadata_completion_ordering(false, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_waits_for_original_native_retirement_response() {
+    manager_native_shutdown_case(true, false, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_preserves_negative_original_native_outcome() {
+    manager_native_shutdown_case(false, false, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_cancelled_waiter_preserves_original_native_join() {
+    manager_native_shutdown_case(true, true, false).await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_preserves_lost_original_native_response() {
+    manager_native_shutdown_case(false, false, true).await;
+}
+
+async fn manager_native_shutdown_case(positive: bool, cancel: bool, lost: bool) {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (handle, mut reader, mut writer) = handle(origin.clone());
+    let connection = handle.execution.connection().unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut resume = Some(resume);
+        let mut context = Value::Null;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"_meta":{"reviewMonitoring":1,"intentCallbackRegistration":{"version":1,"method":"_intent/session/register_mcp_callback"}}})
+                }
+                "session/new" => {
+                    context = request["params"]["_meta"]["reviewMonitoringContext"].clone();
+                    json!({"sessionId":"shutdown-native-original","_meta":{"reviewMonitoring":1,"reviewMonitoringContext":context,"intentCallbackRegistration":{"version":1,"queryReceipt":"11111111-1111-4111-8111-111111111111"}}})
+                }
+                "_intent/session/retire_review_context" => {
+                    assert_eq!(request["params"]["sessionId"], "shutdown-native-original");
+                    assert_eq!(request["params"]["loadAttemptId"], context["loadAttemptId"]);
+                    entered.take().unwrap().send(()).unwrap();
+                    resume.take().unwrap().await.unwrap();
+                    if lost {
+                        break;
+                    }
+                    json!({"retired":positive})
+                }
+                other => panic!("unexpected shutdown request {other}"),
+            };
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let handshake = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap();
+    let callbacks = handshake.callbacks.unwrap();
+    let (creation, attempt) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    let opened = f
+        .manager
+        .services
+        .create_repository_acp_session(
+            (&connection, Some(&callbacks)),
+            &f.row.id,
+            f.dir.path().to_str().unwrap(),
+            vec![],
+            creation,
+            false,
+        )
+        .await
+        .unwrap();
+    let physical = opened.owner.unwrap();
+    let native = physical.native_allocation_for_test();
+    assert!(origin.install(attempt, physical));
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let manager = f.manager.clone();
+    let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(native.is_retired());
+    assert!(!native.is_joined());
+    if cancel {
+        shutdown.abort();
+        assert!(shutdown.await.unwrap_err().is_cancelled());
+        assert!(f.manager.handles.lock().unwrap().contains_key(&f.row.id));
+        let manager = f.manager.clone();
+        shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    }
+    // A bounded held-peer window observes the actual shutdown future, not just
+    // the allocation's independently driven retirement task.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
+    let returned_early = early.is_ok();
+    release.send(()).unwrap();
+    let result = match early {
+        Ok(result) => result.unwrap(),
+        Err(_) => shutdown.await.unwrap(),
+    };
+    assert_eq!(result.is_ok(), positive);
+    f.manager.services.store_tasks.drain_finite().await;
+    assert_eq!(native.is_joined(), positive);
+    assert_eq!(
+        f.manager.handles.lock().unwrap().contains_key(&f.row.id),
+        !positive,
+        "negative native completion must not destroy the still-owned transport"
+    );
+    server.abort();
+    assert!(
+        !returned_early,
+        "manager reported shutdown before original native retirement joined"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn manager_shutdown_keeps_real_stdio_child_until_original_native_join() {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (mut handle, _, _) = handle(origin.clone());
+    let entered = f.dir.path().join("retire-entered");
+    let release = f.dir.path().join("retire-release");
+    // Controlled real stdio process: this establishes transport/child lifetime,
+    // not the separately pinned native consumer's containment or model semantics.
+    let script = r"
+import json,sys,time,pathlib
+entered,release=map(pathlib.Path,sys.argv[1:])
+context=None
+for line in sys.stdin:
+ r=json.loads(line);m=r['method'];p=r.get('params',{})
+ if m=='initialize':
+  result={'protocolVersion':1,'agentCapabilities':{},'authMethods':[],'_meta':{'reviewMonitoring':1,'intentCallbackRegistration':{'version':1,'method':'_intent/session/register_mcp_callback'}}}
+ elif m=='session/new':
+  context=p['_meta']['reviewMonitoringContext']
+  result={'sessionId':'real-shutdown-native','_meta':{'reviewMonitoring':1,'reviewMonitoringContext':context,'intentCallbackRegistration':{'version':1,'queryReceipt':'11111111-1111-4111-8111-111111111111'}}}
+ elif m=='_intent/session/retire_review_context':
+  assert p=={'sessionId':'real-shutdown-native','loadAttemptId':context['loadAttemptId']}
+  entered.write_text('original retirement entered')
+  while not release.exists(): time.sleep(0.005)
+  result={'retired':True}
+ else: raise AssertionError(m)
+ print(json.dumps({'jsonrpc':'2.0','id':r['id'],'result':result}),flush=True)
+";
+    let mut child = tokio::process::Command::new("python3")
+        .args(["-u", "-c", script])
+        .arg(&entered)
+        .arg(&release)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let connection = Arc::new(Connection::new(
+        child.stdin.take().unwrap(),
+        child.stdout.take().unwrap(),
+        None,
+        ConnectionHooks::default(),
+    ));
+    let (_, receiver) = mpsc::unbounded_channel::<IncomingNotification>();
+    handle.execution =
+        crate::agent_manager::RuntimeHandle::local(crate::agent_manager::runtime::LocalResources {
+            connection: connection.clone(),
+            notifications: Arc::new(TokioMutex::new(receiver)),
+            serve_task: tokio::spawn(std::future::pending()),
+            child: Some(child),
+            child_pid: Some(pid),
+            _mcp_bridge: None,
+            _mcp_config: None,
+            _rules_config: None,
+            _pi_extension: None,
+            npx_launch_dir: None,
+            preparation_guard: None,
+            cleanup_lease: None,
+            cleanup_services: None,
+        });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let handshake = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap();
+    let callbacks = handshake.callbacks.unwrap();
+    let (creation, attempt) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    let opened = f
+        .manager
+        .services
+        .create_repository_acp_session(
+            (&connection, Some(&callbacks)),
+            &f.row.id,
+            f.dir.path().to_str().unwrap(),
+            vec![],
+            creation,
+            false,
+        )
+        .await
+        .unwrap();
+    let physical = opened.owner.unwrap();
+    let native = physical.native_allocation_for_test();
+    assert!(origin.install(attempt, physical));
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let manager = f.manager.clone();
+    let shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(native.is_retired());
+    assert!(!native.is_joined());
+    assert!(!shutdown.is_finished());
+    assert!(connection.is_alive());
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "original child was killed before retirement response"
+    );
+    std::fs::write(release, "allow original response").unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(native.is_joined());
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "original child was not joined after positive retirement"
+    );
+    f.manager.services.store_tasks.drain_finite().await;
+}
+
+#[tokio::test]
+async fn manager_shutdown_retains_pending_native_startup_until_original_response_and_join() {
+    use intent_acp::callback_registration::CallbackOffer;
+    use intent_acp::review_monitoring::ReviewMonitoringOffer;
+    let f = Fixture::with_initial_stamp("claude-code", Some("3.1")).await;
+    let origin = f.origin().await;
+    let (handle, mut reader, mut writer) = handle(origin.clone());
+    let connection = handle.execution.connection().unwrap();
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    let (retiring, retirement) = tokio::sync::oneshot::channel();
+    let (join, allow_join) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut entered = Some(entered);
+        let mut resume = Some(resume);
+        let mut retiring = Some(retiring);
+        let mut allow_join = Some(allow_join);
+        let mut context = Value::Null;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                break;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "initialize" => {
+                    json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],"_meta":{"reviewMonitoring":1,"intentCallbackRegistration":{"version":1,"method":"_intent/session/register_mcp_callback"}}})
+                }
+                "session/new" => {
+                    context = request["params"]["_meta"]["reviewMonitoringContext"].clone();
+                    entered.take().unwrap().send(()).unwrap();
+                    resume.take().unwrap().await.unwrap();
+                    json!({"sessionId":"pending-shutdown-native","_meta":{"reviewMonitoring":1,"reviewMonitoringContext":context,"intentCallbackRegistration":{"version":1,"queryReceipt":"11111111-1111-4111-8111-111111111111"}}})
+                }
+                "_intent/session/retire_review_context" => {
+                    assert_eq!(request["params"]["sessionId"], "pending-shutdown-native");
+                    assert_eq!(request["params"]["loadAttemptId"], context["loadAttemptId"]);
+                    retiring.take().unwrap().send(()).unwrap();
+                    allow_join.take().unwrap().await.unwrap();
+                    json!({"retired":true})
+                }
+                other => panic!("unexpected pending shutdown request {other}"),
+            };
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut provider = *intent_providers::find_provider("claude-code").unwrap();
+    provider.supports_authenticate = false;
+    let callbacks = intent_acp::handshake::handshake_with_review_monitoring(
+        connection.clone(),
+        &provider,
+        CallbackOffer::V1,
+        ReviewMonitoringOffer::V1,
+    )
+    .await
+    .unwrap()
+    .callbacks
+    .unwrap();
+    let (creation, _) = origin
+        .begin_session(RepositoryCreationIntent::FirstSet)
+        .unwrap();
+    f.manager
+        .handles
+        .lock()
+        .unwrap()
+        .insert(f.row.id.clone(), handle);
+    let services = f.manager.services.clone();
+    let agent = f.row.id.clone();
+    let original = connection.clone();
+    let cwd = f.dir.path().to_string_lossy().into_owned();
+    let startup = tokio::spawn(async move {
+        services
+            .create_repository_acp_session(
+                (&original, Some(&callbacks)),
+                &agent,
+                &cwd,
+                vec![],
+                creation,
+                false,
+            )
+            .await
+    });
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    f.manager.begin_shutdown();
+    startup.abort();
+    assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+    let manager = f.manager.clone();
+    let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown lost pending producer"
+    );
+    assert!(connection.is_alive());
+    release.send(()).unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        retirement,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown lost original retirement outcome"
+    );
+    join.send(()).unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(!f.manager.handles.lock().unwrap().contains_key(&f.row.id));
+    assert!(f
+        .manager
+        .services
+        .store
+        .get_agent_session(&f.row.id)
+        .await
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    f.manager.services.store_tasks.drain_finite().await;
+    server.abort();
 }

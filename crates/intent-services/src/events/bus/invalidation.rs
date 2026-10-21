@@ -1,6 +1,5 @@
 //! Payload-free subscriptions for consumers that re-read authoritative state.
-use super::{event_matches, EventBus, SubscriptionFilter};
-use intent_core::Event;
+use super::{event_matches, BroadcastEvent, EventBus, SubscriptionFilter};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -14,7 +13,7 @@ pub struct InvalidationSubscription {
 
 impl InvalidationSubscription {
     fn from_receiver(
-        receiver: broadcast::Receiver<Arc<Event>>,
+        receiver: broadcast::Receiver<Arc<BroadcastEvent>>,
         filter: SubscriptionFilter,
     ) -> Self {
         let (sender, changes) = watch::channel(());
@@ -51,14 +50,17 @@ impl EventBus {
 }
 
 async fn deliver(
-    mut receiver: broadcast::Receiver<Arc<Event>>,
+    mut receiver: broadcast::Receiver<Arc<BroadcastEvent>>,
     filter: SubscriptionFilter,
     sender: watch::Sender<()>,
 ) {
     loop {
         let dirty = match receiver.recv().await {
             Ok(event) => {
-                let matched = event_matches(&filter, &event);
+                let matched = match event.as_ref() {
+                    BroadcastEvent::Public(event) => event_matches(&filter, event),
+                    BroadcastEvent::Monitor(_) | BroadcastEvent::HistoryChanged(_) => false,
+                };
                 // Release even the borrowed broadcast payload before notifying
                 // or awaiting another event. No Event clone enters this path.
                 drop(event);
@@ -76,12 +78,12 @@ async fn deliver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{ActorType, EventActor, WorkspaceId};
+    use intent_core::{ActorType, Event, EventActor, WorkspaceId};
     use serde_json::json;
     use std::time::Duration;
 
-    fn event(workspace: &str, event_type: &str, data: serde_json::Value) -> Arc<Event> {
-        Arc::new(Event {
+    fn event(workspace: &str, event_type: &str, data: serde_json::Value) -> Arc<BroadcastEvent> {
+        Arc::new(BroadcastEvent::Public(Event {
             id: "event".into(),
             workspace_id: WorkspaceId::from(workspace),
             timestamp: "2026-10-05T00:00:00Z".into(),
@@ -95,7 +97,7 @@ mod tests {
             parent_event_id: None,
             metadata: None,
             data,
-        })
+        }))
     }
 
     #[tokio::test]
@@ -109,22 +111,24 @@ mod tests {
             json!({"content":"x".repeat(2_000_000)}),
         );
         let weak = Arc::downgrade(&large);
-        sender.send(large).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), subscription.changed())
-                .await
-                .unwrap()
-        );
+        assert!(sender.send(large).is_ok());
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            subscription.changed()
+        )
+        .await
+        .unwrap());
         assert!(
             weak.upgrade().is_none(),
             "neither the worker nor its unread watch retains the Event"
         );
         drop(sender);
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(10), subscription.changed())
-                .await
-                .unwrap()
-        );
+        assert!(!tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            subscription.changed()
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -133,14 +137,17 @@ mod tests {
         let mut subscription =
             InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
         for _ in 0..100 {
-            sender.send(event("ws", "note:updated", json!({}))).unwrap();
+            assert!(sender.send(event("ws", "note:updated", json!({}))).is_ok());
         }
         drop(sender);
         // Wait for actual worker settlement before consuming the coalesced bit.
-        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(subscription.changed().await);
         assert!(!subscription.changed().await);
     }
@@ -163,18 +170,19 @@ mod tests {
         let weak = Arc::downgrade(&large);
         // No await on this current-thread runtime: overwrite the matching
         // event before the worker can inspect it. Remaining events don't match.
-        sender.send(large).unwrap();
+        assert!(sender.send(large).is_ok());
         for _ in 0..8 {
-            sender
-                .send(event("ws", "comment:added", json!({})))
-                .unwrap();
+            assert!(sender.send(event("ws", "comment:added", json!({}))).is_ok());
         }
         assert!(weak.upgrade().is_none());
         drop(sender);
-        tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             subscription.changed().await,
             "lag itself must trigger refresh"
@@ -198,17 +206,60 @@ mod tests {
                     ..Default::default()
                 },
             );
-            sender
-                .send(event(workspace, event_type, json!({})))
-                .unwrap();
+            assert!(sender.send(event(workspace, event_type, json!({}))).is_ok());
             drop(sender);
-            tokio::time::timeout(Duration::from_secs(10), &mut subscription.handle)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                &mut subscription.handle,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(subscription.changed().await, expected);
             assert!(!subscription.changed().await);
         }
+    }
+
+    #[tokio::test]
+    async fn invalidation_discards_private_monitor_and_history_envelopes() {
+        use crate::events::monitor_delivery::MonitorEvent;
+        use intent_core::repository_request::RepositoryMonitorEventSource;
+
+        struct PrivateSource;
+        impl RepositoryMonitorEventSource for PrivateSource {
+            fn with_current(
+                &self,
+                _: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+            ) -> intent_core::Result<()> {
+                panic!("generic invalidation must not project private source authority")
+            }
+        }
+        let (sender, receiver) = broadcast::channel(4);
+        let mut subscription =
+            InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
+        let public = event("ws", "note:updated", json!({"private":"withheld"}));
+        let private = Arc::new(BroadcastEvent::Monitor(MonitorEvent {
+            event: (**public).clone(),
+            binding: None,
+            source: Arc::new(PrivateSource),
+        }));
+        let weak = Arc::downgrade(&private);
+        assert!(sender.send(private).is_ok());
+        assert!(sender
+            .send(Arc::new(BroadcastEvent::HistoryChanged(
+                "original-agent".into(),
+            )))
+            .is_ok());
+        drop(sender);
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut subscription.handle,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert!(!subscription.changed().await);
     }
 
     #[tokio::test]
@@ -218,11 +269,14 @@ mod tests {
             InvalidationSubscription::from_receiver(receiver, SubscriptionFilter::default());
         assert_eq!(sender.receiver_count(), 1);
         drop(subscription);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while sender.receiver_count() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while sender.receiver_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(sender.send(event("ws", "note:updated", json!({}))).is_err());

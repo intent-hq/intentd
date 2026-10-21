@@ -1,5 +1,6 @@
 //! Unit-test scratch and local CLI apparatus.
 
+pub(crate) mod provider_installed;
 mod scratch;
 pub(crate) use scratch::{test_tempdir, test_tempdir_in};
 
@@ -14,7 +15,7 @@ pub(crate) fn installed_cli_env(
     let bin = dir.join("installed-cli");
     std::fs::create_dir_all(&bin).unwrap();
     let cli = bin.join(command);
-    std::fs::write(&cli, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'fixture-cli 1.0.0\\n'\n").unwrap();
+    std::fs::write(&cli, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'fixture-cli 99.0.0\\n'\n").unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(
@@ -46,4 +47,10 @@ pub(crate) fn quick_action_effort_adapter(
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let env = installed_cli_env(dir.path(), "claude");
     (dir, bin, log, env)
+}
+
+/// Bound fixture I/O without shortening normal runs under coverage settings
+/// (delegates to [`intentd_test_support::test_timeout`]).
+pub(crate) fn fixture_timeout(base: std::time::Duration) -> std::time::Duration {
+    intentd_test_support::test_timeout(base)
 }

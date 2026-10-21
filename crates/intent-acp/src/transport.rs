@@ -16,7 +16,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -25,6 +25,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
+
+#[path = "transport_review_history.rs"]
+pub(crate) mod review_history;
 
 use crate::callback_registration::{CallbackFailure, CallbackToolRoutes};
 use crate::error::{AcpError, AcpResult, JsonRpcError};
@@ -88,7 +91,35 @@ const PROMPT_QUEUED: u8 = 1;
 const PROMPT_RETIRED: u8 = 2;
 
 /// Allocation identity for one original prompt transfer, never an RPC/session ID.
-pub struct AcpPromptBoundary(Arc<()>);
+pub struct AcpPromptBoundary(Arc<()>, Option<PromptDestination>);
+
+struct PromptDestination {
+    writer: mpsc::Sender<String>,
+    session_id: String,
+    params: Value,
+}
+
+impl AcpPromptBoundary {
+    /// Check the encoded destination against an original trusted transport
+    /// capture. This is a binding check, never authority by session ID alone.
+    #[must_use]
+    pub fn is_for(&self, connection: &Connection, session_id: &str) -> bool {
+        self.1.as_ref().is_some_and(|destination| {
+            destination.writer.same_channel(&connection.writer_tx)
+                && destination.session_id == session_id
+        })
+    }
+
+    /// Compare the complete already-encoded enriched prompt with the retained
+    /// original body. A matching session alone must not admit substituted text,
+    /// attachments or metadata. This check does not grant transfer authority.
+    #[must_use]
+    pub fn has_params(&self, expected: &Value) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|destination| &destination.params == expected)
+    }
+}
 
 /// Created only by consuming the original queue slot. It proves queue ownership
 /// transfer, not a socket write, model receipt, or reusable approval.
@@ -112,6 +143,18 @@ pub enum AcpPromptAdmissionOutcome {
 /// A trusted owner of the original prompt capture. This neutral transport does
 /// not manufacture that capture or validate repository/provider authority.
 pub trait AcpPromptAdmission: Send + Sync {
+    /// Bind required prompt metadata to the exact caller-supplied payload.
+    /// This only prepares bytes; `admit` must still authorize their final write.
+    ///
+    /// # Errors
+    /// Returns an error if the required original payload cannot be bound.
+    fn required_params(
+        &self,
+        params: serde_json::Value,
+    ) -> crate::error::AcpResult<serde_json::Value> {
+        Ok(params)
+    }
+
     /// Validate the original capture, then consume the borrowed packet while
     /// retaining the required guards. Release guards before returning. Never
     /// detach, retry, rebind, or reconstruct authority from public identifiers.
@@ -155,6 +198,11 @@ impl PreparedAcpPromptTransfer<'_> {
     ) -> AcpPromptAdmissionOutcome {
         if !Arc::ptr_eq(&self.original.0, &original.0) {
             return AcpPromptAdmissionOutcome::ForeignBoundary;
+        }
+        // A required whole-prompt admission has no ordinary variant. Even a
+        // trusted optional policy cannot downgrade it to an unguarded prompt.
+        if variant == PromptVariant::Base && self.slot.base.is_none() {
+            return AcpPromptAdmissionOutcome::OmitOptional;
         }
         if self.writer.is_closed()
             || self.slot.permit.is_none()
@@ -354,6 +402,88 @@ pub struct IncomingRequest {
     pub params: Value,
 }
 
+/// Write-time fences keyed by request id ([`Connection::request_fenced`]).
+#[derive(Default)]
+struct WriteFences {
+    by_id: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+    count: AtomicUsize,
+}
+
+/// Disarms a fence whose line never made it into the outbound queue.
+struct FenceArmGuard<'a> {
+    fences: &'a WriteFences,
+    id: i64,
+    /// Cleared once the line is queued: the writer owns the entry from then.
+    armed: bool,
+}
+
+impl Drop for FenceArmGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.fences.disarm(self.id);
+        }
+    }
+}
+
+/// The id of an outbound line, and whether it is a request. Only our own
+/// requests (`method` + `id`) can carry a fence; a result/error response to
+/// an agent request reuses the agent's id and must never claim one.
+#[derive(serde::Deserialize)]
+struct LineId {
+    id: Option<i64>,
+    method: Option<serde::de::IgnoredAny>,
+}
+
+/// JSON-RPC error a fenced request receives when it is withheld.
+const FENCED_WRITE_CODE: i64 = -32000;
+
+impl WriteFences {
+    fn arm(&self, id: i64, fence: Arc<AtomicBool>) {
+        if self.by_id.lock().unwrap().insert(id, fence).is_none() {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn disarm(&self, id: i64) -> Option<Arc<AtomicBool>> {
+        let fence = self.by_id.lock().unwrap().remove(&id);
+        if fence.is_some() {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+        fence
+    }
+
+    /// Whether `line` is a fenced request whose fence is revoked; if so its
+    /// pending caller (if still waiting) is failed. The writer consumes the
+    /// fence entry either way: it is the queued line's owner. Ordinary lines
+    /// are not parsed unless a fenced request is outstanding.
+    fn revoked_at_write(&self, line: &str, pending: &PendingMap) -> bool {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let Some(id) = serde_json::from_str::<LineId>(line)
+            .ok()
+            .filter(|l| l.method.is_some())
+            .and_then(|l| l.id)
+        else {
+            return false;
+        };
+        let revoked = self
+            .disarm(id)
+            .is_some_and(|fence| fence.load(Ordering::SeqCst));
+        if revoked {
+            if let Some(request) = pending.lock().unwrap().remove(&id) {
+                let _ = request.sender.send(Err(JsonRpcError {
+                    code: FENCED_WRITE_CODE,
+                    message: "request withheld: its write fence was revoked before the write"
+                        .into(),
+                    data: None,
+                }));
+            }
+        }
+        revoked
+    }
+}
+
 /// A notification from the agent (`session/update`, …). For M3.3 this is a
 /// plumbing hook; the streaming router lands in M3.4.
 #[derive(Debug, Clone)]
@@ -375,6 +505,11 @@ pub struct ConnectionHooks {
     pub requests: Option<mpsc::UnboundedSender<IncomingRequest>>,
     /// Sink for agent notifications (streaming router).
     pub notifications: Option<mpsc::UnboundedSender<IncomingNotification>>,
+    /// Sink for provider worker reports (PROTOCOL §5.5b). When set, worker
+    /// `session/update`s and metadata-only backgrounded markers are diverted
+    /// here (or dropped) and never reach `notifications`. The reader drops
+    /// the sender when stdout closes, which is the consumer's disconnect.
+    pub workers: Option<mpsc::UnboundedSender<crate::workers::WorkerFrame>>,
     /// Case-insensitive substrings that mark an auth failure on stderr.
     pub auth_error_patterns: Vec<String>,
     /// When set, every stderr line is also appended to
@@ -567,6 +702,7 @@ fn dispatch(
     title_controls: &TitleControls,
     requests: Option<&mpsc::UnboundedSender<IncomingRequest>>,
     notifications: Option<&mpsc::UnboundedSender<IncomingNotification>>,
+    workers: Option<&mpsc::UnboundedSender<crate::workers::WorkerFrame>>,
     response_seq: &AtomicU64,
     response_notify: &Notify,
     client_request_seq: &AtomicU64,
@@ -626,6 +762,18 @@ fn dispatch(
                     }
                 }
             }
+            if let (Some(sink), "session/update") = (workers, method.as_str()) {
+                // Worker reports are never turn content; diverting them here
+                // also keeps them out of the idle wake listener (§5.5b).
+                match crate::workers::route(&params) {
+                    crate::workers::Routing::Worker => {
+                        let _ = sink.send(crate::workers::frame(&params));
+                        return;
+                    }
+                    crate::workers::Routing::Marker => return,
+                    crate::workers::Routing::Forward => {}
+                }
+            }
             if let Some(tx) = notifications {
                 let _ = tx.send(IncomingNotification { method, params });
             }
@@ -680,9 +828,14 @@ fn dispatch(
 /// so the detached drain (and its capture file) may outlive the connection
 /// until that process exits or the daemon's shutdown sweep reaps it.
 pub struct Connection {
+    review_monitoring: Arc<Mutex<crate::review_monitoring::ConnectionState>>,
     pub(crate) codex_sandboxes: Mutex<HashMap<String, crate::codex_sandbox::CodexSandbox>>,
     callback_routes: Arc<CallbackToolRoutes>,
     writer_tx: mpsc::Sender<String>,
+    /// Write-time fences of outstanding fenced requests, by request id
+    /// ([`Connection::request_fenced`]). The writer consults this only while
+    /// [`WriteFences::count`] is nonzero, so ordinary traffic pays one load.
+    write_fences: Arc<WriteFences>,
     pending: PendingMap,
     config_options: SessionConfigOptions,
     session_titles: watch::Receiver<SessionTitles>,
@@ -728,12 +881,24 @@ impl Connection {
         let auth_error = Arc::new(AtomicBool::new(false));
         let auth_required = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
+        let review_monitoring = Arc::new(Mutex::new(
+            crate::review_monitoring::ConnectionState::default(),
+        ));
 
         // Writer task: drain whole lines to stdin, one at a time.
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(WRITER_CHANNEL_CAPACITY);
+        let review_writer = review_monitoring.clone();
+        let write_fences = Arc::new(WriteFences::default());
+        let fences_writer = Arc::clone(&write_fences);
+        let pending_writer = Arc::clone(&pending);
         tasks.push(tokio::spawn(async move {
             let mut stdin = stdin;
             while let Some(line) = writer_rx.recv().await {
+                // A fenced request whose fence was revoked while it waited in
+                // this queue is never written; its caller gets an error now.
+                if fences_writer.revoked_at_write(&line, &pending_writer) {
+                    continue;
+                }
                 if stdin.write_all(line.as_bytes()).await.is_err() {
                     break;
                 }
@@ -741,6 +906,7 @@ impl Connection {
                     break;
                 }
             }
+            review_writer.lock().unwrap().close();
         }));
 
         // Reader task: frame on `\n`, parse, dispatch.
@@ -753,10 +919,12 @@ impl Connection {
         let client_req_seq_reader = Arc::clone(&client_request_seq);
         let requests = hooks.requests;
         let notifications = hooks.notifications;
+        let workers = hooks.workers;
         let auth_marker = hooks.auth_required_stdout_marker;
         let auth_required_reader = Arc::clone(&auth_required);
         let auth_error_reader = Arc::clone(&auth_error);
         let agent_id_reader = hooks.agent_id;
+        let review_reader = review_monitoring.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -764,6 +932,7 @@ impl Connection {
                     continue;
                 }
                 if auth_marker.is_some_and(|marker| line.trim() == marker) {
+                    review_reader.lock().unwrap().close();
                     auth_required_reader.store(true, Ordering::SeqCst);
                     auth_error_reader.store(true, Ordering::SeqCst);
                     prompt_pending_reader.lock().unwrap().close();
@@ -792,6 +961,7 @@ impl Connection {
                             &title_controls_reader,
                             requests.as_ref(),
                             notifications.as_ref(),
+                            workers.as_ref(),
                             &seq_reader,
                             &notify_reader,
                             &client_req_seq_reader,
@@ -808,6 +978,7 @@ impl Connection {
                     ),
                 }
             }
+            review_reader.lock().unwrap().close();
             // stdout closed: fail every still-pending request.
             prompt_pending_reader.lock().unwrap().close();
             {
@@ -888,9 +1059,11 @@ impl Connection {
         }
 
         Self {
+            review_monitoring,
             callback_routes: Arc::new(CallbackToolRoutes::default()),
             codex_sandboxes: Mutex::new(HashMap::new()),
             writer_tx,
+            write_fences,
             pending,
             config_options,
             session_titles,
@@ -1006,8 +1179,57 @@ impl Connection {
         params: Value,
         timeout: Duration,
     ) -> AcpResult<Value> {
+        if method == "initialize" {
+            self.review_monitoring.lock().unwrap().retire();
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.request_with_id(id, method, params, timeout).await
+        self.request_with_id(id, method, params, timeout, None)
+            .await
+    }
+
+    /// [`Connection::request_timeout`] bound to a revocable write fence: the
+    /// request is refused when `fence` is already set, and the writer drops
+    /// it instead of writing it when `fence` is set while it waits in the
+    /// outbound queue. Either way nothing reaches the agent and the caller
+    /// gets an error (PROTOCOL §5.5b stop).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcpError::Transport`] when the fence is already revoked,
+    /// [`AcpError::Rpc`] when it is revoked before the write, and otherwise
+    /// the errors of [`Connection::request_timeout`].
+    pub async fn request_fenced(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        fence: Arc<AtomicBool>,
+    ) -> AcpResult<Value> {
+        if fence.load(Ordering::SeqCst) {
+            return Err(AcpError::Transport(
+                "write fence revoked before the request was queued".into(),
+            ));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // The fence travels with the queued line: once enqueued only the
+        // writer removes it (when it writes or withholds the line), so a
+        // timeout, an error or a dropped caller can never leave the line
+        // queued without its fence.
+        self.request_with_id(id, method, params, timeout, Some(fence))
+            .await
+    }
+
+    pub(crate) async fn initialize_recipient(
+        &self,
+        params: Value,
+        timeout: Duration,
+    ) -> AcpResult<(Value, Arc<crate::review_monitoring::Generation>)> {
+        let generation = self.review_monitoring.lock().unwrap().begin();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .request_with_id(id, "initialize", params, timeout, None)
+            .await?;
+        Ok((response, generation))
     }
 
     /// [`Connection::request_timeout`] that also tells the peer about an
@@ -1037,8 +1259,13 @@ impl Connection {
         timeout: Duration,
         cancel: impl FnOnce(i64) -> (String, Value),
     ) -> AcpResult<Value> {
+        if method == "initialize" {
+            self.review_monitoring.lock().unwrap().retire();
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let result = self.request_with_id(id, method, params, timeout).await;
+        let result = self
+            .request_with_id(id, method, params, timeout, None)
+            .await;
         if matches!(result, Err(AcpError::Timeout(_))) {
             let (cancel_method, cancel_params) = cancel(id);
             if let Err(e) = self.try_notify(&cancel_method, &cancel_params) {
@@ -1077,6 +1304,7 @@ impl Connection {
         method: &str,
         params: Value,
         timeout: Duration,
+        fence: Option<Arc<AtomicBool>>,
     ) -> AcpResult<Value> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
@@ -1104,8 +1332,22 @@ impl Connection {
         }
 
         let line = encode_message(Some(id), method, &params)?;
+        // Arm right before enqueueing. Until the line is queued the guard
+        // disarms on every exit (closed writer, a dropped caller); after it
+        // is queued the writer owns the fence entry.
+        let mut armed = fence.map(|fence| {
+            self.write_fences.arm(id, fence);
+            FenceArmGuard {
+                fences: &self.write_fences,
+                id,
+                armed: true,
+            }
+        });
         if self.writer_tx.send(line).await.is_err() {
             return Err(AcpError::Transport("writer task closed".to_string()));
+        }
+        if let Some(guard) = armed.as_mut() {
+            guard.armed = false;
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -1195,13 +1437,37 @@ impl Connection {
         admission: Box<dyn AcpPromptAdmission>,
         timeout: Duration,
     ) -> AcpResult<Value> {
+        self.request_admitted_prompt(Some(base_params), enriched_params, admission, timeout)
+            .await
+    }
+
+    /// The entire prompt requires original admission. There is no ordinary
+    /// fallback payload to send after refusal, timeout or failed preparation.
+    pub(crate) async fn request_required_prompt(
+        &self,
+        params: Value,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
+        self.request_admitted_prompt(None, params, admission, timeout)
+            .await
+    }
+
+    async fn request_admitted_prompt(
+        &self,
+        base_params: Option<Value>,
+        enriched_params: Value,
+        admission: Box<dyn AcpPromptAdmission>,
+        timeout: Duration,
+    ) -> AcpResult<Value> {
+        let required = base_params.is_none();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, mut rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(
             id,
             PendingRequest {
                 sender: tx,
-                session_id: base_params
+                session_id: enriched_params
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
@@ -1222,7 +1488,10 @@ impl Connection {
         if state.load(Ordering::SeqCst) != PROMPT_OPEN {
             return Err(AcpError::Transport("agent stdout closed".into()));
         }
-        let base = encode_message(Some(id), "session/prompt", &base_params)?;
+        let base = base_params
+            .as_ref()
+            .map(|params| encode_message(Some(id), "session/prompt", params))
+            .transpose()?;
         let enriched = encode_message(Some(id), "session/prompt", &enriched_params)?;
         let permit = tokio::select! {
             biased;
@@ -1231,10 +1500,21 @@ impl Connection {
                 permit.map_err(|_| AcpError::Transport("writer task closed".into()))?
             }
         };
-        let boundary = AcpPromptBoundary(Arc::new(()));
+        let boundary = AcpPromptBoundary(
+            Arc::new(()),
+            enriched_params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .map(|session_id| PromptDestination {
+                    writer: self.writer_tx.clone(),
+                    session_id,
+                    params: enriched_params,
+                }),
+        );
         let mut slot = PromptSlot {
             permit: Some(permit),
-            base: Some(base),
+            base,
             enriched: Some(enriched),
             queued: false,
         };
@@ -1278,6 +1558,11 @@ impl Connection {
                     return Err(AcpError::Transport("response channel dropped".into()));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+            if required {
+                return Err(AcpError::Transport(
+                    "required prompt admission refused".into(),
+                ));
             }
             let packet = PreparedAcpPromptTransfer {
                 original: &boundary,
@@ -1460,6 +1745,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.review_monitoring.lock().unwrap().close();
         // Aborts the writer/reader tasks only; the stderr drain task is
         // deliberately not owned here — it runs to stderr EOF so the child's
         // dying words reach the capture file (monorepo#3570).
@@ -1566,7 +1852,7 @@ mod prompt_transfer_tests {
                     Mode::PollPanic => panic!("injected poll panic"),
                     Mode::Hang => std::future::pending().await,
                     Mode::ForeignBoundary => packet.transfer(
-                        &AcpPromptBoundary(Arc::new(())),
+                        &AcpPromptBoundary(Arc::new(()), None),
                         PromptVariant::WithGuidance,
                     ),
                     Mode::ForeignReceipt => {
@@ -1708,6 +1994,105 @@ mod prompt_transfer_tests {
         (0..WRITER_CHANNEL_CAPACITY)
             .map(|_| conn.writer_tx.clone().try_reserve_owned().unwrap())
             .collect()
+    }
+
+    fn required_request(
+        conn: &Connection,
+        admission: Box<dyn AcpPromptAdmission>,
+    ) -> impl Future<Output = AcpResult<Value>> + '_ {
+        conn.request_required_prompt(
+            json!({"sessionId":"same-public-session","prompt":[{"type":"text","text":"private monitor wake"}]}),
+            admission,
+            Duration::from_secs(2),
+        )
+    }
+
+    #[tokio::test]
+    async fn required_prompt_refusal_never_falls_back_or_accepts_foreign_receipts() {
+        for mode in [
+            Mode::Refuse,
+            Mode::ConstructorPanic,
+            Mode::PollPanic,
+            Mode::ForeignBoundary,
+            Mode::ForeignReceipt,
+            Mode::DropPanic,
+            Mode::Hang,
+        ] {
+            let (conn, mut reader, _writer) = fixture();
+            let (admission, seen) = policy(mode);
+            let result = required_request(&conn, admission).await;
+            assert!(result.is_err());
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(conn.pending_len(), 0);
+            assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_preserves_one_actual_transfer_despite_late_policy_failure() {
+        for mode in [
+            Mode::Accept,
+            Mode::AfterPanic,
+            Mode::AfterHang,
+            Mode::AfterBadReceipt,
+        ] {
+            let (conn, mut reader, mut writer) = fixture();
+            let (admission, seen) = policy(mode);
+            let mut future = Box::pin(required_request(&conn, admission));
+            let frame = read_frame(&mut reader, future.as_mut()).await;
+            assert_eq!(frame["params"]["prompt"][0]["text"], "private monitor wake");
+            assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 1);
+            reply(&mut writer, &frame["id"]).await;
+            assert_eq!(future.await.unwrap(), json!({"originalResult":true}));
+            assert_eq!(seen.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(conn.pending_len(), 0);
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_cannot_downgrade_after_backpressure_or_admission_wait() {
+        for held_policy in [false, true] {
+            let (conn, mut reader, _writer) = fixture();
+            let mut reserved = if held_policy {
+                Vec::new()
+            } else {
+                reserve_all(&conn)
+            };
+            let (admission, seen) = policy(if held_policy {
+                Mode::Hold
+            } else {
+                Mode::Accept
+            });
+            let mut future = Box::pin(required_request(&conn, admission));
+            poll_pending(future.as_mut()).await;
+            assert_eq!(seen.calls.load(Ordering::SeqCst), usize::from(held_policy));
+            seen.currency.store(false, Ordering::SeqCst);
+            if held_policy {
+                seen.release.notify_one();
+            } else {
+                drop(reserved.pop());
+            }
+            assert!(future.await.is_err());
+            assert_eq!(conn.pending_len(), 0);
+            no_frame(&mut reader).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn required_prompt_cancellation_before_reserved_slot_has_no_effect() {
+        let (conn, mut reader, _writer) = fixture();
+        let reserved = reserve_all(&conn);
+        let (admission, seen) = policy(Mode::Accept);
+        let mut future = Box::pin(required_request(&conn, admission));
+        poll_pending(future.as_mut()).await;
+        drop(future);
+        drop(reserved);
+        assert_eq!(seen.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(conn.pending_len(), 0);
+        assert!(conn.prompt_pending.lock().unwrap().entries.is_empty());
+        no_frame(&mut reader).await;
     }
 
     #[tokio::test]
@@ -1924,7 +2309,7 @@ mod prompt_transfer_tests {
         let (admission, seen) = policy(Mode::Hold);
         let mut first_request = Box::pin(request(&first, admission, Duration::from_secs(2)));
         poll_pending(first_request.as_mut()).await;
-        let foreign = AcpPromptBoundary(Arc::clone(&seen.boundaries.lock().unwrap()[0]));
+        let foreign = AcpPromptBoundary(Arc::clone(&seen.boundaries.lock().unwrap()[0]), None);
         let mut second_request = Box::pin(request(
             &second,
             Box::new(Foreign(foreign)),
@@ -2353,5 +2738,322 @@ mod cancel_on_timeout_tests {
             .await
             .is_err();
         assert!(quiet, "unexpected line after the request: {extra}");
+    }
+}
+
+#[cfg(test)]
+mod worker_routing_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn write_line(agent: &mut tokio::io::DuplexStream, value: &Value) {
+        let mut line = serde_json::to_vec(value).unwrap();
+        line.push(b'\n');
+        agent.write_all(&line).await.unwrap();
+        agent.flush().await.unwrap();
+    }
+
+    fn update(update: Value) -> Value {
+        let mut frame = json!({ "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "s-1" } });
+        frame["params"]["update"] = update;
+        frame
+    }
+
+    /// PROTOCOL §5.5b: with a worker sink wired, worker reports reach only the
+    /// sink, metadata-only markers reach nothing, and everything else (a mixed
+    /// marker included) still reaches the turn router in order.
+    #[tokio::test]
+    async fn reader_diverts_worker_reports_and_markers_from_the_turn_router() {
+        let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+        let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let conn = Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                workers: Some(worker_tx),
+                ..ConnectionHooks::default()
+            },
+        );
+        let marker_meta =
+            json!({ "jetbrains": { "air": { "asyncTasks": { "backgrounded": true } } } });
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": "t-1", "taskType": "shell" }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c-1", "_meta": marker_meta }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "tool_call_update", "toolCallId": "c-1", "status": "completed", "_meta": marker_meta }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "async_task_state_update", "asyncTaskId": "t-1", "state": "completed" }))).await;
+        write_line(&mut a2c_agent, &update(json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }))).await;
+
+        let first = worker_rx.recv().await.expect("spawn diverted");
+        assert_eq!(first.session_id.as_deref(), Some("s-1"));
+        assert_eq!(first.update["asyncTaskId"], "t-1");
+        let second = worker_rx.recv().await.expect("state diverted");
+        assert_eq!(second.update["state"], "completed");
+        assert!(second.received_at_ms >= first.received_at_ms);
+
+        let mixed = note_rx.recv().await.expect("mixed marker forwarded");
+        assert_eq!(mixed.params["update"]["status"], "completed");
+        let chunk = note_rx.recv().await.expect("ordinary update forwarded");
+        assert_eq!(
+            chunk.params["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert!(
+            note_rx.try_recv().is_err(),
+            "no worker frame or bare marker reached the turn router"
+        );
+
+        drop(a2c_agent);
+        assert!(
+            worker_rx.recv().await.is_none(),
+            "stdout close drops the worker sink"
+        );
+        drop(conn);
+    }
+
+    /// Without a worker sink (providers that never requested the extension)
+    /// the reader forwards everything unchanged.
+    #[tokio::test]
+    async fn reader_without_worker_sink_forwards_everything() {
+        let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+        let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let (note_tx, mut note_rx) = mpsc::unbounded_channel();
+        let _conn = Connection::new(
+            c2a_client,
+            a2c_client,
+            None,
+            ConnectionHooks {
+                notifications: Some(note_tx),
+                ..ConnectionHooks::default()
+            },
+        );
+        write_line(
+            &mut a2c_agent,
+            &update(json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": "t-1" })),
+        )
+        .await;
+        let forwarded = note_rx.recv().await.expect("forwarded");
+        assert_eq!(
+            forwarded.params["update"]["sessionUpdate"],
+            "async_task_spawned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_fence_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::AsyncReadExt;
+
+    /// A connection whose agent-side stdin is a tiny pipe nobody reads yet,
+    /// so the writer task blocks on the first large line.
+    fn blocked_writer() -> (
+        Arc<Connection>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (c2a_client, c2a_agent) = tokio::io::duplex(64);
+        let (a2c_agent, a2c_client) = tokio::io::duplex(4096);
+        let conn = Connection::new(c2a_client, a2c_client, None, ConnectionHooks::default());
+        (Arc::new(conn), c2a_agent, a2c_agent)
+    }
+
+    async fn read_until(agent: &mut tokio::io::DuplexStream, needle: &str) -> String {
+        let mut seen = String::new();
+        let mut buf = [0_u8; 1024];
+        // Read until the needle has arrived and the line holding it is complete.
+        while !(seen.contains(needle) && seen.ends_with('\n')) {
+            let n = tokio::time::timeout(Duration::from_secs(5), agent.read(&mut buf))
+                .await
+                .expect("agent stdin read timed out")
+                .unwrap();
+            assert!(n > 0, "stdin closed before {needle}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        seen
+    }
+
+    /// PROTOCOL §5.5b stop: a fence revoked while the request waits in the
+    /// outbound queue means the line is never written and the caller fails
+    /// at once; later traffic still flows.
+    #[tokio::test]
+    async fn a_fence_revoked_while_queued_withholds_the_write() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let fence = Arc::new(AtomicBool::new(false));
+        let request = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&fence));
+            tokio::spawn(async move {
+                conn.request_fenced(
+                    "_session/async_task/stop",
+                    json!({}),
+                    Duration::from_secs(30),
+                    fence,
+                )
+                .await
+            })
+        };
+        // timing-guard: let the fenced request reach the queue behind the blocked writer
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(written.contains("bulk/first"));
+        assert!(
+            !written.contains("_session/async_task/stop"),
+            "the withheld line was written: {written}"
+        );
+        match request.await.unwrap() {
+            Err(AcpError::Rpc(err)) => assert_eq!(err.code, FENCED_WRITE_CODE),
+            other => panic!("expected a withheld write, got {other:?}"),
+        }
+        assert!(!conn.has_pending_requests());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_fence_is_refused_before_queueing_and_an_open_one_writes() {
+        let (conn, mut agent_in, mut agent_out) = blocked_writer();
+        let revoked = Arc::new(AtomicBool::new(true));
+        assert!(matches!(
+            conn.request_fenced(
+                "_session/async_task/stop",
+                json!({}),
+                Duration::from_secs(5),
+                revoked
+            )
+            .await,
+            Err(AcpError::Transport(_))
+        ));
+        let open = Arc::new(AtomicBool::new(false));
+        let request = {
+            let conn = Arc::clone(&conn);
+            tokio::spawn(async move {
+                conn.request_fenced(
+                    "_session/async_task/stop",
+                    json!({ "asyncTaskId": "t" }),
+                    Duration::from_secs(5),
+                    open,
+                )
+                .await
+            })
+        };
+        let written = read_until(&mut agent_in, "_session/async_task/stop").await;
+        let id: Value = serde_json::from_str(written.trim().lines().last().unwrap()).unwrap();
+        agent_out
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({ "jsonrpc": "2.0", "id": id["id"], "result": { "stopped": true } })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.await.unwrap().unwrap(), json!({ "stopped": true }));
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            0,
+            "fence disarmed after the answer"
+        );
+    }
+
+    /// A fenced request whose caller gave up (timeout) or was cancelled
+    /// while its line was still queued keeps its fence: revoking it later
+    /// still withholds the write.
+    #[tokio::test]
+    async fn a_timed_out_or_cancelled_fenced_request_stays_fenced_in_the_queue() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let timed_out_fence = Arc::new(AtomicBool::new(false));
+        let timed_out = conn
+            .request_fenced(
+                "stop/timed-out",
+                json!({}),
+                Duration::from_millis(200),
+                Arc::clone(&timed_out_fence),
+            )
+            .await;
+        assert!(
+            matches!(timed_out, Err(AcpError::Timeout(_))),
+            "{timed_out:?}"
+        );
+        let cancelled_fence = Arc::new(AtomicBool::new(false));
+        let cancelled = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&cancelled_fence));
+            tokio::spawn(async move {
+                conn.request_fenced("stop/cancelled", json!({}), Duration::from_secs(30), fence)
+                    .await
+            })
+        };
+        // timing-guard: let the cancelled request's line reach the queue first
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancelled.abort();
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            2,
+            "both queued lines keep their fences"
+        );
+        timed_out_fence.store(true, Ordering::SeqCst);
+        cancelled_fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(
+            !written.contains("stop/timed-out"),
+            "timed-out line was written: {written}"
+        );
+        assert!(
+            !written.contains("stop/cancelled"),
+            "cancelled line was written: {written}"
+        );
+        assert_eq!(
+            conn.write_fences.count.load(Ordering::SeqCst),
+            0,
+            "the writer consumed both fences"
+        );
+    }
+
+    /// A queued response to an agent request that happens to reuse the
+    /// numeric id of a fenced stop can neither consume nor be withheld by the
+    /// stop's fence: the response is written and the stop is withheld.
+    #[tokio::test]
+    async fn a_response_reusing_a_fenced_request_id_never_claims_its_fence() {
+        let (conn, mut agent_in, _agent_out) = blocked_writer();
+        conn.notify("bulk/first", json!({ "pad": "x".repeat(8192) }))
+            .await
+            .unwrap();
+        let colliding = conn.next_id.load(Ordering::SeqCst);
+        conn.respond_result(json!(colliding), json!({ "collision": "response" }))
+            .await
+            .unwrap();
+        let fence = Arc::new(AtomicBool::new(false));
+        let stop = {
+            let (conn, fence) = (Arc::clone(&conn), Arc::clone(&fence));
+            tokio::spawn(async move {
+                conn.request_fenced("stop/colliding", json!({}), Duration::from_secs(30), fence)
+                    .await
+            })
+        };
+        // timing-guard: let the fenced stop reach the queue behind the response
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fence.store(true, Ordering::SeqCst);
+        conn.notify("after/fence", json!({})).await.unwrap();
+        let written = read_until(&mut agent_in, "after/fence").await;
+        assert!(
+            written.contains("\"collision\":\"response\""),
+            "the response was withheld: {written}"
+        );
+        assert!(
+            !written.contains("stop/colliding"),
+            "the fenced stop was written: {written}"
+        );
+        assert!(matches!(stop.await.unwrap(), Err(AcpError::Rpc(_))));
     }
 }

@@ -1,8 +1,10 @@
 //! Canonical installed runtimes behind the reviewed Codex/Claude ACP adapters.
 //!
-//! Resolution never consults adapter/runtime overrides and never falls back to
-//! a bundled CLI. This module selects inputs only; launching and bounded version
-//! probing belong to the daemon. Resolve once and carry that selection through
+//! Resolution never consults adapter/runtime overrides and never substitutes a
+//! bundled CLI for a missing one. The daemon may replace a resolved CLI whose
+//! version is confirmed too old with Intent's bundled copy (intent-services
+//! `bundled_cli`), using the same runtime type. This module selects inputs
+//! only; launching and bounded version probing belong to the daemon. Resolve once and carry that selection through
 //! environment assembly, version probing and the subsequent adapter launch.
 
 use std::collections::BTreeMap;
@@ -98,7 +100,7 @@ pub struct MissingInstalledCli(InstalledCli);
 
 impl std::fmt::Display for MissingInstalledCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Install {} on the execution host and make it available on PATH, then retry. Intent requires the installed CLI; no bundled runtime is used.", self.0.command())
+        write!(f, "Install {} on the execution host and make it available on PATH, then retry. Intent requires the installed CLI; no bundled runtime replaces a missing one.", self.0.command())
     }
 }
 

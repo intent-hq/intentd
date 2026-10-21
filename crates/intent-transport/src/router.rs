@@ -103,15 +103,17 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: "Note deletion unavailable".into(),
             data: Some(json!({"code":kind.wire_code()})),
         },
-        Error::NotePage(kind) => RpcErr {
-            code: if kind == intent_core::note_page::NotePageError::Stale {
-                -32005
-            } else {
-                -32602
-            },
-            message: "Note page unavailable".into(),
-            data: Some(json!({"code":kind.wire_code()})),
-        },
+        Error::NotePage(kind) => {
+            let mut data = json!({"code":kind.wire_code()});
+            if kind == intent_core::note_page::NotePageError::Preparing {
+                data["retryAfterMs"] = json!(1000);
+            }
+            RpcErr {
+                code: Error::NotePage(kind).code(),
+                message: "Note page unavailable".into(),
+                data: Some(data),
+            }
+        }
         Error::ExecutionAuthorization {
             source,
             authorization,
@@ -154,6 +156,14 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
+        // Provider profile failure (§5.54): -32602 (or -32603 for an
+        // unreadable profile file) with the service-built `data` verbatim —
+        // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
+        ref e @ Error::ProviderProfile(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message.clone(),
+            data: Some(failure.data.clone()),
         },
         // Classified clone/provisioning failure: human message carries the
         // sanitized git stderr tail, `data.code` carries the machine-readable
@@ -303,6 +313,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "rate-limited" })),
+        },
+        ref e @ Error::ProviderRequest(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "provider-error" })),
         },
         other => RpcErr {
             code: other.code(),
@@ -871,6 +886,70 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
         }
+        "sourceControl.gitlab.childGit.get" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_get(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.gitlab.childGit.set" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_set(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.resolveKnownRepository" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_resolve_known(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.captureScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detailScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.releaseScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.list" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_list(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.discussions" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_discussions(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "sourceControl.read.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
@@ -926,6 +1005,17 @@ async fn dispatch_other(
                 .unwrap_or(false);
             let workspaces = api
                 .list_workspaces(include_archived)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(json!({ "workspaces": workspaces }))
+        }
+        "workspace.findByPullRequest" => {
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_params("Missing required parameter: url"))?;
+            let workspaces = api
+                .find_workspaces_by_pull_request(url.to_string())
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
@@ -2518,6 +2608,22 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
+        }
+        "agent.workers.list" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            api.agent_workers_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "agent.workers.stop" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            let generation = require_wire_id(params, "connectionGeneration")?;
+            let task = require_wire_id(params, "asyncTaskId")?;
+            api.agent_workers_stop(ws, agent, generation, task)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.stop" => {
             let agent_id = require_agent_id(params)?;
@@ -4292,6 +4398,29 @@ async fn dispatch_other(
             let r = api.providers_catalog().await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "providers.profiles.list" => {
+            // Administrator-only, daemon-global (§5.54).
+            let base = opt_str(params, "baseProviderId");
+            api.provider_profiles_list(base)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.create" => api
+            .provider_profiles_create(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "providers.profiles.update" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_update(profile_id, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "providers.profiles.delete" => {
+            let profile_id = require_str_param(params, "profileId")?;
+            api.provider_profiles_delete(profile_id)
+                .await
+                .map_err(domain_to_rpc)
+        }
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
@@ -4773,15 +4902,13 @@ async fn dispatch_other(
         }
         "script.list" => {
             let ws = require_ws_note(params)?;
-            let archive = params
-                .get("archive")
-                .map(|value| {
-                    serde_json::from_value::<intent_core::ScriptArchiveFilter>(value.clone())
-                })
-                .transpose()
-                .map_err(|e| invalid_params(e.to_string()))?
-                .unwrap_or_default();
-            api.script_list_filtered(ws, archive)
+            api.script_list_view(ws, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "script.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_get(ws, require_str_param(params, "scriptId")?)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -4815,8 +4942,17 @@ async fn dispatch_other(
         }
         "scriptMonitor.list" => {
             let ws = require_ws_note(params)?;
-            let agent = opt_str(params, "agentId").map(intent_core::AgentId::from);
-            api.script_monitor_list(ws, agent)
+            let agent = params
+                .get("agentId")
+                .map(|_| require_str_param(params, "agentId").map(intent_core::AgentId::from))
+                .transpose()?;
+            api.script_monitor_list_view(ws, agent, Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "scriptMonitor.get" => {
+            let ws = require_ws_note(params)?;
+            api.script_monitor_get(ws, require_str_param(params, "monitorId")?, None)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -5260,6 +5396,25 @@ fn merge_user_app_message_id(
 }
 
 /// Require a string param, mirroring TS `requireParam` (undefined/null → error).
+/// The §5.5b wire-ID rule: a nonempty string of at most 256 UTF-8 bytes
+/// without ASCII control characters.
+pub(crate) fn wire_id(params: &Map<String, Value>, name: &str) -> Option<String> {
+    match params.get(name) {
+        Some(Value::String(s)) if intent_services::is_wire_id(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Require a §5.5b wire ID (`-32602` `invalid-params` otherwise).
+fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
+    match wire_id(params, name) {
+        Some(s) => Ok(s),
+        _ => Err(invalid_params(format!(
+            "{name} must be a nonempty string of at most 256 bytes without control characters"
+        ))),
+    }
+}
+
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),

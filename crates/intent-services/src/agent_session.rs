@@ -371,6 +371,12 @@ pub(crate) struct AcpSessionOpened {
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
     pub config_options: Option<Value>,
+    /// The model id the session-open fill persisted onto a session spawned
+    /// without one (`fill_identity_from_session_open`) — exactly what the
+    /// child runs. The manager records it as the handle's spawned model.
+    /// `None` when nothing was filled (or the fill lost to a concurrent
+    /// write).
+    pub filled_model: Option<String>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -896,6 +902,17 @@ impl Transcript {
     /// block), or `None` when the id was never seen. ACP `tool_call_update`s
     /// are name-less — the name only arrives on the first `tool_call` — so
     /// the completion-side registry claim resolves the name here.
+    /// The status recorded for a known tool call.
+    fn tool_status_for(&self, tool_call_id: &str) -> Option<&'static str> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        match self.blocks[i]["metadata"]["status"].as_str()? {
+            "completed" => Some("completed"),
+            "error" => Some("error"),
+            "started" => Some("started"),
+            _ => None,
+        }
+    }
+
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
@@ -1254,6 +1271,26 @@ pub(crate) fn open_tool_call_stall_ms() -> u64 {
     15 * 60 * 1000
 }
 
+/// Reason prefix of the daemon's terminal provider-stall blocker
+/// (intent-hq/intent#5395). Shared by the raise and by
+/// [`is_daemon_stall_blocker_reason`] so the two cannot drift; reserved —
+/// the agent-facing `reportBlocker` / `requestDiscussion` reject it.
+pub(crate) const PROVIDER_STALL_BLOCKER_PREFIX: &str = "Turn ended after a provider stall: ";
+
+/// Reason prefix of the daemon's blocker for a failed unsolicited (harness
+/// wake) provider turn. Shared and reserved like
+/// [`PROVIDER_STALL_BLOCKER_PREFIX`].
+pub(crate) const UNSOLICITED_STALL_BLOCKER_PREFIX: &str = "Unsolicited provider activity stopped: ";
+
+/// Whether a persisted blocker reason is a daemon-raised provider-stall
+/// blocker (intent-hq/intent#7182): prefix-anchored on the reserved daemon
+/// prefixes — the remainder carries per-stall details (durations, tool
+/// label, provider error) so a whole-string match is not possible.
+pub(crate) fn is_daemon_stall_blocker_reason(reason: &str) -> bool {
+    reason.starts_with(PROVIDER_STALL_BLOCKER_PREFIX)
+        || reason.starts_with(UNSOLICITED_STALL_BLOCKER_PREFIX)
+}
+
 /// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
 /// gone this many ms with zero `session/update` traffic AND no recorded tool
 /// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
@@ -1524,9 +1561,17 @@ pub(crate) fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
+        let id = id.trim();
+        // A profile reference is kept verbatim, even when it is malformed or
+        // its profile is gone: the selection gate then fails it with
+        // `provider-profile-replacement-required` instead of reading it as
+        // unset or running the base's Default account (PROTOCOL §5.54).
+        if crate::provider_profiles::is_qualified_ref(id) {
+            return Some(id.to_string());
+        }
         // Accept the candidate only when it names a registered provider
         // (whitespace-trimmed, so padded settings values still resolve).
-        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
     })
 }
 
@@ -1556,6 +1601,54 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// [`resolve_provider_id`] reduced to the base provider id: a named profile
+/// reference (`<base>@<profileId>`, PROTOCOL §5.54) runs its base provider's
+/// adapter, so provider-keyed protocol shaping (session `_meta`, usage
+/// semantics, orchestrator tooling) keys on the base. Selection identity and
+/// native-session ownership keep the full reference.
+pub(crate) fn resolve_base_provider_id(
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> Option<String> {
+    resolve_provider_id(provider, configured_default)
+        .map(|id| intent_providers::base_provider_id(&id).to_owned())
+}
+
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id; a profile reference is
+/// kept as-is) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`]. A store
+/// read error is returned, never treated as "no last turn".
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Option<String>> {
+    // A store error must not read as "never ran": falling through to the
+    // current default would pin exactly the wrong provider permanently.
+    let (_, last_turn) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await?;
+    // A named profile reference (`<base>@<profileId>`, PROTOCOL §5.54) is
+    // kept as-is: the session ran that profile, not its base's Default.
+    let last_turn = last_turn.map(|raw| raw.trim().to_string()).and_then(|raw| {
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            Some(raw)
+        } else {
+            intent_providers::find_provider_or_legacy_alias(&raw).map(|p| p.id.to_string())
+        }
+    });
+    Ok(last_turn.or_else(|| derived_default_provider(&services.effective_settings())))
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -1694,9 +1787,61 @@ fn prompt_size_error(e: &AcpError) -> Option<Error> {
 /// turn. Everything else keeps the existing opaque
 /// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
 /// method name, e.g. `session/new`).
+#[cfg(test)]
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    map_acp_session_error_for(context, e, &AuthOwner::bare(provider_id))
+}
+
+/// Whose auth verdict a runtime failure belongs to (PROTOCOL §5.54): the
+/// session's selection — a bare provider id, or a named profile reference
+/// with the saved settings it runs under. A profile failure demotes only that
+/// profile's verdict, never the base provider's Default verdict or another
+/// profile's.
+pub(crate) struct AuthOwner {
+    selection: String,
+    profile: Option<intent_acp::ProfileEnv>,
+}
+
+impl AuthOwner {
+    #[cfg(test)]
+    fn bare(provider_id: &str) -> Self {
+        Self {
+            selection: provider_id.to_owned(),
+            profile: None,
+        }
+    }
+
+    fn demote(&self) {
+        match &self.profile {
+            Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+            None => crate::provider_auth::demote_auth_verdict(&self.selection),
+        }
+    }
+}
+
+impl Services {
+    /// The [`AuthOwner`] of a resolved selection. A profile whose saved
+    /// settings cannot be read demotes nothing (and never the Default).
+    pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
+        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
+            Box::pin(self.resolve_profile_env(selection))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        AuthOwner {
+            selection: selection.to_owned(),
+            profile,
+        }
+    }
+}
+
+fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> Error {
+    let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
-        crate::provider_auth::demote_auth_verdict(provider_id);
+        owner.demote();
         return crate::host_execution::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
@@ -1919,6 +2064,7 @@ fn build_session_meta(
 pub(crate) struct LocalPromptInput<'a> {
     pub(crate) connection: &'a Connection,
     pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    pub(crate) required: Option<Box<crate::repository_read_source::MonitorPromptAdmission>>,
 }
 
 impl Services {
@@ -2694,6 +2840,82 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` from what the provider reports at
+    /// session open — the model select's `currentValue`, a selectable option
+    /// id (never the D13 display name, monorepo#1534, and never the adapter's
+    /// floating `"default"` alias: no concrete model is known then and the
+    /// column stays NULL) — so a session created without a resolvable model
+    /// (cold catalog cache, legacy row) ends up pinned to what it runs.
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten.
+    /// Returns the model that actually landed, which the manager records as
+    /// the child's spawned model (no respawn, no `model_changed` row). A NULL
+    /// `reasoning_effort` is filled at the turn boundary from the level the
+    /// provider confirmed instead (`AgentManager::maybe_persist_effort_change_notice`).
+    /// Best-effort: failures are logged, never propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| {
+                !m.trim().is_empty()
+                    && !m.contains(char::is_whitespace)
+                    && !m.eq_ignore_ascii_case("default")
+            });
+        let model = model?;
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                Some(&model),
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                // Report what actually landed: a column a concurrent write
+                // set first keeps that writer's value.
+                let landed = match self.store.get_agent_session(&stored.id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
+                        return None;
+                    }
+                };
+                let filled_model =
+                    (landed.model.as_deref() == Some(model.as_str())).then_some(model);
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?landed.model,
+                    field = "model",
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": stored.id.0, "modelId": landed.model }),
+                )
+                .await;
+                filled_model
+            }
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+                None
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -2808,6 +3030,31 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_review_context(
+            conn,
+            callbacks,
+            agent_id,
+            cwd,
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_acp_session_with_review_context(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        native: Option<
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        >,
+    ) -> Result<PreparedAcpSession> {
+        let context = native.map(
+            crate::repository_admission::lifecycle::native_allocation::NativeAllocation::context,
+        );
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
@@ -2819,20 +3066,32 @@ impl Services {
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
+        let selection = resolve_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        // Protocol shaping keys on the base; auth failures belong to the
+        // selection (a profile never demotes the Default verdict).
+        let provider_id = intent_providers::base_provider_id(&selection).to_owned();
+        let owner = self.auth_owner(&selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
             is_orchestrator,
         );
+        if let Some(context) = context {
+            if !callbacks.is_some_and(CallbackClient::supports_review_monitoring) {
+                return Err(Error::Unsupported(
+                    "Private native startup unavailable".into(),
+                ));
+            }
+            context.insert_into(meta.get_or_insert_with(Default::default));
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2853,7 +3112,38 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/new", &e, &owner))?;
+        if let Some(native) = native {
+            native
+                .bind_response(&opened.response.session_id.0)
+                .map_err(|_| Error::Forbidden("Private native startup unavailable".into()))?;
+        }
+        if let Some(context) = context {
+            let exact = opened
+                .query
+                .as_ref()
+                .and_then(
+                    intent_acp::callback_registration::CallbackQuery::pending_review_monitoring,
+                )
+                .is_some_and(|pending| pending.matches_context(context));
+            if !exact {
+                // A response is not permission to persist or use a mismatched
+                // allocation. Join only the original requested startup attempt.
+                if let Some(callbacks) = callbacks {
+                    callbacks
+                        .retire_review_context(&opened.response.session_id.0, context)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("Private native retirement unconfirmed".into())
+                        })?;
+                }
+                return Err(if native.is_some_and(crate::repository_admission::lifecycle::native_allocation::NativeAllocation::is_retired) {
+                    Error::Forbidden("Private native startup unavailable".into())
+                } else {
+                    Error::Unsupported("Private native startup unavailable".into())
+                });
+            }
+        }
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -2862,7 +3152,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(PreparedAcpSession {
             response: opened.response,
@@ -2976,6 +3266,20 @@ impl Services {
         replacing: bool,
     ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
         let (conn, callbacks) = conn;
+        if let Some(callbacks) =
+            callbacks.filter(|callbacks| callbacks.supports_review_monitoring())
+        {
+            return self
+                .create_owned_review_session(
+                    callbacks.clone(),
+                    agent_id.clone(),
+                    cwd.into(),
+                    mcp_servers,
+                    creation,
+                    replacing,
+                )
+                .await;
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -2997,6 +3301,24 @@ impl Services {
         })
     }
 
+    /// Record the profile settings a just-opened native session belongs to
+    /// (no-op for a bare selection).
+    async fn bind_profile_native_session(&self, stored: &AgentSession) {
+        let Some(selection) = resolve_provider_id(
+            stored.provider.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
+        ) else {
+            return;
+        };
+        if let Some(fingerprint) = self
+            .profile_process_fingerprint(&stored.id, &selection)
+            .await
+        {
+            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                .await;
+        }
+    }
+
     async fn finish_created_acp_session(
         &self,
         prepared: PreparedAcpSession,
@@ -3010,10 +3332,11 @@ impl Services {
         } = prepared;
         // On CAS loss the provider metadata belongs to the losing candidate.
         // Preserve the winner's usage, effective model and effort metadata.
-        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+        let (modes, thought_level, filled_model) = if canonical == resp.session_id.0.as_ref() {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3028,9 +3351,13 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            (resp.modes, thought_level)
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
+            (resp.modes, thought_level, filled_model)
         } else {
-            (None, None)
+            (None, None, None)
         };
         AcpSessionOpened {
             config_options: (canonical == resp.session_id.0.as_ref())
@@ -3039,6 +3366,7 @@ impl Services {
             session_id: canonical,
             modes,
             thought_level,
+            filled_model,
         }
     }
 
@@ -3073,6 +3401,34 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
+        let stored = self.store.get_agent_session(agent_id).await?;
+        if let Some(session_id) = &stored.acp_session_id {
+            if self
+                .store
+                .get_review_context_enrollment(&stored.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+            {
+                let callbacks = callbacks
+                    .filter(|client| client.supports_review_monitoring())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "Private native history requires original admission".into(),
+                        )
+                    })?;
+                return self
+                    .load_owned_review_session(
+                        callbacks.clone(),
+                        init.clone(),
+                        agent_id.clone(),
+                        cwd.into(),
+                        mcp_servers,
+                        creation,
+                    )
+                    .await
+                    .map(Some);
+            }
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -3108,11 +3464,51 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<PreparedAcpLoad>> {
+        self.prepare_acp_load_with_review(
+            conn,
+            callbacks,
+            init,
+            agent_id,
+            cwd.into(),
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original startup owners and admission inputs remain explicit"
+    )]
+    async fn prepare_acp_load_with_review(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        review: Option<(
+            &crate::repository_admission::lifecycle::physical_owner::RepositoryReviewBootstrap,
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        )>,
+    ) -> Result<Option<PreparedAcpLoad>> {
         let stored = self.store.get_agent_session(agent_id).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
+        if review.is_none()
+            && self
+                .store
+                .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
+                .await?
+                .is_some()
+        {
+            return Err(Error::Unsupported(
+                "Private native history requires original admission".into(),
+            ));
+        }
         if !session::supports_load_session(init) {
             return Ok(None);
         }
@@ -3152,17 +3548,43 @@ impl Services {
             .get_agent_session_last_turn_model(&workspace_id, agent_id)
             .await?;
         if let Some(owner) = last_turn_provider {
-            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            // A profile reference is its own owner: a native session never
+            // crosses profiles or a profile and Default (PROTOCOL §5.54).
+            let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
                 );
                 return Ok(None);
             }
         }
+        // A profile's native session also belongs to the settings it was
+        // opened under: after an edit takes effect (account or home may
+        // differ) recreate with Intent history instead of loading it.
+        if let Some(fingerprint) =
+            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
+        {
+            if !Self::native_session_bound_to(&stored, &fingerprint) {
+                tracing::info!(
+                    agent = %agent_id,
+                    provider = %provider_id,
+                    "profile settings changed: skipping session/load of the earlier settings' session"
+                );
+                return Ok(None);
+            }
+        }
+        let owner = self.auth_owner(&provider_id).await;
+        let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
         let is_orchestrator = self
@@ -3182,7 +3604,61 @@ impl Services {
             "info",
         )
         .await;
-        let opened = if let Some(callbacks) = callbacks {
+        let opened = if let Some((bootstrap, native)) = review {
+            let unavailable =
+                || Error::Forbidden("Private native history requires original admission".into());
+            let callbacks = callbacks.ok_or_else(unavailable)?;
+            if bootstrap.loaded_session().map_err(|_| unavailable())? != acp_session_id
+                || native.is_retired()
+            {
+                return Err(unavailable());
+            }
+            bootstrap
+                .with_current(|| Ok(()))
+                .map_err(|_| unavailable())?;
+            let prepared = callbacks
+                .prepare_review_history(&acp_session_id, native.context().clone())
+                .await
+                .map_err(|_| unavailable())?;
+            let target = prepared
+                .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
+                .map_err(|_| unavailable())?;
+            let verified = bootstrap
+                .verify_history(prepared.messages())
+                .await
+                .map_err(|_| unavailable())?;
+            let admitted = verified
+                .admit(Arc::new(self.clone()))
+                .await
+                .map_err(|_| unavailable())?;
+            admitted
+                .retain_native_context()
+                .map_err(|_| unavailable())?;
+            let opened = prepared
+                .load(
+                    callbacks,
+                    cwd,
+                    mcp_servers,
+                    meta,
+                    admitted.bind_load(target),
+                )
+                .await;
+            if let Ok(opened) = &opened {
+                if native.is_retired()
+                    || !opened
+                        .query
+                        .as_ref()
+                        .and_then(intent_acp::callback_registration::CallbackQuery::pending_review_monitoring)
+                        .is_some_and(|receipt| receipt.matches_context(native.context()))
+                {
+                    native.join().await.map_err(|_| {
+                        Error::Internal("Private native retirement unconfirmed".into())
+                    })?;
+                    return Err(unavailable());
+                }
+            }
+            opened
+        } else if let Some(callbacks) = callbacks {
             callbacks
                 .load_session(&acp_session_id, cwd, mcp_servers, meta)
                 .await
@@ -3196,7 +3672,7 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -3205,7 +3681,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
@@ -3236,11 +3712,15 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
+            filled_model,
         }
     }
 
@@ -3354,6 +3834,7 @@ impl Services {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
         let prompt = prompt.into_blocks();
+        let required = local.as_ref().is_some_and(|input| input.required.is_some());
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3507,6 +3988,21 @@ impl Services {
             let attempt_result = {
                 let prompt_fut = async {
                     if let Some(input) = local.as_mut() {
+                        if required {
+                            let admission = input.required.take().ok_or_else(|| {
+                                AcpError::Transport(
+                                    "required monitor prompt already consumed".into(),
+                                )
+                            })?;
+                            return Box::pin(session::prompt_with_required_admission(
+                                input.connection,
+                                acp_session_id,
+                                prompt.clone(),
+                                &activity,
+                                admission,
+                            ))
+                            .await;
+                        }
                         let guidance = match input.captured.as_mut() {
                             Some(original) => original.prepare().await,
                             None => None,
@@ -3604,7 +4100,8 @@ impl Services {
             // Only a recognized pre-start policy rejection may change modes and
             // replay the untouched prompt. Reuse the output/client-work guards
             // above, and recheck after the asynchronous mode change.
-            if !closed
+            if !required
+                && !closed
                 && !any_update_received
                 && conn.client_request_seq() == client_request_watermark
             {
@@ -3660,7 +4157,8 @@ impl Services {
             }
             match &attempt_result {
                 Err(e)
-                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                    if !required
+                        && fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
                         && conn.client_request_seq() == client_request_watermark
@@ -4237,7 +4735,7 @@ impl Services {
         {
             let reason = match open_tool_call {
                 Some(label) => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with tool call {label} still open (open-tool terminal threshold \
                      {:?}; error class: provider stall). The tool call never reported completion \
                      and emitted nothing for the whole window, so the turn was failed instead of \
@@ -4246,7 +4744,7 @@ impl Services {
                     Duration::from_millis(open_tool_terminal_ms),
                 ),
                 None => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
                      provider stall). The provider is neither streaming nor running a tool, so the \
                      turn was failed instead of waiting for the idle timeout; the agent is stopping \
@@ -4255,6 +4753,8 @@ impl Services {
                     Duration::from_millis(stall_terminal_ms),
                 ),
             };
+            // The reserved reason prefix marks it daemon-raised, so the
+            // agent's next successful turn clears it (intent-hq/intent#7182).
             if let Err(raise_err) = self
                 .agent_request_attention_op(
                     workspace_id.clone(),
@@ -4309,12 +4809,17 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((_, _, provider, _)) => resolve_provider_id(
+                    Ok((_, _, provider, _)) => match resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
-                    )
+                    ) {
+                        Some(provider_id) => {
+                            self.auth_owner(&provider_id).await.demote();
+                            Some(provider_id)
+                        }
+                        None => None,
+                    }
                     .map(|provider_id| {
-                        crate::provider_auth::demote_auth_verdict(&provider_id);
                         crate::host_execution::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
@@ -4460,6 +4965,14 @@ impl Services {
         // the redrive is still trying to resume it. On cap exhaustion the
         // flag is false and this arm fires as today (advisory fields
         // included), so watchers get exactly one idle per stall episode.
+        // A successful turn retires a daemon-raised provider-stall blocker
+        // (intent-hq/intent#7182) before the idle emit, so watchers woken by
+        // the idle observe the cleared state. A cancelled turn or an armed
+        // truncation redrive is not a successful completion.
+        if matches!(&result, Ok(stop) if *stop != StopReason::Cancelled) && !truncation_redrive {
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         match &result {
             Ok(_) if truncation_redrive => {
                 tracing::debug!(
@@ -4555,6 +5068,12 @@ impl Services {
                 // correct if the daemon is killed immediately after the event.
                 self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
                     .await;
+                // Observable idle means this turn is complete. The worker keeps
+                // its slot through the post-turn tail; graceful shutdown must
+                // not record that tail as an interrupted turn.
+                if let Some(manager) = self.agent_manager() {
+                    manager.mark_turn_settled_if_slot_held(agent_id);
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }
@@ -5069,12 +5588,17 @@ impl Services {
                 error,
             )
             .await;
-            if let Err(raise_error) = self.agent_request_attention_op(
-                workspace_id.clone(),
-                "blocker".to_string(),
-                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
-                Some(agent_id.clone()),
-            ).await {
+            if let Err(raise_error) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    format!(
+                        "{UNSOLICITED_STALL_BLOCKER_PREFIX}{error}. Retry the agent to continue."
+                    ),
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
             Some(persisted)
@@ -5102,6 +5626,14 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if failure.is_none() && !empty_response {
+            // Successful wake turn: same stall-blocker retirement as the
+            // prompt-turn settlement (intent-hq/intent#7182). An empty wake is
+            // not a success — `recover_empty_harness_wake` handles it — so it
+            // leaves the stall blocker pending.
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         if let Some(error) = &failure {
             self.flush_deferred_attention(agent_id, workspace_id).await;
             self.publish_agent_event(
@@ -5376,7 +5908,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((_, _, provider, _)) => resolve_provider_id(
+            Ok((_, _, provider, _)) => resolve_base_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -5437,7 +5969,7 @@ impl Services {
             .await
         {
             Ok((_, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(
+                let provider_id = resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -5576,7 +6108,7 @@ impl Services {
         // below).
         let provider_id = prev_readable
             .then(|| {
-                resolve_provider_id(
+                resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )
@@ -5826,7 +6358,14 @@ impl Services {
                 }
                 return false;
             }
-            MappedUpdate::ToolCall(tc) => {
+            MappedUpdate::ToolCall(mut tc) => {
+                // §5.5b: a backgrounded marker without an explicit status
+                // keeps the tool's recorded status (never reopens it).
+                if tc.keeps_status {
+                    if let Some(status) = transcript.tool_status_for(&tc.tool_call_id) {
+                        tc.status = status;
+                    }
+                }
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
                 // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit
@@ -6221,3 +6760,6 @@ impl Services {
         .await
     }
 }
+
+#[path = "agent_session/review_startup.rs"]
+mod review_startup;

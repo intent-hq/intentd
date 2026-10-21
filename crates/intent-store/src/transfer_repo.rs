@@ -51,6 +51,11 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // Ownership must precede queue restoration; history is imported separately
     // from live delivery so already-delivered wakes never fire again.
     ("script_monitor", "workspace_id = ?1"),
+    ("script_notification_job", "workspace_id = ?1"),
+    (
+        "agent_queue_admission",
+        "workspace_id = ?1 AND phase != 'completed'",
+    ),
     (
         "agent_message",
         "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
@@ -65,7 +70,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ),
     (
         "agent_queue",
-        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1)",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed')",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
     ("agent_flipped_completion", "workspace_id = ?1"),
@@ -93,6 +98,12 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // before this row insert). `stored_path` is workspace-relative, so no
     // import rewriting is needed.
     ("attachments", "workspace_id = ?1"),
+    // PR <-> workspace links (0161). Shipped because the import-time insert
+    // triggers only see the current PR snapshot: links for PRs that left the
+    // pool, or that came from git roots (not transferred), would be lost and
+    // every `linked_at` reset. Imported with INSERT OR REPLACE so the
+    // archive's rows win over the ones the workspace insert trigger just made.
+    ("pull_request_workspace", "workspace_id = ?1"),
 ];
 
 /// Tables deliberately **excluded** from a transfer, each with the rationale.
@@ -101,11 +112,15 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("pull_request_workspace_candidate", "write-only trigger funnel; its BEFORE INSERT trigger ignores every row, so it never holds data"),
+    ("review_context_private_family", "installation-private denial history; never imported or transferred"),
+    ("review_context_enrollment", "installation-private native family; never imported or transferred"),
+    ("pr_monitor_message_provenance", "local original-message evidence; never transferable or imported authorization"),
     ("note_artifact_source", "derived canonical source grants rebuilt in the destination; artifact arena never transfers"),
     ("note_page_backend", "database-local namespace and authentication secret never transfer"),
     ("note_page_head", "fresh note incarnations created by import insert triggers"),
-    ("note_page_piece", "derived source index rebuilt inside import transaction"),
-    ("note_page_entry", "derived context and metadata rebuilt inside import transaction"),
+    ("note_page_piece", "derived source index prepared on first access"),
+    ("note_page_entry", "derived context and metadata prepared on first access"),
     ("note_stage_root", "backend-local staged operations, ownership and immutable source never transfer"),
     ("note_stage_root_pin", "backend-local retained operation source ownership never transfers"),
     ("note_stage_root_reclaim", "backend-local durable reclamation progress never transfers"),
@@ -521,6 +536,43 @@ impl Store {
         Ok(out)
     }
 
+    /// Read retained monitor envelopes for transfer preflight, without changing
+    /// agents or creating an export. This is not the authoritative archive
+    /// snapshot; the caller must also check its final `transfer_export_rows`.
+    ///
+    /// # Errors
+    /// Returns an error if the read snapshot or row decoding fails.
+    pub async fn transfer_monitor_rows(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Vec<serde_json::Value>)>> {
+        let mut tx = self
+            .read_pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+        let mut out = Vec::new();
+        for (table, predicate) in TRANSFER_TABLES
+            .iter()
+            .filter(|(table, _)| matches!(*table, "pr_monitor" | "agent_message"))
+        {
+            let rows = sqlx::query(&format!("SELECT * FROM \"{table}\" WHERE {predicate}"))
+                .bind(&workspace_id.0)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+            let objects = rows
+                .iter()
+                .map(|row| row_to_json(table, row))
+                .collect::<Result<Vec<_>>>()?;
+            out.push(((*table).to_string(), objects));
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+        Ok(out)
+    }
+
     /// Insert transformed transfer rows into their tables inside ONE
     /// transaction — the atomic heart of `workspace.import.commit`. `rows`
     /// entries must name [`TRANSFER_TABLES`] members (anything else —
@@ -574,6 +626,12 @@ impl Store {
             .begin()
             .await
             .map_err(|e| Error::Internal(format!("transfer import begin failed: {e}")))?;
+        let existing_workspaces: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM workspace UNION SELECT id FROM deleted_workspace_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("read delivery import fence: {e}")))?;
         reclaim_imported_metadata(&mut tx, rows).await?;
         let mut anchor_notes = std::collections::BTreeSet::<(String, String)>::new();
         let mut inserted = 0usize;
@@ -583,22 +641,16 @@ impl Store {
             };
             let schema = &schemas[table];
             for object in objects {
-                // Deleting a workspace suppresses its retained monitor ledger.
-                // Reimport must preserve that terminal fence, never re-arm it.
-                if *table == "script_monitor" {
-                    let existing: Option<(String, String)> =
-                        sqlx::query_as("SELECT workspace_id,state FROM script_monitor WHERE id=?")
-                            .bind(object["id"].as_str())
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| {
-                                Error::Internal(format!("read imported monitor fence: {e}"))
-                            })?;
-                    if existing.is_some_and(|(ws, state)| {
-                        object["workspace_id"].as_str() == Some(ws.as_str()) && state != "active"
-                    }) {
-                        continue;
-                    }
+                // A repeated import may restore history, never superseded live delivery.
+                // Workspace lifecycle identity supplies this fence without monitor tombstones.
+                if matches!(
+                    *table,
+                    "script_monitor" | "script_notification_job" | "agent_queue_admission"
+                ) && object["workspace_id"]
+                    .as_str()
+                    .is_some_and(|ws| existing_workspaces.iter().any(|id| id == ws))
+                {
+                    continue;
                 }
                 // Imported conversation rows are history, not fresh wakes.
                 // Stage their metadata as NULL inside this transaction, then
@@ -669,8 +721,13 @@ impl Store {
                     continue;
                 }
                 let placeholders = vec!["?"; columns.len()].join(",");
+                let verb = if *table == "pull_request_workspace" {
+                    "INSERT OR REPLACE"
+                } else {
+                    "INSERT"
+                };
                 let sql = format!(
-                    "INSERT INTO \"{table}\" ({}) VALUES ({placeholders})",
+                    "{verb} INTO \"{table}\" ({}) VALUES ({placeholders})",
                     columns.join(",")
                 );
                 let mut query = sqlx::query(&sql);
@@ -708,6 +765,29 @@ impl Store {
                 } else {
                     None
                 };
+                if *table == "agent_session" {
+                    // Imported identical public bytes still replace local lineage.
+                    // Failed imports roll this back with their original batch.
+                    sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                        .bind(object["id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("import native enrollment invalidation failed".into())
+                        })?;
+                }
+                if *table == "agent_message" {
+                    // An imported ID never carries local original evidence.
+                    // Stay inside the original lifecycle mutation and SQL
+                    // transaction: a rejected import rolls this back too.
+                    sqlx::query("DELETE FROM pr_monitor_message_provenance WHERE message_id=?")
+                        .bind(object["id"].as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("import monitor provenance invalidation failed".into())
+                        })?;
+                }
                 let written = query.execute(&mut *tx).await.map_err(|e| {
                     Error::Internal(format!("transfer import insert into {table} failed: {e}"))
                 })?;
@@ -727,9 +807,6 @@ impl Store {
                     if let Some(note) = note {
                         anchor_notes.insert((workspace, note));
                     }
-                }
-                if *table == "note" {
-                    crate::note_page_index::rebuild_pending(&mut tx).await?;
                 }
                 if let Some(metadata) = history_metadata {
                     sqlx::query("UPDATE agent_message SET metadata=? WHERE id=? AND agent_id=?")
@@ -860,7 +937,7 @@ impl Store {
             .map_err(|e| Error::Internal(format!("materialize imported counts failed: {e}")))?;
         }
         // Comments arrive after notes. Publish only after the last imported
-        // root/reply, hydrating one affected note at a time inside this writer.
+        // root/reply. Stale source indexes stay pending until explicit demand.
         for (workspace, note) in anchor_notes {
             crate::note_annotation_repo::rebuild_note_anchors(
                 &mut tx,
@@ -873,7 +950,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("transfer import commit failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(inserted)
     }
 }
@@ -1466,6 +1543,8 @@ mod tests {
             format!("INSERT INTO pr_monitor (monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, created_at, updated_at) VALUES ('pm-{ws}', '{ws}', '{agent}', 'o', 'r', 1, 'active', '{t}', '{t}')"),
             format!("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('s-{ws}', '{ws}', 'S', 'true', 'command', 'user', '{t}')"),
             format!("INSERT INTO script_monitor (id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at) VALUES ('sm-{ws}', '{ws}', '{agent}', 's-{ws}', 'run-{ws}', 'active', '{{}}', '{t}')"),
+            format!("INSERT INTO script_notification_job (wake_id,workspace_id,agent_id,script_id,run_id,metadata,body,phase,created_at) VALUES ('script-monitor:job-{ws}','{ws}','{agent}','s-{ws}','run-{ws}','{{}}','wake','pending','{t}')"),
+            format!("INSERT INTO agent_queue_admission (id,agent_id,workspace_id,turn_id,payload,created_at,phase) VALUES ('script-monitor:admitted-{ws}','{agent}','{ws}','turn-{ws}','{{}}','{t}','pending')"),
             format!("INSERT INTO task_agent_link (workspace_id, note_id, task_key, task_text, agent_id, created_at) VALUES ('{ws}', 'n1', 'k', 'do', '{agent}', 1)"),
             format!("INSERT INTO sandbox (id, workspace_id, agent_id, path, branch, base_commit_sha, created_at, updated_at) VALUES ('sb-{ws}', '{ws}', '{agent}', '/tmp/sb', 'sb/a', 'abc', '{t}', '{t}')"),
             format!("INSERT INTO tracked_changes (id, workspace_id, path, stage, status, created_at, updated_at) VALUES ('tc-{ws}', '{ws}', 'a.txt', 'unstaged', 'modified', '{t}', '{t}')"),
@@ -1475,6 +1554,7 @@ mod tests {
             format!("INSERT INTO workspace_context_item (workspace_id, id, ordinal, payload) VALUES ('{ws}', 'ci', 0, '{{}}')"),
             format!("INSERT INTO workspace_ui_context (workspace_id, payload) VALUES ('{ws}', '{{}}')"),
             format!("INSERT INTO attachments (id, workspace_id, file_name, size, uploaded_at, stored_path) VALUES ('at-{ws}', '{ws}', 'f.txt', 3, '{t}', '.intent/attachments/at-{ws}')"),
+            format!("INSERT INTO pull_request_workspace (pr_key, workspace_id, source, linked_at) VALUES ('github.com/o/r/pull/1', '{ws}', 'workspace', '{t}')"),
         ] {
             run(store, sql).await;
         }
@@ -1602,10 +1682,14 @@ mod tests {
         assert_eq!(exported, re_exported, "round-trip must be lossless");
         // Archives made before the effort baseline column remain importable;
         // desired reasoning_effort is not evidence of a previously used level.
+        // Archives made before the Auto-pin flag import with it defaulted to 0
+        // (a portable value: transferred as-is, no import-side rewrite).
         for (table, rows) in &mut exported {
             if table == "agent_session" {
                 for row in rows {
-                    row.as_object_mut().unwrap().remove("last_turn_effort");
+                    let row = row.as_object_mut().unwrap();
+                    row.remove("last_turn_effort");
+                    row.remove("reasoning_effort_auto");
                 }
             }
         }
@@ -2132,8 +2216,10 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
-agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort
-script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, settled_at, cancel_intent, wake_state
+agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto
+script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
+script_notification_job: wake_id, workspace_id, agent_id, script_id, run_id, metadata, body, phase, created_at
+agent_queue_admission: id, agent_id, workspace_id, turn_id, payload, created_at, phase
 agent_message: id, agent_id, seq, role, content, created_at, metadata, thumbnails, usage_model, usage_origin
 agent_message_payload: message_id, agent_id, block_ordinal, kind, encoding, body
 agent_usage_cell: agent_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, thought_tokens, costs_json, human_messages, agent_messages
@@ -2154,7 +2240,8 @@ workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at
 agent_metrics: agent_id, workspace_id, additions, deletions, files_changed, updated_at
 workspace_context_item: workspace_id, id, ordinal, payload
 workspace_ui_context: workspace_id, payload
-attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path";
+attachments: id, workspace_id, file_name, mime_type, size, uploaded_at, stored_path
+pull_request_workspace: pr_key, workspace_id, source, linked_at";
 
     /// Column-drift tripwire: the live columns of every transferred table
     /// must match [`TRANSFERRED_COLUMNS`]. Adding/removing a column on a

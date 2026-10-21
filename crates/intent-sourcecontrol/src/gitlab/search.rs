@@ -34,6 +34,7 @@ impl GitLabSourceControl {
         // credentials, and cannot redirect the adapter to an arbitrary host.
         let scope = serde_json::to_string(&(
             self.descriptor.instance().as_str(),
+            &self.pagination_scope,
             resource,
             &repos,
             &params,

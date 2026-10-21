@@ -277,7 +277,25 @@ impl Services {
                 json!({"revision":revision,"principalId":principal.id,"hostRole":"member","action":"added"})).await;
             // Remaining workspace guests cannot receive the global event.
             // An offline promotion can leave both the online roster and member
-            // count unchanged, but they still need to refresh effective roles.
+            // count unchanged, so presence is not a membership invalidation.
+            match self
+                .store
+                .effective_principal_workspace_ids(&principal.id)
+                .await
+            {
+                Ok(workspaces) => {
+                    for workspace in workspaces {
+                        crate::publish_event(
+                            self.event_bus.as_ref(),
+                            crate::workspace_updated_event(&workspace, &json!({"members": true})),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to publish workspace membership invalidations");
+                }
+            }
             self.emit_presence_for_memberships(&principal.id).await;
         }
         self.host_invite_event(&invite.id, "redeemed").await;

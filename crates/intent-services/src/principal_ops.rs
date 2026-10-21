@@ -1703,26 +1703,32 @@ mod tests {
     /// Poll the primary row until the background refresh linked it (bounded;
     /// no fixed sleep — the poll yields to the spawned task each round).
     async fn wait_until_linked(store: &Store) -> Principal {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let primary = store.get_primary_principal().await.expect("primary");
-                if primary.login.is_some() {
-                    return primary;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let primary = store.get_primary_principal().await.expect("primary");
+                    if primary.login.is_some() {
+                        return primary;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("primary identity refresh linked the row within the bound")
     }
 
     /// Poll until `probe` is true (bounded; yields to spawned tasks).
     async fn wait_until(probe: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !probe() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while !probe() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("observable outcome within the bound");
     }

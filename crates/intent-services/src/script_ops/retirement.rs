@@ -178,6 +178,9 @@ impl ScriptManager {
                     if m.def.mode == intent_core::ScriptMode::Command {
                         m.def.last_run = Some(result);
                     }
+                    if m.def.mode == intent_core::ScriptMode::Command {
+                        self.locks.mark_command_settled();
+                    }
                     m.run_id = None;
                     m.pending_result = None;
                 }

@@ -53,6 +53,11 @@ use crate::config::{
     MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
     TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
+use crate::config::{
+    DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+    SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX, SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+    SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+};
 use crate::error::{Error, Result};
 
 /// Root of the `config.toml` schema. One field per top-level TOML table.
@@ -80,6 +85,7 @@ pub struct SettingsFile {
     pub logging: LoggingSettings,
     pub agents: AgentsSettings,
     pub events: EventsSettings,
+    pub scripts: ScriptsSettings,
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
@@ -101,7 +107,10 @@ pub struct ProvidersSettings {
     pub enabled: Option<BTreeMap<String, bool>>,
     /// `providers.paths` — per-provider CLI path overrides.
     pub paths: BTreeMap<String, String>,
-    /// Session-only Fast mode preference; absent providers default to off.
+    /// Session-only Fast mode preference keyed by `claude-code` / `codex` or
+    /// a named-profile reference of either (`<base>@<profileId>`). Each key is
+    /// its own setting: an absent key is off, and a profile never reads its
+    /// base provider's entry.
     pub fast_mode: BTreeMap<String, bool>,
 }
 
@@ -177,8 +186,10 @@ pub struct WorkspaceSettings {
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
     /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
-    /// sandboxing (requires `CoW` filesystem support on the workspaces root;
-    /// workspace creation fails when unsupported).
+    /// sandboxing (requires `CoW` filesystem support on the workspaces root).
+    /// A preference, not a guarantee: when the filesystem cannot `CoW`-clone,
+    /// `workspace.create` falls back to a linked worktree (local repository)
+    /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
 }
 
@@ -939,6 +950,33 @@ impl Default for EventsSettings {
     }
 }
 
+/// `[scripts]` — on-disk script output retention (`scripts.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ScriptsSettings {
+    /// `scripts.outputRetentionHours` — hours an on-disk script run log is
+    /// kept before the output sweep deletes it; `0` disables the age sweep
+    /// (logs live until their script or workspace is deleted). Max
+    /// [`SCRIPT_OUTPUT_RETENTION_HOURS_MAX`]; read live at each sweep, no
+    /// restart required. `INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS` overrides it
+    /// (see [`crate::config::script_output_retention_hours`]).
+    pub output_retention_hours: u32,
+    /// `scripts.outputMaxBytesPerRun` — per-run byte cap of one on-disk
+    /// script log; past it the newest bytes are kept and the oldest dropped
+    /// (range [`SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN`]–[`SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX`];
+    /// read live at each run start, no restart required).
+    pub output_max_bytes_per_run: u64,
+}
+
+impl Default for ScriptsSettings {
+    fn default() -> Self {
+        Self {
+            output_retention_hours: DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+            output_max_bytes_per_run: DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        }
+    }
+}
+
 /// `[workspaceApi]` — `workspace_api` tool output knobs (`workspaceApi.*`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -1256,6 +1294,25 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "agents.flushQueuedMessages",
 ];
 
+/// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
+/// base provider id, or a well-formed profile reference of one
+/// (`<base>@<id>`, id matching `^[a-z0-9][a-z0-9-]{0,31}$`). Existence of
+/// the profile is checked by the daemon's `settings.update` front door.
+fn is_fast_mode_key(key: &str) -> bool {
+    const BASES: [&str; 2] = ["claude-code", "codex"];
+    let Some((base, id)) = key.split_once('@') else {
+        return BASES.contains(&key);
+    };
+    let bytes = id.as_bytes();
+    BASES.contains(&base)
+        && !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
 pub type LegacySettings = BTreeMap<String, serde_json::Value>;
@@ -1405,11 +1462,11 @@ impl SettingsFile {
             .providers
             .fast_mode
             .keys()
-            .any(|id| !matches!(id.as_str(), "claude-code" | "codex"))
+            .any(|id| !is_fast_mode_key(id))
         {
             return Err(bad(
                 "providers.fastMode",
-                "only claude-code and codex support Fast mode",
+                "only claude-code and codex (or one of their named profiles) support Fast mode",
             ));
         }
         let v = self.notifications.volume;
@@ -1516,6 +1573,27 @@ impl SettingsFile {
                 "agents.toolPayloadRetentionDays",
                 &format!(
                     "must be 0 (keep forever) or between 1 and {TOOL_PAYLOAD_RETENTION_DAYS_MAX}, got {retention_days}"
+                ),
+            ));
+        }
+        let script_hours = self.scripts.output_retention_hours;
+        if script_hours > SCRIPT_OUTPUT_RETENTION_HOURS_MAX {
+            return Err(bad(
+                "scripts.outputRetentionHours",
+                &format!(
+                    "must be 0 (keep until deleted) or between 1 and {SCRIPT_OUTPUT_RETENTION_HOURS_MAX}, got {script_hours}"
+                ),
+            ));
+        }
+        // No `0`/unlimited value: the per-run cap is the disk-growth guard.
+        let script_bytes = self.scripts.output_max_bytes_per_run;
+        if !(SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN..=SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX)
+            .contains(&script_bytes)
+        {
+            return Err(bad(
+                "scripts.outputMaxBytesPerRun",
+                &format!(
+                    "must be between {SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN} and {SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX}, got {script_bytes}"
                 ),
             ));
         }
@@ -1933,8 +2011,9 @@ maxTopLevelAgents = 20
 # tree starts draining once the window passes instead of holding 5.85 GB for
 # another 20. Raise it to keep processes warm for longer and reclaim their
 # memory later; lower it for the reverse. Only agents idle past the TTL are
-# candidates, and the sweep
-# skips any agent reported busy when it checks. An agent is selected within
+# candidates, and the sweep skips any agent reported busy when it checks, or
+# still running a background task (a dev server, say) until that task ends --
+# at most 24 hours past the TTL. An agent is selected within
 # the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
 # memory comes back as each kill completes, so a large idle set drains over a
 # tail rather than all at once.
@@ -1965,6 +2044,17 @@ resumeInterruptedOnStart = "auto"
 # Stream retention hours -- hours ephemeral events are retained before the
 # retention/compaction sweep deletes them (0 disables).
 streamRetentionHours = 72
+
+[scripts]
+# Script output retention hours -- hours an on-disk script run log is kept
+# before the output sweep deletes it; 0 disables the age sweep and keeps logs
+# until their script or workspace is deleted (max 87600; read live at each
+# sweep, no restart required; INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS overrides).
+outputRetentionHours = 168
+# Script output max bytes per run -- size cap of one run's on-disk log; past
+# it the newest bytes are kept and the oldest dropped (65536-1073741824; read
+# live at each run start, no restart required).
+outputMaxBytesPerRun = 52428800
 
 [workspaceApi]
 # Max workspace API output chars -- max characters of one workspace_api tool
@@ -3360,6 +3450,88 @@ mod tests {
             "names the key and value: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `[scripts]` ships a one-week retention window and a 50 MiB per-run
+    /// cap; an empty file and the shipped template both resolve to them.
+    #[test]
+    fn script_output_defaults_and_template_round_trip() {
+        assert_eq!(DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS, 168);
+        assert_eq!(DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, 52_428_800);
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.scripts, ScriptsSettings::default());
+        assert_eq!(parsed.scripts.output_retention_hours, 168);
+        assert_eq!(parsed.scripts.output_max_bytes_per_run, 52_428_800);
+
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[scripts]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("outputRetentionHours = 168"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("outputMaxBytesPerRun = 52428800"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.scripts, ScriptsSettings::default());
+
+        let custom = SettingsFile::parse_str(
+            "[scripts]\noutputRetentionHours = 0\noutputMaxBytesPerRun = 1048576\n",
+        )
+        .expect("custom values parse");
+        assert_eq!(custom.scripts.output_retention_hours, 0);
+        assert_eq!(custom.scripts.output_max_bytes_per_run, 1_048_576);
+        assert_eq!(
+            crate::config::script_output_max_bytes_per_run(&custom),
+            1_048_576
+        );
+    }
+
+    /// `scripts.outputRetentionHours` accepts `0` (keep until deleted) up to
+    /// ten years; `scripts.outputMaxBytesPerRun` is bounded on both sides with
+    /// no `0` escape hatch. Out-of-range values fail with the key and value.
+    #[test]
+    fn script_output_ranges_are_enforced() {
+        for legal in [0, 1, SCRIPT_OUTPUT_RETENTION_HOURS_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[scripts]\noutputRetentionHours = {legal}\n"))
+                    .expect("0, 1 and the upper bound are legal");
+            assert_eq!(parsed.scripts.output_retention_hours, legal);
+        }
+        for bad in ["87601", "-1"] {
+            let err =
+                SettingsFile::parse_str(&format!("[scripts]\noutputRetentionHours = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scripts.outputRetentionHours"),
+                "error names the offending key: {msg}"
+            );
+        }
+
+        for legal in [
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX,
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[scripts]\noutputMaxBytesPerRun = {legal}\n"))
+                    .expect("both bounds are legal");
+            assert_eq!(parsed.scripts.output_max_bytes_per_run, legal);
+        }
+        for bad in ["0", "65535", "1073741825"] {
+            let err =
+                SettingsFile::parse_str(&format!("[scripts]\noutputMaxBytesPerRun = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scripts.outputMaxBytesPerRun") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
+        let err = SettingsFile::parse_str("[scripts]\noutputMaxBytesPerRun = -1\n")
+            .expect_err("negative cap must be rejected");
+        assert!(
+            err.to_string().contains("scripts.outputMaxBytesPerRun"),
+            "{err}"
+        );
+
+        let err = SettingsFile::parse_str("[scripts]\nbogus = 1\n")
+            .expect_err("unknown [scripts] key must be rejected");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

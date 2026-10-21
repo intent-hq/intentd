@@ -116,7 +116,9 @@ fn run_imports(root: &Path, contract: &Value, fault: &str) -> Result<Value, Stri
         command.env("LLVM_PROFILE_FILE", profile);
     }
     let mut child = GuardedChild::spawn(&mut command).unwrap();
-    let status = child.wait_with_timeout(Duration::from_secs(180)).unwrap();
+    let status = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(180)))
+        .unwrap();
     if !status.is_some_and(|status| status.success()) {
         return Err(format!(
             "import worker failed ({status:?}):\n{}",
@@ -175,7 +177,7 @@ async fn import_case(root: &Path, contract: &Value, case: &Value, fault: &str) -
     let agent = AgentId::from("agent-import-contract");
     let timestamp = "2026-01-01T00:00:00Z";
     let manifest = json!({
-        "formatVersion": 1, "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "formatVersion": 1, "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": workspace.0, "createdAt": timestamp,
         "tables": [], "assets": [], "attachments": [],
         "git": {"hasRepository": false, "dirtyFiles": [], "sandboxBranches": [], "submodules": []}

@@ -15,19 +15,22 @@ async fn through_marker(
     ))
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut received = Vec::new();
-        loop {
-            for event in events.recv().await.expect("subscription open") {
-                if event.event_type == WORKSPACE_UPDATED
-                    && event.data["changes"]["title"] == "presence notification barrier"
-                {
-                    return received;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut received = Vec::new();
+            loop {
+                for event in events.recv().await.expect("subscription open") {
+                    if event.event_type == WORKSPACE_UPDATED
+                        && event.data["changes"]["title"] == "presence notification barrier"
+                    {
+                        return received;
+                    }
+                    received.push(event);
                 }
-                received.push(event);
             }
-        }
-    })
+        },
+    )
     .await
     .expect("event delivery barrier")
 }
@@ -41,6 +44,9 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
     let (person, token) = f.first_join(&guest("guest", 4242)).await;
     let inherited = crate::tests::workspace(&WorkspaceId::new());
     f.store.insert_workspace(&inherited).await.unwrap();
+    let mut archived = crate::tests::workspace(&WorkspaceId::new());
+    archived.status = intent_core::WorkspaceStatus::Archived;
+    f.store.insert_workspace(&archived).await.unwrap();
     // Services initialization already seeds the chief workspace.
     f.store
         .get_workspace(&WorkspaceId::from(intent_core::CHIEF_WORKSPACE_ID))
@@ -161,7 +167,21 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
         .unwrap();
     assert_eq!(joined["hostRole"], "member");
     let received = through_marker(&bus, &mut events, &f.ws).await;
-    for workspace in [&f.ws, &inherited.id] {
+    for workspace in [&f.ws, &inherited.id, &archived.id] {
+        let invalidations: Vec<_> = received
+            .iter()
+            .filter(|event| {
+                event.event_type == WORKSPACE_UPDATED
+                    && &event.workspace_id == workspace
+                    && event.data["changes"]["members"] == true
+            })
+            .collect();
+        assert_eq!(
+            invalidations.len(),
+            1,
+            "membership invalidation for {workspace}"
+        );
+        assert_eq!(invalidations[0].data["workspaceId"], workspace.as_str());
         let presence: Vec<_> = received
             .iter()
             .filter(|event| {
@@ -239,7 +259,8 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
     assert!(through_marker(&bus, &mut events, &f.ws)
         .await
         .iter()
-        .all(|event| event.event_type != PRESENCE_CHANGED));
+        .all(|event| event.event_type != PRESENCE_CHANGED
+            && event.data["changes"]["members"] != true));
     assert_eq!(
         f.store.host_membership_state().await.unwrap().revision,
         revision
@@ -274,7 +295,15 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
             .unwrap();
     }
     let removed = through_marker(&bus, &mut events, &f.ws).await;
-    for workspace in [&f.ws, &inherited.id] {
+    for workspace in [&f.ws, &inherited.id, &archived.id] {
+        let count = f.services.member_count(workspace).await.unwrap();
+        assert!(removed.iter().any(|event| {
+            event.event_type == WORKSPACE_UPDATED
+                && &event.workspace_id == workspace
+                && event.data["changes"]["members"] == true
+                && event.data["changes"]["memberCount"] == count
+                && event.data["changes"]["removedPrincipalId"] == person.0
+        }));
         assert!(removed.iter().any(|event| {
             event.event_type == PRESENCE_CHANGED && &event.workspace_id == workspace
         }));

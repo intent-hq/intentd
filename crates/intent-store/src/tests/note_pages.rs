@@ -12,11 +12,22 @@ use std::sync::{
 };
 
 mod anchor_lifecycle;
+mod batched_writes;
 mod delete_grace;
+mod demand_rebuild;
 mod guarded_metadata;
 mod immediate_delete;
 mod plain_markdown;
+mod profile_reopen;
 mod writer_anchors;
+
+/// Hang guard for note-page test waits, scaled by
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER` through the shared
+/// [`intentd_test_support::test_timeout`] (coverage CI exports 3). The bound
+/// only catches hangs; no assertion depends on it.
+fn wait() -> std::time::Duration {
+    intentd_test_support::test_timeout(std::time::Duration::from_secs(5))
+}
 
 fn request(value: Value) -> NotePageRequest {
     serde_json::from_value(value).unwrap()
@@ -424,6 +435,9 @@ async fn indexed_note_pages_migrate_existing_notes_and_preserve_legacy_text() {
     sqlx::query("INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at) VALUES ('spec','pages','original',?,17,'now','now')").bind(&text).execute(&pool).await.unwrap();
     pool.close().await;
     let store = Store::open(&tmp.path).await.unwrap();
+    // Migration leaves source-derived rows pending; first access may return
+    // Preparing while the existing multiline source is converted.
+    demand_rebuild::settled(&store).await.unwrap();
     let got = page(&store, json!({"kind":"source","at":3,"maxSourceBytes":4})).await;
     assert!(got["sourceRevision"].as_str().unwrap().starts_with("r:17:"));
     assert_eq!(got["text"], "\r\n");

@@ -995,3 +995,139 @@ async fn failed_invite_transaction_rolls_back_without_claiming_owner_settlement(
         .unwrap();
     assert!(f.probe.wire().is_none());
 }
+
+// These tests exercise the real single-writer connection while the observer's
+// completion is held; they do not claim an actual native peer was joined.
+#[derive(Clone)]
+struct HeldPrincipalCompletion {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    settled: Arc<AtomicBool>,
+}
+impl RepositoryLifecycleObserver for HeldPrincipalCompletion {
+    fn begin_mutation(
+        &self,
+        _: &[RepositoryLifecycleKey],
+    ) -> Result<Box<dyn RepositoryLifecycleMutationTicket>> {
+        Ok(Box::new(self.clone()))
+    }
+}
+impl RepositoryLifecycleMutationTicket for HeldPrincipalCompletion {
+    fn settle_confirmed(self: Box<Self>) {
+        self.settled.store(true, Ordering::SeqCst);
+    }
+    fn settle_after_retirement(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.settle_confirmed();
+            Ok(())
+        })
+    }
+}
+async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
+    use std::time::Duration;
+    use tokio::time::timeout;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("principal-completion.db"))
+        .await
+        .unwrap();
+    let mut principal = person(91001);
+    store.upsert_principal(&principal).await.unwrap();
+    store
+        .insert_principal_credential(&principal.id, "principal-completion-token")
+        .await
+        .unwrap();
+    let observer = Arc::new(HeldPrincipalCompletion {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        settled: Arc::new(AtomicBool::new(false)),
+    });
+    store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    principal.github_user_id = Some(91002);
+    let mut operation = Box::pin(async {
+        if revoke {
+            assert!(
+                store
+                    .revoke_principal_credential("principal-completion-token")
+                    .await?
+            );
+        } else {
+            store.upsert_principal(&principal).await?;
+        }
+        Ok::<_, intent_core::Error>(())
+    });
+    tokio::select! {
+        () = observer.entered.notified() => {},
+        result = &mut operation => panic!("principal completed before retained settlement: {result:?}"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => panic!("principal did not reach settlement"),
+    }
+    timeout(Duration::from_secs(5), async {
+        let mut writer = store.write_pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE principal SET updated_at=updated_at WHERE 0")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+    })
+    .await
+    .expect("principal retirement retained the single-writer pool");
+    if revoke {
+        assert!(store
+            .lookup_principal_credential("principal-completion-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some());
+    } else {
+        assert_eq!(
+            store
+                .get_principal(&principal.id)
+                .await
+                .unwrap()
+                .github_user_id,
+            Some(91002)
+        );
+    }
+    assert!(!observer.settled.load(Ordering::SeqCst));
+    if cancelled {
+        drop(operation);
+        observer.release.notify_one();
+    } else {
+        observer.release.notify_one();
+        operation.await.unwrap();
+    }
+    timeout(Duration::from_secs(5), async {
+        while !observer.settled.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original completion was lost with its caller");
+}
+#[tokio::test]
+async fn principal_upsert_releases_write_pool_before_completion() {
+    principal_completion_releases_writer(false, false).await;
+}
+#[tokio::test]
+async fn principal_revoke_releases_write_pool_before_completion() {
+    principal_completion_releases_writer(true, false).await;
+}
+#[tokio::test]
+async fn principal_upsert_cancelled_completion_releases_write_pool() {
+    principal_completion_releases_writer(false, true).await;
+}
+#[tokio::test]
+async fn principal_revoke_cancelled_completion_releases_write_pool() {
+    principal_completion_releases_writer(true, true).await;
+}

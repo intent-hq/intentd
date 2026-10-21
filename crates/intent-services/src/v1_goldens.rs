@@ -789,6 +789,7 @@ fn merge_requirements(
         rules_known: true,
         is_in_merge_queue: None,
         merge_queue_ejection: None,
+        merge_queue: None,
     }
 }
 
@@ -1284,7 +1285,8 @@ pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
 pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
         let texts: Vec<String> = session
@@ -2013,7 +2015,7 @@ fn golden_bundled_doctrine_hashes() {
     let expected = vec![
         "task-loop: cc1f40de9643f88529dd5fa61d1f868ae269020aa3ef5d08986a721e19c64c44".to_string(),
         "interactive: 013e064b03286569622d905efd0ee4c2a227fc18f0364d3277a95b548dd1f6c3".to_string(),
-        "workspace-agent: a4602194c382d803f1a1143159035a93e76d0793027d469485126efa475e0ac6"
+        "workspace-agent: 17cba2212f464d29346848007d278bd641dacc3f22ed623d8c2c70002daba802"
             .to_string(),
         "task-breakdown: 1e9e1e2daf42a8adadd8c31d7697f0bac02bf5a7c818b00ae4e50074e40b9e66"
             .to_string(),

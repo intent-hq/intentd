@@ -20,8 +20,8 @@ use crate::model::{
     LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
     NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
+    ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
@@ -134,6 +134,28 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Owner-only policy on the original native application connection.
+    fn gitlab_child_git_policy_get(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    /// Transport-private helper branch. Implementations require actual local
+    /// owner admission and retain credential proof through final socket output.
+    fn gitlab_child_git_credential(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git credential unavailable".into())) })
+    }
+
     /// Acquire read-only repository context under the original native connection.
     /// Explicit original-socket resource reads; older implementations refuse.
     fn repository_resource_capture(
@@ -162,6 +184,68 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
         Box::pin(async {
             Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryKnownSelection>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource read unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedCapture>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedDetail>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_list(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryResourceList>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_discussions(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryDiscussions>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
                 "Repository resource reads unavailable".into(),
             ))
         })
@@ -277,6 +361,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Workspaces linked to the pull request at `url`
+    /// (`workspace.findByPullRequest`, PROTOCOL §5.1 "Pull request workspace
+    /// lookup"): most recently linked first, archived included, narrowed to the
+    /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
+    /// pull-request URL.
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
+        let _ = url;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
             ))
         })
     }
@@ -2525,6 +2626,30 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_get_queue not implemented".to_string(),
             ))
         })
+    }
+
+    /// `agent.workers.list` (PROTOCOL §5.5b): the agent's complete
+    /// `WorkerSnapshot` — a memory-only read, never a provider call.
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.list".into())) })
+    }
+
+    /// `agent.workers.stop` (PROTOCOL §5.5b): ask the provider to stop one
+    /// worker of `connection_generation`; `{ asyncTaskId, stopped }`.
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, connection_generation, async_task_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.stop".into())) })
     }
 
     /// `agent.stop`: cancel an in-flight stream; `{ success: true }` (PROTOCOL §5.5).
@@ -6398,6 +6523,102 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.list` (PROTOCOL §5.54): `{ profiles, revision }`,
+    /// optionally filtered by `baseProviderId`. Env values are masked.
+    /// Administrator-only.
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = base_provider_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId`, `name` and optional `env`; returns
+    /// `{ profile, revision }` and emits `providers:profiles-changed`.
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name` and
+    /// complete `env` list; returns `{ profile, revision, activation }`.
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (profile_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.delete` (PROTOCOL §5.54): `{ profileId, revision }`;
+    /// refused with `provider-profile-in-use` while saved settings select it.
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = profile_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
+    /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
+    /// with that profile's saved environment. `Some(ref)` checks one profile
+    /// (a missing one fails with `provider-profile-replacement-required`);
+    /// `None` sweeps every saved profile (`includeProfiles: true`). Returns a
+    /// JSON array.
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerTestPrompt` for a named profile reference (PROTOCOL
+    /// §5.54): the live probe runs with that profile's saved environment and
+    /// promotes or demotes only its verdict. A missing profile fails with
+    /// `provider-profile-replacement-required`.
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, model, node_max_old_space_mb);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_test_prompt not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
     /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
     /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:
@@ -7243,26 +7464,81 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Select active, archived or all retained definitions, preserving the list envelope.
+    /// Select only active definitions, preserving the legacy list envelope.
     fn script_list_filtered(
         &self,
         workspace_id: WorkspaceId,
         archive: crate::ScriptArchiveFilter,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            if archive != crate::ScriptArchiveFilter::Active {
+                return Err(Error::InvalidParams(
+                    "only active script lists are supported".into(),
+                ));
+            }
             let mut result = self.script_list(workspace_id).await?;
-            if let Some(scripts) = result
-                .get_mut("scripts")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                scripts.retain(|script| match archive {
-                    crate::ScriptArchiveFilter::All => true,
-                    crate::ScriptArchiveFilter::Active => script.get("archivedAt").is_none(),
-                    crate::ScriptArchiveFilter::Archived => script.get("archivedAt").is_some(),
-                });
+            let rows = if result.is_array() {
+                result.as_array_mut()
+            } else {
+                result
+                    .get_mut("scripts")
+                    .and_then(serde_json::Value::as_array_mut)
+            };
+            if let Some(rows) = rows {
+                rows.retain(|row| row.get("archivedAt").is_none_or(serde_json::Value::is_null));
             }
             Ok(result)
         })
+    }
+
+    /// Strict active-only list views.
+    fn script_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let parsed = crate::script_lists::ScriptListOptions::parse(&options, false)?;
+            if parsed.summary {
+                return Err(Error::InvalidParams("summary lists unsupported".into()));
+            }
+            self.script_list_filtered(workspace_id, crate::ScriptArchiveFilter::Active)
+                .await
+        })
+    }
+    /// Selected unarchived definition; never archive history.
+    fn script_get(
+        &self,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, script_id);
+        Box::pin(async { Err(Error::InvalidParams("script.get unsupported".into())) })
+    }
+    /// Strict active-only monitor list views.
+    fn script_monitor_list_view(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let parsed = crate::script_lists::ScriptListOptions::parse(&options, true)?;
+            if parsed.summary {
+                return Err(Error::InvalidParams("summary lists unsupported".into()));
+            }
+            self.script_monitor_list(workspace_id, agent_id).await
+        })
+    }
+    /// Selected active monitor with optional authenticated owner restriction.
+    fn script_monitor_get(
+        &self,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, monitor_id, owner);
+        Box::pin(async { Err(Error::InvalidParams("scriptMonitor.get unsupported".into())) })
     }
 
     /// Archive an explicit workspace-scoped selection without stopping processes.
@@ -8335,6 +8611,52 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_run_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Planned addressed observation seam. No binding dispatches here until
+    /// reviewMonitoring capability version 1 is implemented. Original private
+    /// request admission must be captured synchronously before the first await.
+    /// Defaults refuse; they must never reinterpret a target as legacy GitHub.
+    fn pr_state_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned agent-owned registration seam, sharing the existing registry,
+    /// caller ownership, limits and adoption rules across both aliases.
+    fn pr_monitor_start_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned addressed cancellation of the original caller's own monitor.
+    /// No provider read is needed to cancel; never cancel by a colliding number.
+    fn pr_monitor_stop_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
             ))
         })
     }

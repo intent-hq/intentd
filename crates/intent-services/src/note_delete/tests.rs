@@ -182,24 +182,27 @@ async fn schedule(
     (request, response)
 }
 async fn settled(svc: &Services, request: &NoteDeleteSchedule) -> NoteDeleteReceipt {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let response = svc
-                .note_delete_status(NoteDeleteStatus {
-                    workspace_id: request.workspace_id.clone(),
-                    note_id: Some(request.note_id.clone()),
-                    operation_key: Some(request.operation_key.clone()),
-                })
-                .await
-                .unwrap();
-            if let Some(NoteDeleteOperation::Receipt(r)) = response.operation {
-                if r.expires_tick_ms.is_some() {
-                    return r;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let response = svc
+                    .note_delete_status(NoteDeleteStatus {
+                        workspace_id: request.workspace_id.clone(),
+                        note_id: Some(request.note_id.clone()),
+                        operation_key: Some(request.operation_key.clone()),
+                    })
+                    .await
+                    .unwrap();
+                if let Some(NoteDeleteOperation::Receipt(r)) = response.operation {
+                    if r.expires_tick_ms.is_some() {
+                        return r;
+                    }
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap()
 }
@@ -291,10 +294,13 @@ async fn shutdown_cancels_pending_without_touching_authoritative_row() {
 }
 
 async fn grace_event(sub: &mut crate::Subscription) -> serde_json::Value {
-    let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let events = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(events.len(), 1);
     serde_json::to_value(&events[0]).unwrap()
 }
@@ -311,9 +317,12 @@ async fn cancel_after_deadline_before_claim_emits_one_terminal_invalidation() {
     let pause = Arc::new(TestPause::default());
     *svc.note_deletions.before_claim.lock().unwrap() = Some(pause.clone());
     let (request, _) = schedule(&svc, &ws, &id, 1).await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(grace_event(&mut sub).await["data"]["state"], "PENDING");
     let cancel = NoteDeleteCancel {
         workspace_id: ws.clone(),
@@ -361,9 +370,12 @@ async fn commit_failure_stays_committing_until_owned_settlement_then_exposes_unc
     let pause = Arc::new(TestPause::default());
     *svc.note_deletions.after_commit.lock().unwrap() = Some(pause.clone());
     let (request, _) = schedule(&svc, &ws, &id, 1).await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     let status = svc
         .note_delete_status(NoteDeleteStatus {
             workspace_id: ws.clone(),
@@ -505,7 +517,16 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         "😀abcdefghijk\r\n".repeat(32768),
     ];
     for (index, source) in samples.into_iter().enumerate() {
+        let started = std::time::Instant::now();
+        let stage = |name| {
+            eprintln!(
+                "note cancellation sample {index}: {name} at {:?}",
+                started.elapsed()
+            );
+        };
+        stage("setup");
         let (_tmp, svc, ws, id) = crate::tests::setup_versioned(&source).await;
+        stage("metadata");
         let mut note = svc.store.get_note(&ws, &id).await.unwrap();
         note.content_type = if index == 0 {
             intent_core::ContentType::PlainText
@@ -518,8 +539,10 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         svc.store.update_note(&note).await.unwrap();
         let before = svc.store.get_note(&ws, &id).await.unwrap();
         assert_eq!(before.content, source);
+        stage("schedule");
         let (request, response) = schedule(&svc, &ws, &id, 60000).await;
         assert!(serde_json::to_vec(&response).unwrap().len() < 2048);
+        stage("cancel");
         svc.cancel_note_delete(NoteDeleteCancel {
             workspace_id: ws.clone(),
             note_id: id.clone(),
@@ -527,12 +550,15 @@ async fn cancellation_preserves_empty_html_task_syntax_large_source_and_supporte
         })
         .await
         .unwrap();
+        stage("settle");
         assert_eq!(
             settled(&svc, &request).await.state,
             NoteDeleteState::Cancelled
         );
         assert_eq!(svc.store.get_note(&ws, &id).await.unwrap(), before);
+        stage("cleanup");
         cleanup(&svc).await;
+        stage("complete");
     }
 }
 #[intent_test_macros::daemon_test]
@@ -568,31 +594,37 @@ async fn legacy_credential_revoked_during_grace_never_deletes() {
         intent_core::caller::with_wire_credential(Some(wire), schedule(&svc, &ws, &id, 1)),
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     authority.0.store(false, Ordering::SeqCst);
     pause.release.notify_one();
     // Original owner cannot authenticate with its revoked bearer. Observe the
     // internal terminal receipt only to prove background authentication.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let terminal = svc
-                .note_deletions
-                .state
-                .lock()
-                .unwrap()
-                .entries
-                .get(&request.operation_key)
-                .and_then(|e| e.receipt.clone());
-            if let Some(r) = terminal.filter(|r| r.expires_tick_ms.is_some()) {
-                assert_eq!(r.state, NoteDeleteState::Failed);
-                assert_eq!(r.reason, Some(NoteDeleteReason::AuthorityLost));
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let terminal = svc
+                    .note_deletions
+                    .state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .get(&request.operation_key)
+                    .and_then(|e| e.receipt.clone());
+                if let Some(r) = terminal.filter(|r| r.expires_tick_ms.is_some()) {
+                    assert_eq!(r.state, NoteDeleteState::Failed);
+                    assert_eq!(r.reason, Some(NoteDeleteReason::AuthorityLost));
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -608,9 +640,12 @@ async fn note_removed_during_grace_is_conflict_without_recreation() {
     let pause = Arc::new(TestPause::default());
     *svc.note_deletions.before_claim.lock().unwrap() = Some(pause.clone());
     let (request, _) = schedule(&svc, &ws, &id, 1).await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     svc.store.delete_note(&ws, &id).await.unwrap();
     pause.release.notify_one();
     let receipt = settled(&svc, &request).await;
@@ -626,9 +661,12 @@ async fn claimed_work_keeps_worker_and_shutdown_debt_until_physical_settlement()
     let pause = Arc::new(TestPause::default());
     *svc.note_deletions.after_commit.lock().unwrap() = Some(pause.clone());
     let (request, _) = schedule(&svc, &ws, &id, 1).await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(svc.store.get_note(&ws, &id).await.is_err());
     assert_eq!(svc.note_deletions.workers.available_permits(), 3);
     svc.note_deletions.close();
@@ -651,9 +689,12 @@ async fn claimed_work_keeps_worker_and_shutdown_debt_until_physical_settlement()
         matches!(response.operation,Some(NoteDeleteOperation::Receipt(r)) if r.state==NoteDeleteState::Committing && r.expires_tick_ms.is_none())
     );
     pause.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), draining)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        draining,
+    )
+    .await
+    .unwrap();
     assert_eq!(svc.note_deletions.workers.available_permits(), 4);
     assert_eq!(
         settled(&svc, &request).await.state,
@@ -746,9 +787,12 @@ async fn actual_task_metadata_and_late_comments_survive_cancel_and_follow_canoni
         let pause = Arc::new(TestPause::default());
         *svc.note_deletions.before_claim.lock().unwrap() = Some(pause.clone());
         let (request, _) = schedule(&svc, &ws, &id, 1).await;
-        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            pause.entered.notified(),
+        )
+        .await
+        .unwrap();
         let comment = grace_comment(&id, "late-comment");
         svc.store.insert_comment(&ws, &comment).await.unwrap();
         // Comment-only insertion does not change note identity or task state.
@@ -800,28 +844,35 @@ async fn deleted_callback_tail_holds_slot_and_receipt_even_when_publish_fails() 
     let pause = Arc::new(TestPause::default());
     *svc.note_deletions.after_commit.lock().unwrap() = Some(pause.clone());
     let (request, _) = schedule(&svc, &ws, &id, 1).await;
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
     let mut writer = svc.store.write_pool().acquire().await.unwrap();
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *writer)
         .await
         .unwrap();
     pause.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let receipt = svc.note_deletions.state.lock().unwrap().entries[&request.operation_key]
-                .receipt
-                .clone()
-                .unwrap();
-            if receipt.state == NoteDeleteState::Deleted {
-                assert!(receipt.expires_tick_ms.is_none());
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let receipt = svc.note_deletions.state.lock().unwrap().entries
+                    [&request.operation_key]
+                    .receipt
+                    .clone()
+                    .unwrap();
+                if receipt.state == NoteDeleteState::Deleted {
+                    assert!(receipt.expires_tick_ms.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(svc.note_deletions.workers.available_permits(), 3);
@@ -960,7 +1011,7 @@ async fn dropped_schedule_request_does_not_abandon_owned_admission_or_rearm() {
             svc.schedule_note_delete(request.clone()),
         ),
     ));
-    tokio::time::timeout(Duration::from_secs(5),async {tokio::select! {result=&mut abandoned=>panic!("admission unexpectedly completed {result:?}"),()=gate.entered.notified()=>{}}}).await.unwrap();
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(5)),async {tokio::select! {result=&mut abandoned=>panic!("admission unexpectedly completed {result:?}"),()=gate.entered.notified()=>{}}}).await.unwrap();
     drop(abandoned);
     assert_eq!(svc.note_deletions.state.lock().unwrap().entries.len(), 1);
     gate.release.notify_one();
@@ -988,5 +1039,46 @@ async fn dropped_schedule_request_does_not_abandon_owned_admission_or_rearm() {
         svc.store.get_note(&ws, &id).await.unwrap().content,
         "lost acknowledgment"
     );
+    cleanup(&svc).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn task_push_grace_parent_deletion_detaches_children() {
+    let (_tmp, svc, ws, parent_id) = crate::tests::setup_versioned("ordinary parent").await;
+    let mut child = svc.store.get_note(&ws, &parent_id).await.unwrap();
+    child.id = NoteId::from("child");
+    child.parent_id = Some(parent_id.clone());
+    child.metadata.task = Some(intent_core::TaskMetadata::default());
+    svc.store.insert_note(&child).await.unwrap();
+    let bus = crate::EventBus::new(svc.store.clone());
+    let svc = svc.with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec![intent_core::events::TASK_UPDATED.into()],
+        workspace_id: Some(ws.to_string()),
+        ..Default::default()
+    });
+    let (request, _) = schedule(&svc, &ws, &parent_id, 1).await;
+    assert_eq!(
+        settled(&svc, &request).await.state,
+        NoteDeleteState::Deleted
+    );
+    let expected = svc.task_list(ws, None).await.unwrap();
+    assert!(expected.tasks[0].parent_id.is_none());
+    let event = grace_event(&mut sub).await;
+    assert_eq!(
+        event["data"]["tasks"],
+        serde_json::to_value(expected.tasks).unwrap()
+    );
+    assert_eq!(event["data"]["removedIds"], serde_json::json!([]));
+    let stats = svc
+        .store
+        .query_events(&intent_store::EventQuery {
+            event_types: vec![intent_core::events::WORKSPACE_TASK_STATS_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(stats.is_empty());
+    bus.shutdown().await.unwrap();
     cleanup(&svc).await;
 }

@@ -114,6 +114,10 @@ pub(crate) fn qualified_review_snapshot(
                 "unknown"
             },
         )
+        .map(|reason| match reason.as_str() {
+            "draft PRs cannot be merged" => "draft MRs cannot be merged".into(),
+            _ => reason,
+        })
     } else {
         None
     };
@@ -133,11 +137,15 @@ pub(crate) fn qualified_review_snapshot(
     if let Some(queued) = signals.is_in_merge_queue {
         requirements["isInMergeQueue"] = json!(queued);
     }
-    if let Some(removal) = &signals.merge_queue_removal {
-        requirements["mergeQueueEjection"] = json!(super::MergeQueueEjection {
-            at: removal.at.clone(),
-            reason: removal.reason.clone(),
-        });
+    if let Some(entry) = super::queued_merge_queue_entry(signals) {
+        requirements["mergeQueue"] = json!(entry);
+    }
+    if let Some(ejection) = signals
+        .merge_queue_removal
+        .as_ref()
+        .and_then(|removal| super::MergeQueueEjection::from_removal(removal, state))
+    {
+        requirements["mergeQueueEjection"] = json!(ejection);
     }
     Ok(json!({
         "repo":target.repository.project_path,"prNumber":observation.details.review.number,

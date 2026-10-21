@@ -544,9 +544,12 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
             .unwrap(),
         json!({"specialistId":null})
     );
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-        .await
-        .expect("successful mixed update event");
+    let event = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("successful mixed update event");
     assert!(event.is_some());
     svc.store.update_agent_session(&ws, &before).await.unwrap();
     assert!(

@@ -212,6 +212,66 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Ids of the workspaces that have at least one tracked change at a
+    /// working stage (`unstaged`/`staged`) — the candidate set for the
+    /// stale-row sweep (intent-hq/intent#7266), so a pass never scans a
+    /// workspace with nothing to prune.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_with_working_tracked_changes(&self) -> Result<Vec<WorkspaceId>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT workspace_id FROM tracked_changes \
+             WHERE stage IN ('unstaged', 'staged') ORDER BY workspace_id",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list tracked-change workspaces failed: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| WorkspaceId(r.get("workspace_id")))
+            .collect())
+    }
+
+    /// Delete tracked-change rows of `workspace_id` named by `(id, updated_at)`
+    /// pairs, but only while each row is still at a working stage
+    /// (`unstaged`/`staged`) **and** its `updated_at` is exactly the value the
+    /// caller judged — so a row re-recorded or moved to `committed` after the
+    /// caller read it survives (the stale-row sweep, intent-hq/intent#7266).
+    /// Returns the number of rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn delete_unchanged_working_tracked_changes(
+        &self,
+        workspace_id: &WorkspaceId,
+        rows: &[(String, String)],
+    ) -> Result<u64> {
+        // Two parameters per row: stay well under SQLite's bound-parameter limit.
+        const CHUNK: usize = 400;
+        let mut deleted = 0;
+        for chunk in rows.chunks(CHUNK) {
+            let pairs = vec!["(?, ?)"; chunk.len()].join(", ");
+            let sql = format!(
+                "DELETE FROM tracked_changes WHERE workspace_id = ? \
+                 AND stage IN ('unstaged', 'staged') \
+                 AND (id, updated_at) IN (VALUES {pairs})"
+            );
+            let mut q = sqlx::query(&sql).bind(&workspace_id.0);
+            for (id, updated_at) in chunk {
+                q = q.bind(id).bind(updated_at);
+            }
+            let result = q
+                .execute(self.write_pool())
+                .await
+                .map_err(|e| Error::Internal(format!("delete tracked changes failed: {e}")))?;
+            deleted += result.rows_affected();
+        }
+        Ok(deleted)
+    }
+
     /// List a workspace's tracked changes, oldest first. Internal read used by the
     /// pipeline + tests (the UI-facing reads land in M4.8).
     ///
@@ -254,4 +314,150 @@ fn map_tracked_change_row(r: &SqliteRow) -> Result<TrackedChangeRow> {
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("tracked.db")).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO workspace(id,title,branch,created_at,updated_at)
+             VALUES ('w1','One','main','c','u'), ('w2','Two','main','c','u'),
+                    ('w3','Three','main','c','u');",
+        )
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        (dir, store)
+    }
+
+    fn change(ws: &str, path: &str, stage: &str) -> NewTrackedChange {
+        NewTrackedChange {
+            workspace_id: WorkspaceId(ws.to_string()),
+            path: path.to_string(),
+            stage: stage.to_string(),
+            status: "modified".to_string(),
+            agent_id: Some("agent".to_string()),
+            session_id: None,
+            turn: None,
+            commit_hash: None,
+            old_blob_sha: None,
+            new_blob_sha: None,
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_only_workspaces_with_working_stage_rows() {
+        let (_dir, store) = store().await;
+        store
+            .upsert_tracked_change(&change("w1", "a", "unstaged"))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change("w2", "b", "committed"))
+            .await
+            .unwrap();
+        store
+            .upsert_tracked_change(&change("w3", "c", "staged"))
+            .await
+            .unwrap();
+        let ids = store
+            .list_workspaces_with_working_tracked_changes()
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![WorkspaceId("w1".to_string()), WorkspaceId("w3".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_requires_working_stage_and_unchanged_timestamp() {
+        let (_dir, store) = store().await;
+        let ws = WorkspaceId("w1".to_string());
+        for (path, stage) in [
+            ("stale", "unstaged"),
+            ("staged", "staged"),
+            ("touched", "unstaged"),
+            ("committed", "unstaged"),
+        ] {
+            store
+                .upsert_tracked_change(&change("w1", path, stage))
+                .await
+                .unwrap();
+        }
+        let judged: Vec<(String, String)> = store
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.updated_at))
+            .collect();
+        // After judging: one row is re-recorded, one moves to committed.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .upsert_tracked_change(&change("w1", "touched", "unstaged"))
+            .await
+            .unwrap();
+        store
+            .set_tracked_change_stage(&ws, "committed", "unstaged", "committed")
+            .await
+            .unwrap();
+        // A different workspace's id never matches.
+        let other = WorkspaceId("w2".to_string());
+        assert_eq!(
+            store
+                .delete_unchanged_working_tracked_changes(&other, &judged)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let deleted = store
+            .delete_unchanged_working_tracked_changes(&ws, &judged)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2, "only the untouched working-stage rows go");
+        let mut left: Vec<String> = store
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["committed".to_string(), "touched".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn delete_handles_more_rows_than_one_chunk() {
+        let (_dir, store) = store().await;
+        let ws = WorkspaceId("w1".to_string());
+        for i in 0..1_000 {
+            store
+                .upsert_tracked_change(&change("w1", &format!("f{i}"), "unstaged"))
+                .await
+                .unwrap();
+        }
+        let judged: Vec<(String, String)> = store
+            .list_tracked_changes(&ws)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.updated_at))
+            .collect();
+        assert_eq!(
+            store
+                .delete_unchanged_working_tracked_changes(&ws, &judged)
+                .await
+                .unwrap(),
+            1_000
+        );
+        assert!(store.list_tracked_changes(&ws).await.unwrap().is_empty());
+    }
 }

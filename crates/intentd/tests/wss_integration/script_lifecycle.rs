@@ -83,11 +83,18 @@ async fn purged_repository_scripts_stay_empty_after_wss_reconnect() {
             json!({"workspaceId":ws,"archive":archive}),
         )
         .await;
-        assert_eq!(
-            listed,
-            json!({"jsonrpc":"2.0","id":4,"result":{"scripts":[]}}),
-            "reconnecting must not undo an explicit purge"
-        );
+        if archive == "active" {
+            assert_eq!(
+                listed["result"],
+                json!({"scripts":[]}),
+                "reconnecting must not undo an explicit purge"
+            );
+        } else {
+            assert_eq!(
+                listed["error"]["code"], -32602,
+                "history enumeration is refused"
+            );
+        }
     }
     assert!(srv.store.list_all_scripts().await.unwrap().is_empty());
     srv.ws.stop().await;
@@ -135,7 +142,8 @@ async fn script_archive_restore_contract_over_wss() {
             assert_eq!(data["scriptId"], "retained");
             assert_eq!(data["action"], "updated");
             let listed = rpc(&mut client, 40, "script.list", json!({"workspaceId":ws})).await;
-            assert_eq!(data["script"], listed["result"]["scripts"][0]);
+            assert!(data["script"]["archivedAt"].is_string());
+            assert_eq!(listed["result"], json!({"scripts":[]}));
             break;
         }
     }
@@ -148,8 +156,7 @@ async fn script_archive_restore_contract_over_wss() {
     .await;
     assert_eq!(active["result"], json!({"scripts":[]}));
     let legacy = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
-    assert_eq!(legacy["result"]["scripts"][0]["id"], "retained");
-    assert!(legacy["result"]["scripts"][0]["archivedAt"].is_string());
+    assert_eq!(legacy["result"], json!({"scripts":[]}));
     let history = rpc(
         &mut client,
         7,
@@ -157,7 +164,7 @@ async fn script_archive_restore_contract_over_wss() {
         json!({"workspaceId":ws,"archive":"archived"}),
     )
     .await;
-    assert_eq!(history["result"], legacy["result"]);
+    assert_eq!(history["error"]["code"], -32602);
     for (id, method, params) in [
         (8, "script.list", json!({"workspaceId":ws,"archive":null})),
         (
@@ -262,7 +269,7 @@ async fn script_default_one_off_settlement_and_output_over_wss() {
         assert_eq!(run["result"]["exitCode"], code, "{run}");
         assert_eq!(run["result"]["timedOut"], false);
         let mut exited = false;
-        loop {
+        let row = loop {
             let event = frame(&mut watching).await;
             let event = &event["params"]["event"];
             if event["data"]["scriptId"] != sid {
@@ -275,17 +282,16 @@ async fn script_default_one_off_settlement_and_output_over_wss() {
             if event["type"] == "script:changed" && event["data"]["action"] == "updated" {
                 assert!(exited, "archive snapshot follows final state");
                 let listed = rpc(&mut client, 40, "script.list", json!({"workspaceId":ws})).await;
-                let row = listed["result"]["scripts"]
+                assert!(listed["result"]["scripts"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .find(|r| r["id"] == sid)
-                    .unwrap();
-                assert_eq!(&event["data"]["script"], row);
+                    .all(|r| r["id"] != sid));
+                let row = event["data"]["script"].clone();
                 assert_eq!(row["lastRun"]["outcome"], outcome);
-                break;
+                break row;
             }
-        }
+        };
         let active = rpc(
             &mut client,
             5,
@@ -295,12 +301,7 @@ async fn script_default_one_off_settlement_and_output_over_wss() {
         .await;
         assert_eq!(active["result"], json!({"scripts":[]}));
         let all = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
-        let row = all["result"]["scripts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["id"] == sid)
-            .unwrap();
+        assert_eq!(all["result"], json!({"scripts":[]}));
         assert!(row["archivedAt"].is_string());
         assert_eq!(row["lastRun"]["outcome"], outcome);
         assert_eq!(row["lastRun"]["exitCode"], code);
@@ -650,15 +651,27 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
         assert_eq!(snapshot["lastRun"]["outcome"], outcome, "{sid}: {snapshot}");
         assert_eq!(snapshot["archivedAt"].is_string(), purpose == "oneOff");
         let list = rpc(&mut client, 6, "script.list", json!({"workspaceId":ws})).await;
-        assert_eq!(
-            &snapshot,
-            list["result"]["scripts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|r| r["id"] == sid)
-                .unwrap()
-        );
+        let listed = list["result"]["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == sid);
+        if purpose == "oneOff" {
+            assert!(
+                listed.is_none(),
+                "retired scripts are absent from every list"
+            );
+            let status = rpc(
+                &mut client,
+                60,
+                "script.status",
+                json!({"workspaceId":ws,"scriptId":sid}),
+            )
+            .await;
+            assert_eq!(status["result"], snapshot["runtime"]);
+        } else {
+            assert_eq!(Some(&snapshot), listed);
+        }
         let stopped = rpc(
             &mut client,
             9,

@@ -10,7 +10,9 @@
 
 use std::time::Duration;
 
-use intent_core::events::{is_collaborator_event_type, NOTE_PRESENCE, PRESENCE_CHANGED};
+use intent_core::events::{
+    is_collaborator_event_type, NOTE_PRESENCE, PRESENCE_CHANGED, PR_MONITOR_REFRESHED,
+};
 use intent_core::{parse_iso, ActorType, Event};
 
 /// Category wildcards that a bare `*` subscription expands to. Mirrors
@@ -55,13 +57,16 @@ pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// plus the high-volume streaming types outside the `agent:` prefix:
 /// `chat:stream:delta` and the transient presence pair (`presence:changed`,
 /// `note:presence` — up to ten caret moves a second per viewer, multiplayer
-/// w5; a `note:*` subscriber must not be woken by them). The prefix rule
-/// also covers the `agent:*` pattern itself.
+/// w5; a `note:*` subscriber must not be woken by them), and the UI-only
+/// `prMonitor:refreshed` re-read hint (merge-queue movement must never wake
+/// an agent; agents read the queue entry on request). The prefix rule also
+/// covers the `agent:*` pattern itself.
 pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
     event_type.starts_with("agent:")
         || event_type == "chat:stream:delta"
         || event_type == PRESENCE_CHANGED
         || event_type == NOTE_PRESENCE
+        || event_type == PR_MONITOR_REFRESHED
 }
 
 /// Whether an event type travels ONLY on its scoped subscription channel and
@@ -342,6 +347,7 @@ mod tests {
             "chat:stream:delta",
             "presence:changed",
             "note:presence",
+            "prMonitor:refreshed",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
         }
@@ -350,6 +356,7 @@ mod tests {
             "task:status-changed",
             "chat:stream",
             "note:updated",
+            "prMonitor:changed",
         ] {
             assert!(!is_agent_restricted_event_type(t), "{t} must be allowed");
         }

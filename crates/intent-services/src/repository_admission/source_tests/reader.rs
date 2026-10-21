@@ -952,7 +952,7 @@ async fn verified_same_binding_refresh_reacquires_real_file_without_resetting_qu
                     assert!(directory
                         .record_backoff(
                             ticket.dispatch_stamp(),
-                            Instant::now() + Duration::from_secs(60)
+                            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60))
                         )
                         .unwrap());
                     assert!(matches!(

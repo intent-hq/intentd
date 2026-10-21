@@ -406,3 +406,87 @@ async fn comment_respond_adds_reply_to_thread() {
 
     drop(services);
 }
+
+/// intent-hq/intent#7186: once `comment.add` embeds anchor markers, `note.edit`
+/// must still match the visible text and keep the comment anchored.
+#[intent_test_macros::daemon_test]
+async fn note_edit_matches_visible_text_around_comment_anchor() {
+    let (services, ws, _tmp) = setup().await;
+
+    let note = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "t".to_string(),
+                content: Some("Alpha line here.\nBeta line here.\n".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+
+    let added = services
+        .comment_add(
+            ws.clone(),
+            note.id.clone(),
+            "Beta line here.".to_string(),
+            "Beta".to_string(),
+            "c".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add comment");
+    assert!(added.anchored);
+
+    let result = services
+        .edit_note(
+            ws.clone(),
+            note.id.clone(),
+            NoteEditInput {
+                old: "Beta line here.".to_string(),
+                new: "Beta line edited.".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("edit matches visible text despite anchor markers");
+    assert!(result.ok);
+
+    let id = &added.comment_id;
+    let expected = format!(
+        "Alpha line here.\n<!--anchor:{id}:start-->Beta<!--anchor:{id}:end--> line edited.\n"
+    );
+    assert_eq!(result.new_content, expected);
+    let stored = services
+        .get_note(ws.clone(), note.id.clone())
+        .await
+        .expect("get note");
+    assert_eq!(stored.content, expected);
+
+    let listed = services
+        .comment_list(ws.clone(), note.id.clone(), None, None, None, true)
+        .await
+        .expect("list comments");
+    let thread = listed
+        .threads
+        .iter()
+        .find(|t| t.comments.iter().flatten().any(|c| c.id == *id))
+        .expect("thread for comment");
+    assert_eq!(thread.targeted_text.as_deref(), Some("Beta"));
+    let root = thread
+        .comments
+        .as_ref()
+        .and_then(|c| c.iter().find(|c| c.id == *id))
+        .expect("root comment");
+    assert_ne!(root.is_orphaned, Some(true));
+
+    drop(services);
+}

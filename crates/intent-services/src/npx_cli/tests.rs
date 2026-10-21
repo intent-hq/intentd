@@ -116,7 +116,7 @@ esac
         .stderr(Stdio::from(log));
     let mut child = GuardedChild::spawn(&mut cmd).expect("start isolated service test");
     let status = child
-        .wait_with_timeout(Duration::from_secs(120))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
         .expect("wait for isolated service test")
         .expect("isolated service test timed out");
     assert!(
