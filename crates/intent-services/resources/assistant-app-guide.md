@@ -519,6 +519,14 @@ details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/providers/components/ProviderCliVersionToast.svelte; src/features/providers/utils/provider-cli-warnings.ts; src/store/renderer/slices/host-requirements/sagas/provider-cli-requirements-saga.ts. -->
+
+When the daemon host's Codex CLI is older than Intent requires, the host owner
+sees **Codex CLI is out of date** with **Update**. **Update** runs `codex update`
+in a terminal on the daemon host; follow its output until it finishes. If the
+button is missing or the command fails, update Codex with the tool that
+installed it.
+
 ## Missed display updates
 
 <!-- Sources: packages/cloudlands-fe/src/features/events/renderer-event-recovery.ts; packages/cloudlands-fe/src/features/backend/main/main-event-recovery.ts; packages/cloudlands-fe/src/lib/client/live/terminal-runtime-recovery.ts; packages/cloudlands-fe/src/shared/event-recovery/resource.ts; packages/intentd/crates/intent-transport/src/conn/recovery.rs. -->
