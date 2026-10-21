@@ -22654,6 +22654,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         api.clone(),
         refresher,
         &health,
+        intent_services::worktree_presence::WorktreePresence::default(),
     )
     .await;
 

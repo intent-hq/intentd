@@ -190,7 +190,8 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// Recompute the `WorkspaceGitStatus` for one workspace and publish it as a
 /// `changes:git-status` event. Remote workspaces and workspaces without a
 /// resolvable worktree are skipped (their status cannot change via local
-/// `file:*` events). Failures are logged, never fatal to the loop.
+/// `file:*` events), as are workspaces whose checkout folder is missing
+/// (intent-hq/intent#7183). Failures are logged, never fatal to the loop.
 pub(crate) async fn refresh_workspace(
     bus: &EventBus,
     services: &dyn WorkspaceApi,
@@ -210,6 +211,16 @@ pub(crate) async fn refresh_workspace(
     let Some(worktree) = git_ops::worktree_path(&ws) else {
         return;
     };
+    // A checkout folder missing on disk (deleted or unmounted outside Intent,
+    // intent-hq/intent#7183) has no status to report. Publishing the minimal
+    // status here would tell the app the workspace is clean, so keep the last
+    // published status instead. The watcher registry's presence probe logs
+    // the transition and re-triggers a refresh when the folder returns.
+    if !crate::worktree_presence::checkout_dir_exists(&worktree) {
+        status_cache.invalidate(&worktree);
+        tracing::debug!(workspace = %ws_id, path = %worktree.display(), "git-status refresh skipped: checkout missing");
+        return;
+    }
     // The change that triggered this refresh is exactly what invalidates the
     // read path's cached scan (monorepo#1648): discard the stale entry and let
     // this recompute's scan repopulate it, so reads land on a warm, current
@@ -532,6 +543,36 @@ mod tests {
         // the workspace branch (payload shape check).
         assert_eq!(ev.data["status"]["branch"], "feature/x");
         assert!(ev.data["status"].get("uncommittedCount").is_some());
+    }
+
+    /// intent-hq/intent#7183: a workspace whose checkout folder is gone must
+    /// not publish the minimal (clean, zero-change) status, which would tell
+    /// the app the workspace is clean. A present workspace refreshed right
+    /// after still publishes, and its event is the first one on the bus.
+    #[tokio::test]
+    async fn missing_checkout_publishes_no_git_status() {
+        let (_db, bus, mut sub) = bus_and_status_sub().await;
+        let gone = TempDir::new("gone");
+        let missing_root = gone.path.join("checkout-deleted");
+        let present = TempDir::new("present");
+        let ws_missing = test_workspace("ws-missing", &missing_root);
+        let ws_present = test_workspace("ws-present", &present.path);
+        let api = FakeApi::new(vec![ws_missing.clone(), ws_present.clone()]);
+        let cache = GitStatusCache::new();
+
+        refresh_workspace(&bus, &api, &cache, &ws_missing.id).await;
+        refresh_workspace(&bus, &api, &cache, &ws_present.id).await;
+
+        let batch = timeout(crate::events::LIVENESS, sub.recv())
+            .await
+            .expect("present workspace status must publish")
+            .expect("subscription open");
+        let first = batch.first().expect("non-empty batch");
+        assert_eq!(
+            first.workspace_id, ws_present.id,
+            "missing checkout published a status: {first:?}"
+        );
+        assert!(batch.iter().all(|ev| ev.workspace_id != ws_missing.id));
     }
 
     #[tokio::test]

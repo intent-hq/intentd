@@ -2648,6 +2648,7 @@ async fn cmd_serve_owned(
             api.clone(),
             Arc::clone(&git_status_refresher),
             watch_health.clone(),
+            services.worktree_presence(),
             watcher_shutdown,
         )
     });
@@ -6604,6 +6605,7 @@ fn spawn_watcher_registry_init(
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
     watch_health: intent_services::WatchHealth,
+    presence: intent_services::worktree_presence::WorktreePresence,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
@@ -6629,7 +6631,15 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start_with_health(&hub, bus, api, refresher, &watch_health).await
+                WatcherRegistry::start_with_health(
+                    &hub,
+                    bus,
+                    api,
+                    refresher,
+                    &watch_health,
+                    presence,
+                )
+                .await
             })
         });
         tracing::info!("watcher registry ready");

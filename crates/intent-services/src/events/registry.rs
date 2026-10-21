@@ -31,6 +31,17 @@
 //! catch-up so derived state changed while unwatched is not silently lost: a
 //! `GitStatusRefresher::trigger` plus the skills/specialists rescan (both
 //! fingerprint-checked, so an untouched tree emits nothing).
+//!
+//! Missing checkouts (intent-hq/intent#7183) are a sixth transition, detected
+//! by polling rather than by an event: a workspace whose root folder was
+//! deleted or unmounted outside Intent. Boot and runtime registration track
+//! such a root as *missing* instead of silently skipping it, and a presence
+//! probe every [`CHECKOUT_PROBE_INTERVAL`] stats each watched and missing
+//! root. A watched root that has vanished has its watches stopped, which also
+//! releases its shared common-dir watch so activity in the source repository
+//! stops re-triggering refreshes. A missing root that reappears is re-armed
+//! like an unarchive, catch-up included. Transitions are logged once through
+//! the shared [`WorktreePresence`] map.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,12 +64,18 @@ use super::shared_watch::{SharedWatchHub, WatchHealth};
 use super::skills_watcher::SkillsWatcher;
 use super::specialists_watcher::SpecialistsWatcher;
 use super::watcher::FileWatcher;
+use crate::worktree_presence::WorktreePresence;
 
 /// How long a created workspace's deferred watcher start waits for
 /// `workspace:setup:completed` before starting anyway (with a WARN). Bounds
 /// the deferral when the completion is never observed (missed event, daemon
 /// race, hung script) so file events are never silenced indefinitely.
 const SETUP_COMPLETION_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// How often the registry stats every watched and missing workspace root to
+/// detect a checkout deleted, unmounted, or restored outside Intent
+/// (intent-hq/intent#7183). One `stat` per root per tick.
+const CHECKOUT_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// A created workspace whose watcher start is deferred until its setup stage
 /// completes: the root resolved from the `workspace:created` payload plus the
@@ -113,6 +130,7 @@ impl WatcherRegistry {
             services,
             refresher,
             &WatchHealth::default(),
+            WorktreePresence::default(),
         )
         .await
     }
@@ -123,34 +141,43 @@ impl WatcherRegistry {
     /// backgrounded start runs — the hub so the `config.toml` watcher can share
     /// its stream (intent-hq/intent#4953), the health handle so `DaemonControl`
     /// can hold it; until attachment the handle snapshots `None` (rendered as
-    /// an absent field).
+    /// an absent field). `presence` is the daemon's shared missing-checkout
+    /// map (`Services::worktree_presence`), so the probe's transition logs
+    /// and the auto-commit gate agree.
     pub async fn start_with_health(
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
         health: &WatchHealth,
+        presence: WorktreePresence,
     ) -> Self {
-        Self::start_with_backstop(
+        Self::start_with_timings(
             hub,
             bus,
             services,
             refresher,
             health,
+            presence,
             SETUP_COMPLETION_BACKSTOP,
+            CHECKOUT_PROBE_INTERVAL,
         )
         .await
     }
 
-    /// [`Self::start`] with an explicit setup-completion backstop, so tests
-    /// can exercise the backstop without waiting out the production window.
-    async fn start_with_backstop(
+    /// [`Self::start`] with an explicit setup-completion backstop and
+    /// checkout probe interval, so tests can exercise both without waiting
+    /// out the production windows.
+    #[expect(clippy::too_many_arguments)]
+    async fn start_with_timings(
         hub: &Arc<SharedWatchHub>,
         bus: EventBus,
         services: Arc<dyn WorkspaceApi>,
         refresher: Arc<GitStatusRefresher>,
         health: &WatchHealth,
+        presence: WorktreePresence,
         setup_backstop: Duration,
+        probe_interval: Duration,
     ) -> Self {
         // Subscribe BEFORE taking the workspace snapshot: subscription
         // delivery is live-only, so a lifecycle event published between the
@@ -169,20 +196,31 @@ impl WatcherRegistry {
             ..SubscriptionFilter::default()
         });
 
-        let initial = match services.list_workspaces(false).await {
-            Ok(ws) => ws
-                .into_iter()
-                .filter_map(|ws| {
-                    let root = ws.effective_path()?.to_string();
-                    let path = PathBuf::from(&root);
-                    path.is_dir().then_some((ws.id, path))
-                })
-                .collect(),
+        // Roots missing at boot (deleted or unmounted outside Intent) are
+        // tracked so the presence probe can arm them when they reappear
+        // instead of being skipped until the next daemon restart.
+        let mut initial: Vec<(WorkspaceId, PathBuf)> = Vec::new();
+        let mut missing: HashMap<WorkspaceId, PathBuf> = HashMap::new();
+        match services.list_workspaces(false).await {
+            Ok(list) => {
+                for ws in list {
+                    let Some(root) = ws.effective_path() else {
+                        continue;
+                    };
+                    let path = PathBuf::from(root);
+                    if path.is_dir() {
+                        initial.push((ws.id, path));
+                    } else if !ws.is_remote && !ws.archived {
+                        presence.observe(&ws.id, &path);
+                        missing.insert(ws.id, path);
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "could not list workspaces for watching");
-                Vec::new()
             }
-        };
+        }
+        let roots: HashMap<WorkspaceId, PathBuf> = initial.iter().cloned().collect();
 
         // All four families share the hub's streams, so the steady-state
         // FSEvents stream count follows the number of distinct parent
@@ -241,6 +279,12 @@ impl WatcherRegistry {
             skills,
             specialists,
             setup_backstop,
+            Probe {
+                presence,
+                interval: probe_interval,
+                roots,
+                missing,
+            },
             stopped,
         ));
         Self {
@@ -371,6 +415,52 @@ fn archived_delta(ev: &Event) -> Option<bool> {
         .and_then(serde_json::Value::as_bool)
 }
 
+/// Checkout presence state for the lifecycle loop (intent-hq/intent#7183):
+/// the root of every watched workspace and of every workspace whose root is
+/// currently missing, plus the shared transition log.
+struct Probe {
+    presence: WorktreePresence,
+    interval: Duration,
+    /// Roots with live watches.
+    roots: HashMap<WorkspaceId, PathBuf>,
+    /// Roots that should be watched but are missing on disk.
+    missing: HashMap<WorkspaceId, PathBuf>,
+}
+
+impl Probe {
+    /// Record that `ws_id` is now watched at `path`.
+    fn watching(&mut self, ws_id: &WorkspaceId, path: &Path) {
+        self.missing.remove(ws_id);
+        self.roots.insert(ws_id.clone(), path.to_path_buf());
+    }
+
+    /// Stop tracking `ws_id` (deleted, closed, or archived).
+    fn forget(&mut self, ws_id: &WorkspaceId) {
+        self.roots.remove(ws_id);
+        self.missing.remove(ws_id);
+        self.presence.forget(ws_id);
+    }
+}
+
+/// Resolve the root for a runtime registration whose folder does not exist
+/// and, when it belongs to an unarchived local workspace, track it as missing
+/// so the probe arms it once it reappears. Returns whether it is tracked.
+async fn track_missing_root(ev: &Event, services: &dyn WorkspaceApi, probe: &mut Probe) -> bool {
+    let Some(path) = resolve_root(ev, services).await else {
+        return false;
+    };
+    let Ok(ws) = services.get_workspace(ev.workspace_id.clone()).await else {
+        return false;
+    };
+    if ws.is_remote || ws.archived {
+        return false;
+    }
+    probe.roots.remove(&ev.workspace_id);
+    probe.presence.observe(&ev.workspace_id, &path);
+    probe.missing.insert(ev.workspace_id.clone(), path);
+    true
+}
+
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
 #[expect(clippy::too_many_arguments)]
 async fn lifecycle_loop(
@@ -385,8 +475,11 @@ async fn lifecycle_loop(
     skills: SkillsWatcher,
     specialists: SpecialistsWatcher,
     setup_backstop: Duration,
+    mut probe: Probe,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
+    let mut probe_tick = tokio::time::interval_at(Instant::now() + probe.interval, probe.interval);
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Created workspaces awaiting `workspace:setup:completed` before their
     // watchers start. The loop sleeps toward the earliest deadline; a
     // deadline reached without a completion starts the watchers anyway.
@@ -395,53 +488,98 @@ async fn lifecycle_loop(
         if *stopped.borrow() {
             break;
         }
-        let batch = match pending.values().map(|p| p.deadline).min() {
-            None => tokio::select! {
-                biased;
-                _ = stopped.changed() => break,
-                batch = sub.recv() => match batch {
-                    Some(batch) => batch,
-                    None => break,
-                },
+        let next_deadline = pending.values().map(|p| p.deadline).min();
+        let batch = tokio::select! {
+            biased;
+            _ = stopped.changed() => break,
+            batch = sub.recv() => match batch {
+                Some(batch) => batch,
+                None => break,
             },
-            Some(deadline) => tokio::select! {
-                biased;
-                _ = stopped.changed() => break,
-                batch = sub.recv() => match batch {
-                    Some(batch) => batch,
-                    None => break,
-                },
-                () = tokio::time::sleep_until(deadline) => {
-                    let now = Instant::now();
-                    let expired: Vec<WorkspaceId> = pending
-                        .iter()
-                        .filter(|(_, p)| p.deadline <= now)
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for ws_id in expired {
-                        let p = pending.remove(&ws_id).expect("expired entry present");
-                        tracing::warn!(
-                            workspace = %ws_id,
-                            "workspace setup completion not observed within {}s; starting watchers anyway",
-                            setup_backstop.as_secs(),
-                        );
-                        start_watches(
-                            &hub,
-                            &common_watches,
-                            &bus,
-                            &refresher,
-                            &mut file_watchers,
-                            &mut git_watchers,
-                            &ws_id,
-                            &p.path,
-                            " (setup completion backstop)",
-                        );
-                        skills.add_workspace(ws_id.clone(), &p.path.clone());
-                        specialists.add_workspace(ws_id, &p.path);
-                    }
-                    continue;
+            () = sleep_until_opt(next_deadline), if next_deadline.is_some() => {
+                let now = Instant::now();
+                let expired: Vec<WorkspaceId> = pending
+                    .iter()
+                    .filter(|(_, p)| p.deadline <= now)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for ws_id in expired {
+                    let p = pending.remove(&ws_id).expect("expired entry present");
+                    tracing::warn!(
+                        workspace = %ws_id,
+                        "workspace setup completion not observed within {}s; starting watchers anyway",
+                        setup_backstop.as_secs(),
+                    );
+                    start_watches(
+                        &hub,
+                        &common_watches,
+                        &bus,
+                        &refresher,
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        &p.path,
+                        " (setup completion backstop)",
+                    );
+                    probe.watching(&ws_id, &p.path);
+                    skills.add_workspace(ws_id.clone(), &p.path.clone());
+                    specialists.add_workspace(ws_id, &p.path);
                 }
-            },
+                continue;
+            }
+            _ = probe_tick.tick() => {
+                // Reappeared roots first, so a root that vanishes in this same
+                // tick is not observed twice.
+                let missing: Vec<(WorkspaceId, PathBuf)> = probe
+                    .missing
+                    .iter()
+                    .map(|(id, p)| (id.clone(), p.clone()))
+                    .collect();
+                for (ws_id, path) in missing {
+                    if !probe.presence.observe(&ws_id, &path) {
+                        continue;
+                    }
+                    start_watches(
+                        &hub,
+                        &common_watches,
+                        &bus,
+                        &refresher,
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        &path,
+                        " (checkout reappeared)",
+                    );
+                    probe.watching(&ws_id, &path);
+                    // Same catch-up as unarchive: derived state may have
+                    // changed while the folder was away.
+                    refresher.trigger(ws_id.clone());
+                    skills.resume_workspace(ws_id.clone(), &path);
+                    specialists.resume_workspace(ws_id, &path);
+                }
+                let watched: Vec<(WorkspaceId, PathBuf)> = probe
+                    .roots
+                    .iter()
+                    .filter(|(id, _)| !probe.missing.contains_key(*id))
+                    .map(|(id, p)| (id.clone(), p.clone()))
+                    .collect();
+                for (ws_id, path) in watched {
+                    if probe.presence.observe(&ws_id, &path) {
+                        continue;
+                    }
+                    stop_watches(
+                        &mut file_watchers,
+                        &mut git_watchers,
+                        &ws_id,
+                        "checkout missing",
+                    );
+                    skills.pause_workspace(&ws_id);
+                    specialists.pause_workspace(&ws_id);
+                    probe.roots.remove(&ws_id);
+                    probe.missing.insert(ws_id, path);
+                }
+                continue;
+            }
         };
         for ev in batch {
             if *stopped.borrow() {
@@ -484,11 +622,22 @@ async fn lifecycle_loop(
                         &p.path,
                         " (setup completed)",
                     );
+                    probe.watching(&ws_id, &p.path);
                     skills.add_workspace(ws_id.clone(), &p.path.clone());
                     specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
                     let Some(path) = resolve_path(&ev, services.as_ref()).await else {
+                        if track_missing_root(&ev, services.as_ref(), &mut probe).await {
+                            pending.remove(&ws_id);
+                            stop_watches(
+                                &mut file_watchers,
+                                &mut git_watchers,
+                                &ws_id,
+                                "checkout missing",
+                            );
+                            continue;
+                        }
                         tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
                         continue;
                     };
@@ -508,6 +657,7 @@ async fn lifecycle_loop(
                         &path,
                         " (runtime registration)",
                     );
+                    probe.watching(&ws_id, &path);
                     skills.add_workspace(ws_id.clone(), &path.clone());
                     specialists.add_workspace(ws_id, &path);
                 }
@@ -521,6 +671,7 @@ async fn lifecycle_loop(
                         &ws_id,
                         "runtime deregistration",
                     );
+                    probe.forget(&ws_id);
                     skills.remove_workspace(&ws_id);
                     specialists.remove_workspace(&ws_id);
                 }
@@ -539,10 +690,14 @@ async fn lifecycle_loop(
                             &ws_id,
                             "workspace archived",
                         );
+                        probe.forget(&ws_id);
                         skills.pause_workspace(&ws_id);
                         specialists.pause_workspace(&ws_id);
                     }
-                    Some(false) if file_watchers.contains_key(&ws_id) => {
+                    Some(false)
+                        if file_watchers.contains_key(&ws_id)
+                            || probe.missing.contains_key(&ws_id) =>
+                    {
                         // Redundant `archived: false` (a `workspace.update`
                         // restating the flag, or a double unarchive): the
                         // watches are live, so replacing them would open a
@@ -552,7 +707,9 @@ async fn lifecycle_loop(
                     }
                     Some(false) => {
                         let Some(path) = resolve_path(&ev, services.as_ref()).await else {
-                            tracing::debug!(workspace = %ws_id, "unarchived workspace without resolvable path; not watching");
+                            if !track_missing_root(&ev, services.as_ref(), &mut probe).await {
+                                tracing::debug!(workspace = %ws_id, "unarchived workspace without resolvable path; not watching");
+                            }
                             continue;
                         };
                         start_watches(
@@ -566,6 +723,7 @@ async fn lifecycle_loop(
                             &path,
                             " (workspace unarchived)",
                         );
+                        probe.watching(&ws_id, &path);
                         // Catch-up for the unwatched window: recompute the
                         // derived state that missed `file:*`/`.git` events
                         // would have refreshed. Cost is bounded to one pass
@@ -606,6 +764,14 @@ async fn lifecycle_loop(
 /// checkouts may persist only `repositoryPath` (monorepo#3778). Returns
 /// `None` when the workspace has no existing directory.
 async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf> {
+    resolve_root(ev, services)
+        .await
+        .filter(|path| path.is_dir())
+}
+
+/// [`resolve_path`] without the existence check: the recorded root, whether
+/// or not the folder is currently on disk.
+async fn resolve_root(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf> {
     let from_payload = ev
         .data
         .get("workspace")
@@ -631,7 +797,14 @@ async fn resolve_path(ev: &Event, services: &dyn WorkspaceApi) -> Option<PathBuf
         ws.effective_path().map(PathBuf::from)
     }?;
 
-    path.is_dir().then_some(path)
+    Some(path)
+}
+
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -884,13 +1057,41 @@ mod tests {
             api.clone(),
             Arc::new(crate::git_status_cache::GitStatusCache::new()),
         ));
-        WatcherRegistry::start_with_backstop(
+        WatcherRegistry::start_with_timings(
             &SharedWatchHub::new(),
             bus.clone(),
             api,
             refresher,
             &WatchHealth::default(),
+            WorktreePresence::default(),
             backstop,
+            CHECKOUT_PROBE_INTERVAL,
+        )
+        .await
+    }
+
+    /// [`start_registry`] with a short checkout probe interval and a caller-held
+    /// presence map, for the missing-checkout tests (intent-hq/intent#7183).
+    async fn start_registry_with_probe(
+        bus: &EventBus,
+        api: Arc<dyn WorkspaceApi>,
+        presence: WorktreePresence,
+        probe_interval: Duration,
+    ) -> WatcherRegistry {
+        let refresher = Arc::new(GitStatusRefresher::start(
+            bus.clone(),
+            api.clone(),
+            Arc::new(crate::git_status_cache::GitStatusCache::new()),
+        ));
+        WatcherRegistry::start_with_timings(
+            &SharedWatchHub::new(),
+            bus.clone(),
+            api,
+            refresher,
+            &WatchHealth::default(),
+            presence,
+            SETUP_COMPLETION_BACKSTOP,
+            probe_interval,
         )
         .await
     }
@@ -2041,5 +2242,145 @@ mod tests {
                 _ => return None,
             }
         }
+    }
+
+    /// Poll `presence` until `ws_id`'s missing flag equals `want`.
+    async fn wait_for_presence(
+        presence: &WorktreePresence,
+        ws_id: &WorkspaceId,
+        want_missing: bool,
+    ) {
+        let deadline = Instant::now() + LIVENESS;
+        while presence.is_missing(ws_id) != want_missing {
+            assert!(
+                Instant::now() < deadline,
+                "presence for {ws_id} never became missing={want_missing}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// intent-hq/intent#7183: a workspace whose folder is missing at boot is
+    /// tracked, not silently dropped. When the folder appears (a remounted
+    /// volume), the presence probe arms its watchers. A present workspace is
+    /// watched throughout.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn checkout_missing_at_boot_is_armed_when_it_appears() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let present = TempDir::new("present");
+        let parent = TempDir::new("boot-missing");
+        let missing_root = parent.path.join("checkout");
+        let ws_present = test_workspace("ws-present", &present.path);
+        let ws_missing = test_workspace("ws-boot-missing", &missing_root);
+        let api: Arc<dyn WorkspaceApi> =
+            Arc::new(FakeApi::new(vec![ws_present.clone(), ws_missing.clone()]));
+        let presence = WorktreePresence::default();
+
+        let registry =
+            start_registry_with_probe(&bus, api, presence.clone(), Duration::from_millis(200))
+                .await;
+        assert!(
+            presence.is_missing(&ws_missing.id),
+            "boot must record the missing checkout"
+        );
+        assert!(!presence.is_missing(&ws_present.id));
+        assert_eq!(registry.root_registration_state(&missing_root), "unwatched");
+        confirm_watch_live(&mut sub, &ws_present.id, &present.path).await;
+
+        std::fs::create_dir_all(&missing_root).expect("create checkout");
+        wait_for_root(&registry, &missing_root, true).await;
+        wait_for_presence(&presence, &ws_missing.id, false).await;
+        confirm_watch_live(&mut sub, &ws_missing.id, &missing_root).await;
+        // The present workspace kept its watch through the probe ticks.
+        confirm_watch_live(&mut sub, &ws_present.id, &present.path).await;
+    }
+
+    /// intent-hq/intent#7183: a linked-worktree checkout moved away (deleted or
+    /// unmounted) has its watches stopped by the presence probe, which also
+    /// releases the shared common-dir watch so source-repo activity stops
+    /// re-triggering git-status refreshes. Moving it back re-arms both.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn vanished_worktree_releases_watches_and_rearms_when_it_returns() {
+        use git2::{Repository, Signature};
+
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+
+        let main_root = TempDir::new("wt-gone-main");
+        let repo = Repository::init(&main_root.path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        std::fs::write(main_root.path.join("seed.txt"), "seed\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("seed.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        let wt_parent = TempDir::new("wt-gone-linked");
+        let wt_path = wt_parent.path.join("wt");
+        let away = wt_parent.path.join("wt-unmounted");
+        repo.worktree("wt", &wt_path, None).unwrap();
+
+        let mut ws = test_workspace("ws-wt-gone", &wt_path);
+        ws.worktree_path = ws.path.clone();
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let presence = WorktreePresence::default();
+        let registry =
+            start_registry_with_probe(&bus, api, presence.clone(), Duration::from_millis(200))
+                .await;
+        wait_for_root(&registry, &wt_path, true).await;
+        assert_eq!(registry.common_dir_watch_count(), 1);
+
+        std::fs::rename(&wt_path, &away).expect("move checkout away");
+        wait_for_presence(&presence, &ws.id, true).await;
+        wait_for_root(&registry, &wt_path, false).await;
+        wait_for_common_dir_watch_count(&registry, 0).await;
+
+        std::fs::rename(&away, &wt_path).expect("move checkout back");
+        wait_for_presence(&presence, &ws.id, false).await;
+        wait_for_root(&registry, &wt_path, true).await;
+        wait_for_common_dir_watch_count(&registry, 1).await;
+        confirm_watch_live(&mut sub, &ws.id, &wt_path).await;
+    }
+
+    /// A workspace deleted while its checkout is missing is forgotten: the
+    /// probe never re-arms it when a folder later appears at that path.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn deleted_missing_workspace_is_not_rearmed() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let parent = TempDir::new("deleted-missing");
+        let root = parent.path.join("checkout");
+        let ws = test_workspace("ws-deleted-missing", &root);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let presence = WorktreePresence::default();
+        let registry =
+            start_registry_with_probe(&bus, api, presence.clone(), Duration::from_millis(100))
+                .await;
+        assert!(presence.is_missing(&ws.id));
+
+        bus.publish(&lifecycle_event(WORKSPACE_DELETED, &ws, false))
+            .await
+            .expect("publish deleted");
+        wait_for_presence(&presence, &ws.id, false).await;
+        std::fs::create_dir_all(&root).expect("create folder");
+        // Several probe ticks pass; the deleted workspace stays unwatched.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(registry.root_registration_state(&root), "unwatched");
     }
 }
