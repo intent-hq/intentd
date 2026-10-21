@@ -892,9 +892,32 @@ child.on('exit',code=>process.exit(code||0));
         fixture.assert_clean();
     }
 
-    #[tokio::test]
-    async fn installed_old_codex_is_rejected_before_acp_and_raw_catalog_launch() {
-        let fixture = Fixture::new(&json!({"installed":true}));
+    /// Seed Intent's complete bundled Codex under the fixture home.
+    fn seed_bundled_codex(
+        home: &std::path::Path,
+        target: Option<&std::path::Path>,
+        body: &str,
+    ) -> PathBuf {
+        let bundled = intent_providers::adapter_cli::requirement("codex")
+            .unwrap()
+            .bundled
+            .unwrap();
+        let dir =
+            crate::bundled_cli::version_dir(&crate::bundled_cli::root_in(home).unwrap(), &bundled);
+        let bin = dir.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        if let Some(target) = target {
+            symlink(target, &codex).unwrap();
+        } else {
+            std::fs::write(&codex, body).unwrap();
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
+        codex
+    }
+
+    fn old_installed_launch(fixture: &Fixture) -> (CodexLaunch, PathBuf) {
         let mut launch = fixture.launch(true);
         let installed_dir = fixture.root.path().join("installed");
         let context = crate::installed_cli::test_context_in(
@@ -908,6 +931,73 @@ child.on('exit',code=>process.exit(code||0));
         .unwrap();
         launch.codex_path = Some(installed_dir.join("codex").into_os_string());
         launch.installed = Some(context);
+        (launch, installed_dir)
+    }
+
+    #[tokio::test]
+    async fn installed_old_codex_catalogs_run_on_the_bundled_codex() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let mut launch = fixture.launch(true);
+        let installed_dir = fixture.root.path().join("installed");
+        std::fs::create_dir(&installed_dir).unwrap();
+        std::fs::write(
+            installed_dir.join("codex"),
+            "#!/bin/sh\nprintf 'codex-cli 0.114.0\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            installed_dir.join("codex"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let runtime = intent_providers::installed_cli::InstalledCli::Codex
+            .resolve_in_dirs(std::slice::from_ref(&installed_dir), false)
+            .unwrap();
+        // Same home/PATH as the installed-runtime success test; only the
+        // selected executable differs.
+        let context = crate::installed_cli::InstalledContext::from_inputs(
+            runtime,
+            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                (
+                    OsString::from("HOME"),
+                    fixture.root.path().as_os_str().to_owned(),
+                ),
+                (OsString::from("PATH"), fixture.path.clone()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
+        launch.codex_path = Some(installed_dir.join("codex").into_os_string());
+        launch.installed = Some(context);
+        let bundled = seed_bundled_codex(fixture.root.path(), Some(&fixture.runtime), "");
+        let report = launch
+            .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
+            .await;
+        assert_eq!(catalog(&report.raw).models[0].id, "fixture-model");
+        assert!(
+            matches!(report.acp, CatalogOutcome::Success(_)),
+            "{:?}",
+            report.acp
+        );
+        let boot = fixture
+            .events()
+            .into_iter()
+            .find(|v| v["started"] == true)
+            .unwrap();
+        assert_eq!(
+            boot["codexPath"],
+            json!(bundled),
+            "the adapter received the bundled CLI"
+        );
+        fixture.assert_clean();
+    }
+
+    #[tokio::test]
+    async fn installed_old_codex_with_an_old_bundled_copy_is_rejected_before_launch() {
+        let fixture = Fixture::new(&json!({"installed":true}));
+        let (launch, home) = old_installed_launch(&fixture);
+        seed_bundled_codex(&home, None, "#!/bin/sh\nprintf 'codex-cli 0.1.0\\n'\n");
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())
             .await;

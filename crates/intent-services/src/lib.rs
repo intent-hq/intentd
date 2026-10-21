@@ -70,6 +70,7 @@ mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod browser_tabs;
+mod bundled_cli;
 mod capability;
 #[cfg(all(test, unix))]
 mod claude_adapter_contract;

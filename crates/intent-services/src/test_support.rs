@@ -15,7 +15,7 @@ pub(crate) fn installed_cli_env(
     let bin = dir.join("installed-cli");
     std::fs::create_dir_all(&bin).unwrap();
     let cli = bin.join(command);
-    std::fs::write(&cli, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'fixture-cli 1.0.0\\n'\n").unwrap();
+    std::fs::write(&cli, "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'fixture-cli 99.0.0\\n'\n").unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(

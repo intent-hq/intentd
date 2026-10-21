@@ -744,6 +744,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
 }
 
 /// Startup warning data follows the installed CLI, never an adapter override.
+/// A confirmed-old CLI also reports the bundled CLI launches use instead.
 #[intent_test_macros::daemon_test]
 async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restricted_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -767,6 +768,23 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     let tool_bin = data_dir.join("home/.local/bin");
     std::fs::create_dir_all(&tool_bin).unwrap();
     std::os::unix::fs::symlink(node, tool_bin.join("node")).unwrap();
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    let bundled = requirement.bundled.clone().unwrap();
+    // Intent's managed copy, already installed so no npm runs. It reports an
+    // old version itself, so the test prompt fails before any adapter launch
+    // while proving the launch selected it instead of the installed CLI.
+    let bundled_dir = data_dir
+        .join("home/.local/share/intent/providers/bundled-cli/openai_codex")
+        .join(bundled.version.to_string());
+    std::fs::create_dir_all(bundled_dir.join("node_modules/.bin")).unwrap();
+    let bundled_codex = bundled_dir.join("node_modules/.bin/codex");
+    std::fs::write(
+        &bundled_codex,
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 94\nprintf 'codex-cli 0.0.2\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bundled_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(bundled_dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
     let path = bin.to_string_lossy().into_owned();
     let home = data_dir.join("home").to_string_lossy().into_owned();
     let _daemon = Daemon {
@@ -792,7 +810,6 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
         client_config(status["result"]["fingerprint"].as_str().unwrap()),
     )
     .await;
-    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
     let minimum = requirement.minimum.to_string();
     for (index, (version, expected)) in [
         ("codex-cli 0.0.1", Some(false)),
@@ -820,6 +837,13 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
         assert_eq!(row["cliMinimumVersion"], minimum);
         assert_eq!(row["cliVersionRange"], requirement.range);
         assert_eq!(row.get("cliVersionOk"), expected.map(Value::Bool).as_ref());
+        assert_eq!(
+            row.get("cliBundledVersion"),
+            (expected == Some(false))
+                .then(|| json!(bundled.version.to_string()))
+                .as_ref(),
+            "{row}"
+        );
         assert!(
             row.get("unavailableReason").is_none(),
             "discovery remains descriptive: {row}"
@@ -834,15 +858,26 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
             .await;
             assert_eq!(prompt["ok"], false, "{prompt}");
             let message = prompt["message"].as_str().unwrap();
-            assert!(message.contains(version), "{prompt}");
+            assert!(
+                message.contains("codex-cli 0.0.2"),
+                "bundled CLI selected: {prompt}"
+            );
+            assert!(!message.contains(version), "{prompt}");
             assert!(message.contains(&minimum), "{prompt}");
             assert!(message.contains("Upgrade Codex"), "{prompt}");
         }
-        let no_minimum = providers
+        // Claude now derives a same-minor minimum from its pinned SDK; the
+        // host's own claude (if any) decides the verdict, so only the
+        // requirement itself is asserted.
+        let claude = providers
             .iter()
             .find(|row| row["id"] == "claude-code")
             .unwrap();
-        assert!(no_minimum.get("cliRequirement").is_none());
-        assert!(no_minimum.get("cliVersionOk").is_none());
+        let claude_requirement = intent_providers::adapter_cli::requirement("claude-code").unwrap();
+        assert_eq!(claude["cliCommand"], "claude");
+        assert_eq!(
+            claude["cliMinimumVersion"],
+            claude_requirement.minimum.to_string()
+        );
     }
 }

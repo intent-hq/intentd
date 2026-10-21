@@ -11,9 +11,14 @@ pub async fn add_installed_cli_versions(discovery: &mut Value) {
         return;
     };
     for provider in providers {
-        let Some(id) = provider.get("id").and_then(Value::as_str) else {
+        let Some(id) = provider
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
+        let id = id.as_str();
         if provider.get("gatedOff").is_some() {
             continue;
         }
@@ -66,18 +71,24 @@ pub async fn add_installed_cli_versions(discovery: &mut Value) {
             continue;
         };
         if let Some(row) = provider.as_object_mut() {
-            apply_version_fields(row, &requirement, path.as_deref(), version.as_deref());
+            apply_version_fields(row, id, &requirement, path.as_deref(), version.as_deref());
         }
     }
 }
 
 fn apply_version_fields(
     row: &mut Map<String, Value>,
+    id: &str,
     requirement: &CliRequirement,
     path: Option<&std::path::Path>,
     version: Option<&str>,
 ) {
-    for key in ["cliVersion", "cliVersionOk", "cliResolvedPath"] {
+    for key in [
+        "cliVersion",
+        "cliVersionOk",
+        "cliResolvedPath",
+        "cliBundledVersion",
+    ] {
         row.remove(key);
     }
     row.insert("cliCommand".into(), json!(requirement.command));
@@ -99,6 +110,14 @@ fn apply_version_fields(
         if let Some(ok) = requirement.version_ok(version) {
             row.insert("cliVersionOk".into(), json!(ok));
         }
+        // Launches substitute Intent's bundled CLI for this confirmed-old one;
+        // discovery only reports it and never installs anything.
+        if let Some(bundled) = intent_providers::adapter_cli::bundled_fallback(id, version) {
+            row.insert(
+                "cliBundledVersion".into(),
+                json!(bundled.version.to_string()),
+            );
+        }
     }
 }
 
@@ -119,25 +138,72 @@ mod tests {
             (None, None),
         ] {
             let mut row = Map::from_iter([("installed".into(), json!(true))]);
-            apply_version_fields(&mut row, &requirement, Some(path), version);
+            apply_version_fields(&mut row, "codex", &requirement, Some(path), version);
             assert_eq!(row.get("cliVersionOk"), expected.map(Value::Bool).as_ref());
+            let bundled = requirement.bundled.as_ref().unwrap().version.to_string();
+            assert_eq!(
+                row.get("cliBundledVersion"),
+                (expected == Some(false)).then(|| json!(bundled)).as_ref(),
+                "only a confirmed-old CLI is replaced: {version:?}"
+            );
             assert_eq!(row["cliMinimumVersion"], minimum);
             assert_eq!(row["cliVersionRange"], requirement.range);
             assert_eq!(row["cliResolvedPath"], json!(path));
             assert_eq!(row["installed"], true, "Codex minimum is advisory");
         }
-        let mut missing = Map::new();
-        apply_version_fields(&mut missing, &requirement, None, None);
+        let mut missing = Map::from_iter([("cliBundledVersion".into(), json!("stale"))]);
+        apply_version_fields(&mut missing, "codex", &requirement, None, None);
         assert_eq!(missing["cliResolved"], false);
         assert!(!missing.contains_key("cliVersionOk"));
         assert!(!missing.contains_key("cliVersion"));
+        assert!(
+            !missing.contains_key("cliBundledVersion"),
+            "missing CLIs are not replaced"
+        );
+    }
+
+    #[test]
+    fn claude_rows_report_the_same_minor_minimum_and_bundled_copy() {
+        let requirement = requirement("claude-code").unwrap();
+        let bundled = requirement.bundled.as_ref().unwrap().version.to_string();
+        let path = std::path::Path::new("/selected/claude");
+        let mut row = Map::new();
+        apply_version_fields(
+            &mut row,
+            "claude-code",
+            &requirement,
+            Some(path),
+            Some("1.0.128 (Claude Code)"),
+        );
+        assert_eq!(row["cliCommand"], "claude");
+        assert_eq!(row["cliVersionOk"], false);
+        assert_eq!(row["cliBundledVersion"], bundled);
+        assert_eq!(row["cliMinimumVersion"], requirement.minimum.to_string());
+        apply_version_fields(
+            &mut row,
+            "claude-code",
+            &requirement,
+            Some(path),
+            Some(&format!("{bundled} (Claude Code)")),
+        );
+        assert_eq!(row["cliVersionOk"], true);
+        assert!(!row.contains_key("cliBundledVersion"));
+    }
+
+    #[test]
+    fn providers_without_a_bundled_launch_never_report_one() {
+        let requirement = requirement("codex").unwrap();
+        let mut row = Map::new();
+        apply_version_fields(&mut row, "pi", &requirement, None, Some("codex-cli 0.0.1"));
+        assert_eq!(row["cliVersionOk"], false);
+        assert!(!row.contains_key("cliBundledVersion"));
     }
 
     #[tokio::test]
     async fn absent_declarations_leave_legacy_pi_and_other_rows_unchanged() {
         let original = json!({"providers":[
             {"id":"pi", "cliVersionOk":false, "cliRequirement":"legacy Pi gate"},
-            {"id":"claude-code", "installed":true}, {"id":"unknown"},
+            {"id":"opencode", "installed":true}, {"id":"unknown"},
             {"id":"codex", "gatedOff":"disabled"}
         ]});
         let mut discovery = original.clone();

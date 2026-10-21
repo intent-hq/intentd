@@ -13,7 +13,14 @@
       "peerDependencies": {},
       "version": "0.81.1"
     },
-    "pinConstant": "CLAUDE_AGENT_ACP_NPX_PACKAGE"
+    "pinConstant": "CLAUDE_AGENT_ACP_NPX_PACKAGE",
+    "runtime": {
+      "claudeCodeVersion": "2.1.280",
+      "name": "@anthropic-ai/claude-agent-sdk",
+      "version": "0.3.280"
+    },
+    "runtimePackage": "@anthropic-ai/claude-agent-sdk",
+    "runtimeVersionField": "claudeCodeVersion"
   },
   "codex": {
     "cliCommand": "codex",

@@ -3715,7 +3715,7 @@ impl AgentManager {
         {
             // A named profile resolves before account lookup; the spawn layer
             // applies the same overlay to the prepared command.
-            let context = crate::installed_cli::InstalledContext::discover_for(
+            let mut context = crate::installed_cli::InstalledContext::discover_for(
                 cli,
                 spawn_opts.profile_env.cloned().map(Arc::new),
             )
@@ -3726,16 +3726,17 @@ impl AgentManager {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
-                let (_, version) = context
-                    .observe_with_dependency(&prepared.command, Some(dependency))
-                    .await
-                    .map_err(Error::InvalidInput)?;
+                // A confirmed-old installed CLI switches the context to
+                // Intent's bundled copy; the launch is re-applied below.
                 context
-                    .validate_launch_version(&version)
-                    .map_err(Error::InvalidInput)?;
-                Arc::try_unwrap(prepared).map_err(|_| {
+                    .select_launch(&prepared.command, Some(dependency))
+                    .await
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                let mut prepared = Arc::try_unwrap(prepared).map_err(|_| {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())
-                })
+                })?;
+                context.apply_selection(&mut prepared.command);
+                Ok::<_, Error>(prepared)
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
