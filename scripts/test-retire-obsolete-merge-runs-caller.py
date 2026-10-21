@@ -94,9 +94,19 @@ class CallerTests(unittest.TestCase):
         self.assertTrue(result['probe']['activity']['ok'])
         self.assertEqual(self.api.mutations, [])
 
-    def test_unknown_activity_stops_empty_scan(self):
+    def test_unbuilt_queued_entry_passes_probe(self):
         self.api.runs = {}
         self.api.heads = [None]
+        result = self.sweep(apply=True)
+        self.assertTrue(result['probe']['activity']['ok'], result)
+        self.assertTrue(result['complete'], result)
+        self.assertEqual(self.api.mutations, [])
+
+    def test_unknown_activity_stops_empty_scan(self):
+        self.api.runs = {}
+        page = self.api.queue_body([None])
+        page['data']['repository']['mergeQueue']['entries']['nodes'][0]['state'] = 'AWAITING_CHECKS'
+        self.api.queue_pages = [page]
         result = self.sweep(apply=True)
         self.assertTrue(result['probe']['protection']['ok'])
         self.assertFalse(result['probe']['activity']['ok'])
