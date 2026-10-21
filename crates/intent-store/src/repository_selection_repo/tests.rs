@@ -915,7 +915,8 @@ async fn selection_commit_completion_survives_cancelled_waiter() {
 }
 
 /// intent-hq/intent#7449: owner/name metadata is not a saved choice, so a new,
-/// rebound or same-ID recreated root without a saved choice stays `NeverSaved`.
+/// rebound, moved or same-ID recreated root without a saved choice stays
+/// `NeverSaved`.
 #[tokio::test]
 async fn metadata_never_manufactures_unresolved_history_for_new_roots() {
     let f = Fixture::new().await;
@@ -958,6 +959,29 @@ async fn metadata_never_manufactures_unresolved_history_for_new_roots() {
             .await
             .unwrap(),
     );
+    // Insert triggers give every workspace dependants, so FKs refuse an id
+    // move; exercise the move trigger on one connection with FKs off.
+    let mut conn = f.store.write_pool().acquire().await.unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys=OFF; \
+         INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) \
+         VALUES('github-move','Move','main','same-time','same-time','/move','octo','project'); \
+         UPDATE workspace SET id='github-moved' WHERE id='github-move'; \
+         PRAGMA foreign_keys=ON;",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    drop(conn);
+    never(
+        f.store
+            .repository_selection_snapshot(&RepositoryRootId {
+                workspace_id: WorkspaceId::from("github-moved"),
+                kind: RepositoryRootKind::Primary,
+            })
+            .await
+            .unwrap(),
+    );
 
     let root: WorkspaceGitRoot = serde_json::from_value(serde_json::json!({
         "id":"github-root","workspaceId":f.root.workspace_id,"path":"/github-root","source":"agent",
@@ -986,6 +1010,32 @@ async fn metadata_never_manufactures_unresolved_history_for_new_roots() {
             .await
             .unwrap(),
     );
+    sqlx::query("UPDATE workspace_git_root SET path='/github-root-moved' WHERE id='github-root'")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE workspace_git_root SET workspace_id='github-moved' WHERE id='github-root'")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&RepositoryRootId {
+                workspace_id: WorkspaceId::from("github-moved"),
+                kind: RepositoryRootKind::Registered {
+                    git_root_id: root.id.clone(),
+                },
+            })
+            .await
+            .unwrap(),
+    );
+    // Every key all eight triggers touched, tombstones included.
     let rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM repository_selection_state WHERE choice_mode='unresolved' OR historical_source IS NOT NULL",
     )

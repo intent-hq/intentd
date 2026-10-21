@@ -1429,12 +1429,30 @@ async fn implicit_github_read_refuses_unresolved_historical_selection() {
                 .and_then(|facts| facts.saved().ok()),
             Some(SavedReviewSelection::UnresolvedHistorical { .. })
         ));
-        assert!(
+        let read = || async {
             CapturedReview::capture(&services, git.workspace.id.clone(), 4)
                 .read(&services)
                 .await
-                .is_err()
-        );
+        };
+        assert!(matches!(read().await, Err(AdmissionError::Unavailable)));
+        let unresolved = git
+            .store
+            .repository_selection_snapshot(&git.root())
+            .await
+            .unwrap();
+        git.store
+            .write_repository_selection(
+                &unresolved,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await
+            .result
+            .unwrap();
+        let Ok(ReadOutcome::Github(repo)) = read().await else {
+            panic!("the same root and remote resolve once Automatic is saved");
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
     })
     .await;
 }

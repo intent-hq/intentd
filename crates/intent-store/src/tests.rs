@@ -11527,17 +11527,27 @@ async fn never_saved_default_upgrade_repairs_only_metadata_history() {
         assert_eq!(got, expected, "{workspace}");
     }
 
-    let repair = crate::MIGRATOR
+    // The repair is the only top-level (unindented) statement updating the
+    // table; trigger bodies are indented.
+    let sql = &crate::MIGRATOR
         .iter()
         .find(|m| m.version == 163)
         .expect("migration 0163 present")
-        .sql
-        .rsplit_once(';')
-        .and_then(|(body, _)| body.rsplit_once("END;"))
-        .map(|(_, update)| update.to_string())
-        .expect("repair statement");
-    assert!(repair.contains("UPDATE repository_selection_state"));
-    let replay = sqlx::raw_sql(&repair)
+        .sql;
+    let top_level: Vec<&str> = sql
+        .match_indices("\nUPDATE repository_selection_state")
+        .map(|(at, _)| {
+            let rest = &sql[at + 1..];
+            &rest[..=rest.find(';').expect("terminated repair statement")]
+        })
+        .collect();
+    assert_eq!(top_level.len(), 1, "{top_level:?}");
+    let repair = top_level[0];
+    assert!(
+        repair.contains("WHERE choice_mode='unresolved' AND historical_source IS NOT NULL;"),
+        "{repair}"
+    );
+    let replay = sqlx::raw_sql(repair)
         .execute(store.write_pool())
         .await
         .unwrap();
