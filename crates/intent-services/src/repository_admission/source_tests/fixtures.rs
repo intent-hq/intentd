@@ -26,8 +26,8 @@ impl Fixture {
     }
 
     /// A workspace inserted with repository metadata, as GitHub workspaces are
-    /// created today: the insert trigger saves an unresolved historical
-    /// primary selection rather than Automatic.
+    /// created. Metadata is not a saved choice, so the primary selection is
+    /// never-saved and reads as Automatic (intent-hq/intent#7449).
     pub async fn with_repository_metadata(owner: &str, name: &str) -> Self {
         Self::new_with(|workspace| {
             workspace.repository_owner = Some(owner.into());
@@ -56,6 +56,22 @@ impl Fixture {
             path,
             workspace,
         }
+    }
+
+    /// Retained historical intent that was never proved (the shape 0146 gave
+    /// pre-existing workspaces), seeded directly: no trigger produces it.
+    pub async fn seed_unresolved_history(store: &Store, workspace: &WorkspaceId) {
+        let changed = sqlx::query(
+            "UPDATE repository_selection_state SET selection_revision=selection_revision+1, \
+             choice_incarnation=root_incarnation, choice_mode='unresolved', remote_name=NULL, \
+             historical_source='workspace-metadata', historical_record_id=workspace_id \
+             WHERE workspace_id=? AND root_kind='primary' AND root_id=''",
+        )
+        .bind(workspace.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
     }
 
     pub fn root(&self) -> RepositoryRootId {
