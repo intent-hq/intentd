@@ -129,9 +129,10 @@ async fn blocking<T: Send + 'static>(
 
 /// [`ensure`] with an explicit root, npm and PATH (test seam).
 ///
-/// Installs are serialized within this daemon. Another daemon sharing the
-/// home may install the same version concurrently: its finished copy is
-/// adopted, never replaced, and each install stages privately.
+/// Installs are serialized within this daemon and, through an exclusive lock
+/// on the package's `.install.lock` file, with every other daemon or doctor
+/// process sharing the home: the completeness recheck, install, activation
+/// and pruning all happen under it.
 ///
 /// # Errors
 /// Returns an actionable reason when the install fails or times out.
@@ -145,19 +146,33 @@ pub async fn ensure_in(
 ) -> Result<InstalledCliRuntime, String> {
     let _lock = install_lock().lock().await;
     let destination = version_dir(root, bundled);
-    let (dest, pin) = (destination.clone(), bundled.clone());
-    if let Some(runtime) = blocking(move || Ok(complete(&dest, cli, &pin))).await? {
-        return Ok(runtime);
-    }
     let spec = bundled.spec();
     let parent = destination
         .parent()
         .ok_or("invalid bundled CLI directory")?
         .to_owned();
+    let lock_parent = parent.clone();
+    // Held until this function returns; dropping the file releases the lock.
+    let _file_lock = blocking(move || {
+        std::fs::create_dir_all(&lock_parent)
+            .map_err(|e| format!("cannot create {}: {e}", lock_parent.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_parent.join(LOCK))
+            .map_err(|e| format!("cannot open the bundled CLI install lock: {e}"))?;
+        file.lock()
+            .map_err(|e| format!("cannot lock the bundled CLI install: {e}"))?;
+        Ok(file)
+    })
+    .await?;
+    let (dest, pin) = (destination.clone(), bundled.clone());
+    if let Some(runtime) = blocking(move || Ok(complete(&dest, cli, &pin))).await? {
+        return Ok(runtime);
+    }
     let (staging_parent, staging_spec) = (parent.clone(), spec.clone());
     let staging = blocking(move || {
-        std::fs::create_dir_all(&staging_parent)
-            .map_err(|e| format!("cannot create {}: {e}", staging_parent.display()))?;
         tempfile::Builder::new()
             .prefix(".install-")
             .tempdir_in(&staging_parent)
@@ -275,9 +290,9 @@ fn tail(bytes: &[u8]) -> String {
         .to_owned()
 }
 
-/// Mark the verified staging tree complete and move it into place. A copy
-/// another process completed meanwhile is adopted; an incomplete one is
-/// moved aside first so the final rename never merges trees.
+/// Mark the verified staging tree complete and move it into place (under the
+/// install lock). A complete copy is adopted; an incomplete one is moved
+/// aside first so the final rename never merges trees.
 fn activate(
     staging: tempfile::TempDir,
     destination: &Path,
@@ -313,11 +328,12 @@ fn activate(
 /// Versions kept per package, so daemons with different adapter pins that
 /// share a home do not delete each other's runtimes.
 const KEEP_VERSIONS: usize = 3;
-const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
+const LOCK: &str = ".install.lock";
 
-/// Remove all but the newest [`KEEP_VERSIONS`] versions and staging trees
-/// abandoned for over an hour (live installs of other daemons are younger).
-/// Failures, e.g. a running executable on Windows, only defer cleanup.
+/// Remove all but the newest [`KEEP_VERSIONS`] versions, plus staging and
+/// moved-aside trees. Callers hold the install lock, so no other process is
+/// staging: every hidden directory is abandoned. Failures, e.g. a running
+/// executable on Windows, only defer cleanup.
 fn prune(parent: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -330,15 +346,7 @@ fn prune(parent: &Path, keep: &Path) {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
-            let abandoned = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > STALE_STAGING);
-            if abandoned {
-                let _ = std::fs::remove_dir_all(path);
-            }
+            let _ = std::fs::remove_dir_all(path);
         } else if let Some(version) = BundledCli::new("", &name).map(|dir| dir.version) {
             versions.push((version, path));
         }

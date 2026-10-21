@@ -157,16 +157,8 @@ async fn incomplete_or_mismatched_copies_are_reinstalled() {
     assert_eq!(calls(temp.path()).len(), 1);
 }
 
-fn age(path: &Path) {
-    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
-    std::fs::File::open(path)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(old))
-        .unwrap();
-}
-
 #[tokio::test]
-async fn new_pins_keep_recent_versions_and_drop_only_abandoned_staging() {
+async fn new_pins_keep_recent_versions_and_drop_abandoned_staging() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let npm = fake_npm(temp.path(), "");
@@ -183,10 +175,7 @@ async fn new_pins_keep_recent_versions_and_drop_only_abandoned_staging() {
     .unwrap();
     let parent = version_dir(&root, &pins[0]).parent().unwrap().to_owned();
     let abandoned = parent.join(".install-abandoned");
-    let live = parent.join(".install-another-daemon");
     std::fs::create_dir_all(&abandoned).unwrap();
-    std::fs::create_dir_all(&live).unwrap();
-    age(&abandoned);
     for pin in &pins[1..] {
         ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, pin, TIMEOUT)
             .await
@@ -202,10 +191,39 @@ async fn new_pins_keep_recent_versions_and_drop_only_abandoned_staging() {
         );
     }
     assert!(!abandoned.exists());
+}
+
+#[tokio::test]
+async fn installs_wait_for_another_process_holding_the_install_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let npm = fake_npm(temp.path(), "");
+    let pin = bundled("0.160.1");
+    let parent = version_dir(&root, &pin).parent().unwrap().to_owned();
+    std::fs::create_dir_all(&parent).unwrap();
+    // Stands in for another daemon mid-install: an exclusive lock on the
+    // same file, taken through a separate open file description.
+    let other = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(LOCK))
+        .unwrap();
+    other.lock().unwrap();
+    let path = path_env();
+    let install = tokio::spawn({
+        let (root, npm, pin) = (root.clone(), npm.clone(), pin.clone());
+        async move { ensure_in(&root, &npm, &path, InstalledCli::Codex, &pin, TIMEOUT).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!install.is_finished(), "the install must wait for the lock");
     assert!(
-        live.exists(),
-        "a recent staging tree may belong to another daemon"
+        calls(temp.path()).is_empty(),
+        "npm must not run while another process installs"
     );
+    other.unlock().unwrap();
+    install.await.unwrap().unwrap();
+    assert_eq!(calls(temp.path()).len(), 1);
 }
 
 #[tokio::test]
