@@ -354,6 +354,34 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewThreadComment>,
 }
 
+/// One complete conversation from the provider's discussion collection.
+/// Standalone notes and non-resolvable threads are not readiness blockers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDiscussion {
+    pub id: String,
+    pub individual_note: bool,
+    pub notes: Vec<DiscussionNote>,
+}
+
+/// Canonical note identity and optional diff anchor, without inventing resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionNote {
+    pub id: String,
+    pub in_reply_to_id: Option<String>,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    /// Diff-position provenance, not an attestation of the current MR head.
+    pub position_head_sha: Option<String>,
+    pub url: Option<String>,
+    pub resolvable: bool,
+    pub resolved: Option<bool>,
+}
+
 /// A CI check-run for a git ref.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -381,6 +409,14 @@ pub struct Issue {
     pub author: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Exact authenticated-user filters supported by GitLab issue listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueInvolvement {
+    Created,
+    Assigned,
 }
 
 /// Filter for listing issues.

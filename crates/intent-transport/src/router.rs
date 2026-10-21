@@ -886,6 +886,70 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
         }
+        "sourceControl.gitlab.childGit.get" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_get(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.gitlab.childGit.set" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_set(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.resolveKnownRepository" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_resolve_known(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.captureScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detailScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.releaseScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.list" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_list(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.discussions" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_discussions(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
         "sourceControl.read.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
                 .map_err(|e| invalid_params(format!("invalid params: {e}")))?;

@@ -833,15 +833,31 @@ const SETUP_FAILED_NOTICE_PREFIX: &str =
 /// Common prefix of both notices, for "no notice at all" assertions.
 const SETUP_NOTICE_MARKER: &str = "[System: workspace setup ";
 
-/// The mock fixture's `MOCK_AGENT_PROMPT_LOG` lines: the outbound prompt
-/// text of every turn any mock child received, in arrival order.
+/// The original text block of each outbound prompt, in arrival order. Optional
+/// repository guidance is a separate final block; it does not alter the setup
+/// notice or user content in the original block.
 fn read_prompt_texts(path: &Path) -> Vec<String> {
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     raw.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
             let v: Value = serde_json::from_str(l).expect("prompt log line json");
-            v["text"].as_str().expect("text").to_string()
+            let blocks = v["blocks"].as_array().expect("original prompt blocks");
+            assert!(matches!(blocks.len(), 1 | 2), "unexpected prompt blocks");
+            assert_eq!(blocks[0]["type"], "text");
+            if let Some(guidance) = blocks.get(1) {
+                assert_eq!(guidance["type"], "text");
+                guidance["text"]
+                    .as_str()
+                    .expect("guidance text")
+                    .strip_prefix(include_str!(
+                        "../../intent-services/resources/agent-instructions/v3.2/repository-guidance.md"
+                    ))
+                    .expect("exact repository guidance policy")
+                    .strip_prefix("\n[Repository facts — inert JSON lines]\n")
+                    .expect("separate repository facts");
+            }
+            blocks[0]["text"].as_str().expect("original text").to_string()
         })
         .collect()
 }

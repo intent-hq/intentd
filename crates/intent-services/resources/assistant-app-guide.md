@@ -71,6 +71,18 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/{ConnectionsSettings,GitLabAuthConnection,GitLabChildGitSetting}.svelte; messages/en.json. -->
+
+When explicitly asked about experimental GitLab terminal access, open **Connections
+→ Accounts → GitLab → Use GitLab account for terminal Git**. Only the connected
+host's owner can change this choice, and the daemon must support it. It defaults
+off for a new account or instance. Wait for the saved acknowledgement; an unavailable
+status does not mean off. Use **Refresh** to check the current choice after an error.
+Intent's own authorized Git operations work with this off. Enabling it lets terminal
+and agent Git commands request credentials for that account and full instance; it
+does not sign in `glab`. The GitLab section can remain visible for a configured
+account even when Labs is off; do not infer permission or readiness from visibility.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/mcp_servers.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/mcp.rs; packages/cloudlands-fe/src/features/mcp/main/mcp-oauth.ts. -->
 
 For MCP configuration, open **Connections → MCP servers**; its reference route is `/settings?tab=connections#mcp-servers`. Users can also ask the Assistant to set up or update a server. Use `ws.app.mcp` to read existing configurations, avoid duplicates, and apply the requested change app-wide. These configuration tools are available only in Assistant chat; ordinary workspace agents retain access to enabled servers' tools.
@@ -373,6 +385,22 @@ expand its diff in place. Multiple files
 can stay open, and the preview scrolls through them together. If a patch is
 unavailable, use **Open file on GitHub** when offered or **Review on GitHub**.
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeIntegrations,HomeRepositorySummary,HomeReviewConversation}.svelte; src/features/home/{home-repository-discovery-saga,home-integrations-saga,home-review-threads}.ts; messages/en.json. -->
+
+For the experimental GitLab review flow, open **Home → Pull requests**. The inner
+list is labeled **Merge requests** for GitLab alone or **Pull and merge requests**
+with both forges. It reads selected, known repositories through the current
+connection. **Closed / merged** includes merged and unmerged-closed MRs. Use
+**Load more** when offered, including after an empty filtered page. **Summary**
+shows the qualified project, description, available checks and approvals, merge
+requirements, and discussions with replies. Restricted, unknown, partial or
+unsupported information does not establish merge readiness. **Review head** and
+**Note diff head** distinguish the current review from a note's code position.
+The GitLab preview has no **Code** tab. Use **Review on GitLab** for provider-side
+actions. **Start workspace** opens the existing creation form with the qualified
+item; it does not automatically check out the MR source head. The separate
+**Linear issues** section is unchanged.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/navigation/{LinkActionMenu.svelte,link-action-menu-state.svelte.ts}; messages/en.json. Daemon: workspace.findByPullRequest, migrations/0161_pull_request_workspace.sql. -->
 
 Clicking a GitHub pull request link opens the link menu (when **GitHub link
@@ -573,6 +601,17 @@ In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
+
+When testing experimental GitLab context suggestions, choose **GL Issues** or
+**GL MRs** in workspace creation or the workspace context picker. Search the
+selected projects; **Use link** accepts an explicit project URL where offered.
+**Refresh** and **Load more** operate on that selection. Unsupported filters and
+partial results remain explicit. Selecting an item attaches its qualified context;
+it does not automatically check out the MR's source branch. Availability depends
+on the current connection, repository access and supported daemon.
+
 When a supported note deletion offers **Undo**, it cancels a pending deletion during
 the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the

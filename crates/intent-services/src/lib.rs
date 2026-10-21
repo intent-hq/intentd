@@ -1231,6 +1231,7 @@ pub struct Services {
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_child_git_capacity: Arc<repository_native_wire::child_git::Capacity>,
     repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
@@ -1780,6 +1781,7 @@ impl Services {
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
             repository_resource_capacity: Arc::default(),
+            repository_child_git_capacity: Arc::default(),
             repository_checkout_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
@@ -18632,6 +18634,24 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn gitlab_child_git_policy_get(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_get(self, query)
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_set(self, query)
+    }
+    fn gitlab_child_git_credential(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        repository_native_wire::child_git::credential(self, query)
+    }
     fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
         self.provider_preparation
             .enqueue(provider_ids, self.effective_settings());
@@ -18811,6 +18831,48 @@ impl WorkspaceApi for Services {
         query: intent_core::repository_request::RepositoryResourceBoundQuery,
     ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
         repository_native_wire::resource::release(self, query)
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryKnownSelection>>
+    {
+        repository_native_wire::resource::known::resolve(self, query)
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedCapture>>
+    {
+        repository_native_wire::resource::scoped::capture(self, query)
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedDetail>> {
+        repository_native_wire::resource::scoped::detail(self, query)
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::scoped::release(self, query)
+    }
+
+    fn repository_resource_list(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryResourceList>> {
+        repository_native_wire::resource::pages::list(self, query)
+    }
+
+    fn repository_resource_discussions(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryDiscussions>> {
+        repository_native_wire::resource::pages::discussions(self, query)
     }
 
     fn repository_context_capture(

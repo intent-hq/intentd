@@ -182,6 +182,8 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
             "nativeReview",
             "nativeReviewCompanion",
             "repositoryResourceRead",
+            "repositoryResourcePages",
+            "gitlabChildGitPolicy",
         ] {
             assert_eq!(server["capabilities"][capability], json!(1));
         }

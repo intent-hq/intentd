@@ -51,10 +51,12 @@ pub mod script_lists;
 pub mod script_monitor;
 pub mod script_output;
 pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
+pub mod gitlab_child_git;
 pub mod repository_checkout;
 pub mod repository_context;
 #[doc(hidden)]
 pub mod repository_request;
+pub mod repository_resource_pages;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;

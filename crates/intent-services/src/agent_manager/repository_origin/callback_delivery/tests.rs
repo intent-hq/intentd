@@ -8724,7 +8724,16 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 assert_eq!(h.f.writes().await, 0);
             } else {
                 let s = started.unwrap();
-                assert!(s.turn.prompt.is_none());
+                let prompt_only = matches!(mode, "absent" | "wrong" | "malformed");
+                if prompt_only {
+                    let prompt = s.turn.prompt.as_ref().expect("original 3.2 prompt capture");
+                    assert!(!prompt.binding.requires_callback_ack);
+                    assert!(!prompt.binding.acknowledged.load(Ordering::SeqCst));
+                } else {
+                    // A negotiated Query that fails registration cannot fall
+                    // back to prompt-only ownership or acknowledge monitoring.
+                    assert!(s.turn.prompt.is_none());
+                }
                 h.dispatch(
                     &s.session_id,
                     s.turn,
@@ -8732,7 +8741,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 )
                 .await
                 .unwrap();
-                assert!(!h.prompts().await[0].to_string().contains(FACTS));
+                assert_eq!(
+                    h.prompts().await[0].to_string().matches(FACTS).count(),
+                    usize::from(prompt_only),
+                    "{mode}: guidance does not acknowledge callback registration"
+                );
                 let observed = h.rpc("fixture/inspect", json!({})).await;
                 assert_eq!(
                     count_requests(&observed, METHOD),
