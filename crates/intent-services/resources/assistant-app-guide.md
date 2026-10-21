@@ -386,9 +386,13 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts. -->
 
-In **Home → Workspaces**, open **View options → Group by** in either list or board
+In **Home → Workspaces**, click a list row or board card to select it and show its
+preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
+workspace directly.
+
+Open **View options → Group by** in either list or board
 view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
 groups. In list view, **Status** groups workspace statuses in this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
