@@ -707,12 +707,23 @@ fn observe_fixture_identity(pid: u32, fixture_exe: &Path) -> Result<FixtureIdent
 fn wait_detached_identity_ready(
     root: &Path,
     timeout: Duration,
+    observe: impl FnMut() -> Result<FixtureIdentity, String>,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    wait_detached_identity_ready_until(root, || std::time::Instant::now() >= deadline, observe)
+}
+
+/// Readiness with the deadline injected as `expired`, consulted once after
+/// each pending observation, so controls never depend on the scheduler.
+#[cfg(target_os = "linux")]
+fn wait_detached_identity_ready_until(
+    root: &Path,
+    mut expired: impl FnMut() -> bool,
     mut observe: impl FnMut() -> Result<FixtureIdentity, String>,
 ) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let mut home = b"HOME=".to_vec();
     home.extend_from_slice(root.as_os_str().as_bytes());
-    let deadline = std::time::Instant::now() + timeout;
     // Name the startup phase only if exec was never observed, so a late
     // empty environ cannot hide a child that spent the deadline before exec.
     let mut pre_exec_image = None;
@@ -734,7 +745,7 @@ fn wait_detached_identity_ready(
                 exec_observed = true;
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if expired() {
             return Err(match pre_exec_image {
                 Some(exe) if !exec_observed => format!(
                     "owned fixture child startup timed out before exec; image still {}",
@@ -807,10 +818,8 @@ fn installed_cli_detached_identity_readiness_accepts_only_settled_home() {
         FixtureIdentity::Started(b"HOME=/owned-fixture\0".to_vec()),
     ]
     .into_iter();
-    wait_detached_identity_ready(root, Duration::from_secs(3), || {
-        Ok(observations.next().unwrap())
-    })
-    .unwrap();
+    wait_detached_identity_ready_until(root, || false, || Ok(observations.next().unwrap()))
+        .unwrap();
     assert!(observations.next().is_none());
 }
 
@@ -825,11 +834,21 @@ fn installed_cli_detached_identity_readiness_retries_reads_before_exec() {
         FixtureIdentity::Started(b"HOME=/owned-fixture\0".to_vec()),
     ]
     .into_iter();
-    wait_detached_identity_ready(root, Duration::from_secs(3), || {
-        Ok(observations.next().unwrap())
-    })
+    let mut expiry_checks = 0;
+    wait_detached_identity_ready_until(
+        root,
+        || {
+            expiry_checks += 1;
+            false
+        },
+        || Ok(observations.next().unwrap()),
+    )
     .unwrap();
     assert!(observations.next().is_none());
+    assert_eq!(
+        expiry_checks, 3,
+        "each pending observation consults the deadline"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -849,12 +868,16 @@ fn installed_cli_detached_identity_readiness_times_out_when_empty() {
 #[test]
 fn installed_cli_detached_identity_readiness_times_out_before_exec() {
     let mut calls = 0;
-    let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
-        calls += 1;
-        Ok(FixtureIdentity::Starting(PathBuf::from(
-            "/parent-test-binary",
-        )))
-    })
+    let error = wait_detached_identity_ready_until(
+        Path::new("/owned-fixture"),
+        || true,
+        || {
+            calls += 1;
+            Ok(FixtureIdentity::Starting(PathBuf::from(
+                "/parent-test-binary",
+            )))
+        },
+    )
     .unwrap_err();
     assert_eq!(
         error,
@@ -866,24 +889,25 @@ fn installed_cli_detached_identity_readiness_times_out_before_exec() {
 #[cfg(target_os = "linux")]
 #[test]
 fn installed_cli_detached_identity_readiness_timeout_names_environ_after_exec() {
-    let mut calls = 0;
-    let error = wait_detached_identity_ready(
+    let mut observations = [
+        FixtureIdentity::Starting(PathBuf::from("/parent-test-binary")),
+        FixtureIdentity::Started(Vec::new()),
+    ]
+    .into_iter();
+    let mut expiry_checks = 0;
+    let error = wait_detached_identity_ready_until(
         Path::new("/owned-fixture"),
-        Duration::from_millis(20),
         || {
-            calls += 1;
-            Ok(if calls == 1 {
-                FixtureIdentity::Starting(PathBuf::from("/parent-test-binary"))
-            } else {
-                FixtureIdentity::Started(Vec::new())
-            })
+            expiry_checks += 1;
+            expiry_checks == 2
         },
+        || Ok(observations.next().unwrap()),
     );
     assert_eq!(
         error.unwrap_err(),
         "owned fixture child identity readiness timed out"
     );
-    assert!(calls > 1);
+    assert!(observations.next().is_none());
 }
 
 #[cfg(target_os = "linux")]
@@ -898,9 +922,9 @@ fn installed_cli_detached_identity_readiness_rejects_exit_wrong_home_and_errors(
         Err("permission denied".to_owned()),
     ] {
         let mut calls = 0;
-        assert!(wait_detached_identity_ready(
+        assert!(wait_detached_identity_ready_until(
             Path::new("/owned-fixture"),
-            Duration::from_secs(3),
+            || false,
             || {
                 calls += 1;
                 observation.clone()
@@ -925,9 +949,11 @@ fn installed_cli_detached_identity_observation_defers_pre_exec_environ() {
     );
     let ungated = observe_fixture_identity(pid, &own_exe).unwrap();
     assert!(matches!(&ungated, FixtureIdentity::Started(bytes) if !bytes.is_empty()));
-    let error = wait_detached_identity_ready(Path::new("/owned-fixture"), Duration::ZERO, || {
-        Ok(ungated.clone())
-    })
+    let error = wait_detached_identity_ready_until(
+        Path::new("/owned-fixture"),
+        || false,
+        || Ok(ungated.clone()),
+    )
     .unwrap_err();
     assert_eq!(error, "owned fixture child has an unexpected HOME");
 }
