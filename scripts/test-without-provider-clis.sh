@@ -61,7 +61,7 @@ command -v bwrap >/dev/null 2>&1 ||
   die "bwrap not found: install bubblewrap (Debian/Ubuntu: sudo apt-get install bubblewrap)"
 [[ -n "${HOME:-}" ]] || die "HOME is not set"
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 names=("${PROVIDER_CLIS[@]}")
 if [[ "${HIDE_NODE:-0}" == 1 ]]; then
@@ -103,7 +103,11 @@ fi
 volta_home=${volta_home:-$HOME/.volta}
 dirs+=(/usr/local/bin /usr/bin /bin /usr/sbin /sbin /opt/homebrew/bin /usr/local/opt/node/bin)
 dirs+=("$volta_home/bin")
-for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims; do
+# User-local tool dirs plus the native installer tiers discovery probes
+# directly (find_provider_binary: ~/.grok/bin, ~/.opencode/bin,
+# ~/.augment/bin), so their CLIs are masked even when the provider home
+# itself is kept below.
+for sub in .npm-global/bin .npm-packages/bin .local/bin .asdf/shims .grok/bin .opencode/bin .augment/bin; do
   dirs+=("$HOME/$sub")
 done
 for dir in "$HOME"/.nvm/versions/node/*/bin; do
@@ -132,23 +136,53 @@ fi
 
 args=(--dev-bind / /)
 declare -A masked=()
+candidates=()
 for dir in "${dirs[@]}"; do
   [[ -n "$dir" && -d "$dir" ]] || continue
   for name in "${names[@]}"; do
-    candidate="$dir/$name"
-    [[ -e "$candidate" ]] || continue
-    real=$(readlink -f "$candidate")
-    [[ -f "$real" && -z "${masked[$real]:-}" ]] || continue
-    if [[ -n "${kept[$real]:-}" ]]; then
-      echo "test-without-provider-clis: cannot hide $candidate: it shares $real with Node (the self-check will report it)" >&2
-      continue
-    fi
-    masked[$real]=1
-    args+=(--ro-bind /dev/null "$real")
+    candidates+=("$dir/$name")
   done
 done
+# auggie's install record (~/.augment/auggie-path): the first non-blank line
+# names the binary discovery runs (auggie_marker_path_with_home). An
+# unreadable record names nothing, as in discovery (read_to_string().ok()).
+if [[ -f "$HOME/.augment/auggie-path" && -r "$HOME/.augment/auggie-path" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [[ -n "$line" ]]; then
+      if [[ "$line" == /* ]]; then candidates+=("$line"); fi
+      break
+    fi
+  done <"$HOME/.augment/auggie-path"
+fi
+for candidate in "${candidates[@]}"; do
+  [[ -e "$candidate" ]] || continue
+  real=$(readlink -f "$candidate")
+  [[ -f "$real" && -z "${masked[$real]:-}" ]] || continue
+  if [[ -n "${kept[$real]:-}" ]]; then
+    echo "test-without-provider-clis: cannot hide $candidate: it shares $real with Node (the self-check will report it)" >&2
+    continue
+  fi
+  masked[$real]=1
+  args+=(--ro-bind /dev/null "$real")
+done
+# An empty tmpfs would also hide a checkout (or cwd) living under a provider
+# home, e.g. a Codex worktree in ~/.codex/worktrees: keep that home, whose
+# CLI files are still masked one by one above.
+cwd_real=$(pwd -P)
 for home_dir in "${PROVIDER_HOMES[@]}"; do
-  if [[ -d "$HOME/$home_dir" ]]; then args+=(--tmpfs "$HOME/$home_dir"); fi
+  home_path="$HOME/$home_dir"
+  [[ -d "$home_path" ]] || continue
+  home_real=$(cd "$home_path" && pwd -P)
+  case "$repo_root/" in "$home_real"/*)
+    echo "test-without-provider-clis: keeping $home_path (it contains $repo_root); its CLIs are still masked" >&2
+    continue ;;
+  esac
+  case "$cwd_real/" in "$home_real"/*)
+    echo "test-without-provider-clis: keeping $home_path (it contains $cwd_real); its CLIs are still masked" >&2
+    continue ;;
+  esac
+  args+=(--tmpfs "$home_path")
 done
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/intentd-no-provider-clis.XXXXXX")
@@ -158,6 +192,15 @@ args+=(--setenv INTENTD_USER_SPECIALISTS_DIR "$scratch/user-specialists")
 if [[ "${HIDE_NODE:-0}" == 1 ]]; then
   args+=(--setenv INTENTD_EXPECT_NO_NODE 1)
 fi
+# Set by this script only (not by callers): tells a test runner inside that
+# it really runs sandboxed, and whether the self-check vouched for it, e.g.
+# so resumable gate records keep sandboxed passes separate.
+self_check=checked
+if [[ "${SKIP_SELF_CHECK:-0}" == 1 ]]; then self_check=skipped; fi
+# A PID namespace (with its own /proc) so that when this script is killed,
+# --die-with-parent takes down the whole tree (cargo, nextest, test daemons),
+# not just the immediate command.
+args+=(--setenv INTENTD_PROVIDER_CLIS_HIDDEN "$self_check" --unshare-pid --proc /proc --die-with-parent)
 
 echo "test-without-provider-clis: hiding ${#masked[@]} CLI file(s) and provider home folders" >&2
 if [[ "${SKIP_SELF_CHECK:-0}" != 1 ]]; then
@@ -165,4 +208,7 @@ if [[ "${SKIP_SELF_CHECK:-0}" != 1 ]]; then
     -- --ignored --exact provider_cli_guard::no_provider_cli_visible) ||
     die "self-check failed: a provider CLI is still visible (see the test output above)"
 fi
+# Foreground, so a terminal Ctrl-C reaches the whole sandboxed run. A
+# supervisor that signals only this script kills it, and --die-with-parent
+# then tears the sandbox down instead of leaving the run orphaned.
 bwrap "${args[@]}" "$@"
