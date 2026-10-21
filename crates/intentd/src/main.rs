@@ -8362,12 +8362,10 @@ for line in sys.stdin:
         let monitor = hub.spawn_health_monitor();
         hub.begin_background_shutdown();
         let mut shutdown = intent_core::spawn_daemon(settle_mcp_background(start, monitor));
-        let retained = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(2200)),
-            &mut shutdown,
-        )
-        .await
-        .is_err();
+        // fixed-deadline: allow — past the 2s boot-shutdown grace but before mcp_handshake's fixed 10s init timeout reaps the fake child
+        let retained = tokio::time::timeout(Duration::from_millis(2200), &mut shutdown)
+            .await
+            .is_err();
         let _ = write.write_all(b"x").await;
         if retained {
             tokio::time::timeout(
