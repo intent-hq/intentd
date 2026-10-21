@@ -848,3 +848,150 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
         "invalid-params",
     );
 }
+
+/// The idle reaper keeps an agent whose provider still runs a background
+/// worker: with a sub-second `INTENTD_IDLE_REAP_MS` sweep, an idle claude-code
+/// agent with a running shell survives several sweeps (its process, and so
+/// the worker, stays alive and the row stays `running` on a continuous
+/// connection). Once the worker is stopped the next sweep reaps it with the
+/// usual `agent:process:evicted` / `idle-ttl` event.
+#[tokio::test]
+async fn idle_reap_keeps_an_agent_with_a_running_worker_over_wss() {
+    let Some(script) = gate("WSS idle reap with running worker E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let bin_dir = data_dir.join("bin");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    write_fake_npx(&bin_dir, &data_dir.join("npx-report"), &script);
+    let source_repo = make_source_repo(&data_dir);
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let behavior = json!({
+        "response": "KEEPALIVE_E2E_REPLY",
+        "agentInfo": {
+            "name": "@agentclientprotocol/claude-agent-acp",
+            "version": intent_providers::CLAUDE_AGENT_ACP_VERSION,
+        },
+        "asyncTasks": { "spawnOn": "RUN_BG", "command": "npm run dev" },
+    })
+    .to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("PATH", path.as_str()),
+        ("HOME", home_dir.to_str().unwrap()),
+        ("SHELL", "/bin/sh"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        // Sub-second TTL + sweep (test-only seam; §13.1).
+        ("INTENTD_IDLE_REAP_MS", "500"),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir_guard,
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Idle Reap Keep-Alive E2E",
+            "repositoryPath": source_repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let subscribed = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string(), "{subscribed}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let agent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Keep-Alive E2E", "model": "mock-model", "provider": "claude-code" }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().expect("agent id").to_string();
+    let target = json!({ "workspaceId": ws_id, "agentId": agent_id });
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "please RUN_BG now" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "{sent}");
+    turn_events(&mut sub, &agent_id).await;
+
+    // Idle past many TTLs with the worker running: never evicted.
+    let idle = events_within(&mut sub, &agent_id, Duration::from_secs(4)).await;
+    assert!(
+        !idle.iter().any(|e| e["type"] == "agent:process:evicted"),
+        "an agent with a running worker must not be TTL-reaped: {idle:?}"
+    );
+    let listed = wss_rpc(&mut rpc, 12, "agent.workers.list", target.clone()).await;
+    assert_eq!(listed["continuity"], "continuous", "{listed}");
+    assert_eq!(listed["workers"][0]["identity"]["asyncTaskId"], "bg-1");
+    assert_eq!(listed["workers"][0]["status"], "running", "{listed}");
+    let generation = listed["connectionGeneration"]
+        .as_str()
+        .expect("generation")
+        .to_string();
+
+    // The worker ends: the next sweep reaps the idle agent as usual.
+    let stopped = wss_call(
+        &mut rpc,
+        13,
+        "agent.workers.stop",
+        json!({ "workspaceId": ws_id, "agentId": agent_id,
+                "connectionGeneration": generation, "asyncTaskId": "bg-1" }),
+    )
+    .await;
+    assert_eq!(
+        stopped["result"],
+        json!({ "asyncTaskId": "bg-1", "stopped": true }),
+        "{stopped}"
+    );
+    let mut evicted = None;
+    for _ in 0..30 {
+        let batch = events_within(&mut sub, &agent_id, Duration::from_secs(1)).await;
+        if let Some(e) = batch
+            .into_iter()
+            .find(|e| e["type"] == "agent:process:evicted")
+        {
+            evicted = Some(e);
+            break;
+        }
+    }
+    let evicted = evicted.expect("the agent is reaped once its worker ended");
+    assert_eq!(evicted["data"]["reason"], "idle-ttl", "{evicted}");
+}

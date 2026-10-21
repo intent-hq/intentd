@@ -2011,8 +2011,9 @@ maxTopLevelAgents = 20
 # tree starts draining once the window passes instead of holding 5.85 GB for
 # another 20. Raise it to keep processes warm for longer and reclaim their
 # memory later; lower it for the reverse. Only agents idle past the TTL are
-# candidates, and the sweep
-# skips any agent reported busy when it checks. An agent is selected within
+# candidates, and the sweep skips any agent reported busy when it checks, or
+# still running a background task (a dev server, say) until that task ends --
+# at most 24 hours past the TTL. An agent is selected within
 # the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
 # memory comes back as each kill completes, so a large idle set drains over a
 # tail rather than all at once.
