@@ -32171,6 +32171,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The daemon's provider-stall blocker prefixes are reserved so an
+            // agent-raised request is never mistaken for one and auto-cleared
+            // by a later successful turn (intent-hq/intent#7182).
+            if crate::agent_session::is_daemon_stall_blocker_reason(reason.trim()) {
+                return Err(Error::InvalidParams(
+                    "reason uses a prefix reserved for daemon-raised provider-stall blockers"
+                        .to_string(),
+                ));
+            }
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
                 .await
         })
