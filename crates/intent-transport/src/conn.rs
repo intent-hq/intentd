@@ -502,7 +502,11 @@ pub(crate) fn process_frame<'a>(
     let context = crate::context::CapturedFrame::capture();
     async move {
         context
-            .run(process_captured_frame(
+            // Boxed: `run` nests task-local scopes that each move the body
+            // by value, and debug builds give every scope a stack copy of
+            // this large per-frame future (WSS e2e tests overflowed the
+            // 2 MiB test-thread stack without it).
+            .run(Box::pin(process_captured_frame(
                 &context,
                 raw,
                 api,
@@ -516,7 +520,7 @@ pub(crate) fn process_frame<'a>(
                 client_id,
                 is_local,
                 limiter,
-            ))
+            )))
             .await
     }
 }
