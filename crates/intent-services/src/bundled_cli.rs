@@ -162,9 +162,7 @@ pub async fn ensure_in(
             .write(true)
             .open(lock_parent.join(LOCK))
             .map_err(|e| format!("cannot open the bundled CLI install lock: {e}"))?;
-        file.lock()
-            .map_err(|e| format!("cannot lock the bundled CLI install: {e}"))?;
-        Ok(file)
+        lock_install(file)
     })
     .await?;
     let (dest, pin) = (destination.clone(), bundled.clone());
@@ -323,6 +321,25 @@ fn activate(
     }
     prune(parent, destination);
     complete(destination, cli, bundled).ok_or_else(|| format!("{spec} is not usable after install"))
+}
+
+/// Exclusive advisory lock shared with every process using this home;
+/// released when dropped. Windows installs are serialized per daemon only.
+#[cfg(unix)]
+type InstallLock = nix::fcntl::Flock<std::fs::File>;
+#[cfg(not(unix))]
+type InstallLock = std::fs::File;
+
+fn lock_install(file: std::fs::File) -> Result<InstallLock, String> {
+    #[cfg(unix)]
+    {
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, errno)| format!("cannot lock the bundled CLI install: {errno}"))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(file)
+    }
 }
 
 /// Versions kept per package, so daemons with different adapter pins that

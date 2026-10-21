@@ -203,13 +203,17 @@ async fn installs_wait_for_another_process_holding_the_install_lock() {
     std::fs::create_dir_all(&parent).unwrap();
     // Stands in for another daemon mid-install: an exclusive lock on the
     // same file, taken through a separate open file description.
-    let other = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(parent.join(LOCK))
-        .unwrap();
-    other.lock().unwrap();
+    let other = nix::fcntl::Flock::lock(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.join(LOCK))
+            .unwrap(),
+        nix::fcntl::FlockArg::LockExclusive,
+    )
+    .map_err(|(_, errno)| errno)
+    .unwrap();
     let path = path_env();
     let install = tokio::spawn({
         let (root, npm, pin) = (root.clone(), npm.clone(), pin.clone());
@@ -221,7 +225,7 @@ async fn installs_wait_for_another_process_holding_the_install_lock() {
         calls(temp.path()).is_empty(),
         "npm must not run while another process installs"
     );
-    other.unlock().unwrap();
+    drop(other);
     install.await.unwrap().unwrap();
     assert_eq!(calls(temp.path()).len(), 1);
 }

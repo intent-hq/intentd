@@ -901,12 +901,11 @@ child.on('exit',code=>process.exit(code||0));
         let bin = dir.join("node_modules/.bin");
         std::fs::create_dir_all(&bin).unwrap();
         let codex = bin.join("codex");
-        match target {
-            Some(target) => symlink(target, &codex).unwrap(),
-            None => {
-                std::fs::write(&codex, body).unwrap();
-                std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+        if let Some(target) = target {
+            symlink(target, &codex).unwrap();
+        } else {
+            std::fs::write(&codex, body).unwrap();
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
         codex
