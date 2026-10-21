@@ -12845,10 +12845,45 @@ async fn image_jpg_alias_reaches_acp_unchanged_over_wss() {
     image_prompt_preparation_over_wss(ImagePreparationCase::JpegAlias).await;
 }
 
+#[intent_test_macros::daemon_test]
+async fn image_mime_parameters_reach_acp_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::MimeParameters).await;
+}
+
+/// Legacy image payloads must deliver unsupported formats as retrievable files.
+#[intent_test_macros::daemon_test]
+async fn unsupported_images_become_file_notices_over_wss() {
+    for (mime, name, bytes) in [
+        (
+            "image/svg+xml",
+            "drawing.png",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#
+                .as_slice(),
+        ),
+        (
+            "image/bmp",
+            "drawing.bmp",
+            b"BMunsupported bitmap".as_slice(),
+        ),
+        (
+            "image/tiff",
+            "drawing.tiff",
+            b"IIunsupported tiff".as_slice(),
+        ),
+        ("image/avif", "drawing.avif", b"unsupported avif".as_slice()),
+        ("image/heic", "drawing.heic", b"unsupported heic".as_slice()),
+    ] {
+        image_prompt_preparation_over_wss(ImagePreparationCase::Unsupported(mime, name, bytes))
+            .await;
+    }
+}
+
 enum ImagePreparationCase {
     LargePng,
     CorruptPng,
     JpegAlias,
+    MimeParameters,
+    Unsupported(&'static str, &'static str, &'static [u8]),
 }
 
 async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
@@ -12858,9 +12893,18 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
+    let unsupported = matches!(case, ImagePreparationCase::Unsupported(..));
     let corrupt = matches!(case, ImagePreparationCase::CorruptPng);
     let jpeg_alias = matches!(case, ImagePreparationCase::JpegAlias);
-    let (format, mime, file_name) = if jpeg_alias {
+    let (format, mime, file_name) = if let ImagePreparationCase::Unsupported(mime, name, _) = case {
+        (image::ImageFormat::Png, mime, name)
+    } else if matches!(case, ImagePreparationCase::MimeParameters) {
+        (
+            image::ImageFormat::Png,
+            " IMAGE/PNG ; charset=binary ",
+            "image.png",
+        )
+    } else if jpeg_alias {
         (image::ImageFormat::Jpeg, "image/jpg", "image.jpg")
     } else {
         (image::ImageFormat::Png, "image/png", "image.png")
@@ -12869,7 +12913,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // Deterministic high-entropy pixels defeat PNG compression. This fixture
     // exceeds 5 MiB and the 2000-pixel long-edge limit, but its inline base64
     // still fits the existing 8 MiB prompt cap before preparation.
-    let (width, height) = if corrupt || jpeg_alias {
+    let (width, height) = if !matches!(case, ImagePreparationCase::LargePng) {
         (20, 10)
     } else {
         (3000, 640)
@@ -12887,10 +12931,12 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .write_to(&mut encoded, format)
         .expect("encode genuine fixture image");
     let mut original = encoded.into_inner();
-    if corrupt {
+    if let ImagePreparationCase::Unsupported(_, _, bytes) = case {
+        original = bytes.to_vec();
+    } else if corrupt {
         original.truncate(33); // PNG signature + valid IHDR; no IDAT pixel data.
         assert!(image::load_from_memory(&original).is_err());
-    } else if !jpeg_alias {
+    } else if matches!(case, ImagePreparationCase::LargePng) {
         assert!(original.len() > 5 * 1024 * 1024, "fixture exceeds 5 MiB");
     }
     let image_b64 = base64::engine::general_purpose::STANDARD.encode(&original);
@@ -12975,7 +13021,8 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .to_string();
 
     let mut outbound = Vec::new();
-    for (name, input) in [
+    let mut inline_file_id = None;
+    let mut inputs = vec![
         (
             "ImgRef",
             json!({ "type": "image", "attachmentId": &attachment_id }),
@@ -12984,7 +13031,14 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             "ImgInline",
             json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
         ),
-    ] {
+    ];
+    if unsupported {
+        inputs.push((
+            "ImgInlineAgain",
+            json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
+        ));
+    }
+    for (name, input) in inputs {
         // Separate agents ensure each path has its own first-turn prompt,
         // with no history replay or previous turn's image in the comparison.
         let created = wss_rpc(
@@ -13213,46 +13267,105 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             assert_eq!(matching.len(), 1, "exactly one provider prompt for {name}");
             let blocks = matching[0]["blocks"].as_array().expect("logged ACP blocks");
             let images: Vec<_> = blocks.iter().filter(|b| b["type"] == "image").collect();
-            assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
-            let data = images[0]["data"].as_str().expect("inline ACP image data");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .expect("provider image is base64");
-            assert!(
-                bytes.len() <= 3 * 1024 * 1024,
-                "provider image exceeds 3 MiB: {} bytes",
-                bytes.len()
-            );
-            let format = image::guess_format(&bytes).expect("provider image format");
-            if jpeg_alias {
-                assert_eq!(format, image::ImageFormat::Jpeg);
-                assert_eq!(images[0]["mimeType"], "image/jpg");
-                assert!(bytes == original, "small JPEG bytes remain unchanged");
-            } else {
-                assert_eq!(
-                    images[0]["mimeType"],
-                    format.to_mime_type(),
-                    "MIME matches outgoing bytes"
+            if unsupported {
+                assert!(
+                    images.is_empty(),
+                    "unsupported image never reaches vision: {blocks:?}"
                 );
+                let notice = blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .find(|text| text.starts_with("[Attachment:"))
+                    .expect("retrievable file notice");
+                assert!(notice.contains(mime));
+                let id = notice
+                    .split("attachmentId: ")
+                    .nth(1)
+                    .expect("attachment id")
+                    .split('.')
+                    .next()
+                    .expect("id terminator");
+                if name == "ImgRef" {
+                    assert_eq!(id, attachment_id);
+                } else if let Some(previous) = &inline_file_id {
+                    assert_eq!(
+                        id, previous,
+                        "repeated inline delivery reuses the source file"
+                    );
+                } else {
+                    inline_file_id = Some(id.to_owned());
+                }
+                let source = wss_rpc(
+                    &mut rpc,
+                    40,
+                    "file.getAttachmentInfo",
+                    json!({ "workspaceId": &ws_id, "attachmentId": id }),
+                )
+                .await;
+                assert_eq!(source["exists"], true);
+                let read = wss_rpc(&mut rpc, 41, "file.readChunk",
+                    json!({ "workspaceId": &ws_id, "path": source["path"], "offset": 0, "length": original.len() })).await;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(read["content"].as_str().expect("original file bytes"))
+                    .expect("base64 file");
+                assert_eq!(
+                    bytes, original,
+                    "file fallback preserves exact source bytes"
+                );
+                let queue = wss_rpc(
+                    &mut rpc,
+                    42,
+                    "agent.getQueue",
+                    json!({ "agentId": agent_id }),
+                )
+                .await;
+                assert!(
+                    queue["queue"].as_array().expect("queue").is_empty(),
+                    "no failed retry remains"
+                );
+            } else {
+                assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
+                let data = images[0]["data"].as_str().expect("inline ACP image data");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("provider image is base64");
+                assert!(
+                    bytes.len() <= 3 * 1024 * 1024,
+                    "provider image exceeds 3 MiB: {} bytes",
+                    bytes.len()
+                );
+                let format = image::guess_format(&bytes).expect("provider image format");
+                if jpeg_alias {
+                    assert_eq!(format, image::ImageFormat::Jpeg);
+                    assert_eq!(images[0]["mimeType"], "image/jpeg");
+                    assert!(bytes == original, "small JPEG bytes remain unchanged");
+                } else {
+                    assert_eq!(
+                        images[0]["mimeType"],
+                        format.to_mime_type(),
+                        "MIME matches outgoing bytes"
+                    );
+                }
+                let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
+                assert!(
+                    decoded.width().max(decoded.height()) <= 2000,
+                    "provider image long edge exceeds 2000 pixels"
+                );
+                assert!(
+                    decoded.width() > decoded.height(),
+                    "landscape orientation preserved"
+                );
+                assert!(
+                    images[0].get("attachmentId").is_none(),
+                    "provider receives bytes, not registry references"
+                );
+                outbound.push((images[0]["mimeType"].clone(), bytes));
             }
-            let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
-            assert!(
-                decoded.width().max(decoded.height()) <= 2000,
-                "provider image long edge exceeds 2000 pixels"
-            );
-            assert!(
-                decoded.width() > decoded.height(),
-                "landscape orientation preserved"
-            );
-            assert!(
-                images[0].get("attachmentId").is_none(),
-                "provider receives bytes, not registry references"
-            );
-            outbound.push((images[0]["mimeType"].clone(), bytes));
         }
 
-        if name == "ImgRef" {
-            // Preparation must never write its derived bytes onto the user row.
+        if name == "ImgRef" || !matches!(case, ImagePreparationCase::LargePng) {
+            // Large inline images are intentionally projected as thumbnails on reads.
+            // References and small inline sources must retain their submitted payload.
             let conv = wss_rpc(
                 &mut rpc,
                 14,
@@ -13270,18 +13383,15 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
                 .collect();
             assert_eq!(images.len(), 1, "one persisted image reference");
             let mut reference = images[0].clone();
-            // Conversation reads add a stable block id, not image payload.
-            reference
-                .as_object_mut()
-                .expect("image object")
-                .remove("id");
-            assert_eq!(
-                reference, input,
-                "transcript keeps the submitted reference unchanged"
-            );
+            // Conversation reads enrich inline images with layout metadata.
+            let object = reference.as_object_mut().expect("image object");
+            object.remove("id");
+            object.remove("width");
+            object.remove("height");
+            assert_eq!(reference, input, "transcript keeps the submitted source");
         }
     }
-    if !corrupt {
+    if !corrupt && !unsupported {
         assert_eq!(outbound.len(), 2);
         assert!(
             outbound[0] == outbound[1],

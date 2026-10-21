@@ -5813,6 +5813,7 @@ impl AgentManager {
                     blocks.extend(text_prompt(&text));
                 }
                 self.append_resolved_attachments(
+                    workspace_id,
                     &mut blocks,
                     group.image_blocks.as_ref(),
                     group.file_blocks.as_ref(),
@@ -5821,12 +5822,14 @@ impl AgentManager {
             }
         } else {
             self.append_resolved_attachments(
+                workspace_id,
                 &mut blocks,
                 options.prepend_image_blocks.as_ref(),
                 options.prepend_file_blocks.as_ref(),
             )
             .await?;
             self.append_resolved_attachments(
+                workspace_id,
                 &mut blocks,
                 options.image_blocks.as_ref(),
                 options.file_blocks.as_ref(),
@@ -5885,6 +5888,7 @@ impl AgentManager {
     /// Resolve references within their message group, before emitting the next text.
     async fn append_resolved_attachments(
         &self,
+        workspace_id: &WorkspaceId,
         blocks: &mut Vec<ContentBlock>,
         images: Option<&Value>,
         files: Option<&Value>,
@@ -5893,15 +5897,105 @@ impl AgentManager {
             .services
             .resolve_image_block_refs(images.cloned())
             .await?;
+        if let Some(resolved_images) = resolved.as_ref().and_then(Value::as_array) {
+            for (index, image) in resolved_images.iter().enumerate() {
+                let Some(mime) = image.get("mimeType").and_then(Value::as_str) else {
+                    continue;
+                };
+                let mime = crate::provider_images::normalize_image_mime(mime);
+                if crate::provider_images::supports_image_mime(&mime) {
+                    let mut image = image.clone();
+                    image["mimeType"] = json!(mime);
+                    push_image_blocks(blocks, Some(&json!([image])));
+                    continue;
+                }
+                let original = images
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.get(index));
+                let reference = original
+                    .and_then(|item| item.get("attachmentId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty());
+                let notice = if let Some(id) = reference {
+                    let record = self.services.store.get_attachment(id).await?;
+                    attachment_reference_notice(
+                        &record.file_name,
+                        Some(&mime),
+                        u64::try_from(record.size).ok(),
+                        id,
+                    )
+                } else {
+                    self.preserve_inline_image(workspace_id, image, &mime)
+                        .await?
+                };
+                blocks.extend(text_prompt(&notice));
+            }
+        }
         append_attachment_blocks(
             blocks,
             &TurnOptions {
-                image_blocks: resolved,
                 file_blocks: files.cloned(),
                 ..TurnOptions::default()
             },
         );
         Ok(())
+    }
+
+    /// Keep legacy inline unsupported images accessible without feeding them to vision.
+    /// Content-addressed placement also makes queue retries reuse the original file.
+    async fn preserve_inline_image(
+        &self,
+        workspace_id: &WorkspaceId,
+        image: &Value,
+        mime: &str,
+    ) -> Result<String> {
+        use crate::attachment_upload::{attachment_fingerprint, sha256_hex, KeyedPlacement};
+        use base64::Engine as _;
+        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+            Error::InvalidParams("Image attachment is missing its data. Reattach the file.".into())
+        })?;
+        if data.len() > 40 * 1024 * 1024 {
+            return Err(Error::InvalidParams(
+                "Image attachment exceeds 40 MiB of base64 data.".into(),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+            .map_err(|_| {
+                Error::InvalidParams(
+                    "Image attachment is not valid base64. Reattach the file.".into(),
+                )
+            })?;
+        let mime = mime.trim().to_ascii_lowercase();
+        let extension = intent_core::asset_extension_from_mime(&mime).unwrap_or(".bin");
+        let name = format!("image{extension}");
+        let digest = sha256_hex(&bytes);
+        let fingerprint = attachment_fingerprint(&name, bytes.len() as u64, Some(&digest));
+        let key = format!("image-file-{}", sha256_hex(fingerprint.as_bytes()));
+        let placed = self
+            .services
+            .place_attachment_registered(
+                workspace_id.clone(),
+                &name,
+                &crate::file_ops::AttachmentSource::Bytes(&bytes),
+                Some(mime.clone()),
+                Some(KeyedPlacement {
+                    key,
+                    lookup_fingerprint: Some(fingerprint),
+                    sha256: Some(digest),
+                }),
+            )
+            .await?;
+        let id = placed["attachmentId"].as_str().ok_or_else(|| {
+            Error::Internal("Image attachment placement returned no attachment ID.".into())
+        })?;
+        Ok(attachment_reference_notice(
+            &name,
+            Some(&mime),
+            Some(bytes.len() as u64),
+            id,
+        ))
     }
 
     /// Build the user-turn body: normally just `content`, but when the ACP

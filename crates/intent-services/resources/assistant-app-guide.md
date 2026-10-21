@@ -332,10 +332,13 @@ confirm independently, for example by checking whether the dev server still
 responds. Such a row has no Stop and clears the next time the agent starts.
 Codex and other providers do not report background tasks.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->
 
-Images sent to agents may be resized or re-encoded for provider delivery; original
-attachments and their displayed previews are unchanged. If an image cannot be read
+PNG, JPEG, GIF, and WebP attachments may be resized or re-encoded for provider
+delivery; original attachments and their displayed previews are unchanged. SVG and
+other image formats are sent as files the agent can retrieve and read, rather than
+as vision input. To have the agent inspect their appearance, export a PNG or JPEG.
+If a supported image cannot be read
 or the images together exceed the delivery budget, the turn fails rather than
 silently omitting an image. Re-export an unreadable image as PNG/JPEG, or send fewer
 images cropped to the relevant detail. A provider request-size error can also come
