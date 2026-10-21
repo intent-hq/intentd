@@ -1,7 +1,7 @@
 //! Regression for intent-hq/intent#7449: a repo-less `ws.pr.monitor` /
-//! `ws.pr.unmonitor` in a GitHub workspace must use the workspace's own fetch
-//! remote even though the insert trigger saved an unresolved historical
-//! primary selection.
+//! `ws.pr.unmonitor` in a GitHub workspace (inserted with repository metadata,
+//! so its selection is never-saved / Automatic) must use the workspace's own
+//! fetch remote.
 use super::*;
 use crate::repository_admission_source_tests::fixtures::Fixture as GitFixture;
 use intent_core::caller::{with_caller, Caller};

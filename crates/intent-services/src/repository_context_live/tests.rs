@@ -10,7 +10,7 @@ use crate::repository_read_source::tests::{ActualRead, ReadServer};
 use intent_acp::mcp_server::WorkspaceMcpServer;
 use intent_core::{
     AgentId, AgentSession, HistoricalTargetSource, PrincipalId, ReviewSelectionOutcome,
-    WorkspaceGitRoot, WorkspaceGitRootId,
+    ReviewSelectionSource, WorkspaceGitRoot, WorkspaceGitRootId,
 };
 use intent_store::RepositoryLifecycleObserver;
 use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
@@ -419,8 +419,11 @@ async fn live_context_concurrent_observation_cannot_publish_an_older_attempt() {
     assert_eq!(http.count(), 0);
 }
 
+/// intent-hq/intent#7449: repository owner/name metadata on a new workspace
+/// is not a saved choice, so the live repository context agents see and the
+/// repo-less review read agree on the same Automatic target.
 #[intent_test_macros::daemon_test]
-async fn live_context_historical_primary_and_root_incarnation_never_self_heal_from_remotes() {
+async fn live_context_and_repo_less_read_agree_for_workspace_with_repository_metadata() {
     let http = ReadServer::new().await;
     let mut base = ActualRead::new(&http).await;
     base.auth
@@ -429,14 +432,41 @@ async fn live_context_historical_primary_and_root_incarnation_never_self_heal_fr
         .delete_workspace(&base.git.workspace.id)
         .await
         .unwrap();
-    base.git.workspace.repository_owner = Some("historical-owner".into());
-    base.git.workspace.repository_name = Some("historical-name".into());
+    base.git.workspace.repository_owner = Some("group".into());
+    base.git.workspace.repository_name = Some("project".into());
     base.auth
         .service
         .store
         .insert_workspace(&base.git.workspace)
         .await
         .unwrap();
+    let f = LiveFixture::from_base(base).await;
+    let (_, context) = f.observe().await;
+    let selection = &context.value().context.roots[0].review_selection;
+    assert_eq!(selection.saved, SavedReviewSelection::Automatic);
+    let ReviewSelectionOutcome::Resolved { target, source } = &selection.outcome else {
+        panic!(
+            "metadata must not require a selection: {:?}",
+            selection.outcome
+        );
+    };
+    assert_eq!(*source, ReviewSelectionSource::Automatic);
+    assert_eq!(target.project_path, "group/project");
+    let read =
+        crate::repository_read_source::tests::run(&f.server(), "return await ws.pr.snapshot(4);")
+            .await;
+    assert!(read.to_string().contains("actual review"), "{read}");
+}
+
+#[intent_test_macros::daemon_test]
+async fn live_context_historical_primary_and_root_incarnation_never_self_heal_from_remotes() {
+    let http = ReadServer::new().await;
+    let base = ActualRead::new(&http).await;
+    crate::repository_admission_source_tests::fixtures::Fixture::seed_unresolved_history(
+        &base.auth.service.store,
+        &base.git.workspace.id,
+    )
+    .await;
     let f = LiveFixture::from_base(base).await;
     let (_, context) = f.observe().await;
     let saved = &context.value().context.roots[0].review_selection.saved;

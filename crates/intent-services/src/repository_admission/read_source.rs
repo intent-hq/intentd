@@ -213,30 +213,6 @@ fn target(
     }
 }
 
-/// Implicit (repo-less, non-addressed) reads only. A workspace inserted with
-/// repository metadata has an unresolved historical primary selection
-/// (intent-hq/intent#7449), which would otherwise refuse every repo-less read.
-/// This is a deliberate services-level exception to the intent-core rule that
-/// current remotes never recover historical intent: the selection is treated
-/// as Automatic, and the result is accepted only when it is a GitHub target.
-/// Anything else (GitLab, ambiguous, unmapped, no remote) keeps the strict
-/// refusal, so managed reads, their revalidation and addressed reads, which
-/// all use `selected_target`, are unchanged.
-fn implicit_target(
-    observed: &RepositoryObservedRoot,
-    selection: &SelectionFacts,
-) -> AdmissionResult<intent_core::RepositoryTarget> {
-    let saved = selection.saved()?;
-    if matches!(saved, SavedReviewSelection::UnresolvedHistorical { .. }) {
-        if let Ok(target) = target(observed, &SavedReviewSelection::Automatic) {
-            if target.provider == RepositoryProvider::Github {
-                return Ok(target);
-            }
-        }
-    }
-    target(observed, &saved)
-}
-
 fn selected_target(
     observed: &RepositoryObservedRoot,
     selection: &SelectionFacts,
@@ -425,18 +401,12 @@ impl CapturedReview {
         if SelectionFacts::read(services, &root_id).await? != selection {
             return Err(AdmissionError::BindingChanged);
         }
-        // Only `capture_addressed` sets `explicit`, so an implicit read never
-        // carries one and `selected_target` would reduce to `target`.
-        let selected = if self.addressed {
-            selected_target(
-                &observed,
-                &selection,
-                self.explicit.as_ref(),
-                self.settled.as_ref().ok(),
-            )?
-        } else {
-            implicit_target(&observed, &selection)?
-        };
+        let selected = selected_target(
+            &observed,
+            &selection,
+            self.explicit.as_ref(),
+            self.settled.as_ref().ok(),
+        )?;
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
                 .project_path

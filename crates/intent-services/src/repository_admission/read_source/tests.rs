@@ -78,12 +78,12 @@ impl ActualRead {
         Self::from_auth(server, auth).await
     }
 
-    /// As [`Self::new`], but the workspace carries repository metadata, so the
-    /// insert trigger saves an unresolved historical primary selection.
-    async fn with_repository_metadata(server: &ReadServer) -> Self {
-        let auth = Fixture::new(&server.fixture).await;
-        let git = GitFixture::with_repository_metadata("group", "project").await;
-        Self::from_auth_with(server, auth, git).await
+    /// As [`Self::new`], but the primary selection is retained, unproved
+    /// historical intent.
+    async fn with_unresolved_history(server: &ReadServer) -> Self {
+        let f = Self::new(server).await;
+        GitFixture::seed_unresolved_history(&f.auth.service.store, &f.git.workspace.id).await;
+        f
     }
 
     async fn from_auth(server: &ReadServer, auth: Fixture) -> Self {
@@ -1343,22 +1343,22 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
 }
 
 /// intent-hq/intent#7449: a GitHub workspace inserted with repository
-/// metadata gets an unresolved historical primary selection from the insert
-/// trigger. A repo-less read must still resolve its own GitHub fetch remote,
-/// while ambiguous, unmappable and missing remotes keep refusing.
+/// metadata has no saved choice, so a repo-less read resolves its own GitHub
+/// fetch remote through Automatic, while ambiguous, unmappable and missing
+/// remotes keep refusing.
 #[intent_test_macros::daemon_test]
-async fn implicit_github_read_resolves_unresolved_historical_selection_from_fetch_remotes() {
+async fn implicit_github_read_of_metadata_workspace_resolves_automatic_selection() {
     let git = GitFixture::with_repository_metadata("actual", "repository").await;
     let services = Services::new(git.store.clone());
     let root = git.root();
     intent_core::caller::with_caller(Caller::Daemon, async {
-        assert!(matches!(
+        assert_eq!(
             SelectionFacts::read(&services, &root)
                 .await
                 .ok()
                 .and_then(|facts| facts.saved().ok()),
-            Some(SavedReviewSelection::UnresolvedHistorical { .. })
-        ));
+            Some(SavedReviewSelection::Automatic)
+        );
         let read = || async {
             CapturedReview::capture(&services, git.workspace.id.clone(), 4)
                 .read(&services)
@@ -1404,14 +1404,48 @@ async fn implicit_github_read_resolves_unresolved_historical_selection_from_fetc
     .await;
 }
 
-/// intent-hq/intent#7449 guard: the implicit fallback accepts only GitHub. An
-/// unresolved historical selection over a mappable GitLab remote keeps the
-/// strict refusal for snapshot and monitor, without any provider traffic or
-/// monitor registration.
+/// Retained, unproved historical intent never heals from current remotes on
+/// any reader: a repo-less read refuses even over a single GitHub fetch remote,
+/// until an explicit choice is saved.
 #[intent_test_macros::daemon_test]
-async fn unresolved_history_fallback_never_reaches_gitlab() {
+async fn implicit_github_read_refuses_unresolved_historical_selection() {
+    let git = GitFixture::new().await;
+    GitFixture::seed_unresolved_history(&git.store, &git.workspace.id).await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Actual/Repository.git",
+        ],
+    );
+    let services = Services::new(git.store.clone());
+    intent_core::caller::with_caller(Caller::Daemon, async {
+        assert!(matches!(
+            SelectionFacts::read(&services, &git.root())
+                .await
+                .ok()
+                .and_then(|facts| facts.saved().ok()),
+            Some(SavedReviewSelection::UnresolvedHistorical { .. })
+        ));
+        assert!(
+            CapturedReview::capture(&services, git.workspace.id.clone(), 4)
+                .read(&services)
+                .await
+                .is_err()
+        );
+    })
+    .await;
+}
+
+/// Unresolved historical intent over a mappable GitLab remote keeps the strict
+/// refusal for snapshot and monitor, without any provider traffic or monitor
+/// registration.
+#[intent_test_macros::daemon_test]
+async fn unresolved_history_never_reaches_gitlab() {
     let server = ReadServer::new().await;
-    let f = ActualRead::with_repository_metadata(&server).await;
+    let f = ActualRead::with_unresolved_history(&server).await;
     assert!(matches!(
         SelectionFacts::read(&f.auth.service, &f.git.root())
             .await
