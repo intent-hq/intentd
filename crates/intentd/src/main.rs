@@ -2721,10 +2721,11 @@ async fn cmd_serve_owned(
 
     let tunnel_supervisor = bootstrap.tunnel.clone();
 
-    // Sitter idle-update handshake state (unix only), created ahead of the
-    // control surface so `system.status` can report it; the requester and
-    // staged-restart watcher below share it.
-    #[cfg(unix)]
+    // Command-script activity probe: `system.status` reports it on every
+    // platform (`DaemonControl.command_scripts`), so it must exist off unix
+    // too. The sitter idle-update handshake state below (unix only) shares
+    // it; it is created ahead of the control surface so `system.status` can
+    // report it, and the requester and staged-restart watcher share it.
     let command_scripts: CommandScriptsProbe = {
         let services = services.clone();
         Arc::new(move || services.command_script_activity())
