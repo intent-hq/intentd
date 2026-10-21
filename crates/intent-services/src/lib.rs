@@ -237,6 +237,7 @@ pub mod provider_models;
 mod provider_preparation;
 mod provider_profiles;
 pub mod provider_test_prompt;
+mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
 pub mod retention;
@@ -1090,6 +1091,11 @@ pub struct Services {
     /// Shared across clones so consecutive turns of one agent accumulate the
     /// same stall-episode streak.
     truncation_redrives: agent_session::TruncationRedrives,
+    /// Per-agent quota failover chain of the user turn in flight
+    /// (PROTOCOL §5.54 Backup failover): see
+    /// [`quota_failover::QuotaFailoverChains`]. Shared across clones so the
+    /// turn worker's arm and the failure seam's switch observe the same chain.
+    quota_failover_chains: quota_failover::QuotaFailoverChains,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1764,6 +1770,7 @@ impl Services {
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),

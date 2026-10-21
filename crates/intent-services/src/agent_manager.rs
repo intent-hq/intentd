@@ -6305,6 +6305,9 @@ impl AgentManager {
         // inherit the old count and hit the cap early.
         self.services.take_truncation_redrive(agent_id);
         self.services.clear_truncation_redrives(agent_id);
+        // The aborted worker's quota failover chain (PROTOCOL §5.54) belongs
+        // to the aborted turn; the next worker re-arms its own.
+        self.services.disarm_quota_failover(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -10592,7 +10595,9 @@ impl AgentManager {
 
     /// Whether a pending `model_changed` row for the provider hop
     /// `from_provider` → `to_provider` is the deferred last-turn commit of a
-    /// re-home the transcript already announces (intent-hq/intent#5737): the
+    /// re-home (intent-hq/intent#5737) or a quota failover (PROTOCOL §5.54,
+    /// a `provider_failover` row for the same selection hop) the transcript
+    /// already announces. For a re-home: the
     /// agent's newest identity-change system row
     /// ([`intent_store::Store::latest_agent_identity_notice`]) is a
     /// `provider_rehomed` notice for that same hop, both sides canonicalized
@@ -10610,9 +10615,13 @@ impl AgentManager {
         to_provider: &str,
     ) -> bool {
         let canonical = |id: &str| intent_providers::provider_config(id).id;
-        if canonical(from_provider) == canonical(to_provider) {
+        let selection = crate::provider_profiles::canonical_selection;
+        // A model-only change is never an announced switch. A hop between two
+        // configurations of one base can only be a quota failover.
+        if selection(from_provider) == selection(to_provider) {
             return false;
         }
+        let same_base = canonical(from_provider) == canonical(to_provider);
         let latest = match self
             .services
             .store
@@ -10628,7 +10637,14 @@ impl AgentManager {
         let Some(latest) = latest else {
             return false;
         };
-        if latest["type"].as_str() != Some("provider_rehomed") {
+        // Quota failover (PROTOCOL §5.54): the `provider_failover` row already
+        // names this exact hop between selections (profiles included).
+        if latest["type"].as_str() == Some(crate::quota_failover::PROVIDER_FAILOVER_NOTICE_TYPE) {
+            let hop = |key: &str| latest[key].as_str().map(selection);
+            return hop("fromProvider") == Some(selection(from_provider))
+                && hop("toProvider") == Some(selection(to_provider));
+        }
+        if same_base || latest["type"].as_str() != Some("provider_rehomed") {
             return false;
         }
         let hop = |key: &str| latest[key].as_str().map(canonical);
@@ -11288,11 +11304,19 @@ impl AgentManager {
         // Record the identity this attempt runs under BEFORE anything below
         // can fail: a spawn or session-setup failure is attributed to the
         // provider that was actually tried, not to whatever the last committed
-        // turn ran on. Cleared on success at the end of this method.
+        // turn ran on. Cleared on success at the end of this method. A
+        // profile attempt records its reference (PROTOCOL §5.54: a quota
+        // exhaustion names the last reference tried); a bare selection keeps
+        // its base id.
+        let attempt_provider = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+            resolved.selection.clone()
+        } else {
+            resolved.provider.id.to_string()
+        };
         self.spawn_attempt_provider
             .lock()
             .unwrap()
-            .insert(agent_id.clone(), resolved.provider.id.to_string());
+            .insert(agent_id.clone(), attempt_provider);
         let private_history = if let Some(session_id) = &session.acp_session_id {
             self.services
                 .store
@@ -13104,6 +13128,15 @@ fn resolve_spawn(
     // A profile shares its base provider's installation, paths and launch
     // configuration; only the environment overlay differs.
     let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
+    // Test seam: let the mock ACP agent stand in for a profile-capable base
+    // (`codex` / `claude-code`) so profile selections spawn a real child in
+    // unit tests. The selection identity is unchanged.
+    #[cfg(test)]
+    let provider_id = if std::env::var("MOCK_AGENT_STANDS_IN_FOR").is_ok_and(|b| b == provider_id) {
+        "mock".to_owned()
+    } else {
+        provider_id
+    };
     // Whitespace-bearing ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
     // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
@@ -13633,6 +13666,11 @@ async fn run_message_worker(
     // [`MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES`] the worker injects a warning
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
+    // Backup failover (PROTOCOL §5.54): set when the attempt about to run
+    // redrives the SAME message (a quota failover or a silent redrive), so
+    // the references already tried for it stay excluded; every other loop
+    // pass starts a new message with a fresh chain.
+    let mut keep_failover_chain = false;
     'outer: loop {
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
@@ -13711,6 +13749,8 @@ async fn run_message_worker(
                 .await;
             return;
         }
+        mgr.services
+            .arm_quota_failover(&agent_id, std::mem::take(&mut keep_failover_chain));
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
         match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
@@ -14229,10 +14269,28 @@ async fn run_message_worker(
                             // Tear down the dead child and loop back through
                             // `retry_spawn` with the SAME content/options.
                             silent_redrive_used = true;
+                            keep_failover_chain = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 error = %e,
                                 "transport closed before output — redriving the prompt once on a fresh child"
+                            );
+                            mgr.kill_child_only(&agent_id).await;
+                            continue 'outer;
+                        } else if crate::quota_failover::is_quota_failover_error(&e) {
+                            // Backup failover (PROTOCOL §5.54): `run_prompt_turn`
+                            // already switched the agent onto a backup profile
+                            // and swallowed this attempt. Redrive the SAME
+                            // content/options on a fresh child of the backup —
+                            // its new identity opens a fresh native session with
+                            // Intent history replayed; the user row is not
+                            // persisted again. Bounded: the chain never retries
+                            // a reference for this message.
+                            keep_failover_chain = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "provider quota exhausted — redriving the turn on a backup profile"
                             );
                             mgr.kill_child_only(&agent_id).await;
                             continue 'outer;
@@ -14274,6 +14332,28 @@ async fn run_message_worker(
                     // Cancellation is not provider failure. Leave the admitted
                     // slot for shutdown's interrupted-turn capture.
                     return;
+                }
+                // Backup failover for a rejected session setup (PROTOCOL
+                // §5.54): the spawn attempt hit its quota, so switch onto the
+                // next backup and loop back through the spawn with the same
+                // message instead of surfacing `agent:failed`. The attempt's
+                // provider record is consumed here because no terminal
+                // publisher runs for the swallowed attempt.
+                if intent_acp::message_is_quota_exceeded(&e.to_string())
+                    && mgr
+                        .services
+                        .try_quota_failover(&workspace_id, &agent_id)
+                        .await
+                {
+                    mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "provider quota exhausted at session setup — retrying on a backup profile"
+                    );
+                    keep_failover_chain = true;
+                    mgr.kill_child_only(&agent_id).await;
+                    continue 'outer;
                 }
                 match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
@@ -23973,6 +24053,10 @@ mod legacy_identity_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+#[cfg(test)]
+#[path = "agent_manager/quota_failover_tests.rs"]
+mod quota_failover_tests;
 
 #[cfg(test)]
 #[path = "agent_manager/future_size_tests.rs"]

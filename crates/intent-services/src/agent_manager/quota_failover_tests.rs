@@ -1,0 +1,477 @@
+//! Automatic quota failover to backup profiles (PROTOCOL §5.54 Backup
+//! failover), driven through the real turn worker against the mock ACP agent
+//! standing in for `claude-code` (`MOCK_AGENT_STANDS_IN_FOR`). The mock's
+//! attempt counter (`MOCK_AGENT_ATTEMPT_FILE`) persists across spawns, so
+//! "the first N attempts hit their quota" models the Default configuration
+//! and then each backup in turn running out.
+
+use super::dead_child_respawn_tests::mock_agent_script;
+use super::role_reminder_tests::{session, workspace};
+use super::*;
+use crate::agent_manager::tests::EnvGuard;
+use crate::events::{EventBus, SubscriptionFilter};
+use intent_store::Store;
+
+const WS: &str = "ws-quota-failover";
+
+/// The bridge-wrapped 429 shape `intent_acp::is_quota_exceeded` classifies.
+fn quota_error() -> Value {
+    json!({
+        "code": -32603,
+        "message": "Internal error",
+        "data": "{\"type\":\"rate_limit_error\",\"message\":\"usage limit reached\"}",
+    })
+}
+
+struct Fixture {
+    mgr: Arc<AgentManager>,
+    bus: EventBus,
+    agent: AgentId,
+    ws: WorkspaceId,
+    _db: tempfile::TempDir,
+    _scratch: tempfile::TempDir,
+    _env: EnvGuard,
+}
+
+impl Fixture {
+    /// A `claude-code` Default agent (model `opus`) with the given mock
+    /// behavior and a fresh attempt counter.
+    async fn new(behavior: Value) -> Self {
+        let script = mock_agent_script();
+        let scratch = crate::test_support::test_tempdir("quota-failover-");
+        let attempts = scratch.path().join("attempts");
+        let behavior = behavior.to_string();
+        let env = EnvGuard::apply(&[
+            ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
+            ("MOCK_AGENT_BEHAVIOR", Some(behavior.as_str())),
+            ("MOCK_AGENT_ATTEMPT_FILE", attempts.to_str()),
+            ("MOCK_AGENT_STANDS_IN_FOR", Some("claude-code")),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("10,20")),
+        ]);
+        let db = crate::test_support::test_tempdir("quota-failover-db-");
+        let store = Store::open(&db.path().join("store.db"))
+            .await
+            .expect("open store");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(db.path().join("secrets.json")),
+        )
+        .with_event_bus(bus.clone());
+        let ws = WorkspaceId::from(WS);
+        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        let agent = AgentId::from("agent-quota-failover");
+        let mut s = session(&agent, &ws, None);
+        s.provider = Some("claude-code".to_string());
+        s.model = Some("opus".to_string());
+        store.insert_agent_session(&s).await.unwrap();
+        let sink = Arc::new(BusEventSink::new(bus.clone()));
+        Self {
+            mgr: Arc::new(AgentManager::new(services, sink, 4)),
+            bus,
+            agent,
+            ws,
+            _db: db,
+            _scratch: scratch,
+            _env: env,
+        }
+    }
+
+    async fn profile(&self, name: &str, backup: bool) -> String {
+        self.mgr
+            .services
+            .provider_profiles_create_impl(json!({
+                "baseProviderId": "claude-code",
+                "name": name,
+                "backup": backup,
+            }))
+            .await
+            .expect("create profile")["profile"]["providerRef"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Send one user message and wait for the worker to settle; returns
+    /// every event published meanwhile.
+    async fn send(&self, text: &str) -> Vec<intent_core::Event> {
+        let mut sub = self.bus.subscribe(SubscriptionFilter::default());
+        self.mgr
+            .send_message(
+                self.agent.clone(),
+                self.ws.clone(),
+                text.to_string(),
+                None,
+                super::TurnOptions::default(),
+            )
+            .await
+            .expect("send_message spawns the worker inline");
+        timeout_settled(&self.mgr, &self.agent).await;
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) =
+            // fixed-deadline: allow — quiet-window drain after the worker settled
+            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+        {
+            events.extend(batch);
+        }
+        events
+    }
+
+    async fn row(&self) -> AgentSession {
+        self.mgr
+            .services
+            .store
+            .get_agent_session(&self.agent)
+            .await
+            .unwrap()
+    }
+
+    async fn messages(&self) -> Vec<intent_core::AgentMessage> {
+        self.mgr
+            .services
+            .store
+            .get_agent_messages(&self.agent, None)
+            .await
+            .unwrap()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let mgr = self.mgr.clone();
+        let agent = self.agent.clone();
+        // Best-effort child teardown; the runtime may already be shutting down.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { mgr.stop(&agent).await });
+        }
+    }
+}
+
+async fn timeout_settled(mgr: &AgentManager, agent: &AgentId) {
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session(agent)
+                    .await
+                    .unwrap()
+                    .status;
+                if matches!(status, AgentStatus::RuntimeIdle | AgentStatus::Error)
+                    && !mgr.is_busy(agent)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("the worker settles");
+}
+
+fn of_type<'a>(events: &'a [intent_core::Event], ty: &str) -> Vec<&'a intent_core::Event> {
+    events.iter().filter(|e| e.event_type == ty).collect()
+}
+
+fn notices<'a>(
+    messages: &'a [intent_core::AgentMessage],
+    ty: &str,
+) -> Vec<&'a intent_core::AgentMessage> {
+    messages
+        .iter()
+        .filter(|m| m.metadata.as_ref().and_then(|md| md["type"].as_str()) == Some(ty))
+        .collect()
+}
+
+fn user_rows<'a>(
+    messages: &'a [intent_core::AgentMessage],
+    text: &str,
+) -> Vec<&'a intent_core::AgentMessage> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" && m.content[0]["text"] == json!(text))
+        .collect()
+}
+
+/// The profile-change events a failover must not produce (activation
+/// changes from processes starting and stopping are not profile edits).
+fn profile_edits(events: &[intent_core::Event]) -> Vec<&intent_core::Event> {
+    events
+        .iter()
+        .filter(|e| {
+            e.event_type == "providers:profiles-changed" && e.data["change"] != json!("activation")
+        })
+        .collect()
+}
+
+/// A quota failure on the Default configuration moves the agent onto the
+/// first backup in saved order (skipping the non-backup profile), with the
+/// same model, and the same user turn completes there: one
+/// `provider_failover` row, `agent:updated`, no `agent:failed`, no
+/// `model_changed` row, no Error, the user row persisted once. The switch
+/// is sticky for the next turn.
+async fn assert_fails_over_to_first_backup(stream_before_error: Option<&str>) {
+    let mut behavior = json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    });
+    if let Some(text) = stream_before_error {
+        behavior["streamBeforeErrorText"] = json!(text);
+    }
+    let fx = Fixture::new(behavior).await;
+    let _work = fx.profile("Work", false).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+
+    let events = fx.send("please answer").await;
+
+    let row = fx.row().await;
+    assert_eq!(
+        row.provider.as_deref(),
+        Some(first.as_str()),
+        "sticky switch"
+    );
+    assert_eq!(row.model.as_deref(), Some("opus"), "same model id");
+    assert_eq!(row.status, AgentStatus::RuntimeIdle);
+    assert!(row.stop_reason.is_none(), "no error persisted: {row:?}");
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let updated: Vec<_> = of_type(&events, intent_core::events::AGENT_UPDATED)
+        .into_iter()
+        .filter(|e| e.data["providerId"] == json!(first))
+        .collect();
+    assert_eq!(updated.len(), 1, "{events:#?}");
+    assert_eq!(updated[0].data["modelId"], json!("opus"));
+    assert!(profile_edits(&events).is_empty(), "{events:#?}");
+    assert_eq!(of_type(&events, "agent:idle").len(), 1, "{events:#?}");
+
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(failover[0].role, "system");
+    assert_eq!(
+        failover[0].metadata,
+        Some(json!({
+            "type": "provider_failover",
+            "fromProvider": "claude-code",
+            "toProvider": first,
+            "model": "opus",
+            "reason": "quota-exceeded",
+        }))
+    );
+    assert_eq!(
+        failover[0].content[0]["text"],
+        json!("claude-code ran out of quota. Switched to the backup claude-code (First).")
+    );
+    assert!(
+        of_type(&events, "agent:message")
+            .iter()
+            .any(|e| e.data["messageId"] == json!(failover[0].id)),
+        "the notice is published live"
+    );
+    assert!(
+        notices(&messages, "model_changed").is_empty(),
+        "a failover never adds a model_changed row: {messages:#?}"
+    );
+    assert_eq!(user_rows(&messages, "please answer").len(), 1);
+    let assistant: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .map(|m| m.content.to_string())
+        .collect();
+    assert!(
+        assistant
+            .iter()
+            .any(|c| c.contains("answered on the backup")),
+        "the backup completed the turn: {assistant:?}"
+    );
+    if let Some(text) = stream_before_error {
+        assert!(
+            assistant.iter().any(|c| c.contains(text)),
+            "partial output of the failed attempt stays: {assistant:?}"
+        );
+    }
+
+    // Sticky: the next turn runs on the backup with no further notice.
+    let events = fx.send("and again").await;
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let messages = fx.messages().await;
+    assert_eq!(notices(&messages, "provider_failover").len(), 1);
+    assert!(
+        notices(&messages, "model_changed").is_empty(),
+        "{messages:#?}"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn quota_failure_before_output_fails_over_to_the_first_backup() {
+    assert_fails_over_to_first_backup(None).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn quota_failure_after_partial_output_still_fails_over() {
+    assert_fails_over_to_first_backup(Some("partial answer from the default")).await;
+}
+
+/// Every backup out of quota: each switch is recorded once, then the turn
+/// fails exactly as today — one `agent:failed` with `quota-exceeded` naming
+/// the last reference tried, the agent parked in Error on it.
+#[intent_test_macros::daemon_test]
+async fn exhausted_chain_fails_the_turn_as_today() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 3,
+        "response": "unreached",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    assert_eq!(failed[0].data["providerId"], json!(second));
+    let row = fx.row().await;
+    assert_eq!(row.status, AgentStatus::Error);
+    assert_eq!(row.provider.as_deref(), Some(second.as_str()));
+    let messages = fx.messages().await;
+    let hops: Vec<(Value, Value)> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| {
+            let md = m.metadata.as_ref().unwrap();
+            (md["fromProvider"].clone(), md["toProvider"].clone())
+        })
+        .collect();
+    assert_eq!(
+        hops,
+        vec![
+            (json!("claude-code"), json!(first)),
+            (json!(first), json!(second)),
+        ]
+    );
+    assert_eq!(user_rows(&messages, "please answer").len(), 1);
+    assert!(
+        notices(&messages, "model_changed").is_empty(),
+        "{messages:#?}"
+    );
+}
+
+/// No backup profile (only a non-backup one): today's behavior, untouched.
+#[intent_test_macros::daemon_test]
+async fn quota_failure_without_backups_is_unchanged() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "response": "unreached",
+    }))
+    .await;
+    let _work = fx.profile("Work", false).await;
+
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    assert_eq!(failed[0].data["providerId"], json!("claude-code"));
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// A failure that is not a quota rejection never fails over, even with
+/// backups saved.
+#[intent_test_macros::daemon_test]
+async fn non_quota_failures_never_fail_over() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": { "code": -32603, "message": "Internal error", "data": "boom" },
+        "response": "unreached",
+    }))
+    .await;
+    let _first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert!(
+        failed[0].data.get("errorCode").is_none(),
+        "{:?}",
+        failed[0].data
+    );
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some("claude-code"));
+    assert_eq!(row.status, AgentStatus::Error);
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// A quota rejection at session setup (`session/new`, the spawn-attempt
+/// path) fails over too, once today's spawn retry budget on the failing
+/// configuration is spent (`session/new` failures are retried as before):
+/// the backup's session opens and the turn completes.
+#[intent_test_macros::daemon_test]
+async fn session_setup_quota_failure_fails_over() {
+    let fx = Fixture::new(json!({
+        "sessionNewRpcError": quota_error(),
+        "sessionNewRpcErrorAttempts": super::MAX_SPAWN_ATTEMPTS,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(row.status, AgentStatus::RuntimeIdle);
+    let messages = fx.messages().await;
+    assert_eq!(notices(&messages, "provider_failover").len(), 1);
+    assert_eq!(user_rows(&messages, "please answer").len(), 1);
+    assert!(
+        !fx.mgr
+            .spawn_attempt_provider
+            .lock()
+            .unwrap()
+            .contains_key(&fx.agent),
+        "the swallowed attempt's provider record is consumed"
+    );
+}
+
+/// Every session setup out of quota: the spawn path's chain is bounded the
+/// same way and ends in today's spawn failure.
+#[intent_test_macros::daemon_test]
+async fn session_setup_quota_exhaustion_fails_as_today() {
+    let fx = Fixture::new(json!({
+        "sessionNewRpcError": quota_error(),
+        "response": "unreached",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    assert_eq!(
+        failed[0].data["providerId"],
+        json!(second),
+        "last reference tried"
+    );
+    let row = fx.row().await;
+    assert_eq!(row.status, AgentStatus::Error);
+    assert_eq!(row.provider.as_deref(), Some(second.as_str()));
+    let messages = fx.messages().await;
+    let targets: Vec<Value> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| m.metadata.as_ref().unwrap()["toProvider"].clone())
+        .collect();
+    assert_eq!(targets, vec![json!(first), json!(second)]);
+}

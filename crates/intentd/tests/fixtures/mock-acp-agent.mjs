@@ -1163,9 +1163,18 @@ async function dispatch(msg) {
       // upstream body lives in `data`), modelling a provider whose allowance
       // is already spent when the daemon opens the session — before any
       // prompt — so spawn-path failure attribution can be pinned.
+      // `sessionNewRpcErrorAttempts` gates the rejection to the first N
+      // session/new calls (counter in MOCK_AGENT_ATTEMPT_FILE, persisted
+      // across spawns), so a later spawn — e.g. on a backup profile — opens.
       if (behavior.sessionNewRpcError) {
-        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
-        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        const gate =
+          typeof behavior.sessionNewRpcErrorAttempts === 'number' && behavior.sessionNewRpcErrorAttempts > 0
+            ? behavior.sessionNewRpcErrorAttempts
+            : 0;
+        if (gate === 0 || getAndIncrementAttempt() <= gate) {
+          log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+          return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        }
       }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.

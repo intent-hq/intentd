@@ -2672,9 +2672,9 @@ impl Store {
     }
 
     /// Metadata of the agent's newest `role: "system"` transcript row that
-    /// records a spawn-identity change — a `model_changed` or a
-    /// `provider_rehomed` notice — or `None` when the transcript carries
-    /// neither. The model-change notice path reads it to tell a re-home's
+    /// records a spawn-identity change — a `model_changed`, a
+    /// `provider_rehomed` or a `provider_failover` notice — or `None` when
+    /// the transcript carries none of them. The model-change notice path reads it to tell a re-home's
     /// deferred last-turn commit (the newest such row is the
     /// `provider_rehomed` notice for this very provider hop) from an
     /// ordinary switch, durably across spawn retries, later turns and
@@ -2692,7 +2692,8 @@ impl Store {
         let raw = sqlx::query_scalar::<_, Option<String>>(
             "SELECT metadata FROM agent_message \
              WHERE agent_id=? AND role='system' \
-               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover') \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(&agent_id.0)
@@ -3202,6 +3203,68 @@ impl Store {
         .fetch_one(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        lifecycle.settle_after_retirement().await?;
+        Ok(false)
+    }
+
+    /// Move a session onto a backup provider profile after a quota failure
+    /// (PROTOCOL §5.54 Backup failover): a narrow write of `provider` and
+    /// `updated_at` only. The model id and reasoning effort carry over
+    /// unchanged — a backup is a profile of the same base provider, so the
+    /// write is what `agent.setModel` with the same model would persist.
+    /// Like [`Store::rehome_agent_session_provider`] it may change `provider`
+    /// after first real use, and it is a compare-and-set on the `provider`
+    /// column: a concurrent `agent.setModel` that moved the session between
+    /// the caller's read and this write is never overwritten (`Ok(false)`,
+    /// nothing mutated). Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn failover_agent_session_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: &str,
+        provider: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && current.provider.as_deref() == Some(expected_provider)
+            && expected_provider != provider
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND provider=?",
+        )
+        .bind(provider)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            lifecycle.settle_after_retirement().await?;
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?;
         if exists == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -14023,6 +14086,78 @@ mod tests {
         assert_eq!(after.provider.as_deref(), Some("mock"));
     }
 
+    /// The narrow `failover_agent_session_provider` writer (quota failover,
+    /// PROTOCOL §5.54 Backup failover): only `provider` and `updated_at`
+    /// change — the model id and reasoning effort carry over to the backup,
+    /// as `agent.setModel` with the same model would keep them. Compare-and-
+    /// set on the provider the caller read; a wrong workspace is `NotFound`.
+    #[tokio::test]
+    async fn failover_agent_session_provider_switches_only_the_provider() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-failover".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let err = store
+            .failover_agent_session_provider(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                "claude-code",
+                "claude-code@pbackup",
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code@pother",
+                "claude-code@pbackup",
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
+        let updated_at = now_iso();
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                "claude-code@pbackup",
+                &updated_at,
+            )
+            .await
+            .expect("failover after first real use");
+        assert!(landed);
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.provider.as_deref(), Some("claude-code@pbackup"));
+        assert_eq!(after.model.as_deref(), Some("opus"), "model id unchanged");
+        assert_eq!(after.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+    }
+
     /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
     /// newest system `model_changed` / `provider_rehomed` row's metadata
     /// only: other system rows, user/assistant rows carrying those types,
@@ -14135,6 +14270,21 @@ mod tests {
             .expect("model_changed row");
         assert_eq!(latest["type"], "model_changed", "newest identity row wins");
         assert_eq!(latest["toProvider"], "a");
+
+        // A quota failover switch is an identity change too.
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_failover", "fromProvider": "a", "toProvider": "c" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("provider_failover row");
+        assert_eq!(latest["type"], "provider_failover");
+        assert_eq!(latest["toProvider"], "c");
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
