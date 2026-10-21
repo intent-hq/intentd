@@ -71,7 +71,7 @@ jobs:
         adapter: [codex, claude-code]
     name: pin (${{ matrix.adapter }})
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Check for RELEASE_PLZ_TOKEN

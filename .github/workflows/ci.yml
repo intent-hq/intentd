@@ -281,7 +281,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - run: python3 -m pip install 'PyYAML==6.0.3'
@@ -334,7 +334,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -651,7 +651,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -854,7 +854,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -920,7 +920,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -1023,7 +1023,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -1167,7 +1167,7 @@ jobs:
           threads=$(( cpus < 16 ? cpus : 16 ))
           echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
           echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -1309,7 +1309,7 @@ jobs:
           threads=$(( cpus < 16 ? cpus : 16 ))
           echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
           echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -1443,7 +1443,7 @@ jobs:
           threads=$(( cpus < 16 ? cpus : 16 ))
           echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
           echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
@@ -1857,7 +1857,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Test release metadata and auto-cut guards (offline)
@@ -2117,7 +2117,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7

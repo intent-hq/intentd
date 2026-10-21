@@ -34,7 +34,7 @@ jobs:
       INTENTD_ASSERT_BOUND_CALLER: "1"
       INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
