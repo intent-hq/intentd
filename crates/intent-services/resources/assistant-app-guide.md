@@ -23,6 +23,17 @@ Multiplayer, Collaboration, personal device pairing, and provider profiles are
 currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
+
+Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
+Labs feature labels the default collaborator role Participant. The workspace owner
+can change a direct guest between Participant and Manager in Share. Managers can
+create agents, choose models/providers and reasoning effort, and run, start, stop,
+restart or inspect existing
+saved scripts. They cannot edit script commands, control raw terminals, run host
+commands, change credentials, or manage sharing. Host membership retains its existing
+authority. Role downgrades apply to subsequent operations on open connections.
+
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
 Labs feature supports reactions 👍 👎 👀 ✅ 🙈 and shows a bounded sample of who
 reacted. Legacy 🙂 can be removed. Agents can react only after explicit addressing

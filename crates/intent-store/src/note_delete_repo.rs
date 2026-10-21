@@ -93,7 +93,7 @@ async fn authorize(
             if member && !ws.is_chief() {
                 return Ok(());
             }
-            let guest: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id=? AND principal_id=? AND role IN ('owner','collaborator'))")
+            let guest: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id=? AND principal_id=? AND role IN ('owner','collaborator','manager'))")
                 .bind(ws.as_str()).bind(principal_id.as_str()).fetch_one(&mut *conn).await.map_err(|error| db(&error))?;
             if guest && !member {
                 Ok(())

@@ -580,7 +580,7 @@ impl Store {
                 .bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?;
             result.credentials = sqlx::query("UPDATE principal_credential SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL")
                 .bind(&now).bind(&principal_id.0).execute(&mut *tx).await.map_err(db_error)?.rows_affected();
-            result.workspaces = sqlx::query_scalar::<_, String>("DELETE FROM workspace_member WHERE principal_id = ? AND (role = 'collaborator' OR ?) RETURNING workspace_id")
+            result.workspaces = sqlx::query_scalar::<_, String>("DELETE FROM workspace_member WHERE principal_id = ? AND (role IN ('collaborator', 'manager') OR ?) RETURNING workspace_id")
                 .bind(&principal_id.0).bind(removed).fetch_all(&mut *tx).await.map_err(db_error)?.into_iter().map(WorkspaceId).collect();
             result.workspaces.sort_by(|a, b| a.0.cmp(&b.0));
             if removed {

@@ -1313,6 +1313,18 @@ async fn dispatch_other(
                 .map_err(workspace_err)?;
             Ok(r)
         }
+        "workspace.members.setRole" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let role = match require_str_param(params, "role")?.as_str() {
+                "collaborator" => intent_core::WorkspaceRole::Collaborator,
+                "manager" => intent_core::WorkspaceRole::Manager,
+                _ => return Err(invalid_params("role must be collaborator or manager")),
+            };
+            api.workspace_members_set_role(id, intent_core::PrincipalId::from(principal_id), role)
+                .await
+                .map_err(workspace_err)
+        }
         "workspace.members.remove" => {
             let id = require_workspace_id(params)?;
             let principal_id = require_str_param(params, "principalId")?;
@@ -5070,16 +5082,58 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)
         }
         "script.start" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_start(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.stop" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_stop(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.restart" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_restart(ws, script_id)
@@ -5104,6 +5158,26 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)
         }
         "script.run" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params.keys().any(|k| {
+                ![
+                    "workspaceId",
+                    "scriptId",
+                    "maxLines",
+                    "timeoutSeconds",
+                    "timeout",
+                ]
+                .contains(&k.as_str())
+            }) {
+                return Err(invalid_params(
+                    "saved script run accepts only IDs and output/timeout options",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");

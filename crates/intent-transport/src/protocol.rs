@@ -746,7 +746,8 @@ use std::time::{Duration, Instant};
 // 14.0 removes archived script lists and terminal monitor history; active pages and lazy details.
 // 14.1 adds owner-only startup readiness and indexing observations.
 // 15.0 removes system.importLegacy, the legacy import CLI commands and first-boot import.
-// 15.1 adds human workspace discussion history, sends, and live messages.
+// 15.1 adds human workspace discussion history, sends, live messages, and
+// capability-gated persisted guest roles with owner-only role assignment.
 pub const PROTOCOL_VERSION: &str = "15.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by

@@ -33,6 +33,7 @@ impl ScriptManager {
     }
 
     async fn prepare_admission(&self, ws: &WorkspaceId, id: &str, restart: bool) -> Result<()> {
+        self.require_admission(ws, id).await?;
         if self
             .scripts
             .lock()

@@ -409,7 +409,13 @@ impl Services {
                     .store
                     .get_workspace_member_role(workspace_id, &principal_id)
                     .await?;
-                if role != Some(intent_core::WorkspaceRole::Collaborator) {
+                if !matches!(
+                    role,
+                    Some(
+                        intent_core::WorkspaceRole::Collaborator
+                            | intent_core::WorkspaceRole::Manager
+                    )
+                ) {
                     return Ok(None);
                 }
                 false

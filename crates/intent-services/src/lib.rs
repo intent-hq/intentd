@@ -18762,6 +18762,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionConversations".into(), serde_json::json!(1));
             caps.insert("discussionMessageActions".into(), serde_json::json!(1));
             caps.insert("discussionReactions".into(), serde_json::json!(1));
+            caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
@@ -20697,7 +20698,7 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list(&workspace_id).await
         })
@@ -20710,7 +20711,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list_filtered(&workspace_id, archive).await
         })
@@ -20722,7 +20723,7 @@ impl WorkspaceApi for Services {
         options: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
             if options.summary {
@@ -20740,9 +20741,11 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.get")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.get")
                 .await?;
-            self.script_manager().get(&workspace_id, &script_id).await
+            let mgr = self.script_manager();
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
+            mgr.get(&workspace_id, &script_id).await
         })
     }
     fn script_monitor_list_view(
@@ -20910,7 +20913,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.start")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
                 .await?;
             mgr.start(&workspace_id, &script_id).await
         })
@@ -20923,7 +20926,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.stop")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.stop")
                 .await?;
             mgr.stop(&workspace_id, &script_id).await
         })
@@ -20936,7 +20939,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.restart")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.restart")
                 .await?;
             mgr.restart(&workspace_id, &script_id).await
         })
@@ -20952,9 +20955,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.output")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.output")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -20972,9 +20976,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.status")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.status")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -20988,10 +20993,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.run")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
                 .await?;
-            mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
-                .await
+            let result = mgr
+                .run(&workspace_id, &script_id, max_lines, timeout_seconds)
+                .await?;
+            // A command may finish after the owner downgraded this open socket.
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
+                .await?;
+            Ok(result)
         })
     }
 
@@ -30929,8 +30939,28 @@ impl WorkspaceApi for Services {
             // background flag); lifecycle, session, model, prompt, task and
             // attachment fields are the owner's.
             if !capability::collaborator_editable_agent_update(&changes) {
-                self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                let model_preferences = changes.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        [
+                            "name",
+                            "nameExplicitlySet",
+                            "isBackground",
+                            "reasoningEffort",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                });
+                if model_preferences {
+                    let workspace_id = self.agent_workspace(&agent_id).await?;
+                    self.require_workspace_operator(
+                        &workspace_id,
+                        "agent.update (model preferences)",
+                    )
                     .await?;
+                } else {
+                    self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                        .await?;
+                }
             }
             self.agent_update_op(agent_id, changes).await
         })
@@ -31074,7 +31104,34 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         self.execution_call(async move {
-            self.require_member(&workspace_id).await?;
+            let manager = self
+                .require_workspace_operator(&workspace_id, "agent.create")
+                .await?;
+            if manager
+                && (parent_agent_id.is_some()
+                    || extra.workspace_path.is_some()
+                    || extra.workspace_context.is_some()
+                    || extra.agent_type.is_some()
+                    || extra.metadata.as_ref().is_some_and(|m| {
+                        !m.as_object().is_some_and(|o| {
+                            o.keys().all(|k| {
+                                [
+                                    "initialMessage",
+                                    "contextReferences",
+                                    "contextRefs",
+                                    "imageBlocks",
+                                    "fileBlocks",
+                                    "isBackground",
+                                ]
+                                .contains(&k.as_str())
+                            })
+                        })
+                    }))
+            {
+                return Err(Error::Forbidden(
+                    "agent.create protected configuration requires the workspace owner".into(),
+                ));
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -34349,6 +34406,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
+    }
+
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+        role: intent_core::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_set_role_op(&workspace_id, &principal_id, role)
                 .await
         })
     }

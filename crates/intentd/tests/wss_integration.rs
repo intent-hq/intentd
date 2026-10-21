@@ -26,6 +26,8 @@ mod discovery_context;
 mod discussion;
 #[path = "wss_integration/git_commit_removal.rs"]
 mod git_commit_removal;
+#[path = "wss_integration/guest_roles.rs"]
+mod guest_roles;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]

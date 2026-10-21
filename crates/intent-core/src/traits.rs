@@ -5385,6 +5385,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Owner-only direct guest role change. Owner and inherited host roles
+    /// are immutable here. Emits workspace:updated only when changed.
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        role: crate::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id, role);
+        Box::pin(async {
+            Err(Error::Internal(
+                "workspace_members_set_role not implemented".into(),
+            ))
+        })
+    }
+
     /// `workspace.members.remove` (multiplayer w3): drop a collaborator from
     /// a workspace → `{ removed: bool }`. Owner-only; the owner membership
     /// itself cannot be removed (`InvalidParams`). The removed member's
