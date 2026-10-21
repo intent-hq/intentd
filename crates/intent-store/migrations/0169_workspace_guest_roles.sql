@@ -137,4 +137,3 @@ BEGIN
   SELECT 'workspace_member', NEW.workspace_id, NEW.principal_id, 1
   WHERE NOT EXISTS (SELECT 1 FROM repository_authority_revision WHERE kind = 'workspace_member' AND subject_id = NEW.workspace_id AND member_id = NEW.principal_id) AND (NEW.workspace_id IS NOT OLD.workspace_id OR NEW.principal_id IS NOT OLD.principal_id);
 END;
-
