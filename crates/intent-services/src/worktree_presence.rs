@@ -49,6 +49,7 @@ impl WorktreePresence {
     /// Stat `path` for `workspace_id`, record the result, and return whether
     /// the checkout is present. Logs one `warn!` on present → missing, one
     /// `info!` on missing → present, and `debug!` otherwise.
+    #[must_use]
     pub fn observe(&self, workspace_id: &WorkspaceId, path: &Path) -> bool {
         let present = checkout_dir_exists(path);
         self.record(workspace_id, path, present);

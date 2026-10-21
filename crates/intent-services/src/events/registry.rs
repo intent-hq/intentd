@@ -211,7 +211,7 @@ impl WatcherRegistry {
                     if path.is_dir() {
                         initial.push((ws.id, path));
                     } else if !ws.is_remote && !ws.archived {
-                        presence.observe(&ws.id, &path);
+                        presence.record(&ws.id, &path, false);
                         missing.insert(ws.id, path);
                     }
                 }
@@ -456,7 +456,7 @@ async fn track_missing_root(ev: &Event, services: &dyn WorkspaceApi, probe: &mut
         return false;
     }
     probe.roots.remove(&ev.workspace_id);
-    probe.presence.observe(&ev.workspace_id, &path);
+    probe.presence.record(&ev.workspace_id, &path, false);
     probe.missing.insert(ev.workspace_id.clone(), path);
     true
 }
