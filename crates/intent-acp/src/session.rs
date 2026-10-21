@@ -548,6 +548,11 @@ pub struct MappedToolCall {
     pub output: Option<Value>,
     /// `data.status`: one of started|completed|error.
     pub status: &'static str,
+    /// PROTOCOL §5.5b: a backgrounded-marker update that supplied no explicit
+    /// `status`. Its genuine fields keep their ordinary processing, but the
+    /// tool keeps the status it already has: the marker must never reopen a
+    /// completed or failed tool as `started`.
+    pub keeps_status: bool,
 }
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
@@ -727,6 +732,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
         input,
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
+        keeps_status: false,
         tool_name,
         name_authoritative,
         title,
@@ -743,6 +749,11 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
         status: fields.status.map_or("started", tool_status_word),
+        keeps_status: fields.status.is_none()
+            && update
+                .meta
+                .as_ref()
+                .is_some_and(crate::workers::meta_is_backgrounded),
         tool_call_id: update.tool_call_id.0.to_string(),
         input,
         output: fields.raw_output.clone(),

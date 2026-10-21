@@ -177,7 +177,8 @@ pub struct SystemStatus {
 
 /// The idle-triggered update check state for `system.status`: the daemon
 /// asks its supervising sitter for an idle-mode update check (SIGUSR2) while
-/// no turn is in flight, and exits for a staged update only once idle.
+/// no turn is in flight and no command script runs, and exits for a staged
+/// update only once idle (the script wait is bounded).
 /// Timestamps are RFC 3339 UTC strings, `None` (null on the wire) when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdleUpdateCheckStatus {
@@ -193,8 +194,15 @@ pub struct IdleUpdateCheckStatus {
     /// the requester is disabled.
     pub next_eligible_at: Option<String>,
     /// The sitter staged a newer version: the daemon exits for the restart
-    /// at the next moment no turn is in flight.
+    /// at the next moment no turn is in flight and no command script runs.
     pub restart_pending: bool,
+    /// Command-mode script runs in flight right now. They count as busy for
+    /// the handshake: no idle request is sent and a staged restart waits for
+    /// them (bounded; see `restart_deferred_until`). Services never count.
+    pub running_scripts: usize,
+    /// While a staged restart is pending and held by running command
+    /// scripts: when the daemon stops waiting for them and restarts anyway.
+    pub restart_deferred_until: Option<String>,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -502,6 +510,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             "lastRequestedAt": status.idle_update_check.last_requested_at,
             "nextEligibleAt": status.idle_update_check.next_eligible_at,
             "restartPending": status.idle_update_check.restart_pending,
+            "runningScripts": status.idle_update_check.running_scripts,
+            "restartDeferredUntil": status.idle_update_check.restart_deferred_until,
         },
         "host": {
             "os": status.os,

@@ -1,5 +1,6 @@
 //! Unit-test scratch and local CLI apparatus.
 
+pub(crate) mod provider_installed;
 mod scratch;
 pub(crate) use scratch::{test_tempdir, test_tempdir_in};
 

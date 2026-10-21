@@ -191,6 +191,13 @@ pub enum Error {
     #[error("source control rate limited: {0}")]
     RateLimited(String),
 
+    /// A request forwarded to an agent's provider adapter failed (JSON-RPC
+    /// error, timeout, or the connection ended before or during the request),
+    /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
+    /// `data.code: "provider-error"`.
+    #[error("provider request failed: {0}")]
+    ProviderRequest(String),
+
     /// The bound caller lacks the capability for this operation (multiplayer
     /// w3 capability matrix: an Owner-only or administrator-only method
     /// invoked by a collaborator). Surfaces as `-32003 Forbidden` — the same
@@ -584,6 +591,7 @@ impl Error {
             | Error::DeviceGrantUnsupported { .. }
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
+            | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now

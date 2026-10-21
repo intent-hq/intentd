@@ -22,6 +22,21 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub async fn new() -> Self {
+        Self::new_with(|_| {}).await
+    }
+
+    /// A workspace inserted with repository metadata, as GitHub workspaces are
+    /// created today: the insert trigger saves an unresolved historical
+    /// primary selection rather than Automatic.
+    pub async fn with_repository_metadata(owner: &str, name: &str) -> Self {
+        Self::new_with(|workspace| {
+            workspace.repository_owner = Some(owner.into());
+            workspace.repository_name = Some(name.into());
+        })
+        .await
+    }
+
+    async fn new_with(configure: impl FnOnce(&mut Workspace)) -> Self {
         let dir = crate::test_support::test_tempdir("repository-admission-sources-");
         let path = dir.path().join("repo");
         init(&path);
@@ -31,6 +46,7 @@ impl Fixture {
         workspace.branch = "main".into();
         workspace.repository_path = Some(path.to_str().unwrap().into());
         workspace.path = Some(dir.path().join("metadata").to_str().unwrap().into());
+        configure(&mut workspace);
         store.insert_workspace(&workspace).await.unwrap();
         std::fs::write(dir.path().join("global"), "").unwrap();
         std::fs::write(dir.path().join("system"), "").unwrap();

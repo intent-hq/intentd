@@ -19,17 +19,10 @@ use crate::Services;
 
 /// Make claude-code the settings default and runnable in tests.
 fn use_claude_code(svc: &Services) {
-    let mut paths = svc.effective_settings().providers.paths;
-    paths.insert(
-        "claude-code".to_string(),
-        crate::agent_ops::TEST_RUNNABLE_PATH.to_string(),
-    );
+    crate::test_support::provider_installed::mark_on(svc, &["claude-code"]);
     svc.settings_registry()
         .expect("registry")
-        .apply(&[
-            ("providers.paths".into(), json!(paths)),
-            ("model.defaultProvider".into(), json!("claude-code")),
-        ])
+        .apply(&[("model.defaultProvider".into(), json!("claude-code"))])
         .expect("apply settings");
 }
 

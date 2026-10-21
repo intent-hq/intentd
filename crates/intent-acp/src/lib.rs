@@ -35,6 +35,7 @@ pub mod spawn;
 pub mod terminal;
 pub(crate) mod tool_restrictions;
 pub mod transport;
+pub mod workers;
 
 #[cfg(unix)]
 pub use descendant_sweep::{descendant_pids, descendant_pids_many, sweep_escaped_descendants};

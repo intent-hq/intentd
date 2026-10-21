@@ -83,6 +83,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
+        ("agent_workers.rs", "agent.workers."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -196,7 +197,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Named provider profiles (§5.54): +4 router methods.
 // Startup status (14.1): +1 fast-path method.
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 448;
+// Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
+const EXPECTED_TOTAL_METHODS: usize = 451;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -205,10 +207,12 @@ const EXPECTED_TOTAL_METHODS: usize = 448;
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
-const EXPECTED_ROUTER_METHODS: usize = 391;
+/// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
+const EXPECTED_ROUTER_METHODS: usize = 393;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+/// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
@@ -570,6 +574,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.summary",
     "agent.unsubscribe",
     "agent.update",
+    "agent.workers.list",
+    "agent.workers.stop",
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",

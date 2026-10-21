@@ -307,13 +307,19 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/script_monitor.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-services/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect
-or edit its full definition. Output is temporary and may no longer be available after a restart. Script watches show
+or edit its full definition. Output from each script's latest run is saved and
+stays available after a restart or archive. Saved output is cleared 7 days (by
+default) after it was last written, when you delete the script, or when you delete
+the workspace, which also stops its scripts. Output of a script that is still running
+is never cleared by age. Very long runs keep only their most recent output. Script watches show
 only active monitors and disappear when they finish, trigger, expire, or are
-cancelled; completion notices remain in the agent conversation.
+cancelled; completion notices remain in the agent conversation. An automatic
+background update waits for running one-off (command) scripts to finish, for up
+to 90 minutes, before restarting; long-running service scripts do not delay it.
 
 To delete a saved script, use **Delete script** beside its play/edit controls in
 the bottom bar, or open the script panel's **…** menu and choose **Delete script**

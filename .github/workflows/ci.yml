@@ -426,6 +426,14 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # CI is the guard against host-dependent tests: a test that relies on
+      # an installed provider CLI passes locally and fails here only while
+      # runners have none. Fail loudly if a runner image starts shipping one.
+      # Locally: scripts/test-without-provider-clis.sh (intentd#2462).
+      - name: No provider CLIs on the runner
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: cargo test -p intent-providers --lib -- --ignored --exact provider_cli_guard::no_provider_cli_visible
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
       # (coverage-e2e / coverage-all are merge_group-only; PRs run only
@@ -1801,6 +1809,8 @@ jobs:
           python3 -I -B scripts/test-native-review-artifact.py
       - name: Test the local release-scripts runner (make test-release-scripts)
         run: python3 -I -B scripts/test-release-scripts-local.py
+      - name: Test optional Intel cargo-dist network handling (offline)
+        run: python3 -I -B scripts/test-optional-intel-dist-network.py
       - name: Test optional Intel cargo-dist publication
         shell: bash
         run: |

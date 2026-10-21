@@ -78,8 +78,19 @@ impl ActualRead {
         Self::from_auth(server, auth).await
     }
 
-    async fn from_auth(server: &ReadServer, mut auth: Fixture) -> Self {
-        let mut git = GitFixture::new().await;
+    /// As [`Self::new`], but the workspace carries repository metadata, so the
+    /// insert trigger saves an unresolved historical primary selection.
+    async fn with_repository_metadata(server: &ReadServer) -> Self {
+        let auth = Fixture::new(&server.fixture).await;
+        let git = GitFixture::with_repository_metadata("group", "project").await;
+        Self::from_auth_with(server, auth, git).await
+    }
+
+    async fn from_auth(server: &ReadServer, auth: Fixture) -> Self {
+        Self::from_auth_with(server, auth, GitFixture::new().await).await
+    }
+
+    async fn from_auth_with(server: &ReadServer, mut auth: Fixture, mut git: GitFixture) -> Self {
         auth.service = Arc::new(
             auth.service
                 .as_ref()
@@ -1329,6 +1340,102 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
         );
     })
     .await;
+}
+
+/// intent-hq/intent#7449: a GitHub workspace inserted with repository
+/// metadata gets an unresolved historical primary selection from the insert
+/// trigger. A repo-less read must still resolve its own GitHub fetch remote,
+/// while ambiguous, unmappable and missing remotes keep refusing.
+#[intent_test_macros::daemon_test]
+async fn implicit_github_read_resolves_unresolved_historical_selection_from_fetch_remotes() {
+    let git = GitFixture::with_repository_metadata("actual", "repository").await;
+    let services = Services::new(git.store.clone());
+    let root = git.root();
+    intent_core::caller::with_caller(Caller::Daemon, async {
+        assert!(matches!(
+            SelectionFacts::read(&services, &root)
+                .await
+                .ok()
+                .and_then(|facts| facts.saved().ok()),
+            Some(SavedReviewSelection::UnresolvedHistorical { .. })
+        ));
+        let read = || async {
+            CapturedReview::capture(&services, git.workspace.id.clone(), 4)
+                .read(&services)
+                .await
+        };
+        assert!(read().await.is_err(), "no remote");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Actual/Repository.git",
+            ],
+        );
+        let Ok(ReadOutcome::Github(repo)) = read().await else {
+            panic!("repo-less read of a GitHub workspace must use its fetch remote");
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "other",
+                "https://github.com/private/other.git",
+            ],
+        );
+        assert!(read().await.is_err(), "ambiguous GitHub remotes");
+        git.git(&git.path, &["remote", "remove", "other"]);
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "unmapped",
+                "https://unknown.test/private/repo.git",
+            ],
+        );
+        assert!(read().await.is_err(), "unmappable remote");
+    })
+    .await;
+}
+
+/// intent-hq/intent#7449 guard: the implicit fallback accepts only GitHub. An
+/// unresolved historical selection over a mappable GitLab remote keeps the
+/// strict refusal for snapshot and monitor, without any provider traffic or
+/// monitor registration.
+#[intent_test_macros::daemon_test]
+async fn unresolved_history_fallback_never_reaches_gitlab() {
+    let server = ReadServer::new().await;
+    let f = ActualRead::with_repository_metadata(&server).await;
+    assert!(matches!(
+        SelectionFacts::read(&f.auth.service, &f.git.root())
+            .await
+            .ok()
+            .and_then(|facts| facts.saved().ok()),
+        Some(SavedReviewSelection::UnresolvedHistorical { .. })
+    ));
+    for call in ["ws.pr.snapshot(4)", "ws.mr.snapshot(4)", "ws.pr.monitor(4)"] {
+        let reply = run(
+            &f.server(),
+            &format!("try {{ return await {call}; }} catch(e) {{ return e.message; }}"),
+        )
+        .await;
+        assert!(reply.to_string().contains(REFUSAL), "{call}: {reply}");
+    }
+    assert_eq!(server.count(), 0);
+    assert!(f
+        .auth
+        .service
+        .store
+        .list_pr_monitors_by_agent(&f.agent)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[intent_test_macros::daemon_test]

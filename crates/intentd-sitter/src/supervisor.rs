@@ -83,15 +83,16 @@
 //!     immediate check, but when a different version installs (or is found
 //!     staged) the child is not stopped — it is sent SIGUSR2 ("staged; exit
 //!     when idle") and supervision continues. The daemon exits with
-//!     [`RESTART_FOR_UPDATE_EXIT_CODE`] once idle; that exit is neither a
-//!     crash nor a clean exit: the sitter re-resolves the version from
+//!     [`RESTART_FOR_UPDATE_EXIT_CODE`] once idle (no turn in flight and no
+//!     command script running, the script wait capped at 90 minutes); that
+//!     exit is neither a crash nor a clean exit: the sitter re-resolves the version from
 //!     `state.json`, resets the backoff and failure counter, and respawns
 //!     immediately (setting [`UPDATE_RESTART_ENV`] when the version
 //!     differs) — the SIGHUP path without the stop. Serve mode advertises
 //!     the handshake by setting [`IDLE_RESTART_ENV`]`=1` on the child; the
 //!     daemon only sends SIGUSR2 to a sitter that did. The daemon sends one
-//!     once no agent turn has been in flight for `updates.idleGraceSeconds`
-//!     (default 120 s), at most every `updates.idleCheckIntervalMinutes`
+//!     once no agent turn and no command-mode script run has been in flight
+//!     for `updates.idleGraceSeconds` (default 120 s), at most every `updates.idleCheckIntervalMinutes`
 //!     (default 60), so an idle daemon picks up a publish within about that
 //!     interval instead of waiting for item 3's 12–24 h schedule — which
 //!     stays the forced fallback: a daemon that never gets idle is caught by

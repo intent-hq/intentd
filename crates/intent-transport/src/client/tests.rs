@@ -175,6 +175,7 @@ fn shared_host_capabilities_are_independent_of_client_authority() {
         assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
         assert_eq!(server["capabilities"]["submissionCorrelation"], json!(1));
         assert_eq!(server["capabilities"]["prWorkspaceLookup"], json!(1));
+        assert_eq!(server["capabilities"]["agentWorkers"], json!(1));
         for capability in [
             "repositoryContext",
             "repositorySelection",

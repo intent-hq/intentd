@@ -228,6 +228,31 @@ class RunnerTests(unittest.TestCase):
         result = self.run_runner()
         self.assertIn('ran test-env.sh FOO=one BAR=two PWD=sub', result.stdout)
 
+    def git(self, *args):
+        # The caller's git config must not reach the fixture: a global ignore of
+        # __pycache__ would hide the very file the test looks for.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith('GIT_') and key != 'XDG_CONFIG_HOME'}
+        env.update(HOME=str(self.temp), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        config = ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', f'core.excludesFile={os.devnull}',
+                  '-c', 'commit.gpgsign=false']
+        return subprocess.run(['git', '-C', str(self.root), *config, *args],
+                              env=env, capture_output=True, text=True, check=True).stdout
+
+    def test_suites_leave_no_untracked_files(self):
+        # A suite that imports a sibling module would leave scripts/__pycache__
+        # behind, dirtying the caller's worktree (nothing git-ignores it there).
+        self.write('scripts/helper_module.py', 'VALUE = 1\n')
+        self.write('scripts/test-imports.py', 'import helper_module\nprint("ran test-imports.py", helper_module.VALUE)\n')
+        self.ci_with('- run: python3 scripts/test-imports.py\n')
+        self.git('init', '-q')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'fixture')
+        result = self.run_runner()
+        self.assertIn('ran test-imports.py 1', result.stdout)
+        self.assertEqual(self.git('status', '--porcelain', '--untracked-files=all'), '',
+                         'a suite left files behind in the worktree')
+
     def test_steps_needing_ci_context_are_skipped(self):
         for step, reason in [
             ("- if: runner.os == 'macOS'\n  run: ./scripts/test-pass.sh\n", "step runs only if: runner.os == 'macOS'"),

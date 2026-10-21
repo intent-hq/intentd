@@ -4763,6 +4763,7 @@ mod tests {
     mod ancestry_regression;
     mod compact_required_checks;
     mod home_queue_regression;
+    mod implicit_repository;
     mod merge_queue_position;
     mod qualified_isolation;
     mod qualified_recovery;
