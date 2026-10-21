@@ -40,6 +40,7 @@ nix = { workspace = true, features = ["fs"] }
 toml = { workspace = true }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 regex = "1"
 trybuild = "1"
 tempfile = "3"

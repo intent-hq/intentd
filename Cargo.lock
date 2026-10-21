@@ -2343,6 +2343,7 @@ name = "intent-pty"
 version = "0.11.19"
 dependencies = [
  "intent-core",
+ "intentd-test-support",
  "nix 0.31.3",
  "portable-pty",
  "tokio",
@@ -2466,6 +2467,7 @@ dependencies = [
  "html5gum",
  "image",
  "intent-core",
+ "intentd-test-support",
  "nix 0.31.3",
  "pulldown-cmark",
  "rand 0.10.3",
@@ -2505,6 +2507,7 @@ dependencies = [
  "intent-core",
  "intent-services",
  "intent-store",
+ "intentd-test-support",
  "libc",
  "rcgen",
  "rustls",
