@@ -224,16 +224,19 @@ standalone clone they exit 2 and name the monorepo command):
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
 make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
 ```
 
-The raw equivalents in `packages/intentd` are `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
+The raw equivalents in `packages/intentd` are `cargo fmt --check` and
+`cargo clippy --workspace --all-targets -- -D warnings`. Raw `cargo nextest` is not
+equivalent: it leaves the callback/transfer fixture variables the `make` targets
+prepare unset, so fixture tests in intent-acp/intent-services fail in bulk (95 bogus
+failures while fixing #2559) — run subsets with `make test-select`. Saved `ws.script` runs are
 PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
-environment (all three) and `--show-progress none` on the nextest command (the `make`
+environment and `--show-progress none` on any nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
 Raw invocations must also run under the rustup-managed toolchain pinned in
 `rust-toolchain.toml` (`rustup run <pin> cargo ...` when a non-rustup cargo shadows

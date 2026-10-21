@@ -235,6 +235,14 @@ impl tokio::io::AsyncWrite for PeerWriter {
     }
 }
 
+/// The frozen callback adapter, which only the monorepo gate runner prepares.
+fn callback_adapter_fixture() -> std::path::PathBuf {
+    std::fs::canonicalize(std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").expect(
+        "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: run these tests from the monorepo root with make test-select E='<nextest filterset>' (or make test), which prepare it; raw cargo nextest does not",
+    ))
+    .unwrap()
+}
+
 struct NodePeer {
     child: tokio::process::Child,
     connection: Arc<Connection>,
@@ -249,11 +257,7 @@ impl NodePeer {
     }
 
     fn with_original_repository(repository: Option<&std::path::Path>) -> Self {
-        let adapter = std::fs::canonicalize(
-            std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
-                .expect("explicit frozen da577fff adapter fixture"),
-        )
-        .unwrap();
+        let adapter = callback_adapter_fixture();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
         let scratch = crate::test_support::test_tempdir("manager-callback-node");
         let base =
@@ -8210,10 +8214,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         async fn new(stamp: Option<&str>, options: Value) -> Self {
             let scratch = crate::test_support::test_tempdir("normal-callback-launch");
             std::fs::write(scratch.path().join("controls.json"), options.to_string()).unwrap();
-            let adapter = std::fs::canonicalize(
-                std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").unwrap(),
-            )
-            .unwrap();
+            let adapter = super::callback_adapter_fixture();
             let node = std::fs::canonicalize(
                 intent_providers::find_node().expect("installed Node fixture prerequisite"),
             )

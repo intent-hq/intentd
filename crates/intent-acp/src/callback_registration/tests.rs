@@ -512,8 +512,9 @@ struct NodePeer {
 
 impl NodePeer {
     fn start() -> Self {
-        let adapter = std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
-            .expect("set INTENT_ACP_CALLBACK_ADAPTER_FIXTURE to the frozen da577fff local fixture");
+        let adapter = std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").expect(
+            "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: run these tests from the monorepo root with make test-select E='<nextest filterset>' (or make test), which prepare it; raw cargo nextest does not",
+        );
         let adapter = std::fs::canonicalize(adapter).unwrap();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

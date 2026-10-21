@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # The caller's environment must not steer make under test.
-unset RESUME BASE GATE_FORCE DRY_RUN ARGS MAKEFLAGS MFLAGS MAKELEVEL ROOT_EXIT
+unset RESUME BASE GATE_FORCE DRY_RUN ARGS E MAKEFLAGS MFLAGS MAKELEVEL ROOT_EXIT
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 forwarder="$here/../Makefile"
@@ -31,23 +31,28 @@ fail() {
 # it.
 targets=$(grep -E '^FORWARDED_TARGETS[[:space:]]*:=' "$forwarder" | sed 's/^[^=]*:=[[:space:]]*//')
 [[ -n "$targets" ]] || fail "could not read FORWARDED_TARGETS from $forwarder"
-for required in check test test-changed gate list-tests; do
+for required in check test test-changed test-select gate list-tests; do
   [[ " $targets " == *" $required "* ]] || fail "FORWARDED_TARGETS lacks '$required': $targets"
 done
 
 # Stub root Makefile: every forwarded target appends
 # "<target> RESUME=<v> BASE=<v> GATE_FORCE=<v>" to ROOT_LOG and exits with
-# ROOT_EXIT (both read from the environment; default success).
+# ROOT_EXIT (both read from the environment; default success). It also logs
+# the origin and raw value of E (apostrophes escaped for the quoted printf), so
+# a test-select filterset can be checked byte-for-byte.
 root_log="$temp_dir/root.log"
 root_goals_log="$temp_dir/root-goals.log"
-export ROOT_LOG="$root_log" ROOT_GOALS_LOG="$root_goals_log"
+root_e_log="$temp_dir/root-e.log"
+export ROOT_LOG="$root_log" ROOT_GOALS_LOG="$root_goals_log" ROOT_E_LOG="$root_e_log"
 write_stub_root() {
   cat >"$1/Makefile" <<MK
 ROOT_EXIT ?= 0
+E_QUOTED = \$(subst ','\\'',\$(value E))
 \$(shell printf '%s\\n' '\$(MAKECMDGOALS)' >>"\$(ROOT_GOALS_LOG)")
 .PHONY: $targets
 $targets:
 	@printf '%s\\n' '\$@ RESUME=\$(RESUME) BASE=\$(BASE) GATE_FORCE=\$(GATE_FORCE)' >>"\$(ROOT_LOG)"
+	@printf '%s\\n' '\$(origin E) E=\$(E_QUOTED)' >>"\$(ROOT_E_LOG)"
 	@exit \$(ROOT_EXIT)
 MK
 }
@@ -79,6 +84,7 @@ run_make() {
   shift
   : >"$root_log"
   : >"$root_goals_log"
+  : >"$root_e_log"
   set +e
   (cd "$dir" && "$make_bin" "$@") >"$temp_dir/stdout" 2>"$temp_dir/stderr"
   status=$?
@@ -87,6 +93,7 @@ run_make() {
   stderr=$(<"$temp_dir/stderr")
   log=$(<"$root_log")
   goals_log=$(<"$root_goals_log")
+  e_log=$(<"$root_e_log")
 }
 
 expect_status() {
@@ -117,6 +124,15 @@ case_name="variables pass through"
 run_make "$monorepo/packages/intentd" RESUME=1 BASE=abc GATE_FORCE=1 test-changed
 expect_status 0
 expect_log "test-changed RESUME=1 BASE=abc GATE_FORCE=1"
+
+# A test-select filterset reaches the root as a command-line variable with
+# regex anchors, spaces and apostrophes intact (the root requires that origin).
+case_name="test-select filterset passes through"
+filterset="test(/it's a \$/) | package(intent-acp)"
+run_make "$monorepo/packages/intentd" test-select "E=$filterset"
+expect_status 0
+expect_log "test-select RESUME= BASE= GATE_FORCE="
+[[ "$e_log" == "command line E=$filterset" ]] || fail "$case_name: root saw E as: $e_log"
 
 # The root recipe's failure is the forwarder's failure.
 case_name="root failure propagates"
