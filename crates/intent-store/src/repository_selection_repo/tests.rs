@@ -913,3 +913,97 @@ async fn selection_commit_waits_outside_locks_for_original_completion() {
 async fn selection_commit_completion_survives_cancelled_waiter() {
     selection_waits_for_original_completion(true).await;
 }
+
+/// intent-hq/intent#7449: owner/name metadata is not a saved choice, so a new,
+/// rebound or same-ID recreated root without a saved choice stays `NeverSaved`.
+#[tokio::test]
+async fn metadata_never_manufactures_unresolved_history_for_new_roots() {
+    let f = Fixture::new().await;
+    let id = WorkspaceId::from("github-workspace");
+    let row: Workspace = serde_json::from_value(serde_json::json!({
+        "id":id,"title":"GitHub","branch":"main","status":"Active","activity":"idle","attention":"none",
+        "createdAt":"same-time","updatedAt":"same-time","tags":[],"skipWorktree":false,"isRemote":false,"archived":false,
+        "repositoryPath":"/github","repositoryOwner":"octo","repositoryName":"project"
+    })).unwrap();
+    f.store.insert_workspace(&row).await.unwrap();
+    let primary = RepositoryRootId {
+        workspace_id: id.clone(),
+        kind: RepositoryRootKind::Primary,
+    };
+    let never = |s: RepositorySelectionSnapshot| {
+        assert_eq!(s.selection(), Some(&RepositoryStoredSelection::NeverSaved));
+    };
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE workspace SET repository_path='/rebound' WHERE id=?")
+        .bind(id.as_str())
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+    f.store.delete_workspace(&id).await.unwrap();
+    f.store.insert_workspace(&row).await.unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+
+    let root: WorkspaceGitRoot = serde_json::from_value(serde_json::json!({
+        "id":"github-root","workspaceId":f.root.workspace_id,"path":"/github-root","source":"agent",
+        "repoOwner":"octo","repoName":"submodule","registeredCommitSha":"abc123",
+        "registeredByAgentIds":[],"createdAt":"same-time","updatedAt":"same-time"
+    }))
+    .unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let registered = RepositoryRootId {
+        workspace_id: f.root.workspace_id.clone(),
+        kind: RepositoryRootKind::Registered {
+            git_root_id: root.id.clone(),
+        },
+    };
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    f.store.delete_workspace_git_root(&root.id).await.unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_selection_state WHERE choice_mode='unresolved' OR historical_source IS NOT NULL",
+    )
+    .fetch_one(f.store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// A choice the user saved still cannot silently carry over to a recreated root.
+#[tokio::test]
+async fn saved_choice_still_becomes_unresolved_after_same_id_recreation() {
+    let f = Fixture::new().await;
+    f.set("upstream").await;
+    f.store
+        .delete_workspace(&f.root.workspace_id)
+        .await
+        .unwrap();
+    workspace(&f.store, &f.root.workspace_id, Some("octo")).await;
+    unresolved(&f.read().await);
+}
