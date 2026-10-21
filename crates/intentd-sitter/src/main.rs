@@ -16,6 +16,7 @@ use intentd_sitter::paths::SitterPaths;
 #[cfg(unix)]
 use intentd_sitter::readiness;
 use intentd_sitter::supervisor::{self, SupervisorConfig, MANIFEST_BASE_URL_ENV};
+use intentd_sitter::telemetry::{CheckTrigger, UpdateEndpoint};
 use intentd_sitter::updater::{UpdateCheck, UpdateOutcome, Updater};
 
 fn main() {
@@ -52,17 +53,25 @@ fn run() -> i32 {
         }
     };
 
-    // The env override pins exactly one base (no fallback) so tests and
-    // overrides stay deterministic; the default is the ordered fallback list.
-    let base_urls = match std::env::var(MANIFEST_BASE_URL_ENV)
+    // The env override pins exactly one base (no fallback, no update-check
+    // endpoint) so tests and overrides stay deterministic; the default is the
+    // update-check endpoint, then the ordered GitHub fallback list.
+    let (base_urls, endpoint) = match std::env::var(MANIFEST_BASE_URL_ENV)
         .ok()
         .filter(|url| !url.is_empty())
     {
-        Some(url) => vec![url],
-        None => manifest::DEFAULT_MANIFEST_BASE_URLS
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
+        Some(url) => (vec![url], None),
+        None => (
+            manifest::DEFAULT_MANIFEST_BASE_URLS
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            Some(UpdateEndpoint::production()),
+        ),
+    };
+    let sources = ManifestSources {
+        base_urls,
+        endpoint,
     };
 
     // Let the daemon parser handle help and invalid options before any effect.
@@ -73,7 +82,7 @@ fn run() -> i32 {
     }
 
     match args.sitter_command() {
-        Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &base_urls),
+        Some(Ok(command)) => return run_sitter_command(command, &args, &paths, &sources),
         Some(Err(e)) => {
             eprintln!("intentd-sitter: {e}");
             return 2;
@@ -88,8 +97,28 @@ fn run() -> i32 {
         channel,
         args.passthrough,
         SupervisorConfig::from_env(),
-        base_urls,
+        sources.base_urls,
+        sources.endpoint,
     )
+}
+
+/// Where manifests come from: the optional update-check endpoint, then the
+/// GitHub bases.
+struct ManifestSources {
+    base_urls: Vec<String>,
+    endpoint: Option<UpdateEndpoint>,
+}
+
+impl ManifestSources {
+    fn updater(
+        &self,
+        paths: &SitterPaths,
+    ) -> Result<Updater, intentd_sitter::updater::UpdateError> {
+        Ok(
+            Updater::with_base_urls(paths.clone(), self.base_urls.iter().cloned())?
+                .with_update_endpoint(self.endpoint.clone()),
+        )
+    }
 }
 
 /// How to apply a new channel pin / freshly installed binary right away.
@@ -102,15 +131,15 @@ fn run_sitter_command(
     command: SitterCommand,
     args: &SitterArgs,
     paths: &SitterPaths,
-    base_urls: &[String],
+    sources: &ManifestSources,
 ) -> i32 {
     match command {
         SitterCommand::Channel { set, redownload } => {
-            run_channel_command(set, redownload, args, paths, base_urls)
+            run_channel_command(set, redownload, args, paths, sources)
         }
         SitterCommand::Restart => run_restart(args, paths),
         SitterCommand::Start => intentd_sitter::startup::run(args, paths),
-        SitterCommand::Update { check } => run_update_command(check, args, paths, base_urls),
+        SitterCommand::Update { check } => run_update_command(check, args, paths, sources),
     }
 }
 
@@ -121,7 +150,7 @@ fn run_channel_command(
     redownload: bool,
     args: &SitterArgs,
     paths: &SitterPaths,
-    base_urls: &[String],
+    sources: &ManifestSources,
 ) -> i32 {
     let Some(channel) = set else {
         let resolved =
@@ -143,14 +172,14 @@ fn run_channel_command(
     );
 
     if redownload {
-        let updater = match Updater::with_base_urls(paths.clone(), base_urls.iter().cloned()) {
+        let updater = match sources.updater(paths) {
             Ok(updater) => updater,
             Err(e) => {
                 eprintln!("intentd-sitter: {e} (the channel pin was still written)");
                 return 1;
             }
         };
-        match updater.force_install(channel) {
+        match updater.force_install(channel, CheckTrigger::Manual) {
             // `AlreadyCurrent` is defensive/unreachable here: force_install
             // bypasses the newer-only comparison and always reinstalls, but
             // the arm keeps the match exhaustive (and prints something
@@ -203,11 +232,11 @@ fn run_update_command(
     check: bool,
     args: &SitterArgs,
     paths: &SitterPaths,
-    base_urls: &[String],
+    sources: &ManifestSources,
 ) -> i32 {
     let resolved = config::resolve_channel(args.channel, config::load_channel(&paths.config_path));
     let channel = resolved.channel;
-    let updater = match Updater::with_base_urls(paths.clone(), base_urls.iter().cloned()) {
+    let updater = match sources.updater(paths) {
         Ok(updater) => updater,
         Err(e) => {
             eprintln!("intentd-sitter: {e}");
@@ -216,7 +245,7 @@ fn run_update_command(
     };
 
     if check {
-        return match updater.check_only(channel) {
+        return match updater.check_only(channel, CheckTrigger::Manual) {
             Ok(UpdateCheck {
                 installed,
                 latest,
@@ -244,7 +273,7 @@ fn run_update_command(
         };
     }
 
-    match updater.check_and_install(channel) {
+    match updater.check_and_install(channel, CheckTrigger::Manual) {
         Ok(UpdateOutcome::AlreadyCurrent { version }) => {
             println!("already up to date: intentd {version} (channel {channel})");
             0
