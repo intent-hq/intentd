@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.23] - 2026-10-21
+
+### 🚀 Features
+
+- *(sitter)* Check for updates through updates.intentapp.dev, once a day on stable ([#2566](https://github.com/intent-hq/intentd/pull/2566))
+- Launch Intent's bundled Codex/Claude CLI when the installed one is too old ([#2567](https://github.com/intent-hq/intentd/pull/2567))
+
+### 🐛 Bug Fixes
+
+- *(test)* Gate LogCapture helper to unix for Windows clippy ([#2579](https://github.com/intent-hq/intentd/pull/2579))
+- Clear daemon-raised provider-stall blockers after a later successful turn ([#2572](https://github.com/intent-hq/intentd/pull/2572))
+- *(agents)* Keep idle agents with running background workers alive ([#2573](https://github.com/intent-hq/intentd/pull/2573))
+- Pause worktree work for workspaces whose checkout folder is missing ([#2574](https://github.com/intent-hq/intentd/pull/2574))
+
+### 📚 Documentation
+
+- *(guide)* Describe provider background tasks in the chat card ([#2564](https://github.com/intent-hq/intentd/pull/2564))
+- *(guide)* Document double-click opening in Home ([#2561](https://github.com/intent-hq/intentd/pull/2561))
+- *(assistant-guide)* Idle agents with running background tasks stay open ([#2577](https://github.com/intent-hq/intentd/pull/2577))
+- Explain safe return from raw Markdown ([#2394](https://github.com/intent-hq/intentd/pull/2394))
+
+### 🧪 Testing
+
+- *(intent-services)* Scale fixed test deadlines with the timeout multiplier ([#2568](https://github.com/intent-hq/intentd/pull/2568))
+- Share a current Codex/Claude CLI version across test fixtures ([#2578](https://github.com/intent-hq/intentd/pull/2578))
+- *(intentd)* Scale fixed test deadlines of 1s or more with the timeout multiplier ([#2576](https://github.com/intent-hq/intentd/pull/2576))
+
+
 ## [0.11.22] - 2026-10-21
 
 ### 🧪 Testing
