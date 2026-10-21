@@ -10291,53 +10291,176 @@ impl Services {
             let Some(blocker_reason) = session.attention_request_reason.as_deref() else {
                 return Ok(result(false));
             };
-            let gate = self.attention_mutation_gates.for_agent(&caller);
-            let _guard = gate.lock().await;
             let saved_at = session.attention_request_timestamp.as_deref();
-            if !self.store.clear_blocker_request_if_matches(
-                &workspace_id, &caller, blocker_reason, saved_at, &now_iso(),
-            ).await? {
-                return Ok(result(false));
-            }
-            // Retire this blocker and older blocker raises only. Discussions
-            // and replacement generations remain independently actionable.
-            if let Ok(mut map) = self.deferred_attention.lock() {
-                if let Some(entries) = map.get_mut(&caller) {
-                    // The generation CAS succeeded while holding the raise
-                    // gate: every parked blocker precedes or is this request.
-                    // A newer raise cannot park until this guard is released.
-                    entries.retain(|entry| entry.meta_kind != "blocker-report");
-                    if entries.is_empty() { map.remove(&caller); }
+            let resolved = self
+                .clear_observed_blocker(&workspace_id, &caller, &session, blocker_reason, saved_at)
+                .await?;
+            Ok(result(resolved))
+        })
+        .await
+    }
+
+    /// Clear the blocker generation `(blocker_reason, saved_at)` observed on
+    /// `session` — the shared clearing path behind `ws.agent.resolveBlocker`
+    /// and the daemon's provider-stall auto-clear (intent-hq/intent#7182).
+    /// A replacement request (a newer blocker or a discussion) survives the
+    /// conditional write. On success: retires parked blocker surfacings,
+    /// emits `agent:updated` with `attentionRequestCleared: true`, resumes a
+    /// still-`blocked` linked task the agent is assigned to (terminal
+    /// statuses untouched), and recomputes the workspace displayStatus.
+    /// Returns whether the blocker was cleared.
+    async fn clear_observed_blocker(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller: &AgentId,
+        session: &AgentSession,
+        blocker_reason: &str,
+        saved_at: Option<&str>,
+    ) -> Result<bool> {
+        let workspace_id = workspace_id.clone();
+        let caller = caller.clone();
+        let gate = self.attention_mutation_gates.for_agent(&caller);
+        let _guard = gate.lock().await;
+        if !self
+            .store
+            .clear_blocker_request_if_matches(
+                &workspace_id,
+                &caller,
+                blocker_reason,
+                saved_at,
+                &now_iso(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        // Retire this blocker and older blocker raises only. Discussions
+        // and replacement generations remain independently actionable.
+        if let Ok(mut map) = self.deferred_attention.lock() {
+            if let Some(entries) = map.get_mut(&caller) {
+                // The generation CAS succeeded while holding the raise
+                // gate: every parked blocker precedes or is this request.
+                // A newer raise cannot park until this guard is released.
+                entries.retain(|entry| entry.meta_kind != "blocker-report");
+                if entries.is_empty() {
+                    map.remove(&caller);
                 }
             }
-            self.publish_agent_mutation_event(
-                &workspace_id, &caller, intent_core::events::AGENT_UPDATED,
-                json!({ "agentId": caller.0, "attentionRequestCleared": true }),
-            ).await;
-            // Read the current task, then condition its write on both that
-            // revision and the session link in one SQLite statement. A note
-            // transition or a session-only relink wins before the write.
-            let current = self.store.get_agent_session_summary(&caller).await?;
-            if current.task_note_id == session.task_note_id {
-                if let Some(note_id) = &session.task_note_id {
-                    if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
-                        if note.metadata.task.as_ref().is_some_and(|task| {
-                            task.status == intent_core::TaskStatus::Blocked
-                                && task.assigned_agent_ids.contains(&caller)
-                        }) {
-                            if let Err(e) = self.set_task_note_status_guarded(
-                                &workspace_id, note_id, intent_core::TaskStatus::InProgress,
-                                Some(note.rev), Some(caller.clone()), Some(caller.clone()),
-                            ).await {
-                                tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
-                            }
+        }
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": caller.0, "attentionRequestCleared": true }),
+        )
+        .await;
+        // Read the current task, then condition its write on both that
+        // revision and the session link in one SQLite statement. A note
+        // transition or a session-only relink wins before the write.
+        let current = self.store.get_agent_session_summary(&caller).await?;
+        if current.task_note_id == session.task_note_id {
+            if let Some(note_id) = &session.task_note_id {
+                if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                    if note.metadata.task.as_ref().is_some_and(|task| {
+                        task.status == intent_core::TaskStatus::Blocked
+                            && task.assigned_agent_ids.contains(&caller)
+                    }) {
+                        if let Err(e) = self
+                            .set_task_note_status_guarded(
+                                &workspace_id,
+                                note_id,
+                                intent_core::TaskStatus::InProgress,
+                                Some(note.rev),
+                                Some(caller.clone()),
+                                Some(caller.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
                         }
                     }
                 }
             }
-            self.maybe_emit_display_status_changed(&workspace_id).await;
-            Ok(result(true))
-        }).await
+        }
+        self.maybe_emit_display_status_changed(&workspace_id).await;
+        Ok(true)
+    }
+
+    /// Raise a daemon-owned provider-stall blocker on `agent_id` through the
+    /// shared [`Self::agent_request_attention_op`] and record its generation
+    /// so the agent's next successful turn can clear it
+    /// ([`Self::clear_daemon_stall_blocker_after_success`],
+    /// intent-hq/intent#7182). Agent-raised blockers are never recorded here.
+    pub(crate) async fn raise_daemon_stall_blocker(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        reason: String,
+    ) -> Result<()> {
+        let raised = self
+            .agent_request_attention_op(
+                workspace_id.clone(),
+                "blocker".to_string(),
+                reason,
+                Some(agent_id.clone()),
+            )
+            .await?;
+        if let (Some(reason), Some(saved_at)) = (
+            raised.get("reason").and_then(Value::as_str),
+            raised.get("savedAt").and_then(Value::as_str),
+        ) {
+            if let Ok(mut map) = self.daemon_stall_blockers.lock() {
+                map.insert(agent_id.clone(), (reason.to_string(), saved_at.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Successful-turn hook (intent-hq/intent#7182): when the turn that just
+    /// completed successfully belongs to an agent carrying a daemon-raised
+    /// provider-stall blocker, clear that blocker through the
+    /// `resolveBlocker` path. Only the exact recorded generation is cleared —
+    /// an agent's own later blocker or a discussion stays pending. The marker
+    /// is consumed either way. Best-effort: errors log and the turn proceeds.
+    pub(crate) async fn clear_daemon_stall_blocker_after_success(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let marker = match self.daemon_stall_blockers.lock() {
+            Ok(mut map) => map.remove(agent_id),
+            Err(_) => None,
+        };
+        let Some((reason, saved_at)) = marker else {
+            return;
+        };
+        let outcome = async {
+            let session = self.load_session_internal(agent_id).await?;
+            if session.workspace_id != *workspace_id {
+                return Ok(false);
+            }
+            let _mutation = self.workspace_mutations.enter(workspace_id)?;
+            self.clear_observed_blocker(
+                workspace_id,
+                agent_id,
+                &session,
+                &reason,
+                Some(saved_at.as_str()),
+            )
+            .await
+        };
+        match crate::workspace_mutations::boxed(outcome).await {
+            Ok(true) => tracing::info!(
+                agent = %agent_id,
+                "provider-stall blocker cleared after a successful turn (intent#7182)"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "failed to clear provider-stall blocker after a successful turn (intent#7182)"
+            ),
+        }
     }
 
     /// Shared services op behind `ws.agent.requestDiscussion` /

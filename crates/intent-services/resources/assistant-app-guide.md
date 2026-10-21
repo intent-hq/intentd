@@ -515,12 +515,13 @@ details**. These are counts of recorded notices, not total attempts or proof tha
 all failures belong to the same request. A historical notice alone does not mean
 the agent is still failing; check the current status and latest response.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/agent_ops.rs (agent_resolve_blocker_op, clear_daemon_stall_blocker_after_success); packages/cloudlands-fe/src/shared/utils/agent-attention.ts. -->
 
 A current blocker warning means an agent reported a problem that prevents work.
 After confirming recovery, the agent can clear its warning while a release or
-scheduled check is still pending. A recorded blocker notice can remain in the
-conversation after the current warning clears.
+scheduled check is still pending. A blocker Intent raised because the provider
+stalled clears on its own after the agent's next successful turn. A recorded
+blocker notice can remain in the conversation after the current warning clears.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{agent_session.rs,provider_auth.rs,provider_models/parse.rs}; packages/intentd/crates/intent-providers/src/config.rs. -->
 

@@ -4733,13 +4733,10 @@ impl Services {
                     Duration::from_millis(stall_terminal_ms),
                 ),
             };
+            // Daemon-owned stall blocker: recorded so the agent's next
+            // successful turn clears it (intent-hq/intent#7182).
             if let Err(raise_err) = self
-                .agent_request_attention_op(
-                    workspace_id.clone(),
-                    "blocker".to_string(),
-                    reason,
-                    Some(agent_id.clone()),
-                )
+                .raise_daemon_stall_blocker(workspace_id, agent_id, reason)
                 .await
             {
                 tracing::warn!(
@@ -4943,6 +4940,14 @@ impl Services {
         // the redrive is still trying to resume it. On cap exhaustion the
         // flag is false and this arm fires as today (advisory fields
         // included), so watchers get exactly one idle per stall episode.
+        // A successful turn retires a daemon-raised provider-stall blocker
+        // (intent-hq/intent#7182) before the idle emit, so watchers woken by
+        // the idle observe the cleared state. A cancelled turn or an armed
+        // truncation redrive is not a successful completion.
+        if matches!(&result, Ok(stop) if *stop != StopReason::Cancelled) && !truncation_redrive {
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         match &result {
             Ok(_) if truncation_redrive => {
                 tracing::debug!(
@@ -5558,11 +5563,10 @@ impl Services {
                 error,
             )
             .await;
-            if let Err(raise_error) = self.agent_request_attention_op(
-                workspace_id.clone(),
-                "blocker".to_string(),
+            if let Err(raise_error) = self.raise_daemon_stall_blocker(
+                workspace_id,
+                agent_id,
                 format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
-                Some(agent_id.clone()),
             ).await {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
@@ -5591,6 +5595,12 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if failure.is_none() {
+            // Successful wake turn: same stall-blocker retirement as the
+            // prompt-turn settlement (intent-hq/intent#7182).
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         if let Some(error) = &failure {
             self.flush_deferred_attention(agent_id, workspace_id).await;
             self.publish_agent_event(
