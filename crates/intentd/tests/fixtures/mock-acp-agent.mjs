@@ -624,12 +624,16 @@ async function handlePrompt(id, params) {
             status: 'in_progress', rawInput: { command: behavior.toolCallBeforeError },
           },
         });
+        // `toolCallBeforeErrorNoOutput` completes the call with no rawOutput
+        // (a tool that printed nothing).
         note('session/update', {
           sessionId: SESSION_ID,
-          update: {
-            sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
-            rawOutput: `ran: ${behavior.toolCallBeforeError}`,
-          },
+          update: behavior.toolCallBeforeErrorNoOutput
+            ? { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' }
+            : {
+                sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+                rawOutput: `ran: ${behavior.toolCallBeforeError}`,
+              },
         });
       }
       log(`failing session/prompt with JSON-RPC error ${behavior.promptRpcError.code}`);

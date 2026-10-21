@@ -5708,7 +5708,7 @@ impl AgentManager {
                 group_source_ids.push(id.to_string());
             }
         }
-        let (body, excluded_group_sources) = self
+        let (body, excluded_group_sources, continues_cut_short_turn) = self
             .build_turn_body_with_group_replay(
                 agent_id,
                 &combined,
@@ -5803,7 +5803,12 @@ impl AgentManager {
                         .as_ref()
                         .is_some_and(|source| excluded_group_sources.contains(source));
                 let in_envelope = !batch && !history_covers_prepend && i == 0;
-                if !covered && !in_envelope {
+                // A quota failover continuing a cut-short turn (PROTOCOL
+                // §5.54) already replays every request of this delivery in
+                // the turn section; re-appending their text after the
+                // continuation would invite repeated work. Attachments are
+                // not in the text replay, so they are still delivered.
+                if !covered && !in_envelope && !continues_cut_short_turn {
                     let text = if batch && !group.is_prepend {
                         message_number += 1;
                         format!("\n\nMessage #{}:\n{}", message_number, group.content)
@@ -5928,7 +5933,7 @@ impl AgentManager {
         content: &str,
         flushed_ids: Option<&[String]>,
         group_source_ids: &[String],
-    ) -> (String, HashSet<String>) {
+    ) -> (String, HashSet<String>, bool) {
         let failover_replay = self.services.quota_failover_replay_pending(agent_id);
         if !self.take_recreated(agent_id) {
             // A resumed native session (no replay) already holds the cut-short
@@ -5945,9 +5950,10 @@ impl AgentManager {
                 return (
                     crate::quota_failover::QUOTA_FAILOVER_CONTINUATION.to_string(),
                     HashSet::new(),
+                    true,
                 );
             }
-            return (content.to_string(), HashSet::new());
+            return (content.to_string(), HashSet::new(), false);
         }
         // The per-block cap is read live so a `config.toml` edit applies to
         // the next replay without a daemon restart. The bounded replay read
@@ -5995,16 +6001,49 @@ impl AgentManager {
         });
         // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
         // already persisted assistant/tool rows after the current user row,
-        // the backup continues that turn — the replay keeps the user row and
-        // the partial work, and a continuation instruction replaces the
-        // re-sent message so finished tool calls are not repeated.
-        // Applies to every send shape (direct, live flush, saved groups): the
-        // whole persisted turn, including the current batch's user rows, is
-        // replayed as history.
-        let continue_partial_turn = failover_replay && partial_turn_follows_last_user(&messages);
-        let prior: &[_] = if continue_partial_turn {
-            &messages
-        } else if let Some(index) = first_flushed {
+        // the backup continues that turn — older history, then the cut-short
+        // turn (user request + every tool call it made, never dropped for
+        // size; see `format_cut_short_turn`), then a continuation instruction
+        // instead of the re-sent message. Applies to every send shape
+        // (direct, live flush, saved groups).
+        if failover_replay && partial_turn_follows_last_user(&messages) {
+            // The current turn starts at its first user row: the flushed
+            // batch's first row, the earliest saved group source, else the
+            // newest user row. Everything before it is older history.
+            let group_start = messages.iter().position(|message| {
+                message.role == "user"
+                    && (excluded_group_sources.contains(&message.id)
+                        || queue_source(message)
+                            .is_some_and(|source| excluded_group_sources.contains(&source)))
+            });
+            let last_user = messages.iter().rposition(|message| message.role == "user");
+            let start = first_flushed
+                .into_iter()
+                .chain(group_start)
+                .chain(last_user)
+                .min()
+                .unwrap_or(0);
+            let keep = |message: &&intent_core::AgentMessage| {
+                !crate::agent_ops::is_qualified_monitor_message(message)
+            };
+            let prior: Vec<_> = messages[..start].iter().filter(keep).cloned().collect();
+            let current: Vec<_> = messages[start..].iter().filter(keep).cloned().collect();
+            let turn = crate::history_xml::format_cut_short_turn(
+                &prior,
+                &current,
+                crate::history_xml::MAX_HISTORY_CHARS,
+                tool_content_chars,
+            );
+            return (
+                format!(
+                    "{turn}\n\n{}",
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION
+                ),
+                excluded_group_sources,
+                true,
+            );
+        }
+        let prior: &[_] = if let Some(index) = first_flushed {
             // Preserve the existing boundary for an ordinary live flush.
             &messages[..index]
         } else if !excluded_group_sources.is_empty() {
@@ -6018,13 +6057,8 @@ impl AgentManager {
             }
         };
         if prior.is_empty() {
-            return (content.to_string(), excluded_group_sources);
+            return (content.to_string(), excluded_group_sources, false);
         }
-        let content = if continue_partial_turn {
-            crate::quota_failover::QUOTA_FAILOVER_CONTINUATION
-        } else {
-            content
-        };
         // Unlike the existing live-flush boundary, saved group sources may
         // precede unrelated conversation. Remove only matched source rows.
         let prior: Vec<_> = prior
@@ -6033,7 +6067,6 @@ impl AgentManager {
             .filter(|message| !crate::agent_ops::is_qualified_monitor_message(message))
             .filter(|message| {
                 message.role != "user"
-                    || continue_partial_turn
                     || (!excluded_group_sources.contains(&message.id)
                         && !queue_source(message)
                             .is_some_and(|source| excluded_group_sources.contains(&source)))
@@ -6048,6 +6081,7 @@ impl AgentManager {
         (
             format!("{history_xml}\n\n{content}"),
             excluded_group_sources,
+            false,
         )
     }
 

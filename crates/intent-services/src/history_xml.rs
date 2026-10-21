@@ -443,5 +443,290 @@ pub(crate) fn format_history_as_xml(
     format!("{preamble}{exchanges_xml}{SUPERVISOR_CLOSING}")
 }
 
+/// Max characters of a tool call's input kept in the compact (over-budget)
+/// listing of a cut-short turn's tool calls.
+const CUT_SHORT_TOOL_ARGS_SUMMARY_CHARS: usize = 200;
+
+/// One tool call of a cut-short turn: its `tool_use` block and, when the
+/// call completed with a recorded output, its `tool_result` block.
+struct CutShortToolCall<'a> {
+    call: &'a Value,
+    result: Option<&'a Value>,
+}
+
+/// One rendered item of a cut-short turn's partial work, in transcript order.
+enum PartialItem<'a> {
+    Text(&'static str, String),
+    Tool(CutShortToolCall<'a>),
+}
+
+/// Render the turn a quota failover cut short (PROTOCOL §5.54 Backup
+/// failover) for the backup provider: older history first (budget
+/// permitting), then a `<current_turn_cut_short>` section with the user
+/// request and EVERY tool call the failed attempt made — completed, failed
+/// or only started, with or without a recorded output — so the instruction
+/// not to repeat them is accurate. Unlike the ordinary history replay this
+/// never runs the turn through the history sanitizer, which drops tool calls
+/// without a paired non-empty result.
+///
+/// The current turn is never dropped. When the whole body exceeds
+/// `max_chars`, older history is shortened first (newest exchanges kept);
+/// if the turn alone is still over budget, the partial work falls back to a
+/// compact listing of every tool call (name, status and an argument summary)
+/// with its text truncated behind an explicit marker. The user request is
+/// always kept whole.
+pub(crate) fn format_cut_short_turn(
+    prior: &[AgentMessage],
+    current: &[AgentMessage],
+    max_chars: usize,
+    tool_content_chars: usize,
+) -> String {
+    let user_xml = render_cut_short_user_request(current, tool_content_chars);
+    let items = cut_short_partial_items(current);
+    let full = render_cut_short_partial(&items, tool_content_chars, None);
+    let wrap = |partial: &str| {
+        format!(
+            "<current_turn_cut_short>\n{user_xml}  <partial_work>\n{partial}  </partial_work>\n</current_turn_cut_short>"
+        )
+    };
+    let mut turn = wrap(&full);
+    if turn.len() > max_chars {
+        let compact_overhead = wrap(&render_cut_short_partial(
+            &items,
+            tool_content_chars,
+            Some(0),
+        ))
+        .len();
+        let text_budget = max_chars.saturating_sub(compact_overhead);
+        turn = wrap(&render_cut_short_partial(
+            &items,
+            tool_content_chars,
+            Some(text_budget),
+        ));
+    }
+    let history_budget = max_chars.saturating_sub(turn.len());
+    let history = if prior.is_empty() {
+        String::new()
+    } else if history_budget
+        <= supervisor_preamble(tool_content_chars).len() + SUPERVISOR_CLOSING.len()
+    {
+        "<!-- earlier conversation omitted due to size limits -->".to_owned()
+    } else {
+        format_history_as_xml(prior, history_budget, tool_content_chars)
+    };
+    if history.is_empty() {
+        turn
+    } else {
+        format!("{history}\n\n{turn}")
+    }
+}
+
+/// The `<user_request>` element: every user row of the cut-short turn,
+/// whole (text escaped; other block kinds named so attachments are not
+/// silently lost).
+fn render_cut_short_user_request(current: &[AgentMessage], tool_content_chars: usize) -> String {
+    let mut xml = String::from("  <user_request>\n");
+    for message in current.iter().filter(|m| m.role == "user") {
+        for block in message.content.as_array().into_iter().flatten() {
+            match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text" => {
+                    let text = str_field(block, &["text", "content"]);
+                    let _ = writeln!(xml, "    <text>{}</text>", escape_xml(&text));
+                }
+                "tool_result" => xml.push_str(&render_content_blocks(
+                    std::slice::from_ref(block),
+                    "    ",
+                    tool_content_chars,
+                )),
+                "" => {}
+                other => {
+                    let _ = writeln!(xml, "    <attachment type=\"{}\"/>", escape_xml(other));
+                }
+            }
+        }
+    }
+    xml.push_str("  </user_request>\n");
+    xml
+}
+
+/// The failed attempt's assistant text, thinking and tool calls in order.
+/// Tool calls pair with results by `toolCallId` (falling back to
+/// `tool_use_id` / `id`); a result that pairs with no call is still listed.
+fn cut_short_partial_items(current: &[AgentMessage]) -> Vec<PartialItem<'_>> {
+    let call_key = |block: &Value| str_field(block, &["toolCallId", "tool_use_id", "id"]);
+    let blocks: Vec<&Value> = current
+        .iter()
+        .filter(|m| m.role == "assistant" || m.role == "error")
+        .flat_map(|m| m.content.as_array().into_iter().flatten())
+        .collect();
+    let results: Vec<&Value> = blocks
+        .iter()
+        .copied()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .collect();
+    let mut paired: HashSet<String> = HashSet::new();
+    let mut items = Vec::new();
+    for block in &blocks {
+        match block.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text" => items.push(PartialItem::Text(
+                "text",
+                str_field(block, &["text", "content"]),
+            )),
+            "thinking" => items.push(PartialItem::Text(
+                "thinking",
+                str_field(block, &["text", "content"]),
+            )),
+            "tool_use" => {
+                let key = call_key(block);
+                let result = results
+                    .iter()
+                    .copied()
+                    .find(|r| !key.is_empty() && str_field(r, &["tool_use_id"]) == key);
+                if result.is_some() {
+                    paired.insert(key);
+                }
+                items.push(PartialItem::Tool(CutShortToolCall {
+                    call: block,
+                    result,
+                }));
+            }
+            _ => {}
+        }
+    }
+    for result in results {
+        if !paired.contains(&str_field(result, &["tool_use_id"])) {
+            items.push(PartialItem::Tool(CutShortToolCall {
+                call: result,
+                result: Some(result),
+            }));
+        }
+    }
+    items
+}
+
+/// Render the partial-work items. `text_budget: None` renders everything
+/// (tool inputs/outputs middle-truncated to `tool_content_chars`);
+/// `Some(n)` is the compact over-budget form: every tool call listed with
+/// its name, status and an argument summary (no outputs), and at most `n`
+/// characters of text kept, behind an explicit truncation marker.
+fn render_cut_short_partial(
+    items: &[PartialItem<'_>],
+    tool_content_chars: usize,
+    text_budget: Option<usize>,
+) -> String {
+    let mut xml = String::new();
+    let mut text_left = text_budget;
+    let mut text_omitted = 0usize;
+    for item in items {
+        match item {
+            PartialItem::Text(tag, text) => {
+                let kept = match text_left.as_mut() {
+                    None => text.clone(),
+                    Some(left) => {
+                        let take = text.chars().count().min(*left);
+                        *left -= take;
+                        text_omitted += text.chars().count() - take;
+                        text.chars().take(take).collect()
+                    }
+                };
+                if !kept.is_empty() {
+                    let _ = writeln!(xml, "    <{tag}>{}</{tag}>", escape_xml(&kept));
+                }
+            }
+            PartialItem::Tool(tool) => {
+                render_cut_short_tool(&mut xml, tool, tool_content_chars, text_budget.is_some());
+            }
+        }
+    }
+    if text_omitted > 0 {
+        let _ = writeln!(
+            xml,
+            "    <!-- partial work truncated: {text_omitted} characters of text omitted; every tool call is still listed -->"
+        );
+    }
+    xml
+}
+
+fn render_cut_short_tool(
+    xml: &mut String,
+    tool: &CutShortToolCall<'_>,
+    tool_content_chars: usize,
+    compact: bool,
+) {
+    let call = tool.call;
+    let is_call = call.get("type").and_then(Value::as_str) == Some("tool_use");
+    let raw_name = if is_call {
+        str_field(call, &["name", "toolName"])
+    } else {
+        String::new()
+    };
+    let name = if raw_name.chars().count() > MAX_TOOL_NAME_CHARS {
+        let head: String = raw_name.chars().take(MAX_TOOL_NAME_CHARS - 3).collect();
+        format!("{head}...")
+    } else if raw_name.is_empty() {
+        "unknown".to_owned()
+    } else {
+        raw_name
+    };
+    let recorded_status = call
+        .get("metadata")
+        .and_then(|m| m.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let status = match tool.result {
+        Some(result) if bool_field(result, &["is_error", "isError"]) => "error",
+        Some(_) => "completed",
+        None if recorded_status == "completed" || recorded_status == "error" => recorded_status,
+        None => "started",
+    };
+    let id = escape_xml(&str_field(call, &["toolCallId", "tool_use_id", "id"]));
+    let _ = writeln!(
+        xml,
+        "    <tool_call name=\"{}\" status=\"{status}\" tool_call_id=\"{id}\">",
+        escape_xml(&name)
+    );
+    if is_call {
+        let input = match call.get("input") {
+            Some(v) if is_truthy(v) => v.clone(),
+            _ => json!({}),
+        };
+        let limit = if compact {
+            CUT_SHORT_TOOL_ARGS_SUMMARY_CHARS.min(tool_content_chars)
+        } else {
+            tool_content_chars
+        };
+        let (input, attrs) =
+            truncate_tool_content(call, INPUT_REPLAY_ORIGINAL_CHARS_KEY, &input, limit);
+        let _ = writeln!(xml, "      <input{attrs}>{}</input>", escape_xml(&input));
+    }
+    if !compact {
+        let output = tool
+            .result
+            .and_then(|r| first_truthy(r, &["output", "content"]))
+            .filter(is_truthy);
+        match (tool.result, output) {
+            (Some(result), Some(output)) => {
+                let (text, attrs) = truncate_tool_content(
+                    result,
+                    OUTPUT_REPLAY_ORIGINAL_CHARS_KEY,
+                    &output,
+                    tool_content_chars,
+                );
+                let _ = writeln!(xml, "      <result{attrs}>{}</result>", escape_xml(&text));
+            }
+            _ if status == "started" => {
+                let _ = writeln!(
+                    xml,
+                    "      <result>(no result recorded; it may have run)</result>"
+                );
+            }
+            _ => {
+                let _ = writeln!(xml, "      <result>(no output)</result>");
+            }
+        }
+    }
+    let _ = writeln!(xml, "    </tool_call>");
+}
+
 #[cfg(test)]
 mod tests;

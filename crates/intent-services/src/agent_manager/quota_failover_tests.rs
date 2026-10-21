@@ -931,3 +931,137 @@ async fn a_provider_default_agent_with_a_session_open_fill_still_fails_over() {
         json!("mock-current")
     );
 }
+
+/// A tool call the failed attempt completed WITHOUT any output (it printed
+/// nothing) still reaches the backup, so the instruction not to repeat the
+/// tool calls is accurate (review intentd#2581).
+#[intent_test_macros::daemon_test]
+async fn a_completed_tool_call_without_output_reaches_the_backup() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "streamBeforeErrorText": "starting the migration",
+        "toolCallBeforeError": "rm -rf build-cache",
+        "toolCallBeforeErrorNoOutput": true,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let _first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let prompts = fx.prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    let backup = &prompts[1];
+    assert!(backup.contains("<current_turn_cut_short>"), "{backup}");
+    assert!(backup.contains("please answer"), "{backup}");
+    assert!(
+        backup.contains("rm -rf build-cache"),
+        "the silent call is listed: {backup}"
+    );
+    assert!(backup.contains("status=\"completed\""), "{backup}");
+    assert!(backup.contains("(no output)"), "{backup}");
+    assert!(
+        backup.ends_with(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{backup}"
+    );
+}
+
+/// A cut-short turn that delivered saved groups (with an attachment):
+/// the backup's prompt carries each request's text exactly once — in the
+/// replayed turn section — and the attachment, but does not re-append the
+/// group texts after the continuation (review intentd#2581).
+#[intent_test_macros::daemon_test]
+async fn a_cut_short_group_delivery_is_not_appended_again_after_the_continuation() {
+    let fx = Fixture::new(json!({ "response": "unused" })).await;
+    let store = fx.mgr.services.store.clone();
+    let mut source_ids = Vec::new();
+    for text in ["first grouped request", "second grouped request"] {
+        let row = store
+            .append_agent_message_with_metadata(
+                &fx.agent,
+                "user",
+                &json!([{ "type": "text", "text": text }]),
+                None,
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        source_ids.push(row.id);
+    }
+    store
+        .append_agent_message_with_metadata(
+            &fx.agent,
+            "assistant",
+            &json!([
+                { "type": "text", "text": "working on both" },
+                {
+                    "type": "tool_use", "id": "m:0", "name": "Bash",
+                    "input": { "command": "make migrate" }, "toolCallId": "call-1",
+                    "metadata": { "toolKind": "execute", "status": "completed" },
+                },
+            ]),
+            None,
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let group =
+        |source: &str, text: &str, image: Option<Value>| crate::agent_ops::QueuedDeliveryGroup {
+            source_id: Some(source.to_owned()),
+            is_prepend: false,
+            content: text.to_owned(),
+            image_blocks: image,
+            file_blocks: None,
+        };
+    let options = super::TurnOptions {
+        delivery_groups: Some(vec![
+            group(
+                &source_ids[0],
+                "first grouped request",
+                Some(json!([{ "data": "GROUP_IMG", "mimeType": "image/png" }])),
+            ),
+            group(&source_ids[1], "second grouped request", None),
+        ]),
+        ..super::TurnOptions::default()
+    };
+    fx.mgr.recreated.lock().unwrap().insert(fx.agent.clone());
+    fx.mgr
+        .services
+        .quota_failover_replays
+        .lock()
+        .unwrap()
+        .insert(fx.agent.clone());
+
+    let prompt = fx
+        .mgr
+        .build_turn_prompt(&fx.agent, &fx.ws, "first grouped request", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    let blocks = wire.as_array().unwrap();
+    let text: String = blocks
+        .iter()
+        .filter(|b| b["type"] == json!("text"))
+        .map(|b| b["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for request in ["first grouped request", "second grouped request"] {
+        assert_eq!(text.matches(request).count(), 1, "{request} once: {text}");
+    }
+    assert!(text.contains("make migrate"), "{text}");
+    let continuation = text
+        .find(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION)
+        .expect("continuation");
+    assert!(
+        !text[continuation..].contains("Message #"),
+        "no group text re-appended after the continuation: {text}"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == json!("image") && b["data"] == json!("GROUP_IMG")),
+        "the group attachment is still delivered: {wire}"
+    );
+}
