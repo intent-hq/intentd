@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.20] - 2026-10-21
+
+### 🚀 Features
+
+- *(scripts)* Persist script output to disk with retention GC ([#2545](https://github.com/intent-hq/intentd/pull/2545))
+- Observe and stop provider background workers (agent.workers) ([#2550](https://github.com/intent-hq/intentd/pull/2550))
+- *(agents)* Ask Assistant chats to name themselves on the first turn ([#2558](https://github.com/intent-hq/intentd/pull/2558))
+
+### 🐛 Bug Fixes
+
+- *(services)* Resolve repo-less GitHub PR reads from fetch remotes ([#2552](https://github.com/intent-hq/intentd/pull/2552))
+- Expect unused_mut on non-unix in script output store no_follow ([#2555](https://github.com/intent-hq/intentd/pull/2555))
+- *(store)* Default new repository roots to never-saved selection ([#2559](https://github.com/intent-hq/intentd/pull/2559))
+- *(git)* Stop history reads walking the whole first-parent chain ([#2560](https://github.com/intent-hq/intentd/pull/2560))
+- *(intentd)* Pace incremental vacuum by time so it never stalls the write pool ([#2549](https://github.com/intent-hq/intentd/pull/2549))
+- *(intentd)* Wait for running command scripts before a staged update restart ([#2533](https://github.com/intent-hq/intentd/pull/2533))
+- Restore the Windows build on main ([#2556](https://github.com/intent-hq/intentd/pull/2556))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the Codex CLI Update toast action ([#2557](https://github.com/intent-hq/intentd/pull/2557))
+
+### 🧪 Testing
+
+- *(intent-services)* Give the Claude adapter contract a CI-sized startup budget ([#2548](https://github.com/intent-hq/intentd/pull/2548))
+- Shared provider-installed helper and a no-provider-CLI test guard ([#2551](https://github.com/intent-hq/intentd/pull/2551))
+- Lint fixed test deadlines that bypass the timeout multiplier ([#2531](https://github.com/intent-hq/intentd/pull/2531))
+
+
 ## [0.11.19] - 2026-10-20
 
 ### 🚀 Features
