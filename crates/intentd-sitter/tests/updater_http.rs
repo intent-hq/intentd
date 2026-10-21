@@ -1070,8 +1070,7 @@ fn assert_installed_from_github(outcome: &UpdateOutcome, paths: &SitterPaths) {
 
 #[test]
 fn endpoint_down_installs_from_github_fallback() {
-    let (_dir, paths, outcome) =
-        install_with_endpoint("http://127.0.0.1:1", CheckTrigger::Periodic);
+    let (_dir, paths, outcome) = install_with_endpoint("http://127.0.0.1:1", CheckTrigger::Daily);
     assert_installed_from_github(&outcome, &paths);
     // A failed endpoint check is not recorded as today's check.
     assert_eq!(state::load(&paths.state_path).last_check_day, None);
@@ -1089,7 +1088,7 @@ fn endpoint_404_installs_from_github_fallback() {
 fn slow_endpoint_installs_from_github_fallback() {
     let (url, seen) = serve_endpoint(Endpoint::Slow);
     let started = std::time::Instant::now();
-    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Periodic);
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
     assert_installed_from_github(&outcome, &paths);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(4),
@@ -1130,7 +1129,7 @@ fn endpoint_redirect_to_another_host_falls_back_to_github() {
     let (url, seen) = serve_endpoint(Endpoint::Redirect(format!(
         "{decoy}/channel-stable/stable.json"
     )));
-    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Periodic);
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
     assert_installed_from_github(&outcome, &paths);
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
@@ -1143,7 +1142,7 @@ fn endpoint_redirect_to_another_repo_or_channel_falls_back_to_github() {
         "https://evil.example/channel-stable/stable.json",
     ] {
         let (url, seen) = serve_endpoint(Endpoint::Redirect(location.to_string()));
-        let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Periodic);
+        let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
         assert_installed_from_github(&outcome, &paths);
         assert_eq!(seen.lock().unwrap().len(), 1, "{location}");
     }
@@ -1156,7 +1155,7 @@ fn endpoint_serving_a_manifest_itself_is_refused() {
     let decoy = serve_release("9.9.9", b"decoy daemon", false);
     let body = http_get(&format!("{decoy}/channel-stable/stable.json"));
     let (url, _) = serve_endpoint(Endpoint::Serve(body));
-    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Periodic);
+    let (_dir, paths, outcome) = install_with_endpoint(&url, CheckTrigger::Daily);
     assert_installed_from_github(&outcome, &paths);
 }
 
@@ -1172,7 +1171,7 @@ fn config_opt_out_skips_the_endpoint() {
         .unwrap()
         .with_update_endpoint(Some(endpoint(&url)));
     let outcome = updater
-        .check_and_install(Channel::Stable, CheckTrigger::Periodic)
+        .check_and_install(Channel::Stable, CheckTrigger::Daily)
         .unwrap();
     assert_installed_from_github(&outcome, &paths);
     assert!(seen.lock().unwrap().is_empty());

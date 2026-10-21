@@ -56,10 +56,13 @@ pub struct SitterState {
     pub channel: Channel,
     /// Currently installed daemon version (`versions/<version>/`), if any.
     pub current_version: Option<String>,
-    /// When the last update check ran (RFC 3339).
+    /// When the last successful automatic update check ran (RFC 3339).
+    /// Failed and manual checks leave it alone. On the stable channel a
+    /// value on today's UTC date means the daily check is done.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_check_at: Option<OffsetDateTime>,
-    /// When the next periodic update check is due (RFC 3339).
+    /// When the next scheduled check (alpha/beta) or local tick (stable)
+    /// fires (RFC 3339).
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub next_check_at: Option<OffsetDateTime>,
     /// UTC day (`YYYY-MM-DD`) of the last update check that reached the

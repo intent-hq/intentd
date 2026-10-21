@@ -100,7 +100,13 @@ anonymous update statistics** (on by default). For standalone intentd, set `DO_N
 `INTENTD_DISABLE_TELEMETRY=1`, or `telemetry = false` in
 `<data-dir>/sitter/config.toml`.
 
-<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,updater.rs,config.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
+On the stable channel, standalone intentd checks for updates automatically at most
+once per UTC day (at startup if it has not checked that day, otherwise within the
+first hour after midnight UTC) and restarts into an update once no agent turn is
+running, forcing the restart only after 24 hours. Alpha and beta still check
+hourly when idle. `intentd update` always checks immediately.
+
+<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,updater.rs,config.rs,supervisor.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
 
 ## Manage Assistant chats
 

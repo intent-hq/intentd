@@ -62,9 +62,13 @@ pub fn user_agent() -> String {
 /// change in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckTrigger {
-    /// The randomized periodic timer (also the startup and failed-start
-    /// re-checks the supervisor runs on its own).
-    Periodic,
+    /// The supervisor's own check when the daemon starts: the serve-mode
+    /// startup check and the re-check after a failed start.
+    Startup,
+    /// The scheduled check: on stable, the first tick of a UTC day with no
+    /// successful automatic check yet; on alpha/beta, the 12–24 h periodic
+    /// check.
+    Daily,
     /// SIGUSR2: the daemon's idle-time check.
     Idle,
     /// `intentd update`, `intentd sitter channel --redownload`, or SIGUSR1
@@ -77,7 +81,8 @@ impl CheckTrigger {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Periodic => "periodic",
+            Self::Startup => "startup",
+            Self::Daily => "daily",
             Self::Idle => "idle",
             Self::Manual => "manual",
         }
@@ -373,7 +378,7 @@ mod tests {
     }
 
     const ENDPOINT: &str =
-        "https://updates.intentapp.dev/channel/stable.json?p=x&v=1&src=brew&k=periodic&d=0";
+        "https://updates.intentapp.dev/channel/stable.json?p=x&v=1&src=brew&k=daily&d=0";
     const STABLE_RELEASES: &str =
         "https://github.com/intent-hq/intentd-releases/releases/download/channel-stable/stable.json";
     const STABLE_INTENTD: &str =
@@ -535,14 +540,14 @@ mod tests {
             platform: "aarch64-apple-darwin",
             version: "0.1.28",
             source: InstallSource::Brew,
-            trigger: CheckTrigger::Periodic,
+            trigger: CheckTrigger::Daily,
             first_of_day: true,
         };
         assert_eq!(
             update_check_url("https://updates.intentapp.dev/", Channel::Stable, &params)
                 .unwrap()
                 .as_str(),
-            "https://updates.intentapp.dev/channel/stable.json?p=aarch64-apple-darwin&v=0.1.28&src=brew&k=periodic&d=1"
+            "https://updates.intentapp.dev/channel/stable.json?p=aarch64-apple-darwin&v=0.1.28&src=brew&k=daily&d=1"
         );
         let params = CheckParams {
             platform: "x86_64-unknown-linux-gnu",
@@ -561,7 +566,8 @@ mod tests {
 
     #[test]
     fn trigger_and_source_wire_values() {
-        assert_eq!(CheckTrigger::Periodic.as_str(), "periodic");
+        assert_eq!(CheckTrigger::Startup.as_str(), "startup");
+        assert_eq!(CheckTrigger::Daily.as_str(), "daily");
         assert_eq!(CheckTrigger::Idle.as_str(), "idle");
         assert_eq!(CheckTrigger::Manual.as_str(), "manual");
         for (source, wire) in [

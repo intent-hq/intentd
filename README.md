@@ -75,8 +75,8 @@ packaged and named `intentd` (built from `crates/intentd-sitter`). On the first
 default) — served from the public
 [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) mirror
 first, with a coded fallback to this repo (see
-[Channel manifests](#channel-manifests)) — checks for updates at startup and then every
-12–24 hours, forwards daemon CLI args verbatim, and respawns the daemon
+[Channel manifests](#channel-manifests)) — checks for updates at most once a day on
+stable (every 12–24 hours on alpha/beta; see [How updates work](#how-updates-work)), forwards daemon CLI args verbatim, and respawns the daemon
 if it crashes. Background `start` launches this same supervised `serve`; one-shot
 subcommands (`doctor`, `status`, `stop`, `call`, …) run the already-installed daemon immediately
 without checking for or installing updates. You never install the daemon binary
@@ -104,7 +104,7 @@ directly.
 **Anonymous update statistics.** The sitter fetches each channel manifest through
 `https://updates.intentapp.dev/channel/<channel>.json` first. The request carries
 only the target triple, sitter version, install source (`brew` / `deb` / `script` /
-`windows` / `unknown`), check trigger, and a once-per-UTC-day flag (from a date in
+`windows` / `unknown`), check trigger (`startup` / `daily` / `idle` / `manual`), and a once-per-UTC-day flag (from a date in
 `state.json`); no IDs are sent and the IP is not stored. The endpoint answers with a
 redirect, and the sitter accepts only the official
 `github.com/intent-hq/{intentd-releases,intentd}` channel asset (then GitHub's asset
@@ -384,11 +384,21 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 ### How updates work
 
 - On `intentd serve` the sitter checks the channel manifest at startup and then on a
-  randomized 12–24 h cadence; when a newer daemon version lands it downloads,
-  sha256-verifies, and installs it atomically, then restarts the daemon on the new
-  version. Unless the channel was pinned by flag/env at launch, each check re-reads
-  the `config.toml` pin first, so `intentd sitter channel` takes effect on a running
-  service without a restart.
+  schedule that depends on the channel; when a newer daemon version lands it
+  downloads, sha256-verifies, and installs it atomically, then restarts the daemon on
+  the new version. Unless the channel was pinned by flag/env at launch, each check
+  re-reads the `config.toml` pin first, so `intentd sitter channel` takes effect on a
+  running service without a restart.
+- **Stable** makes at most one successful automatic check per UTC day: at startup
+  if no check succeeded today (otherwise it starts the installed version with no
+  request), then a local tick about every hour checks only once the UTC day has
+  rolled over, so most installs check within the first hour after midnight UTC. A
+  failed check (offline) is not counted, so the next tick retries. A newer version
+  is staged and the daemon restarts into it the next moment no turn is in flight;
+  if it still has not 24 h after staging, the sitter forces the restart.
+  `last_check_at` in `state.json` records the last successful automatic check.
+- **Alpha and beta** keep the randomized 12–24 h cadence, which force-restarts onto
+  a found version, plus the idle-triggered checks below.
 - Manifest fetches try the public `intent-hq/intentd-releases` mirror first and fall
   back to this repo's release URLs if the mirror fetch fails (see
   [Channel manifests](#channel-manifests)). Archive URLs come from inside the chosen
@@ -396,16 +406,18 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
-- Idle daemons update sooner than that cadence: once no agent has had a turn in
+- On alpha and beta, idle daemons update sooner than that cadence: once no agent has had a turn in
   flight for `updates.idleGraceSeconds` (default 120 s), the daemon asks its sitter to
   check right away (via `SIGUSR2`, at most every `updates.idleCheckIntervalMinutes`,
   default 60), the sitter stages any newer version, and the daemon restarts into it
   the next moment no turn is in flight — so an idle daemon picks up a publish within
   about an hour, while a continuously busy daemon still gets the forced 12–24 h
   restart. `updates.checkOnIdle=false` (a live setting, no restart) disables the
-  idle-triggered path and leaves only the periodic one.
-- `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
-  no restart required; `intentd update --check` reports what would happen without
+  idle-triggered path and leaves only the periodic one. On stable an idle request
+  makes no network check unless the day's check is still due, but it still lets an
+  already-staged version restart.
+- `intentd update` forces a check right away on every channel (it never counts as
+  stable's daily check) — no waiting for the scheduled check and no restart required; `intentd update --check` reports what would happen without
   installing (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
