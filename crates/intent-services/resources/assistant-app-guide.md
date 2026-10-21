@@ -350,7 +350,7 @@ title in the conversation header. The title field uses the available header widt
 Press **Enter** or click away to save; press **Escape** to cancel. Sidebar titles
 select conversations and cannot be edited there.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 
 In **Home → Workspaces**, PR badges update as Intent observes changes.
 **Queued** means the PR is in the merge queue, including while queue checks
@@ -365,7 +365,8 @@ and the sidebar PR tooltip also show its place in the queue (for example,
 Home badges show only **Queued**. Agents see the position when they request a
 PR snapshot; queue movement alone does not wake them.
 
-In **Home → Pull requests**, select a PR to open its preview. **Summary** shows
+In **Home → Pull requests**, select a PR to open its preview. If the PR is linked
+to a workspace, double-click the row to open that workspace directly. **Summary** shows
 reviews and check status counts; expand the overview to inspect individual checks in
 open status groups. Collapse a group to hide its checks. **Code** lists changed
 files with their directory paths. Search by filename or path, then click a file to
