@@ -92,6 +92,8 @@ suggest an Apple Silicon build for an Intel Mac.
 
 ## Manage Assistant chats
 
+A new Assistant chat names itself during its first reply; until then the chat list
+previews the first message. A name the user sets by renaming the chat is kept.
 Users can ask the Assistant to find, read, rename, or delete another Assistant chat.
 Use `ws.app.chats.list` to identify it and read only the relevant conversation slice.
 Ask which chat they mean if several match. Apply a rename or deletion only when
@@ -102,7 +104,7 @@ Deletion uses the app's 15-second undo window. Report the deletion as scheduled;
 `ws.app.chats.cancelDelete` can undo it before the returned deadline. It cannot
 recover a chat after deletion has completed.
 
-<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/chats.rs; packages/cloudlands-fe/src/lib/components/chat/assistant-thread-rename.svelte.ts; packages/cloudlands-fe/src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; packages/cloudlands-fe/src/features/agent/utils/pending-agent-deletions.ts. -->
+<!-- Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/app/chats.rs; packages/intentd/crates/intent-services/src/agent_manager.rs; packages/cloudlands-fe/src/store/renderer/slices/sidebar-nav/chief-thread-title.ts; packages/cloudlands-fe/src/lib/components/chat/assistant-thread-rename.svelte.ts; packages/cloudlands-fe/src/lib/components/layout/sidebar-nav/cards/ChiefCard.svelte; packages/cloudlands-fe/src/features/agent/utils/pending-agent-deletions.ts. -->
 
 ## Choose a model or change agent behavior
 

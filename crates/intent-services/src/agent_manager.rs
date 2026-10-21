@@ -5390,7 +5390,10 @@ impl AgentManager {
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
     /// * Agent naming fires only for generated generic/specialist placeholders
-    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   whose name was not explicitly set — plus, in the Assistant (chief)
+    ///   workspace, the chat placeholders ([`is_assistant_chat_placeholder_name`]),
+    ///   so Assistant chats name themselves like workspace agents. Intentional
+    ///   task names are retained.
     ///   It uses the provider-correct workspace API MCP tool to call
     ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
@@ -5418,6 +5421,9 @@ impl AgentManager {
         let needs_agent_name = session.as_ref().is_ok_and(|s| {
             if s.name_explicitly_set {
                 return false;
+            }
+            if workspace_id.is_chief() && is_assistant_chat_placeholder_name(&s.name) {
+                return true;
             }
             let specialist_name = self
                 .services
@@ -12943,6 +12949,20 @@ pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>)
         || specialist_name.is_some_and(matches_base)
 }
 
+/// Whether `name` is a placeholder an Assistant (chief) chat carries before it
+/// is named: blank, the desktop "New chat" placeholder, a legacy stored
+/// placeholder, or a generated "New thread …" name. Mirrors cloudlands-fe
+/// `isPlaceholderChiefThreadName`. Only consulted for chief-workspace sessions.
+pub(crate) fn is_assistant_chat_placeholder_name(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty()
+        || matches!(
+            name,
+            "New chat" | "New chat with Assistant" | "New chat with Intent" | "Chief of Staff"
+        )
+        || name.starts_with("New thread ")
+}
+
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
 pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
@@ -18002,6 +18022,114 @@ mod role_reminder_tests {
         );
         assert!(!later.contains("ws.workspace.setAgentName"));
         assert!(later.ends_with("later"));
+    }
+
+    /// Seed an Assistant (chief) chat session alongside the default fixture.
+    async fn insert_assistant_chat(
+        mgr: &AgentManager,
+        name: &str,
+        explicitly_set: bool,
+    ) -> AgentId {
+        let agent_id = AgentId::from("assistant-chat-1");
+        let mut chat = session(&agent_id, &WorkspaceId::chief(), Some("chief-of-staff"));
+        chat.name = name.to_string();
+        chat.name_explicitly_set = explicitly_set;
+        mgr.services
+            .store
+            .insert_agent_session(&chat)
+            .await
+            .expect("insert assistant chat");
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_placeholder_names_receive_agent_naming_instruction() {
+        for name in [
+            "New chat",
+            "  New chat  ",
+            "",
+            "New chat with Assistant",
+            "New chat with Intent",
+            "Chief of Staff",
+            "New thread 3/4/2026, 10:15 AM",
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, false).await;
+            let instruction = mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                .await
+                .unwrap_or_else(|| panic!("Assistant placeholder {name:?} needs a name"));
+            assert!(
+                instruction.contains("ws.workspace.setAgentName"),
+                "{name:?}: {instruction}"
+            );
+            assert!(
+                !instruction.contains("This workspace needs a title"),
+                "the Assistant workspace is never retitled: {instruction}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_naming_instruction_is_first_turn_only() {
+        let (mgr, _agent, _db) = manager_with(None, None).await;
+        let agent_id = insert_assistant_chat(&mgr, "New chat", false).await;
+        let chief = WorkspaceId::chief();
+        let first = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "first", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(first.contains("ws.workspace.setAgentName"));
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "ready" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("assistant message");
+        let later = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "later", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(!later.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn named_assistant_chats_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set) in [
+            ("New chat", true),
+            ("Quarterly planning", true),
+            ("Quarterly planning", false),
+            ("New chats digest", false),
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, explicitly_set).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                    .await
+                    .is_none(),
+                "preserve Assistant chat name {name:?} (explicit: {explicitly_set})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_placeholder_names_stay_intentional_in_regular_workspaces() {
+        for name in ["New chat", "Chief of Staff", "New thread 1"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "workspace agent named {name:?} keeps its name"
+            );
+        }
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
