@@ -95,8 +95,8 @@ suggest an Apple Silicon build for an Intel Mac.
 Update checks go through `updates.intentapp.dev`, which counts them (platform,
 version, channel, install source, check trigger, country; no IDs, IPs not stored)
 and redirects to the GitHub release; if it is unreachable, updates come straight
-from GitHub. The desktop app's switch is **Settings → General → Share anonymous
-update statistics** (on by default). For standalone intentd, set `DO_NOT_TRACK=1`,
+from GitHub. The desktop app's switch is **Settings → General → Updates → Share
+anonymous update statistics** (on by default). For standalone intentd, set `DO_NOT_TRACK=1`,
 `INTENTD_DISABLE_TELEMETRY=1`, or `telemetry = false` in
 `<data-dir>/sitter/config.toml`.
 
