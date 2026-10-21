@@ -926,6 +926,7 @@ child.on('exit',code=>process.exit(code||0));
         );
         std::fs::write(
             installed_dir.join("codex"),
+            // cli-fixture-version: allow — catalog probes of a confirmed-old Codex
             "#!/bin/sh\nprintf 'codex-cli 0.114.0\\n'\n",
         )
         .unwrap();
@@ -942,6 +943,7 @@ child.on('exit',code=>process.exit(code||0));
         std::fs::create_dir(&installed_dir).unwrap();
         std::fs::write(
             installed_dir.join("codex"),
+            // cli-fixture-version: allow — catalog probes of a confirmed-old Codex
             "#!/bin/sh\nprintf 'codex-cli 0.114.0\\n'\n",
         )
         .unwrap();
@@ -997,6 +999,7 @@ child.on('exit',code=>process.exit(code||0));
     async fn installed_old_codex_with_an_old_bundled_copy_is_rejected_before_launch() {
         let fixture = Fixture::new(&json!({"installed":true}));
         let (launch, home) = old_installed_launch(&fixture);
+        // cli-fixture-version: allow — a bundled copy that is itself old is never used
         seed_bundled_codex(&home, None, "#!/bin/sh\nprintf 'codex-cli 0.1.0\\n'\n");
         let report = launch
             .catalogs_with_auth(Ok(fixture.auth().await), Limits::default())

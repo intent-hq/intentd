@@ -761,6 +761,7 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     .unwrap();
     std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
     let version_file = bin.join("codex.version");
+    // cli-fixture-version: allow — set-model against a confirmed-old Codex
     std::fs::write(&version_file, "codex-cli 0.114.0\n").unwrap();
     // The CLI is selected from inherited PATH, but its Node interpreter must
     // come from the same enhanced PATH used by the real adapter launch.
@@ -780,6 +781,7 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     let bundled_codex = bundled_dir.join("node_modules/.bin/codex");
     std::fs::write(
         &bundled_codex,
+        // cli-fixture-version: allow — a bundled copy that is itself old
         "#!/bin/sh\n[ \"$1\" = --version ] || exit 94\nprintf 'codex-cli 0.0.2\\n'\n",
     )
     .unwrap();
@@ -812,8 +814,10 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     .await;
     let minimum = requirement.minimum.to_string();
     for (index, (version, expected)) in [
+        // cli-fixture-version: allow — old Codex versions in the set-model gate
         ("codex-cli 0.0.1", Some(false)),
         (minimum.as_str(), Some(true)),
+        // cli-fixture-version: allow — a far-newer Codex passes the set-model gate
         ("codex-cli 99.0.0", Some(true)),
         ("codex unknown build", None),
     ]
@@ -859,6 +863,7 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
             assert_eq!(prompt["ok"], false, "{prompt}");
             let message = prompt["message"].as_str().unwrap();
             assert!(
+                // cli-fixture-version: allow — the error names the old bundled version
                 message.contains("codex-cli 0.0.2"),
                 "bundled CLI selected: {prompt}"
             );
