@@ -508,9 +508,12 @@ async fn child_policy_cancelled_caller_cannot_abandon_the_admitted_original_writ
         receive.lock().unwrap().recv().unwrap();
     }));
     let update = tokio::spawn(async move { original.set_current(true, Caller::current()).await });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        crate::test_support::fixture_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     update.abort();
     assert!(matches!(update.await, Err(error) if error.is_cancelled()));
     assert!(f
@@ -521,7 +524,7 @@ async fn child_policy_cancelled_caller_cannot_abandon_the_admitted_original_writ
         .is_none());
     release.send(()).unwrap();
     let status = tokio::time::timeout(
-        Duration::from_secs(5),
+        crate::test_support::fixture_timeout(Duration::from_secs(5)),
         capture(&f).status_current(Caller::current()),
     )
     .await
@@ -559,18 +562,22 @@ async fn child_policy_cancelled_file_read_retains_lease_until_worker_exits() {
     let mut disable =
         tokio::spawn(async move { update.set_current(false, Caller::current()).await });
     assert!(
+        // fixed-deadline: allow — short window proving the disable is still held, not a hang guard
         tokio::time::timeout(Duration::from_millis(30), &mut disable)
             .await
             .is_err()
     );
     paused.resume();
     assert!(
-        !tokio::time::timeout(Duration::from_secs(5), disable)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .enabled
+        !tokio::time::timeout(
+            crate::test_support::fixture_timeout(Duration::from_secs(5)),
+            disable
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .enabled
     );
     assert!(credential(&f).await.is_none());
 }
@@ -1019,9 +1026,12 @@ async fn child_status_receipt_pending_write_and_poison_refuse_without_output() {
         receive.lock().unwrap().recv().unwrap();
     }));
     let write = tokio::spawn(async move { update.set_current(true, Caller::current()).await });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        crate::test_support::fixture_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(receipt
         .with_current(|| panic!("pending policy cannot deliver"))
         .is_err());
@@ -1082,6 +1092,7 @@ async fn child_status_receipt_verified_refresh_remains_current_without_revising_
     owner
         .owner
         .directory
+        // fixed-deadline: allow — backoff expiry under test, not a hang guard
         .record_backoff(&stamp, std::time::Instant::now() + Duration::from_secs(60))
         .unwrap();
     let before_http = server.control.requests.lock().unwrap().len();
