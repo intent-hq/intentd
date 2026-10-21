@@ -311,11 +311,14 @@ async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
         .expect("spawn mock http mcp server");
     let stdout = child.stdout.take().expect("fixture stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let line = timeout(Duration::from_secs(10), lines.next_line())
-        .await
-        .expect("timed out waiting for fixture PORT line")
-        .expect("read fixture stdout")
-        .expect("fixture exited before announcing PORT");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        lines.next_line(),
+    )
+    .await
+    .expect("timed out waiting for fixture PORT line")
+    .expect("read fixture stdout")
+    .expect("fixture exited before announcing PORT");
     let port = line
         .strip_prefix("PORT=")
         .expect("fixture PORT line")

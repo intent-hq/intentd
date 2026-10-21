@@ -481,9 +481,12 @@ async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str,
     let mut sub_resp: Option<Value> = None;
     let mut snap: Option<Value> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
-            .await
-            .expect("chat.subscribe frame timed out");
+        let next = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("chat.subscribe frame timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -700,25 +703,28 @@ async fn wss_workspace_auto_commit_round_trip() {
 
     // The `workspace:updated` event's `changes` delta is self-sufficient
     // (§6.5): subscribers see the toggled flag without a follow-up read.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str());
@@ -1029,15 +1035,18 @@ async fn wss_oversized_message_terminates_connection() {
     let last = Frame::message(vec![b'a'; 1024], OpCode::Data(Data::Continue), true);
     ws.send(Message::Frame(first)).await.expect("send first");
     ws.send(Message::Frame(last)).await.expect("send last");
-    let close_code = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_)) => break None,
-                Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
-                Some(Ok(_)) => {}
+    let close_code = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) => break None,
+                    Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
+                    Some(Ok(_)) => {}
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("oversized message must terminate the connection");
     assert_eq!(
@@ -1053,14 +1062,17 @@ async fn wss_oversized_message_terminates_connection() {
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
     let _ = ws.send(Message::Text(oversized.into())).await;
-    let closed = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                Some(Ok(_)) => {}
+    let closed = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         closed.is_ok(),
@@ -1337,25 +1349,28 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -2123,7 +2138,7 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
     assert_eq!(raised["ok"], serde_json::json!(true), "{raised}");
     let promoted = next_event_until(
         &mut sub,
-        tokio::time::Instant::now() + Duration::from_secs(10),
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10)),
     )
     .await
     .expect("displayStatus promotion event");
@@ -2161,7 +2176,8 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
     let mut retired_evt: Option<Value> = None;
     let mut attention_evts: Vec<Value> = Vec::new();
     let mut display_evts: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut quiet_until: Option<tokio::time::Instant> = None;
     loop {
         let until = quiet_until.unwrap_or(deadline);
@@ -2179,7 +2195,10 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
             && !attention_evts.is_empty()
             && !display_evts.is_empty()
         {
-            quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+            quiet_until = Some(
+                tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_millis(1500)),
+            );
         }
     }
     let retired_evt = retired_evt.expect("agent:retired");
@@ -2255,7 +2274,8 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
         "{restored}"
     );
     let mut restored_evt: Option<Value> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut quiet_until: Option<tokio::time::Instant> = None;
     loop {
         let until = quiet_until.unwrap_or(deadline);
@@ -2266,7 +2286,10 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
             "agent:restored" => {
                 assert_eq!(evt["data"]["agentId"], agent_id.as_str(), "{evt}");
                 restored_evt = Some(evt);
-                quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+                quiet_until = Some(
+                    tokio::time::Instant::now()
+                        + intentd_test_support::test_timeout(Duration::from_millis(1500)),
+                );
             }
             "workspace:attention-changed" => {
                 panic!("agent.restore must be silent for the unread state: {evt}")
@@ -2504,7 +2527,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     let (mut parent_retired, mut child_retired, mut hook_cancelled) = (None, None, None);
     while parent_retired.is_none() || child_retired.is_none() || hook_cancelled.is_none() {
         let ev = next_event_any(&mut sub, deadline).await;
@@ -2559,7 +2583,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let conv_frame = format!(
         r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{watcher_id}"}}}}"#
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     let wake_text = loop {
         let conv = wss_call(srv.port, srv.cfg.clone(), &conv_frame).await;
         let found = conv["result"]["messages"]
@@ -2589,7 +2614,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let subs_frame = format!(
         r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getSubscriptions","params":{{"workspaceId":"{ws_id}","agentId":"{watcher_id}"}}}}"#
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let subs = wss_call(srv.port, srv.cfg.clone(), &subs_frame).await;
         let remaining = subs["result"]["subscriptions"]
@@ -3056,7 +3082,8 @@ async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
 async fn next_subscription_push(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -3237,9 +3264,12 @@ async fn wss_agent_subscribe_delta_rows_use_the_list_projection() {
     let mut sub_id: Option<String> = None;
     let mut snapshot: Option<Value> = None;
     while sub_id.is_none() || snapshot.is_none() {
-        let next = tokio::time::timeout(Duration::from_secs(10), sub.next())
-            .await
-            .expect("agent.subscribe frame timed out");
+        let next = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("agent.subscribe frame timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -3671,9 +3701,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     let mut sub_resp: Option<Value> = None;
     let mut snap: Option<Value> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let frame = tokio::time::timeout(Duration::from_secs(10), sub.next())
-            .await
-            .expect("workspace.subscribe frame timed out");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("workspace.subscribe frame timed out");
         match frame {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -4072,39 +4105,45 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     async fn push(ws: &mut Ws, kind: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
@@ -4265,25 +4304,28 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
 
     // The owner's `events.event`: the §6.5 `workspace:updated` membership
     // delta is self-sufficient (`members`, `addedPrincipalId`, `memberCount`).
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match owner_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match owner_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = owner_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = owner_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for the owner's workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
@@ -4396,39 +4438,45 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     async fn push(ws: &mut Ws, kind: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
@@ -4859,45 +4907,51 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
         ws.send(Message::Text(frame.to_string().into()))
             .await
             .expect("send");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{method} reply within 10s"))
     }
 
     async fn event(ws: &mut Ws, ty: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{ty} event within 10s"))
     }
@@ -5121,29 +5175,32 @@ impl Guest {
             .send(Message::Text(frame.to_string().into()))
             .await
             .expect("send");
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match self.ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            assert_eq!(v["jsonrpc"], "2.0", "{method} envelope: {v}");
-                            assert!(v.get("method").is_none(), "{method} envelope: {v}");
-                            assert!(
-                                v.get("result").is_some() != v.get("error").is_some(),
-                                "{method} envelope: exactly one of result/error: {v}"
-                            );
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                assert_eq!(v["jsonrpc"], "2.0", "{method} envelope: {v}");
+                                assert!(v.get("method").is_none(), "{method} envelope: {v}");
+                                assert!(
+                                    v.get("result").is_some() != v.get("error").is_some(),
+                                    "{method} envelope: exactly one of result/error: {v}"
+                                );
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = self.ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = self.ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{method} reply within 15s"))
     }
@@ -5681,25 +5738,28 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     assert_eq!(removed["result"]["removed"], true, "{removed}");
 
     // Live echo: the queue republished without the removed member's entry.
-    let echo = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == AGENT_QUEUE_UPDATED
-                    {
-                        return v["params"]["event"].clone();
+    let echo = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == AGENT_QUEUE_UPDATED
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("agent:queue:updated after removal");
     assert_eq!(echo["data"]["agentId"], agent_id.as_str(), "{echo}");
@@ -5985,28 +6045,31 @@ async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
     // The emitted sequence: two removals (memberCount 2 then 1), the invite
     // delta, then the archived delta.
     let mut changes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while changes.len() < 4 {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == WORKSPACE_UPDATED
-                    {
-                        let ev = &v["params"]["event"];
-                        assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
-                        assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
-                        changes.push(ev["data"]["changes"].clone());
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while changes.len() < 4 {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == WORKSPACE_UPDATED
+                        {
+                            let ev = &v["params"]["event"];
+                            assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
+                            assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
+                            changes.push(ev["data"]["changes"].clone());
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("four workspace:updated deltas after archive");
     let mut removed: Vec<String> = changes[..2]
@@ -6165,20 +6228,23 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         id: u64,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
@@ -6610,56 +6676,62 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     /// Collect delivered `events.event` types until `until` arrives.
     async fn delivered_until(ws: &mut Ws, until: &str) -> Vec<String> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let mut types = Vec::new();
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] != "events.event" {
-                            continue;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                let mut types = Vec::new();
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] != "events.event" {
+                                continue;
+                            }
+                            let ty = v["params"]["event"]["type"]
+                                .as_str()
+                                .expect("event type")
+                                .to_string();
+                            let done = ty == until;
+                            types.push(ty);
+                            if done {
+                                return types;
+                            }
                         }
-                        let ty = v["params"]["event"]["type"]
-                            .as_str()
-                            .expect("event type")
-                            .to_string();
-                        let done = ty == until;
-                        types.push(ty);
-                        if done {
-                            return types;
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {until}"))
     }
@@ -6955,7 +7027,11 @@ impl PresenceClient {
     /// Clean close: a `Close` frame, then the reader ends with the stream.
     async fn close(mut self) {
         let _ = self.tx.send(Message::Close(None)).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.reader).await;
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.reader,
+        )
+        .await;
     }
 
     /// Silent drop: stop polling (no more pongs) without closing the socket,
@@ -6976,11 +7052,14 @@ async fn presence_matching_frame(
         return skipped.remove(index);
     }
     loop {
-        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| panic!("no {description} within 10s"));
+        let v = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            rx.recv(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("no {description} within 10s"));
         if matches(&v) {
             return v;
         }
@@ -7911,25 +7990,28 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -9690,32 +9772,35 @@ async fn wss_agent_mark_seen_round_trip() {
     ))
     .await
     .expect("send markSeen");
-    let (marked, evt) = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut marked: Option<Value> = None;
-        let mut evt: Option<Value> = None;
-        loop {
-            if let (Some(m), Some(e)) = (&marked, &evt) {
-                return (m.clone(), e.clone());
-            }
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(6)) {
-                        marked = Some(v);
-                    } else if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "agent:updated"
-                    {
-                        evt = Some(v["params"]["event"].clone());
+    let (marked, evt) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            let mut marked: Option<Value> = None;
+            let mut evt: Option<Value> = None;
+            loop {
+                if let (Some(m), Some(e)) = (&marked, &evt) {
+                    return (m.clone(), e.clone());
+                }
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v.get("id") == Some(&serde_json::json!(6)) {
+                            marked = Some(v);
+                        } else if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "agent:updated"
+                        {
+                            evt = Some(v["params"]["event"].clone());
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for markSeen response + agent:updated");
     assert_eq!(marked["result"]["success"], true, "markSeen: {marked}");
@@ -9803,25 +9888,28 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -11237,12 +11325,15 @@ async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abor
     let wait_count = |wanted: u64| {
         let health = &health;
         async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while health().await != wanted {
-                    // timing-guard: poll interval
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while health().await != wanted {
+                        // timing-guard: poll interval
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                },
+            )
             .await
             .expect("guest count converges");
         }
@@ -13224,7 +13315,8 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     // some hosts, and a fixed sleep would probe the queue before the parked
     // calls hold their slots — the probe would then measure nothing and the
     // test would pass or fail on timing luck.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(60));
     while spawned_count() < limit && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -13235,7 +13327,12 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         let mut outcomes = Vec::new();
         for run in parked {
             outcomes.push(
-                match tokio::time::timeout(std::time::Duration::from_secs(5), run).await {
+                match tokio::time::timeout(
+                    intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                    run,
+                )
+                .await
+                {
                     Ok(Ok(v)) => v.to_string(),
                     Ok(Err(e)) => format!("<join error: {e}>"),
                     Err(_) => "<still in flight>".to_string(),
@@ -14239,25 +14336,28 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // The `workspace:updated` event's `changes` delta is self-sufficient
     // (§6.5): subscribers see the new asset id without a follow-up read.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str());
@@ -15038,23 +15138,26 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
         ))
         .await
         .expect("send subscribe");
-    let sub_resp = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["id"] == 10 {
-                        return v;
+    let sub_resp = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == 10 {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscribe response timed out");
     assert!(
@@ -15096,29 +15199,34 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
     // nested repo is clean after the commit).
     let mut commit_evt = None;
     let mut status_evt = None;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while commit_evt.is_none() || status_evt.is_none() {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event" {
-                        match v["params"]["event"]["type"].as_str() {
-                            Some("git:commit") => commit_evt = Some(v["params"]["event"].clone()),
-                            Some("changes:git-status") => {
-                                status_evt = Some(v["params"]["event"].clone());
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while commit_evt.is_none() || status_evt.is_none() {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            match v["params"]["event"]["type"].as_str() {
+                                Some("git:commit") => {
+                                    commit_evt = Some(v["params"]["event"].clone());
+                                }
+                                Some("changes:git-status") => {
+                                    status_evt = Some(v["params"]["event"].clone());
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for git:commit / changes:git-status");
     let commit_evt = commit_evt.expect("git:commit event");
@@ -15427,17 +15535,20 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
-                let response: Value = serde_json::from_str(&text).unwrap();
-                if response["id"] == 10 {
-                    assert!(response["result"]["subscriptionId"].is_string());
-                    break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                    let response: Value = serde_json::from_str(&text).unwrap();
+                    if response["id"] == 10 {
+                        assert!(response["result"]["subscriptionId"].is_string());
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let added = wss_call(
@@ -15454,18 +15565,21 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
         added["result"]["historyIdentity"],
         result["historyIdentity"]
     );
-    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
-                let event: Value = serde_json::from_str(&text).unwrap();
-                if event["method"] == "events.event"
-                    && event["params"]["event"]["type"] == "changes:git-status"
-                {
-                    break event["params"]["event"]["data"]["status"].clone();
+    let pushed = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["method"] == "events.event"
+                        && event["params"]["event"]["type"] == "changes:git-status"
+                    {
+                        break event["params"]["event"]["data"]["status"].clone();
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(pushed, added["result"]);
@@ -16862,24 +16976,27 @@ async fn hello_with(
     ws.send(Message::Text(frame.into()))
         .await
         .expect("send hello");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    if v["id"] == "hello" {
-                        assert!(v.get("result").is_some(), "hello failed: {v}");
-                        break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        if v["id"] == "hello" {
+                            assert!(v.get("result").is_some(), "hello failed: {v}");
+                            break;
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected hello reply, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected hello reply, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("client.hello reply");
 }
@@ -16901,33 +17018,39 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
             )
             .await
     });
-    let frame = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).expect("json frame");
-                    if frame["method"] == "browser.exec" {
-                        break frame;
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).expect("json frame");
+                        if frame["method"] == "browser.exec" {
+                            break frame;
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected reverse frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected reverse frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("accepted reverse frame");
     assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
     ws.send(Message::Close(None)).await.expect("close WSS");
 
-    let err = tokio::time::timeout(Duration::from_secs(1), request)
-        .await
-        .expect("disconnect wakes request")
-        .expect("join")
-        .expect_err("request fails on disconnect");
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        request,
+    )
+    .await
+    .expect("disconnect wakes request")
+    .expect("join")
+    .expect_err("request fails on disconnect");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     srv.ws.stop().await;
 }
@@ -16954,29 +17077,35 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
             )
             .await
     });
-    let frame = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).expect("json frame");
-                    if frame["method"] == "browser.exec" {
-                        break frame;
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).expect("json frame");
+                        if frame["method"] == "browser.exec" {
+                            break frame;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected reverse frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected reverse frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("accepted reverse frame");
     assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
 
-    let err = tokio::time::timeout(Duration::from_secs(2), request)
-        .await
-        .expect("heartbeat abort wakes request")
-        .expect("join")
-        .expect_err("request fails on heartbeat abort");
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        request,
+    )
+    .await
+    .expect("heartbeat abort wakes request")
+    .expect("join")
+    .expect_err("request fails on heartbeat abort");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     assert!(srv.reverse_registry.is_empty());
     srv.ws.stop().await;
@@ -16989,27 +17118,30 @@ async fn await_client_event(
     event_type: &str,
     client_id: &str,
 ) -> Value {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    let event = &v["params"]["event"];
-                    if v["method"] == "events.event"
-                        && event["type"] == event_type
-                        && event["data"]["clientId"] == client_id
-                    {
-                        break event.clone();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        let event = &v["params"]["event"];
+                        if v["method"] == "events.event"
+                            && event["type"] == event_type
+                            && event["data"]["clientId"] == client_id
+                        {
+                            break event.clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected {event_type} event, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected {event_type} event, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }
@@ -17038,21 +17170,24 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     ))
     .await
     .expect("send subscribe");
-    let ack = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match sub.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["id"] == "sub" {
-                        break v;
+    let ack = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match sub.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == "sub" {
+                            break v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
+                    Some(Ok(_)) => {}
+                    other => panic!("expected subscribe ack, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
-                Some(Ok(_)) => {}
-                other => panic!("expected subscribe ack, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscribe ack");
     assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
@@ -17905,9 +18040,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let mut sub_resp: Option<Value> = None;
     let mut snap: Option<Value> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
-            .await
-            .expect("chat.subscribe frame timed out");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("chat.subscribe frame timed out");
         match frame {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -20785,26 +20923,29 @@ async fn wss_workspace_import_lifecycle() {
     );
 
     // The commit's `workspace:created` event reaches the subscriber (§6.3).
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:created"
-                        && v["params"]["event"]["workspaceId"] == ws_id
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:created"
+                            && v["params"]["event"]["workspaceId"] == ws_id
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:created after import commit");
     assert_eq!(evt["workspaceId"], ws_id, "{evt}");
@@ -20812,26 +20953,29 @@ async fn wss_workspace_import_lifecycle() {
     // Imports run no setup stage, so the commit pairs `workspace:created`
     // with an immediate `workspace:setup:completed { ranScript: false }` —
     // the watcher registry must not defer this workspace to the backstop.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:setup:completed"
-                        && v["params"]["event"]["workspaceId"] == ws_id
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:setup:completed"
+                            && v["params"]["event"]["workspaceId"] == ws_id
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:setup:completed after import commit");
     assert_eq!(
@@ -20995,39 +21139,46 @@ async fn wss_workspace_export_lifecycle() {
 
     // The subscriber sees ≥1 progress event and then the ready event whose
     // payload carries everything workspace.import.begin needs.
-    let (saw_progress, ready) = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut saw_progress = false;
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] != "events.event" {
-                        continue;
+    let (saw_progress, ready) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut saw_progress = false;
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("workspace:transfer:progress") => {
+                                assert_eq!(
+                                    event["data"]["exportId"],
+                                    export_id.as_str(),
+                                    "{event}"
+                                );
+                                assert!(event["data"]["stage"].is_string(), "{event}");
+                                saw_progress = true;
+                            }
+                            Some("workspace:transfer:ready") => {
+                                return (saw_progress, event.clone());
+                            }
+                            Some("workspace:transfer:failed") => {
+                                panic!("export failed: {event}");
+                            }
+                            _ => {}
+                        }
                     }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("workspace:transfer:progress") => {
-                            assert_eq!(event["data"]["exportId"], export_id.as_str(), "{event}");
-                            assert!(event["data"]["stage"].is_string(), "{event}");
-                            saw_progress = true;
-                        }
-                        Some("workspace:transfer:ready") => {
-                            return (saw_progress, event.clone());
-                        }
-                        Some("workspace:transfer:failed") => {
-                            panic!("export failed: {event}");
-                        }
-                        _ => {}
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:transfer:ready");
     assert!(saw_progress, "at least one progress event before ready");
@@ -21155,29 +21306,32 @@ async fn wss_workspace_export_lifecycle() {
     )
     .await;
     let export2 = started2["result"]["exportId"].as_str().expect("exportId");
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match sub2.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:transfer:ready"
-                    {
-                        return;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match sub2.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:transfer:ready"
+                        {
+                            return;
+                        }
+                        assert!(
+                            v["params"]["event"]["type"] != "workspace:transfer:failed",
+                            "second export failed: {v}"
+                        );
                     }
-                    assert!(
-                        v["params"]["event"]["type"] != "workspace:transfer:failed",
-                        "second export failed: {v}"
-                    );
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub2.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub2.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for second export's ready event");
     let aborted = wss_call(
@@ -21527,29 +21681,32 @@ async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
         .unwrap_or_else(|| panic!("exportId: {started}"))
         .to_string();
 
-    let ready = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] != "events.event" {
-                        continue;
+    let ready = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("workspace:transfer:ready") => return event.clone(),
+                            Some("workspace:transfer:failed") => panic!("export failed: {event}"),
+                            _ => {}
+                        }
                     }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("workspace:transfer:ready") => return event.clone(),
-                        Some("workspace:transfer:failed") => panic!("export failed: {event}"),
-                        _ => {}
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:transfer:ready");
     let data = &ready["data"];
@@ -21731,7 +21888,7 @@ async fn wss_transfer_preserves_remote_state() {
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params
         });
         let response = tokio::time::timeout(
-            Duration::from_secs(60),
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
             wss_call(srv.port, srv.cfg.clone(), &frame.to_string()),
         )
         .await
@@ -21943,46 +22100,52 @@ async fn wss_transfer_preserves_remote_state() {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match events.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let ack: Value = serde_json::from_str(&text).unwrap();
-                        assert_eq!(ack["id"], 100, "{ack}");
-                        assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
-                        break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let ack: Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(ack["id"], 100, "{ack}");
+                            assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+                            break;
+                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("subscribe ended: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
-                    Some(Ok(_)) => {}
-                    other => panic!("subscribe ended: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("subscribe timeout");
         let started = rpc(&source, "workspace.export.start", params.clone()).await;
         let export_id = started["result"]["exportId"].as_str().expect("exportId");
-        let ready = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                match events.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = serde_json::from_str(&text).unwrap();
-                        if frame["method"] != "events.event" {
-                            continue;
+        let ready = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
+            async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let frame: Value = serde_json::from_str(&text).unwrap();
+                            if frame["method"] != "events.event" {
+                                continue;
+                            }
+                            let event = &frame["params"]["event"];
+                            assert_ne!(event["type"], "workspace:transfer:failed", "{event}");
+                            if event["type"] == "workspace:transfer:ready" {
+                                assert_eq!(event["data"]["exportId"], export_id, "{event}");
+                                return event["data"].clone();
+                            }
                         }
-                        let event = &frame["params"]["event"];
-                        assert_ne!(event["type"], "workspace:transfer:failed", "{event}");
-                        if event["type"] == "workspace:transfer:ready" {
-                            assert_eq!(event["data"]["exportId"], export_id, "{event}");
-                            return event["data"].clone();
-                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("export stream ended: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
-                    Some(Ok(_)) => {}
-                    other => panic!("export stream ended: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("export ready timeout");
         assert_eq!(ready["manifest"]["workspaceId"], ws_id.0);
@@ -22850,20 +23013,23 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
         ))
         .await
         .expect("send system.status");
-    let response = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match status.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let response: Value = serde_json::from_str(&text).expect("status json");
-                    if response["id"] == 202 {
-                        break response;
+    let response = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                match status.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let response: Value = serde_json::from_str(&text).expect("status json");
+                        if response["id"] == 202 {
+                            break response;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected system.status response, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected system.status response, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("system.status stayed responsive during detached traversal");
     assert!(response["result"].is_object(), "system.status: {response}");
@@ -22872,7 +23038,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
         "system.status was delayed by file.tree"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while srv.ws.client_count() > 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -22884,7 +23051,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
 
     status.close(None).await.expect("close status client");
     drop(status);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while srv.ws.client_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -23219,21 +23387,24 @@ async fn port_assignment_reserves_persists_then_serves_and_reuses() {
     );
     let mut client = connect_ws(port, client_config(&tls.fingerprint256)).await;
     client.send(Message::Text(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"settings.get","params":{"path":"server.wsApi.port"}}).to_string().into())).await.unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Message::Text(text) = client
-                .next()
-                .await
-                .expect("WSS response")
-                .expect("WSS frame")
-            {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                if frame["id"] == 1 {
-                    break frame;
+    let response = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Message::Text(text) = client
+                    .next()
+                    .await
+                    .expect("WSS response")
+                    .expect("WSS frame")
+                {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["id"] == 1 {
+                        break frame;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("settings response before timeout");
     assert_eq!(response["jsonrpc"], "2.0");

@@ -754,15 +754,18 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     ws.send(Message::Text(notification.into()))
         .await
         .expect("send");
-    let unexpected = timeout(Duration::from_secs(2), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => return Some(text),
-                Some(Ok(_)) => {}
-                _ => return None,
+    let unexpected = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => return Some(text),
+                    Some(Ok(_)) => {}
+                    _ => return None,
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         !matches!(&unexpected, Ok(Some(_))),

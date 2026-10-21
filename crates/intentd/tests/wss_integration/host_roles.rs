@@ -3,21 +3,24 @@ use intent_core::WorkspaceRole;
 use serde_json::json;
 
 async fn workspace_push(guest: &mut Guest) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match guest.ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).unwrap();
-                    if frame["method"] == "subscription.push" {
-                        return frame["params"].clone();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match guest.ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["method"] == "subscription.push" {
+                            return frame["params"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => guest.ws.send(Message::Pong(p)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("expected workspace push, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => guest.ws.send(Message::Pong(p)).await.unwrap(),
-                Some(Ok(_)) => {}
-                other => panic!("expected workspace push, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("workspace push within deadline")
 }

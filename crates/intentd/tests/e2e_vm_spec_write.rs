@@ -177,27 +177,33 @@ async fn spec_write(method: &str) {
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     let manager = AgentManager::new(services.clone(), sink, 8)
         .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
-    let startup = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        manager
-            .create_agent(
-                agent_id.clone(),
-                ws.clone(),
-                "Spec write control",
-                "interactive",
-                cwd.clone(),
-                &opts,
-            )
-            .await?;
-        manager
-            .start_session(&agent_id, cwd.clone(), &provider)
-            .await
-    })
+    let startup = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        async {
+            manager
+                .create_agent(
+                    agent_id.clone(),
+                    ws.clone(),
+                    "Spec write control",
+                    "interactive",
+                    cwd.clone(),
+                    &opts,
+                )
+                .await?;
+            manager
+                .start_session(&agent_id, cwd.clone(), &provider)
+                .await
+        },
+    )
     .await;
     let session = match startup {
         Ok(Ok(session)) => session,
         failure => {
-            let cleanup =
-                tokio::time::timeout(std::time::Duration::from_secs(10), manager.shutdown()).await;
+            let cleanup = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+                manager.shutdown(),
+            )
+            .await;
             panic!("bounded startup failed: {failure:?}; cleanup: {cleanup:?}");
         }
     };
@@ -215,87 +221,95 @@ async fn spec_write(method: &str) {
     .unwrap();
     let started = std::time::Instant::now();
     // Capture all observations before shutdown, which can itself force idle.
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let observe = async {
-            let mut seen = Vec::new();
-            let mut released = false;
-            let mut tool_id = serde_json::Value::Null;
-            let mut tool_completed = false;
-            let mut ended = false;
-            let mut idle = false;
-            while !(ended && idle) {
-                let batch = events
-                    .recv()
-                    .await
-                    .ok_or_else(|| "event bus closed".to_owned())?;
-                for event in batch {
-                    if event.workspace_id != ws || event.data["agentId"] != agent_id.0 {
-                        continue;
-                    }
-                    if event.event_type == "agent:tool:call"
-                        && event.data["status"] == "started"
-                        && !released
-                    {
-                        let before = services
-                            .get_note(ws.clone(), spec.id.clone())
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        if before.content != spec.content {
-                            return Err("write occurred before observed open tool".to_owned());
+    let outcome = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+        async {
+            let observe = async {
+                let mut seen = Vec::new();
+                let mut released = false;
+                let mut tool_id = serde_json::Value::Null;
+                let mut tool_completed = false;
+                let mut ended = false;
+                let mut idle = false;
+                while !(ended && idle) {
+                    let batch = events
+                        .recv()
+                        .await
+                        .ok_or_else(|| "event bus closed".to_owned())?;
+                    for event in batch {
+                        if event.workspace_id != ws || event.data["agentId"] != agent_id.0 {
+                            continue;
                         }
-                        tokio::fs::write(&release_file, b"invoke")
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        released = true;
-                        tool_id = event.data["toolCallId"].clone();
-                    }
-                    if released
-                        && event.event_type == "agent:tool:call"
-                        && event.data["toolCallId"] == tool_id
-                        && event.data["status"] == "completed"
-                    {
-                        tool_completed = true;
-                    }
-                    // This fixture creates one agent/session/turn and subscribes
-                    // after startup. Terminal frames must follow its exact tool.
-                    if event.event_type == "agent:stream:end" || event.event_type == "agent:idle" {
-                        if !tool_completed {
-                            return Err("terminal event before current tool completed".into());
+                        if event.event_type == "agent:tool:call"
+                            && event.data["status"] == "started"
+                            && !released
+                        {
+                            let before = services
+                                .get_note(ws.clone(), spec.id.clone())
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            if before.content != spec.content {
+                                return Err("write occurred before observed open tool".to_owned());
+                            }
+                            tokio::fs::write(&release_file, b"invoke")
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            released = true;
+                            tool_id = event.data["toolCallId"].clone();
                         }
-                        ended |= event.event_type == "agent:stream:end";
-                        idle |= event.event_type == "agent:idle";
+                        if released
+                            && event.event_type == "agent:tool:call"
+                            && event.data["toolCallId"] == tool_id
+                            && event.data["status"] == "completed"
+                        {
+                            tool_completed = true;
+                        }
+                        // This fixture creates one agent/session/turn and subscribes
+                        // after startup. Terminal frames must follow its exact tool.
+                        if event.event_type == "agent:stream:end"
+                            || event.event_type == "agent:idle"
+                        {
+                            if !tool_completed {
+                                return Err("terminal event before current tool completed".into());
+                            }
+                            ended |= event.event_type == "agent:stream:end";
+                            idle |= event.event_type == "agent:idle";
+                        }
+                        seen.push(event);
                     }
-                    seen.push(event);
                 }
-            }
-            Ok::<_, String>(seen)
-        };
-        let (turn, observed) = tokio::join!(
-            manager.run_turn(&agent_id, &ws, &session, vec![block], None),
-            observe
-        );
-        let transcript = services
-            .agent_get_conversation(
-                agent_id.clone(),
-                None,
-                Some(ws.clone()),
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await;
-        let naturally_idle = !manager.list_busy().iter().any(|(id, _)| id == &agent_id);
-        (turn, observed, transcript, naturally_idle)
-    })
+                Ok::<_, String>(seen)
+            };
+            let (turn, observed) = tokio::join!(
+                manager.run_turn(&agent_id, &ws, &session, vec![block], None),
+                observe
+            );
+            let transcript = services
+                .agent_get_conversation(
+                    agent_id.clone(),
+                    None,
+                    Some(ws.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+            let naturally_idle = !manager.list_busy().iter().any(|(id, _)| id == &agent_id);
+            (turn, observed, transcript, naturally_idle)
+        },
+    )
     .await;
     eprintln!(
         "VM_SPEC_CONTROL method={method} turn_elapsed_ms={} pre_cleanup={outcome:?}",
         started.elapsed().as_millis()
     );
-    let cleanup =
-        tokio::time::timeout(std::time::Duration::from_secs(10), manager.shutdown()).await;
+    let cleanup = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        manager.shutdown(),
+    )
+    .await;
     assert!(
         cleanup.is_ok(),
         "cleanup failed: {cleanup:?}; original outcome: {outcome:?}"

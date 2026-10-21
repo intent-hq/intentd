@@ -1081,7 +1081,8 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     // The completed `agent:tool:call` event: recorded as the daemon's own
     // `workspace_api` tool (not the prose summary) and carrying the claimed
     // batch + the materialized proposal block ids.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     let mut completed = None;
     while completed.is_none() {
         let batch = tokio::time::timeout_at(deadline, tool_events.recv())

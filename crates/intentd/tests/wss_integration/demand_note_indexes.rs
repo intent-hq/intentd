@@ -66,14 +66,17 @@ async fn demand_wss_authorization_retry_and_one_note_publication() {
     drop(writer);
     let url = format!("wss://localhost:{}/ws?token={}", srv.port, "91".repeat(32));
     alice.ws = common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await;
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let frame = alice.call("note.get", params.clone()).await;
-            if frame["error"]["data"]["code"] != "note-index-preparing" {
-                break frame;
+    let ready = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            loop {
+                let frame = alice.call("note.get", params.clone()).await;
+                if frame["error"]["data"]["code"] != "note-index-preparing" {
+                    break frame;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(ready["result"]["kind"], "noteSourcePage", "{ready}");

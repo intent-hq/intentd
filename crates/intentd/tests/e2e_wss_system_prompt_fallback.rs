@@ -190,9 +190,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -617,18 +620,21 @@ async fn assistant_app_guide_reaches_every_turn_over_wss() {
     std::fs::write(&release_file, "continue").expect("release first turn");
     await_stream_end(&mut sub, agent).await;
     await_stream_end(&mut sub, agent).await;
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let frame = wss_event(&mut sub, 10).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "agent:status-changed"
-                && event["data"]["agentId"] == agent
-                && event["data"]["status"] == "idle"
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 10).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:status-changed"
+                    && event["data"]["agentId"] == agent
+                    && event["data"]["status"] == "idle"
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("queued turns must release the busy slot before the next direct send");
 
@@ -1024,19 +1030,22 @@ async fn assistant_real_answers_over_wss() {
             }),
         )
         .await;
-        timeout(Duration::from_secs(240), async {
-            loop {
-                let frame = wss_event(&mut sub, 240).await;
-                let ev = &frame["params"]["event"];
-                if ev["data"]["agentId"] == agent && ev["type"] == "agent:stream:end" {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(240)),
+            async {
+                loop {
+                    let frame = wss_event(&mut sub, 240).await;
+                    let ev = &frame["params"]["event"];
+                    if ev["data"]["agentId"] == agent && ev["type"] == "agent:stream:end" {
+                        break;
+                    }
+                    assert!(
+                        !(ev["data"]["agentId"] == agent && ev["type"] == "agent:failed"),
+                        "provider failed: {ev}"
+                    );
                 }
-                assert!(
-                    !(ev["data"]["agentId"] == agent && ev["type"] == "agent:failed"),
-                    "provider failed: {ev}"
-                );
-            }
-        })
+            },
+        )
         .await
         .expect("real Assistant answer timed out");
         let mut conversation = wss_rpc(

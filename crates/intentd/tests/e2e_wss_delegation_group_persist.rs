@@ -306,9 +306,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -684,9 +687,12 @@ async fn baseline_plus_aggregated_wake() {
     // Loop to skip events until we get child1's idle (in case filter isn't working).
     let mut child1_idle = false;
     for _ in 0..100 {
-        let frame = timeout(Duration::from_secs(20), wss_event(&mut child1_sub, 60))
-            .await
-            .expect("child1 idle timeout");
+        let frame = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            wss_event(&mut child1_sub, 60),
+        )
+        .await
+        .expect("child1 idle timeout");
         let ev = &frame["params"]["event"];
         if ev["type"] == "agent:idle" && ev["data"]["agentId"] == child1_id {
             child1_idle = true;

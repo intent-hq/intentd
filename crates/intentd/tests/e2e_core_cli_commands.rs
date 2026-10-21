@@ -186,12 +186,12 @@ async fn retained_cli_status_call_and_graceful_stop() {
     .expect("spawn stop");
     let exit = daemon
         .child
-        .wait_with_timeout(Duration::from_secs(15))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
         .expect("wait for daemon")
         .expect("daemon should stop");
     assert!(exit.success(), "daemon did not exit gracefully: {exit}");
     assert!(stop
-        .wait_with_timeout(Duration::from_secs(15))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
         .unwrap()
         .expect("stop exits")
         .success());
@@ -1424,7 +1424,8 @@ async fn serve_survives_closed_stderr_pipe_during_skill_scan() {
         .stderr(Stdio::from(pipe_write));
     let mut child = GuardedChild::spawn(&mut cmd).expect("spawn intentd serve");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     let mut warned_at = None;
     loop {
         if let Ok(Some(status)) = child.try_wait() {

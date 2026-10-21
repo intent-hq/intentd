@@ -244,20 +244,24 @@ fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
 /// released. A probe that wins the lock before the warm starts must retry.
 async fn wait_for_warm_completion(root: &std::path::Path, owner: &str, repo: &str) {
     let cache = cache_slot(root, owner, repo);
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let path = cache.clone();
-            let populated = intent_git::repo_cache::with_cache_lock_blocking(&cache, move || {
-                Ok(path.join(".git").is_dir())
-            })
-            .await
-            .expect("observe warm cache under its lock");
-            if populated {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let path = cache.clone();
+                let populated =
+                    intent_git::repo_cache::with_cache_lock_blocking(&cache, move || {
+                        Ok(path.join(".git").is_dir())
+                    })
+                    .await
+                    .expect("observe warm cache under its lock");
+                if populated {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("warm did not complete in time");
 }
@@ -376,7 +380,9 @@ async fn repo_warm_cache_busy_rejection_envelope_over_wss() {
         })
         .await
     });
-    held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    held_rx
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+        .unwrap();
 
     let v = wss_rpc(&mut rpc, 1, "repo.warmCache", json!({ "githubUrl": url })).await;
     assert_eq!(v["result"]["started"], json!(true), "first warm accepted");
