@@ -3728,7 +3728,7 @@ impl AgentManager {
                 context
                     .select_launch(&prepared.command, Some(dependency))
                     .await
-                    .map_err(Error::InvalidInput)?;
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?;
                 let mut prepared = Arc::try_unwrap(prepared).map_err(|_| {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())
                 })?;

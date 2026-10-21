@@ -7,6 +7,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
+use crate::installed_cli::LaunchSelectionError;
+
 use super::catalog_io::{self, Authentication, Rpc, PHASE_TIMEOUT};
 use super::process::{ProbeDependency, ProbeProcess};
 use super::{CodexInspection, CodexLaunch, CodexRuntimeReport, ProviderLaunch, UnknownReason};
@@ -336,8 +338,8 @@ impl CodexLaunch {
                         }
                     }
                 }
-                if let Some(version) = version {
-                    inspection.report.runtime_version = version;
+                if let Some(selected) = version {
+                    selected.report(&mut inspection.report);
                 }
                 guard = Some(process);
                 result
@@ -349,7 +351,7 @@ impl CodexLaunch {
                 self.raw_catalog(
                     runtime.command(),
                     &mut auth,
-                    &mut inspection.report.runtime_version,
+                    &mut inspection.report,
                     limits,
                     guard
                         .as_ref()
@@ -379,17 +381,12 @@ impl CodexLaunch {
         }
     }
 
+    /// The measured runtime version and, when Intent's bundled CLI replaced
+    /// the installed one, the bundled path reported in its place.
     async fn start_acp(
         &self,
         auth: &Authentication,
-    ) -> Result<
-        (
-            ProbeProcess,
-            std::path::PathBuf,
-            Option<super::VersionMeasurement>,
-        ),
-        CatalogFailure,
-    > {
+    ) -> Result<(ProbeProcess, std::path::PathBuf, Option<SelectedRuntime>), CatalogFailure> {
         super::process::ensure_supported()?;
         let home = auth.home().await?;
         let path = home.path().to_owned();
@@ -435,14 +432,7 @@ impl CodexLaunch {
         &self,
         command: Command,
         home: tempfile::TempDir,
-    ) -> Result<
-        (
-            Command,
-            tempfile::TempDir,
-            Option<super::VersionMeasurement>,
-        ),
-        CatalogFailure,
-    > {
+    ) -> Result<(Command, tempfile::TempDir, Option<SelectedRuntime>), CatalogFailure> {
         let Some(context) = self.installed.clone() else {
             return Ok((command, home, None));
         };
@@ -457,11 +447,17 @@ impl CodexLaunch {
             // only a failed switch (or an old bundled copy) rejects the probe.
             let version = match context.select_launch(&command, Some(dependency)).await {
                 Ok((_, version)) => version,
-                Err(reason) if reason.contains("below the required minimum") => {
+                Err(LaunchSelectionError::BelowMinimum(reason)) => {
                     tracing::warn!(%reason, "Codex catalog probe rejected before launch");
                     return Err(CatalogFailure::RuntimeBelowMinimum);
                 }
-                Err(_) => return Err(CatalogFailure::RuntimeUnverified),
+                Err(LaunchSelectionError::BundledUnavailable(reason)) => {
+                    tracing::warn!(%reason, "Codex catalog probe could not install the bundled CLI");
+                    return Err(CatalogFailure::RuntimeUnverified);
+                }
+                Err(LaunchSelectionError::Unverified(_)) => {
+                    return Err(CatalogFailure::RuntimeUnverified)
+                }
             };
             context.apply_selection(&mut command);
             // The raw catalog executes the runtime itself: run the bundled
@@ -489,7 +485,17 @@ impl CodexLaunch {
                 );
             let home =
                 std::sync::Arc::try_unwrap(home).map_err(|_| CatalogFailure::RuntimeUnverified)?;
-            Ok((command, home, Some(measured)))
+            let bundled_path = context
+                .replaced_host()
+                .map(|_| super::safe_text(&context.runtime.path().to_string_lossy()));
+            Ok((
+                command,
+                home,
+                Some(SelectedRuntime {
+                    version: measured,
+                    bundled_path,
+                }),
+            ))
         })
         .await
         .map_err(|_| CatalogFailure::RuntimeUnverified)?
@@ -499,7 +505,7 @@ impl CodexLaunch {
         &self,
         mut command: Command,
         auth: &mut Authentication,
-        runtime_version: &mut super::VersionMeasurement,
+        report: &mut super::CodexRuntimeReport,
         limits: Limits,
         dependency: Option<ProbeDependency>,
     ) -> Result<Catalog, CatalogFailure> {
@@ -512,8 +518,8 @@ impl CodexLaunch {
         // app-server defaults to newline-delimited stdio; no thread/turn is created.
         command.arg("app-server");
         let (command, home, version) = self.validate_installed_command(command, home).await?;
-        if let Some(version) = version {
-            *runtime_version = version;
+        if let Some(selected) = version {
+            selected.report(report);
         }
         let mut guard = tokio::time::timeout_at(
             deadline,
@@ -766,6 +772,21 @@ fn finish(
         runtime: inspection.report,
         acp: acp.into(),
         raw: raw.into(),
+    }
+}
+
+/// What a catalog probe measured about the runtime it launched.
+struct SelectedRuntime {
+    version: super::VersionMeasurement,
+    bundled_path: Option<String>,
+}
+
+impl SelectedRuntime {
+    fn report(self, report: &mut super::CodexRuntimeReport) {
+        report.runtime_version = self.version;
+        if let Some(path) = self.bundled_path {
+            report.runtime_path = Some(path);
+        }
     }
 }
 

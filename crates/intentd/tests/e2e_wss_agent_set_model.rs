@@ -858,7 +858,10 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
             .await;
             assert_eq!(prompt["ok"], false, "{prompt}");
             let message = prompt["message"].as_str().unwrap();
-            assert!(message.contains("codex-cli 0.0.2"), "bundled CLI selected: {prompt}");
+            assert!(
+                message.contains("codex-cli 0.0.2"),
+                "bundled CLI selected: {prompt}"
+            );
             assert!(!message.contains(version), "{prompt}");
             assert!(message.contains(&minimum), "{prompt}");
             assert!(message.contains("Upgrade Codex"), "{prompt}");
@@ -870,9 +873,11 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
             .iter()
             .find(|row| row["id"] == "claude-code")
             .unwrap();
-        let claude_requirement =
-            intent_providers::adapter_cli::requirement("claude-code").unwrap();
+        let claude_requirement = intent_providers::adapter_cli::requirement("claude-code").unwrap();
         assert_eq!(claude["cliCommand"], "claude");
-        assert_eq!(claude["cliMinimumVersion"], claude_requirement.minimum.to_string());
+        assert_eq!(
+            claude["cliMinimumVersion"],
+            claude_requirement.minimum.to_string()
+        );
     }
 }

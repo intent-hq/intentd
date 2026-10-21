@@ -79,7 +79,8 @@ needs. Fields that matter most:
   `claudeCodeVersion`, whose same-minor `.0` is the minimum), installed on first use
   with the host's npm under `~/.local/share/intent/providers/bundled-cli`
   (`crates/intent-services/src/bundled_cli.rs`). A missing or unknown-version CLI is
-  never replaced. Discovery reports `cliBundledVersion` and never installs. The
+  never replaced. If the bundled install fails, Codex launches fail with both reasons;
+  Claude launches keep the installed CLI (Claude had no launch minimum before). Discovery reports `cliBundledVersion` and never installs. The
   Claude `claudeCodeVersion` snapshot is kept in sync by `provider_cli_metadata.py` and
   the auto-pin automation (`runtimePackage` / `runtimeVersionField`). Legacy `providers.paths.codex` and
   `providers.paths["claude-code"]` adapter overrides are ignored on all launch/catalog

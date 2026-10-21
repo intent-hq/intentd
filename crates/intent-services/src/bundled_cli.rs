@@ -99,7 +99,8 @@ pub async fn ensure(
     cli: InstalledCli,
     bundled: &BundledCli,
 ) -> Result<InstalledCliRuntime, String> {
-    if let Some(runtime) = existing(root, cli, bundled) {
+    let (lookup_root, lookup) = (root.to_owned(), bundled.clone());
+    if let Some(runtime) = blocking(move || Ok(existing(&lookup_root, cli, &lookup))).await? {
         return Ok(runtime);
     }
     // Unit tests seed complete installs or call `ensure_in` with a fake npm;
@@ -107,18 +108,30 @@ pub async fn ensure(
     if cfg!(test) {
         return Err(format!("unit tests do not install {}", bundled.spec()));
     }
-    let (npm, path) = tokio::task::spawn_blocking(|| {
+    let (npm, path) = blocking(|| {
         let npm = find_npm();
         let path = intent_providers::enhanced_path(npm.as_deref());
-        (npm, path)
+        Ok((npm, path))
     })
-    .await
-    .map_err(|_| "bundled CLI lookup task failed".to_owned())?;
+    .await?;
     let npm = npm.ok_or("npm was not found next to npx on the execution host")?;
     ensure_in(root, &npm, &path, cli, bundled, INSTALL_TIMEOUT).await
 }
 
+/// Filesystem work (marker reads, tree removal, renames) stays off the executor.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| "bundled CLI filesystem task failed".to_owned())?
+}
+
 /// [`ensure`] with an explicit root, npm and PATH (test seam).
+///
+/// Installs are serialized within this daemon. Another daemon sharing the
+/// home may install the same version concurrently: its finished copy is
+/// adopted, never replaced, and each install stages privately.
 ///
 /// # Errors
 /// Returns an actionable reason when the install fails or times out.
@@ -132,7 +145,8 @@ pub async fn ensure_in(
 ) -> Result<InstalledCliRuntime, String> {
     let _lock = install_lock().lock().await;
     let destination = version_dir(root, bundled);
-    if let Some(runtime) = complete(&destination, cli, bundled) {
+    let (dest, pin) = (destination.clone(), bundled.clone());
+    if let Some(runtime) = blocking(move || Ok(complete(&dest, cli, &pin))).await? {
         return Ok(runtime);
     }
     let spec = bundled.spec();
@@ -140,12 +154,16 @@ pub async fn ensure_in(
         .parent()
         .ok_or("invalid bundled CLI directory")?
         .to_owned();
-    std::fs::create_dir_all(&parent)
-        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    let staging = tempfile::Builder::new()
-        .prefix(".install-")
-        .tempdir_in(&parent)
-        .map_err(|e| format!("cannot create a staging directory for {spec}: {e}"))?;
+    let (staging_parent, staging_spec) = (parent.clone(), spec.clone());
+    let staging = blocking(move || {
+        std::fs::create_dir_all(&staging_parent)
+            .map_err(|e| format!("cannot create {}: {e}", staging_parent.display()))?;
+        tempfile::Builder::new()
+            .prefix(".install-")
+            .tempdir_in(&staging_parent)
+            .map_err(|e| format!("cannot create a staging directory for {staging_spec}: {e}"))
+    })
+    .await?;
     tracing::info!(%spec, "installing Intent's bundled CLI");
     let mut command = tokio::process::Command::new(npm);
     command
@@ -178,56 +196,156 @@ pub async fn ensure_in(
         Ok(Ok(output)) => output,
     };
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        let tail = stderr
-            .char_indices()
-            .rev()
-            .nth(STDERR_TAIL)
-            .map_or(stderr, |(i, _)| &stderr[i..]);
         return Err(format!(
-            "npm install {spec} failed ({}): {tail}",
-            output.status
+            "npm install {spec} failed ({}): {}",
+            output.status,
+            tail(&output.stderr)
         ));
     }
-    if cli
+    let staged = cli
         .resolve_in_dirs(&[bin_dir(staging.path())], cfg!(windows))
-        .is_err()
-    {
-        return Err(format!(
-            "npm install {spec} did not provide a {} executable",
-            cli.command()
-        ));
-    }
-    std::fs::write(staging.path().join(READY), &spec)
-        .map_err(|e| format!("cannot mark {spec} complete: {e}"))?;
-    if std::fs::symlink_metadata(&destination).is_ok() {
-        // An incomplete or foreign earlier copy is never trusted.
-        std::fs::remove_dir_all(&destination)
-            .map_err(|e| format!("cannot replace {}: {e}", destination.display()))?;
-    }
-    let staged = staging.keep();
-    if let Err(e) = std::fs::rename(&staged, &destination) {
-        let _ = std::fs::remove_dir_all(&staged);
-        return Err(format!("cannot activate {spec}: {e}"));
-    }
-    prune(&parent, &destination);
-    complete(&destination, cli, bundled)
-        .ok_or_else(|| format!("{spec} is not usable after install"))
+        .map_err(|_| {
+            format!(
+                "npm install {spec} did not provide a {} executable",
+                cli.command()
+            )
+        })?;
+    // Packages that finish their binary in an install script (or a missing
+    // platform package) can leave a placeholder: only a CLI that reports the
+    // pinned version is ever marked complete.
+    verify_version(staged.path(), staging.path(), path, bundled).await?;
+    let pin = bundled.clone();
+    blocking(move || activate(staging, &destination, cli, &pin)).await
 }
 
-/// Remove superseded versions and abandoned staging directories of this
-/// package (installs are serialized); failures, e.g. a running executable on
-/// Windows, only defer cleanup to a later install.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn verify_version(
+    executable: &Path,
+    cwd: &Path,
+    path: &str,
+    bundled: &BundledCli,
+) -> Result<(), String> {
+    let spec = bundled.spec();
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("--version")
+        .current_dir(cwd)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(VERIFY_TIMEOUT, command.output()).await {
+        Err(_) => {
+            return Err(format!(
+                "installed {spec} did not report its version in time"
+            ))
+        }
+        Ok(Err(e)) => return Err(format!("installed {spec} could not run: {e}")),
+        Ok(Ok(output)) => output,
+    };
+    let version = bundled.version.to_string();
+    let reported = String::from_utf8_lossy(&output.stdout);
+    if output.status.success()
+        && reported
+            .split_whitespace()
+            .any(|t| t.trim_start_matches('v') == version)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "installed {spec} is not runnable (--version exited {}): {}",
+        output.status,
+        tail(if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &output.stderr
+        })
+    ))
+}
+
+fn tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    text.char_indices()
+        .rev()
+        .nth(STDERR_TAIL)
+        .map_or(text, |(i, _)| &text[i..])
+        .to_owned()
+}
+
+/// Mark the verified staging tree complete and move it into place. A copy
+/// another process completed meanwhile is adopted; an incomplete one is
+/// moved aside first so the final rename never merges trees.
+fn activate(
+    staging: tempfile::TempDir,
+    destination: &Path,
+    cli: InstalledCli,
+    bundled: &BundledCli,
+) -> Result<InstalledCliRuntime, String> {
+    let spec = bundled.spec();
+    std::fs::write(staging.path().join(READY), &spec)
+        .map_err(|e| format!("cannot mark {spec} complete: {e}"))?;
+    if let Some(runtime) = complete(destination, cli, bundled) {
+        return Ok(runtime);
+    }
+    let parent = destination
+        .parent()
+        .ok_or("invalid bundled CLI directory")?;
+    if std::fs::symlink_metadata(destination).is_ok() {
+        let stale = parent.join(format!(".stale-{}", uuid::Uuid::new_v4()));
+        std::fs::rename(destination, &stale)
+            .map_err(|e| format!("cannot replace {}: {e}", destination.display()))?;
+        let _ = std::fs::remove_dir_all(stale);
+    }
+    let staged = staging.keep();
+    if let Err(e) = std::fs::rename(&staged, destination) {
+        let _ = std::fs::remove_dir_all(&staged);
+        // Lost a race with another daemon installing the same version.
+        return complete(destination, cli, bundled)
+            .ok_or_else(|| format!("cannot activate {spec}: {e}"));
+    }
+    prune(parent, destination);
+    complete(destination, cli, bundled).ok_or_else(|| format!("{spec} is not usable after install"))
+}
+
+/// Versions kept per package, so daemons with different adapter pins that
+/// share a home do not delete each other's runtimes.
+const KEEP_VERSIONS: usize = 3;
+const STALE_STAGING: Duration = Duration::from_secs(60 * 60);
+
+/// Remove all but the newest [`KEEP_VERSIONS`] versions and staging trees
+/// abandoned for over an hour (live installs of other daemons are younger).
+/// Failures, e.g. a running executable on Windows, only defer cleanup.
 fn prune(parent: &Path, keep: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
+    let mut versions = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path != keep && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = std::fs::remove_dir_all(path);
+        if path == keep || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
         }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            let abandoned = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_STAGING);
+            if abandoned {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        } else if let Some(version) = BundledCli::new("", &name).map(|dir| dir.version) {
+            versions.push((version, path));
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in versions.into_iter().skip(KEEP_VERSIONS - 1) {
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 

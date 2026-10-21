@@ -305,18 +305,22 @@ impl InstalledContext {
         &mut self,
         launch: &Command,
         dependency: Option<ProbeDependency>,
-    ) -> Result<(InstalledCliIdentity, String), String> {
+    ) -> Result<(InstalledCliIdentity, String), LaunchSelectionError> {
+        use LaunchSelectionError::{BelowMinimum, BundledUnavailable, Unverified};
         let observed = self
             .observe_with_dependency(launch, dependency.clone())
-            .await?;
+            .await
+            .map_err(Unverified)?;
         if self.host.is_some() {
-            self.validate_launch_version(&observed.1)?;
+            self.validate_launch_version(&observed.1)
+                .map_err(BelowMinimum)?;
             return Ok(observed);
         }
         let provider = self.provider_id();
         let Some(bundled) = intent_providers::adapter_cli::bundled_fallback(provider, &observed.1)
         else {
-            self.validate_launch_version(&observed.1)?;
+            self.validate_launch_version(&observed.1)
+                .map_err(BelowMinimum)?;
             return Ok(observed);
         };
         let reason = self
@@ -329,14 +333,29 @@ impl InstalledContext {
             Some(root) => crate::bundled_cli::ensure(root, cli, &bundled).await,
             None => Err("the launch environment has no absolute home directory".to_owned()),
         };
-        let runtime = installed.map_err(|error| {
-            format!(
-                "{reason} Intent could not install its bundled {} instead: {error}",
-                bundled.spec()
-            )
-        })?;
+        let runtime = match installed {
+            Ok(runtime) => runtime,
+            // Claude had no launch minimum before the bundled fallback; when
+            // it cannot be installed (offline, no npm) keep launching the
+            // installed Claude rather than blocking every session.
+            Err(error) if cli == InstalledCli::Claude => {
+                tracing::warn!(
+                    installed = %observed.1,
+                    bundled = %bundled.spec(),
+                    %error,
+                    "could not install Intent's bundled Claude Code CLI; launching the installed CLI"
+                );
+                return Ok(observed);
+            }
+            Err(error) => {
+                return Err(BundledUnavailable(format!(
+                    "{reason} Intent could not install its bundled {} instead: {error}",
+                    bundled.spec()
+                )))
+            }
+        };
         warn_bundled_once(cli, &observed.1, &bundled);
-        *self = self.with_bundled(runtime).await?;
+        *self = self.with_bundled(runtime).await.map_err(Unverified)?;
         // Probe with the launch's environment and cwd, selecting the bundled
         // executable exactly as the launch will.
         let mut probe = Command::new(self.runtime.path());
@@ -350,8 +369,12 @@ impl InstalledContext {
             probe.current_dir(cwd);
         }
         self.apply_selection(&mut probe);
-        let observed = self.observe_with_dependency(&probe, dependency).await?;
-        self.validate_launch_version(&observed.1)?;
+        let observed = self
+            .observe_with_dependency(&probe, dependency)
+            .await
+            .map_err(Unverified)?;
+        self.validate_launch_version(&observed.1)
+            .map_err(BelowMinimum)?;
         Ok(observed)
     }
 
@@ -451,6 +474,33 @@ impl InstalledContext {
             .map_err(|_| "installed CLI identity task failed")?
             .map_err(|_| "installed CLI changed or disappeared")?;
         Ok((identity, version))
+    }
+}
+
+/// Why a launch could not select a runnable CLI.
+#[derive(Debug)]
+pub(crate) enum LaunchSelectionError {
+    /// The CLI that would be launched is confirmed below the minimum.
+    BelowMinimum(String),
+    /// The installed CLI is too old and Intent's bundled copy could not be
+    /// installed; the message names both.
+    BundledUnavailable(String),
+    /// A version or identity probe failed.
+    Unverified(String),
+}
+
+impl std::fmt::Display for LaunchSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::BelowMinimum(reason)
+        | Self::BundledUnavailable(reason)
+        | Self::Unverified(reason)) = self;
+        f.write_str(reason)
+    }
+}
+
+impl From<LaunchSelectionError> for String {
+    fn from(error: LaunchSelectionError) -> Self {
+        error.to_string()
     }
 }
 

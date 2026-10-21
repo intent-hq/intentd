@@ -1538,7 +1538,12 @@ async fn failed_or_old_bundled_cli_reports_both_versions_and_the_reason() {
     )
     .unwrap();
     let command = launch(&context, root.path());
-    let error = context.select_launch(&command, None).await.err().unwrap();
+    let error = context
+        .select_launch(&command, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
     assert!(
         error.contains("0.114.0") && error.contains(&minimum),
         "{error}"
@@ -1556,9 +1561,42 @@ async fn failed_or_old_bundled_cli_reports_both_versions_and_the_reason() {
     );
     seed_bundled(root.path(), InstalledCli::Codex, "codex-cli 0.1.0");
     let command = launch(&context, root.path());
-    let error = context.select_launch(&command, None).await.err().unwrap();
+    let error = context
+        .select_launch(&command, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
     assert!(
         error.contains("0.1.0") && error.contains(&minimum),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn old_claude_keeps_the_installed_cli_when_the_bundled_copy_is_unavailable() {
+    // Claude had no launch minimum before the bundled fallback: an install
+    // failure (unit tests never install) must not block Claude launches.
+    let (root, mut context) = fixture(
+        InstalledCli::Claude,
+        "#!/bin/sh\nprintf '1.0.128 (Claude Code)'\n",
+    );
+    let host = context.runtime.clone();
+    let command = launch(&context, root.path());
+    let (_, version) = context.select_launch(&command, None).await.unwrap();
+    assert_eq!(version, "1.0.128 (Claude Code)");
+    assert_eq!(context.runtime, host);
+    assert!(context.replaced_host().is_none());
+
+    // Codex keeps its hard minimum and reports the install failure distinctly.
+    let (root, mut context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    let command = launch(&context, root.path());
+    let error = context.select_launch(&command, None).await.err().unwrap();
+    assert!(
+        matches!(error, LaunchSelectionError::BundledUnavailable(_)),
         "{error}"
     );
 }

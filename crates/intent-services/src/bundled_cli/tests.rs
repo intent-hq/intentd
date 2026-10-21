@@ -157,24 +157,100 @@ async fn incomplete_or_mismatched_copies_are_reinstalled() {
     assert_eq!(calls(temp.path()).len(), 1);
 }
 
+fn age(path: &Path) {
+    let old = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    std::fs::File::open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(old))
+        .unwrap();
+}
+
 #[tokio::test]
-async fn a_new_pin_prunes_superseded_versions_and_staging() {
+async fn new_pins_keep_recent_versions_and_drop_only_abandoned_staging() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("root");
     let npm = fake_npm(temp.path(), "");
-    let old = bundled("0.159.0");
-    let new = bundled("0.160.1");
-    ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &old, TIMEOUT)
-        .await
-        .unwrap();
-    let abandoned = version_dir(&root, &new).with_file_name(".install-abandoned");
+    let pins = ["0.158.0", "0.159.0", "0.160.0", "0.160.1"].map(bundled);
+    ensure_in(
+        &root,
+        &npm,
+        &path_env(),
+        InstalledCli::Codex,
+        &pins[0],
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let parent = version_dir(&root, &pins[0]).parent().unwrap().to_owned();
+    let abandoned = parent.join(".install-abandoned");
+    let live = parent.join(".install-another-daemon");
     std::fs::create_dir_all(&abandoned).unwrap();
-    ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &new, TIMEOUT)
+    std::fs::create_dir_all(&live).unwrap();
+    age(&abandoned);
+    for pin in &pins[1..] {
+        ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, pin, TIMEOUT)
+            .await
+            .unwrap();
+    }
+    // Another daemon on an older pin keeps its runtime; only the oldest goes.
+    assert!(existing(&root, InstalledCli::Codex, &pins[0]).is_none());
+    for pin in &pins[1..] {
+        assert!(
+            existing(&root, InstalledCli::Codex, pin).is_some(),
+            "{}",
+            pin.spec()
+        );
+    }
+    assert!(!abandoned.exists());
+    assert!(
+        live.exists(),
+        "a recent staging tree may belong to another daemon"
+    );
+}
+
+#[tokio::test]
+async fn a_placeholder_cli_is_never_marked_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    // Installs a `codex` that fails like an unfinished install-script placeholder.
+    let npm = fake_npm(
+        temp.path(),
+        "mkdir -p \"$prefix/node_modules/.bin\"; printf '#!/bin/sh\\necho placeholder >&2\\nexit 1\\n' > \"$prefix/node_modules/.bin/codex\"; chmod 755 \"$prefix/node_modules/.bin/codex\"; exit 0",
+    );
+    let pin = bundled("0.160.1");
+    let error = ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("not runnable") && error.contains("placeholder"),
+        "{error}"
+    );
+    assert!(existing(&root, InstalledCli::Codex, &pin).is_none());
+    assert!(!version_dir(&root, &pin).exists());
+}
+
+#[tokio::test]
+async fn a_copy_another_daemon_completed_meanwhile_is_adopted() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let pin = bundled("0.160.1");
+    let destination = version_dir(&root, &pin);
+    // While this install runs, "another daemon" finishes the same version.
+    let npm = fake_npm(
+        temp.path(),
+        &format!(
+            "d='{dest}'; mkdir -p \"$d/node_modules/.bin\"; printf '#!/bin/sh\\necho \"codex-cli 0.160.1\"\\n' > \"$d/node_modules/.bin/codex\"; chmod 755 \"$d/node_modules/.bin/codex\"; printf '@openai/codex@0.160.1' > \"$d/{READY}\"; echo other > \"$d/owner\"",
+            dest = destination.display()
+        ),
+    );
+    let runtime = ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
         .await
         .unwrap();
-    assert!(!version_dir(&root, &old).exists());
-    assert!(!abandoned.exists());
-    assert!(existing(&root, InstalledCli::Codex, &new).is_some());
+    assert!(runtime.path().starts_with(&destination));
+    assert!(
+        destination.join("owner").exists(),
+        "the finished copy is kept, not replaced"
+    );
 }
 
 #[test]

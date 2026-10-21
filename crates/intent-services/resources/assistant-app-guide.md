@@ -531,8 +531,9 @@ owner sees a warning that Intent is using its bundled CLI (older apps show
 it. For Codex, **Update** runs `codex update` in a terminal on the daemon host;
 follow its output until it finishes. If the button is missing or the command
 fails, update the CLI with the tool that installed it. If the bundled download
-fails (for example, offline or without npm), launches report the installed
-version, the required minimum, and the download error.
+fails (for example, offline or without npm), Codex launches report the
+installed version, the required minimum, and the download error; Claude Code
+keeps using the installed CLI.
 
 ## Missed display updates
 
