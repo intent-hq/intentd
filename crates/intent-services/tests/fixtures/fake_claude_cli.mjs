@@ -25,7 +25,9 @@ if (argv.length > 0 && !argv[0].startsWith("--")) {
   process.exit(0);
 }
 if (argv.includes("--version")) {
-  process.stdout.write("0.0.0 (Claude Code)\n");
+  // Replaced on write with intent_providers::test_support::current_cli_version,
+  // so the launch never treats this stand-in as too old.
+  process.stdout.write("@CURRENT_CLI_VERSION@\n");
   process.exit(0);
 }
 

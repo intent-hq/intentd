@@ -9,7 +9,9 @@ description = "Provider registry, launch arg/env assembly, model-tier and capabi
 
 [features]
 # Shared Codex/Claude CLI test fixtures (`test_support`). Enable only from
-# `[dev-dependencies]`; daemon and packaging builds leave it disabled.
+# `[dev-dependencies]`: Cargo then turns it on for builds that also compile
+# test targets (`cargo test`, `--all-targets`), never for release/packaging
+# builds of the daemon.
 test-support = []
 
 [dependencies]

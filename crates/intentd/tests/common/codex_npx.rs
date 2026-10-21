@@ -10,11 +10,8 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
     let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
     let bin = data_dir.join("codex-toolchain");
     std::fs::create_dir_all(&bin).expect("create fake toolchain");
-    let codex = format!(
-        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{}'\n",
-        intent_providers::test_support::current_cli_version(
-            intent_providers::installed_cli::InstalledCli::Codex
-        )
+    let codex = intent_providers::test_support::current_cli_script(
+        intent_providers::installed_cli::InstalledCli::Codex,
     );
     for (name, body) in [
         ("codex", codex.as_str()),

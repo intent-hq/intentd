@@ -12,9 +12,9 @@ fn current(cli: InstalledCli) -> String {
     intent_providers::test_support::current_cli_version(cli)
 }
 
-/// A fake `cli` that prints its current version and nothing else.
+/// A fake `cli` that answers only `--version`, with its current version.
 fn current_script(cli: InstalledCli) -> String {
-    format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", current(cli))
+    intent_providers::test_support::current_cli_script(cli)
 }
 
 fn fixture(cli: InstalledCli, body: &str) -> (tempfile::TempDir, InstalledContext) {
@@ -432,27 +432,34 @@ pub(crate) fn context_in(cli: InstalledCli, root: &Path) -> InstalledContext {
 
 /// The shared ordinary fixtures must stay current as adapter bumps raise the
 /// CLI minimum (intent-hq/intentd#2567): a stale one would make unrelated
-/// tests select a bundled copy or fail the launch gate.
+/// tests select a bundled copy or fail the launch gate. Each fixture is
+/// launched through the production selection, which judges its version
+/// against the adapter requirement independently of the helper.
 #[tokio::test]
 async fn ordinary_cli_fixtures_report_a_current_version() {
     for cli in [InstalledCli::Codex, InstalledCli::Claude] {
-        let provider = match cli {
-            InstalledCli::Codex => "codex",
-            InstalledCli::Claude => "claude-code",
-        };
-        let required = intent_providers::adapter_cli::requirement(provider).unwrap();
+        let required = intent_providers::adapter_cli::requirement(cli.provider_id()).unwrap();
         let root = tempfile::tempdir().unwrap();
-        let shared_env = root.path().join("shared-env");
-        std::fs::create_dir_all(&shared_env).unwrap();
-        let env_cli = shared_env.join(cli.command());
-        executable(&env_cli, &crate::test_support::installed_cli_script(cli));
-        let env_output = std::process::Command::new(&env_cli)
-            .arg("--version")
-            .output()
-            .unwrap();
-        assert!(env_output.status.success(), "{cli:?}");
-        let env_version = String::from_utf8(env_output.stdout).unwrap();
+        // `installed_cli_env` publishes its fake through PATH; resolve it there.
+        let from_env = {
+            let _path = crate::test_support::installed_cli_env(root.path(), cli);
+            let dirs: Vec<PathBuf> =
+                std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect();
+            cli.resolve_in_dirs(&dirs, false).unwrap()
+        };
+        assert!(from_env.path().starts_with(root.path()), "{from_env:?}");
+        let env_context = InstalledContext::from_inputs(
+            from_env,
+            &BTreeMap::new(),
+            BTreeMap::from([
+                (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+                ("PATH".into(), "/bin:/usr/bin".into()),
+            ]),
+            &intent_core::cli_env::CodexEnvNames::default(),
+        )
+        .unwrap();
         for (fixture, mut context) in [
+            ("installed_cli_env", env_context),
             (
                 "context_in",
                 context_in(cli, &root.path().join("context-in")),
@@ -467,7 +474,6 @@ async fn ordinary_cli_fixtures_report_a_current_version() {
                 Some(true),
                 "{fixture}: {version}"
             );
-            assert_eq!(version, env_version.trim(), "{fixture}");
             assert_eq!(
                 context.runtime, host,
                 "{fixture} must keep the installed CLI"
@@ -1703,11 +1709,7 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
 /// Seed a complete Intent-managed bundled CLI under `home` that reports
 /// `version`, so selection never runs npm or touches the developer's home.
 fn seed_bundled(home: &Path, cli: InstalledCli, version: &str) -> PathBuf {
-    let provider = match cli {
-        InstalledCli::Codex => "codex",
-        InstalledCli::Claude => "claude-code",
-    };
-    let bundled = intent_providers::adapter_cli::requirement(provider)
+    let bundled = intent_providers::adapter_cli::requirement(cli.provider_id())
         .unwrap()
         .bundled
         .unwrap();

@@ -4,9 +4,10 @@ pub(crate) mod provider_installed;
 mod scratch;
 pub(crate) use scratch::{test_tempdir, test_tempdir_in};
 
-/// Supply the canonical installed CLI required even by a mock ACP adapter.
-/// It reports a current version, so the launch never selects a bundled copy.
-/// Keep the guard alive with the fixture; it restores PATH under the test env lock.
+/// Supply the canonical installed CLI required even by a mock ACP adapter:
+/// [`intent_providers::test_support::current_cli_script`], so the launch
+/// never selects a bundled copy. Keep the guard alive with the fixture; it
+/// restores PATH under the test env lock.
 #[cfg(unix)]
 pub(crate) fn installed_cli_env(
     dir: &std::path::Path,
@@ -16,7 +17,11 @@ pub(crate) fn installed_cli_env(
     let bin = dir.join("installed-cli");
     std::fs::create_dir_all(&bin).unwrap();
     let path = bin.join(cli.command());
-    std::fs::write(&path, installed_cli_script(cli)).unwrap();
+    std::fs::write(
+        &path,
+        intent_providers::test_support::current_cli_script(cli),
+    )
+    .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(
@@ -24,16 +29,6 @@ pub(crate) fn installed_cli_env(
     ));
     let path = std::env::join_paths(paths).unwrap();
     crate::agent_manager::tests::EnvGuard::set_all(&[("PATH", path.to_str().unwrap())])
-}
-
-/// The [`installed_cli_env`] fake: answers exactly `--version` with the
-/// current version and refuses any other invocation.
-#[cfg(unix)]
-pub(crate) fn installed_cli_script(cli: intent_providers::installed_cli::InstalledCli) -> String {
-    format!(
-        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{}'\n",
-        intent_providers::test_support::current_cli_version(cli)
-    )
 }
 
 /// Mock ACP adapter for quick-action effort tests, with an exact request log.
