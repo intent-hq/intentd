@@ -839,19 +839,12 @@ async fn native_wire_saved_selection_historical_and_exact_root_incarnation() {
         ReviewSelectionOutcome, ReviewSelectionRequiredReason, SavedReviewSelection,
     };
     use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
-    let mut f = Fixture::new().await;
-    f.services
-        .store
-        .delete_workspace(&f.git.workspace.id)
-        .await
-        .unwrap();
-    f.git.workspace.repository_owner = Some("historical".into());
-    f.git.workspace.repository_name = Some("old".into());
-    f.services
-        .store
-        .insert_workspace(&f.git.workspace)
-        .await
-        .unwrap();
+    let f = Fixture::new().await;
+    crate::repository_admission_source_tests::fixtures::Fixture::seed_unresolved_history(
+        &f.services.store,
+        &f.git.workspace.id,
+    )
+    .await;
     f.git.git(
         &f.git.path,
         &["remote", "add", "origin", "https://github.com/team/one.git"],

@@ -813,6 +813,117 @@ async fn chief_agent_spawns_in_dedicated_cwd_over_wss() {
     let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
 }
 
+/// Assistant chats name themselves like workspace agents: a chief chat
+/// created over WSS with the desktop placeholder (`name: "New chat"`,
+/// `nameExplicitlySet: false`) receives the first-turn
+/// `ws.workspace.setAgentName` instruction exactly once, never a workspace
+/// title instruction, and an explicitly named chat receives neither.
+#[tokio::test]
+async fn assistant_chat_placeholder_receives_first_turn_naming_over_wss() {
+    let Some(script) = gate("WSS Assistant chat naming E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let prompt_log = data_dir.join("assistant-naming-prompts.jsonl");
+    let prompt_log_str = prompt_log.to_string_lossy().into_owned();
+    let behavior = json!({ "response": "done" }).to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", &prompt_log_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let mut rpc = connect_ws(port, client_config(&fingerprint)).await;
+
+    let prompt_for = |content: &str| -> String {
+        let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|prompt| prompt["text"].as_str().map(str::to_string))
+            .find(|text| text.contains(content))
+            .unwrap_or_else(|| panic!("prompt for {content:?} never reached the provider"))
+    };
+
+    for (case, create, expect_nudge) in [
+        (
+            "placeholder",
+            json!({
+                "workspaceId": CHIEF_WORKSPACE_ID, "name": "New chat",
+                "nameExplicitlySet": false, "model": "default", "provider": "mock",
+            }),
+            true,
+        ),
+        (
+            "explicit",
+            json!({
+                "workspaceId": CHIEF_WORKSPACE_ID, "name": "Quarterly planning",
+                "model": "default", "provider": "mock",
+            }),
+            false,
+        ),
+    ] {
+        let created = wss_rpc_envelope(&mut rpc, 2, "agent.create", create).await;
+        assert!(
+            created.get("error").is_none(),
+            "agent.create {case}: {created}"
+        );
+        let agent_id = created["result"]["agent"]["id"]
+            .as_str()
+            .expect("agent id")
+            .to_string();
+        for turn in 1..=2usize {
+            let content = format!("Assistant naming {case} turn {turn}");
+            let sent = wss_rpc_envelope(
+                &mut rpc,
+                3,
+                "agent.sendMessage",
+                json!({
+                    "workspaceId": CHIEF_WORKSPACE_ID, "agentId": agent_id, "content": content,
+                }),
+            )
+            .await;
+            assert_eq!(
+                sent["result"]["success"],
+                json!(true),
+                "sendMessage: {sent}"
+            );
+            poll_conversation(&mut rpc, 100, &agent_id, "assistant reply", |messages| {
+                let replies = messages
+                    .as_array()?
+                    .iter()
+                    .filter(|m| m["role"] == "assistant")
+                    .count();
+                (replies >= turn).then_some(())
+            })
+            .await;
+            let text = prompt_for(&content);
+            assert_eq!(
+                text.contains("This agent still has a generated name"),
+                expect_nudge && turn == 1,
+                "{case} turn {turn}: {text}"
+            );
+            assert!(
+                !text.contains("This workspace needs a title"),
+                "the Assistant workspace is never retitled: {text}"
+            );
+        }
+        let _ = wss_rpc_envelope(&mut rpc, 200, "agent.stop", json!({ "agentId": agent_id })).await;
+    }
+}
+
 /// WSS e2e coverage for chief workspace contract. Verifies:
 /// - workspace.list returns user workspaces (filters out __chief__)
 /// - agent.list returns agent metadata (queryable by ws.app.agents.list)

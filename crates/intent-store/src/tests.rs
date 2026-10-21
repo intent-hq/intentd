@@ -11159,10 +11159,8 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         let provenance: (String, Option<String>) = sqlx::query_as("SELECT target_provenance,target_provider FROM pr_monitor WHERE monitor_id='upgrade-pr'").fetch_one(store.read_pool()).await.unwrap();
         assert_eq!(provenance, ("unresolved".into(), None));
         let selection: (String, Option<String>, Option<String>) = sqlx::query_as("SELECT choice_mode,remote_name,historical_source FROM repository_selection_state WHERE workspace_id='upgrade-workspace' AND root_kind='primary'").fetch_one(store.read_pool()).await.unwrap();
-        assert_eq!(
-            selection,
-            ("unresolved".into(), None, Some("workspace-metadata".into()))
-        );
+        // 0146 backfilled metadata history; 0163 repairs it to never-saved.
+        assert_eq!(selection, ("never".into(), None, None));
         let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='credential' AND subject_id='upgrade-credential'").fetch_one(store.read_pool()).await.unwrap();
         assert_eq!(revision, 1);
         store.read_pool().close().await;
@@ -11376,4 +11374,184 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
     );
     replay().await;
     assert_eq!(read().await, first, "idempotent");
+}
+
+/// intent-hq/intent#7449: 0163 stops the lifecycle triggers from turning
+/// owner/name metadata into unresolved history and repairs the rows they (and
+/// the 0146 backfill) wrote, without touching saved choices, resets or imports.
+#[tokio::test]
+async fn never_saved_default_upgrade_repairs_only_metadata_history() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version <= 162)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql(r"
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) VALUES
+          ('meta','t','main','c','u','/meta','octo','project'),
+          ('remote','t','main','c','u','/remote','octo','project'),
+          ('auto','t','main','c','u','/auto','octo','project'),
+          ('reset','t','main','c','u','/reset','octo','project'),
+          ('import','t','main','c','u','/import','octo','project'),
+          ('plain','t','main','c','u','/plain',NULL,NULL),
+          ('recreated','t','main','c','u','/recreated','octo','project'),
+          ('saved-recreated','t','main','c','u','/saved','octo','project');
+        INSERT INTO workspace_git_root(id,workspace_id,path,source,repo_owner,repo_name,registered_commit_sha,created_at,updated_at) VALUES
+          ('meta-root','plain','/plain/sub','agent','octo','sub',NULL,'c','u'),
+          ('sha-root','plain','/plain/sha','agent',NULL,NULL,'abc123','c','u'),
+          ('remote-root','plain','/plain/remote','agent','octo','sub',NULL,'c','u');
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='remote',remote_name='upstream',historical_source=NULL,historical_record_id=NULL
+          WHERE workspace_id IN ('remote','saved-recreated') AND root_kind='primary' OR root_id='remote-root';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='automatic',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='auto';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='reset',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='reset';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='unresolved',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='import';
+        DELETE FROM workspace WHERE id IN ('recreated','saved-recreated');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) VALUES
+          ('recreated','t','main','c','u','/recreated','octo','project'),
+          ('saved-recreated','t','main','c','u','/saved','octo','project');
+    ").execute(&pool).await.unwrap();
+    let state = "SELECT workspace_id||'/'||root_id, json_array(root_incarnation,selection_revision,choice_incarnation,choice_mode,remote_name,historical_source,historical_record_id) FROM repository_selection_state ORDER BY 1";
+    let before: BTreeMap<String, String> = sqlx::query_as(state)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let modes = |rows: &BTreeMap<String, String>| {
+        rows.iter()
+            .map(|(k, v)| {
+                let v: serde_json::Value = serde_json::from_str(v).unwrap();
+                (k.clone(), v[3].as_str().unwrap().to_string())
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let unresolved_before: Vec<_> = modes(&before)
+        .into_iter()
+        .filter(|(_, m)| m == "unresolved")
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        unresolved_before,
+        [
+            "import/",
+            "meta/",
+            "plain/meta-root",
+            "plain/sha-root",
+            "recreated/"
+        ],
+        "0162 triggers mark metadata roots unresolved: {before:?}"
+    );
+    pool.close().await;
+
+    let repaired = ["meta/", "plain/meta-root", "plain/sha-root", "recreated/"];
+    let store = Store::open(&tmp.path).await.unwrap();
+    let after: BTreeMap<String, String> = sqlx::query_as(state)
+        .fetch_all(store.read_pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    for (key, old) in &before {
+        let new = &after[key];
+        if repaired.contains(&key.as_str()) {
+            let old: serde_json::Value = serde_json::from_str(old).unwrap();
+            let new: serde_json::Value = serde_json::from_str(new).unwrap();
+            assert_eq!(new[0], old[0], "{key}: incarnation unchanged");
+            assert_eq!(
+                new[1],
+                old[1].as_i64().unwrap() + 1,
+                "{key}: revision advances"
+            );
+            assert_eq!(
+                new[2], new[0],
+                "{key}: choice belongs to the current incarnation"
+            );
+            assert_eq!(
+                new.as_array().unwrap()[3..],
+                [
+                    serde_json::json!("never"),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null
+                ],
+                "{key}"
+            );
+        } else {
+            assert_eq!(new, old, "{key}: untouched");
+        }
+    }
+    for (workspace, expected) in [
+        ("meta", "never"),
+        ("recreated", "never"),
+        ("auto", "automatic"),
+        ("reset", "reset"),
+        ("import", "unresolved-historical"),
+        ("saved-recreated", "unresolved-historical"),
+        ("remote", "explicit-remote"),
+    ] {
+        let root = intent_core::RepositoryRootId {
+            workspace_id: WorkspaceId::from(workspace),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let got = match store
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap()
+            .selection()
+            .unwrap()
+        {
+            crate::RepositoryStoredSelection::NeverSaved => "never".to_string(),
+            crate::RepositoryStoredSelection::Reset => "reset".to_string(),
+            crate::RepositoryStoredSelection::Saved(saved) => serde_json::to_value(saved).unwrap()
+                ["mode"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        };
+        assert_eq!(got, expected, "{workspace}");
+    }
+
+    // The repair is the only top-level (unindented) statement updating the
+    // table; trigger bodies are indented.
+    let sql = &crate::MIGRATOR
+        .iter()
+        .find(|m| m.version == 163)
+        .expect("migration 0163 present")
+        .sql;
+    let top_level: Vec<&str> = sql
+        .match_indices("\nUPDATE repository_selection_state")
+        .map(|(at, _)| {
+            let rest = &sql[at + 1..];
+            &rest[..=rest.find(';').expect("terminated repair statement")]
+        })
+        .collect();
+    assert_eq!(top_level.len(), 1, "{top_level:?}");
+    let repair = top_level[0];
+    assert!(
+        repair.contains("WHERE choice_mode='unresolved' AND historical_source IS NOT NULL;"),
+        "{repair}"
+    );
+    let replay = sqlx::raw_sql(repair)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(replay.rows_affected(), 0, "replaying the repair is a no-op");
+    store.read_pool().close().await;
+    store.write_pool().close().await;
 }

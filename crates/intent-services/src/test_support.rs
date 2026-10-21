@@ -49,50 +49,8 @@ pub(crate) fn quick_action_effort_adapter(
     (dir, bin, log, env)
 }
 
-/// Bound fixture I/O without shortening normal runs under coverage settings.
+/// Bound fixture I/O without shortening normal runs under coverage settings
+/// (delegates to [`intentd_test_support::test_timeout`]).
 pub(crate) fn fixture_timeout(base: std::time::Duration) -> std::time::Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER").ok();
-    scaled_fixture_timeout(base, multiplier.as_deref())
-}
-
-fn scaled_fixture_timeout(
-    base: std::time::Duration,
-    multiplier: Option<&str>,
-) -> std::time::Duration {
-    let multiplier = multiplier
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(1.0);
-    // Coverage exports 3; keep malformed or extreme settings from shortening
-    // the ordinary wait or turning a fixture hang into an unbounded wait.
-    base.mul_f64(multiplier.clamp(1.0, 20.0))
-}
-
-#[test]
-fn fixture_timeout_honors_coverage_without_shortening_normal_runs() {
-    use std::time::Duration;
-    const WAIT: Duration = Duration::from_secs(15);
-    assert_eq!(scaled_fixture_timeout(WAIT, Some("3")), WAIT * 3);
-    assert_eq!(
-        scaled_fixture_timeout(WAIT, Some("1.5")),
-        Duration::from_millis(22_500)
-    );
-    assert_eq!(
-        scaled_fixture_timeout(WAIT, Some("1e300")),
-        Duration::from_secs(300)
-    );
-    assert_eq!(
-        scaled_fixture_timeout(Duration::from_secs(1), Some("3")),
-        Duration::from_secs(3)
-    );
-    for multiplier in [
-        None,
-        Some("0"),
-        Some("-1"),
-        Some("invalid"),
-        Some("NaN"),
-        Some("inf"),
-    ] {
-        assert_eq!(scaled_fixture_timeout(WAIT, multiplier), WAIT);
-    }
+    intentd_test_support::test_timeout(base)
 }

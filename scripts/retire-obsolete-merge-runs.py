@@ -314,6 +314,8 @@ def activity(client, ctx, candidate):
             require(isinstance(node['id'], str) and node['id'] not in node_ids, 'invalid/duplicate queue entry')
             node_ids.add(node['id'])
             require(node['state'] in QUEUE_STATES and node['pullRequest']['baseRefName'] == 'main', 'unknown queue state/target')
+            if node['headCommit'] is None and node['state'] == 'QUEUED':
+                continue  # not yet built: no merge-group commit exists, so no run SHA to protect
             require(node['headCommit'] is not None and sha(node['headCommit']['oid']), 'unknown candidate activity')
             if node['headCommit']['oid'] == candidate:
                 raise Skip('current queue head protects SHA')

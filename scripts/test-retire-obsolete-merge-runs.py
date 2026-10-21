@@ -219,11 +219,21 @@ class Scenarios:
         self.assertEqual(self.api.mutations, self.expected(), result)
 
     def test_unknown_or_current_queue_head_and_later_page(self):
-        for head in (None, S):
-            self.api.heads = [head]
-            self.assert_skips()
+        self.api.heads = [S]
+        self.assert_skips()
+        for state in sorted(P.QUEUE_STATES - {'QUEUED'}):
+            page = self.api.queue_body([None])
+            page['data']['repository']['mergeQueue']['entries']['nodes'][0]['state'] = state
+            self.api.queue_pages = [page]
+            with self.subTest(state=state): self.assert_skips()
         self.api.queue_pages = [self.api.queue_body([], True, '1'), self.api.queue_body([S])]
         self.assert_skips()
+
+    def test_unbuilt_queued_entry_without_head_does_not_block(self):
+        # GitHub builds only maximumEntriesToBuild entries; later QUEUED entries report headCommit null.
+        self.api.heads = [H, None]
+        result = self.scan()
+        self.assertEqual(self.api.mutations, self.expected(), result)
 
     def test_partial_graphql_and_incomplete_cursor_fail_closed(self):
         for change in ('error', 'cursor', 'unknown-state', 'wrong-repo', 'other-base'):
