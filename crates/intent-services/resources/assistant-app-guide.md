@@ -278,6 +278,17 @@ PR and its latest status. Required checks that are still running or failing can
 block merging. If monitoring is paused or information is unavailable, wait for a
 fresh status before treating the PR as ready.
 
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/intentd/crates/intent-services/src/agent_workers.rs; packages/intentd/crates/intent-core/src/settings_file.rs (agents.idleReapMinutes); messages/en.json. -->
+
+When a Claude Code agent starts a command in the background (for example a dev
+server), its conversation's subscriptions card lists it as **Running**. Expand the
+row to see the task type and start time. Choose **Stop** in the row's
+**…** menu to end that command without interrupting the agent; the row disappears
+once the agent reports it stopped. A row that ends on its own disappears too.
+**Connection lost** means the agent's process ended (Intent closes an agent that
+has been idle for about 10 minutes, which also ends its background commands), so the
+command is probably no longer running. Other providers, including Codex, do not report background commands yet.
+
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
 
 Images sent to agents may be resized or re-encoded for provider delivery; original
