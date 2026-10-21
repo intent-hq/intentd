@@ -997,7 +997,7 @@ async fn a_cut_short_group_delivery_is_not_appended_again_after_the_continuation
             &json!([
                 { "type": "text", "text": "working on both" },
                 {
-                    "type": "tool_use", "id": "m:0", "name": "Bash",
+                    "type": "tool_use", "id": "m-0", "name": "Bash",
                     "input": { "command": "make migrate" }, "toolCallId": "call-1",
                     "metadata": { "toolKind": "execute", "status": "completed" },
                 },

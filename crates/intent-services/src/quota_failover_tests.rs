@@ -251,7 +251,7 @@ fn message(role: &str, content: serde_json::Value) -> intent_core::AgentMessage 
 
 fn tool_use(call_id: &str, name: &str, command: &str, status: &str) -> serde_json::Value {
     serde_json::json!({
-        "type": "tool_use", "id": format!("m:{call_id}"), "name": name,
+        "type": "tool_use", "id": format!("m-{call_id}"), "name": name,
         "input": { "command": command }, "toolCallId": call_id,
         "metadata": { "toolKind": "execute", "status": status },
     })
@@ -273,7 +273,7 @@ fn the_cut_short_turn_lists_every_tool_call() {
             serde_json::json!([
                 { "type": "text", "text": "Starting." },
                 tool_use("c1", "Bash", "pg_dump prod", "completed"),
-                { "type": "tool_result", "id": "m:r1", "tool_use_id": "c1", "output": "dumped", "is_error": false },
+                { "type": "tool_result", "id": "m-r1", "tool_use_id": "c1", "output": "dumped", "is_error": false },
                 tool_use("c2", "Bash", "rm -rf build-cache", "completed"),
                 tool_use("c3", "Edit", "schema.sql", "in_progress"),
             ]),
@@ -339,7 +339,7 @@ fn an_oversized_cut_short_turn_keeps_the_request_and_every_tool_call() {
             serde_json::json!([
                 { "type": "text", "text": format!("PARTIAL-START {}", "p".repeat(30_000)) },
                 tool_use("c1", "Bash", "deploy --prod", "completed"),
-                { "type": "tool_result", "id": "m:r1", "tool_use_id": "c1", "output": "o".repeat(30_000), "is_error": false },
+                { "type": "tool_result", "id": "m-r1", "tool_use_id": "c1", "output": "o".repeat(30_000), "is_error": false },
                 tool_use("c2", "Write", "config.yaml", "completed"),
             ]),
         ),
@@ -407,4 +407,48 @@ fn a_cut_short_turn_within_budget_keeps_older_history() {
     let turn = out.find("<current_turn_cut_short>").expect("turn section");
     assert!(old < turn, "history comes first");
     assert!(!out.contains("partial work truncated"), "{out}");
+}
+
+/// The compact budget is spent on the escaped UTF-8 bytes actually emitted:
+/// a partial response dominated by characters that expand when escaped
+/// (`"` → `&quot;`, `&`, `<`) and multi-byte characters still fits the byte
+/// budget, with the request and tool identities intact (review
+/// intentd#2581).
+#[test]
+fn an_escape_heavy_partial_response_stays_within_the_byte_budget() {
+    let budget = 20_000;
+    let current = [
+        message(
+            "user",
+            serde_json::json!([{ "type": "text", "text": "quote everything" }]),
+        ),
+        message(
+            "assistant",
+            serde_json::json!([
+                { "type": "text", "text": format!("ESCAPES {}", "\"&<é—".repeat(40_000)) },
+                tool_use("c1", "Bash", "echo \"done\" && exit", "completed"),
+                tool_use("c2", "Write", "notes.md", "in_progress"),
+            ]),
+        ),
+    ];
+    let out = crate::history_xml::format_cut_short_turn(&[], &current, budget, 2_000);
+    assert!(
+        out.len() <= budget,
+        "escaped output {} bytes > budget {budget}",
+        out.len()
+    );
+    assert!(
+        out.contains("<text>quote everything</text>"),
+        "request intact"
+    );
+    assert!(
+        out.contains("name=\"Bash\"") && out.contains("name=\"Write\""),
+        "tool identities"
+    );
+    assert!(out.contains("tool_call_id=\"c1\"") && out.contains("tool_call_id=\"c2\""));
+    assert!(out.contains("partial work truncated"), "explicit marker");
+    assert!(
+        out.contains("ESCAPES"),
+        "the start of the partial text is kept"
+    );
 }

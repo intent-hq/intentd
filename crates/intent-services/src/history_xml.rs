@@ -447,6 +447,11 @@ pub(crate) fn format_history_as_xml(
 /// listing of a cut-short turn's tool calls.
 const CUT_SHORT_TOOL_ARGS_SUMMARY_CHARS: usize = 200;
 
+/// Bytes reserved in the compact budget for the truncation marker, whose
+/// omitted-character count can grow by a few digits between the probe
+/// render and the real one.
+const MARKER_DIGITS_SLACK: usize = 24;
+
 /// One tool call of a cut-short turn: its `tool_use` block and, when the
 /// call completed with a recorded output, its `tool_result` block.
 struct CutShortToolCall<'a> {
@@ -497,7 +502,7 @@ pub(crate) fn format_cut_short_turn(
             Some(0),
         ))
         .len();
-        let text_budget = max_chars.saturating_sub(compact_overhead);
+        let text_budget = max_chars.saturating_sub(compact_overhead + MARKER_DIGITS_SLACK);
         turn = wrap(&render_cut_short_partial(
             &items,
             tool_content_chars,
@@ -608,7 +613,9 @@ fn cut_short_partial_items(current: &[AgentMessage]) -> Vec<PartialItem<'_>> {
 /// (tool inputs/outputs middle-truncated to `tool_content_chars`);
 /// `Some(n)` is the compact over-budget form: every tool call listed with
 /// its name, status and an argument summary (no outputs), and at most `n`
-/// characters of text kept, behind an explicit truncation marker.
+/// bytes of rendered text lines — measured on the escaped UTF-8 output,
+/// element tags included, cut at a character boundary — behind an explicit
+/// truncation marker.
 fn render_cut_short_partial(
     items: &[PartialItem<'_>],
     tool_content_chars: usize,
@@ -620,17 +627,31 @@ fn render_cut_short_partial(
     for item in items {
         match item {
             PartialItem::Text(tag, text) => {
-                let kept = match text_left.as_mut() {
-                    None => text.clone(),
-                    Some(left) => {
-                        let take = text.chars().count().min(*left);
-                        *left -= take;
-                        text_omitted += text.chars().count() - take;
-                        text.chars().take(take).collect()
-                    }
+                let Some(left) = text_left.as_mut() else {
+                    let _ = writeln!(xml, "    <{tag}>{}</{tag}>", escape_xml(text));
+                    continue;
                 };
-                if !kept.is_empty() {
-                    let _ = writeln!(xml, "    <{tag}>{}</{tag}>", escape_xml(&kept));
+                // The line costs its tags plus each character's escaped
+                // UTF-8 bytes (`"` → `&quot;` is 6 bytes, `é` is 2).
+                let tags = format!("    <{tag}></{tag}>\n").len();
+                let mut escaped = String::new();
+                let mut kept_chars = 0usize;
+                if *left > tags {
+                    let room = *left - tags;
+                    let mut piece = [0u8; 4];
+                    for ch in text.chars() {
+                        let one = escape_xml(ch.encode_utf8(&mut piece));
+                        if escaped.len() + one.len() > room {
+                            break;
+                        }
+                        escaped.push_str(&one);
+                        kept_chars += 1;
+                    }
+                }
+                text_omitted += text.chars().count() - kept_chars;
+                if kept_chars > 0 {
+                    *left -= tags + escaped.len();
+                    let _ = writeln!(xml, "    <{tag}>{escaped}</{tag}>");
                 }
             }
             PartialItem::Tool(tool) => {
