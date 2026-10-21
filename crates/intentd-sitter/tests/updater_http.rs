@@ -1009,6 +1009,7 @@ fn serve_endpoint(behaviour: Endpoint) -> (String, RequestLog) {
                 let (head, body) = match behaviour {
                     Endpoint::NotFound => ("404 Not Found".to_string(), b"nope".to_vec()),
                     Endpoint::Slow => {
+                        // timing-guard: simulates a slow endpoint; the client times out long before this
                         thread::sleep(std::time::Duration::from_secs(5));
                         ("200 OK".to_string(), Vec::new())
                     }
