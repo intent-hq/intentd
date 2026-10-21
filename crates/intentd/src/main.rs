@@ -2617,10 +2617,11 @@ async fn cmd_serve_owned(
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
-    let git_status_refresher = Arc::new(GitStatusRefresher::start(
+    let git_status_refresher = Arc::new(GitStatusRefresher::start_with_presence(
         bus.clone(),
         api.clone(),
         services.git_status_cache(),
+        services.worktree_presence(),
     ));
     // Slow initializations run in the background so the listeners below bind —
     // and `system.status` answers — without waiting on them (monorepo#1581):

@@ -208,10 +208,13 @@ impl WatcherRegistry {
                         continue;
                     };
                     let path = PathBuf::from(root);
-                    if path.is_dir() {
+                    if ws.is_remote || ws.archived {
+                        if path.is_dir() {
+                            initial.push((ws.id, path));
+                        }
+                    } else if presence.observe_workspace(&ws, &path) {
                         initial.push((ws.id, path));
-                    } else if !ws.is_remote && !ws.archived {
-                        presence.record(&ws.id, &path, false);
+                    } else {
                         missing.insert(ws.id, path);
                     }
                 }
@@ -430,6 +433,7 @@ struct Probe {
 impl Probe {
     /// Record that `ws_id` is now watched at `path`.
     fn watching(&mut self, ws_id: &WorkspaceId, path: &Path) {
+        self.presence.learn(ws_id, path);
         self.missing.remove(ws_id);
         self.roots.insert(ws_id.clone(), path.to_path_buf());
     }
@@ -454,6 +458,9 @@ async fn track_missing_root(ev: &Event, services: &dyn WorkspaceApi, probe: &mut
     };
     if ws.is_remote || ws.archived {
         return false;
+    }
+    if ws.checkout_mode.is_some() {
+        probe.presence.mark_git(&ws.id);
     }
     probe.roots.remove(&ev.workspace_id);
     probe.presence.record(&ev.workspace_id, &path, false);
@@ -636,6 +643,13 @@ async fn lifecycle_loop(
                                 &ws_id,
                                 "checkout missing",
                             );
+                            // Same teardown as the probe: a watched checkout
+                            // that vanished before the next tick must not
+                            // keep its skills/specialists subscriptions, and
+                            // `track_missing_root` already dropped it from the
+                            // probe's watched roots.
+                            skills.pause_workspace(&ws_id);
+                            specialists.pause_workspace(&ws_id);
                             continue;
                         }
                         tracing::debug!(workspace = %ws_id, "lifecycle event without resolvable path; not watching");
@@ -2382,5 +2396,74 @@ mod tests {
         // Several probe ticks pass; the deleted workspace stays unwatched.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(registry.root_registration_state(&root), "unwatched");
+    }
+
+    /// Review regression (intentd#2574): a watched checkout that vanishes and
+    /// then receives `workspace:opened` before the next probe tick must drop
+    /// its skills and specialists project-tier subscriptions too, not only
+    /// the file and Git watchers. A `.intent/specialists` tier exists so the
+    /// specialists watcher has a live project tier to hold.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn opened_after_checkout_vanished_releases_skills_and_specialists() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let parent = TempDir::new("opened-vanished");
+        let root = parent.path.join("checkout");
+        let specialists_dir = root.join(".intent").join("specialists");
+        std::fs::create_dir_all(&specialists_dir).expect("create specialists dir");
+        let ws = test_workspace("ws-opened-vanished", &root);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let presence = WorktreePresence::default();
+        // A probe interval far beyond the test so only the event path acts.
+        let registry =
+            start_registry_with_probe(&bus, api, presence.clone(), Duration::from_secs(3600)).await;
+        wait_for_root(&registry, &root, true).await;
+
+        std::fs::rename(&root, parent.path.join("away")).expect("move checkout away");
+        bus.publish(&lifecycle_event(WORKSPACE_OPENED, &ws, false))
+            .await
+            .expect("publish opened");
+        wait_for_presence(&presence, &ws.id, true).await;
+        // The skills and specialists tier watches subscribe to the workspace
+        // root itself, so the root only becomes unwatched once they are
+        // paused too, not just the file and Git watchers.
+        wait_for_root(&registry, &root, false).await;
+    }
+
+    /// intent-hq/intent#7183: a Git checkout at a mountpoint leaves an empty
+    /// directory behind when the volume unmounts. The probe must treat that
+    /// empty directory as missing (no `.git` entry) and recover once the
+    /// checkout is back.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn empty_mountpoint_for_git_checkout_counts_as_missing() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let parent = TempDir::new("mountpoint");
+        let root = parent.path.join("checkout");
+        let away = parent.path.join("unmounted");
+        git2::Repository::init(&root).expect("init repo");
+        let ws = test_workspace("ws-mountpoint", &root);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::new(vec![ws.clone()]));
+        let presence = WorktreePresence::default();
+        let registry =
+            start_registry_with_probe(&bus, api, presence.clone(), Duration::from_millis(200))
+                .await;
+        wait_for_root(&registry, &root, true).await;
+
+        std::fs::rename(&root, &away).expect("unmount");
+        std::fs::create_dir_all(&root).expect("empty mountpoint");
+        wait_for_presence(&presence, &ws.id, true).await;
+
+        std::fs::remove_dir(&root).expect("remove mountpoint");
+        std::fs::rename(&away, &root).expect("remount");
+        wait_for_presence(&presence, &ws.id, false).await;
+        wait_for_root(&registry, &root, true).await;
+        confirm_watch_live(&mut sub, &ws.id, &root).await;
     }
 }

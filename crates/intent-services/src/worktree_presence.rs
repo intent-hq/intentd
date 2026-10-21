@@ -12,6 +12,13 @@
 //! tracked-changes sweep, and the watcher registry's presence probe) gate
 //! their worktree work on [`WorktreePresence::observe`].
 //!
+//! A checkout that sits exactly at a mountpoint stays behind as an empty
+//! directory when its volume unmounts, so "is a directory" alone would report
+//! it present forever. A workspace known to be a Git checkout — its row
+//! carries a `checkoutMode`, or this process has seen a `.git` entry (dir or
+//! gitfile) at its root — is therefore present only while that `.git` entry
+//! exists. Plain non-Git workspaces only need the directory.
+//!
 //! The map is derived and never persisted. A daemon restart starts with
 //! every workspace presumed present, and a remounted volume recovers on the
 //! next observation.
@@ -21,7 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use intent_core::WorkspaceId;
+use std::collections::HashSet;
+
+use intent_core::{Workspace, WorkspaceId};
 
 /// One workspace last observed with a missing checkout.
 #[derive(Debug, Clone)]
@@ -35,6 +44,8 @@ struct Missing {
 #[derive(Debug, Clone, Default)]
 pub struct WorktreePresence {
     missing: Arc<Mutex<HashMap<WorkspaceId, Missing>>>,
+    /// Workspaces known to be Git checkouts (see the module docs).
+    git: Arc<Mutex<HashSet<WorkspaceId>>>,
 }
 
 /// Whether `path` is an existing directory. A cheap `stat`; a symlink to a
@@ -51,9 +62,52 @@ impl WorktreePresence {
     /// `info!` on missing → present, and `debug!` otherwise.
     #[must_use]
     pub fn observe(&self, workspace_id: &WorkspaceId, path: &Path) -> bool {
-        let present = checkout_dir_exists(path);
+        let present = self.available(workspace_id, path);
         self.record(workspace_id, path, present);
         present
+    }
+
+    /// [`Self::observe`] for a workspace row: a row with a `checkoutMode` is
+    /// a daemon-provisioned Git checkout, so its `.git` entry is required.
+    #[must_use]
+    pub fn observe_workspace(&self, ws: &Workspace, path: &Path) -> bool {
+        if ws.checkout_mode.is_some() {
+            self.mark_git(&ws.id);
+        }
+        self.observe(&ws.id, path)
+    }
+
+    /// Remember that `workspace_id` is a Git checkout.
+    pub fn mark_git(&self, workspace_id: &WorkspaceId) {
+        self.git
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(workspace_id.clone());
+    }
+
+    /// Learn from a present root without recording a transition: a root
+    /// with a `.git` entry marks the workspace as a Git checkout.
+    pub fn learn(&self, workspace_id: &WorkspaceId, path: &Path) {
+        if path.join(".git").exists() {
+            self.mark_git(workspace_id);
+        }
+    }
+
+    /// Whether the checkout at `path` is usable: the directory exists and,
+    /// for a known Git checkout, so does its `.git` entry.
+    fn available(&self, workspace_id: &WorkspaceId, path: &Path) -> bool {
+        if !checkout_dir_exists(path) {
+            return false;
+        }
+        if path.join(".git").exists() {
+            self.mark_git(workspace_id);
+            return true;
+        }
+        !self
+            .git
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(workspace_id)
     }
 
     /// Record an already-made observation (see [`Self::observe`]). Split out
@@ -115,6 +169,10 @@ impl WorktreePresence {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(workspace_id);
+        self.git
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(workspace_id);
     }
 }
 
@@ -157,5 +215,50 @@ mod tests {
             "a regular file is not a checkout"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A Git checkout at a mountpoint leaves an empty directory behind when
+    /// the volume unmounts: once the workspace is known to be a Git checkout,
+    /// that empty directory counts as missing, and the restored checkout
+    /// recovers. A plain non-Git folder only needs the directory.
+    #[test]
+    fn known_git_checkout_without_git_entry_is_missing() {
+        let presence = WorktreePresence::default();
+        let base = std::env::temp_dir().join(format!("intent-7183-mnt-{}", uuid::Uuid::new_v4()));
+        let mount = base.join("checkout");
+        let away = base.join("unmounted");
+        std::fs::create_dir_all(mount.join(".git")).expect("mkdir .git");
+        let id = WorkspaceId::from("ws-mnt");
+        assert!(presence.observe(&id, &mount));
+
+        std::fs::rename(&mount, &away).expect("unmount");
+        std::fs::create_dir_all(&mount).expect("empty mountpoint");
+        assert!(
+            !presence.observe(&id, &mount),
+            "empty mountpoint must be missing"
+        );
+        assert!(presence.is_missing(&id));
+
+        std::fs::remove_dir(&mount).expect("rm mountpoint");
+        std::fs::rename(&away, &mount).expect("remount");
+        assert!(presence.observe(&id, &mount));
+        assert!(!presence.is_missing(&id));
+
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).expect("mkdir plain");
+        let plain_id = WorkspaceId::from("ws-plain");
+        assert!(
+            presence.observe(&plain_id, &plain),
+            "non-Git folder is present"
+        );
+
+        let mut row = intent_core::chief_workspace();
+        row.id = WorkspaceId::from("ws-row");
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        assert!(
+            !presence.observe_workspace(&row, &plain),
+            "a provisioned checkout without .git is missing even on first sight"
+        );
+        std::fs::remove_dir_all(&base).expect("cleanup");
     }
 }

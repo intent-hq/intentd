@@ -86,7 +86,7 @@ impl Services {
         };
         // Missing checkout (intent-hq/intent#7183): nothing to scan, and the
         // shared presence map owns the one transition warning.
-        if !self.worktree_presence.observe(workspace_id, &worktree) {
+        if !self.worktree_presence.observe_workspace(&ws, &worktree) {
             return Ok(PruneOutcome::default());
         }
         let sandboxed: HashSet<String> = self

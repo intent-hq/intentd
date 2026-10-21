@@ -285,6 +285,9 @@ impl Services {
         // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
             Ok(ws) => {
+                if ws.checkout_mode.is_some() {
+                    self.worktree_presence.mark_git(&ws.id);
+                }
                 if let Some(p) = ws.effective_path().map(PathBuf::from) {
                     p
                 } else {
