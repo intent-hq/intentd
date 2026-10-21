@@ -468,6 +468,23 @@ async fn track_missing_root(ev: &Event, services: &dyn WorkspaceApi, probe: &mut
     true
 }
 
+/// Whether a runtime registration's existing root is a usable checkout
+/// (intent-hq/intent#7183). The row decides it: a provisioned checkout
+/// (`checkoutMode`) needs its `.git` entry even if this process never saw
+/// it, so an empty mountpoint left by an unmounted volume is not accepted.
+/// Rows that cannot be read, and remote rows, keep the plain directory check.
+async fn runtime_root_available(
+    ev: &Event,
+    services: &dyn WorkspaceApi,
+    presence: &WorktreePresence,
+    path: &Path,
+) -> bool {
+    match services.get_workspace(ev.workspace_id.clone()).await {
+        Ok(ws) if !ws.is_remote => presence.observe_workspace(&ws, path),
+        _ => true,
+    }
+}
+
 /// Follow workspace lifecycle events, registering/deregistering watch roots.
 #[expect(clippy::too_many_arguments)]
 async fn lifecycle_loop(
@@ -634,7 +651,21 @@ async fn lifecycle_loop(
                     specialists.add_workspace(ws_id, &p.path);
                 }
                 WORKSPACE_OPENED => {
-                    let Some(path) = resolve_path(&ev, services.as_ref()).await else {
+                    let path = match resolve_path(&ev, services.as_ref()).await {
+                        Some(p)
+                            if runtime_root_available(
+                                &ev,
+                                services.as_ref(),
+                                &probe.presence,
+                                &p,
+                            )
+                            .await =>
+                        {
+                            Some(p)
+                        }
+                        _ => None,
+                    };
+                    let Some(path) = path else {
                         if track_missing_root(&ev, services.as_ref(), &mut probe).await {
                             pending.remove(&ws_id);
                             stop_watches(
@@ -720,7 +751,21 @@ async fn lifecycle_loop(
                         tracing::debug!(workspace = %ws_id, "already watching; ignoring redundant unarchive delta");
                     }
                     Some(false) => {
-                        let Some(path) = resolve_path(&ev, services.as_ref()).await else {
+                        let path = match resolve_path(&ev, services.as_ref()).await {
+                            Some(p)
+                                if runtime_root_available(
+                                    &ev,
+                                    services.as_ref(),
+                                    &probe.presence,
+                                    &p,
+                                )
+                                .await =>
+                            {
+                                Some(p)
+                            }
+                            _ => None,
+                        };
+                        let Some(path) = path else {
                             if !track_missing_root(&ev, services.as_ref(), &mut probe).await {
                                 tracing::debug!(workspace = %ws_id, "unarchived workspace without resolvable path; not watching");
                             }
@@ -2465,5 +2510,72 @@ mod tests {
         wait_for_presence(&presence, &ws.id, false).await;
         wait_for_root(&registry, &root, true).await;
         confirm_watch_live(&mut sub, &ws.id, &root).await;
+    }
+
+    /// Verifier regression (intentd#2574): a provisioned Git checkout
+    /// (`checkoutMode`) registered at runtime — `workspace:opened` or
+    /// unarchive — whose folder is only an empty mountpoint must be tracked
+    /// as missing even with no prior in-process observation, and armed once
+    /// the checkout (its `.git` entry) is back.
+    async fn empty_mountpoint_at_runtime_registration(unarchive: bool) {
+        let (_db, bus, mut sub) = bus_and_sub().await;
+        let parent = TempDir::new(if unarchive { "rt-unarchive" } else { "rt-open" });
+        let root = parent.path.join("checkout");
+        std::fs::create_dir_all(&root).expect("empty mountpoint");
+        let mut ws = test_workspace(
+            if unarchive {
+                "ws-rt-unarchive"
+            } else {
+                "ws-rt-open"
+            },
+            &root,
+        );
+        ws.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        // Empty at boot: the registry has never observed this workspace.
+        let api = Arc::new(FakeApi::new(vec![]));
+        let presence = WorktreePresence::default();
+        let registry = start_registry_with_probe(
+            &bus,
+            Arc::clone(&api) as Arc<dyn WorkspaceApi>,
+            presence.clone(),
+            Duration::from_millis(200),
+        )
+        .await;
+        api.workspaces.lock().unwrap().push(ws.clone());
+        let ev = if unarchive {
+            archive_event(&ws, false)
+        } else {
+            lifecycle_event(WORKSPACE_OPENED, &ws, false)
+        };
+        bus.publish(&ev).await.expect("publish registration");
+        wait_for_presence(&presence, &ws.id, true).await;
+        // Several probe ticks: the empty directory stays missing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(presence.is_missing(&ws.id));
+        assert_eq!(registry.root_registration_state(&root), "unwatched");
+
+        // Remount: the checkout's `.git` entry is back.
+        git2::Repository::init(&root).expect("init repo");
+        wait_for_presence(&presence, &ws.id, false).await;
+        wait_for_root(&registry, &root, true).await;
+        confirm_watch_live(&mut sub, &ws.id, &root).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn opened_empty_mountpoint_for_provisioned_checkout_is_missing() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        empty_mountpoint_at_runtime_registration(false).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn unarchived_empty_mountpoint_for_provisioned_checkout_is_missing() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        empty_mountpoint_at_runtime_registration(true).await;
     }
 }
