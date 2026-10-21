@@ -106,7 +106,11 @@ pub async fn ensure(
     // Unit tests seed complete installs or call `ensure_in` with a fake npm;
     // they must never reach the registry through the host's npm.
     if cfg!(test) {
-        return Err(format!("unit tests do not install {}", bundled.spec()));
+        return Err(format!(
+            "unit tests do not install {}; a fake CLI that is not about old versions should \
+             print intent_providers::test_support::current_cli_version",
+            bundled.spec()
+        ));
     }
     let (npm, path) = blocking(|| {
         let npm = find_npm();
