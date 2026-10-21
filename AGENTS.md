@@ -230,13 +230,14 @@ make gate     # check, then test
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
 ```
 
-The raw equivalents in `packages/intentd` are `cargo fmt --check` and
-`cargo clippy --workspace --all-targets -- -D warnings`. Raw `cargo nextest` is not
-equivalent: it leaves the callback/transfer fixture variables the `make` targets
-prepare unset, so fixture tests in intent-acp/intent-services fail in bulk (95 bogus
-failures while fixing #2559) — run subsets with `make test-select`. Saved `ws.script` runs are
+The raw equivalents in `packages/intentd` are `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo nextest run --workspace --show-progress none` — except that raw nextest leaves
+the callback fixture the `make` targets set unset, so intent-acp/intent-services callback
+tests fail in bulk (95 bogus failures while fixing #2559); run those via `make test-select`
+(Linux x64 only, like the fixture). Saved `ws.script` runs are
 PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
-environment and `--show-progress none` on any nextest command (the `make`
+environment (all three) and `--show-progress none` on the nextest command (the `make`
 targets already set both) or progress-bar redraws flood the output buffer.
 Raw invocations must also run under the rustup-managed toolchain pinned in
 `rust-toolchain.toml` (`rustup run <pin> cargo ...` when a non-rustup cargo shadows

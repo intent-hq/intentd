@@ -235,12 +235,24 @@ impl tokio::io::AsyncWrite for PeerWriter {
     }
 }
 
-/// The frozen callback adapter, which only the monorepo gate runner prepares.
+/// The frozen da577fff callback adapter. Only the monorepo gate runner
+/// (`make test`, `make test-select`) sets the variable, from its verified
+/// offline cache; raw `cargo nextest` leaves it unset.
 fn callback_adapter_fixture() -> std::path::PathBuf {
-    std::fs::canonicalize(std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").expect(
-        "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: run these tests from the monorepo root with make test-select E='<nextest filterset>' (or make test), which prepare it; raw cargo nextest does not",
-    ))
-    .unwrap()
+    const HINT: &str = "run these tests with make test-select E='<nextest filterset>' (or make \
+        test), which set it from the verified offline cache; raw cargo nextest does not. Setup: \
+        the monorepo's CONTRIBUTING.md#linux-x64-callback-gates";
+    let value = std::env::var_os("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: {HINT}")
+        });
+    std::fs::canonicalize(&value).unwrap_or_else(|error| {
+        panic!(
+            "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE={} is not a usable fixture ({error}): {HINT}",
+            std::path::Path::new(&value).display()
+        )
+    })
 }
 
 struct NodePeer {
