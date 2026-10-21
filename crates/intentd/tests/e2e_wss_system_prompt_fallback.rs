@@ -272,6 +272,28 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
+/// Drain subscriber events until the post-turn `agent:status-changed`
+/// (`status: "idle"`) for `agent_id` arrives. Call after [`await_stream_end`]:
+/// the daemon emits `agent:stream:end` (then `agent:idle`) BEFORE `end_turn`
+/// persists `RuntimeIdle`, and publishes this event only after that write, so
+/// it is the signal that the stored session no longer reads as in flight.
+async fn await_durable_idle<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for _ in 0..120 {
+        let frame = wss_event(sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "agent:status-changed"
+            && ev["data"]["agentId"].as_str() == Some(agent_id)
+            && ev["data"]["status"] == "idle"
+        {
+            return;
+        }
+    }
+    panic!("no agent:status-changed(idle) for {agent_id}");
+}
+
 /// Parse the mock fixture's prompt log: one `{ turn, text }` JSON per line.
 fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
     let raw = std::fs::read_to_string(path).expect("read prompt log");
@@ -847,6 +869,12 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     let agent = created["agent"]["id"].as_str().unwrap().to_string();
     wss_rpc(&mut rpc, 3, "agent.sendMessage", json!({"workspaceId": chief, "agentId": agent, "content": "Where is the QR code for mobile?"})).await;
     await_stream_end(&mut sub, &agent).await;
+    // The SIGKILL below skips graceful shutdown, which is what normally
+    // finishes a post-turn idle write still in flight. Killing before that
+    // write lands leaves the session `active`, so the restarted daemon heals
+    // it as a crashed turn and auto-resumes it — the resume prompt then
+    // becomes the second prompt instead of the message sent below.
+    await_durable_idle(&mut sub, &agent).await;
     let before = wss_rpc(&mut rpc, 4, "agent.getSession", json!({"agentId": agent})).await;
     let system = before["session"]["systemPrompt"].as_str().unwrap();
     assert!(system.contains("## Assistant scope"));
@@ -880,6 +908,15 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     })).await;
     await_stream_end(&mut sub, &agent).await;
     let prompts = read_prompt_log(&prompt_log);
+    let resumed: Vec<_> = prompts
+        .iter()
+        .filter(|(_, text)| text.contains("due to a harness shutdown and restart"))
+        .map(|(turn, text)| (turn, text.lines().last()))
+        .collect();
+    assert!(
+        resumed.is_empty(),
+        "the restart healed the completed first turn as a crash and auto-resumed it: {resumed:?}"
+    );
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].1.contains("Bundled app reference (sha256:"));
     assert!(prompts[1]
