@@ -22,15 +22,12 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 const READY: &str = ".intent-bundled-ready";
 const STDERR_TAIL: usize = 600;
 
-/// `$HOME/.local/share/intent/providers/bundled-cli`, beside Intent's other
-/// managed provider runtimes.
+/// `<home>/.local/share/intent/providers/bundled-cli`, beside Intent's other
+/// managed provider runtimes. `home` is the launch environment's home.
 #[must_use]
-pub fn default_root() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .map(|home| home.join(".local/share/intent/providers/bundled-cli"))
+pub fn root_in(home: &Path) -> Option<PathBuf> {
+    home.is_absolute()
+        .then(|| home.join(".local/share/intent/providers/bundled-cli"))
 }
 
 /// The installation directory for one exact package version.
@@ -98,12 +95,17 @@ fn find_npm() -> Option<PathBuf> {
 /// # Errors
 /// Returns an actionable reason when npm is unavailable or the install fails.
 pub async fn ensure(
+    root: &Path,
     cli: InstalledCli,
     bundled: &BundledCli,
 ) -> Result<InstalledCliRuntime, String> {
-    let root = default_root().ok_or("cannot locate the home directory for Intent's bundled CLI")?;
-    if let Some(runtime) = existing(&root, cli, bundled) {
+    if let Some(runtime) = existing(root, cli, bundled) {
         return Ok(runtime);
+    }
+    // Unit tests seed complete installs or call `ensure_in` with a fake npm;
+    // they must never reach the registry through the host's npm.
+    if cfg!(test) {
+        return Err(format!("unit tests do not install {}", bundled.spec()));
     }
     let (npm, path) = tokio::task::spawn_blocking(|| {
         let npm = find_npm();
@@ -113,7 +115,7 @@ pub async fn ensure(
     .await
     .map_err(|_| "bundled CLI lookup task failed".to_owned())?;
     let npm = npm.ok_or("npm was not found next to npx on the execution host")?;
-    ensure_in(&root, &npm, &path, cli, bundled, INSTALL_TIMEOUT).await
+    ensure_in(root, &npm, &path, cli, bundled, INSTALL_TIMEOUT).await
 }
 
 /// [`ensure`] with an explicit root, npm and PATH (test seam).

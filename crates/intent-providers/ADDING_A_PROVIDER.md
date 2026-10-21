@@ -72,8 +72,16 @@ needs. Fields that matter most:
   resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
   adapter auto-discovery entirely; claude-code, codex, pi). Codex and Claude always
   use their reviewed adapter pins with the execution host's canonical `codex` / `claude`
-  executable, resolved from enhanced PATH. Both the installed CLI and npx are required;
-  there is no bundled-runtime fallback. Legacy `providers.paths.codex` and
+  executable, resolved from enhanced PATH. Both the installed CLI and npx are required.
+  When the installed CLI's version is confirmed below the adapter-derived minimum
+  (`adapter_cli`), launches substitute Intent's bundled copy: the exact
+  `bundled` package (Codex: the adapter-declared minimum; Claude: the pinned Agent SDK's
+  `claudeCodeVersion`, whose same-minor `.0` is the minimum), installed on first use
+  with the host's npm under `~/.local/share/intent/providers/bundled-cli`
+  (`crates/intent-services/src/bundled_cli.rs`). A missing or unknown-version CLI is
+  never replaced. Discovery reports `cliBundledVersion` and never installs. The
+  Claude `claudeCodeVersion` snapshot is kept in sync by `provider_cli_metadata.py` and
+  the auto-pin automation (`runtimePackage` / `runtimeVersionField`). Legacy `providers.paths.codex` and
   `providers.paths["claude-code"]` adapter overrides are ignored on all launch/catalog
   paths, with one warning per provider per daemon process. Remove those settings and
   install the canonical CLI on the execution host. `CODEX_PATH` and
@@ -253,10 +261,11 @@ certainly needs new normalization arms:
     expose native delegation even when both are false. The derived minimum
     gate excludes older parsers that reject `agents.enabled` with an
     `AgentRoleToml` error (intent-hq/intent#6982).
-    The launch boundary keeps `CODEX_PATH` on the exact installed CLI and
-    rejects a confirmed version below the minimum derived from the pinned
-    adapter's CLI declaration. This prevents older runtimes that drop the
-    feature policy on later turns from bypassing native-subagent denial.
+    The launch boundary keeps `CODEX_PATH` on the exact installed CLI, or on
+    Intent's bundled Codex when the installed one is confirmed below the
+    minimum derived from the pinned adapter's CLI declaration, and rejects
+    any launched version below that minimum. This prevents older runtimes that
+    drop the feature policy on later turns from bypassing native-subagent denial.
     No user configuration is changed. Node.js and npm/npx are required even on hosts
     with a native adapter; missing prerequisites produce an actionable error.
     The unchanged frontend may still offer Codex on a native-only host; the

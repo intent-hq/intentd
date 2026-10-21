@@ -451,16 +451,37 @@ impl CodexLaunch {
         intent_core::caller::spawn_with_current_caller(async move {
             let home = std::sync::Arc::new(home);
             let dependency = ProbeDependency::hold(home.clone());
-            let (_, version) = context
-                .observe_with_dependency(&command, Some(dependency))
-                .await
-                .map_err(|_| CatalogFailure::RuntimeUnverified)?;
-            context
-                .validate_launch_version(&version)
-                .map_err(|reason| {
+            let mut context = context;
+            let mut command = command;
+            // A confirmed-old installed Codex switches to Intent's bundled copy;
+            // only a failed switch (or an old bundled copy) rejects the probe.
+            let version = match context.select_launch(&command, Some(dependency)).await {
+                Ok((_, version)) => version,
+                Err(reason) if reason.contains("below the required minimum") => {
                     tracing::warn!(%reason, "Codex catalog probe rejected before launch");
-                    CatalogFailure::RuntimeBelowMinimum
-                })?;
+                    return Err(CatalogFailure::RuntimeBelowMinimum);
+                }
+                Err(_) => return Err(CatalogFailure::RuntimeUnverified),
+            };
+            context.apply_selection(&mut command);
+            // The raw catalog executes the runtime itself: run the bundled
+            // copy as the program when it replaced the installed CLI.
+            if let Some(host) = context.replaced_host() {
+                let launch = command.as_std();
+                if launch.get_program() == host.path().as_os_str() {
+                    let mut retargeted = Command::new(context.runtime.path());
+                    retargeted.args(launch.get_args()).env_clear();
+                    for (key, value) in launch.get_envs() {
+                        if let Some(value) = value {
+                            retargeted.env(key, value);
+                        }
+                    }
+                    if let Some(cwd) = launch.get_current_dir() {
+                        retargeted.current_dir(cwd);
+                    }
+                    command = retargeted;
+                }
+            }
             let measured = super::parse_version(version.as_bytes(), super::VersionKind::Runtime)
                 .map_or(
                     super::VersionMeasurement::Unknown(UnknownReason::InvalidVersion),

@@ -1430,7 +1430,7 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
         std::fs::write(bin.join("node"), launcher).unwrap();
         std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
         for (name, script) in [
-            ("claude", "#!/bin/sh\nprintf '2.0.0 (Claude Code)\\n'\n"),
+            ("claude", "#!/bin/sh\nprintf '99.0.0 (Claude Code)\\n'\n"),
             (
                 "npx",
                 r"#!/usr/bin/env node

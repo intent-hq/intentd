@@ -521,13 +521,18 @@ details and check the CLI found by **Providers**. A Windows error saying Pi MCP
 delivery requires a Unix host comes from an older Intent build; changing the
 workspace setup script does not resolve it.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/providers/components/ProviderCliVersionToast.svelte; src/features/providers/utils/provider-cli-warnings.ts; src/store/renderer/slices/host-requirements/sagas/provider-cli-requirements-saga.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/providers/components/ProviderCliVersionToast.svelte; src/features/providers/utils/provider-cli-warnings.ts; src/store/renderer/slices/host-requirements/sagas/provider-cli-requirements-saga.ts. Daemon: packages/intentd/crates/intent-services/src/{bundled_cli.rs,installed_cli.rs,provider_cli.rs}. -->
 
-When the daemon host's Codex CLI is older than Intent requires, the host owner
-sees **Codex CLI is out of date** with **Update**. **Update** runs `codex update`
-in a terminal on the daemon host; follow its output until it finishes. If the
-button is missing or the command fails, update Codex with the tool that
-installed it.
+When the daemon host's Codex or Claude Code CLI is older than Intent requires,
+Intent runs its own bundled copy of that CLI instead, downloading it with npm on
+first use. Sessions keep using the installed CLI's sign-in and settings. The host
+owner sees a warning that Intent is using its bundled CLI (older apps show
+**CLI is out of date**). Updating the installed CLI makes Intent switch back to
+it. For Codex, **Update** runs `codex update` in a terminal on the daemon host;
+follow its output until it finishes. If the button is missing or the command
+fails, update the CLI with the tool that installed it. If the bundled download
+fails (for example, offline or without npm), launches report the installed
+version, the required minimum, and the download error.
 
 ## Missed display updates
 

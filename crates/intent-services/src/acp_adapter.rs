@@ -323,10 +323,12 @@ impl AcpAdapterCommand {
                     npx_dir.clone(),
                     codex_home.clone(),
                 ));
-                let (identity, version) = context
-                    .observe_with_dependency(&command, Some(dependency))
-                    .await?;
-                context.validate_launch_version(&version)?;
+                // A confirmed-old installed CLI switches context and command
+                // to Intent's bundled copy before anything is launched.
+                let mut context = context;
+                let mut command = command;
+                let (identity, _) = context.select_launch(&command, Some(dependency)).await?;
+                context.apply_selection(&mut command);
                 let env = command
                     .as_std()
                     .get_envs()

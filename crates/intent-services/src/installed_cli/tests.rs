@@ -76,7 +76,7 @@ async fn assert_ordinary_launch(context: InstalledContext, root: &Path) {
 
 #[tokio::test]
 async fn installed_cli_launch_accepts_oversized_claude_config() {
-    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '99.0.0\\n'\n");
     let config = serde_json::json!({"history": "x".repeat(1024 * 1024)});
     std::fs::write(root.path().join(".claude.json"), config.to_string()).unwrap();
     let context = InstalledContext::from_inputs(
@@ -264,7 +264,7 @@ async fn claude_catalog_key(
 
 #[tokio::test]
 async fn installed_cli_claude_state_churn_keeps_catalog_identity() {
-    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '2.0.0\\n'\n");
+    let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\nprintf '99.0.0\\n'\n");
     let context = context.with_catalog_fingerprint().await.unwrap();
     let (identity, _) = context
         .observe(&launch(&context, root.path()))
@@ -405,7 +405,15 @@ async fn installed_cli_ephemeral_isolation_uses_effective_home_before_env_overri
 /// or require a developer's installed CLI. The caller owns the fixture home.
 pub(crate) fn context_in(cli: InstalledCli, root: &Path) -> InstalledContext {
     std::fs::create_dir_all(root).unwrap();
-    executable(&root.join(cli.command()), "#!/bin/sh\nprintf '1.2.3\\n'\n");
+    // Current for both CLIs, so ordinary fixtures never select a bundled copy.
+    let version = match cli {
+        InstalledCli::Codex => "1.2.3",
+        InstalledCli::Claude => "99.0.0 (Claude Code)",
+    };
+    executable(
+        &root.join(cli.command()),
+        &format!("#!/bin/sh\nprintf '{version}\\n'\n"),
+    );
     let runtime = cli.resolve_in_dirs(&[root.to_owned()], false).unwrap();
     InstalledContext::from_inputs(
         runtime,
@@ -484,12 +492,12 @@ async fn installed_cli_version_timeout_reaps_process_group() {
 async fn installed_cli_prepared_catalog_rechecks_wrapper_before_launch() {
     use crate::acp_adapter::{spawn_adapter_in, AcpAdapterCommand, AdapterSlots};
     let (root, context) = fixture(InstalledCli::Claude, "#!/bin/sh\ncat \"$HOME/version\"\n");
-    std::fs::write(root.path().join("version"), "1.2.3").unwrap();
+    std::fs::write(root.path().join("version"), "99.2.3").unwrap();
     let cmd = AcpAdapterCommand::binary("/bin/true".into(), vec![])
         .prepare_with_context(context)
         .await
         .unwrap();
-    std::fs::write(root.path().join("version"), "1.2.4").unwrap();
+    std::fs::write(root.path().join("version"), "99.2.4").unwrap();
     let error = spawn_adapter_in(&AdapterSlots::new(1), &cmd, Duration::from_secs(1))
         .await
         .err()
@@ -519,7 +527,7 @@ with staging.open('w') as output:
 os.replace(staging,root/'detached-pid')
 if controlled: (root/'publication-finished').touch()
 if os.environ['VERSION_MODE']!='success':time.sleep(120)
-print('2.0.0 (Claude Code)')
+print('99.0.0 (Claude Code)')
 ";
 
 // A pidfd can only signal the process we inspected, even if its numeric PID
@@ -1387,20 +1395,79 @@ async fn installed_cli_cancelled_preparation_releases_actual_directories_after_c
     cancel_version_owner(operation, root.path()).await;
 }
 
-#[tokio::test]
-async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_other_cli() {
-    let minimum = intent_providers::adapter_cli::requirement("codex")
+/// Seed a complete Intent-managed bundled CLI under `home` that reports
+/// `version`, so selection never runs npm or touches the developer's home.
+fn seed_bundled(home: &Path, cli: InstalledCli, version: &str) -> PathBuf {
+    let provider = match cli {
+        InstalledCli::Codex => "codex",
+        InstalledCli::Claude => "claude-code",
+    };
+    let bundled = intent_providers::adapter_cli::requirement(provider)
         .unwrap()
-        .minimum
-        .to_string();
-    for (cli, version, rejected) in [
-        (InstalledCli::Codex, "codex-cli 0.114.0", true),
-        (InstalledCli::Codex, minimum.as_str(), false),
-        (InstalledCli::Codex, "codex-cli 99.0.0", false),
-        (InstalledCli::Codex, "unknown", false),
-        (InstalledCli::Claude, "0.0.1", false),
+        .bundled
+        .unwrap();
+    let dir =
+        crate::bundled_cli::version_dir(&crate::bundled_cli::root_in(home).unwrap(), &bundled);
+    let bin = dir.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(cli.command());
+    executable(
+        &path,
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] || exit 97\n[ \"${}\" = \"$0\" ] || exit 98\nprintf '%s\\n' '{version}'\n",
+            cli.path_env()
+        ),
+    );
+    std::fs::write(dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
+    path
+}
+
+fn bundled_version(provider: &str) -> String {
+    intent_providers::adapter_cli::requirement(provider)
+        .unwrap()
+        .bundled
+        .unwrap()
+        .version
+        .to_string()
+}
+
+#[tokio::test]
+async fn confirmed_old_codex_and_claude_launch_the_bundled_cli_instead() {
+    let codex = bundled_version("codex");
+    let claude = bundled_version("claude-code");
+    for (cli, old, bundled_output) in [
+        (
+            InstalledCli::Codex,
+            "codex-cli 0.114.0",
+            format!("codex-cli {codex}"),
+        ),
+        (
+            InstalledCli::Claude,
+            "1.0.128 (Claude Code)",
+            format!("{claude} (Claude Code)"),
+        ),
     ] {
-        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let (root, mut context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{old}'\n"));
+        let host = context.runtime.clone();
+        let bundled = seed_bundled(root.path(), cli, &bundled_output);
+        let mut command = launch(&context, root.path());
+        let (_, version) = context.select_launch(&command, None).await.unwrap();
+        assert_eq!(version, bundled_output);
+        assert_eq!(context.runtime.path(), bundled);
+        assert_eq!(context.replaced_host(), Some(&host));
+        // Before the selection is applied the launch still names the host CLI.
+        assert_eq!(env(&command, cli.path_env()), Some(host.path().into()));
+        context.apply_selection(&mut command);
+        assert_eq!(env(&command, cli.path_env()), Some(bundled.clone().into()));
+        assert_eq!(
+            env(&command, "HOME"),
+            Some(root.path().into()),
+            "env is preserved"
+        );
+
+        // The production launch preparation takes the same path.
+        let (root, context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{old}'\n"));
+        seed_bundled(root.path(), cli, &bundled_output);
         let prepared = crate::acp_adapter::AcpAdapterCommand::binary(
             "/must-not-launch-adapter".into(),
             vec![],
@@ -1408,21 +1475,117 @@ async fn codex_prelaunch_rejects_confirmed_old_but_allows_newer_unknown_and_othe
         .cwd(root.path().to_owned())
         .prepare_with_context(context)
         .await;
-        if rejected {
-            let Err(error) = prepared else {
-                panic!("old Codex was accepted");
-            };
-            assert!(error.contains("0.114.0"), "{error}");
-            assert!(error.contains(&minimum), "{error}");
-            assert!(error.contains("Upgrade"), "{error}");
-        } else {
-            assert!(
-                prepared.is_ok(),
-                "{version}: {}",
-                prepared.err().unwrap_or_default()
-            );
-        }
+        assert!(
+            prepared.is_ok(),
+            "{old}: {}",
+            prepared.err().unwrap_or_default()
+        );
     }
+}
+
+#[tokio::test]
+async fn current_newer_and_unknown_versions_keep_the_installed_cli() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    let claude = bundled_version("claude-code");
+    let patch_lag = format!("{}.0 (Claude Code)", claude.rsplit_once('.').unwrap().0);
+    for (cli, version) in [
+        (InstalledCli::Codex, minimum.as_str()),
+        (InstalledCli::Codex, "codex-cli 99.0.0"),
+        (InstalledCli::Codex, "unknown"),
+        (InstalledCli::Claude, patch_lag.as_str()),
+        (InstalledCli::Claude, "unknown"),
+    ] {
+        let (root, mut context) = fixture(cli, &format!("#!/bin/sh\nprintf '%s' '{version}'\n"));
+        let host = context.runtime.clone();
+        // Even a ready bundled copy is not used for a CLI that is not old.
+        seed_bundled(root.path(), cli, "99.0.0");
+        let command = launch(&context, root.path());
+        let (_, observed) = context.select_launch(&command, None).await.unwrap();
+        assert_eq!(observed, version);
+        assert_eq!(context.runtime, host);
+        assert!(context.replaced_host().is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_or_old_bundled_cli_reports_both_versions_and_the_reason() {
+    let minimum = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .minimum
+        .to_string();
+    let spec = intent_providers::adapter_cli::requirement("codex")
+        .unwrap()
+        .bundled
+        .unwrap()
+        .spec();
+    // No usable home: the install cannot be attempted, and nothing launches.
+    let root = tempfile::tempdir().unwrap();
+    executable(
+        &root.path().join("codex"),
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    let runtime = InstalledCli::Codex
+        .resolve_in_dirs(&[root.path().to_owned()], false)
+        .unwrap();
+    let mut context = InstalledContext::from_inputs(
+        runtime,
+        &BTreeMap::new(),
+        BTreeMap::from([("PATH".into(), "/bin:/usr/bin".into())]),
+        &intent_core::cli_env::CodexEnvNames::default(),
+    )
+    .unwrap();
+    let command = launch(&context, root.path());
+    let error = context.select_launch(&command, None).await.err().unwrap();
+    assert!(
+        error.contains("0.114.0") && error.contains(&minimum),
+        "{error}"
+    );
+    assert!(error.contains("Upgrade Codex"), "{error}");
+    assert!(
+        error.contains(&spec) && error.contains("home directory"),
+        "{error}"
+    );
+
+    // A bundled copy that itself reports an old version is never launched.
+    let (root, mut context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    seed_bundled(root.path(), InstalledCli::Codex, "codex-cli 0.1.0");
+    let command = launch(&context, root.path());
+    let error = context.select_launch(&command, None).await.err().unwrap();
+    assert!(
+        error.contains("0.1.0") && error.contains(&minimum),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn bundled_catalog_key_differs_from_the_installed_cli_key() {
+    let codex = bundled_version("codex");
+    let (root, context) = fixture(
+        InstalledCli::Codex,
+        "#!/bin/sh\nprintf 'codex-cli 0.114.0'\n",
+    );
+    seed_bundled(
+        root.path(),
+        InstalledCli::Codex,
+        &format!("codex-cli {codex}"),
+    );
+    let host = context.with_catalog_fingerprint().await.unwrap();
+    let command = launch(&host, root.path());
+    let (host_identity, _) = host.observe(&command).await.unwrap();
+    let mut selected = host.clone();
+    let (identity, _) = selected.select_launch(&command, None).await.unwrap();
+    let (host_key, bundled_key) = (host.key(&host_identity), selected.key(&identity));
+    assert!(
+        host_key.is_some() && bundled_key.is_some(),
+        "fingerprint survives the switch"
+    );
+    assert_ne!(host_key, bundled_key);
 }
 
 #[tokio::test]
