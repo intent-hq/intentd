@@ -5398,7 +5398,8 @@ impl AgentManager {
     ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
-    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
+    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]), and
+    ///   never for the virtual Assistant workspace.
     /// * Workspace naming names the concrete daemon tool the session's
     ///   provider surfaces (see [`workspace_naming_tool_reference`]).
     async fn build_first_turn_naming_instruction(
@@ -5430,10 +5431,12 @@ impl AgentManager {
                 .session_specialist_display_name(s, workspace_path.as_deref());
             is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
-        let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
-            let title = workspace.title.trim();
-            title.is_empty() || is_workspace_slug(title)
-        });
+        // The Assistant workspace is virtual and has no user-facing title.
+        let needs_workspace_title = !workspace_id.is_chief()
+            && workspace.as_ref().is_some_and(|workspace| {
+                let title = workspace.title.trim();
+                title.is_empty() || is_workspace_slug(title)
+            });
         if !needs_agent_name && !needs_workspace_title {
             return None;
         }
@@ -12949,18 +12952,18 @@ pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>)
         || specialist_name.is_some_and(matches_base)
 }
 
-/// Whether `name` is a placeholder an Assistant (chief) chat carries before it
-/// is named: blank, the desktop "New chat" placeholder, a legacy stored
-/// placeholder, or a generated "New thread …" name. Mirrors cloudlands-fe
-/// `isPlaceholderChiefThreadName`. Only consulted for chief-workspace sessions.
+/// Whether `name` is a creation placeholder an Assistant (chief) chat carries
+/// before it is named: blank, the desktop "New chat" placeholder, or a legacy
+/// placeholder an older client may still create. Exact matches only — the
+/// cloudlands-fe display helper `isPlaceholderChiefThreadName` also treats a
+/// "New thread …" prefix as a placeholder, but only fresh chats reach the
+/// first-turn check, and a prefix would also catch intentional task names.
+/// Only consulted for chief-workspace sessions.
 pub(crate) fn is_assistant_chat_placeholder_name(name: &str) -> bool {
-    let name = name.trim();
-    name.is_empty()
-        || matches!(
-            name,
-            "New chat" | "New chat with Assistant" | "New chat with Intent" | "Chief of Staff"
-        )
-        || name.starts_with("New thread ")
+    matches!(
+        name.trim(),
+        "" | "New chat" | "New chat with Assistant" | "New chat with Intent" | "Chief of Staff"
+    )
 }
 
 /// Provider-correct spelling of the workspace API MCP tool used for agent
@@ -18051,7 +18054,6 @@ mod role_reminder_tests {
             "New chat with Assistant",
             "New chat with Intent",
             "Chief of Staff",
-            "New thread 3/4/2026, 10:15 AM",
         ] {
             let (mgr, _agent, _db) = manager_with(None, None).await;
             let agent_id = insert_assistant_chat(&mgr, name, false).await;
@@ -18106,6 +18108,7 @@ mod role_reminder_tests {
             ("Quarterly planning", true),
             ("Quarterly planning", false),
             ("New chats digest", false),
+            ("New thread pool for workers", false),
         ] {
             let (mgr, _agent, _db) = manager_with(None, None).await;
             let agent_id = insert_assistant_chat(&mgr, name, explicitly_set).await;
