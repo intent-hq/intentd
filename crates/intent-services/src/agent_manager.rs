@@ -1047,7 +1047,7 @@ fn ttl_reapable(
     if e.last_active_ms <= pinned_cutoff_ms || !keep_alive.is_some_and(|f| f(id)) {
         return true;
     }
-    tracing::debug!(
+    tracing::trace!(
         agent = %id,
         idle_ms = now_ms().saturating_sub(e.last_active_ms),
         "process registry: idle process kept (running provider worker)"
