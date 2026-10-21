@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.22] - 2026-10-21
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for exec before judging fixture HOME ([#2563](https://github.com/intent-hq/intentd/pull/2563))
+- Point fixture-test failures at make test-select ([#2565](https://github.com/intent-hq/intentd/pull/2565))
+
+
 ## [0.11.21] - 2026-10-21
 
 ### 🚀 Features
