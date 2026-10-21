@@ -23,6 +23,14 @@ Multiplayer, Collaboration, personal device pairing, and provider profiles are
 currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+Only when explicitly asked about workspace discussions: this unreleased Multiplayer
+Labs feature supports reactions 👍 👎 👀 ✅ 🙈 and shows a bounded sample of who
+reacted. Legacy 🙂 can be removed. Agents can react only after explicit addressing
+in the workspace-wide discussion; reactions never wake agents. Private discussions
+remain human-only. Imported reaction names are historical snapshots, not local access.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
 Only when explicitly asked about personal device pairing: it pairs another device

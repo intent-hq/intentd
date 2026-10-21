@@ -827,7 +827,7 @@ async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() 
     assert_eq!(a.reaction_version, 1);
     assert_eq!(
         serde_json::to_value(&a.reactions).unwrap(),
-        json!([{"reaction":"👍","count":1,"reacted":true}])
+        json!([{"reaction":"👍","count":1,"reacted":true,"reactors":[made.message.author]}])
     );
     let bob = with_caller(
         human(&p[2].id),
@@ -846,7 +846,7 @@ async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() 
     assert_eq!(both.reactions[0].count, 2);
     let other = with_caller(
         human(&p[2].id),
-        svc.discussion_react_op(&ws, id, message, "🙂", true),
+        svc.discussion_react_op(&ws, id, message, "👀", true),
     )
     .await
     .unwrap();
@@ -892,7 +892,7 @@ async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() 
         .unwrap();
         assert_eq!(
             projected.data,
-            json!({"workspaceId":ws,"conversationId":id,"messageId":message,"reactionVersion":4,"reactions":[{"reaction":"👍","count":1,"reacted":selected},{"reaction":"🙂","count":1,"reacted":selected}]})
+            json!({"workspaceId":ws,"conversationId":id,"messageId":message,"reactionVersion":4,"reactions":[{"reaction":"👍","count":1,"reacted":selected,"reactors":other.reactions[1].reactors},{"reaction":"👀","count":1,"reacted":selected,"reactors":other.reactions[1].reactors}]})
         );
     }
     for caller in [
@@ -1144,7 +1144,7 @@ async fn discussion_reaction_concurrency_and_send_retry_keep_viewer_state() {
         .unwrap();
         assert_eq!(
             history["messages"][0]["reactions"],
-            json!([{"reaction":"👍","count":2,"reacted":selected}])
+            json!([{"reaction":"👍","count":2,"reacted":selected,"reactors":history["messages"][0]["reactions"][0]["reactors"]}])
         );
         assert_eq!(history["messages"][0]["reactionVersion"], 4);
         assert_eq!(history["messages"][0]["sequence"], 1);

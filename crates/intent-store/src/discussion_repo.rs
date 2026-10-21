@@ -1,8 +1,8 @@
 //! Bounded sequence paging and atomic per-human retry deduplication.
 use intent_core::discussion::{
-    DiscussionAuthor, DiscussionMessage, DiscussionPage, DISCUSSION_PAGE_MAX,
+    DiscussionActor, DiscussionAuthor, DiscussionMessage, DiscussionPage, DISCUSSION_PAGE_MAX,
 };
-use intent_core::{Error, PrincipalId, Result, WorkspaceId};
+use intent_core::{Error, Result, WorkspaceId};
 use sqlx::{sqlite::SqliteRow, Row};
 
 use crate::Store;
@@ -118,7 +118,7 @@ impl Store {
     }
 
     /// Read a bounded page and viewer reaction selection in a single snapshot.
-    /// Aggregate counts are persisted on write; the indexed selection is at most two rows per message.
+    /// Aggregate counts are persisted on write; the indexed selection is at most six rows per message.
     /// # Errors
     /// Returns invalid bounds or database errors.
     pub async fn list_discussion_messages_for(
@@ -128,7 +128,7 @@ impl Store {
         before_sequence: Option<i64>,
         after_sequence: Option<i64>,
         limit: u32,
-        principal: Option<&PrincipalId>,
+        viewer: Option<&DiscussionActor>,
     ) -> Result<DiscussionPage> {
         if limit == 0
             || limit > DISCUSSION_PAGE_MAX
@@ -145,12 +145,13 @@ impl Store {
             None => ("<", "DESC", before_sequence.unwrap_or(i64::MAX)),
         };
         let sql = format!(
-            "SELECT m.*, (SELECT json_group_array(reaction) FROM discussion_reaction r WHERE r.message_id=m.id AND r.principal_id=?) AS viewer_reactions \
+            "SELECT m.*, (SELECT json_group_array(reaction) FROM discussion_reaction r WHERE r.message_id=m.id AND (r.principal_id=? OR r.agent_id=?)) AS viewer_reactions \
              FROM workspace_discussion_message m WHERE workspace_id=? AND conversation_id=? AND sequence {comparison} ? \
              ORDER BY sequence {order} LIMIT ?"
         );
         let rows = sqlx::query(&sql)
-            .bind(principal.map(PrincipalId::as_str))
+            .bind(viewer.and_then(DiscussionActor::principal_id))
+            .bind(viewer.and_then(DiscussionActor::agent_id))
             .bind(workspace_id.as_str())
             .bind(conversation_id)
             .bind(cursor)

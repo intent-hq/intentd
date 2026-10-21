@@ -9,7 +9,31 @@ pub const DISCUSSION_RECIPIENT_MAX: usize = 31;
 pub const DISCUSSION_BODY_MAX_BYTES: usize = 16 * 1024;
 pub const DISCUSSION_PAGE_MAX: u32 = 100;
 pub const DISCUSSION_PAGE_DEFAULT: u32 = 50;
-pub const DISCUSSION_REACTIONS: [&str; 2] = ["👍", "🙂"];
+pub const DISCUSSION_REACTIONS: [&str; 6] = ["👍", "👎", "👀", "✅", "🙈", "🙂"];
+pub const DISCUSSION_REACTOR_MAX: u32 = 20;
+
+/// Server-bound local identity, never deserialized from discussion arguments.
+#[derive(Debug, Clone)]
+pub enum DiscussionActor {
+    Human(PrincipalId),
+    Agent(AgentId),
+}
+impl DiscussionActor {
+    #[must_use]
+    pub fn principal_id(&self) -> Option<&str> {
+        match self {
+            Self::Human(id) => Some(id.as_str()),
+            Self::Agent(_) => None,
+        }
+    }
+    #[must_use]
+    pub fn agent_id(&self) -> Option<&str> {
+        match self {
+            Self::Agent(id) => Some(id.as_str()),
+            Self::Human(_) => None,
+        }
+    }
+}
 
 /// Profile snapshot captured from the authenticated human or bound agent at send time.
 /// After workspace transfer the principal id is inert source attribution;
@@ -79,6 +103,9 @@ pub struct DiscussionReaction {
     pub reaction: String,
     pub count: i64,
     pub reacted: bool,
+    /// First-added immutable snapshots, bounded independently of the total count.
+    #[serde(default)]
+    pub reactors: Vec<DiscussionAuthor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -258,10 +258,28 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .execute(store.write_pool())
         .await
         .unwrap();
+    sqlx::query("INSERT INTO discussion_reaction(id,workspace_id,message_id,principal_id,reaction) VALUES('old-reaction',?,'old-message',?,'🙂')")
+        .bind(ws.as_str()).bind(author.principal_id.as_ref().unwrap().as_str()).execute(store.write_pool()).await.unwrap();
+    sqlx::query("UPDATE workspace_discussion_message SET reactions_json='[{\"reaction\":\"🙂\",\"count\":1,\"reacted\":false}]',reaction_version=2 WHERE id='old-message'").execute(store.write_pool()).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0168_discussion_reactors.sql"))
+        .execute(store.write_pool())
+        .await
+        .unwrap();
     let page = store
         .list_discussion_messages(&ws, None, None, 50)
         .await
         .unwrap();
+    assert_eq!(
+        page.messages[0].reactions[0].reactors[0].principal_id,
+        author.principal_id
+    );
+    let principal = author.principal_id.as_ref().unwrap();
+    let (same, changed) = store
+        .set_discussion_reaction(&ws, "default", "old-message", principal, "🙂", true)
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(same.reaction_version, 2);
     assert_eq!(page.messages.len(), 1);
     let old = &page.messages[0];
     assert_eq!(old.id, "old-message");
@@ -287,6 +305,14 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .unwrap();
     assert!(!inserted);
     assert_eq!(&retry.message, old);
+    let (removed, changed) = store
+        .set_discussion_reaction(&ws, "default", "old-message", principal, "🙂", false)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert!(removed.reactions.is_empty());
+    assert_eq!(removed.reaction_version, 3);
+
     let (next, _) = store
         .insert_discussion_message(&ws, "next", "next", &author)
         .await
@@ -500,4 +526,115 @@ async fn discussion_agent_grants_and_outbox_rollback_with_message_and_identity_i
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn discussion_reactor_samples_are_bounded_immutable_and_refilled() {
+    use intent_core::discussion::DiscussionActor;
+    use intent_core::AgentId;
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws, "Reactions", false))
+        .await
+        .unwrap();
+    let primary = store.get_primary_principal().await.unwrap();
+    let author = DiscussionAuthor {
+        principal_id: Some(primary.id.clone()),
+        agent_id: None,
+        login: primary.login,
+        display_name: primary.display_name,
+        avatar_url: primary.avatar_url,
+    };
+    let (message, _) = store
+        .insert_discussion_message(&ws, "target", "body", &author)
+        .await
+        .unwrap();
+    let mut actors = vec![];
+    let mut expected = vec![];
+    for n in 0..22 {
+        let id = AgentId::from(format!("reactor-{n}"));
+        sqlx::query("INSERT INTO agent_session(id,workspace_id,name,status,created_at,updated_at) VALUES(?,?,?,'idle','now','now')")
+            .bind(id.as_str()).bind(ws.as_str()).bind(format!("Helper {n}")).execute(store.write_pool()).await.unwrap();
+        sqlx::query("INSERT INTO discussion_agent_grant(workspace_id,conversation_id,agent_id) VALUES(?,'default',?)")
+            .bind(ws.as_str()).bind(id.as_str()).execute(store.write_pool()).await.unwrap();
+        let actor = DiscussionActor::Agent(id.clone());
+        let (state, changed) = store
+            .set_discussion_actor_reaction(&ws, "default", &message.id, &actor, "✅", true)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(state.reaction_version, n + 1);
+        assert_eq!(state.reactions[0].count, n + 1);
+        assert_eq!(
+            state.reactions[0].reactors.len(),
+            usize::try_from(n + 1).unwrap().min(20)
+        );
+        if n < 20 {
+            expected.push(id);
+        }
+        assert_eq!(
+            state.reactions[0]
+                .reactors
+                .iter()
+                .map(|r| r.agent_id.clone().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        actors.push(actor);
+    }
+    sqlx::query("UPDATE agent_session SET name='Renamed' WHERE id='reactor-0'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    let (same, changed) = store
+        .set_discussion_actor_reaction(&ws, "default", &message.id, &actors[0], "✅", true)
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(same.reaction_version, 22);
+    assert_eq!(
+        same.reactions[0].reactors[0].display_name.as_deref(),
+        Some("Helper 0")
+    );
+    let (removed, changed) = store
+        .set_discussion_actor_reaction(&ws, "default", &message.id, &actors[0], "✅", false)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert_eq!(removed.reactions[0].count, 21);
+    assert_eq!(removed.reactions[0].reactors.len(), 20);
+    assert_eq!(
+        removed.reactions[0].reactors[19].agent_id,
+        Some(AgentId::from("reactor-20"))
+    );
+    assert!(!removed.reactions[0].reacted);
+    // Exercise every current choice and verify fixed aggregate order, not insertion order.
+    for emoji in ["🙈", "👀", "👎", "👍"] {
+        store
+            .set_discussion_actor_reaction(&ws, "default", &message.id, &actors[1], emoji, true)
+            .await
+            .unwrap();
+    }
+    let reopened = Store::open(&tmp.path).await.unwrap();
+    let page = reopened
+        .list_discussion_messages_for(&ws, "default", None, None, 50, Some(&actors[1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.messages[0]
+            .reactions
+            .iter()
+            .map(|r| r.reaction.as_str())
+            .collect::<Vec<_>>(),
+        vec!["👍", "👎", "👀", "✅", "🙈"]
+    );
+    assert!(page.messages[0].reactions.iter().all(|r| r.reacted));
+    assert!(matches!(
+        store
+            .set_discussion_actor_reaction(&ws, "default", &message.id, &actors[1], "🙂", true)
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
 }

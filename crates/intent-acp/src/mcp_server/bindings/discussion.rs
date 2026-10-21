@@ -9,6 +9,7 @@ pub(crate) const PRELUDE: &str = r"
     ws.discussion = {
         conversations: (options) => host({ method: 'discussion.conversations', args: options || {} }),
         list: (conversationId, options) => host({ method: 'discussion.list', args: { ...(options || {}), conversationId } }),
+        react: (conversationId, messageId, reaction, active) => host({ method: 'discussion.react', args: { conversationId, messageId, reaction, active } }),
         send: (conversationId, body, options) => host({ method: 'discussion.send', args: { ...(options || {}), conversationId, body } }),
     };
 ";
@@ -70,6 +71,21 @@ pub(crate) async fn dispatch(
                     )
                     .await
                     .map_err(map_err),
+                "react" => {
+                    let result = api
+                        .discussion_react(
+                            ws.clone(),
+                            req_str(args, "conversationId")?,
+                            req_str(args, "messageId")?,
+                            req_str(args, "reaction")?,
+                            args.get("active")
+                                .and_then(Value::as_bool)
+                                .ok_or("active must be a boolean")?,
+                        )
+                        .await
+                        .map_err(map_err)?;
+                    serde_json::to_value(result).map_err(|e| e.to_string())
+                }
                 "send" => {
                     let recipients = args
                         .get("recipientAgentIds")
@@ -142,6 +158,33 @@ mod tests {
                 Ok(json!({"messages":[],"hasMore":false}))
             })
         }
+        fn discussion_react(
+            &self,
+            ws: WorkspaceId,
+            conversation: String,
+            message: String,
+            reaction: String,
+            active: bool,
+        ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionReactionState>> {
+            Box::pin(async move {
+                assert_eq!(
+                    intent_core::current_caller(),
+                    Some(Caller::Agent {
+                        agent_id: AgentId::from("agent-bound")
+                    })
+                );
+                assert_eq!(ws.as_str(), "workspace-bound");
+                assert_eq!(conversation, "default");
+                assert_eq!(message, "server-message");
+                assert_eq!(reaction, "👀");
+                assert!(active);
+                Ok(intent_core::discussion::DiscussionReactionState {
+                    message_id: message,
+                    reactions: vec![],
+                    reaction_version: 1,
+                })
+            })
+        }
         fn discussion_send(
             &self,
             ws: WorkspaceId,
@@ -188,6 +231,22 @@ mod tests {
             .await
             .unwrap_err()
             .contains("binding reached"));
+        let mut react = json!({"conversationId":"default","messageId":"server-message","reaction":"👀","active":true,"workspaceId":"forged","agentId":"forged","principalId":"forged","author":{"agentId":"forged"}});
+        assert_eq!(
+            dispatch(&api, &ws, Some(&agent), "react", &react)
+                .await
+                .unwrap()["reactionVersion"],
+            1
+        );
+        assert!(dispatch(&api, &ws, None, "react", &react)
+            .await
+            .unwrap_err()
+            .contains("bound agent"));
+        react["active"] = json!("true");
+        assert!(dispatch(&api, &ws, Some(&agent), "react", &react)
+            .await
+            .unwrap_err()
+            .contains("boolean"));
         for value in [json!(null), json!("agent-target"), json!([1])] {
             let mut invalid = args.clone();
             invalid["recipientAgentIds"] = value;

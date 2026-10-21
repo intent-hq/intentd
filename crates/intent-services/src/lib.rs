@@ -18761,6 +18761,7 @@ impl WorkspaceApi for Services {
             let mut caps = serde_json::Map::new();
             caps.insert("discussionConversations".into(), serde_json::json!(1));
             caps.insert("discussionMessageActions".into(), serde_json::json!(1));
+            caps.insert("discussionReactions".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {

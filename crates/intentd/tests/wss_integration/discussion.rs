@@ -533,6 +533,10 @@ async fn discussion_private_conversations_events_typing_and_retry_over_wss() {
             hello["result"]["server"]["capabilities"]["discussionConversations"],
             1
         );
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["discussionReactions"],
+            1
+        );
         let sub = client
             .call(
                 2,
@@ -850,6 +854,10 @@ async fn discussion_reactions_and_replies_are_durable_private_and_projected_over
             hello["result"]["server"]["capabilities"]["discussionMessageActions"], 1,
             "{hello}"
         );
+        assert_eq!(
+            hello["result"]["server"]["capabilities"]["discussionReactions"],
+            1
+        );
         let sub = client
             .call(
                 2,
@@ -862,6 +870,7 @@ async fn discussion_reactions_and_replies_are_durable_private_and_projected_over
     }
     let caps = alice.call(3, "system.capabilities", json!({})).await;
     assert_eq!(caps["result"]["discussionMessageActions"], 1);
+    assert_eq!(caps["result"]["discussionReactions"], 1);
     let made=alice.call(4,"discussion.send",json!({"workspaceId":ws,"messageId":"first","body":"Original","recipientPrincipalIds":[bp.id]})).await;
     let message = made["result"]["message"].clone();
     let id = message["id"].as_str().unwrap();
@@ -876,17 +885,17 @@ async fn discussion_reactions_and_replies_are_durable_private_and_projected_over
     let added = alice.call(5, "discussion.react", react.clone()).await;
     assert_eq!(
         added["result"],
-        json!({"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":true}],"reactionVersion":1})
+        json!({"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":true,"reactors":[message["author"]]}],"reactionVersion":1})
     );
     for (client, selected) in [(&mut alice, true), (&mut bob, false)] {
         let event = client.event("discussion:reaction").await;
         assert_eq!(
             event["data"],
-            json!({"workspaceId":ws,"conversationId":conversation,"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":selected}],"reactionVersion":1})
+            json!({"workspaceId":ws,"conversationId":conversation,"messageId":id,"reactions":[{"reaction":"👍","count":1,"reacted":selected,"reactors":[message["author"]]}],"reactionVersion":1})
         );
         assert!(
             event["actor"].get("id").is_none(),
-            "reaction events expose no reactor identity"
+            "event actor is not used as the viewer selection identity"
         );
     }
     let retry = alice.call(6, "discussion.react", react.clone()).await;

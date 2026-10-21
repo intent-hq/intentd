@@ -882,3 +882,116 @@ async fn discussion_legacy_delivered_retry_returns_history_without_new_invocatio
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn discussion_agent_reactions_are_granted_bound_idempotent_and_never_wake() {
+    let (tmp, svc, ws, people) = conversation_fixture().await;
+    svc.store
+        .insert_workspace(&workspace(&WorkspaceId::new()))
+        .await
+        .unwrap();
+    let a = agent(&svc, &ws, "reactor").await;
+    let b = agent(&svc, &ws, "ungranted-reactor").await;
+    let sent = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(
+            &ws,
+            "react-target",
+            "please review",
+            &addressed(std::slice::from_ref(&a)),
+        ),
+    )
+    .await
+    .unwrap();
+    let id = &sent.message.id;
+    let queue_before = svc.queue_snapshot(&a);
+    let (first, retry) = tokio::join!(
+        with_caller(
+            as_agent(&a),
+            svc.discussion_react_op(&ws, "default", id, "👀", true)
+        ),
+        with_caller(
+            as_agent(&a),
+            svc.discussion_react_op(&ws, "default", id, "👀", true)
+        ),
+    );
+    let first = first.unwrap();
+    assert_eq!(first, retry.unwrap());
+    assert_eq!(first.reaction_version, 1);
+    assert_eq!(first.reactions[0].count, 1);
+    assert_eq!(first.reactions[0].reactors[0].agent_id, Some(a.clone()));
+    assert_eq!(first.reactions[0].reactors[0].principal_id, None);
+    assert_eq!(svc.queue_snapshot(&a), queue_before);
+    assert!(svc.queue_snapshot(&b).is_empty());
+    let reopened = Services::new(Store::open(&tmp.path).await.unwrap());
+    let history = with_caller(
+        as_agent(&a),
+        reopened.discussion_history_op(&ws, "default", None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(history["messages"][0]["reactions"], json!(first.reactions));
+    let human_history = with_caller(
+        human(&people[1].id),
+        svc.discussion_history_op(&ws, "default", None, None, 50),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        human_history["messages"][0]["reactions"][0]["reacted"],
+        false
+    );
+    assert!(with_caller(
+        as_agent(&b),
+        svc.discussion_react_op(&ws, "default", id, "👍", true)
+    )
+    .await
+    .is_err());
+    let private = with_caller(
+        human(&people[1].id),
+        svc.discussion_send_to_op(
+            &ws,
+            "private-react",
+            "private",
+            &recipients(&[people[2].id.clone()]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(with_caller(
+        as_agent(&a),
+        svc.discussion_react_op(
+            &ws,
+            &private.conversation.id,
+            &private.message.id,
+            "👍",
+            true
+        )
+    )
+    .await
+    .is_err());
+    // Hold the writer, change authorization, then let the reaction attempt proceed.
+    // Every denial must be checked after acquiring that same serialized writer.
+    for mutation in [
+        "UPDATE agent_session SET retired_at='now' WHERE id='reactor'",
+        "UPDATE agent_session SET status='deleted' WHERE id='reactor'",
+        "DELETE FROM discussion_agent_grant WHERE agent_id='reactor'",
+        "UPDATE agent_session SET workspace_id=(SELECT id FROM workspace WHERE id<>? LIMIT 1) WHERE id='reactor'",
+    ] {
+        sqlx::query("UPDATE agent_session SET retired_at=NULL,status='idle',workspace_id=? WHERE id='reactor'").bind(ws.as_str()).execute(svc.store.write_pool()).await.unwrap();
+        sqlx::query("INSERT OR IGNORE INTO discussion_agent_grant(workspace_id,conversation_id,agent_id) VALUES(?,'default','reactor')").bind(ws.as_str()).execute(svc.store.write_pool()).await.unwrap();
+        let mut writer = svc.store.write_pool().begin().await.unwrap();
+        let actor = intent_core::discussion::DiscussionActor::Agent(a.clone());
+        let pending = svc.store.set_discussion_actor_reaction(&ws,"default",id,&actor,"👍",true);
+        tokio::pin!(pending);
+        tokio::select! { biased; result=&mut pending => panic!("reaction bypassed writer: {result:?}"), ()=std::future::ready(())=>{} }
+        if mutation.contains('?') {
+            // The fixture provides another workspace; moving the session must invalidate the grant.
+            sqlx::query(mutation).bind(ws.as_str()).execute(&mut *writer).await.unwrap();
+        } else {
+            sqlx::query(mutation).execute(&mut *writer).await.unwrap();
+        }
+        writer.commit().await.unwrap();
+        assert!(matches!(pending.await, Err(Error::NotFound(_))));
+    }
+}

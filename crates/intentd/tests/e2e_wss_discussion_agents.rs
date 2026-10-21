@@ -491,13 +491,16 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         const page = await ws.discussion.list('default', {{ limit: 1 }});
         const addressed = page.messages[0];
         const older = await ws.discussion.list('default', {{ beforeSequence: addressed.sequence, limit: 1 }});
+        const reaction = await ws.discussion.react('default', addressed.id, '👀', true);
+        const reactionRetry = await ws.discussion.react('default', addressed.id, '👀', true);
+        const reactedPage = await ws.discussion.list('default', {{limit:1}});
         const relay = (await ws.agent.list(true)).find(agent => agent.name === 'Relay agent');
         if (!relay) throw new Error('Relay agent missing');
         const reply = await ws.discussion.send('default', {reply}, {{
             messageId: 'agent-reply', replyToMessageId: addressed.id, recipientAgentIds: [relay.id],
             author: {{ principalId: 'forged-human', agentId: 'forged-agent', displayName: 'Forged' }}
         }});
-        return {{ page, older, reply }};
+        return {{ page, older, reply, reaction, reactionRetry, reactedPage }};
     ",
         reply = json!(REPLY)
     );
@@ -559,12 +562,13 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     let mut sub = connect_ws(port, cfg).await;
     let capabilities = wss_rpc(&mut rpc, 1, "system.capabilities", json!({})).await;
     assert_eq!(capabilities["discussionAgentMessaging"], 1);
+    assert_eq!(capabilities["discussionReactions"], 1);
     let subscription = wss_rpc(
         &mut sub,
         1,
         "events.subscribe",
         json!({
-            "workspaceId":workspace, "eventTypes":["discussion:message", "agent:*"]
+            "workspaceId":workspace, "eventTypes":["discussion:message", "discussion:reaction", "agent:*"]
         }),
     )
     .await;
@@ -745,6 +749,26 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     assert_eq!(output["older"]["messages"].as_array().unwrap().len(), 1);
     assert_eq!(output["older"]["messages"][0]["body"], ORDINARY);
     assert_eq!(output["older"]["hasMore"], false);
+    assert_eq!(output["reaction"], output["reactionRetry"]);
+    assert_eq!(output["reaction"]["reactionVersion"], 1);
+    assert_eq!(
+        output["reaction"]["reactions"],
+        json!([{"reaction":"👀","count":1,"reacted":true,"reactors":[{"principalId":null,"agentId":target,"login":null,"displayName":"Addressed agent","avatarUrl":null}]}])
+    );
+    assert_eq!(
+        output["reactedPage"]["messages"][0]["reactions"],
+        output["reaction"]["reactions"]
+    );
+    let reaction_events: Vec<_> = events
+        .iter()
+        .filter(|e| e["type"] == "discussion:reaction" || e["eventType"] == "discussion:reaction")
+        .collect();
+    assert_eq!(reaction_events.len(), 1, "no-op must not emit: {events:?}");
+    assert_eq!(reaction_events[0]["data"]["reactions"][0]["reacted"], false);
+    assert_eq!(
+        reaction_events[0]["data"]["reactions"][0]["reactors"][0]["agentId"],
+        target
+    );
     let reply = &output["reply"]["message"];
     assert_eq!(reply["body"], REPLY);
     assert_eq!(reply["recipientAgentIds"], json!([relay]));
@@ -834,6 +858,8 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     let retry = wss_rpc(&mut rpc, 12, "discussion.send", request).await;
     let mut original = sent["message"].clone();
     original["agentActivity"] = retry["message"]["agentActivity"].clone();
+    original["reactions"] = json!([{"reaction":"👀","count":1,"reacted":false,"reactors":[{"principalId":null,"agentId":target,"login":null,"displayName":"Addressed agent","avatarUrl":null}]}]);
+    original["reactionVersion"] = json!(1);
     assert_eq!(
         retry["message"], original,
         "retry preserves every immutable message field"

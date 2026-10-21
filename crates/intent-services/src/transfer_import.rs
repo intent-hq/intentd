@@ -1374,8 +1374,10 @@ fn transform_rows(
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;
                     map.insert("principal_id".into(), serde_json::Value::Null);
-                    if table == "workspace_discussion_message" {
+                    if table == "workspace_discussion_message" || table == "discussion_reaction" {
                         map.insert("agent_id".into(), serde_json::Value::Null);
+                    }
+                    if table == "workspace_discussion_message" {
                         map.insert("agent_activity_json".into(), serde_json::json!("[]"));
                     }
                 }
@@ -1728,6 +1730,12 @@ mod tests {
                 ],
             ),
             (
+                "discussion_reaction".into(),
+                vec![
+                    serde_json::json!({"principal_id":null,"agent_id":"source-agent","author_json":author.to_string()}),
+                ],
+            ),
+            (
                 "discussion_agent_grant".into(),
                 vec![serde_json::json!({"agent_id":"source-agent"})],
             ),
@@ -1753,6 +1761,14 @@ mod tests {
             .find(|(name, _)| name == "workspace_discussion_message")
             .unwrap()
             .1[0];
+        let reaction = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "discussion_reaction")
+            .unwrap()
+            .1[0];
+        assert!(reaction["agent_id"].is_null() && reaction["principal_id"].is_null());
+        assert_eq!(reaction["author_json"], author.to_string());
         assert!(message["agent_id"].is_null());
         assert_eq!(message["author_json"], author.to_string());
         assert_eq!(
@@ -1905,6 +1921,7 @@ mod tests {
             .discussion_reaction_state(&ws(), "default", &original.id, &local.id)
             .await
             .unwrap();
+        assert_eq!(inert.reactions[0].reactors, original.reactions[0].reactors);
         assert_eq!(inert.reactions[0].count, 1);
         assert!(!inert.reactions[0].reacted);
         let (removed, changed) = service
@@ -1920,6 +1937,11 @@ mod tests {
             .await
             .unwrap();
         assert!(changed);
+        assert_eq!(added.reactions[0].reactors.len(), 2);
+        assert_eq!(
+            added.reactions[0].reactors[0],
+            inert.reactions[0].reactors[0]
+        );
         assert_eq!(added.reactions[0].count, 2);
         assert!(added.reactions[0].reacted);
         assert_eq!(added.reaction_version, 2);

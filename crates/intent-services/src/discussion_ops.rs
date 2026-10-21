@@ -1,7 +1,7 @@
 //! Explicitly addressed workspace discussions; all transports share these gates.
 use intent_core::discussion::{
-    DiscussionAuthor, DiscussionSendResult, DiscussionTarget, DEFAULT_CONVERSATION,
-    DISCUSSION_BODY_MAX_BYTES, DISCUSSION_RECIPIENT_MAX,
+    DiscussionActor, DiscussionAuthor, DiscussionSendResult, DiscussionTarget,
+    DEFAULT_CONVERSATION, DISCUSSION_BODY_MAX_BYTES, DISCUSSION_RECIPIENT_MAX,
 };
 use intent_core::events::{DISCUSSION_MESSAGE, DISCUSSION_REACTION};
 use intent_core::{
@@ -78,13 +78,13 @@ impl Services {
     ) -> Result<Value> {
         let principal = if let Some(Caller::Agent { agent_id }) = current_caller() {
             self.discussion_agent_access(ws, id, &agent_id).await?;
-            None
+            DiscussionActor::Agent(agent_id)
         } else {
-            Some(self.discussion_access(ws, id).await?)
+            DiscussionActor::Human(self.discussion_access(ws, id).await?)
         };
         let page = self
             .store
-            .list_discussion_messages_for(ws, id, before, after, limit, principal.as_ref())
+            .list_discussion_messages_for(ws, id, before, after, limit, Some(&principal))
             .await?;
         let conversation = self.store.discussion_conversation(ws, id).await?;
         Ok(json!({"messages":page.messages,"hasMore":page.has_more,"conversation":conversation}))
@@ -285,14 +285,19 @@ impl Services {
             self.retry_pending_discussion_message(&result.message)
                 .await?;
         }
-        if let Some(principal) = author.principal_id.as_ref() {
+        let viewer = author
+            .principal_id
+            .clone()
+            .map(DiscussionActor::Human)
+            .or_else(|| author.agent_id.clone().map(DiscussionActor::Agent));
+        if let Some(viewer) = viewer {
             let state = self
                 .store
-                .discussion_reaction_state(
+                .discussion_actor_reaction_state(
                     workspace_id,
                     &result.message.conversation_id,
                     &result.message.id,
-                    principal,
+                    &viewer,
                 )
                 .await?;
             result.message.reactions = state.reactions;
@@ -325,10 +330,13 @@ impl Services {
         reaction: &str,
         active: bool,
     ) -> Result<intent_core::discussion::DiscussionReactionState> {
-        let principal = self.discussion_access(ws, conversation).await?;
+        let actor = match current_caller() {
+            Some(Caller::Agent { agent_id }) => DiscussionActor::Agent(agent_id),
+            _ => DiscussionActor::Human(self.discussion_access(ws, conversation).await?),
+        };
         let (state, changed) = self
             .store
-            .set_discussion_reaction(ws, conversation, message, &principal, reaction, active)
+            .set_discussion_actor_reaction(ws, conversation, message, &actor, reaction, active)
             .await?;
         if changed {
             // Only the target identity crosses the bus. Delivery projects the
@@ -340,7 +348,10 @@ impl Services {
                     timestamp: intent_core::now_iso(),
                     event_type: DISCUSSION_REACTION.into(),
                     actor: EventActor {
-                        actor_type: ActorType::User,
+                        actor_type: match actor {
+                            DiscussionActor::Human(_) => ActorType::User,
+                            DiscussionActor::Agent(_) => ActorType::Agent,
+                        },
                         ..EventActor::default()
                     },
                     session_id: None,
