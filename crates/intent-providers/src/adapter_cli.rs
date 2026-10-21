@@ -28,6 +28,16 @@ pub struct BundledCli {
 }
 
 impl BundledCli {
+    /// An exact stable package version, e.g. `("@openai/codex", "0.160.1")`.
+    #[must_use]
+    pub fn new(package: &str, version: &str) -> Option<Self> {
+        let version = Version::parse(version).ok()?;
+        exact_stable(&version).then(|| Self {
+            package: package.to_owned(),
+            version,
+        })
+    }
+
     /// The exact npm spec, e.g. `@openai/codex@0.160.1`.
     #[must_use]
     pub fn spec(&self) -> String {
