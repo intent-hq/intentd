@@ -127,6 +127,7 @@ use crate::cli::Channel;
 use crate::config::{self, ChannelOrigin, ResolvedChannel};
 use crate::paths::SitterPaths;
 use crate::state;
+use crate::telemetry::{CheckTrigger, UpdateEndpoint};
 use crate::updater::{UpdateError, UpdateOutcome, Updater};
 
 /// Env override for the channel-manifest base URL — exactly one base, no
@@ -439,9 +440,10 @@ pub fn run(
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     base_urls: Vec<String>,
+    endpoint: Option<UpdateEndpoint>,
 ) -> i32 {
     let updater = match Updater::with_base_urls(paths.clone(), base_urls) {
-        Ok(updater) => Arc::new(updater),
+        Ok(updater) => Arc::new(updater.with_update_endpoint(endpoint)),
         Err(e) => {
             eprintln!("intentd-sitter: {e}");
             return 1;
@@ -546,7 +548,7 @@ impl Supervisor {
             // Signal handlers are already installed for PID discovery. Keep
             // consuming them while network I/O is in flight, so service stop
             // never waits for a manifest/download timeout or spawns a child.
-            let check = self.check();
+            let check = self.check(CheckTrigger::Periodic);
             tokio::pin!(check);
             let startup = loop {
                 tokio::select! {
@@ -910,7 +912,7 @@ impl Supervisor {
                         break; // respawn (possibly a new version after SIGHUP)
                     }
                     () = tokio::time::sleep_until(next_check_at), if supervised => {
-                        match self.check().await {
+                        match self.check(CheckTrigger::Periodic).await {
                             Ok(UpdateOutcome::Installed { version, previous }) => {
                                 eprintln!(
                                     "intentd-sitter: installed intentd {version} (was {}); restarting daemon",
@@ -1091,10 +1093,10 @@ impl Supervisor {
     /// One blocking update check on the blocking pool (the updater's HTTP
     /// client is blocking; never run it on the async runtime). Re-resolves
     /// the channel from `config.toml` first unless flag/env pinned it.
-    async fn check(&self) -> Result<UpdateOutcome, UpdateError> {
+    async fn check(&self, trigger: CheckTrigger) -> Result<UpdateOutcome, UpdateError> {
         let updater = Arc::clone(&self.updater);
         let channel = effective_channel(self.channel, &self.paths.config_path);
-        tokio::task::spawn_blocking(move || updater.check_and_install(channel))
+        tokio::task::spawn_blocking(move || updater.check_and_install(channel, trigger))
             .await
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
     }
@@ -1157,7 +1159,7 @@ impl Supervisor {
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> FailedStartCheck {
-        let check = self.check();
+        let check = self.check(CheckTrigger::Periodic);
         tokio::pin!(check);
         #[cfg_attr(
             windows,
@@ -1243,7 +1245,11 @@ impl Supervisor {
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> CheckNowOutcome {
-        let check = self.check();
+        let trigger = match style {
+            RestartStyle::Now => CheckTrigger::Manual,
+            RestartStyle::WhenIdle => CheckTrigger::Idle,
+        };
+        let check = self.check(trigger);
         tokio::pin!(check);
         let outcome = loop {
             tokio::select! {

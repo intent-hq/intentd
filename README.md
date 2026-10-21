@@ -101,6 +101,18 @@ directly.
 > [intent-hq/intentd-releases README](https://github.com/intent-hq/intentd-releases#readme);
 > keep the two in sync when editing this section.
 
+**Anonymous update statistics.** The sitter fetches each channel manifest through
+`https://updates.intentapp.dev/channel/<channel>.json` first. The request carries
+only the target triple, sitter version, install source (`brew` / `deb` / `script` /
+`windows` / `unknown`), check trigger, and a once-per-UTC-day flag (from a date in
+`state.json`); no IDs are sent and the IP is not stored. The endpoint answers with a
+redirect, and the sitter accepts only the official
+`github.com/intent-hq/{intentd-releases,intentd}` channel asset (then GitHub's asset
+hosts), so manifests always come from GitHub. Any failure — down, 404, slow, or an
+unexpected redirect — falls back to GitHub directly. To opt out, set
+`DO_NOT_TRACK=1` or `INTENTD_DISABLE_TELEMETRY=1`, or add `telemetry = false` to
+`<data-dir>/sitter/config.toml` (kept when `intentd sitter channel` rewrites the pin).
+
 ### Requirements
 
 The daemon expects a few tools on the host it runs on:

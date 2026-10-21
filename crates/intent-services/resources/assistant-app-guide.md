@@ -90,6 +90,18 @@ suggest an Apple Silicon build for an Intel Mac.
 
 <!-- Sources: packages/cloudlands-fe/src/features/auto-update/main/{auto-update.service.ts,mac-update-compatibility.ts}; packages/cloudlands-fe/scripts/mac-channel-feeds.mjs; packages/intentd/scripts/optional-intel-release.py; packages/intentd/crates/intentd-sitter/src/updater.rs. -->
 
+## Anonymous update statistics
+
+Update checks go through `updates.intentapp.dev`, which counts them (platform,
+version, channel, install source, check trigger, country; no IDs, IPs not stored)
+and redirects to the GitHub release; if it is unreachable, updates come straight
+from GitHub. The desktop app's switch is **Settings → General → Share anonymous
+update statistics** (on by default). For standalone intentd, set `DO_NOT_TRACK=1`,
+`INTENTD_DISABLE_TELEMETRY=1`, or `telemetry = false` in
+`<data-dir>/sitter/config.toml`.
+
+<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,updater.rs,config.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
+
 ## Manage Assistant chats
 
 A new Assistant chat names itself during its first reply; until then the chat list
