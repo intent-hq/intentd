@@ -322,10 +322,12 @@ once the agent reports it stopped. Rows that end on their own disappear too.
 **Connection lost** means Intent can no longer observe the task, so whether it
 is still running is unknown; it is not proof that the task stopped. After the
 app reconnects to Intent, the row returns to **Running** if fresh status shows
-the task still running. If it stays Connection lost, the agent's connection ended, most often
-because an idle agent was closed after **Settings → Advanced → Agent backend →
-Idle reap minutes** (10 by default; Off disables it) or under memory pressure,
-and the task has probably ended with it. Before telling the user it stopped,
+the task still running. If it stays Connection lost, the agent's connection
+ended and the task has probably ended with it. An idle agent stays open while it
+has a running background task: Intent closes it only to free a process slot or
+memory, or once it has been idle about a day past **Settings → Advanced → Agent
+backend → Idle reap minutes** (10 by default; Off disables it). Agents without
+running tasks close after Idle reap minutes. Before telling the user it stopped,
 confirm independently, for example by checking whether the dev server still
 responds. Such a row has no Stop and clears the next time the agent starts.
 Codex and other providers do not report background tasks.
