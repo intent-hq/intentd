@@ -62,7 +62,7 @@ intentd-test-support = { path = "../intentd-test-support" }
 uuid = { workspace = true }
 intent-services = { path = "../intent-services", version = "0.11.22", features = ["repository-test-fixtures"] }
 intent-acp = { path = "../intent-acp", version = "0.11.22" }
-intent-providers = { path = "../intent-providers", version = "0.11.22" }
+intent-providers = { path = "../intent-providers", version = "0.11.22", features = ["test-support"] }
 intent-core = { path = "../intent-core", version = "0.11.22" }
 intent-store = { path = "../intent-store", version = "0.11.22" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice

@@ -400,8 +400,11 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     std::fs::write(
         &cli,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.cli'\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'claude 1.0.0\\n'\n",
-            report.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.cli'\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{}'\n",
+            report.display(),
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            )
         ),
     )
     .expect("write canonical Claude CLI");

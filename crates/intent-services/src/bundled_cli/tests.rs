@@ -67,6 +67,7 @@ async fn first_use_installs_the_exact_spec_and_later_uses_skip_npm() {
     let output = std::process::Command::new(runtime.path()).output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
+        // cli-fixture-version: allow — installer tests use an explicit pin, not the adapter metadata
         "codex-cli 0.160.1"
     );
     let recorded = calls(temp.path());
@@ -152,6 +153,7 @@ async fn incomplete_or_mismatched_copies_are_reinstalled() {
     let output = std::process::Command::new(runtime.path()).output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
+        // cli-fixture-version: allow — installer tests use an explicit pin, not the adapter metadata
         "codex-cli 0.160.1"
     );
     assert_eq!(calls(temp.path()).len(), 1);
@@ -261,6 +263,7 @@ async fn a_copy_another_daemon_completed_meanwhile_is_adopted() {
     let npm = fake_npm(
         temp.path(),
         &format!(
+            // cli-fixture-version: allow — installer tests use an explicit pin, not the adapter metadata
             "d='{dest}'; mkdir -p \"$d/node_modules/.bin\"; printf '#!/bin/sh\\necho \"codex-cli 0.160.1\"\\n' > \"$d/node_modules/.bin/codex\"; chmod 755 \"$d/node_modules/.bin/codex\"; printf '@openai/codex@0.160.1' > \"$d/{READY}\"; echo other > \"$d/owner\"",
             dest = destination.display()
         ),

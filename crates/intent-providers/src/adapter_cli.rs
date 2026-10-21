@@ -231,10 +231,14 @@ mod tests {
             );
         }
         let requirement = from_package(&declared("^0.159.1")).unwrap();
+        // cli-fixture-version: allow — synthetic ^0.159.1 requirement, not the live minimum
         assert_eq!(requirement.version_ok("codex-cli 0.159.0"), Some(false));
+        // cli-fixture-version: allow — synthetic ^0.159.1 requirement, not the live minimum
         assert_eq!(requirement.version_ok("codex-cli 0.159.1"), Some(true));
+        // cli-fixture-version: allow — synthetic ^0.159.1 requirement, not the live minimum
         assert_eq!(requirement.version_ok("codex-cli 0.160.0"), Some(true));
         assert_eq!(
+            // cli-fixture-version: allow — synthetic ^0.159.1 requirement, not the live minimum
             requirement.version_ok("codex-cli 0.159.1-beta.1"),
             Some(false)
         );
@@ -258,13 +262,16 @@ mod tests {
     #[test]
     fn launch_gate_covers_codex_and_claude_and_uses_the_derived_minimum() {
         let minimum = requirement("codex").unwrap().minimum.to_string();
+        // cli-fixture-version: allow — the launch gate rejects an old Codex
         let error = validate_launch_version("codex", "codex-cli 0.114.0").unwrap_err();
         assert!(error.contains("0.114.0") && error.contains(&minimum));
         assert!(error.contains("Codex CLI"), "{error}");
+        // cli-fixture-version: allow — a far-newer Codex passes the launch gate
         for output in [minimum.as_str(), "codex-cli 99.0.0", "unknown"] {
             assert!(validate_launch_version("codex", output).is_ok(), "{output}");
         }
         let claude = requirement("claude-code").unwrap().minimum.to_string();
+        // cli-fixture-version: allow — the launch gate rejects an old Claude
         let error = validate_launch_version("claude-code", "1.0.0 (Claude Code)").unwrap_err();
         assert!(
             error.contains("Claude Code CLI 1.0.0") && error.contains(&claude),
@@ -305,9 +312,11 @@ mod tests {
     #[test]
     fn fallback_only_for_confirmed_old_codex_or_claude() {
         let codex = requirement("codex").unwrap().bundled.unwrap();
+        // cli-fixture-version: allow — old Codex selects the bundled fallback
         assert_eq!(bundled_fallback("codex", "codex-cli 0.114.0"), Some(codex));
         let claude = requirement("claude-code").unwrap().bundled.unwrap();
         assert_eq!(
+            // cli-fixture-version: allow — old Claude selects the bundled fallback
             bundled_fallback("claude-code", "1.0.128 (Claude Code)"),
             Some(claude.clone())
         );
@@ -317,6 +326,7 @@ mod tests {
         );
         assert_eq!(bundled_fallback("claude-code", &patch_lag), None);
         for (provider, output) in [
+            // cli-fixture-version: allow — a far-newer Codex needs no fallback
             ("codex", "codex-cli 99.0.0"),
             ("codex", "unknown"),
             ("claude-code", ""),

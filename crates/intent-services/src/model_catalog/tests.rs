@@ -1429,8 +1429,14 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
         );
         std::fs::write(bin.join("node"), launcher).unwrap();
         std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            )
+        );
         for (name, script) in [
-            ("claude", "#!/bin/sh\nprintf '99.0.0 (Claude Code)\\n'\n"),
+            ("claude", claude.as_str()),
             (
                 "npx",
                 r"#!/usr/bin/env node

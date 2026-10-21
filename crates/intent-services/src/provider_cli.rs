@@ -131,8 +131,10 @@ mod tests {
         let minimum = requirement.minimum.to_string();
         let path = std::path::Path::new("/selected/codex");
         for (version, expected) in [
+            // cli-fixture-version: allow — discovery reports an old Codex
             (Some("codex-cli 0.0.1"), Some(false)),
             (Some(minimum.as_str()), Some(true)),
+            // cli-fixture-version: allow — discovery reports a far-newer Codex as current
             (Some("codex-cli 99.0.0"), Some(true)),
             (Some("unknown"), None),
             (None, None),
@@ -173,6 +175,7 @@ mod tests {
             "claude-code",
             &requirement,
             Some(path),
+            // cli-fixture-version: allow — discovery reports the bundled CLI for an old Claude
             Some("1.0.128 (Claude Code)"),
         );
         assert_eq!(row["cliCommand"], "claude");
@@ -194,6 +197,7 @@ mod tests {
     fn providers_without_a_bundled_launch_never_report_one() {
         let requirement = requirement("codex").unwrap();
         let mut row = Map::new();
+        // cli-fixture-version: allow — non-Codex/Claude rows ignore the version
         apply_version_fields(&mut row, "pi", &requirement, None, Some("codex-cli 0.0.1"));
         assert_eq!(row["cliVersionOk"], false);
         assert!(!row.contains_key("cliBundledVersion"));
