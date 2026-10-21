@@ -10617,11 +10617,7 @@ mod change_event_parity {
         assert_eq!(second.id.0, first.id.0, "replay returns the original note");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -10943,11 +10939,8 @@ mod change_event_parity {
     /// batches into one ordered list of wire-JSON envelopes.
     async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(400)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
         {
             for ev in batch {
                 out.push(serde_json::to_value(&ev).expect("serialize event"));
@@ -12050,11 +12043,7 @@ mod change_event_parity {
         assert_eq!(comments.len(), 1, "replay must not duplicate the comment");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -12107,11 +12096,7 @@ mod change_event_parity {
             json!({ "noteId": "n-1", "commentId": reply.comment.id })
         );
         // Cardinality exactly 1: no additional publishes fire.
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "comment.respond must publish exactly one event, got extra: {quiet:?}"
@@ -12470,11 +12455,7 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "archive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -12610,11 +12591,7 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         // Store: only the owner row survives; the invite is closed.
@@ -12704,11 +12681,7 @@ mod change_event_parity {
             .expect("invites");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, invite.id);
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "a rolled-back archive publishes nothing: {quiet:?}"
@@ -12790,11 +12763,7 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(ev["data"]["changes"]["archived"], true);
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12885,11 +12854,7 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12970,11 +12935,7 @@ mod change_event_parity {
             let ws = h.ws.clone();
             async move { svc.unarchive_workspace(ws).await }
         });
-        let pending = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            &mut unarchive,
-        )
-        .await;
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut unarchive).await;
         assert!(
             pending.is_err(),
             "unarchive must stay fenced behind the archive tail"
@@ -13062,22 +13023,19 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            async {
-                loop {
-                    let batch = sub.recv().await.expect("subscription open");
-                    for ev in batch {
-                        let ev = serde_json::to_value(&ev).expect("serialize event");
-                        if ev["type"] == "workspace:updated"
-                            && ev["data"]["changes"].get("archived").is_some()
-                        {
-                            return ev;
-                        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
                     }
                 }
-            },
-        )
+            }
+        })
         .await;
         assert!(
             quiet.is_err(),
@@ -13163,11 +13121,7 @@ mod change_event_parity {
                 .await
             }
         });
-        let pending = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            &mut update,
-        )
-        .await;
+        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
         assert!(
             pending.is_err(),
             "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
@@ -13263,22 +13217,19 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            async {
-                loop {
-                    let batch = sub.recv().await.expect("subscription open");
-                    for ev in batch {
-                        let ev = serde_json::to_value(&ev).expect("serialize event");
-                        if ev["type"] == "workspace:updated"
-                            && ev["data"]["changes"].get("archived").is_some()
-                        {
-                            return ev;
-                        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let batch = sub.recv().await.expect("subscription open");
+                for ev in batch {
+                    let ev = serde_json::to_value(&ev).expect("serialize event");
+                    if ev["type"] == "workspace:updated"
+                        && ev["data"]["changes"].get("archived").is_some()
+                    {
+                        return ev;
                     }
                 }
-            },
-        )
+            }
+        })
         .await;
         assert!(
             quiet.is_err(),
@@ -13465,11 +13416,7 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -13569,11 +13516,7 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "auto-unarchive must publish exactly one event, got extra: {quiet:?}"
@@ -13597,11 +13540,7 @@ mod change_event_parity {
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
         assert!(!flipped, "no flip on an active workspace");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "active workspace must emit nothing, got: {quiet:?}"
@@ -13626,11 +13565,7 @@ mod change_event_parity {
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
         assert!(!flipped, "a failed read reports no flip");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "failed read must emit nothing, got: {quiet:?}"
@@ -13664,11 +13599,7 @@ mod change_event_parity {
             .expect("losing racer still succeeds");
         assert!(!flipped, "the losing racer must not claim the flip");
         assert!(!ws.archived, "the returned row reflects the Active state");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "the losing racer must emit nothing, got: {quiet:?}"
@@ -14913,11 +14844,7 @@ mod change_event_parity {
         );
 
         // No further events are published (the replay short-circuits the op).
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -15120,11 +15047,7 @@ mod change_event_parity {
         assert_eq!(ev["data"]["title"], "Spec");
 
         // No further events fire — reseed publishes exactly once.
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "reseed must publish exactly one event, got extra: {quiet:?}"
@@ -15151,11 +15074,7 @@ mod change_event_parity {
         let event = recv_one(&mut sub).await;
         assert_envelope(&event, &h.ws.0, "note:created");
         assert_eq!(event["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
 
         let versions = h
@@ -15214,11 +15133,7 @@ mod change_event_parity {
         assert_eq!(spec_row.created_at, spec_before.created_at);
 
         // No further events fire for the untouched-spec list call.
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "list must not publish for existing spec");
 
         // Version count unchanged.
@@ -15296,11 +15211,7 @@ mod change_event_parity {
             other => panic!("expected NotFound, got: {other:?}"),
         }
 
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             none.is_err(),
             "unknown-workspace list must not publish a reseed event"
@@ -15355,11 +15266,7 @@ mod change_event_parity {
             "expected workspace NotFound, got: {err:?}"
         );
 
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             none.is_err(),
             "deleted-workspace list must not publish a reseed event"
@@ -15379,11 +15286,7 @@ mod change_event_parity {
         let notes = h.services.list_notes(&chief).await.expect("list");
         assert!(notes.is_empty());
 
-        let none = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
@@ -15619,11 +15522,7 @@ mod change_event_parity {
         // Idempotency: a second `note.list` is a no-op — no further events,
         // no additional version snapshots.
         let _ = h.services.list_notes(&h.ws).await.expect("list again");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
             "second list must not republish after adoption"
@@ -15682,11 +15581,7 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "no adoption events on ambiguous fallback");
     }
 
@@ -15796,11 +15691,7 @@ mod change_event_parity {
             .expect("stray present");
         assert_eq!(stray_now.content, "stray body");
 
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(quiet.is_err(), "healthy workspace must not fire adoption");
     }
 
@@ -33217,11 +33108,8 @@ mod known_repo {
         for _ in 0..100 {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
-            if let Ok(Some(batch)) = tokio::time::timeout(
-                intentd_test_support::test_timeout(tokio::time::Duration::from_millis(10)),
-                sub.recv(),
-            )
-            .await
+            if let Ok(Some(batch)) =
+                tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await
             {
                 for evt in batch {
                     if evt.event_type == "workspace:updated"
@@ -35758,11 +35646,7 @@ mod setup_lifecycle_events {
     }
 
     async fn assert_quiet(sub: &mut Subscription) {
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
     }
 
@@ -38468,11 +38352,8 @@ mod initial_agent_orchestration {
     /// quiet, flattening batches into one ordered list of event types.
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(400)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -38881,11 +38762,8 @@ mod clone_orchestration {
 
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(400)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -39570,11 +39448,8 @@ mod clone_orchestration {
     /// Drain the subscription and return the full `git:clone:*` events.
     async fn drain_clone_frames(sub: &mut crate::Subscription) -> Vec<intent_core::Event> {
         let mut frames = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(400)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
         {
             for ev in batch {
                 if ev.event_type.starts_with("git:clone:") {
@@ -43015,12 +42890,9 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(200)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
             "no idle event on the suppressed-fire path"
         );
     }
@@ -43095,12 +42967,9 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(200)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .is_err(),
             "no idle event for a deleted workspace"
         );
     }
@@ -43171,12 +43040,7 @@ mod last_activity_events {
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while let Ok(Some(batch)) = timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(50)),
-            sub.recv(),
-        )
-        .await
-        {
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
                 assert_eq!(
@@ -43194,12 +43058,9 @@ mod last_activity_events {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(50)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no event on idempotent dismiss"
         );
     }
@@ -43264,8 +43125,7 @@ mod last_activity_events {
         // No second workspace:updated (coalesced) within a quiet window after
         // the first. One absolute deadline bounds the whole window, so a
         // stream of unrelated events cannot keep extending it.
-        let quiet_until = tokio::time::Instant::now()
-            + intentd_test_support::test_timeout(Duration::from_millis(100));
+        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
         while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
@@ -43610,12 +43470,9 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(50)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "token recompute must not emit a lastActivity workspace:updated"
         );
 
@@ -43631,12 +43488,9 @@ mod last_activity_events {
         // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(50)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no event on idempotent token scan"
         );
     }
@@ -43982,12 +43836,9 @@ mod last_activity_events {
 
         // No idle event should have been emitted.
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(50)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no idle event when re-begin cancels the debounce"
         );
 
@@ -44019,12 +43870,9 @@ mod last_activity_events {
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(20)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(20), sub.recv())
+                .await
+                .is_err(),
             "no idle event before debounce window expires"
         );
 
@@ -44034,13 +43882,10 @@ mod last_activity_events {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let mut events = Vec::new();
         while events.len() < 2 {
-            let batch = timeout(
-                intentd_test_support::test_timeout(Duration::from_secs(2)),
-                sub.recv(),
-            )
-            .await
-            .expect("debounced events delivered")
-            .expect("subscription open");
+            let batch = timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("debounced events delivered")
+                .expect("subscription open");
             for ev in &batch {
                 events.push(serde_json::to_value(ev).expect("serialize event"));
             }
@@ -44077,12 +43922,9 @@ mod last_activity_events {
 
         // No duplicate events.
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(50)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(50), sub.recv())
+                .await
+                .is_err(),
             "no duplicate idle event"
         );
     }
@@ -45056,12 +44898,9 @@ mod turn_token_usage {
             .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(100)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
             "no event when the tally is unchanged"
         );
     }
@@ -45149,12 +44988,9 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "zero recount must not overwrite the live tally");
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(100)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
             "no event when the guard skips the write"
         );
         let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -45247,12 +45083,9 @@ mod turn_token_usage {
             .persist_turn_token_usage(&AgentId::new(), &h.ws, Some(&acp_usage(1, 1, 0, 0)), None)
             .await;
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(100)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
             "no event when the session row is absent"
         );
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -45435,12 +45268,9 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "scan agrees with the live tally");
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(100)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .is_err(),
             "no event when scan matches the live tally"
         );
         let scanned = h
@@ -45769,12 +45599,7 @@ mod turn_token_usage {
         // Every emitted event carries a committed snapshot value — never a
         // torn/mixed aggregate.
         let mut seen = 0usize;
-        while let Ok(Some(batch)) = timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            sub.recv(),
-        )
-        .await
-        {
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(200), sub.recv()).await {
             for ev in batch {
                 let data = serde_json::to_value(&ev).expect("serialize event");
                 let input = data["data"]["tokenUsage"]["totals"]["inputTokens"]
@@ -48889,11 +48714,8 @@ mod agent_delete_grace_window {
         // The cascade emits `agent:deleted` + `workspace:deleted`; no
         // `agent:delete-cancelled` sneaks in.
         let mut seen = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(500)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
         {
             for ev in batch {
                 seen.push(serde_json::to_value(&ev).expect("serialize"));
@@ -49649,11 +49471,7 @@ mod derived_workspace_unread {
     }
 
     async fn assert_silent(sub: &mut Subscription) {
-        let res = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no attention event: {res:?}");
     }
 

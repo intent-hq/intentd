@@ -1869,12 +1869,9 @@ mod tests {
         let again = add(&f.outsider).await.expect("add again");
         assert_eq!(again, json!({ "added": false, "memberCount": 4 }));
         assert!(
-            tokio::time::timeout(
-                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
-                events.recv()
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
             "an idempotent add publishes nothing"
         );
 
@@ -1893,12 +1890,9 @@ mod tests {
             "{seated_revoked:?}"
         );
         assert!(
-            tokio::time::timeout(
-                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
-                events.recv()
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
+                .await
+                .is_err(),
             "a refused add publishes nothing"
         );
         assert_eq!(

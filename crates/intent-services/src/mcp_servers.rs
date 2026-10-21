@@ -3759,12 +3759,9 @@ for line in sys.stdin:
         assert_eq!(now["state"], json!("running"));
         assert_eq!(now["startedAt"], started_at);
         assert!(
-            tokio::time::timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(300)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(Duration::from_millis(300), sub.recv())
+                .await
+                .is_err(),
             "no event on an unchanged state"
         );
     }
@@ -4356,12 +4353,9 @@ for line in sys.stdin:
         assert_eq!(result["content"][0]["text"], json!("ok"));
         // An answered call is followed by nothing — no stray cancel.
         let mut extra = String::new();
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            reader.read_line(&mut extra),
-        )
-        .await
-        .is_err();
+        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
+            .await
+            .is_err();
         assert!(quiet, "unexpected line after the answered call: {extra}");
     }
 

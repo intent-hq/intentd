@@ -1748,11 +1748,7 @@ async fn manager_native_shutdown_case(positive: bool, cancel: bool, lost: bool) 
     }
     // A bounded held-peer window observes the actual shutdown future, not just
     // the allocation's independently driven retirement task.
-    let early = tokio::time::timeout(
-        intentd_test_support::test_timeout(std::time::Duration::from_millis(100)),
-        &mut shutdown,
-    )
-    .await;
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
     let returned_early = early.is_ok();
     release.send(()).unwrap();
     let result = match early {
@@ -2016,12 +2012,9 @@ async fn manager_shutdown_retains_pending_native_startup_until_original_response
     let manager = f.manager.clone();
     let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
     assert!(
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(std::time::Duration::from_millis(100)),
-            &mut shutdown
-        )
-        .await
-        .is_err(),
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
         "shutdown lost pending producer"
     );
     assert!(connection.is_alive());

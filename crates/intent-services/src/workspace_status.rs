@@ -4253,11 +4253,7 @@ mod display_status_events {
     }
 
     async fn assert_silent(sub: &mut Subscription) {
-        let res = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }
 

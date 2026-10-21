@@ -343,12 +343,7 @@ async fn acquire_queues_until_a_process_goes_idle() {
     let reg2 = reg.clone();
     let acquired = tokio::spawn(async move { reg2.acquire(&b, claim_all, release_none).await });
     // All processes active → the acquire must block.
-    assert!(timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(50)),
-        async {}
-    )
-    .await
-    .is_ok());
+    assert!(timeout(Duration::from_millis(50), async {}).await.is_ok());
     assert!(!acquired.is_finished(), "acquire blocks while all active");
 
     // Becoming idle wakes the queued spawn, which evicts `a` and proceeds.
@@ -639,13 +634,13 @@ async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("over-budget tree with host headroom admits the spawn");
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -738,7 +733,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -747,7 +742,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -781,7 +776,7 @@ async fn budget_is_off_by_default_and_inert_before_the_first_sample() {
         reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
 
         timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            Duration::from_millis(200),
             reg.acquire(&b, claim_all, release_none),
         )
         .await
@@ -993,7 +988,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     for n in 0..6 {
         let id = AgentId::from(format!("burst-{n}").as_str());
         if timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            Duration::from_millis(50),
             reg.acquire(&id, claim_all, release_none),
         )
         .await
@@ -1017,7 +1012,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     probe.set(gb);
     let next = AgentId::from("after-fresh-sample");
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        Duration::from_millis(50),
         reg.acquire(&next, claim_all, release_none),
     )
     .await
@@ -1038,7 +1033,7 @@ async fn deregister_credits_back_the_provisional_charge() {
 
     let first = AgentId::from("first");
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        Duration::from_millis(50),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -1051,7 +1046,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     let second = AgentId::from("second");
     assert!(
         timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            Duration::from_millis(50),
             reg.acquire(&second, claim_all, release_none),
         )
         .await
@@ -1063,7 +1058,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     // back rather than waiting a full sampling period for the truth.
     reg.deregister(&first);
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        Duration::from_millis(50),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -1374,14 +1369,14 @@ async fn turn_start_never_gates_active_or_unregistered_agents() {
     reg.mark_active(&busy);
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire_turn_start(&busy, claim_all, release_none),
     )
     .await
     .expect("an active process is never gated mid-turn");
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire_turn_start(&AgentId::from("unregistered"), claim_all, release_none),
     )
     .await
@@ -1673,13 +1668,13 @@ async fn immediate_admission_emits_no_process_events() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("under budget with a slot free admits immediately");
     timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        Duration::from_millis(200),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -2276,12 +2271,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect the eviction event with bounded wait (event emission is async).
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            sub.recv(),
-        )
-        .await
-        {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
@@ -2379,12 +2369,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect queue event with bounded wait (event emission is async).
     let mut queue_event = None;
     for _ in 0..50 {
-        match timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            sub.recv(),
-        )
-        .await
-        {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
@@ -2420,12 +2405,7 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect resume event with bounded wait (event emission is async).
     let mut resume_event = None;
     for _ in 0..50 {
-        match timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            sub.recv(),
-        )
-        .await
-        {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
@@ -3064,12 +3044,7 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
     // The eviction is observable: agent:process:evicted with reason idle-ttl.
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            sub.recv(),
-        )
-        .await
-        {
+        match timeout(Duration::from_millis(100), sub.recv()).await {
             Ok(Some(batch)) => {
                 if let Some(ev) = batch
                     .into_iter()
@@ -3356,12 +3331,7 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     assert!(after.archived_at.is_none());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let delta = events
@@ -8380,12 +8350,7 @@ async fn terminal_failure_events_carry_turn_id() {
     .await;
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let failed = events
@@ -8413,12 +8378,7 @@ async fn terminal_failure_events_carry_turn_id() {
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     for ty in ["agent:failed", "agent:stream:end"] {
@@ -8503,12 +8463,7 @@ async fn quota_failed_payload(
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     events
@@ -8696,12 +8651,7 @@ async fn terminal_failure_persists_error_before_publishing_events() {
     handler.await.unwrap();
 
     // Wire order is unchanged by the persist reorder.
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let order: Vec<&str> = events
@@ -8850,12 +8800,7 @@ async fn drain_emits_queue_processing_with_turn_id() {
     .expect("drained turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let processing = events
@@ -9237,12 +9182,7 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9327,12 +9267,7 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9388,13 +9323,7 @@ async fn wedged_connection() -> (
                 let probe = tokio::spawn(async move {
                     let _ = conn.notify("wedge/probe", payload).await;
                 });
-                if timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(100)),
-                    probe,
-                )
-                .await
-                .is_err()
-                {
+                if timeout(Duration::from_millis(100), probe).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -9414,12 +9343,7 @@ async fn wedged_connection() -> (
         let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
     });
     assert!(
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(500)),
-            confirm
-        )
-        .await
-        .is_err(),
+        timeout(Duration::from_millis(500), confirm).await.is_err(),
         "saturation loop broke early: the confirming notify still found channel capacity"
     );
     (conn, agent_r, agent_w)
@@ -9494,12 +9418,7 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     assert!(found, "interrupt finds the live agent");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9602,12 +9521,7 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     assert!(result["messageId"].is_string());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9666,12 +9580,7 @@ async fn interrupt_kills_child_for_provider_with_kill_quirk() {
     // The terminal stream:end is still emitted (the teardown happens after
     // the cancel, before the terminal emits — same shape as keep-alive).
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9761,12 +9670,7 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
 
     // The terminal stream:end mirrors both fields.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let end = events
@@ -9885,12 +9789,7 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let end = events
@@ -9974,12 +9873,7 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -10076,12 +9970,7 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -10257,11 +10146,7 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     .expect("retirement fences the target");
     // Before the fix this finishes teardown while startup is paused. After
     // the fix retirement waits for startup, then balances its activity edge.
-    let early_retirement = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(100)),
-        &mut retiring,
-    )
-    .await;
+    let early_retirement = timeout(Duration::from_millis(100), &mut retiring).await;
     pause.resume.notify_one();
     let admission = starting.await.unwrap().unwrap();
     match early_retirement {
@@ -12033,12 +11918,7 @@ async fn preemption_by_agent_sender_without_name_omits_name_field() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let end = events
@@ -12141,12 +12021,7 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
             break;
         }
     }
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -13182,12 +13057,7 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -13276,12 +13146,7 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     assert!(archived.archived, "workspace archived");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let interrupted: Vec<&str> = events
@@ -13638,12 +13503,7 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
 
     // No workspace:updated unarchive delta was published.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     assert!(
@@ -13816,12 +13676,7 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
     assert_eq!(row.status, WorkspaceStatus::Active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     assert!(
@@ -14171,12 +14026,7 @@ async fn try_begin_persists_active_status_and_emits_event() {
     assert!(stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let status_event = events
@@ -14207,12 +14057,7 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert!(!stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let status_event = events
@@ -15082,12 +14927,7 @@ async fn send_message_direct_response_and_user_echo_carry_turn_id() {
     .expect("direct turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let echo = events
@@ -16191,12 +16031,7 @@ async fn drain_persist_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     assert!(
@@ -16248,12 +16083,7 @@ async fn terminal_turn_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     assert!(
@@ -16354,12 +16184,9 @@ async fn wake_delivery_fails_closed_when_session_lookup_fails() {
         "the pre-existing queue entry survives (only NotFound drops the queue)"
     );
     assert!(
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(200)),
-            events.recv()
-        )
-        .await
-        .is_err(),
+        timeout(Duration::from_millis(200), events.recv())
+            .await
+            .is_err(),
         "nothing is published under the caller's (or any) workspace"
     );
 }
@@ -16846,12 +16673,7 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(
     // The user-row echo for the delivered message is scoped to the target's
     // home workspace, never the sender's.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let echo = events
@@ -17049,12 +16871,7 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -17170,12 +16987,7 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     // until quiet — pre-fix the turn started and the mock agent's response
     // chunk reached subscribers before the terminal failure parked the agent.
     let mut streamed_chunks = 0;
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
             if ev.event_type == intent_core::events::CHAT_STREAM_DELTA {
                 streamed_chunks += 1;
@@ -17425,12 +17237,7 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     // No user-visible failure surfaced for the redriven attempt.
     let mut saw_failed = false;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => saw_failed = true,
@@ -17567,12 +17374,7 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
 
     let mut failed_payloads = Vec::new();
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed_payloads.push(ev.data["error"].clone()),
@@ -17736,12 +17538,7 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
     // the first attempt stayed silent) — the STAB-6 Retry surface intact.
     let mut failed = 0;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed += 1,
@@ -17841,12 +17638,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
 
     // No failure surface anywhere in the sequence.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     assert!(
@@ -18011,12 +17803,7 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
     // Exactly one agent:failed (the worker's cap-exceeded emit) and it names
     // the idle timeout.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let failed: Vec<_> = events
@@ -18116,12 +17903,7 @@ async fn send_message_direct_branch_emits_agent_message_with_row_id() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
     }
     let msg_event = events
@@ -19462,12 +19244,7 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(100)),
-        sub.recv(),
-    )
-    .await
-    {
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
         events.extend(batch);
     }
     for kind in ["agent:failed", "agent:stream:end"] {
@@ -21795,12 +21572,7 @@ mod draining_overlay_tests {
 
     async fn drain_bus(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await
-        {
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
             events.extend(batch);
         }
         events
@@ -22831,17 +22603,14 @@ mod harness_wake_tests {
             .await;
             assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(500)),
-                    async {
-                        loop {
-                            let events = sub.recv().await.unwrap();
-                            if events.iter().any(|e| e.event_type == "agent:stream:end") {
-                                return;
-                            }
+                timeout(Duration::from_millis(500), async {
+                    loop {
+                        let events = sub.recv().await.unwrap();
+                        if events.iter().any(|e| e.event_type == "agent:stream:end") {
+                            return;
                         }
                     }
-                )
+                })
                 .await
                 .is_err(),
                 "updates must renew the silence budget, not accumulate tool duration"
@@ -23320,12 +23089,9 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(150)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
             "no events published for an unmappable burst"
         );
         assert!(
@@ -23362,12 +23128,9 @@ mod harness_wake_tests {
             })
             .unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
-        assert!(timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(50)),
-            sub.recv()
-        )
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(50), sub.recv())
+            .await
+            .is_err());
         assert!(mgr
             .services
             .store
@@ -23406,12 +23169,9 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(150)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
             "no events published for a name-less tool-call first-sight"
         );
         assert!(
@@ -23515,12 +23275,9 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(150)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
             "no wake turn driven against the handle being killed"
         );
         assert!(
@@ -23614,12 +23371,7 @@ mod harness_wake_tests {
         tokio::time::sleep(crate::agent_manager::HARNESS_WAKE_SETTLE + Duration::from_millis(100))
             .await;
         let mut late: Vec<intent_core::Event> = Vec::new();
-        while let Ok(Some(batch)) = timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(50)),
-            sub.recv(),
-        )
-        .await
-        {
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
             late.extend(batch);
         }
         assert!(
@@ -23663,12 +23415,9 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("replay")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(150)),
-                sub.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(150), sub.recv())
+                .await
+                .is_err(),
             "gated tick consumes nothing and emits nothing"
         );
 
@@ -25337,12 +25086,7 @@ mod attention_request_clear_gates {
     /// `attentionRequestCleared: true` was published.
     async fn saw_cleared_event(sub: &mut crate::events::Subscription) -> bool {
         let mut cleared = false;
-        while let Ok(Some(batch)) = timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await
-        {
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
             for e in batch {
                 if e.event_type == intent_core::events::AGENT_UPDATED
                     && e.data["attentionRequestCleared"] == json!(true)

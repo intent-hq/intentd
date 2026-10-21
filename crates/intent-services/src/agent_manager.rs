@@ -19778,11 +19778,8 @@ mod disabled_provider_rehome_tests {
 
     async fn drain(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
         {
             events.extend(batch);
         }

@@ -350,9 +350,7 @@ async fn request_retirement_waits_for_its_original_child_consuming_fence() {
     });
     waiting.recv().unwrap();
     assert!(retired
-        .recv_timeout(intentd_test_support::test_timeout(
-            std::time::Duration::from_millis(40)
-        ))
+        .recv_timeout(std::time::Duration::from_millis(40))
         .is_err());
     release.send(()).unwrap();
     assert_eq!(worker.join().unwrap(), Ok(()));

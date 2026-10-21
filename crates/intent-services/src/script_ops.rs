@@ -3762,11 +3762,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let live = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(100)),
-            sub.recv(),
-        )
-        .await;
+        let live = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
         assert!(
             live.is_err(),
             "failed remove must not emit an event: {live:?}"
@@ -5219,8 +5215,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["scriptId"], id);
         // Drain a short window — there must be no SECOND `running` state transition.
-        let deadline = tokio::time::Instant::now()
-            + intentd_test_support::test_timeout(Duration::from_millis(300));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -5648,11 +5643,7 @@ mod tests {
         let pid = running["data"]["pid"].as_i64().expect("running pid");
         // Nothing but the second launch's `running` may follow: a stale first
         // supervisor would publish a second `running` with a different pid.
-        let next = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
+        let next = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(
             next.is_err(),
             "no further transition after the single running: {next:?}"
@@ -6777,11 +6768,7 @@ mod tests {
             );
             // One poll reserves the run (synchronously, before the first
             // await) and parks the future inside the reservation window.
-            let pending = tokio::time::timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(0)),
-                &mut fut,
-            )
-            .await;
+            let pending = tokio::time::timeout(Duration::from_millis(0), &mut fut).await;
             assert!(pending.is_err(), "run should still be in flight");
             // A concurrent entry inside the window warn-and-returns.
             let out = h

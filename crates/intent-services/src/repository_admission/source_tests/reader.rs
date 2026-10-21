@@ -856,7 +856,7 @@ async fn cancelled_actual_file_read_retains_original_gate_until_worker_exit() {
                     ));
                 }
                 assert!(timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(30)),
+                    Duration::from_millis(30),
                     f.auth.service.gitlab_credential_gate.lock()
                 )
                 .await

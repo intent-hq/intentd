@@ -865,12 +865,9 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         }
         assert!(native.is_retired());
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(30)),
-                &mut operation
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(30), &mut operation)
+                .await
+                .is_err(),
             "credential success escaped held native join"
         );
         let gate = timeout(
@@ -900,22 +897,16 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         }
         assert!(directory.binding().is_err());
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(30)),
-                events.recv()
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(30), events.recv())
+                .await
+                .is_err(),
             "auth event escaped original retirement"
         );
         if settings_change {
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(30)),
-                    settings_events.recv()
-                )
-                .await
-                .is_err(),
+                timeout(Duration::from_millis(30), settings_events.recv())
+                    .await
+                    .is_err(),
                 "settings success event escaped native completion"
             );
         }
@@ -944,12 +935,9 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             .then(|| Box::pin(services.store_tasks.drain_finite()));
         if let Some(drain) = finite_drain.as_mut() {
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(30)),
-                    drain.as_mut()
-                )
-                .await
-                .is_err(),
+                timeout(Duration::from_millis(30), drain.as_mut())
+                    .await
+                    .is_err(),
                 "finite-task drain escaped the held reload retirement"
             );
         }
@@ -1093,22 +1081,16 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         if reject_join || changed_reconcile || changed_source || projection_failure || batch_error {
             assert!(directory.binding().is_err());
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(30)),
-                    events.recv()
-                )
-                .await
-                .is_err(),
+                timeout(Duration::from_millis(30), events.recv())
+                    .await
+                    .is_err(),
                 "unconfirmed retirement published auth event"
             );
             if settings_change {
                 assert!(
-                    timeout(
-                        intentd_test_support::test_timeout(Duration::from_millis(30)),
-                        settings_events.recv()
-                    )
-                    .await
-                    .is_err(),
+                    timeout(Duration::from_millis(30), settings_events.recv())
+                        .await
+                        .is_err(),
                     "unconfirmed retirement published settings success"
                 );
             }
@@ -1147,12 +1129,9 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                     "metadata/reset must not adopt retained secrets"
                 );
             }
-            assert!(timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(30)),
-                events.recv()
-            )
-            .await
-            .is_err());
+            assert!(timeout(Duration::from_millis(30), events.recv())
+                .await
+                .is_err());
         } else if expired {
             let batch = timeout(
                 intentd_test_support::test_timeout(Duration::from_secs(5)),
@@ -1183,12 +1162,9 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             }
             assert!(directory.binding().is_ok());
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(30)),
-                    events.recv()
-                )
-                .await
-                .is_err(),
+                timeout(Duration::from_millis(30), events.recv())
+                    .await
+                    .is_err(),
                 "refresh invented an auth transition"
             );
         } else {
@@ -1269,12 +1245,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             Err(RepositoryCredentialError::Indeterminate)
         );
         let mut join = Box::pin(directory.native_contexts.join());
-        assert!(timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(30)),
-            &mut join
-        )
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(30), &mut join).await.is_err());
         assert!(
             directory.binding().is_err(),
             "credential publication escaped held native join"
@@ -1845,12 +1816,9 @@ async fn retired_new_waits_for_remote_join(
         );
         let mut shutdown = Box::pin(services.store_tasks.drain_finite());
         assert!(
-            timeout(
-                intentd_test_support::test_timeout(Duration::from_millis(30)),
-                &mut shutdown
-            )
-            .await
-            .is_err(),
+            timeout(Duration::from_millis(30), &mut shutdown)
+                .await
+                .is_err(),
             "shutdown escaped held native retirement"
         );
         let shared = handshake
@@ -1860,12 +1828,9 @@ async fn retired_new_waits_for_remote_join(
             .begin_review_context_retirement("late-original", &context)
             .unwrap();
         let mut waiting = Box::pin(shared.join());
-        assert!(timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(30)),
-            &mut waiting
-        )
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(30), &mut waiting)
+            .await
+            .is_err());
         retire_release.send(()).unwrap();
         assert_eq!(
             timeout(
@@ -1914,12 +1879,9 @@ async fn retired_new_waits_for_remote_join(
         () = tokio::time::sleep(Duration::from_secs(5)) => panic!("retirement request absent"),
     }
     // Poll the operation while the peer explicitly holds its retirement result.
-    assert!(timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(30)),
-        &mut operation
-    )
-    .await
-    .is_err());
+    assert!(timeout(Duration::from_millis(30), &mut operation)
+        .await
+        .is_err());
     assert!(services
         .store
         .get_agent_session(&agent)
@@ -1942,12 +1904,9 @@ async fn retired_new_waits_for_remote_join(
             .begin_review_context_retirement("late-original", &context)
             .unwrap();
         let mut waiting = Box::pin(shared.join());
-        assert!(timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(30)),
-            &mut waiting
-        )
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(30), &mut waiting)
+            .await
+            .is_err());
         retire_release.send(()).unwrap();
         assert_eq!(
             timeout(

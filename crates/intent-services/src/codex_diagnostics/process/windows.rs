@@ -911,12 +911,9 @@ mod tests {
                 .unwrap();
         } else {
             assert!(
-                timeout(
-                    intentd_test_support::test_timeout(Duration::from_millis(50)),
-                    stdout.read_to_end(&mut output)
-                )
-                .await
-                .is_err(),
+                timeout(Duration::from_millis(50), stdout.read_to_end(&mut output))
+                    .await
+                    .is_err(),
                 "live descendant holds inherited stdout after leader exit"
             );
         }
@@ -987,12 +984,9 @@ mod tests {
     #[tokio::test]
     async fn leader_deadline_preserves_ownership_until_confirmed_cleanup() {
         let (mut started, leader, descendant) = tree("tree_inherit").await;
-        assert!(timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(25)),
-            started.ownership.wait()
-        )
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(25), started.ownership.wait())
+            .await
+            .is_err());
         assert!(!leader.process.stopped());
         assert!(!descendant.process.stopped());
         started.ownership.cleanup().await.unwrap();

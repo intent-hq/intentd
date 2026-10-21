@@ -1788,12 +1788,7 @@ async fn detached_actual_file_read_cancellation_keeps_lease_and_never_dispatches
     assert!(task.await.unwrap_err().is_cancelled());
     let gate = f.auth.service.gitlab_credential_gate.lock();
     tokio::pin!(gate);
-    assert!(timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(40)),
-        &mut gate
-    )
-    .await
-    .is_err());
+    assert!(timeout(Duration::from_millis(40), &mut gate).await.is_err());
     file.resume();
     drop(timeout(BUDGET, gate).await.unwrap());
     assert_eq!(http.count(), 0);
