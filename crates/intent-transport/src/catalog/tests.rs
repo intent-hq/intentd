@@ -195,10 +195,11 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Legacy workspace import removal (15.0): -1 fast-path method.
 // PR workspace lookup (`prWorkspaceLookup: 1`): +1 router method.
 // Named provider profiles (§5.54): +4 router methods.
+// Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
 // Startup status (14.1): +1 fast-path method.
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
 // Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
-const EXPECTED_TOTAL_METHODS: usize = 451;
+const EXPECTED_TOTAL_METHODS: usize = 452;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -206,9 +207,10 @@ const EXPECTED_TOTAL_METHODS: usize = 451;
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
-/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
+/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
+/// then `providers.profiles.reorder`.
 /// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
-const EXPECTED_ROUTER_METHODS: usize = 393;
+const EXPECTED_ROUTER_METHODS: usize = 394;
 
 /// Golden count: fast-path methods (intercepted before router).
 /// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
@@ -794,6 +796,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "providers.profiles.create",
     "providers.profiles.delete",
     "providers.profiles.list",
+    "providers.profiles.reorder",
     "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
@@ -1364,6 +1367,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "providers.profiles.create",
     "providers.profiles.delete",
     "providers.profiles.list",
+    "providers.profiles.reorder",
     "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
@@ -2060,6 +2064,10 @@ mod unbound_owner_only_methods {
             ("providers.profiles.delete", json!({ "profileId": "p1" })),
             ("providers.profiles.list", json!({})),
             (
+                "providers.profiles.reorder",
+                json!({ "baseProviderId": "codex", "profileIds": [] }),
+            ),
+            (
                 "providers.profiles.update",
                 json!({ "profileId": "p1", "name": "n" }),
             ),
@@ -2613,6 +2621,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "providers.profiles.create",
         "providers.profiles.delete",
         "providers.profiles.list",
+        "providers.profiles.reorder",
         "providers.profiles.update",
         "providers.setup.cancel",
         "providers.setup.login",

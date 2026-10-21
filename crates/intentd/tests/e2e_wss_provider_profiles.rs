@@ -352,6 +352,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(profile["providerRef"], reference.as_str());
     assert_eq!(profile["baseProviderId"], "codex");
     assert_eq!(profile["name"], "Work");
+    assert_eq!(profile["backup"], false);
     assert_eq!(
         profile["env"],
         json!([
@@ -366,6 +367,7 @@ async fn provider_profiles_crud_contract_over_wss() {
         keys,
         vec![
             "activation",
+            "backup",
             "baseProviderId",
             "createdAt",
             "env",
@@ -383,7 +385,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(
         ev["data"],
         json!({ "revision": 1, "change": "created", "profileId": id,
-                "profile": { "id": id, "providerRef": reference, "baseProviderId": "codex", "name": "Work" } })
+                "profile": { "id": id, "providerRef": reference, "baseProviderId": "codex", "name": "Work", "backup": false } })
     );
 
     // Values stay out of the metadata file and settings.list.
@@ -561,6 +563,198 @@ async fn provider_profiles_crud_contract_over_wss() {
     drop(daemon);
 }
 
+/// Backup flag and saved order over the wire (PROTOCOL §5.54): `backup`
+/// round-trips through create/update/list/catalog, `providers.profiles.reorder`
+/// validates the id set, returns the base's rows in the new order, emits one
+/// `reordered` event, and the order and flags survive a daemon restart.
+#[tokio::test]
+async fn provider_profiles_backup_and_reorder_contract_over_wss() {
+    let root = scratch_dir("reorder");
+    let (mut daemon, _port, _cfg) = boot(root.path()).await;
+    let data_dir = daemon.data_dir.clone();
+    let (mut ws, mut sub) = connect(&data_dir).await;
+    let ack = rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["providers:profiles-changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "{ack}");
+
+    let mut ids = Vec::new();
+    for (id, (base, name, backup)) in (1_i64..).zip([
+        ("claude-code", "Main", None),
+        ("claude-code", "Spare", Some(true)),
+        ("codex", "Other", None),
+        ("claude-code", "Spare 2", Some(false)),
+    ]) {
+        let mut params = json!({ "baseProviderId": base, "name": name });
+        if let Some(backup) = backup {
+            params["backup"] = json!(backup);
+        }
+        let created = ok(&mut ws, id, "providers.profiles.create", params).await;
+        assert_eq!(created["profile"]["backup"], backup.unwrap_or(false));
+        let ev = next_event(&mut sub, "providers:profiles-changed").await;
+        assert_eq!(ev["data"]["profile"]["backup"], backup.unwrap_or(false));
+        ids.push(created["profile"]["id"].as_str().unwrap().to_string());
+    }
+    let (main, spare, other, spare2) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+
+    // A backup-only update.
+    let updated = ok(
+        &mut ws,
+        10,
+        "providers.profiles.update",
+        json!({ "profileId": spare2, "backup": true }),
+    )
+    .await;
+    assert_eq!(updated["profile"]["backup"], true);
+    assert_eq!(
+        updated["activation"],
+        json!({ "envChanged": false, "runningProcesses": 0 })
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(ev["data"]["change"], "updated");
+    assert_eq!(ev["data"]["envChanged"], false);
+    assert_eq!(ev["data"]["profile"]["backup"], true);
+    let bad = rpc(
+        &mut ws,
+        11,
+        "providers.profiles.update",
+        json!({ "profileId": spare2, "backup": "yes" }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+
+    // Invalid id sets are field errors.
+    let bad = rpc(
+        &mut ws,
+        12,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code", "profileIds": [spare, other] }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params");
+    let codes: Vec<(&str, &str)> = bad["error"]["data"]["fieldErrors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["field"].as_str().unwrap(), e["code"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("profileIds[1]", "profile-order-unknown"),
+            ("profileIds", "profile-order-incomplete"),
+        ]
+    );
+    let malformed = rpc(
+        &mut ws,
+        13,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+
+    // Reorder.
+    let reordered = rpc(
+        &mut ws,
+        14,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code", "profileIds": [spare2, main, spare] }),
+    )
+    .await;
+    assert_eq!(reordered["jsonrpc"], "2.0");
+    assert_eq!(reordered["id"], 14);
+    let result = &reordered["result"];
+    assert_eq!(result["revision"], 6);
+    let order: Vec<&str> = result["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, [spare2.as_str(), main.as_str(), spare.as_str()]);
+    let mut keys: Vec<&String> = result["profiles"][0].as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "activation",
+            "backup",
+            "baseProviderId",
+            "createdAt",
+            "env",
+            "id",
+            "name",
+            "providerRef",
+            "settingsFingerprint",
+            "updatedAt"
+        ]
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(ev["workspaceId"], "");
+    assert_eq!(
+        ev["data"],
+        json!({ "revision": 6, "change": "reordered", "baseProviderId": "claude-code" })
+    );
+
+    // Claude Code's slots (0, 1, 3) take the new order; Codex keeps slot 2.
+    let catalog = ok(&mut ws, 15, "providers.catalog", json!({})).await;
+    let rows: Vec<(String, bool)> = catalog["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap().to_string(),
+                p["backup"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (spare2.clone(), true),
+            (main.clone(), false),
+            (other.clone(), false),
+            (spare.clone(), true),
+        ]
+    );
+
+    // Persistence across a real restart.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    daemon.child = spawn_serve(&data_dir, &env);
+    let (mut ws, _sub) = connect(&data_dir).await;
+    let list = ok(
+        &mut ws,
+        20,
+        "providers.profiles.list",
+        json!({ "baseProviderId": "claude-code" }),
+    )
+    .await;
+    let rows: Vec<(&str, bool)> = list["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap(), p["backup"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (spare2.as_str(), true),
+            (main.as_str(), false),
+            (spare.as_str(), true),
+        ]
+    );
+    drop(daemon);
+}
+
 /// Selection surfaces over the wire (PROTOCOL §5.54): the catalog offers
 /// profiles beside one row per provider type, a profile's auth status is
 /// keyed by its reference, and a missing reference needs a replacement on
@@ -605,6 +799,7 @@ async fn provider_profile_selection_surfaces_over_wss() {
             "providerRef": reference,
             "baseProviderId": "codex",
             "name": "Work",
+            "backup": false,
         }])
     );
 

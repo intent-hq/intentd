@@ -4421,6 +4421,10 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "providers.profiles.reorder" => api
+            .provider_profiles_reorder(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.

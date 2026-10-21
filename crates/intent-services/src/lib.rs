@@ -19017,6 +19017,13 @@ impl WorkspaceApi for Services {
         Box::pin(self.provider_profiles_delete_impl(profile_id))
     }
 
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_reorder_impl(params))
+    }
+
     fn provider_profiles_auth_status(
         &self,
         provider_ref: Option<String>,

@@ -6,7 +6,9 @@
 //!   (temp file, fsync, rename; mode `0600`) and read only at startup and after
 //!   the daemon's own writes. It is not a `settings.*` path and not in
 //!   `config.toml` (whose `SettingsFile` denies unknown fields, so an older
-//!   daemon would refuse to start).
+//!   daemon would refuse to start). The array order is the saved profile
+//!   order (`providers.profiles.reorder`), and `backup` marks the profiles
+//!   quota failover may switch to.
 //! - **Environment entries** live in the existing secret store under
 //!   `providerProfiles.<id>.env`, one JSON document per profile, and are only
 //!   ever returned masked. They never enter events, logs, catalogs or the
@@ -165,6 +167,19 @@ pub(crate) struct ProfileMeta {
     pub(crate) name: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    /// Whether quota failover may switch to this profile. Omitted from the
+    /// file while false, so files without backups keep the original shape
+    /// and files written before the field existed load as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) backup: bool,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde `skip_serializing_if` passes `&bool`"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ProfileMeta {
@@ -178,6 +193,7 @@ impl ProfileMeta {
             "providerRef": self.provider_ref(),
             "baseProviderId": self.base_provider,
             "name": self.name,
+            "backup": self.backup,
         })
     }
 }
@@ -811,6 +827,7 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
         "providerRef": meta.provider_ref(),
         "baseProviderId": meta.base_provider,
         "name": meta.name,
+        "backup": meta.backup,
         "env": env.entries.iter().map(StoredEnv::masked_json).collect::<Vec<_>>(),
         "settingsFingerprint": env.fingerprint,
         "createdAt": meta.created_at,
@@ -826,7 +843,28 @@ fn profiles_changed_event(
     summary: Option<Value>,
     env_changed: Option<bool>,
 ) -> NewEvent {
-    let mut data = json!({ "revision": revision, "change": change, "profileId": profile_id });
+    profiles_changed_event_with(
+        json!({ "revision": revision, "change": change, "profileId": profile_id }),
+        summary,
+        env_changed,
+    )
+}
+
+/// `change: "reordered"`: the order of one base provider's profiles moved.
+/// No single profile changed, so there is no `profileId` or `profile`.
+fn profiles_reordered_event(revision: u64, base_provider: &str) -> NewEvent {
+    profiles_changed_event_with(
+        json!({ "revision": revision, "change": "reordered", "baseProviderId": base_provider }),
+        None,
+        None,
+    )
+}
+
+fn profiles_changed_event_with(
+    mut data: Value,
+    summary: Option<Value>,
+    env_changed: Option<bool>,
+) -> NewEvent {
     if let Some(summary) = summary {
         data["profile"] = summary;
     }
@@ -852,6 +890,104 @@ fn opt_string(params: &Value, key: &str) -> Result<Option<String>> {
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(Error::InvalidParams(format!("{key} must be a string"))),
     }
+}
+
+fn opt_bool(params: &Value, key: &str) -> Result<Option<bool>> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(Error::InvalidParams(format!("{key} must be a boolean"))),
+    }
+}
+
+/// Parse `providers.profiles.reorder` `profileIds`: an array of strings.
+/// Anything else is a malformed request → plain `-32602`.
+fn parse_profile_ids(params: &Value) -> Result<Vec<String>> {
+    let ids = params
+        .get("profileIds")
+        .ok_or_else(|| Error::InvalidParams("missing required param: profileIds".into()))?
+        .as_array()
+        .ok_or_else(|| Error::InvalidParams("profileIds must be an array".into()))?;
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| {
+            id.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::InvalidParams(format!("profileIds[{i}] must be a string")))
+        })
+        .collect()
+}
+
+/// Validate a reorder request against the saved profiles: `profile_ids`
+/// must list every saved profile of `base` exactly once and nothing else.
+/// Returns the new saved list, with `base`'s profiles placed in the
+/// requested order into the slots they already occupy (other bases' rows
+/// keep their positions).
+pub(crate) fn reorder_profiles(
+    profiles: &[ProfileMeta],
+    base: &str,
+    profile_ids: &[String],
+) -> std::result::Result<Vec<ProfileMeta>, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    if !PROFILE_BASE_PROVIDERS.contains(&base) {
+        errors.push(FieldError::new(
+            "baseProviderId",
+            "base-provider-unsupported",
+            format!("{base} does not support profiles."),
+        ));
+        return Err(errors);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, id) in profile_ids.iter().enumerate() {
+        let field = format!("profileIds[{i}]");
+        if !seen.insert(id.as_str()) {
+            errors.push(FieldError::new(
+                field,
+                "profile-order-duplicate",
+                format!("{id} appears more than once."),
+            ));
+        } else if !profiles
+            .iter()
+            .any(|p| p.id == *id && p.base_provider == base)
+        {
+            errors.push(FieldError::new(
+                field,
+                "profile-order-unknown",
+                format!("{id} is not a saved {base} profile."),
+            ));
+        }
+    }
+    let missing = profiles
+        .iter()
+        .filter(|p| p.base_provider == base && !seen.contains(p.id.as_str()))
+        .count();
+    if missing > 0 {
+        errors.push(FieldError::new(
+            "profileIds",
+            "profile-order-incomplete",
+            format!("List every saved {base} profile exactly once ({missing} missing)."),
+        ));
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let mut ordered = profile_ids.iter().map(|id| {
+        profiles
+            .iter()
+            .find(|p| p.id == *id)
+            .cloned()
+            .expect("validated id")
+    });
+    Ok(profiles
+        .iter()
+        .map(|p| {
+            if p.base_provider == base {
+                ordered.next().expect("validated permutation")
+            } else {
+                p.clone()
+            }
+        })
+        .collect())
 }
 
 fn opt_env(params: &Value) -> Result<Option<Vec<EnvWrite>>> {
@@ -1484,12 +1620,51 @@ impl Services {
         .await
     }
 
+    pub(crate) async fn provider_profiles_reorder_impl(&self, params: Value) -> Result<Value> {
+        Self::require_administrator("providers.profiles.reorder")?;
+        self.owned_profile_mutation(move |svc| async move {
+            svc.provider_profiles_reorder_owned(params).await
+        })
+        .await
+    }
+
+    /// Persist a new order for one base provider's profiles (failover tries
+    /// backups in this order). Metadata only: no secret I/O, one atomic
+    /// write. Every successful call commits, bumps the revision and emits
+    /// one `reordered` event, even when the order is unchanged (§5.54).
+    async fn provider_profiles_reorder_owned(&self, params: Value) -> Result<Value> {
+        let base = opt_string(&params, "baseProviderId")?
+            .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
+        let profile_ids = parse_profile_ids(&params)?;
+
+        let store = &self.provider_profiles;
+        let _guard = store.lock().await;
+        let profiles = store.profiles()?;
+        let after = reorder_profiles(&profiles, &base, &profile_ids)
+            .map_err(|errors| field_errors(&errors))?;
+        store.persist(after.clone(), store.pending())?;
+        let revision = store.bump_revision();
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            profiles_reordered_event(revision, &base),
+        )
+        .await;
+        let mut rows = Vec::new();
+        for meta in after.iter().filter(|p| p.base_provider == base) {
+            let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
+            let running = self.profile_activation.running_processes(&meta.id);
+            rows.push(profile_json(meta, &env, running));
+        }
+        Ok(json!({ "profiles": rows, "revision": revision }))
+    }
+
     async fn provider_profiles_create_owned(&self, params: Value) -> Result<Value> {
         let base = opt_string(&params, "baseProviderId")?
             .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
         let raw_name = opt_string(&params, "name")?
             .ok_or_else(|| Error::InvalidParams("missing required param: name".into()))?;
         let writes = opt_env(&params)?.unwrap_or_default();
+        let backup = opt_bool(&params, "backup")?.unwrap_or(false);
 
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
@@ -1530,6 +1705,7 @@ impl Services {
             name,
             created_at: now.clone(),
             updated_at: now,
+            backup,
         };
         let env = EnvDoc::fresh(entries);
         let account = env_account(&id);
@@ -1573,6 +1749,7 @@ impl Services {
     ) -> Result<Value> {
         let raw_name = opt_string(&params, "name")?;
         let writes = opt_env(&params)?;
+        let backup = opt_bool(&params, "backup")?;
 
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
@@ -1611,7 +1788,8 @@ impl Services {
             .as_ref()
             .is_some_and(|entries| *entries != saved_doc.entries || saved.is_none());
         let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
-        if !env_changed && !name_changed {
+        let backup_changed = backup.is_some_and(|b| b != current.backup);
+        if !env_changed && !name_changed && !backup_changed {
             let running = self.profile_activation.running_processes(&profile_id);
             return Ok(json!({
                 "profile": profile_json(&current, &saved_doc, running),
@@ -1631,6 +1809,9 @@ impl Services {
         let mut meta = current;
         if let Some(name) = name {
             meta.name = name;
+        }
+        if let Some(backup) = backup {
+            meta.backup = backup;
         }
         meta.updated_at = now_rfc3339();
         let mut after = profiles.as_ref().clone();

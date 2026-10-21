@@ -267,6 +267,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "providers.profiles.create",
     "providers.profiles.delete",
     "providers.profiles.list",
+    "providers.profiles.reorder",
     "providers.profiles.update",
     "repo.list",
     "repo.remove",
