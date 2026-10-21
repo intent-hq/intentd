@@ -80,19 +80,25 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
         true,
     ));
     let first: Value = serde_json::from_str(
-        &timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .unwrap()
-            .unwrap(),
+        &timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(
         first["params"]["snapshot"]["initialHistory"]["complete"],
         false
     );
-    timeout(Duration::from_secs(10), api.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        api.entered.notified(),
+    )
+    .await
+    .unwrap();
     let _ = bus.publish_transient(&NewEvent {
         workspace_id: WorkspaceId::from("w"),
         timestamp: intent_core::now_iso(),
@@ -108,10 +114,13 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
         data: json!({"replacedCount":3}),
     });
     let recovery: Value = serde_json::from_str(
-        &timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .unwrap()
-            .unwrap(),
+        &timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(recovery["params"]["seq"], 1);
@@ -131,10 +140,13 @@ async fn progressive_history_invalidation_cancels_held_read_and_completes_recove
     api.release.notify_one();
     drop(bus);
     assert_eq!(
-        timeout(Duration::from_secs(10), handle)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            handle
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         "bus_closed"
     );
     assert!(
@@ -167,19 +179,28 @@ async fn progressive_history_closed_client_cancels_held_read() {
         3,
         true,
     ));
-    timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(10), api.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        api.entered.notified(),
+    )
+    .await
+    .unwrap();
     drop(rx);
     assert_eq!(
-        timeout(Duration::from_secs(10), handle)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            handle
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         "client_closed"
     );
 }
@@ -219,13 +240,19 @@ async fn progressive_history_membership_revocation_cancels_held_read() {
         3,
         true,
     ));
-    timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(10), api.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        api.entered.notified(),
+    )
+    .await
+    .unwrap();
     let _ = bus.publish_transient(&NewEvent {
         workspace_id: WorkspaceId::from("w"),
         timestamp: intent_core::now_iso(),
@@ -241,10 +268,13 @@ async fn progressive_history_membership_revocation_cancels_held_read() {
         data: json!({"changes":{"members":true,"removedPrincipalId":principal_id}}),
     });
     assert_eq!(
-        timeout(Duration::from_secs(10), handle)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            handle
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         "membership_revoked"
     );
     assert!(rx.recv().await.is_none());
@@ -289,10 +319,13 @@ async fn progressive_history_finishes_during_sustained_live_traffic() {
         20,
         true,
     ));
-    timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let traffic_bus = bus.clone();
     let traffic = tokio::spawn(async move {
         loop {
@@ -315,10 +348,13 @@ async fn progressive_history_finishes_during_sustained_live_traffic() {
     });
     for seq in 1..=20 {
         let frame: Value = serde_json::from_str(
-            &timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .unwrap()
-                .unwrap(),
+            &timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                rx.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(frame["params"]["kind"], "history", "{frame}");
@@ -329,10 +365,13 @@ async fn progressive_history_finishes_during_sustained_live_traffic() {
     let _ = traffic.await;
     drop(rx);
     assert_eq!(
-        timeout(Duration::from_secs(10), handle)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            handle
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         "client_closed"
     );
 }
@@ -412,11 +451,18 @@ async fn progressive_history_first_read_cancels_on_closed_client() {
         3,
         true,
     ));
-    timeout(Duration::from_secs(10), api.0.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        api.0.entered.notified(),
+    )
+    .await
+    .unwrap();
     drop(rx);
-    let result = timeout(Duration::from_secs(1), &mut handle).await;
+    let result = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        &mut handle,
+    )
+    .await;
     if result.is_err() {
         handle.abort();
     }
@@ -476,9 +522,12 @@ async fn assert_first_snapshot_revoked(lookup: WorkspaceLookup) {
         3,
         true,
     ));
-    timeout(Duration::from_secs(10), api.0.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        api.0.entered.notified(),
+    )
+    .await
+    .unwrap();
     let _ = bus.publish_transient(&NewEvent {
         workspace_id: WorkspaceId::from("w"),
         timestamp: intent_core::now_iso(),
@@ -496,12 +545,21 @@ async fn assert_first_snapshot_revoked(lookup: WorkspaceLookup) {
     if !matches!(lookup, WorkspaceLookup::Held) {
         api.0.release.notify_one();
     }
-    let result = timeout(Duration::from_secs(2), &mut handle).await;
+    let result = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        &mut handle,
+    )
+    .await;
     if result.is_err() {
         handle.abort();
     }
     assert_eq!(result.unwrap().unwrap(), "membership_revoked");
-    let frame = timeout(Duration::from_secs(10), rx.recv()).await.unwrap();
+    let frame = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx.recv(),
+    )
+    .await
+    .unwrap();
     assert!(
         frame.is_none(),
         "Snapshot escaped after own membership revocation: {frame:?}"
@@ -570,9 +628,12 @@ async fn progressive_history_first_enqueue_prioritizes_revocation_over_ready_cap
     tokio::task::yield_now().await;
     assert_eq!(rx.bulk.try_recv().unwrap(), "occupied");
     assert_eq!(
-        timeout(Duration::from_secs(10), &mut forwarder)
-            .await
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut forwarder
+        )
+        .await
+        .unwrap(),
         "membership_revoked"
     );
     drop(forwarder);
@@ -665,9 +726,12 @@ async fn progressive_history_initial_overlay_and_retry_are_cancellable() {
                 3,
                 true,
             ));
-            timeout(Duration::from_secs(10), api.held.entered.notified())
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                api.held.entered.notified(),
+            )
+            .await
+            .unwrap();
             let mut rx = Some(rx);
             let expected = if close_client {
                 drop(rx.take());
@@ -690,10 +754,13 @@ async fn progressive_history_initial_overlay_and_retry_are_cancellable() {
                 "membership_revoked"
             };
             assert_eq!(
-                timeout(Duration::from_secs(10), handle)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(10)),
+                    handle
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 expected
             );
             if let Some(mut rx) = rx {
@@ -735,7 +802,12 @@ async fn progressive_history_first_enqueue_cancels_on_closed_client() {
     );
     drop(rx);
     assert_eq!(
-        timeout(Duration::from_secs(10), forwarder).await.unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            forwarder
+        )
+        .await
+        .unwrap(),
         "client_closed"
     );
 }

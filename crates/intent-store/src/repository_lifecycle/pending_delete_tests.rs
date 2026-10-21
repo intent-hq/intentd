@@ -192,7 +192,9 @@ impl RepositoryLifecycleObserver for Probe {
         let block = self.callback.lock().unwrap().take();
         if let Some((entered, release)) = block {
             entered.notify_one();
-            release.recv_timeout(Duration::from_secs(10)).unwrap();
+            release
+                .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                .unwrap();
         }
         assert!(
             !self.panic_pending.load(Ordering::SeqCst),
@@ -489,12 +491,15 @@ async fn held_observer_callback_does_not_hold_store_writer_or_install_lock() {
     entered.notified().await;
     let mut other = f.workspace.clone();
     other.id = WorkspaceId::from("independent");
-    tokio::time::timeout(Duration::from_secs(3), f.store.insert_workspace(&other))
-        .await
-        .unwrap()
-        .unwrap();
     tokio::time::timeout(
-        Duration::from_secs(3),
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        f.store.insert_workspace(&other),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
         f.store.install_repository_lifecycle_observer(observer),
     )
     .await
@@ -799,7 +804,9 @@ async fn cancelled_batch(installed: bool) {
             if update.table == "draft" {
                 if let Some(blocked) = blocked.take() {
                     notify.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                        .unwrap();
                 }
             }
         });
@@ -891,7 +898,9 @@ async fn cancelled_caller_does_not_cancel_original_final_commit_or_settle_pendin
         if deleting.load(Ordering::SeqCst) {
             if let Some(blocked) = blocked.take() {
                 notify.notify_one();
-                blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                blocked
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                    .unwrap();
             }
         }
         true
@@ -911,9 +920,12 @@ async fn cancelled_caller_does_not_cancel_original_final_commit_or_settle_pendin
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), probe.settled.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        probe.settled.notified(),
+    )
+    .await
+    .unwrap();
     let reopened = Store::open(&f.dir.path().join("pending.db")).await.unwrap();
     assert!(reopened.has_repository_lifecycle_observer(&observer));
     let count: i64 =

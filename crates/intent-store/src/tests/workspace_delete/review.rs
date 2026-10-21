@@ -30,7 +30,9 @@ async fn block_next_update(
             if update.table == table {
                 if let Some(blocked) = blocked.take() {
                     notify.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(20)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
+                        .unwrap();
                 }
             }
         });
@@ -302,7 +304,7 @@ async fn note_cleanup_does_not_rescan_processed_prefixes() {
 /// checking the overlay. No sleep or scheduler timing assumption is needed.
 #[tokio::test]
 async fn browser_commit_eviction_survives_caller_cancellation() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let doomed = seed_workspace(&store, "doomed").await;
@@ -361,7 +363,7 @@ async fn browser_commit_eviction_survives_caller_cancellation() {
 }
 
 async fn cancel_final_transaction(fail_commit: bool) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.unwrap();
         let doomed = seed_workspace(&store, "doomed").await;

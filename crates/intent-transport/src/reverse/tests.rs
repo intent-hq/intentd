@@ -20,10 +20,13 @@ async fn shutdown_releases_reverse_request_blocked_on_full_outbound_lane() {
         () = std::future::ready(()) => {}
     }
     reverse.close();
-    let error = tokio::time::timeout(Duration::from_secs(1), request)
-        .await
-        .unwrap()
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        request,
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
     assert!(error.message.contains("closed"));
 }
 

@@ -856,7 +856,7 @@ fn update_signals_running_supervised_sitter_then_waits_for_it() {
     );
 
     // The trap handler appends asynchronously; poll briefly.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     while Instant::now() < deadline
         && !fs::read_to_string(&hup_log).is_ok_and(|s| s.contains("HUP"))
     {
