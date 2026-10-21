@@ -401,6 +401,16 @@ impl Projection {
         true
     }
 
+    /// Whether this generation can vouch for a still-running worker: it is
+    /// supported, its connection is continuous, and at least one row has no
+    /// end report yet. The idle reaper keeps such an agent alive, since
+    /// killing its process would kill the worker with it.
+    pub(crate) fn has_running_workers(&self) -> bool {
+        self.supported()
+            && self.continuity == Continuity::Continuous
+            && self.rows.iter().any(|r| r.provider_state == "running")
+    }
+
     /// The complete `WorkerSnapshot` (§5.5b).
     pub(crate) fn snapshot(&mut self, now: u64) -> Value {
         let as_of = self.clock(now);
@@ -659,6 +669,16 @@ impl AgentWorkers {
         self.lock()
             .get_mut(agent_id)
             .map(|e| e.projection.snapshot(now_ms()))
+    }
+
+    /// Whether the agent's current generation has a running worker on a
+    /// continuous connection ([`Projection::has_running_workers`]). The
+    /// workers lock is a leaf lock, so this is safe to call while holding the
+    /// process registry lock.
+    pub(crate) fn has_running_workers(&self, agent_id: &AgentId) -> bool {
+        self.lock()
+            .get(agent_id)
+            .is_some_and(|e| e.projection.has_running_workers())
     }
 
     /// Resolve a stop request. `None` is not-found.

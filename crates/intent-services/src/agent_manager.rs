@@ -893,6 +893,22 @@ pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
 /// only evicts.
 pub(crate) const REASON_IDLE_TTL: &str = "idle-ttl";
 
+/// Whether an idle agent still has a running provider worker (PROTOCOL
+/// §5.5b — a `run_in_background` dev server, say) on a continuous connection.
+/// Killing such an agent's process kills the worker with it, so the TTL sweep
+/// skips it and the pressure-driven paths (slot cap, memory budget) evict it
+/// only after every idle agent without one. Called under the registry lock:
+/// it must not take any lock that can be held while acquiring that lock.
+pub(crate) type KeepAliveFn = Arc<dyn Fn(&AgentId) -> bool + Send + Sync>;
+
+/// Safety bound on the TTL keep-alive for an agent with running workers.
+/// §5.5b keeps a row `running` until its end report arrives or the
+/// connection ends, so a lost end report could otherwise pin an idle agent
+/// forever on a host with no slot or memory pressure. Past
+/// `idleReapMinutes + WORKER_KEEPALIVE_CAP` of idle time the sweep reaps it
+/// like any other — long enough to keep an overnight dev server running.
+pub(crate) const WORKER_KEEPALIVE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
 struct ProcessEntry {
     last_active_ms: u64,
     is_active: bool,
@@ -968,17 +984,31 @@ fn settle_stale_waiter(rx: Option<tokio::sync::oneshot::Receiver<()>>) -> bool {
 /// parked here; its waiter then wakes via `deregister`, re-classifies as
 /// unregistered, admits, and respawns through the spawn gate (queued, never
 /// refused, message intact — the warm session is lost, not the turn).
-fn lru_idle_ordered(inner: &RegistryInner, exclude: Option<&AgentId>) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
+///
+/// Agents the keep-alive predicate pins (running provider workers) sort after
+/// every unpinned candidate: pressure relief may still evict them, but last.
+fn lru_idle_ordered(
+    inner: &RegistryInner,
+    exclude: Option<&AgentId>,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, bool, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(id, e)| !e.is_active && exclude.is_none_or(|x| *id != x))
-        .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
+                e.last_active_ms,
+                e.kill.clone(),
+            )
+        })
         .collect();
-    candidates.sort_by_key(|(_, ms, _)| *ms);
+    candidates.sort_by_key(|(_, pinned, ms, _)| (*pinned, *ms));
     candidates
         .into_iter()
-        .map(|(id, _, kill)| (id, kill))
+        .map(|(id, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -1001,13 +1031,42 @@ impl<R: Fn(&AgentId)> Drop for ClaimGuard<'_, R> {
     }
 }
 
-/// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
+/// Whether the TTL sweep may reap this idle entry: it is idle past
+/// `cutoff_ms` and either has no running worker or has been idle past
+/// `pinned_cutoff_ms` (the [`WORKER_KEEPALIVE_CAP`] safety bound).
+fn ttl_reapable(
+    id: &AgentId,
+    e: &ProcessEntry,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> bool {
+    if e.is_active || e.last_active_ms > cutoff_ms {
+        return false;
+    }
+    if e.last_active_ms <= pinned_cutoff_ms || !keep_alive.is_some_and(|f| f(id)) {
+        return true;
+    }
+    tracing::debug!(
+        agent = %id,
+        idle_ms = now_ms().saturating_sub(e.last_active_ms),
+        "process registry: idle process kept (running provider worker)"
+    );
+    false
+}
+
+/// Idle entries the TTL sweep may reap ([`ttl_reapable`]), ordered
 /// least-recently-used first (the TTL idle-reap candidate list).
-fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillFn)> {
+fn idle_older_than(
+    inner: &RegistryInner,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
     let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
         .entries
         .iter()
-        .filter(|(_, e)| !e.is_active && e.last_active_ms <= cutoff_ms)
+        .filter(|(id, e)| ttl_reapable(id, e, cutoff_ms, pinned_cutoff_ms, keep_alive))
         .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
         .collect();
     candidates.sort_by_key(|(_, ms, _)| *ms);
@@ -1020,28 +1079,32 @@ fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillF
 /// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
 /// attributed subtree first (Phase A attribution), ties and unattributed
 /// entries (charged 0 by the sort) falling back to least-recently-used first —
-/// so with no attribution at all the order degrades to plain LRU.
+/// so with no attribution at all the order degrades to plain LRU. Agents the
+/// keep-alive predicate pins (running provider workers) sort after every
+/// unpinned candidate, whatever their size.
 fn idle_largest_first(
     inner: &RegistryInner,
     samples: &HashMap<AgentId, u64>,
+    keep_alive: Option<&KeepAliveFn>,
 ) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, u64, KillFn)> = inner
+    let mut candidates: Vec<(AgentId, bool, u64, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(_, e)| !e.is_active)
         .map(|(id, e)| {
             (
                 id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
                 samples.get(id).copied().unwrap_or(0),
                 e.last_active_ms,
                 e.kill.clone(),
             )
         })
         .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    candidates.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
     candidates
         .into_iter()
-        .map(|(id, _, _, kill)| (id, kill))
+        .map(|(id, _, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -1365,6 +1428,10 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    /// Optional "has a running provider worker" predicate ([`KeepAliveFn`]),
+    /// wired by the manager to the §5.5b worker projections. Not installed
+    /// leaves every eviction path byte-for-byte the pre-keep-alive behaviour.
+    keep_alive: Option<KeepAliveFn>,
     event_tasks: crate::delivery_tasks::DeliveryTasks,
     /// Optional aggregate memory budget, installed once by the composition root
     /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
@@ -1426,6 +1493,7 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            keep_alive: None,
             event_tasks: crate::delivery_tasks::DeliveryTasks::default(),
             memory: std::sync::OnceLock::new(),
         }
@@ -1546,6 +1614,13 @@ impl ProcessRegistry {
     /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub(crate) fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
+        self
+    }
+
+    /// Attach the running-worker keep-alive predicate ([`KeepAliveFn`]).
+    /// Chainable builder, like [`Self::with_event_fn`].
+    pub(crate) fn with_keep_alive_fn(mut self, f: KeepAliveFn) -> Self {
+        self.keep_alive = Some(f);
         self
     }
 
@@ -1823,7 +1898,7 @@ impl ProcessRegistry {
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
                 } else if let Some(candidates) = (!forced_wait)
-                    .then(|| lru_idle_ordered(&inner, None))
+                    .then(|| lru_idle_ordered(&inner, None, self.keep_alive.as_ref()))
                     .filter(|c| !c.is_empty())
                 {
                     Action::Evict(candidates, reason)
@@ -2012,7 +2087,7 @@ impl ProcessRegistry {
                     let candidates = if forced_wait {
                         Vec::new()
                     } else {
-                        lru_idle_ordered(&inner, Some(agent_id))
+                        lru_idle_ordered(&inner, Some(agent_id), self.keep_alive.as_ref())
                     };
                     if candidates.is_empty() {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2167,7 +2242,7 @@ impl ProcessRegistry {
         let max = max.unwrap_or(usize::MAX);
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            lru_idle_ordered(&inner, None)
+            lru_idle_ordered(&inner, None, self.keep_alive.as_ref())
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2227,9 +2302,12 @@ impl ProcessRegistry {
         R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+        let pinned_cutoff = cutoff
+            .saturating_sub(u64::try_from(WORKER_KEEPALIVE_CAP.as_millis()).unwrap_or(u64::MAX));
+        let keep_alive = self.keep_alive.as_ref();
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            idle_older_than(&inner, cutoff)
+            idle_older_than(&inner, cutoff, pinned_cutoff, keep_alive)
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2239,14 +2317,15 @@ impl ProcessRegistry {
             // Re-validate under the registry lock: the candidate snapshot is
             // stale by the time earlier kills in this sweep have awaited, so
             // the entry may have run a whole turn (fresh `last_active_ms`),
-            // be actively streaming again, or be gone. With the claim held
-            // nothing can start new work on it after this check.
+            // be actively streaming again, have started a worker, or be gone.
+            // With the claim held nothing can start new work on it after this
+            // check.
             let still_stale = {
                 let inner = self.inner.lock().unwrap();
                 inner
                     .entries
                     .get(&id)
-                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+                    .is_some_and(|e| ttl_reapable(&id, e, cutoff, pinned_cutoff, keep_alive))
             };
             if !still_stale {
                 release(&id);
@@ -2323,7 +2402,10 @@ impl ProcessRegistry {
                 .get()
                 .map(|b| b.probe.agent_samples())
                 .unwrap_or_default();
-            (idle_largest_first(&inner, &samples), samples)
+            (
+                idle_largest_first(&inner, &samples, self.keep_alive.as_ref()),
+                samples,
+            )
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -3008,9 +3090,18 @@ impl AgentManager {
             })
         });
 
+        // Keep idle agents with running provider workers (§5.5b) out of the
+        // TTL sweep and last in pressure eviction.
+        let workers = services.agent_workers.clone();
+        let keep_alive: KeepAliveFn = Arc::new(move |id| workers.has_running_workers(id));
+
         Self {
             services,
-            registry: Arc::new(ProcessRegistry::new(cap).with_event_fn(event_fn)),
+            registry: Arc::new(
+                ProcessRegistry::new(cap)
+                    .with_event_fn(event_fn)
+                    .with_keep_alive_fn(keep_alive),
+            ),
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),

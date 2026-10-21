@@ -2936,6 +2936,178 @@ async fn ttl_eviction_emits_evicted_event_with_idle_ttl_reason() {
     );
 }
 
+/// A keep-alive predicate over a shared set of "has a running worker" agents,
+/// standing in for the §5.5b worker projection the manager wires in.
+fn keep_alive_set() -> (
+    Arc<Mutex<std::collections::HashSet<AgentId>>>,
+    super::KeepAliveFn,
+) {
+    let pinned: Arc<Mutex<std::collections::HashSet<AgentId>>> = Arc::default();
+    let set = pinned.clone();
+    let f: super::KeepAliveFn = Arc::new(move |id: &AgentId| set.lock().unwrap().contains(id));
+    (pinned, f)
+}
+
+/// `last_active_ms` this far in the past: older than `ttl`, well inside the
+/// worker keep-alive cap.
+fn idle_for(ttl: Duration) -> u64 {
+    super::now_ms() - u64::try_from(ttl.as_millis()).unwrap() * 2
+}
+
+/// An idle agent past its TTL is NOT reaped by the TTL sweep while it has a
+/// running provider worker (a `run_in_background` dev server): killing the
+/// ACP process would kill the worker with it. Once the worker ends, the next
+/// sweep reaps it as usual.
+#[tokio::test]
+async fn ttl_sweep_keeps_an_idle_agent_with_a_running_worker() {
+    let (pinned, keep_alive) = keep_alive_set();
+    let reg = ProcessRegistry::new(8).with_keep_alive_fn(keep_alive);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (busy, plain) = (AgentId::from("busy"), AgentId::from("plain"));
+    for id in [&busy, &plain] {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+    }
+    let ttl = Duration::from_secs(60);
+    reg.set_last_active(&busy, idle_for(ttl));
+    reg.set_last_active(&plain, idle_for(ttl));
+    pinned.lock().unwrap().insert(busy.clone());
+
+    let evicted = reg.evict_idle_older_than(ttl, |_| true, |_| {}).await;
+    assert_eq!(evicted, 1, "only the agent without workers is reaped");
+    assert_eq!(*log.lock().unwrap(), vec![plain.clone()]);
+    assert!(
+        reg.is_registered(&busy),
+        "running worker keeps the agent alive"
+    );
+
+    // Repeated sweeps keep skipping it while the worker runs.
+    assert_eq!(reg.evict_idle_older_than(ttl, |_| true, |_| {}).await, 0);
+    assert!(reg.is_registered(&busy));
+
+    // The worker ends: the next sweep reaps it.
+    pinned.lock().unwrap().clear();
+    assert_eq!(reg.evict_idle_older_than(ttl, |_| true, |_| {}).await, 1);
+    assert!(!reg.is_registered(&busy), "reaped once its worker ended");
+}
+
+/// The keep-alive is bounded: a worker whose end report never arrives
+/// (§5.5b keeps such a row running until the connection ends) cannot pin an
+/// idle agent forever. Past `ttl + WORKER_KEEPALIVE_CAP` the sweep reaps it.
+#[tokio::test]
+async fn ttl_sweep_reaps_a_pinned_agent_past_the_keep_alive_cap() {
+    let (pinned, keep_alive) = keep_alive_set();
+    let reg = ProcessRegistry::new(8).with_keep_alive_fn(keep_alive);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (capped, within) = (AgentId::from("capped"), AgentId::from("within"));
+    for id in [&capped, &within] {
+        reg.register(id.clone(), recording_kill(id.clone(), log.clone()));
+        pinned.lock().unwrap().insert(id.clone());
+    }
+    let ttl = Duration::from_secs(60);
+    let cap_ms = u64::try_from(super::WORKER_KEEPALIVE_CAP.as_millis()).unwrap();
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap();
+    let now = super::now_ms();
+    reg.set_last_active(&capped, now - ttl_ms - cap_ms - 1_000);
+    reg.set_last_active(&within, now - ttl_ms - cap_ms + 60_000);
+
+    let evicted = reg.evict_idle_older_than(ttl, |_| true, |_| {}).await;
+    assert_eq!(evicted, 1);
+    assert_eq!(*log.lock().unwrap(), vec![capped.clone()]);
+    assert!(reg.is_registered(&within), "inside the cap stays pinned");
+}
+
+/// Slot-cap admission is never blocked by a running worker, but it prefers
+/// an agent without workers even when that agent was used more recently.
+#[tokio::test]
+async fn slot_cap_eviction_orders_agents_with_running_workers_last() {
+    let (pinned, keep_alive) = keep_alive_set();
+    let reg = ProcessRegistry::new(2).with_keep_alive_fn(keep_alive);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (old_busy, new_plain, c, d) = (
+        AgentId::from("old-busy"),
+        AgentId::from("new-plain"),
+        AgentId::from("c"),
+        AgentId::from("d"),
+    );
+    reg.register(
+        old_busy.clone(),
+        recording_kill(old_busy.clone(), log.clone()),
+    );
+    reg.register(
+        new_plain.clone(),
+        recording_kill(new_plain.clone(), log.clone()),
+    );
+    reg.set_last_active(&old_busy, 100);
+    reg.set_last_active(&new_plain, 200);
+    pinned.lock().unwrap().insert(old_busy.clone());
+
+    reg.acquire(&c, claim_all, release_none).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![new_plain.clone()],
+        "the agent without workers goes first despite being more recent"
+    );
+    reg.register(c.clone(), recording_kill(c.clone(), log.clone()));
+    reg.mark_active(&c);
+
+    // Only the pinned agent is idle now: pressure relief still evicts it.
+    reg.acquire(&d, claim_all, release_none).await;
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![new_plain.clone(), old_busy.clone()]
+    );
+    assert!(!reg.is_registered(&old_busy));
+}
+
+/// The count-based `evict_idle` walk uses the same order: unpinned first.
+#[tokio::test]
+async fn evict_idle_orders_agents_with_running_workers_last() {
+    let (pinned, keep_alive) = keep_alive_set();
+    let reg = ProcessRegistry::new(8).with_keep_alive_fn(keep_alive);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (busy, plain) = (AgentId::from("busy"), AgentId::from("plain"));
+    reg.register(busy.clone(), recording_kill(busy.clone(), log.clone()));
+    reg.register(plain.clone(), recording_kill(plain.clone(), log.clone()));
+    reg.set_last_active(&busy, 100);
+    reg.set_last_active(&plain, 200);
+    pinned.lock().unwrap().insert(busy.clone());
+
+    assert_eq!(reg.evict_idle(Some(1), |_| true, |_| {}).await, 1);
+    assert_eq!(*log.lock().unwrap(), vec![plain.clone()]);
+    assert_eq!(reg.evict_idle(None, |_| true, |_| {}).await, 1);
+    assert_eq!(*log.lock().unwrap(), vec![plain, busy]);
+}
+
+/// The memory-budget drain still reclaims a pinned agent, but only after
+/// every idle agent without workers — even a larger pinned subtree waits.
+#[tokio::test]
+async fn over_budget_drain_orders_agents_with_running_workers_last() {
+    let gb = super::GB;
+    let (pinned, keep_alive) = keep_alive_set();
+    let reg = ProcessRegistry::new(8).with_keep_alive_fn(keep_alive);
+    let probe = FakeProbe::new(10 * gb);
+    assert!(reg.set_memory_budget(4 * gb, probe.clone()));
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (small, big_busy) = (AgentId::from("small"), AgentId::from("big-busy"));
+    reg.register(small.clone(), recording_kill(small.clone(), log.clone()));
+    reg.register(
+        big_busy.clone(),
+        recording_kill(big_busy.clone(), log.clone()),
+    );
+    reg.set_last_active(&small, 200);
+    reg.set_last_active(&big_busy, 100);
+    probe.set_agents(&[(&small, gb), (&big_busy, 7 * gb)]);
+    pinned.lock().unwrap().insert(big_busy.clone());
+
+    let evicted = reg.evict_while_over_budget(|_| true, |_| {}).await;
+    assert_eq!(
+        evicted, 2,
+        "still over budget after the small one → drain the pinned one"
+    );
+    assert_eq!(*log.lock().unwrap(), vec![small, big_busy]);
+}
+
 /// Regression for monorepo#3040 — a send to an agent the TTL sweep just
 /// reaped must NOT be silently dropped. The reap only kills the child process
 /// (the session row survives), so `send_message` must take the auto-restore

@@ -697,3 +697,59 @@ async fn a_stop_fence_is_revoked_by_disconnect_replacement_and_release() {
     workers.release(&agent);
     assert!(fence.load(Ordering::SeqCst), "release revokes");
 }
+
+/// The idle reaper's keep-alive query: only a running row on the agent's
+/// current, continuous, supported generation counts.
+#[test]
+fn has_running_workers_tracks_running_rows_on_a_continuous_generation() {
+    let mut p = claude();
+    assert!(!p.has_running_workers(), "no rows yet");
+    p.ingest(&frame(spawn("w"), 1000));
+    assert!(p.has_running_workers());
+    p.ingest(&frame(spawn("done"), 1000));
+    p.ingest(&frame(state("done", "completed"), 2000));
+    assert!(p.has_running_workers(), "one row still running");
+    p.ingest(&frame(state("w", "stopped"), 3000));
+    assert!(!p.has_running_workers(), "every row ended");
+
+    let mut gone = claude();
+    gone.ingest(&frame(spawn("w"), 1000));
+    gone.disconnect();
+    assert!(
+        !gone.has_running_workers(),
+        "a disconnected generation cannot vouch for its workers"
+    );
+
+    let unsupported = Projection::new(scope("claude-code"), &identity("claude-code"), false);
+    assert!(!unsupported.has_running_workers());
+}
+
+#[test]
+fn registry_has_running_workers_follows_the_current_generation() {
+    let workers = AgentWorkers::default();
+    let agent = AgentId::from("agent-A");
+    assert!(!workers.has_running_workers(&agent), "no generation held");
+    workers.begin(
+        scope("claude-code"),
+        &identity("claude-code"),
+        true,
+        Weak::new(),
+    );
+    assert!(!workers.has_running_workers(&agent));
+    workers.ingest(&agent, "generation-A", &frame(spawn("w"), 1000));
+    assert!(workers.has_running_workers(&agent));
+
+    workers.disconnect(&agent, "generation-A");
+    assert!(!workers.has_running_workers(&agent), "disconnected");
+
+    workers.begin(
+        scope("claude-code"),
+        &identity("claude-code"),
+        true,
+        Weak::new(),
+    );
+    workers.ingest(&agent, "generation-A", &frame(spawn("w2"), 1000));
+    assert!(workers.has_running_workers(&agent));
+    workers.release(&agent);
+    assert!(!workers.has_running_workers(&agent), "released");
+}
