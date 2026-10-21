@@ -7,6 +7,11 @@ repository.workspace = true
 license.workspace = true
 description = "Provider registry, launch arg/env assembly, model-tier and capability tables"
 
+[features]
+# Shared Codex/Claude CLI test fixtures (`test_support`). Enable only from
+# `[dev-dependencies]`; daemon and packaging builds leave it disabled.
+test-support = []
+
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.22" }
 serde_json = { workspace = true }
@@ -16,6 +21,8 @@ tracing.workspace = true
 [dev-dependencies]
 ctor = "1.0.10"
 tempfile = "3"
+# Source-lint scaffolding for `tests/cli_fixture_version_lint.rs`.
+intentd-test-support = { path = "../intentd-test-support" }
 
 [lints]
 workspace = true

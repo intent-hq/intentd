@@ -2332,6 +2332,7 @@ version = "0.11.22"
 dependencies = [
  "ctor",
  "intent-core",
+ "intentd-test-support",
  "node-semver",
  "serde_json",
  "tempfile",
