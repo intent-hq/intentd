@@ -123,10 +123,13 @@ mod tests {
             .workspace_branch_auto_generated(&ws.id)
             .await
             .unwrap());
-        let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data["changes"],
@@ -168,10 +171,13 @@ mod tests {
             .unwrap();
         refresher.trigger(ws.id.clone());
 
-        let events = tokio::time::timeout(Duration::from_secs(10), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events[0].data["changes"]["branch"], "fix/linked");
         assert_eq!(
             svc.store.get_workspace(&ws.id).await.unwrap().branch,

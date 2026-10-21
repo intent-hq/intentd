@@ -649,37 +649,43 @@ child.on('exit',code=>process.exit(code||0));
             tokio::spawn(
                 async move { launch.catalogs_with_auth(Ok(auth), Limits::default()).await },
             );
-        let ready = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut poll = tokio::time::interval(Duration::from_millis(10));
-            loop {
-                poll.tick().await;
-                if fixture
-                    .events()
-                    .iter()
-                    .any(|event| event["role"] == "raw" && event["method"] == "initialize")
-                {
-                    break;
+        let ready = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                let mut poll = tokio::time::interval(Duration::from_millis(10));
+                loop {
+                    poll.tick().await;
+                    if fixture
+                        .events()
+                        .iter()
+                        .any(|event| event["role"] == "raw" && event["method"] == "initialize")
+                    {
+                        break;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         ready.expect("raw fixture reached its pending request");
-        tokio::time::timeout(Duration::from_secs(8), async {
-            let mut poll = tokio::time::interval(Duration::from_millis(10));
-            loop {
-                poll.tick().await;
-                if fixture
-                    .events()
-                    .iter()
-                    .filter_map(|event| event["home"].as_str())
-                    .all(|home| !Path::new(home).exists())
-                {
-                    break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(8)),
+            async {
+                let mut poll = tokio::time::interval(Duration::from_millis(10));
+                loop {
+                    poll.tick().await;
+                    if fixture
+                        .events()
+                        .iter()
+                        .filter_map(|event| event["home"].as_str())
+                        .all(|home| !Path::new(home).exists())
+                    {
+                        break;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("cancelled catalog guards complete cleanup");
         fixture.assert_clean();

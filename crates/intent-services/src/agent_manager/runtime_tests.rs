@@ -38,11 +38,14 @@ impl FakeRuntime {
     }
 
     async fn wait_prompts(&self, count: usize) {
-        timeout(Duration::from_secs(5), async {
-            while self.prompts.lock().unwrap().len() < count {
-                self.entered.notified().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while self.prompts.lock().unwrap().len() < count {
+                    self.entered.notified().await;
+                }
+            },
+        )
         .await
         .expect("manager dispatches the expected prompt");
     }
@@ -165,11 +168,14 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
 }
 
 async fn wait_idle(mgr: &AgentManager, id: &AgentId) {
-    timeout(Duration::from_secs(5), async {
-        while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("turn worker settles");
 }

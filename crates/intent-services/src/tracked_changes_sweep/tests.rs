@@ -447,10 +447,13 @@ async fn prune_recomputes_and_publishes_metrics() {
     });
 
     assert_eq!(prune_confirmed(&svc, &ws).await, 1);
-    let events = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-        .await
-        .expect("metrics event")
-        .expect("subscription open");
+    let events = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("metrics event")
+    .expect("subscription open");
     let event = events.first().expect("one event");
     assert_eq!(event.data["metrics"]["filesChanged"], serde_json::json!(1));
     let stored = svc

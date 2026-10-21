@@ -12375,9 +12375,12 @@ mod shutdown_writer_tests {
             () = std::future::ready(()) => {}
         }
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            shutdown,
+        )
+        .await
+        .unwrap();
         let workspace = manager
             .services
             .store
@@ -16867,7 +16870,7 @@ mod npx_launch_dir_lifetime_tests {
         *svc.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
         let owner = mgr.clone();
         let mut shutdown = intent_core::spawn_daemon(async move { owner.shutdown().await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), async {
             tokio::select! {
                 result = pending => assert_eq!(result.unwrap(), "process-registry"),
                 result = &mut shutdown => { result.unwrap(); panic!("shutdown omitted removed physical cleanup"); }
@@ -16875,32 +16878,35 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            shutdown.await.unwrap();
-            // These are synchronous shutdown postconditions: orphan-PID
-            // polling below must not hide delayed resource/registry cleanup.
-            assert!(!pid_alive(leader.cast_signed()));
-            assert!(
-                !pid_alive(tree.grandchild),
-                "grandchild {} alive after shutdown; launch_dir_exists={}",
-                tree.grandchild,
-                tree.launch_path.exists()
-            );
-            assert!(!tree.launch_path.exists());
-            // An aborted acquire skips its existing post-kill deregistration.
-            // Preserve that stale in-memory slot: late ID-only removal could
-            // erase a replacement runtime. The watcher deregisters first.
-            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
-            // Live descendants must be gone before shutdown returns. A dead
-            // orphan may still retain its PID until init reaps it; observe
-            // that retirement within the SAME total shutdown budget. Use
-            // signal 0 because pid_alive deliberately treats zombies as dead.
-            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
-                != Err(nix::errno::Errno::ESRCH)
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                shutdown.await.unwrap();
+                // These are synchronous shutdown postconditions: orphan-PID
+                // polling below must not hide delayed resource/registry cleanup.
+                assert!(!pid_alive(leader.cast_signed()));
+                assert!(
+                    !pid_alive(tree.grandchild),
+                    "grandchild {} alive after shutdown; launch_dir_exists={}",
+                    tree.grandchild,
+                    tree.launch_path.exists()
+                );
+                assert!(!tree.launch_path.exists());
+                // An aborted acquire skips its existing post-kill deregistration.
+                // Preserve that stale in-memory slot: late ID-only removal could
+                // erase a replacement runtime. The watcher deregisters first.
+                assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+                // Live descendants must be gone before shutdown returns. A dead
+                // orphan may still retain its PID until init reaps it; observe
+                // that retirement within the SAME total shutdown budget. Use
+                // signal 0 because pid_alive deliberately treats zombies as dead.
+                while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                    != Err(nix::errno::Errno::ESRCH)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(!pid_alive(tree.grandchild));
@@ -17062,7 +17068,8 @@ mod npx_launch_dir_lifetime_tests {
         let _ends =
             install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !marker.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -17202,7 +17209,8 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     async fn wait_for_file(path: &Path, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !path.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -17215,7 +17223,8 @@ mod npx_launch_dir_lifetime_tests {
 
     async fn read_grandchild_pid(pidfile: &Path) -> i32 {
         wait_for_file(pidfile, "grandchild pidfile").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if let Ok(pid) = std::fs::read_to_string(pidfile)
                 .unwrap_or_default()
@@ -17283,7 +17292,8 @@ mod npx_launch_dir_lifetime_tests {
     /// The launch dir must exist for as long as the discoverable tree is
     /// live, and be gone once the bounded kill has swept it.
     async fn assert_dir_outlives_tree(tree: &Tree, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while pid_alive(tree.grandchild) {
             assert!(
                 tree.launch_path.is_dir(),
@@ -19173,7 +19183,7 @@ mod role_reminder_tests {
                 calls
             });
             let outcome = tokio::time::timeout(
-                Duration::from_secs(2),
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
                 mgr.maybe_apply_session_model(
                     &connection,
                     &agent_id,
@@ -19679,7 +19689,8 @@ mod dead_child_respawn_tests {
         // The child exits on its own; once `try_wait` observes that, the
         // mapping must be gone. Poll up to a deadline — the exit is quick
         // but not synchronous with the spawn returning.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !mgr.agent_root_pids().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -22244,11 +22255,14 @@ mod cancel_and_settle_tests {
 
         // The cancel frame reached the agent side of the pipe.
         let mut lines = BufReader::new(c2a_agent).lines();
-        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
-            .await
-            .expect("frame arrives")
-            .expect("read ok")
-            .expect("one frame");
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            lines.next_line(),
+        )
+        .await
+        .expect("frame arrives")
+        .expect("read ok")
+        .expect("one frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC frame");
         assert_eq!(frame["method"], "session/cancel");
         assert_eq!(frame["params"]["sessionId"], "acp-1");

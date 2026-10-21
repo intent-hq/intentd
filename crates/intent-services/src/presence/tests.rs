@@ -309,7 +309,8 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
         .and_then(|v| v.get_mut(&principal))
         .expect("the member is viewing the note")
         .throttle
-        .last_publish = Some(Instant::now() + Duration::from_secs(60));
+        .last_publish =
+        Some(Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60)));
     with_caller(
         caller.clone(),
         services.note_presence_update_op("conn-1", ws.clone(), note.clone(), &cursor(2)),

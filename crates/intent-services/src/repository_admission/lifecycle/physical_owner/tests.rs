@@ -507,14 +507,16 @@ async fn concurrent_hard_retire_callers_join_the_original_leaf_before_returning(
             Ok(())
         })
     });
-    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    entering
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
     let first = owner.retirement();
     let (first_done, first_returned) = mpsc::channel();
     let first_worker = std::thread::spawn(move || {
         first.retire();
         first_done.send(()).unwrap();
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         if !f
             .registry
@@ -545,8 +547,14 @@ async fn concurrent_hard_retire_callers_join_the_original_leaf_before_returning(
         second.retire();
         done.send(()).unwrap();
     });
-    starting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let premature = returned.recv_timeout(Duration::from_millis(50)).is_ok();
+    starting
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
+    let premature = returned
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_millis(
+            50,
+        )))
+        .is_ok();
     release.send(()).unwrap();
     assert!(worker.join().unwrap().is_ok());
     first_worker.join().unwrap();
@@ -741,10 +749,12 @@ async fn every_pending_retirement_caller_joins_the_confirmed_original_leaf() {
             Ok(())
         })
     });
-    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    entering
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
     let first = pending.clone();
     let first_worker = std::thread::spawn(move || first.retire());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     while f
         .registry
         .state
@@ -777,8 +787,14 @@ async fn every_pending_retirement_caller_joins_the_confirmed_original_leaf() {
         pending.retire();
         done.send(()).unwrap();
     });
-    starting.recv_timeout(Duration::from_secs(5)).unwrap();
-    let premature = returned.recv_timeout(Duration::from_millis(50)).is_ok();
+    starting
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
+    let premature = returned
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_millis(
+            50,
+        )))
+        .is_ok();
     release.send(()).unwrap();
     assert!(worker.join().unwrap().is_ok());
     first_worker.join().unwrap();
@@ -1798,7 +1814,9 @@ async fn private_history_bootstrap_mutation_joins_original_transfer_and_preserve
     release.send(()).unwrap();
     transfer.join().unwrap().unwrap();
     joined_result
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let ticket = mutation.join().unwrap();
     assert!(bootstrap.with_current(|| Ok(())).is_err());
@@ -2712,10 +2730,13 @@ async fn services_original_history_case(variant: &'static str) {
             );
         }
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            retirement,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
                 .await
@@ -2724,15 +2745,18 @@ async fn services_original_history_case(variant: &'static str) {
         );
         assert!(connection.is_alive());
         finish_join.send(()).unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            shutdown,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.is_ok(),
             !matches!(variant, "shutdown-load-refused" | "shutdown-load-lost")
         );
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             auth.service.store_tasks.drain_finite(),
         )
         .await
@@ -2776,7 +2800,7 @@ async fn services_original_history_case(variant: &'static str) {
         drop(resume);
         release.send(()).unwrap();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             auth.service.store_tasks.drain_finite(),
         )
         .await

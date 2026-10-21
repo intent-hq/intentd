@@ -116,7 +116,9 @@ fn run_imports(root: &Path, contract: &Value, fault: &str) -> Result<Value, Stri
         command.env("LLVM_PROFILE_FILE", profile);
     }
     let mut child = GuardedChild::spawn(&mut command).unwrap();
-    let status = child.wait_with_timeout(Duration::from_secs(180)).unwrap();
+    let status = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(180)))
+        .unwrap();
     if !status.is_some_and(|status| status.success()) {
         return Err(format!(
             "import worker failed ({status:?}):\n{}",

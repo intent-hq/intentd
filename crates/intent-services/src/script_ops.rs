@@ -6686,7 +6686,8 @@ mod tests {
 
         drop(h);
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while pgroup_alive(pid) {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -7166,7 +7167,11 @@ mod tests {
         // Before serialization the second update completes while the first
         // awaits its predecessor; the first then overwrites only live state.
         // A serialized second update remains pending until we release the park.
-        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+        let early_second = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            &mut second,
+        )
+        .await;
 
         // A different script in the same workspace must remain writable while
         // replacement waits for a supervisor, rather than taking a global lock.
@@ -7313,7 +7318,11 @@ mod tests {
             caller(!first_member),
             !first_remove,
         ));
-        let early_second = tokio::time::timeout(Duration::from_secs(1), &mut second).await;
+        let early_second = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            &mut second,
+        )
+        .await;
         tokio::time::timeout(LIVENESS, async {
             let independent =
                 create_simple(&h, "independent", "echo independent", ScriptMode::Command).await;

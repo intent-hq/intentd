@@ -9356,9 +9356,12 @@ mod tests {
             let repo = repo.clone();
             async move { svc.serve_pr(&repo, 42).await }
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("serve_pr reaches the miss→fetch window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("serve_pr reaches the miss→fetch window");
         assert_eq!(forge.fetches(), 0, "parked before its own fetch");
 
         // The concurrent fill: another reader stores #42 while the first
@@ -10841,7 +10844,8 @@ mod tests {
         // The deferral is decided by the registration's one quota probe;
         // once that probe is counted, the next await is the gate section.
         async fn probed(forge: &StubForge, n: usize) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
             while forge.sub_fetches("rate_limit_status") < n {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -14629,7 +14633,8 @@ mod tests {
         // The owner learns why its watch stopped (store-only wake here: no
         // manager attached, so nothing can spawn a turn; the wake parks
         // behind the archived gate at most).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             let text = owner_messages(&svc, &owner).await;
             if text.contains("workspace was archived") {

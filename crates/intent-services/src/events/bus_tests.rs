@@ -68,10 +68,13 @@ async fn publish_appends_to_store_and_broadcasts() {
         .expect("publish");
 
     // Broadcast leg: the subscriber receives the persisted event.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, stored.id);
     assert_eq!(batch[0].event_type, "note:created");
@@ -123,10 +126,13 @@ async fn non_agent_file_events_broadcast_without_persisting() {
     // Broadcast leg: all four events reached the subscriber.
     let mut seen = Vec::new();
     for _ in 0..4 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         seen.extend(batch);
     }
     assert_eq!(seen.len(), 4);
@@ -163,7 +169,12 @@ async fn large_transient_file_burst_reaches_a_draining_subscriber() {
     let consumer = tokio::spawn(async move {
         let mut received = 0usize;
         while received < BURST {
-            match timeout(Duration::from_secs(5), sub.recv()).await {
+            match timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            {
                 Ok(Some(batch)) => received += batch.len(),
                 _ => break,
             }
@@ -246,10 +257,13 @@ async fn type_glob_and_exclude_self() {
         .await
         .expect("publish other");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, kept.id);
     assert_eq!(batch[0].actor.id.as_deref(), Some("agent-other"));
@@ -296,10 +310,13 @@ async fn batch_window_coalesces_matched_events() {
     tokio::time::pause();
     tokio::time::advance(WINDOW).await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 3, "events within the window should coalesce");
 }
 
@@ -373,10 +390,13 @@ async fn dropping_bus_flushes_buffered_batch_before_close() {
     // flushes the buffered batch, then returns.
     drop(bus);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("flush timed out")
-        .expect("flush yielded no batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("flush timed out")
+    .expect("flush yielded no batch");
     assert_eq!(batch.len(), 2, "buffered events must flush on bus close");
     // After the flush the channel is closed; no further batches arrive.
     assert!(sub.recv().await.is_none());
@@ -493,10 +513,13 @@ async fn idle_publish_resolves_without_batch_window_delay() {
 
     // Shutdown invariant: closing the channel ends the loop.
     drop(wtx);
-    timeout(Duration::from_secs(2), writer)
-        .await
-        .expect("writer loop exits on channel close")
-        .expect("writer loop task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        writer,
+    )
+    .await
+    .expect("writer loop exits on channel close")
+    .expect("writer loop task");
 }
 
 #[tokio::test]
@@ -552,10 +575,13 @@ async fn concurrent_burst_batches_events_correctly() {
     let start = std::time::Instant::now();
     let mut received = Vec::new();
     for _ in 0..TOTAL_EVENTS {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("subscriber recv timed out")
-            .expect("subscription closed early");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("subscriber recv timed out")
+        .expect("subscription closed early");
         assert_eq!(batch.len(), 1, "no batching; each event is single-element");
         received.push(batch.into_iter().next().unwrap());
     }
@@ -699,10 +725,13 @@ async fn oversized_tool_call_payload_is_capped_in_store_but_full_on_broadcast() 
 
     // Publisher's returned event and the broadcast keep the FULL payload.
     assert_eq!(stored.data["output"], json!(big_output));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].data["output"], json!(big_output));
 
@@ -1181,10 +1210,13 @@ async fn broadcast_lag_emits_warn_with_skipped_count_and_filter_context() {
     }
 
     // Delivery resumes after the lag report: the surviving events arrive.
-    let batch = timeout(Duration::from_secs(5), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert!(!batch.is_empty());
 
     let warns = capture.warns();
@@ -1227,10 +1259,13 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
         let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
-    let first = timeout(Duration::from_secs(5), sub.recv_delivery())
-        .await
-        .expect("recv_delivery timed out")
-        .expect("subscription closed");
+    let first = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv_delivery(),
+    )
+    .await
+    .expect("recv_delivery timed out")
+    .expect("subscription closed");
     match first {
         Delivery::Lagged(n) => assert_eq!(
             n, OVERFLOW as u64,
@@ -1243,10 +1278,13 @@ async fn broadcast_lag_yields_in_band_lagged_marker_before_surviving_events() {
             panic!("expected the lag marker before any surviving event")
         }
     }
-    let second = timeout(Duration::from_secs(5), sub.recv_delivery())
-        .await
-        .expect("recv_delivery timed out")
-        .expect("subscription closed");
+    let second = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv_delivery(),
+    )
+    .await
+    .expect("recv_delivery timed out")
+    .expect("subscription closed");
     assert!(
         matches!(second, Delivery::Batch(ref b) if !b.is_empty()),
         "surviving events follow the marker"
@@ -1266,10 +1304,13 @@ async fn recv_skips_lag_markers_transparently() {
         let _ = bus.publish_transient(&new_event("note:created", Some("u"), ActorType::User));
     }
 
-    let batch = timeout(Duration::from_secs(5), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert!(
         !batch.is_empty(),
         "recv yields the surviving events, never a marker"
@@ -1370,10 +1411,12 @@ async fn private_history_change_only_notifies_matching_opted_in_chat() {
         Some(Delivery::HistoryChanged)
     ));
     for sub in [&mut ordinary, &mut matching, &mut other] {
-        let Some(Delivery::Batch(events)) = timeout(Duration::from_secs(2), sub.recv_delivery())
-            .await
-            .unwrap()
-        else {
+        let Some(Delivery::Batch(events)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv_delivery(),
+        )
+        .await
+        .unwrap() else {
             panic!("only the matching opted-in subscriber may receive the private notification")
         };
         assert_eq!(events.len(), 1);
@@ -1418,16 +1461,21 @@ async fn recovery_fence_covers_private_quiet_tail_without_projection() {
     bus.notify_monitor_history("private-agent");
     for sub in [&mut ordinary, &mut filtered] {
         let receipt = sub.fence_handle().request().unwrap();
-        let delivery = timeout(Duration::from_secs(2), sub.recv_delivery())
-            .await
-            .unwrap();
+        let delivery = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv_delivery(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(delivery, Some(Delivery::Batch(ref batch)) if batch.len() == 1 && batch[0].id == public.id)
         );
-        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
-            .await
-            .unwrap()
-        else {
+        let Some(Delivery::Fence(ack)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv_delivery(),
+        )
+        .await
+        .unwrap() else {
             panic!("private quiet tail must reach its fence without a public projection");
         };
         ack.send(()).unwrap();
@@ -1440,10 +1488,12 @@ async fn recovery_fence_covers_private_quiet_tail_without_projection() {
     bus.notify_monitor_history("private-agent-only");
     for sub in [&mut ordinary, &mut filtered, &mut late] {
         let receipt = sub.fence_handle().request().unwrap();
-        let Some(Delivery::Fence(ack)) = timeout(Duration::from_secs(2), sub.recv_delivery())
-            .await
-            .unwrap()
-        else {
+        let Some(Delivery::Fence(ack)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv_delivery(),
+        )
+        .await
+        .unwrap() else {
             panic!("private-only tail has no public marker");
         };
         ack.send(()).unwrap();

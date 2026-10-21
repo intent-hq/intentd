@@ -88,7 +88,9 @@ impl RepositoryLifecycleObserver for Probe {
         let callback = self.callback.lock().unwrap().take();
         if let Some((entered, release)) = callback {
             entered.notify_one();
-            release.recv_timeout(Duration::from_secs(10)).unwrap();
+            release
+                .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                .unwrap();
         }
         if self.reject.load(Ordering::SeqCst) {
             return Err(Error::Internal("fixture unknown begin".into()));
@@ -303,7 +305,7 @@ async fn preparation_waiters_are_pinned_and_unrelated_keys_progress_during_retir
     drop(abandoned_waiter);
     let other = PendingDeleteSubject::Workspace(WorkspaceId::from("unrelated"));
     tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         f.registry.schedule_owned(other.clone(), 60_000, no_delete),
     )
     .await

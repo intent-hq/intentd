@@ -54,25 +54,34 @@ async fn qualified_scheduler_slow_or_failed_gitlab_preserves_healthy_github_prog
         });
         if failure == "slow" {
             provider.entered().await;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                while forge.fetches() == fetched {
-                    tokio::task::yield_now().await;
-                }
-            })
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                async {
+                    while forge.fetches() == fetched {
+                        tokio::task::yield_now().await;
+                    }
+                },
+            )
             .await
             .unwrap();
             assert!(!polling.is_finished(), "GitLab request must still be held");
             // A second sweep cannot wait on the occupied GitLab lane.
-            tokio::time::timeout(Duration::from_secs(10), service.poll_pr_monitors())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                service.poll_pr_monitors(),
+            )
+            .await
+            .unwrap();
             assert!(forge.fetches() >= fetched + 2);
             provider.resume();
         }
-        tokio::time::timeout(Duration::from_secs(10), polling)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            polling,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         if failure != "slow" {
             service.poll_pr_monitors().await;
             assert!(forge.fetches() >= fetched + 2);

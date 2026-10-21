@@ -1187,7 +1187,9 @@ mod tests {
                 .stdout(log.try_clone().unwrap())
                 .stderr(log);
             let mut child = GuardedChild::spawn(&mut command).unwrap();
-            let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+            let status = child
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
+                .unwrap();
             let output = std::fs::read_to_string(&log_path).unwrap();
             assert!(
                 status.is_some_and(|status| status.success()) && output.contains("1 passed"),

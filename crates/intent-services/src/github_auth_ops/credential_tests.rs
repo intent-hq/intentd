@@ -55,10 +55,13 @@ async fn connect_after_shutdown_fence(drain_writers: bool) {
         let services = services.clone();
         async move { services.github_connect().await }
     });
-    tokio::time::timeout(Duration::from_secs(5), entered_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered_rx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     if drain_writers {
         services.shutdown_store_writers().await;
         assert!(services.store_tasks.is_closed());
@@ -67,10 +70,13 @@ async fn connect_after_shutdown_fence(drain_writers: bool) {
         assert!(!services.store_tasks.is_closed());
     }
     release_tx.send(()).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        request,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     server.await.unwrap();
     let advertised = services.github_auth_flow.lock().await.is_some();
     // Clean up even on the failing baseline, which starts a resident poller.
@@ -124,7 +130,7 @@ pub(crate) async fn authorize(
         .await
         .unwrap();
     let flow_id = next_flow_id();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let state = services.github_auth_flow.clone();
     *state.lock().await = Some(FlowSlot {
         flow_id,
@@ -190,19 +196,29 @@ async fn github_poll_retains_engine_result_after_write_wait_budget() {
         }
     });
     let mut flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     // The engine's existing public wait cap is ten seconds. Its real blocking
     // closure has written the token but remains held in lease destruction,
     // before the actual Result can be returned to a completion owner.
-    let early = tokio::time::timeout(Duration::from_secs(11), &mut flow).await;
+    let early = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(11)),
+        &mut flow,
+    )
+    .await;
     release_tx.send(()).unwrap();
     if early.is_err() {
-        tokio::time::timeout(Duration::from_secs(5), flow)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            flow,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(
         early.is_err(),
@@ -255,9 +271,12 @@ async fn revoke_or_cancel_before_publication(cancel: bool) {
         }
     });
     let flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
         Some("new-device-token")
@@ -281,10 +300,13 @@ async fn revoke_or_cancel_before_publication(cancel: bool) {
     if !cancel {
         revoke.await.unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), flow)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        flow,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(raw.load(SECRET_ACCOUNT).unwrap(), None);
     assert_eq!(
         raw.load(crate::source_control_auth_ops::GITHUB_TOKEN_METHOD_ACCOUNT)
@@ -353,9 +375,12 @@ async fn finalizer_ownership_timeout(replace_flow: bool) {
         }
     });
     let flow = authorize(&services, raw.clone(), identity).await;
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     // Queue ahead of the finalizer while the persistence lease is still held.
     let mut mutation = Box::pin(services.secrets.github_mutation());
     assert!(
@@ -382,10 +407,13 @@ async fn finalizer_ownership_timeout(replace_flow: bool) {
         slot.flow_id
     };
     // Keep the newer mutation owned until the finalizer's bounded wait expires.
-    tokio::time::timeout(Duration::from_secs(5), flow)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        flow,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
         Some("newer-token")

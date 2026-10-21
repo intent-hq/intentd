@@ -226,7 +226,8 @@ fn retirement_waits_for_admitted_leaf_but_does_not_hold_registry_lock() {
             Ok(())
         })
     });
-    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    wait.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
     let mutation_registry = registry.clone();
     let mutation_workspace = workspace.clone();
     let (finished, finish) = mpsc::channel();
@@ -237,7 +238,7 @@ fn retirement_waits_for_admitted_leaf_but_does_not_hold_registry_lock() {
         finished.send(()).unwrap();
         ticket
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         if !registry.state.lock().unwrap().pending.is_empty() {
             break;
@@ -267,7 +268,11 @@ fn retirement_waits_for_admitted_leaf_but_does_not_hold_registry_lock() {
         returned.send(()).unwrap();
         ticket
     });
-    let premature = returned_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+    let premature = returned_rx
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_millis(
+            50,
+        )))
+        .is_ok();
     release.send(()).unwrap();
     assert!(worker.join().unwrap().is_ok());
     second.join().unwrap().settle_confirmed();
@@ -275,7 +280,9 @@ fn retirement_waits_for_admitted_leaf_but_does_not_hold_registry_lock() {
         !premature,
         "second writer returned before original leaf retirement"
     );
-    finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    finish
+        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        .unwrap();
     writer.join().unwrap().settle_confirmed();
     assert_eq!(leaf.check_current(), Err(AdmissionError::Retired));
 }
@@ -458,7 +465,8 @@ mod pending_delete {
                 release: Some(release),
                 worker: Some(worker),
             };
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            wait.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+                .unwrap();
             held
         }
 
@@ -490,7 +498,7 @@ mod pending_delete {
     }
 
     async fn wait_pending(registry: &RepositoryLifecycleRegistry, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             if registry.state.lock().unwrap().pending.len() == count {
                 return;
@@ -740,19 +748,22 @@ mod pending_delete {
         let unavailable = owner.callback().capture();
         assert!(!current(&unavailable, &f.first).await);
         assert!(current(&other.callback().capture(), &f.other).await);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            f.registry.install(&f.store).await.unwrap();
-            let _inserted = Fixture::insert_subject(&f.store).await;
-            f.store
-                .begin_repository_pending_delete(&[RepositoryLifecycleKey::Agent(
-                    f.other.agent.clone(),
-                )])
-                .await
-                .unwrap()
-                .settle_confirmed()
-                .await
-                .unwrap();
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                f.registry.install(&f.store).await.unwrap();
+                let _inserted = Fixture::insert_subject(&f.store).await;
+                f.store
+                    .begin_repository_pending_delete(&[RepositoryLifecycleKey::Agent(
+                        f.other.agent.clone(),
+                    )])
+                    .await
+                    .unwrap()
+                    .settle_confirmed()
+                    .await
+                    .unwrap();
+            },
+        )
         .await
         .unwrap();
         assert!(!first.is_finished());
