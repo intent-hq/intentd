@@ -875,7 +875,7 @@ async fn idle_reap_keeps_an_agent_with_a_running_worker_over_wss() {
             "name": "@agentclientprotocol/claude-agent-acp",
             "version": intent_providers::CLAUDE_AGENT_ACP_VERSION,
         },
-        "asyncTasks": { "spawnOn": "RUN_BG", "command": "sleep 900" },
+        "asyncTasks": { "spawnOn": "RUN_BG", "command": "npm run dev" },
     })
     .to_string();
     let env: [(&str, &str); 7] = [
