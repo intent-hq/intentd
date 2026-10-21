@@ -697,7 +697,13 @@ fn check_below_root(root: &Path, path: &Path, walk: Walk) -> io::Result<()> {
 }
 
 /// Open options that refuse a symlinked final component (`O_NOFOLLOW`).
-fn no_follow(mut opts: OpenOptions) -> OpenOptions {
+fn no_follow(
+    #[cfg_attr(
+        not(unix),
+        expect(unused_mut, reason = "only the unix O_NOFOLLOW block mutates")
+    )]
+    mut opts: OpenOptions,
+) -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
