@@ -2617,10 +2617,11 @@ async fn cmd_serve_owned(
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
-    let git_status_refresher = Arc::new(GitStatusRefresher::start(
+    let git_status_refresher = Arc::new(GitStatusRefresher::start_with_presence(
         bus.clone(),
         api.clone(),
         services.git_status_cache(),
+        services.worktree_presence(),
     ));
     // Slow initializations run in the background so the listeners below bind —
     // and `system.status` answers — without waiting on them (monorepo#1581):
@@ -2648,6 +2649,7 @@ async fn cmd_serve_owned(
             api.clone(),
             Arc::clone(&git_status_refresher),
             watch_health.clone(),
+            services.worktree_presence(),
             watcher_shutdown,
         )
     });
@@ -6604,6 +6606,7 @@ fn spawn_watcher_registry_init(
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
     watch_health: intent_services::WatchHealth,
+    presence: intent_services::worktree_presence::WorktreePresence,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
@@ -6629,7 +6632,15 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start_with_health(&hub, bus, api, refresher, &watch_health).await
+                WatcherRegistry::start_with_health(
+                    &hub,
+                    bus,
+                    api,
+                    refresher,
+                    &watch_health,
+                    presence,
+                )
+                .await
             })
         });
         tracing::info!("watcher registry ready");

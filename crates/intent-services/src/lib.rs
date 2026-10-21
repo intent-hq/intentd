@@ -246,6 +246,7 @@ mod script_monitor;
 mod script_ops;
 mod script_output_cleanup;
 mod script_output_store;
+pub mod worktree_presence;
 pub use script_ops::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
@@ -674,6 +675,11 @@ pub struct Services {
     /// generation up front and commits the fallback subject. In-memory only,
     /// shared across clones like the other registries.
     auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
+    /// Workspaces last observed with a missing checkout folder
+    /// (intent-hq/intent#7183). Gates auto-commit and the tracked-changes
+    /// sweep and is shared with the watcher registry's presence probe.
+    /// In-memory only, shared across clones.
+    worktree_presence: worktree_presence::WorktreePresence,
     /// Per-workspace setup-stage state (§6.5 lifecycle) backing
     /// [`WorkspaceApi::workspace_setup_status`]: written at every
     /// `workspace:setup:started` / `workspace:setup:completed` publish site
@@ -1675,6 +1681,7 @@ impl Services {
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            worktree_presence: worktree_presence::WorktreePresence::default(),
             workspace_setup_states: WorkspaceSetupStates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -2852,6 +2859,14 @@ impl Services {
     pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));
         self
+    }
+
+    /// The shared missing-checkout map (intent-hq/intent#7183), handed to the
+    /// composition root so the watcher registry's presence probe and the
+    /// auto-commit / sweep gates agree on one transition log.
+    #[must_use]
+    pub fn worktree_presence(&self) -> worktree_presence::WorktreePresence {
+        self.worktree_presence.clone()
     }
 
     /// The shared event-invalidated working-tree status cache (monorepo#1648),

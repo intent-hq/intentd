@@ -54,6 +54,7 @@ mod tests {
             svc.event_bus.as_ref().unwrap(),
             svc,
             svc.git_status_cache().as_ref(),
+            &svc.worktree_presence(),
             &ws.id,
         )
         .await;
