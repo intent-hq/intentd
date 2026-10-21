@@ -892,9 +892,11 @@ fn opt_string(params: &Value, key: &str) -> Result<Option<String>> {
     }
 }
 
+/// An optional boolean member: absent is `None`; any other non-boolean,
+/// explicit `null` included, is a malformed request (§5.54).
 fn opt_bool(params: &Value, key: &str) -> Result<Option<bool>> {
     match params.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(Error::InvalidParams(format!("{key} must be a boolean"))),
     }
@@ -1629,9 +1631,11 @@ impl Services {
     }
 
     /// Persist a new order for one base provider's profiles (failover tries
-    /// backups in this order). Metadata only: no secret I/O, one atomic
-    /// write. Every successful call commits, bumps the revision and emits
-    /// one `reordered` event, even when the order is unchanged (§5.54).
+    /// backups in this order): one atomic metadata write. The response rows
+    /// (which read each profile's masked env) are built first, so a failed
+    /// read changes nothing (§5.54). Every successful call commits, bumps
+    /// the revision and emits one `reordered` event, even when the order is
+    /// unchanged.
     async fn provider_profiles_reorder_owned(&self, params: Value) -> Result<Value> {
         let base = opt_string(&params, "baseProviderId")?
             .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
@@ -1642,19 +1646,19 @@ impl Services {
         let profiles = store.profiles()?;
         let after = reorder_profiles(&profiles, &base, &profile_ids)
             .map_err(|errors| field_errors(&errors))?;
-        store.persist(after.clone(), store.pending())?;
-        let revision = store.bump_revision();
-        crate::publish_event(
-            self.event_bus.as_ref(),
-            profiles_reordered_event(revision, &base),
-        )
-        .await;
         let mut rows = Vec::new();
         for meta in after.iter().filter(|p| p.base_provider == base) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
             let running = self.profile_activation.running_processes(&meta.id);
             rows.push(profile_json(meta, &env, running));
         }
+        store.persist(after, store.pending())?;
+        let revision = store.bump_revision();
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            profiles_reordered_event(revision, &base),
+        )
+        .await;
         Ok(json!({ "profiles": rows, "revision": revision }))
     }
 

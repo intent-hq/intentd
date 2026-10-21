@@ -618,11 +618,22 @@ async fn provider_profiles_backup_and_reorder_contract_over_wss() {
     assert_eq!(ev["data"]["change"], "updated");
     assert_eq!(ev["data"]["envChanged"], false);
     assert_eq!(ev["data"]["profile"]["backup"], true);
+    for (id, value) in (40_i64..).zip([json!("yes"), Value::Null]) {
+        let bad = rpc(
+            &mut ws,
+            id,
+            "providers.profiles.update",
+            json!({ "profileId": spare2, "backup": value }),
+        )
+        .await;
+        assert_eq!(bad["error"]["code"], -32602, "{bad}");
+        assert!(bad["error"]["data"].get("fieldErrors").is_none(), "{bad}");
+    }
     let bad = rpc(
         &mut ws,
-        11,
-        "providers.profiles.update",
-        json!({ "profileId": spare2, "backup": "yes" }),
+        30,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "Null", "backup": null }),
     )
     .await;
     assert_eq!(bad["error"]["code"], -32602, "{bad}");

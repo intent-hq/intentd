@@ -1730,8 +1730,9 @@ async fn backup_round_trips_through_create_update_list_and_catalog() {
         .unwrap();
     assert_eq!(renamed["profile"]["backup"], true);
 
-    // Non-boolean backup is a malformed request.
-    for bad in [json!("yes"), json!(1)] {
+    // Non-boolean backup (explicit null included) is a malformed request;
+    // only an absent member means "default" / "keep".
+    for bad in [json!("yes"), json!(1), Value::Null, json!([]), json!({})] {
         let err = fx
             .svc
             .provider_profiles_create_impl(
@@ -1886,4 +1887,46 @@ async fn reorder_persists_the_order_bumps_revision_and_emits_one_event_per_call(
         [c.clone(), a.clone(), b.clone()],
         "order survives a restart"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn failed_reorder_response_read_changes_nothing() {
+    let fx = Fixture::new().await;
+    let a = fx.create("codex", "A", json!([])).await["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = fx.create("codex", "B", json!([])).await["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // An unreadable environment document makes the response rows fail.
+    SecretStore::store(&*fx.secrets, &env_account(&a), "{ not json").unwrap();
+    let before = std::fs::read(fx.profiles_file()).unwrap();
+    let revision = fx.svc.provider_profiles.revision();
+    let mut sub = fx.subscribe();
+
+    let err = fx
+        .svc
+        .provider_profiles_reorder_impl(json!({ "baseProviderId": "codex", "profileIds": [b, a] }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), -32603, "{err:?}");
+
+    assert_eq!(std::fs::read(fx.profiles_file()).unwrap(), before);
+    assert_eq!(fx.svc.provider_profiles.revision(), revision);
+    let order: Vec<String> = fx
+        .svc
+        .provider_profiles
+        .profiles()
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(order, [a.clone(), b.clone()]);
+    // No `reordered` event: the next event is the next mutation.
+    fx.create("codex", "C", json!([])).await;
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(ev["data"]["change"], "created");
+    assert_eq!(ev["data"]["revision"], revision + 1);
 }
