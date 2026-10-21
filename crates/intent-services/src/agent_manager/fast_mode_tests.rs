@@ -190,15 +190,18 @@ async fn fast_mode_setting_change_leaves_running_turn_untouched() {
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut notifications = notifications.lock().await;
-        while let Some(note) = notifications.recv().await {
-            if note.method == "fixture/held" {
-                return;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            let mut notifications = notifications.lock().await;
+            while let Some(note) = notifications.recv().await {
+                if note.method == "fixture/held" {
+                    return;
+                }
             }
-        }
-        panic!("fixture disconnected before prompt");
-    })
+            panic!("fixture disconnected before prompt");
+        },
+    )
     .await
     .unwrap();
     preference(&mgr, "claude-code", true);

@@ -1105,7 +1105,7 @@ async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
     // anyway, the fallback subject lands. The outer deadline is what fails
     // when the write happens before the timed region.
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
         svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn")),
     )
     .await
@@ -1268,11 +1268,14 @@ async fn auto_commit_attribution_survives_receiver_abort() {
     attribute_dirty_change(&svc, &ws, "agent-tail").await;
     let (rx, release) = hold(&svc, "git");
     let task = svc.spawn_auto_commit_loop();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while bus.subscriber_count() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let e = idle_event(&ws, "agent-tail", "end_turn");

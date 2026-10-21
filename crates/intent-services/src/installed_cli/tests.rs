@@ -64,11 +64,14 @@ async fn assert_ordinary_launch(context: InstalledContext, root: &Path) {
         .await
         .unwrap()
         .child;
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !root.join("launch-marker").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while !root.join("launch-marker").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     child.reap().await;
@@ -1038,7 +1041,9 @@ fn installed_cli_detached_identity_cleanup_signals_only_verified_child() {
     let guard = DetachedCleanup::capture(pid, root.path()).unwrap();
     assert!(!guard.retired().unwrap());
     drop(guard);
-    let retired = child.wait_with_timeout(Duration::from_secs(3)).unwrap();
+    let retired = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(3)))
+        .unwrap();
     let unrelated_alive = unrelated.try_wait().unwrap().is_none();
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
@@ -1109,11 +1114,16 @@ async fn detached_version_children_from(mode: &str, controlled: bool, body: &str
     command.env("VERSION_MODE", mode);
     let mut operation = tokio::spawn(async move { context.observe(&command).await.map(|_| ()) });
     let file = root.path().join("detached-pid");
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        while !file.exists() || (controlled && !root.path().join("publication-finished").exists()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    let ready = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !file.exists()
+                || (controlled && !root.path().join("publication-finished").exists())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await;
     let child = ready.map_err(|e| e.to_string()).and_then(|()| {
         let text = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
@@ -1140,12 +1150,15 @@ async fn detached_version_children_from(mode: &str, controlled: bool, body: &str
             .and_then(|(pid, _)| read_detached_publication(root.path(), *pid))
     });
     let cleaned = if let Ok((_, guard)) = &child {
-        tokio::time::timeout(Duration::from_secs(7), async {
-            while !guard.retired()? {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Ok::<_, String>(())
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(7)),
+            async {
+                while !guard.retired()? {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, String>(())
+            },
+        )
         .await
         .map_err(|error| error.to_string())
         .and_then(|result| result)
@@ -1226,11 +1239,14 @@ async fn ordinary_version_children(mode: &str) {
     command.args(["-c", "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > \"$PID_FILE\"; if [ \"$VERSION_MODE\" = success ]; then printf '1.2.3\\n'; else wait; fi"])
         .env("PID_FILE", &pid_file).env("VERSION_MODE", mode);
     let operation = tokio::spawn(version_output_uncontained(command));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !pid_file.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !pid_file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     let pid: i32 = std::fs::read_to_string(pid_file)
@@ -1249,21 +1265,24 @@ async fn ordinary_version_children(mode: &str) {
             assert!(result.unwrap_err().contains("timed out"));
         }
     }
-    let result = tokio::time::timeout(Duration::from_secs(7), async {
-        loop {
-            #[cfg(target_os = "linux")]
-            let live = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                !s.rsplit_once(") ")
-                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
-            });
-            #[cfg(not(target_os = "linux"))]
-            let live = unsafe { libc::kill(pid, 0) } == 0;
-            if !live {
-                break;
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(7)),
+        async {
+            loop {
+                #[cfg(target_os = "linux")]
+                let live = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+                    !s.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                });
+                #[cfg(not(target_os = "linux"))]
+                let live = unsafe { libc::kill(pid, 0) } == 0;
+                if !live {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await;
     if result.is_err() {
         unsafe {
@@ -1347,11 +1366,14 @@ async fn installed_cli_preparation_retains_actual_directories_on_owner_failure()
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>, root: &Path) {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !root.join("version-cwd").exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while !root.join("version-cwd").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     let profile = PathBuf::from(std::fs::read_to_string(root.join("version-profile")).unwrap());
@@ -1360,11 +1382,14 @@ pub(crate) async fn cancel_version_owner(operation: tokio::task::JoinHandle<()>,
     assert!(operation.await.unwrap_err().is_cancelled());
     assert!(profile.is_dir());
     assert!(cwd.is_dir());
-    tokio::time::timeout(Duration::from_secs(8), async {
-        while profile.exists() || cwd.exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(8)),
+        async {
+            while profile.exists() || cwd.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("actual profile and launch directory released after confirmed cleanup");
 }

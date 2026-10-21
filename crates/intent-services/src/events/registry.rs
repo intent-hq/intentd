@@ -1542,7 +1542,8 @@ mod tests {
     /// `want` (the guard drop runs inside the lifecycle task, so the count
     /// changes shortly after — not synchronously with — the archive event).
     async fn wait_for_common_dir_watch_count(registry: &WatcherRegistry, want: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while registry.common_dir_watch_count() != want && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

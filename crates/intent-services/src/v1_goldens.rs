@@ -1285,7 +1285,8 @@ pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
 pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
         let texts: Vec<String> = session

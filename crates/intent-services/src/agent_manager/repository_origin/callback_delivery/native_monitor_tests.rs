@@ -275,19 +275,22 @@ async fn manager_monitor_actual_native_queue_and_account_retirement() {
             .await;
     })
     .await;
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            let stored = services
-                .store
-                .get_pr_monitor(&monitor.monitor_id)
-                .await
-                .unwrap();
-            if stored.pending_changes.is_empty() {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        async {
+            loop {
+                let stored = services
+                    .store
+                    .get_pr_monitor(&monitor.monitor_id)
+                    .await
+                    .unwrap();
+                if stored.pending_changes.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("manager monitor turn must execute and acknowledge exact original transfer");
     let messages = services

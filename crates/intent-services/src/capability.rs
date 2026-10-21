@@ -1658,7 +1658,7 @@ mod tests {
         let (services, primary, ws) = (&services, &primary, &ws);
         let list = |what: &'static str| async move {
             tokio::time::timeout(
-                Duration::from_secs(1),
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
                 with_caller(
                     Caller::Wire {
                         principal_id: primary.id.clone(),
@@ -1678,11 +1678,14 @@ mod tests {
         let first = list("first list").await;
         assert_eq!(first["members"][0]["principalId"], json!(primary.id.0));
         assert_eq!(first["members"][0]["login"], Value::Null);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while fetches() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while fetches() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("the refresh was spawned");
 
@@ -1711,15 +1714,18 @@ mod tests {
         // Open the gate: the detached refresh completes and persists the
         // identity; a later list carries it.
         gate.add_permits(1);
-        let attached = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let p = store.get_primary_principal().await.expect("primary");
-                if p.login.is_some() {
-                    break p;
+        let attached = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    let p = store.get_primary_principal().await.expect("primary");
+                    if p.login.is_some() {
+                        break p;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("the background refresh attaches the identity");
         assert_eq!(attached.login.as_deref(), Some("octocat"));
@@ -1837,10 +1843,13 @@ mod tests {
         let added = add(&f.outsider).await.expect("add");
         // owner + demoted primary + collaborator + the new guest
         assert_eq!(added, json!({ "added": true, "memberCount": 4 }));
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("event in time")
-            .expect("event batch");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("event in time")
+        .expect("event batch");
         let ev = batch
             .iter()
             .find(|e| e.data["changes"]["addedPrincipalId"] == json!(f.outsider.0))
@@ -1860,9 +1869,12 @@ mod tests {
         let again = add(&f.outsider).await.expect("add again");
         assert_eq!(again, json!({ "added": false, "memberCount": 4 }));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "an idempotent add publishes nothing"
         );
 
@@ -1881,9 +1893,12 @@ mod tests {
             "{seated_revoked:?}"
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "a refused add publishes nothing"
         );
         assert_eq!(

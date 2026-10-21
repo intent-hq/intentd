@@ -990,9 +990,12 @@ fn scheduled_provider(
     .unwrap()
 }
 async fn reached(pause: &Pause) {
-    tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        pause.entered.notified(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1202,7 +1205,7 @@ async fn http_admission_429_during_refresh_keeps_original_quota_and_longest_dead
         .await
         .unwrap()
         .stamp;
-    let floor = Instant::now() + Duration::from_secs(300);
+    let floor = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(300));
     *server.handler.lock().unwrap() = Box::new(move |_, _| {
         test.directory.record_backoff(&prior, floor).unwrap();
         let ticket = test
@@ -1358,9 +1361,12 @@ async fn http_admission_detach_or_cancel_cannot_recall_a_request_already_seen() 
         }
         server.test.directory.retire().unwrap();
         pause.release.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), server.response_completed.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            server.response_completed.notified(),
+        )
+        .await
+        .unwrap();
         if cancel {
             // Dropping a sent future cannot prove that its effect was unsent.
             assert!(receive.await.is_err());

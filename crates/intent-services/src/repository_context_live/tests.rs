@@ -331,15 +331,22 @@ impl BlockingHold {
         let guard = self.released.lock().unwrap();
         let (guard, timed) = self
             .ready
-            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |done| !*done)
+            .wait_timeout_while(
+                guard,
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+                |done| !*done,
+            )
             .unwrap();
         drop(guard);
         assert!(!timed.timed_out(), "blocking fixture release deadline");
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(std::time::Duration::from_secs(15), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn release(&self) {
         *self.released.lock().unwrap() = true;
@@ -380,9 +387,12 @@ async fn live_context_cancelled_blocking_job_keeps_real_lock_and_rejects_late_pu
         "the real worktree lease stays with the worker"
     );
     held.release();
-    tokio::time::timeout(std::time::Duration::from_secs(15), f.owner.drain_jobs())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        f.owner.drain_jobs(),
+    )
+    .await
+    .unwrap();
     assert_eq!(f.owner.jobs.active.load(Ordering::Acquire), 0);
     assert!(
         f.owner.revision.lock().unwrap().published.is_none(),
@@ -405,11 +415,14 @@ async fn live_context_concurrent_observation_cannot_publish_an_older_attempt() {
     held.reached().await;
     let b = f.prompt_capture().await;
     let second = tokio::spawn(b.prepare());
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while f.owner.revision.lock().unwrap().attempt < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        async {
+            while f.owner.revision.lock().unwrap().attempt < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     held.release();

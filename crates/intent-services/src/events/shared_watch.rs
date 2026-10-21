@@ -3930,9 +3930,12 @@ mod tests {
         // (a) Settled-as-failed is not live: the probe keeps waiting.
         let probe = sub.probe();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), probe.wait_live(LIVENESS))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
+                probe.wait_live(LIVENESS)
+            )
+            .await
+            .is_err(),
             "wait_live must not return on a registration failed during a creation retry"
         );
 

@@ -1489,7 +1489,7 @@ async fn script_monitor_maintenance_loop_exits_once_settings_tasks_close() {
     h.services.start_script_monitor_maintenance();
     assert!(running(), "maintenance loop started");
     h.services.settings_tasks.close();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(10)), async {
         while running() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

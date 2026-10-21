@@ -1506,7 +1506,7 @@ while IFS= read -r unexpected; do exit 95; done
             .stderr(Stdio::from(log));
         let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
         let status = child
-            .wait_with_timeout(Duration::from_secs(60))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(60)))
             .unwrap()
             .expect("isolated auth wiring test timed out");
         assert!(

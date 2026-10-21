@@ -1154,9 +1154,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         drop(held);
-        tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drain,
+        )
+        .await
+        .unwrap();
         bus.shutdown().await.unwrap();
         let events = store
             .query_events(&intent_store::EventQuery::default())

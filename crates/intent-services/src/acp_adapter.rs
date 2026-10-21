@@ -1751,7 +1751,8 @@ exit 0
             let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
                 .await
                 .expect("spawn real npx");
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(120));
             let started = loop {
                 if let Ok(s) = std::fs::read_to_string(&report) {
                     break s;
@@ -1874,7 +1875,8 @@ exit 0
         let mut spawned = spawn_adapter_in(&slots, &cmd, Duration::from_secs(5))
             .await
             .expect("spawn real npx");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(120));
         let started = loop {
             if let Ok(s) = std::fs::read_to_string(&report) {
                 break s;
@@ -2132,7 +2134,8 @@ wait
 
         adapter.child.reap().await;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         assert_tree_then_dir_and_slot_released(
             grandchild,
             &npx_cwd,
@@ -2167,7 +2170,8 @@ wait
         assert!(!terminated.exists());
 
         let reaping = tokio::spawn(reap_adapter(adapter)); // caller-binding: allow — test-only bounded reap of a fake adapter; reaches no service layer
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !terminated.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -2185,7 +2189,8 @@ wait
             "reap task neither finished nor cancelled: {outcome:?}"
         );
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         assert_tree_then_dir_and_slot_released(
             grandchild,
             &npx_cwd,
@@ -2218,7 +2223,8 @@ wait
         parked.abort();
         assert!(parked.await.unwrap_err().is_cancelled());
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while grandchild_alive(grandchild) {
             assert!(
                 npx_cwd.is_dir(),

@@ -69,20 +69,26 @@ async fn unsloth_status_queue_drains_before_store_close() {
     *services.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
     let owner = services.clone();
     let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
-            result = &mut drain => { result.unwrap(); false }
-        }
-    })
+    let pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        },
+    )
     .await
     .unwrap();
     drop(connection);
     if pending {
-        timeout(Duration::from_secs(5), drain)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(
         pending,
@@ -337,15 +343,23 @@ async fn acquire_queues_until_a_process_goes_idle() {
     let reg2 = reg.clone();
     let acquired = tokio::spawn(async move { reg2.acquire(&b, claim_all, release_none).await });
     // All processes active → the acquire must block.
-    assert!(timeout(Duration::from_millis(50), async {}).await.is_ok());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        async {}
+    )
+    .await
+    .is_ok());
     assert!(!acquired.is_finished(), "acquire blocks while all active");
 
     // Becoming idle wakes the queued spawn, which evicts `a` and proceeds.
     reg.mark_idle(&a);
-    timeout(Duration::from_secs(2), acquired)
-        .await
-        .expect("acquire resolves once a slot frees")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        acquired,
+    )
+    .await
+    .expect("acquire resolves once a slot frees")
+    .expect("task ok");
     assert_eq!(*log.lock().unwrap(), vec![a]);
     assert_eq!(reg.size(), 0);
 }
@@ -405,10 +419,13 @@ async fn slot_held_idle_flip_defers_the_wakeup_to_the_slot_release() {
 
     // The slot release wakes the waiter, which evicts the idle `a` and admits.
     reg.wake_waiter_if_idle(&a);
-    timeout(Duration::from_secs(2), acquired)
-        .await
-        .expect("acquire resolves once the slot release wakes it")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        acquired,
+    )
+    .await
+    .expect("acquire resolves once the slot release wakes it")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         *log.lock().unwrap(),
@@ -622,13 +639,13 @@ async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("over-budget tree with host headroom admits the spawn");
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -666,10 +683,13 @@ async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
     );
     // Headroom returns: the timed re-check admits the waiter.
     probe.set_available_memory(Some(63 * gb));
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the waiter re-checks host headroom on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the waiter re-checks host headroom on its own timer")
+    .expect("task ok");
 }
 
 /// One admission decision reads exactly one sweep. Two consecutive sweeps
@@ -718,7 +738,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -727,7 +747,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -761,7 +781,7 @@ async fn budget_is_off_by_default_and_inert_before_the_first_sample() {
         reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
 
         timeout(
-            Duration::from_millis(200),
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
             reg.acquire(&b, claim_all, release_none),
         )
         .await
@@ -806,10 +826,13 @@ async fn budget_reclaims_idle_processes_before_queueing_a_spawn() {
     // Once the tree actually drains, the queued spawn proceeds without any
     // registry event to wake it — nothing was deregistered or marked idle.
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the memory waiter must re-check on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the memory waiter must re-check on its own timer")
+    .expect("task ok");
     assert!(
         reg.is_registered(&active),
         "an active process is never evicted by the budget"
@@ -860,10 +883,13 @@ async fn budget_driven_process_events_carry_memory_budget_reason() {
     // Under budget again + a deregister → wakes the queued spawn (resumed).
     probe.set(gb);
     reg.deregister(&active);
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("acquire resolves once woken under budget")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        handle,
+    )
+    .await
+    .expect("acquire resolves once woken under budget")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let events = events.lock().unwrap().clone();
@@ -939,10 +965,13 @@ async fn both_constraints_binding_labels_reason_memory_budget() {
     // Release both constraints so the queued spawn resolves and the task ends.
     probe.set(gb);
     reg.deregister(&active);
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("acquire resolves once both constraints clear")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        handle,
+    )
+    .await
+    .expect("acquire resolves once both constraints clear")
+    .expect("task ok");
 }
 
 #[tokio::test]
@@ -964,7 +993,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     for n in 0..6 {
         let id = AgentId::from(format!("burst-{n}").as_str());
         if timeout(
-            Duration::from_millis(50),
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
             reg.acquire(&id, claim_all, release_none),
         )
         .await
@@ -988,7 +1017,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     probe.set(gb);
     let next = AgentId::from("after-fresh-sample");
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&next, claim_all, release_none),
     )
     .await
@@ -1009,7 +1038,7 @@ async fn deregister_credits_back_the_provisional_charge() {
 
     let first = AgentId::from("first");
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -1022,7 +1051,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     let second = AgentId::from("second");
     assert!(
         timeout(
-            Duration::from_millis(50),
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
             reg.acquire(&second, claim_all, release_none),
         )
         .await
@@ -1034,7 +1063,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     // back rather than waiting a full sampling period for the truth.
     reg.deregister(&first);
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -1117,10 +1146,13 @@ async fn budget_status_reports_budget_charged_and_queued() {
 
     // Draining the tree admits the queued spawn on its timed re-check.
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the drained tree admits the queued spawn")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the drained tree admits the queued spawn")
+    .expect("task ok");
     let (_, _, queued) = reg.budget_status().expect("budget installed");
     assert_eq!(queued, 0, "the admitted spawn left the queue");
 }
@@ -1316,10 +1348,13 @@ async fn turn_start_gates_idle_agent_and_reclaims_other_idle_first() {
     // Once the tree drains, the queued turn proceeds on its own timed
     // re-check — no registry event fires here.
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the turn-start waiter must re-check on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the turn-start waiter must re-check on its own timer")
+    .expect("task ok");
 }
 
 /// Busy agents are never gated mid-turn (monorepo#2063 B8 regression): a
@@ -1339,14 +1374,14 @@ async fn turn_start_never_gates_active_or_unregistered_agents() {
     reg.mark_active(&busy);
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&busy, claim_all, release_none),
     )
     .await
     .expect("an active process is never gated mid-turn");
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&AgentId::from("unregistered"), claim_all, release_none),
     )
     .await
@@ -1398,10 +1433,13 @@ async fn turn_start_gate_events_carry_memory_budget_reason_without_charge() {
     }
 
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the drained tree admits the queued turn")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the drained tree admits the queued turn")
+    .expect("task ok");
     // Admission left the charge exactly at the sample — no provisional cost.
     let (_, charged, _) = reg.budget_status().expect("budget installed");
     assert_eq!(charged, Some(gb), "turn-start admission charges nothing");
@@ -1467,10 +1505,13 @@ async fn timed_recheck_admission_emits_resumed_for_a_queued_spawn() {
 
     // The tree drains with no registry event: only the timer admits.
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the memory waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the memory waiter re-checks on its own timer")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1517,10 +1558,13 @@ async fn timed_recheck_admission_emits_resumed_for_a_queued_turn_start() {
     );
 
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the turn-start waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the turn-start waiter re-checks on its own timer")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1577,10 +1621,13 @@ async fn evict_then_admit_emits_resumed_for_a_queued_spawn() {
     // An idle process appears without waking the waiter (`register` pops no
     // waiter): the timed re-check finds it, evicts it, and admits.
     reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the re-check reclaims the idle process and admits")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the re-check reclaims the idle process and admits")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1626,13 +1673,13 @@ async fn immediate_admission_emits_no_process_events() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("under budget with a slot free admits immediately");
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -1762,10 +1809,13 @@ async fn wakeup_during_the_timed_wait_is_the_single_resumed_for_a_queued_spawn()
     // The active process exits before the timer: its release credits the
     // budget and its `deregister` wakes (and emits for) the waiter.
     assert!(reg.deregister(&active));
-    timeout(Duration::from_secs(1), handle)
-        .await
-        .expect("the wakeup admits the waiter without waiting for the timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        handle,
+    )
+    .await
+    .expect("the wakeup admits the waiter without waiting for the timer")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1813,10 +1863,13 @@ async fn wakeup_during_the_timed_wait_is_the_single_resumed_for_a_queued_turn_st
     assert!(!handle.is_finished(), "over budget → queued");
 
     assert!(reg.deregister(&active));
-    timeout(Duration::from_secs(1), handle)
-        .await
-        .expect("the wakeup admits the turn without waiting for the timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        handle,
+    )
+    .await
+    .expect("the wakeup admits the turn without waiting for the timer")
+    .expect("task ok");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -1867,10 +1920,13 @@ async fn late_wakeup_after_a_self_admitted_spawn_emits_no_second_resumed() {
     // The tree drains with no registry event: only the timer admits, and the
     // waiter emits its own `resumed`.
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the memory waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the memory waiter re-checks on its own timer")
+    .expect("task ok");
 
     // Late wakeups from both pop paths: the retired entry is skipped.
     reg.mark_idle(&active);
@@ -1919,10 +1975,13 @@ async fn late_wakeup_after_a_self_admitted_turn_start_emits_no_second_resumed() 
     assert!(!handle.is_finished(), "over budget → queued");
 
     probe.set(gb);
-    timeout(Duration::from_secs(30), handle)
-        .await
-        .expect("the turn-start waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        handle,
+    )
+    .await
+    .expect("the turn-start waiter re-checks on its own timer")
+    .expect("task ok");
 
     reg.mark_idle(&active);
     assert!(reg.deregister(&active));
@@ -2217,7 +2276,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect the eviction event with bounded wait (event emission is async).
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
@@ -2315,7 +2379,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect queue event with bounded wait (event emission is async).
     let mut queue_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
@@ -2351,7 +2420,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect resume event with bounded wait (event emission is async).
     let mut resume_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
@@ -2475,9 +2549,12 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     )
     .await
     .unwrap();
-    timeout(Duration::from_secs(10), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     assert!(!mgr.is_busy(&id), "old worker released its admission");
     assert_ne!(
         mgr.services
@@ -2506,11 +2583,14 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     )
     .await
     .unwrap();
-    timeout(Duration::from_secs(10), async {
-        while mgr.services.live_turn(&id).is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.services.live_turn(&id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let live_id = mgr.services.live_turn(&id).unwrap().message_id;
@@ -2535,11 +2615,14 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     );
     let replacement = mgr.workers.lock().unwrap().get(&id).unwrap().abort_handle();
     pause.resume.notify_one();
-    timeout(Duration::from_secs(10), async {
-        while !old.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !old.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 
@@ -2572,20 +2655,23 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
             )
             .await
     });
-    let interrupted_row = timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(row) = mgr
-                .services
-                .store
-                .get_agent_message_by_id(&id, &live_id)
-                .await
-                .unwrap()
-            {
-                break row;
+    let interrupted_row = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(row) = mgr
+                    .services
+                    .store
+                    .get_agent_message_by_id(&id, &live_id)
+                    .await
+                    .unwrap()
+                {
+                    break row;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -2596,15 +2682,21 @@ async fn stale_worker_tail_cannot_requeue_interrupted_prompt_ahead_of_newer_mess
     // If the replacement was deregistered, it still owns the prompt receiver.
     // Let it settle: its append then collides with the just-flushed row.
     gate.notify_one();
-    timeout(Duration::from_secs(10), interrupt)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(10), async {
-        while !replacement.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        interrupt,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !replacement.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let row = mgr
@@ -2972,7 +3064,12 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
     // The eviction is observable: agent:process:evicted with reason idle-ttl.
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 if let Some(ev) = batch
                     .into_iter()
@@ -3259,7 +3356,12 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     assert!(after.archived_at.is_none());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let delta = events
@@ -3793,7 +3895,7 @@ async fn acquire_evict_skips_candidate_claimed_by_a_sweep() {
 
     let (try_claim, release, _released) = mgr.reap_claim_fns();
     timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         mgr.registry
             .acquire(&AgentId::from("spawning"), try_claim, release),
     )
@@ -3884,10 +3986,13 @@ async fn acquire_waits_when_every_candidate_is_claimed() {
     // Holder releases (no deregister fires): the waiter's timed re-check
     // claims and evicts normally.
     mgr.reap_claims.lock().unwrap().remove(&held);
-    timeout(Duration::from_secs(30), acquire)
-        .await
-        .expect("the waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        acquire,
+    )
+    .await
+    .expect("the waiter re-checks on its own timer")
+    .expect("task ok");
     assert!(!mgr.registry.is_registered(&held));
 }
 
@@ -3914,7 +4019,7 @@ async fn acquire_evicts_own_stale_entry_without_claim() {
 
     let (try_claim, release, _released) = mgr.reap_claim_fns();
     timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         mgr.registry.acquire(&id, try_claim, release),
     )
     .await
@@ -4029,14 +4134,17 @@ async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
     // parked message — no tail call after the await ever runs here.
     acquire.abort();
     let _ = acquire.await;
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if services.queue_snapshot(&victim).is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                if services.queue_snapshot(&victim).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("the aborted admission's claim release kicks the parked drain");
 }
@@ -4085,10 +4193,13 @@ async fn turn_start_evict_claim_blocks_try_begin_during_kill_window() {
     release_tx.send(()).unwrap();
     // Under budget again → the gate admits.
     probe.set(gb);
-    timeout(Duration::from_secs(30), gate)
-        .await
-        .expect("gate admits once the tree drains")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        gate,
+    )
+    .await
+    .expect("gate admits once the tree drains")
+    .expect("task ok");
     assert!(!mgr.registry.is_registered(&victim), "victim evicted");
     assert!(
         mgr.try_begin(&victim, &ws).await,
@@ -4139,9 +4250,10 @@ async fn turn_start_evict_skips_candidate_claimed_by_a_sweep() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
-    timeout(Duration::from_secs(30), async {
-        tokio::join!(&mut gate, advance)
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(&mut gate, advance) },
+    )
     .await
     .expect("gate proceeds via the next-LRU candidate");
 
@@ -4198,10 +4310,13 @@ async fn turn_start_waits_when_every_candidate_is_claimed() {
     // waiter's timed re-check admits.
     mgr.reap_claims.lock().unwrap().remove(&held);
     probe.set(gb);
-    timeout(Duration::from_secs(30), gate)
-        .await
-        .expect("the waiter re-checks on its own timer")
-        .expect("task ok");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        gate,
+    )
+    .await
+    .expect("the waiter re-checks on its own timer")
+    .expect("task ok");
     assert!(mgr.registry.is_registered(&held), "under budget: no evict");
     assert!(log.lock().unwrap().is_empty(), "nothing was killed");
 }
@@ -4387,10 +4502,13 @@ async fn child_exit_watcher_reaps_idle_agent_on_external_kill() {
 
     kill(Pid::from_raw(pid.cast_signed()), Signal::SIGKILL).expect("external SIGKILL");
 
-    let fired = timeout(Duration::from_secs(5), watcher)
-        .await
-        .expect("watcher fires within a bounded delay")
-        .expect("watcher task completes");
+    let fired = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        watcher,
+    )
+    .await
+    .expect("watcher fires within a bounded delay")
+    .expect("watcher task completes");
     assert!(fired, "watcher fired the unexpected-exit cleanup");
     assert!(!mgr.contains(&id), "handle removed");
     assert!(!mgr.registry().is_registered(&id), "registry deregistered");
@@ -4408,10 +4526,13 @@ async fn child_exit_watcher_stands_down_on_deliberate_stop() {
 
     assert!(mgr.stop(&id).await, "stop removes the tracked handle");
 
-    let fired = timeout(Duration::from_secs(5), watcher)
-        .await
-        .expect("watcher stands down within a bounded delay")
-        .expect("watcher task completes");
+    let fired = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        watcher,
+    )
+    .await
+    .expect("watcher stands down within a bounded delay")
+    .expect("watcher task completes");
     assert!(!fired, "deliberate stop must not fire the watcher");
 }
 
@@ -4426,10 +4547,13 @@ async fn child_exit_watcher_stands_down_on_kill_child_only() {
 
     mgr.kill_child_only(&id).await;
 
-    let fired = timeout(Duration::from_secs(5), watcher)
-        .await
-        .expect("watcher stands down within a bounded delay")
-        .expect("watcher task completes");
+    let fired = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        watcher,
+    )
+    .await
+    .expect("watcher stands down within a bounded delay")
+    .expect("watcher task completes");
     assert!(
         !fired,
         "deliberate kill_child_only must not fire the watcher"
@@ -4457,11 +4581,14 @@ async fn kill_child_tree_terminates_grandchild() {
 
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let line = timeout(Duration::from_secs(5), lines.next_line())
-        .await
-        .expect("grandchild pid line in time")
-        .expect("read ok")
-        .expect("a pid line");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        lines.next_line(),
+    )
+    .await
+    .expect("grandchild pid line in time")
+    .expect("read ok")
+    .expect("a pid line");
     let grandchild: u32 = line.trim().parse().expect("grandchild pid");
     assert!(pid_alive(grandchild), "grandchild alive before teardown");
 
@@ -4501,11 +4628,14 @@ async fn kill_child_tree_sweeps_group_after_leader_reaped() {
 
     let stdout = child.stdout.take().expect("piped stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let line = timeout(Duration::from_secs(5), lines.next_line())
-        .await
-        .expect("grandchild pid line in time")
-        .expect("read ok")
-        .expect("a pid line");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        lines.next_line(),
+    )
+    .await
+    .expect("grandchild pid line in time")
+    .expect("read ok")
+    .expect("a pid line");
     let grandchild: u32 = line.trim().parse().expect("grandchild pid");
     assert!(pid_alive(grandchild), "grandchild alive before teardown");
 
@@ -5451,10 +5581,13 @@ async fn suspend_enrollment_flushes_deferred_attention() {
     // event always arrives once the worker runs, but under full-suite
     // nextest load the worker's scheduling can starve for several seconds
     // (monorepo#4230 — 5s flaked while the test passes in ~0.1s isolated).
-    let batch = timeout(Duration::from_secs(30), sub.recv())
-        .await
-        .expect("suspend-interrupted turn end must flush the parked attention raise")
-        .expect("subscription open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        sub.recv(),
+    )
+    .await
+    .expect("suspend-interrupted turn end must flush the parked attention raise")
+    .expect("subscription open");
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
     assert_eq!(batch[0].data["kind"], json!("discussion"));
     assert_eq!(batch[0].data["reason"], json!("raised before suspend"));
@@ -5556,14 +5689,17 @@ async fn suspend_enrollment_drains_continuation_parked_behind_held_slot() {
 
     // Wait for the worker to exit with the slot released (pre-fix it exits
     // straight after the enrollment; post-fix after the drained turn).
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("the suspend-interrupted worker exits");
     // The continuation did not strand behind the exited worker: the drain
@@ -6999,18 +7135,21 @@ async fn append_failure_queue_fallback_preserves_prepend_fields() {
         .await
         .expect("agent.retry");
     assert_eq!(result["redriven"], json!(true));
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn completes and the agent goes idle");
 
@@ -7401,18 +7540,21 @@ async fn context_size_requeue_retry_sends_marker_to_provider() {
         .expect("agent.retry");
     assert_eq!(result["redriven"], json!(true));
     assert_eq!(result["turnId"], json!("turn-413-retry"));
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn completes and the agent goes idle");
 
@@ -7856,18 +7998,21 @@ async fn stop_redelivery_flush_413_retry(
     }
     // The drain flushes both entries into ONE turn; the mock fails it 413.
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let status = mgr.services.store.get_agent_session_status(&id).await;
-            if status.ok() == Some(AgentStatus::Error)
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let status = mgr.services.store.get_agent_session_status(&id).await;
+                if status.ok() == Some(AgentStatus::Error)
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("the flush turn fails terminally with the 413");
     assert!(
@@ -7888,19 +8033,22 @@ async fn stop_redelivery_flush_413_retry(
         .await
         .expect("agent.retry");
     assert_eq!(result["redriven"], json!(true), "{result}");
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-                && !mgr.services.has_ready_to_send(&id)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && !mgr.services.has_ready_to_send(&id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn completes and the agent goes idle");
 
@@ -8232,7 +8380,12 @@ async fn terminal_failure_events_carry_turn_id() {
     .await;
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed = events
@@ -8260,7 +8413,12 @@ async fn terminal_failure_events_carry_turn_id() {
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     for ty in ["agent:failed", "agent:stream:end"] {
@@ -8304,10 +8462,13 @@ async fn member_async_failure_keeps_safe_authorization_and_workspace_scope() {
         Some(&auth),
     )
     .await;
-    let events = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let events = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let failed = events
         .iter()
         .find(|e| e.event_type == "agent:failed")
@@ -8342,7 +8503,12 @@ async fn quota_failed_payload(
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     events
@@ -8498,10 +8664,13 @@ async fn terminal_failure_persists_error_before_publishing_events() {
     // Error must already be visible.
     let mut events = Vec::new();
     'observed: loop {
-        let batch = timeout(Duration::from_secs(10), sub.recv())
-            .await
-            .expect("agent:failed within 10s")
-            .expect("bus open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.recv(),
+        )
+        .await
+        .expect("agent:failed within 10s")
+        .expect("bus open");
         for event in batch {
             let failed = event.event_type == "agent:failed";
             events.push(event);
@@ -8527,7 +8696,12 @@ async fn terminal_failure_persists_error_before_publishing_events() {
     handler.await.unwrap();
 
     // Wire order is unchanged by the persist reorder.
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let order: Vec<&str> = events
@@ -8661,19 +8835,27 @@ async fn drain_emits_queue_processing_with_turn_id() {
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
 
     // Wait for the drained turn to finish so the worker exits cleanly.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("drained turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let processing = events
@@ -9055,7 +9237,12 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9140,7 +9327,12 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9187,19 +9379,28 @@ async fn wedged_connection() -> (
         });
     }
     // The channel is full once a fresh notify no longer completes promptly.
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let conn = Arc::clone(&conn);
-            let payload = payload.clone();
-            let probe = tokio::spawn(async move {
-                let _ = conn.notify("wedge/probe", payload).await;
-            });
-            if timeout(Duration::from_millis(100), probe).await.is_err() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let conn = Arc::clone(&conn);
+                let payload = payload.clone();
+                let probe = tokio::spawn(async move {
+                    let _ = conn.notify("wedge/probe", payload).await;
+                });
+                if timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(100)),
+                    probe,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("writer channel saturates");
     // Confirm the saturation with a longer window: under heavy scheduling
@@ -9213,7 +9414,12 @@ async fn wedged_connection() -> (
         let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
     });
     assert!(
-        timeout(Duration::from_millis(500), confirm).await.is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(500)),
+            confirm
+        )
+        .await
+        .is_err(),
         "saturation loop broke early: the confirming notify still found channel capacity"
     );
     (conn, agent_r, agent_w)
@@ -9279,13 +9485,21 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     // The stop must settle within the bounded cancel window (+ margin), not
     // hang forever on the wedged writer channel.
-    let found = timeout(Duration::from_secs(10), mgr.interrupt(&id))
-        .await
-        .expect("interrupt returns despite the wedged transport (monorepo#3039)");
+    let found = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.interrupt(&id),
+    )
+    .await
+    .expect("interrupt returns despite the wedged transport (monorepo#3039)");
     assert!(found, "interrupt finds the live agent");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9315,7 +9529,7 @@ async fn cancel_and_settle_idle_prompt_times_out_on_wedged_transport() {
     let (conn, _agent_r, _agent_w) = wedged_connection().await;
     let id = AgentId::from("a-wedged-settle");
     let settled = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         super::cancel_and_settle_idle_prompt(
             &super::runtime::ConnectionRuntime(&conn),
             &id,
@@ -9388,7 +9602,12 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     assert!(result["messageId"].is_string());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9447,7 +9666,12 @@ async fn interrupt_kills_child_for_provider_with_kill_quirk() {
     // The terminal stream:end is still emitted (the teardown happens after
     // the cancel, before the terminal emits — same shape as keep-alive).
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9537,7 +9761,12 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
 
     // The terminal stream:end mirrors both fields.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -9656,7 +9885,12 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -9740,7 +9974,12 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -9837,7 +10076,12 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -9904,11 +10148,14 @@ async fn user_retire_stops_running_target_and_preserves_partial_turn() {
     .await
     .expect("user retirement");
     assert_eq!(result["success"], true);
-    timeout(Duration::from_secs(2), async {
-        while !aborted.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !aborted.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("retirement must abort the running worker");
     assert!(!mgr.is_busy(&id));
@@ -9979,9 +10226,12 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move { mgr.try_begin_turn(&id, &ws).await }
     });
-    timeout(Duration::from_secs(2), pause.reached.notified())
-        .await
-        .expect("turn claimed before side effects");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("turn claimed before side effects");
     let mut retiring = tokio::spawn({
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         async move {
@@ -9995,16 +10245,23 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
             .await
         }
     });
-    timeout(Duration::from_secs(2), async {
-        while !mgr.retired.lock().unwrap().contains(&id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !mgr.retired.lock().unwrap().contains(&id) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("retirement fences the target");
     // Before the fix this finishes teardown while startup is paused. After
     // the fix retirement waits for startup, then balances its activity edge.
-    let early_retirement = timeout(Duration::from_millis(100), &mut retiring).await;
+    let early_retirement = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        &mut retiring,
+    )
+    .await;
     pause.resume.notify_one();
     let admission = starting.await.unwrap().unwrap();
     match early_retirement {
@@ -11776,7 +12033,12 @@ async fn preemption_by_agent_sender_without_name_omits_name_field() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -11864,7 +12126,8 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
     // `interrupted` idle (that emit would precede settlement). A final short
     // drain keeps the exactly-one-settlement-idle guard meaningful.
     let mut events = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         let batch = tokio::time::timeout_at(deadline, sub.recv())
             .await
@@ -11878,7 +12141,12 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
             break;
         }
     }
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -12826,7 +13094,7 @@ async fn incremental_workspace_delete_refuses_runtime_sends_and_drain_after_tear
     track(&mgr, &agent);
     let (reached, resume) = services.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = services.delete_workspace(ws.clone());
-    timeout(Duration::from_secs(30), async {
+    timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before runtime probe: {result:?}"),
             () = reached.notified() => {}
@@ -12914,7 +13182,12 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -13003,7 +13276,12 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     assert!(archived.archived, "workspace archived");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let interrupted: Vec<&str> = events
@@ -13222,14 +13500,17 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     assert_eq!(out["queued"], json!(true), "wake parked behind the gate");
     assert_eq!(out["archivedParked"], json!(true), "archived park marker");
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if services.queue_snapshot(&id).is_empty() && !services.has_ready_to_send(&id) {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if services.queue_snapshot(&id).is_empty() && !services.has_ready_to_send(&id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("re-check drain delivers the raced wake without an organic kick");
 }
@@ -13283,14 +13564,17 @@ async fn retired_session_parks_wake_deliveries_until_restore() {
         .agent_restore_op(id.clone(), Some(ws.clone()))
         .await
         .expect("restore");
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if services.queue_snapshot(&id).is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if services.queue_snapshot(&id).is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("restore's drain kick delivers the parked wake");
 }
@@ -13354,7 +13638,12 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
 
     // No workspace:updated unarchive delta was published.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -13527,7 +13816,12 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
     assert_eq!(row.status, WorkspaceStatus::Active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -13877,7 +14171,12 @@ async fn try_begin_persists_active_status_and_emits_event() {
     assert!(stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let status_event = events
@@ -13908,7 +14207,12 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert!(!stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let status_event = events
@@ -13960,21 +14264,27 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
         .await
         .unwrap();
     assert_eq!(sent["queued"], false);
-    timeout(Duration::from_secs(10), reached)
-        .await
-        .expect("worker reached post-turn drain barrier")
-        .unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = sub.recv().await.expect("event subscription open");
-            if batch
-                .iter()
-                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        reached,
+    )
+    .await
+    .expect("worker reached post-turn drain barrier")
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let batch = sub.recv().await.expect("event subscription open");
+                if batch
+                    .iter()
+                    .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("real turn published idle before releasing the slot");
     assert!(mgr.is_busy(&id));
@@ -13984,11 +14294,14 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     // WAL readers remain available, but end_turn cannot persist RuntimeIdle.
     let writer = mgr.services.store.write_pool().begin().await.unwrap();
     release.send(()).unwrap();
-    timeout(Duration::from_secs(10), async {
-        while mgr.is_busy(&id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("end_turn releases the busy slot before awaiting the writer");
     let early = mgr
@@ -14008,18 +14321,21 @@ async fn prompt_idle_event_precedes_end_turn_status_persistence() {
     );
 
     writer.rollback().await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = sub.recv().await.expect("event subscription open");
-            if batch.iter().any(|ev| {
-                ev.event_type == AGENT_STATUS_CHANGED
-                    && ev.data["agentId"] == id.0
-                    && ev.data["status"] == "idle"
-            }) {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let batch = sub.recv().await.expect("event subscription open");
+                if batch.iter().any(|ev| {
+                    ev.event_type == AGENT_STATUS_CHANGED
+                        && ev.data["agentId"] == id.0
+                        && ev.data["status"] == "idle"
+                }) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("worker publishes durable idle after the writer is released");
     let settled = mgr
@@ -14059,9 +14375,12 @@ async fn shutdown_after_idle_before_slot_release_records_no_interruption() {
         "the completed turn's request is durable before shutdown"
     );
 
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown aborts the parked worker");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown aborts the parked worker");
     assert!(
         mgr.services
             .store
@@ -14107,11 +14426,14 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
     // Take the only writer, so end_turn stops after its synchronous release.
     let writer = mgr.services.store.write_pool().begin().await.unwrap();
     release.send(()).unwrap();
-    timeout(Duration::from_secs(10), async {
-        while mgr.is_busy(&id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("end_turn releases the slot before awaiting the writer");
     assert_eq!(
@@ -14123,18 +14445,24 @@ async fn shutdown_after_slot_release_before_idle_persist_settles_status() {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
     };
-    timeout(Duration::from_secs(10), async {
-        while !mgr.workers.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !mgr.workers.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("shutdown takes the aborted worker");
     writer.rollback().await.unwrap();
-    timeout(Duration::from_secs(10), shutdown)
-        .await
-        .expect("shutdown completes")
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        shutdown,
+    )
+    .await
+    .expect("shutdown completes")
+    .unwrap();
 
     assert!(mgr
         .services
@@ -14192,9 +14520,12 @@ async fn shutdown_settled_turn_with_ready_queue_records_interruption() {
     assert_eq!(queued["queued"], true);
     assert!(mgr.services.has_ready_to_send(&id));
 
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown aborts the parked worker");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown aborts the parked worker");
     assert!(
         mgr.services
             .store
@@ -14227,20 +14558,26 @@ async fn shutdown_finishes_aborted_end_turn_idle_write() {
         let id = id.clone();
         intent_core::spawn_daemon(async move { mgr.end_turn(&id).await })
     };
-    timeout(Duration::from_secs(10), async {
-        while mgr.is_busy(&id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("end_turn releases before awaiting the writer");
     ending.abort();
     assert!(ending.await.unwrap_err().is_cancelled());
     writer.rollback().await.unwrap();
 
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown completes");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown completes");
     let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
     assert_eq!(stored.status, AgentStatus::RuntimeIdle);
     assert_eq!(mgr.services.heal_stale_agent_sessions().await.unwrap(), 0);
@@ -14265,11 +14602,14 @@ async fn shutdown_pending_idle_write_preserves_later_status() {
     let (mock, release) = park_after_settled_turn(&mgr, &bus, &ws, &id).await;
     let writer = mgr.services.store.write_pool().begin().await.unwrap();
     release.send(()).unwrap();
-    timeout(Duration::from_secs(10), async {
-        while mgr.is_busy(&id) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while mgr.is_busy(&id) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("end_turn releases before awaiting the writer");
     let worker = mgr.workers.lock().unwrap().remove(&id).expect("worker");
@@ -14282,9 +14622,12 @@ async fn shutdown_pending_idle_write_preserves_later_status() {
         .await
         .unwrap();
 
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown completes");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown completes");
     let stored = mgr.services.store.get_agent_session(&id).await.unwrap();
     assert_eq!(
         stored.status,
@@ -14330,21 +14673,27 @@ async fn park_after_settled_turn(
         .await
         .unwrap();
     assert_eq!(sent["queued"], false);
-    timeout(Duration::from_secs(10), reached)
-        .await
-        .expect("worker reached post-turn drain barrier")
-        .unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = sub.recv().await.expect("event subscription open");
-            if batch
-                .iter()
-                .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        reached,
+    )
+    .await
+    .expect("worker reached post-turn drain barrier")
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let batch = sub.recv().await.expect("event subscription open");
+                if batch
+                    .iter()
+                    .any(|ev| ev.event_type == AGENT_IDLE && ev.data["agentId"] == id.0)
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("completed turn published idle");
     assert!(mgr.is_busy(id));
@@ -14380,15 +14729,21 @@ async fn shutdown_after_settled_turn_takes_new_work_records_interruption() {
     let pause = Arc::new(super::TurnStartPause::default());
     *mgr.user_persist_pause.lock().unwrap() = Some(pause.clone());
     release.send(()).unwrap();
-    timeout(Duration::from_secs(10), pause.reached.notified())
-        .await
-        .expect("worker drains the follow-up into a new turn");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        pause.reached.notified(),
+    )
+    .await
+    .expect("worker drains the follow-up into a new turn");
     assert!(mgr.is_busy(&id));
     assert!(!mgr.turn_settled(&id), "new work clears the settled mark");
 
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown aborts the draining worker");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown aborts the draining worker");
     assert!(
         mgr.services
             .store
@@ -14421,9 +14776,12 @@ async fn settled_mark_lives_only_with_the_held_slot() {
 
     assert!(mgr.try_begin(&id, &ws).await);
     assert!(!mgr.turn_settled(&id));
-    timeout(Duration::from_secs(10), mgr.shutdown())
-        .await
-        .expect("shutdown completes");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        mgr.shutdown(),
+    )
+    .await
+    .expect("shutdown completes");
     assert!(
         mgr.services
             .store
@@ -14709,19 +15067,27 @@ async fn send_message_direct_response_and_user_echo_carry_turn_id() {
         .to_string();
 
     // Wait for the turn to finish so the worker exits cleanly.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("direct turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let echo = events
@@ -14782,14 +15148,17 @@ async fn agent_retry_response_carries_redriven_turn_id() {
     );
     // Let the redriven worker settle (spawn fails without a provider script,
     // parking the session back in Error — irrelevant to this assertion).
-    let _ = timeout(Duration::from_secs(10), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    let _ = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await;
 
     // Empty-queue retry: no turnId key.
@@ -14863,14 +15232,17 @@ async fn send_message_still_redrives_ordinary_error_session() {
 
     // Let the worker hit its terminal spawn failure and exit so the test
     // leaves no dangling state.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker exits after the terminal spawn failure");
 
@@ -15030,10 +15402,13 @@ async fn terminal_failure_event_carries_session_corrupted_when_poisoned() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "agent:status-changed")
@@ -15074,10 +15449,13 @@ async fn terminal_failure_event_omits_session_corrupted_for_ordinary_error() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "agent:status-changed")
@@ -15144,10 +15522,13 @@ async fn terminal_failure_appends_turn_failure_transcript_notice() {
     );
 
     // Wire: agent:message (role=system) for the appended notice.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let ev = batch
         .iter()
         .find(|e| {
@@ -15295,10 +15676,13 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
         .stop_reason_timestamp
         .expect("stop_reason_timestamp persisted with the error");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "agent:status-changed")
@@ -15335,10 +15719,13 @@ async fn terminal_failure_persists_and_clears_stop_reason_timestamp() {
         session.stop_reason_timestamp, None,
         "stop_reason_timestamp cleared wherever stop_reason clears"
     );
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "agent:status-changed")
@@ -15465,18 +15852,21 @@ async fn terminal_spawn_failure_parks_error_without_crash_loop() {
     assert_eq!(result["queued"], json!(false));
 
     // Wait for the worker to hit the terminal spawn failure and exit.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker parks the session in error and exits");
 
@@ -15555,23 +15945,26 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
     // Wait for the worker to hit the terminal spawn failure and exit. Poll
     // the status-only read: the full session read joins the (hidden)
     // transcript table.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let status = mgr
-                .services
-                .store
-                .get_agent_session_status(&id)
-                .await
-                .unwrap();
-            if status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap();
+                if status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker parks the session in error and exits");
     assert_eq!(
@@ -15592,18 +15985,21 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
     assert_eq!(result["redriven"], json!(true));
 
     // The retry turn fails terminally again (spawn still broken) and parks.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn parks the session in error and exits");
 
@@ -15658,18 +16054,21 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
     .await
     .expect("send_message spawns the worker inline");
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker parks the session in error and exits");
 
@@ -15679,18 +16078,21 @@ async fn successful_persist_is_not_duplicated_by_retry_drain() {
         .expect("agent.retry");
     assert_eq!(result["redriven"], json!(true));
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn parks the session in error and exits");
 
@@ -15789,7 +16191,12 @@ async fn drain_persist_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -15841,7 +16248,12 @@ async fn terminal_turn_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -15942,9 +16354,12 @@ async fn wake_delivery_fails_closed_when_session_lookup_fails() {
         "the pre-existing queue entry survives (only NotFound drops the queue)"
     );
     assert!(
-        timeout(Duration::from_millis(200), events.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            events.recv()
+        )
+        .await
+        .is_err(),
         "nothing is published under the caller's (or any) workspace"
     );
 }
@@ -16178,7 +16593,7 @@ async fn probe_bridge_workspace_api(mgr: &AgentManager, id: &AgentId, code: &str
         .expect("write tools/call");
     let mut line = String::new();
     timeout(
-        Duration::from_secs(30),
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
         BufReader::new(read).read_line(&mut line),
     )
     .await
@@ -16378,28 +16793,31 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(
     );
 
     // The turn completes on a fresh child that stamps `cwd=<process.cwd()>`.
-    let echoed = timeout(Duration::from_secs(30), async {
-        loop {
-            let messages = mgr
-                .services
-                .store
-                .get_agent_messages(&target, None)
-                .await
-                .unwrap();
-            let stamped = messages.iter().find_map(|m| {
-                (m.role == "assistant")
-                    .then(|| m.content.to_string())?
-                    .split("cwd=")
-                    .nth(1)
-                    .and_then(|rest| rest.split(['"', ' ']).next())
-                    .map(str::to_string)
-            });
-            if let Some(cwd) = stamped {
-                break cwd;
+    let echoed = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let messages = mgr
+                    .services
+                    .store
+                    .get_agent_messages(&target, None)
+                    .await
+                    .unwrap();
+                let stamped = messages.iter().find_map(|m| {
+                    (m.role == "assistant")
+                        .then(|| m.content.to_string())?
+                        .split("cwd=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(['"', ' ']).next())
+                        .map(str::to_string)
+                });
+                if let Some(cwd) = stamped {
+                    break cwd;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("the woken agent's turn completes with an echoed cwd");
     // A chief-homed target resolves to the isolated chief cwd root, created
@@ -16428,7 +16846,12 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(
     // The user-row echo for the delivered message is scoped to the target's
     // home workspace, never the sender's.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let echo = events
@@ -16626,7 +17049,12 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -16691,23 +17119,26 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     // The drain must park the session in Error WITHOUT starting the turn.
     // Poll the status-only read: the full session read joins the (hidden)
     // transcript table.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let status = mgr
-                .services
-                .store
-                .get_agent_session_status(&id)
-                .await
-                .unwrap();
-            if status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap();
+                if status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("drain parks the session in error without a worker");
 
@@ -16739,7 +17170,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     // until quiet — pre-fix the turn started and the mock agent's response
     // chunk reached subscribers before the terminal failure parked the agent.
     let mut streamed_chunks = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             if ev.event_type == intent_core::events::CHAT_STREAM_DELTA {
                 streamed_chunks += 1;
@@ -16781,18 +17217,21 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
         .await
         .expect("agent.retry");
     assert_eq!(result["redriven"], json!(true));
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry turn completes and the agent goes idle");
 
@@ -16873,18 +17312,21 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         .expect("restore agent_message table");
     drain.await.expect("drain task");
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("turn completes after the transient blip self-heals");
 
@@ -16962,25 +17404,33 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     .expect("send_message spawns the worker inline");
 
     // The redriven turn completes: the agent settles idle, not Error.
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("silently redriven turn completes and the agent goes idle");
 
     // No user-visible failure surfaced for the redriven attempt.
     let mut saw_failed = false;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => saw_failed = true,
@@ -17084,18 +17534,21 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
     .await
     .expect("send_message spawns the worker inline");
 
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let status = mgr.services.store.get_agent_session_status(&id).await;
-            if status.ok() == Some(AgentStatus::Error)
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let status = mgr.services.store.get_agent_session_status(&id).await;
+                if status.ok() == Some(AgentStatus::Error)
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("auth-required failure parks the session in Error");
 
@@ -17114,7 +17567,12 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
 
     let mut failed_payloads = Vec::new();
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed_payloads.push(ev.data["error"].clone()),
@@ -17169,18 +17627,21 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
     .expect("send_message spawns the worker inline");
 
     // The worker settles the terminal failure: Error persisted, worker gone.
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let status = mgr.services.store.get_agent_session_status(&id).await;
-            if status.ok() == Some(AgentStatus::Error)
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let status = mgr.services.store.get_agent_session_status(&id).await;
+                if status.ok() == Some(AgentStatus::Error)
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker settles the terminal streaming failure");
 
@@ -17253,18 +17714,21 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
     .expect("send_message spawns the worker inline");
 
     // The second failure parks the agent in Error (one-retry bound).
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("second pre-output failure parks the session in error");
 
@@ -17272,7 +17736,12 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
     // the first attempt stayed silent) — the STAB-6 Retry surface intact.
     let mut failed = 0;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed += 1,
@@ -17352,24 +17821,32 @@ async fn idle_timeout_injects_warning_and_redrives() {
     );
 
     // The warning redrive + queued drain complete: the agent settles idle.
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::RuntimeIdle
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("warning redrive + queued turn complete and the agent goes idle");
 
     // No failure surface anywhere in the sequence.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -17490,18 +17967,21 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
 
     // 4 consecutive silent timeouts at ~1s each (poll tick), 3 warning
     // redrives in between, then the terminal park.
-    timeout(Duration::from_secs(60), async {
-        loop {
-            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-            if session.status == AgentStatus::Error
-                && !mgr.is_busy(&id)
-                && mgr.workers.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("4th consecutive idle timeout parks the session in error");
 
@@ -17531,7 +18011,12 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
     // Exactly one agent:failed (the worker's cap-exceeded emit) and it names
     // the idle timeout.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed: Vec<_> = events
@@ -17631,7 +18116,12 @@ async fn send_message_direct_branch_emits_agent_message_with_row_id() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let msg_event = events
@@ -18908,14 +19398,17 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     .await
     .unwrap();
 
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if !mgr.is_busy(&id) && !mgr.workers.lock().unwrap().contains_key(&id) {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && !mgr.workers.lock().unwrap().contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("failed worker releases its slot and exits");
     let session = mgr.services.store.get_agent_session(&id).await.unwrap();
@@ -18969,7 +19462,12 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     for kind in ["agent:failed", "agent:stream:end"] {
@@ -19008,11 +19506,14 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
         )
         .await
         .unwrap();
-        timeout(Duration::from_secs(10), async {
-            while mgr.is_busy(&id) || mgr.workers.lock().unwrap().contains_key(&id) {
-                tokio::task::yield_now().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while mgr.is_busy(&id) || mgr.workers.lock().unwrap().contains_key(&id) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("follow-up worker settles");
         let calls = resumed_log.lock().unwrap();
@@ -20394,18 +20895,21 @@ mod stale_redrive_tests {
         set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-                if session.status == AgentStatus::RuntimeIdle
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    if session.status == AgentStatus::RuntimeIdle
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("stale drained turn completes");
 
@@ -20477,18 +20981,21 @@ mod stale_redrive_tests {
         mgr.services.requeue_front(&id, entry);
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-                if session.status == AgentStatus::RuntimeIdle
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    if session.status == AgentStatus::RuntimeIdle
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("fresh drained turn completes");
 
@@ -21288,7 +21795,12 @@ mod draining_overlay_tests {
 
     async fn drain_bus(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         events
@@ -21311,21 +21823,24 @@ mod draining_overlay_tests {
     /// entries into one combined turn and the test's edit of the second entry
     /// fails with "Queued message not found".
     async fn wait_until_draining(mgr: &AgentManager, id: &AgentId, message_id: &str) {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let parked = mgr
-                    .services
-                    .draining_queue_entries
-                    .lock()
-                    .unwrap()
-                    .get(id)
-                    .is_some_and(|d| d.iter().any(|m| m.id == message_id));
-                if parked {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let parked = mgr
+                        .services
+                        .draining_queue_entries
+                        .lock()
+                        .unwrap()
+                        .get(id)
+                        .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+                    if parked {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("the drain arm pops the entry into the draining overlay");
     }
@@ -21615,19 +22130,22 @@ mod draining_overlay_tests {
             .await
             .expect("restore agent_message table");
         drain.await.expect("drain task");
-        timeout(Duration::from_secs(20), async {
-            loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-                if session.status == AgentStatus::RuntimeIdle
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && mgr.services.queue_snapshot(&id).is_empty()
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            async {
+                loop {
+                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    if session.status == AgentStatus::RuntimeIdle
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && mgr.services.queue_snapshot(&id).is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("both entries drain and the agent goes idle");
 
@@ -21730,23 +22248,26 @@ mod draining_overlay_tests {
         );
 
         drain.await.expect("drain task");
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let status = mgr
-                    .services
-                    .store
-                    .get_agent_session_status(&id)
-                    .await
-                    .unwrap();
-                if status == AgentStatus::Error
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let status = mgr
+                        .services
+                        .store
+                        .get_agent_session_status(&id)
+                        .await
+                        .unwrap();
+                    if status == AgentStatus::Error
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("drain parks the session in error");
         sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
@@ -22059,7 +22580,8 @@ mod harness_wake_tests {
         pred: impl Fn(&[intent_core::Event]) -> bool,
     ) -> Vec<intent_core::Event> {
         let mut seen: Vec<intent_core::Event> = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !pred(&seen) {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -22309,14 +22831,17 @@ mod harness_wake_tests {
             .await;
             assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
             assert!(
-                timeout(Duration::from_millis(500), async {
-                    loop {
-                        let events = sub.recv().await.unwrap();
-                        if events.iter().any(|e| e.event_type == "agent:stream:end") {
-                            return;
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(500)),
+                    async {
+                        loop {
+                            let events = sub.recv().await.unwrap();
+                            if events.iter().any(|e| e.event_type == "agent:stream:end") {
+                                return;
+                            }
                         }
                     }
-                })
+                )
                 .await
                 .is_err(),
                 "updates must renew the silence budget, not accumulate tool duration"
@@ -22347,7 +22872,7 @@ mod harness_wake_tests {
             .notifications();
         let mut notes = notes.lock().await;
         let outcome = timeout(
-            Duration::from_secs(1),
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
             mgr.services.run_harness_wake_turn(
                 &mut notes,
                 compaction_note("in_progress"),
@@ -22404,9 +22929,12 @@ mod harness_wake_tests {
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         note_tx.send(compaction_note("in_progress")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
-        timeout(Duration::from_secs(5), pause.reached.notified())
-            .await
-            .expect("failed wake reaches provider disposal");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            pause.reached.notified(),
+        )
+        .await
+        .expect("failed wake reaches provider disposal");
         let events = collect_until(&mut sub, |seen| {
             seen.iter().any(|e| e.event_type == "agent:failed")
         })
@@ -22607,11 +23135,14 @@ mod harness_wake_tests {
             .as_deref()
             .unwrap()
             .contains("Compact conversation"));
-        timeout(Duration::from_secs(5), async {
-            while mgr.is_busy(&id) {
-                tokio::task::yield_now().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while mgr.is_busy(&id) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("failed wake must release ownership");
         assert!(
@@ -22789,9 +23320,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no events published for an unmappable burst"
         );
         assert!(
@@ -22828,9 +23362,12 @@ mod harness_wake_tests {
             })
             .unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
-        assert!(timeout(Duration::from_millis(50), sub.recv())
-            .await
-            .is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv()
+        )
+        .await
+        .is_err());
         assert!(mgr
             .services
             .store
@@ -22869,9 +23406,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no events published for a name-less tool-call first-sight"
         );
         assert!(
@@ -22975,9 +23515,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no wake turn driven against the handle being killed"
         );
         assert!(
@@ -23071,7 +23614,12 @@ mod harness_wake_tests {
         tokio::time::sleep(crate::agent_manager::HARNESS_WAKE_SETTLE + Duration::from_millis(100))
             .await;
         let mut late: Vec<intent_core::Event> = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv(),
+        )
+        .await
+        {
             late.extend(batch);
         }
         assert!(
@@ -23115,9 +23663,12 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("replay")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "gated tick consumes nothing and emits nothing"
         );
 
@@ -23333,14 +23884,18 @@ mod harness_wake_tests {
             !events.iter().any(|e| e.event_type == "agent:idle"),
             "idle suppressed — ready-to-send queue non-empty"
         );
-        timeout(Duration::from_secs(5), tick)
-            .await
-            .expect("tick completes")
-            .expect("tick task");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            tick,
+        )
+        .await
+        .expect("tick completes")
+        .expect("tick task");
 
         // The wake turn's assistant row landed, and the drain kick persisted
         // the queued user row before spawning the follow-up prompt worker.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let messages = mgr
                 .services
@@ -23529,10 +24084,13 @@ mod model_change_notice_tests {
             .contains("Model changed"));
 
         // The persist emitted `agent:message` with the row id + system role.
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv")
-            .expect("open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv")
+        .expect("open");
         let event = batch
             .iter()
             .find(|e| e.event_type == AGENT_MESSAGE)
@@ -23864,17 +24422,20 @@ mod pending_questions_no_gate {
     /// Waits until no turn is live, no worker is registered, and the queue
     /// has nothing ready to send.
     async fn settle(mgr: &Arc<AgentManager>, id: &AgentId) {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                if !mgr.is_busy(id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if !mgr.is_busy(id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("agent settles");
     }
@@ -24269,17 +24830,20 @@ mod archived_flush_gates {
     }
 
     async fn await_settled(mgr: &Arc<AgentManager>, id: &AgentId) {
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if !mgr.is_busy(id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    if !mgr.is_busy(id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("agent settles");
     }
@@ -24751,17 +25315,20 @@ mod attention_request_clear_gates {
     /// spawn + handshake can starve well past 10s (monorepo#4246 — 13–17s
     /// observed while the tests pass in under a second isolated).
     async fn await_worker_idle(mgr: &Arc<AgentManager>, id: &AgentId) {
-        timeout(Duration::from_secs(60), async {
-            loop {
-                if !mgr.is_busy(id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
+            async {
+                loop {
+                    if !mgr.is_busy(id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("turn completes and worker exits");
     }
@@ -24770,7 +25337,12 @@ mod attention_request_clear_gates {
     /// `attentionRequestCleared: true` was published.
     async fn saw_cleared_event(sub: &mut crate::events::Subscription) -> bool {
         let mut cleared = false;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             for e in batch {
                 if e.event_type == intent_core::events::AGENT_UPDATED
                     && e.data["attentionRequestCleared"] == json!(true)
@@ -25258,17 +25830,20 @@ mod flush_queued_messages_tests {
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    if !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(&id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("combined turn completes");
 
@@ -25372,17 +25947,20 @@ mod flush_queued_messages_tests {
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    if !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(&id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("batch turn completes");
 
@@ -25457,17 +26035,20 @@ mod flush_queued_messages_tests {
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    if !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(&id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("mixed-origin batch completes");
 
@@ -25528,17 +26109,20 @@ mod flush_queued_messages_tests {
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(15), async {
-            loop {
-                if !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    if !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(&id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("solo turn completes");
 
@@ -25595,23 +26179,26 @@ mod flush_queued_messages_tests {
             .expect("hide agent_message table");
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let status = mgr
-                    .services
-                    .store
-                    .get_agent_session_status(&id)
-                    .await
-                    .unwrap();
-                if status == AgentStatus::Error
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let status = mgr
+                        .services
+                        .store
+                        .get_agent_session_status(&id)
+                        .await
+                        .unwrap();
+                    if status == AgentStatus::Error
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("flush parks the session in error without a worker");
 
@@ -25637,19 +26224,22 @@ mod flush_queued_messages_tests {
             .await
             .expect("agent.retry");
         assert_eq!(result["redriven"], json!(true));
-        timeout(Duration::from_secs(15), async {
-            loop {
-                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
-                if session.status == AgentStatus::RuntimeIdle
-                    && !mgr.is_busy(&id)
-                    && mgr.workers.lock().unwrap().is_empty()
-                    && !mgr.services.has_ready_to_send(&id)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                    if session.status == AgentStatus::RuntimeIdle
+                        && !mgr.is_busy(&id)
+                        && mgr.workers.lock().unwrap().is_empty()
+                        && !mgr.services.has_ready_to_send(&id)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("retry delivers the requeued batch");
 
@@ -26270,10 +26860,13 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
         .await
         .unwrap();
         assert_eq!(sent["queued"], false);
-        let first = timeout(Duration::from_secs(10), prompts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let first = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            prompts.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(first.to_string().contains("running human"));
         with_caller(
             caller,
@@ -26313,10 +26906,13 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
             );
             release.send(()).unwrap();
             remove.await.unwrap();
-            let second = timeout(Duration::from_secs(10), prompts.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let second = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                prompts.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(second.to_string().contains("pending human"));
             mgr.services
                 .agent_queue_message(
@@ -26340,10 +26936,13 @@ async fn member_removal_preserves_running_turn_and_automation_but_sweeps_human_q
             assert!(mgr.is_busy(&id));
             finish_first.send(()).unwrap();
         }
-        let automatic = timeout(Duration::from_secs(10), prompts.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let automatic = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            prompts.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(automatic.to_string().contains("automatic continuation"));
         // History may contain the admitted first turn; no removed queued user
         // row may appear when removal linearized first.
@@ -26500,10 +27099,13 @@ async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
     assert!(!mgr.is_busy(&id));
     assert!(mgr.workers.lock().unwrap().is_empty());
     assert!(
-        timeout(Duration::from_secs(1), receiver)
-            .await
-            .unwrap()
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            receiver
+        )
+        .await
+        .unwrap()
+        .is_err(),
         "pending worker was aborted"
     );
     assert!(release.send(()).is_err(), "shutdown dropped the held spawn");
@@ -26561,27 +27163,36 @@ async fn shutdown_snapshots_and_aborts_all_workers_before_persistence() {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
     };
-    timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     for release in senders {
         let _ = release.send(());
     }
     let mut terminal_failures = 0;
     for completion in completions {
-        if timeout(Duration::from_secs(5), completion)
-            .await
-            .unwrap()
-            .is_ok()
+        if timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            completion,
+        )
+        .await
+        .unwrap()
+        .is_ok()
         {
             terminal_failures += 1;
         }
     }
     pause.resume.notify_one();
-    timeout(Duration::from_secs(5), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     for id in &ids {
         assert!(
             mgr.services
@@ -26618,15 +27229,21 @@ async fn shutdown_admission_rejects_idle_agent_outside_snapshot() {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
     };
-    timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     let admitted = mgr.try_begin(&idle, &idle_ws).await;
     pause.resume.notify_one();
-    timeout(Duration::from_secs(5), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         !admitted,
         "shutdown must reject agents absent from its snapshot"
@@ -26649,9 +27266,12 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
         let mgr = mgr.clone();
         intent_core::spawn_daemon(async move { mgr.shutdown().await })
     };
-    timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     mgr.spawn_worker(
         id.clone(),
         ws.clone(),
@@ -26668,10 +27288,13 @@ async fn shutdown_admission_rejects_preclaimed_worker_registration() {
         let _ = worker.await;
     }
     pause.resume.notify_one();
-    timeout(Duration::from_secs(5), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         !registered,
         "pre-shutdown admission must not register after the abort sweep"
@@ -26743,9 +27366,12 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
         let (mgr, id, ws) = (mgr.clone(), id.clone(), ws.clone());
         intent_core::spawn_daemon(async move { mgr.try_begin_turn(&id, &ws).await })
     };
-    timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     mgr.begin_shutdown();
     let shutdown = {
         let mgr = mgr.clone();
@@ -26753,10 +27379,13 @@ async fn shutdown_admission_orders_claimed_startup_writes_before_persistence() {
     };
     pause.resume.notify_one();
     let admission = start.await.unwrap().unwrap();
-    timeout(Duration::from_secs(5), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     mgr.spawn_worker(
         id.clone(),
         ws,
@@ -27046,16 +27675,22 @@ async fn shutdown_durable_batch_append_failure_is_not_terminal() {
             super::FlushPrep::Parked
         )
     });
-    timeout(Duration::from_secs(5), pause.reached.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        pause.reached.notified(),
+    )
+    .await
+    .unwrap();
     sqlx::query("CREATE TRIGGER fail_shutdown_append BEFORE INSERT ON agent_message WHEN NEW.role = 'user' BEGIN SELECT RAISE(ABORT, 'test append failure'); END").execute(mgr.services.store.write_pool()).await.unwrap();
     mgr.begin_shutdown();
     pause.resume.notify_one();
-    assert!(timeout(Duration::from_secs(5), preparation)
-        .await
-        .unwrap()
-        .unwrap());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        preparation
+    )
+    .await
+    .unwrap()
+    .unwrap());
     let status = mgr
         .services
         .store
@@ -27190,19 +27825,25 @@ async fn queue_merge_failed_transcript_append_keeps_admitted_human_barrier() {
                 ));
             }
         });
-        timeout(Duration::from_secs(5), pause.reached.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            pause.reached.notified(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             enqueue("a3", "a", "three").id,
             "a3",
             "an admitted but unwritten B remains a human barrier"
         );
         pause.resume.notify_one();
-        timeout(Duration::from_secs(5), worker)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            worker,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let queue = mgr.services.queue_snapshot(&id);
         assert_eq!(
             queue.len(),
@@ -27256,17 +27897,20 @@ async fn reap_shutdown_retains_removed_child_cleanup() {
     *mgr.services.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
     let owner = mgr.clone();
     let mut shutdown = tokio::spawn(async move { owner.shutdown().await });
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), async {
         tokio::select! {
             result = rx => assert_eq!(result.unwrap(), "process-registry"),
             result = &mut shutdown => { result.unwrap(); panic!("manager shutdown detached removed child cleanup"); }
         }
     }).await.unwrap();
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), shutdown)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(mgr.reap_claims.lock().unwrap().is_empty());
     assert_eq!(mgr.registry.size(), 0);
     assert!(!watcher.await.unwrap());
@@ -27849,14 +28493,17 @@ async fn submission_correlation_completed_interrupt_replay_is_complete() {
         .await
         .unwrap();
     assert_eq!(first["submissionIds"], json!(["interrupt-correlation"]));
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                if !mgr.is_busy(&id) && mgr.workers.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("interrupt turn completed");
     assert_eq!(

@@ -7999,7 +7999,7 @@ mod normal_launch {
                         let mut byte = [0];
                         assert!(
                             tokio::time::timeout(
-                                std::time::Duration::from_millis(30),
+                                intentd_test_support::test_timeout(std::time::Duration::from_millis(30)),
                                 tokio::io::AsyncReadExt::read(&mut foreign_reader, &mut byte)
                             )
                             .await

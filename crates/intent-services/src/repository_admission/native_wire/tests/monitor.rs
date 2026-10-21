@@ -396,9 +396,12 @@ async fn native_monitor_unresolved_cancel_fences_waiting_writer_and_full_row() {
                 )
                 .await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            ready.notified(),
+        )
+        .await
+        .unwrap();
         assert!(!task.is_finished());
         assert_eq!(
             f.services
@@ -428,10 +431,13 @@ async fn native_monitor_unresolved_cancel_fences_waiting_writer_and_full_row() {
             .await
             .unwrap();
         drop(writer);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let saved = f
             .services
             .store
@@ -551,11 +557,13 @@ async fn native_monitor_unresolved_cancel_event_retains_source_and_original_subs
             )
             .await
             .unwrap();
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(10), native.recv_delivery())
-                .await
-                .unwrap()
-                .unwrap();
+        let output = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            native.recv_delivery(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let crate::Delivery::Monitor(output) = output else {
             panic!("qualified event must retain private output")
         };
@@ -571,7 +579,7 @@ async fn native_monitor_unresolved_cancel_event_retains_source_and_original_subs
         );
         assert!(!output.frame().contains("private pending text"));
         let same_output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
             same_socket.recv_delivery(),
         )
         .await

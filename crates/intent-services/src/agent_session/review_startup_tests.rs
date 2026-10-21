@@ -134,7 +134,7 @@ async fn while_retirement_held<T, R: std::fmt::Debug>(
     milestone: impl std::future::Future<Output = T>,
     description: &str,
 ) -> T {
-    timeout(Duration::from_secs(5), async {
+    timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), async {
         tokio::select! {
             biased;
             result = mutation => panic!("Store completion escaped held retirement while waiting for {description}: {result:?}"),
@@ -865,13 +865,16 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         }
         assert!(native.is_retired());
         assert!(
-            timeout(Duration::from_millis(30), &mut operation)
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(30)),
+                &mut operation
+            )
+            .await
+            .is_err(),
             "credential success escaped held native join"
         );
         let gate = timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             services.gitlab_credential_gate.lock(),
         )
         .await
@@ -879,7 +882,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         drop(gate);
         if settings_change {
             let accounts = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 services
                     .settings_secret_gates
                     .write(&["sourceControl.gitlab.token"]),
@@ -888,7 +891,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             .expect("native join retained secret account gate");
             drop(accounts);
             let revision = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 services.settings_revision_gate.write(),
             )
             .await
@@ -897,16 +900,22 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         }
         assert!(directory.binding().is_err());
         assert!(
-            timeout(Duration::from_millis(30), events.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(30)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "auth event escaped original retirement"
         );
         if settings_change {
             assert!(
-                timeout(Duration::from_millis(30), settings_events.recv())
-                    .await
-                    .is_err(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(30)),
+                    settings_events.recv()
+                )
+                .await
+                .is_err(),
                 "settings success event escaped native completion"
             );
         }
@@ -915,14 +924,17 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             HeldMutation::SettingsConcurrent | HeldMutation::SettingsOverlap
         ) {
             use intent_core::WorkspaceApi;
-            let result = timeout(Duration::from_secs(5), intent_core::with_caller(intent_core::Caller::Daemon,
+            let result = timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), intent_core::with_caller(intent_core::Caller::Daemon,
                 services.settings_update(json!([{"path":"git.autoCommit","value":mutation_case == HeldMutation::SettingsOverlap}])))).await
                 .expect("held native completion blocked unrelated settings").unwrap();
             let revision = result["revision"].as_u64().unwrap();
-            let batch = timeout(Duration::from_secs(5), settings_events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                settings_events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(batch.iter().any(|event| event.data["revision"] == revision));
             Some(revision)
         } else {
@@ -932,9 +944,12 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             .then(|| Box::pin(services.store_tasks.drain_finite()));
         if let Some(drain) = finite_drain.as_mut() {
             assert!(
-                timeout(Duration::from_millis(30), drain.as_mut())
-                    .await
-                    .is_err(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(30)),
+                    drain.as_mut()
+                )
+                .await
+                .is_err(),
                 "finite-task drain escaped the held reload retirement"
             );
         }
@@ -993,16 +1008,24 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         if device && (reject_join || changed_source) {
             drop(operation);
             retire_release.send(()).unwrap();
-            timeout(Duration::from_secs(5), services.store_tasks.drain_finite())
-                .await
-                .expect("rejected device retirement left its original supervisor running");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                services.store_tasks.drain_finite(),
+            )
+            .await
+            .expect("rejected device retirement left its original supervisor running");
             assert!(services.gitlab_auth.lock().await.flow.is_none());
         } else if cancel_waiter {
             drop(operation);
             retire_release.send(()).unwrap();
         } else {
             retire_release.send(()).unwrap();
-            let result = timeout(Duration::from_secs(5), operation).await.unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                operation,
+            )
+            .await
+            .unwrap();
             if batch_error {
                 assert!(result.is_err());
                 assert!(
@@ -1061,7 +1084,7 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         }
         if batch_error && cancel_waiter {
             timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 services.settings_tasks.drain_finite(),
             )
             .await
@@ -1070,24 +1093,33 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         if reject_join || changed_reconcile || changed_source || projection_failure || batch_error {
             assert!(directory.binding().is_err());
             assert!(
-                timeout(Duration::from_millis(30), events.recv())
-                    .await
-                    .is_err(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(30)),
+                    events.recv()
+                )
+                .await
+                .is_err(),
                 "unconfirmed retirement published auth event"
             );
             if settings_change {
                 assert!(
-                    timeout(Duration::from_millis(30), settings_events.recv())
-                        .await
-                        .is_err(),
+                    timeout(
+                        intentd_test_support::test_timeout(Duration::from_millis(30)),
+                        settings_events.recv()
+                    )
+                    .await
+                    .is_err(),
                     "unconfirmed retirement published settings success"
                 );
             }
         } else if settings_change {
-            let batch = timeout(Duration::from_secs(5), settings_events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                settings_events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             if mutation_case == HeldMutation::SettingsOverlap {
                 let value = batch
                     .iter()
@@ -1115,14 +1147,20 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                     "metadata/reset must not adopt retained secrets"
                 );
             }
-            assert!(timeout(Duration::from_millis(30), events.recv())
-                .await
-                .is_err());
+            assert!(timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(30)),
+                events.recv()
+            )
+            .await
+            .is_err());
         } else if expired {
-            let batch = timeout(Duration::from_secs(5), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(batch.iter().any(|event| event.data["status"] == "expired"));
             assert!(directory.binding().is_err());
             assert!(services
@@ -1132,26 +1170,35 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                 .is_none());
         } else if refresh || reconcile {
             if cancel_waiter {
-                timeout(Duration::from_secs(5), async {
-                    while directory.binding().is_err() {
-                        tokio::task::yield_now().await;
-                    }
-                })
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    async {
+                        while directory.binding().is_err() {
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                )
                 .await
                 .expect("cancelled refresh lost original native completion");
             }
             assert!(directory.binding().is_ok());
             assert!(
-                timeout(Duration::from_millis(30), events.recv())
-                    .await
-                    .is_err(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(30)),
+                    events.recv()
+                )
+                .await
+                .is_err(),
                 "refresh invented an auth transition"
             );
         } else {
-            let batch = timeout(Duration::from_secs(5), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(
                 batch
                     .iter()
@@ -1165,9 +1212,12 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             }
         }
         if let Some(drain) = finite_drain {
-            timeout(Duration::from_secs(5), drain)
-                .await
-                .expect("finite-task drain lost the original reload completion");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .expect("finite-task drain lost the original reload completion");
         }
         assert_eq!(
             std::fs::read(tmp.dir.path().join("secrets.json")).unwrap(),
@@ -1207,16 +1257,24 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
             native.is_retired(),
             "credential mutation did not synchronously close native eligibility"
         );
-        timeout(Duration::from_secs(5), &mut retire_ready)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            &mut retire_ready,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             directory.finish_mutation(&ticket, SettledCredentialState::Disconnected),
             Err(RepositoryCredentialError::Indeterminate)
         );
         let mut join = Box::pin(directory.native_contexts.join());
-        assert!(timeout(Duration::from_millis(30), &mut join).await.is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(30)),
+            &mut join
+        )
+        .await
+        .is_err());
         assert!(
             directory.binding().is_err(),
             "credential publication escaped held native join"
@@ -1224,12 +1282,20 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         let joined = if cancel_waiter {
             drop(join);
             retire_release.send(()).unwrap();
-            timeout(Duration::from_secs(5), directory.native_contexts.join())
-                .await
-                .unwrap()
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                directory.native_contexts.join(),
+            )
+            .await
+            .unwrap()
         } else {
             retire_release.send(()).unwrap();
-            timeout(Duration::from_secs(5), join).await.unwrap()
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                join,
+            )
+            .await
+            .unwrap()
         };
         if reject_join {
             assert!(joined.is_err());
@@ -1288,7 +1354,9 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
                     let _ = entered.send(native.is_retired());
                     // Timeout bounds a broken fixture; sender drop on assertion
                     // failure also unblocks the worker (and rejects the commit).
-                    blocked.recv_timeout(Duration::from_secs(10)).is_ok()
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                        .is_ok()
                 });
             Some((waiting, release))
         };
@@ -1489,22 +1557,28 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         if cancel_waiter {
             drop(mutation);
             retire_release.send(()).unwrap();
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    if let Ok(owner) = allocate() {
-                        drop(owner);
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        if let Ok(owner) = allocate() {
+                            drop(owner);
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .expect("cancelled waiter lost original committed settlement");
         } else {
             retire_release.send(()).unwrap();
-            let result = timeout(Duration::from_secs(5), &mut mutation)
-                .await
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                &mut mutation,
+            )
+            .await
+            .unwrap();
             if reject_join {
                 if initialize {
                     assert!(
@@ -1539,19 +1613,22 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
     if drop_confirmed {
         let original = outcome.owner.as_ref().unwrap().native_allocation_for_test();
         drop(outcome);
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if captured
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|r| r["method"] == "_intent/session/retire_review_context")
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    if captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r["method"] == "_intent/session/retire_review_context")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("confirmed physical owner lost its original native allocation");
         {
@@ -1579,11 +1656,14 @@ async fn run_qualified_new(bad_echo: bool, drop_confirmed: bool, mutation_case: 
         let transport = Arc::downgrade(&connection);
         drop(handshake);
         drop(connection);
-        timeout(Duration::from_secs(2), async {
-            while transport.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                while transport.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("positive native join retained the original ACP transport");
         original
@@ -1711,22 +1791,25 @@ async fn retired_new_waits_for_remote_join(
     if drop_before_response || drop_after_commit {
         if drop_after_commit {
             new_release.send(()).unwrap();
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    if services
-                        .store
-                        .get_agent_session(&agent)
-                        .await
-                        .unwrap()
-                        .acp_session_id
-                        .as_deref()
-                        == Some("late-original")
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        if services
+                            .store
+                            .get_agent_session(&agent)
+                            .await
+                            .unwrap()
+                            .acp_session_id
+                            .as_deref()
+                            == Some("late-original")
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .expect("original initialization never committed");
             drop(operation);
@@ -1734,10 +1817,13 @@ async fn retired_new_waits_for_remote_join(
             drop(operation);
             new_release.send(()).unwrap();
         }
-        timeout(Duration::from_secs(5), &mut retire_ready)
-            .await
-            .expect("cancelled startup lost the original response and native retirement")
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            &mut retire_ready,
+        )
+        .await
+        .expect("cancelled startup lost the original response and native retirement")
+        .unwrap();
         assert_eq!(
             services
                 .store
@@ -1759,9 +1845,12 @@ async fn retired_new_waits_for_remote_join(
         );
         let mut shutdown = Box::pin(services.store_tasks.drain_finite());
         assert!(
-            timeout(Duration::from_millis(30), &mut shutdown)
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(30)),
+                &mut shutdown
+            )
+            .await
+            .is_err(),
             "shutdown escaped held native retirement"
         );
         let shared = handshake
@@ -1771,20 +1860,29 @@ async fn retired_new_waits_for_remote_join(
             .begin_review_context_retirement("late-original", &context)
             .unwrap();
         let mut waiting = Box::pin(shared.join());
-        assert!(timeout(Duration::from_millis(30), &mut waiting)
-            .await
-            .is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(30)),
+            &mut waiting
+        )
+        .await
+        .is_err());
         retire_release.send(()).unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(5), waiting)
-                .await
-                .unwrap()
-                .is_ok(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                waiting
+            )
+            .await
+            .unwrap()
+            .is_ok(),
             joined
         );
-        timeout(Duration::from_secs(5), &mut shutdown)
-            .await
-            .expect("retained startup task did not finish");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            &mut shutdown,
+        )
+        .await
+        .expect("retained startup task did not finish");
         assert_eq!(
             services
                 .store
@@ -1816,9 +1914,12 @@ async fn retired_new_waits_for_remote_join(
         () = tokio::time::sleep(Duration::from_secs(5)) => panic!("retirement request absent"),
     }
     // Poll the operation while the peer explicitly holds its retirement result.
-    assert!(timeout(Duration::from_millis(30), &mut operation)
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(30)),
+        &mut operation
+    )
+    .await
+    .is_err());
     assert!(services
         .store
         .get_agent_session(&agent)
@@ -1841,15 +1942,21 @@ async fn retired_new_waits_for_remote_join(
             .begin_review_context_retirement("late-original", &context)
             .unwrap();
         let mut waiting = Box::pin(shared.join());
-        assert!(timeout(Duration::from_millis(30), &mut waiting)
-            .await
-            .is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(30)),
+            &mut waiting
+        )
+        .await
+        .is_err());
         retire_release.send(()).unwrap();
         assert_eq!(
-            timeout(Duration::from_secs(5), waiting)
-                .await
-                .unwrap()
-                .is_ok(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                waiting
+            )
+            .await
+            .unwrap()
+            .is_ok(),
             joined
         );
         assert!(services
@@ -1864,10 +1971,12 @@ async fn retired_new_waits_for_remote_join(
         return;
     }
     retire_release.send(()).unwrap();
-    let Err(error) = timeout(Duration::from_secs(5), &mut operation)
-        .await
-        .unwrap()
-    else {
+    let Err(error) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        &mut operation,
+    )
+    .await
+    .unwrap() else {
         panic!("retired original startup was accepted");
     };
     if joined {
