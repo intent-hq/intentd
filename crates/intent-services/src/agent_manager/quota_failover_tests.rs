@@ -29,7 +29,7 @@ struct Fixture {
     agent: AgentId,
     ws: WorkspaceId,
     _db: tempfile::TempDir,
-    _scratch: tempfile::TempDir,
+    scratch: tempfile::TempDir,
     _env: EnvGuard,
 }
 
@@ -37,15 +37,25 @@ impl Fixture {
     /// A `claude-code` Default agent (model `opus`) with the given mock
     /// behavior and a fresh attempt counter.
     async fn new(behavior: Value) -> Self {
+        Self::build(behavior, Some("opus"), None).await
+    }
+
+    /// A Default agent with the given stored model (`None` = provider
+    /// default) and an optional session-open result (`MOCK_AGENT_SESSION_RESULT`).
+    async fn build(behavior: Value, model: Option<&str>, session_result: Option<Value>) -> Self {
         let script = mock_agent_script();
+        let session_result = session_result.map(|v| v.to_string());
         let scratch = crate::test_support::test_tempdir("quota-failover-");
         let attempts = scratch.path().join("attempts");
+        let prompts = scratch.path().join("prompts.jsonl");
         let behavior = behavior.to_string();
         let env = EnvGuard::apply(&[
             ("MOCK_AGENT_SCRIPT_PATH", Some(script.as_str())),
+            ("MOCK_AGENT_PROMPT_LOG", prompts.to_str()),
             ("MOCK_AGENT_BEHAVIOR", Some(behavior.as_str())),
             ("MOCK_AGENT_ATTEMPT_FILE", attempts.to_str()),
             ("MOCK_AGENT_STANDS_IN_FOR", Some("claude-code")),
+            ("MOCK_AGENT_SESSION_RESULT", session_result.as_deref()),
             ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("10,20")),
         ]);
         let db = crate::test_support::test_tempdir("quota-failover-db-");
@@ -63,7 +73,7 @@ impl Fixture {
         let agent = AgentId::from("agent-quota-failover");
         let mut s = session(&agent, &ws, None);
         s.provider = Some("claude-code".to_string());
-        s.model = Some("opus".to_string());
+        s.model = model.map(str::to_string);
         store.insert_agent_session(&s).await.unwrap();
         let sink = Arc::new(BusEventSink::new(bus.clone()));
         Self {
@@ -72,7 +82,7 @@ impl Fixture {
             agent,
             ws,
             _db: db,
-            _scratch: scratch,
+            scratch,
             _env: env,
         }
     }
@@ -115,6 +125,29 @@ impl Fixture {
             events.extend(batch);
         }
         events
+    }
+
+    /// How many attempt-gated mock calls ran (the mock's counter file holds
+    /// the NEXT attempt number); here, the `session/new` calls.
+    fn gated_calls(&self) -> u32 {
+        std::fs::read_to_string(self.scratch.path().join("attempts"))
+            .ok()
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .map_or(0, |next| next - 1)
+    }
+
+    /// The text of every prompt the mock children received, in order.
+    fn prompts(&self) -> Vec<String> {
+        std::fs::read_to_string(self.scratch.path().join("prompts.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("prompt log line")["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
     }
 
     async fn row(&self) -> AgentSession {
@@ -222,6 +255,7 @@ async fn assert_fails_over_to_first_backup(stream_before_error: Option<&str>) {
     });
     if let Some(text) = stream_before_error {
         behavior["streamBeforeErrorText"] = json!(text);
+        behavior["toolCallBeforeError"] = json!("touch partial-marker");
     }
     let fx = Fixture::new(behavior).await;
     let _work = fx.profile("Work", false).await;
@@ -290,10 +324,36 @@ async fn assert_fails_over_to_first_backup(stream_before_error: Option<&str>) {
             .any(|c| c.contains("answered on the backup")),
         "the backup completed the turn: {assistant:?}"
     );
+    // What the backup was sent: the failed attempt's prompt, then the
+    // backup's, on a fresh native session with Intent history replayed.
+    let prompts = fx.prompts();
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].ends_with("please answer"), "{:?}", prompts[0]);
+    let backup = &prompts[1];
     if let Some(text) = stream_before_error {
         assert!(
             assistant.iter().any(|c| c.contains(text)),
             "partial output of the failed attempt stays: {assistant:?}"
+        );
+        // Mid-turn: the backup continues the turn — it sees the user message,
+        // the partial text AND the finished tool call, and gets the
+        // continuation instruction instead of the message again.
+        assert!(backup.contains("please answer"), "{backup}");
+        assert!(backup.contains(text), "{backup}");
+        assert!(
+            backup.contains("touch partial-marker"),
+            "the partial turn's tool call reaches the backup: {backup}"
+        );
+        assert!(
+            backup.ends_with(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+            "{backup}"
+        );
+    } else {
+        // Before any output: nothing to continue, the same message is sent.
+        assert!(backup.ends_with("please answer"), "{backup}");
+        assert!(
+            !backup.contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+            "{backup}"
         );
     }
 
@@ -411,20 +471,26 @@ async fn non_quota_failures_never_fail_over() {
 }
 
 /// A quota rejection at session setup (`session/new`, the spawn-attempt
-/// path) fails over too, once today's spawn retry budget on the failing
-/// configuration is spent (`session/new` failures are retried as before):
-/// the backup's session opens and the turn completes.
+/// path) fails over IMMEDIATELY when a backup exists: no further
+/// same-provider spawn retries (they cannot help a spent quota), the
+/// backup's session opens and the turn completes.
 #[intent_test_macros::daemon_test]
 async fn session_setup_quota_failure_fails_over() {
     let fx = Fixture::new(json!({
         "sessionNewRpcError": quota_error(),
-        "sessionNewRpcErrorAttempts": super::MAX_SPAWN_ATTEMPTS,
+        "sessionNewRpcErrorAttempts": 1,
         "response": "answered on the backup",
     }))
     .await;
     let first = fx.profile("First", true).await;
 
     let events = fx.send("please answer").await;
+
+    assert_eq!(
+        fx.gated_calls(),
+        2,
+        "one rejected session/new on Default, then the backup's — no same-provider retry"
+    );
 
     assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
     let row = fx.row().await;
@@ -474,4 +540,394 @@ async fn session_setup_quota_exhaustion_fails_as_today() {
         .map(|m| m.metadata.as_ref().unwrap()["toProvider"].clone())
         .collect();
     assert_eq!(targets, vec![json!(first), json!(second)]);
+}
+
+/// With no backup, a quota rejection at session setup keeps today's
+/// behavior exactly: every same-provider spawn retry runs, then the turn
+/// fails with the quota signal.
+#[intent_test_macros::daemon_test]
+async fn session_setup_quota_failure_without_backups_keeps_todays_retries() {
+    let fx = Fixture::new(json!({
+        "sessionNewRpcError": quota_error(),
+        "sessionNewRpcErrorAttempts": 100,
+        "response": "unreached",
+    }))
+    .await;
+    let _work = fx.profile("Work", false).await;
+
+    let events = fx.send("please answer").await;
+
+    assert_eq!(fx.gated_calls(), super::MAX_SPAWN_ATTEMPTS);
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// A user switch that lands while the failing attempt is in flight wins: the
+/// quota failure belongs to the configuration that ran, so when the session
+/// already names another one, nothing fails over and the user's choice is
+/// never overwritten.
+#[intent_test_macros::daemon_test]
+async fn a_user_switch_during_the_failing_attempt_is_never_overridden() {
+    let fx = Fixture::new(json!({ "response": "unused" })).await;
+    let _first = fx.profile("First", true).await;
+    let chosen = fx.profile("Chosen", false).await;
+    fx.mgr
+        .services
+        .store
+        .set_agent_session_model(&fx.ws, &fx.agent, "opus", Some(&chosen), &now_iso())
+        .await
+        .unwrap();
+    fx.mgr.services.arm_quota_failover(&fx.agent, false);
+    fx.mgr
+        .services
+        .note_quota_failover_attempt(&fx.agent, "claude-code", Some("opus"));
+
+    assert!(
+        !fx.mgr
+            .services
+            .try_quota_failover(&fx.ws, &fx.agent, Some("claude-code"))
+            .await,
+        "the failed attempt ran on Default, not on the user's new choice"
+    );
+    assert_eq!(fx.row().await.provider.as_deref(), Some(chosen.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    assert!(
+        !fx.mgr
+            .services
+            .has_quota_failover_candidate(&fx.agent, Some("claude-code"))
+            .await
+    );
+}
+
+/// Full worker path of the user-switch race: `change` runs while the failing
+/// prompt is in flight (held by the mock's receipt gate) and stands in for
+/// what `agent.setModel` persists. The late quota failure belongs to the
+/// identity the attempt started with, so nothing fails over — the turn
+/// fails as today and the user's choice stays.
+async fn assert_mid_flight_change_wins(
+    change: impl FnOnce(&Fixture, &str) -> (Option<String>, String),
+) {
+    let scratch = crate::test_support::test_tempdir("quota-failover-gate-");
+    let entered = scratch.path().join("entered");
+    let release = scratch.path().join("release");
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "promptReceiptGate": {
+            "suffix": "please answer",
+            "enteredFile": entered.to_str().unwrap(),
+            "releaseFile": release.to_str().unwrap(),
+        },
+        "response": "unreached",
+    }))
+    .await;
+    let _first = fx.profile("First", true).await;
+    let chosen = fx.profile("Chosen", false).await;
+
+    let mut sub = fx.bus.subscribe(SubscriptionFilter::default());
+    fx.mgr
+        .send_message(
+            fx.agent.clone(),
+            fx.ws.clone(),
+            "please answer".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the prompt reaches the provider");
+    let (provider, model) = change(&fx, &chosen);
+    fx.mgr
+        .services
+        .store
+        .set_agent_session_model(&fx.ws, &fx.agent, &model, provider.as_deref(), &now_iso())
+        .await
+        .unwrap();
+    std::fs::write(&release, "go").unwrap();
+    timeout_settled(&fx.mgr, &fx.agent).await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) =
+        // fixed-deadline: allow — quiet-window drain after the worker settled
+        tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+    {
+        events.extend(batch);
+    }
+
+    let row = fx.row().await;
+    assert_eq!(row.provider, provider, "the user's provider stays");
+    assert_eq!(
+        row.model.as_deref(),
+        Some(model.as_str()),
+        "the user's model stays"
+    );
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    assert_eq!(failed[0].data["providerId"], json!("claude-code"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_user_provider_switch_while_the_prompt_is_in_flight_wins_over_failover() {
+    assert_mid_flight_change_wins(|_, chosen| (Some(chosen.to_owned()), "opus".to_owned())).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_user_model_change_while_the_prompt_is_in_flight_wins_over_failover() {
+    assert_mid_flight_change_wins(|_, _| (Some("claude-code".to_owned()), "sonnet".to_owned()))
+        .await;
+}
+
+/// The failover replay keeps the partial turn for a queued-batch (live
+/// flush) send too, where the ordinary boundary is the batch's first row;
+/// without the failover mark the ordinary boundary is unchanged.
+#[intent_test_macros::daemon_test]
+async fn failover_replay_keeps_the_partial_turn_for_a_flushed_batch() {
+    let fx = Fixture::new(json!({ "response": "unused" })).await;
+    let append = |role: &'static str, text: &'static str, metadata: Option<Value>| {
+        let store = fx.mgr.services.store.clone();
+        let agent = fx.agent.clone();
+        async move {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    role,
+                    &json!([{ "type": "text", "text": text }]),
+                    metadata.as_ref(),
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    append("user", "earlier question", None).await;
+    append("assistant", "earlier answer", None).await;
+    append(
+        "user",
+        "batched request",
+        Some(json!({ "queueInfo": { "queuedMessageId": "q-1" } })),
+    )
+    .await;
+    append("assistant", "partial work before the quota", None).await;
+    let flushed = vec!["q-1".to_string()];
+
+    fx.mgr.recreated.lock().unwrap().insert(fx.agent.clone());
+    let ordinary = fx
+        .mgr
+        .build_turn_body(&fx.agent, "batched request", Some(&flushed))
+        .await;
+    assert!(ordinary.contains("earlier answer"), "{ordinary}");
+    assert!(!ordinary.contains("partial work"), "{ordinary}");
+    assert!(ordinary.ends_with("batched request"), "{ordinary}");
+
+    fx.mgr.recreated.lock().unwrap().insert(fx.agent.clone());
+    fx.mgr
+        .services
+        .quota_failover_replays
+        .lock()
+        .unwrap()
+        .insert(fx.agent.clone());
+    let continued = fx
+        .mgr
+        .build_turn_body(&fx.agent, "batched request", Some(&flushed))
+        .await;
+    assert!(continued.contains("earlier answer"), "{continued}");
+    assert!(continued.contains("batched request"), "{continued}");
+    assert!(
+        continued.contains("partial work before the quota"),
+        "{continued}"
+    );
+    assert!(
+        continued.ends_with(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{continued}"
+    );
+    assert!(
+        fx.mgr.services.quota_failover_replay_pending(&fx.agent),
+        "the mark lasts for the message"
+    );
+    fx.mgr.services.arm_quota_failover(&fx.agent, true);
+    assert!(fx.mgr.services.quota_failover_replay_pending(&fx.agent));
+    fx.mgr.services.arm_quota_failover(&fx.agent, false);
+    assert!(
+        !fx.mgr.services.quota_failover_replay_pending(&fx.agent),
+        "a new message clears it"
+    );
+}
+
+fn resolved_on(selection: &str) -> ResolvedSpawn {
+    ResolvedSpawn {
+        provider: *intent_providers::provider_config(selection),
+        selection: crate::provider_profiles::canonical_selection(selection),
+        model: Some("opus".into()),
+        reasoning_effort: None,
+        cwd: std::env::temp_dir(),
+        provider_binary: None,
+        extra_env: std::collections::BTreeMap::default(),
+        npx_fallback_binary: None,
+        npx_fallback_package: None,
+        unsloth_endpoint: None,
+    }
+}
+
+/// A turn that failed over twice (Default's prompt ran out, the first
+/// backup's session setup ran out too, the second backup succeeded) commits
+/// Default → second backup at the successful start. Its two
+/// `provider_failover` rows announce that hop, so no `model_changed` row is
+/// added; a later manual switch still gets its own.
+#[intent_test_macros::daemon_test]
+async fn a_multi_hop_failover_adds_no_model_changed_row() {
+    let fx = Fixture::new(json!({ "response": "unused" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let work = fx.profile("Work", false).await;
+    fx.mgr
+        .maybe_persist_model_change_notice(&fx.agent, &fx.ws, &resolved_on("claude-code"))
+        .await;
+    for (from, to) in [
+        ("claude-code", first.as_str()),
+        (first.as_str(), second.as_str()),
+    ] {
+        fx.mgr
+            .services
+            .store
+            .append_agent_message_with_metadata(
+                &fx.agent,
+                "system",
+                &json!([{ "type": "text", "text": "switched" }]),
+                Some(&json!({
+                    "type": "provider_failover", "fromProvider": from, "toProvider": to,
+                    "model": "opus", "reason": "quota-exceeded",
+                })),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fx.mgr
+        .maybe_persist_model_change_notice(&fx.agent, &fx.ws, &resolved_on(&second))
+        .await;
+    assert!(
+        notices(&fx.messages().await, "model_changed").is_empty(),
+        "the failover chain already announces Default → Second"
+    );
+    let (_, committed) = fx
+        .mgr
+        .services
+        .store
+        .get_agent_session_last_turn_model(&fx.ws, &fx.agent)
+        .await
+        .unwrap();
+    assert_eq!(committed.as_deref(), Some(second.as_str()));
+
+    fx.mgr
+        .maybe_persist_model_change_notice(&fx.agent, &fx.ws, &resolved_on(&work))
+        .await;
+    assert_eq!(
+        notices(&fx.messages().await, "model_changed").len(),
+        1,
+        "a manual switch after the failover is still announced"
+    );
+}
+
+/// A pre-output transport failure on the backup (silently redriven on a
+/// fresh child) keeps continuing the cut-short turn: the redriven prompt
+/// still carries the partial work and the continuation instruction.
+#[intent_test_macros::daemon_test]
+async fn a_silent_redrive_on_the_backup_still_continues_the_partial_turn() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "streamBeforeErrorText": "partial answer from the default",
+        "toolCallBeforeError": "touch partial-marker",
+        "exitDuringPromptOnAttempt": 2,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let prompts = fx.prompts();
+    assert_eq!(
+        prompts.len(),
+        3,
+        "default, backup (died), backup redriven: {prompts:#?}"
+    );
+    assert!(
+        prompts[1].contains("touch partial-marker"),
+        "{}",
+        prompts[1]
+    );
+    // The redriven prompt continues the turn either way: through a replay
+    // that carries the partial work again, or on the resumed native session
+    // that already holds it.
+    let redriven = &prompts[2];
+    assert!(
+        redriven.ends_with(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "{redriven}"
+    );
+    assert!(
+        redriven.contains("touch partial-marker")
+            || redriven.trim() == crate::quota_failover::QUOTA_FAILOVER_CONTINUATION,
+        "{redriven}"
+    );
+    assert!(
+        !redriven.trim_end().ends_with("please answer"),
+        "{redriven}"
+    );
+}
+
+/// An agent on the provider default (no stored model) has its model filled
+/// at session open; that fill is the attempt's identity, not a user change,
+/// so a quota failure still fails over — with the filled model id kept.
+#[intent_test_macros::daemon_test]
+async fn a_provider_default_agent_with_a_session_open_fill_still_fails_over() {
+    let fx = Fixture::build(
+        json!({
+            "promptRpcError": quota_error(),
+            "promptRpcErrorAttempts": 1,
+            "response": "answered on the backup",
+        }),
+        None,
+        Some(json!({"configOptions": [
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": "mock-current",
+             "options": [{"value": "mock-current", "name": "Mock Current"}]}
+        ]})),
+    )
+    .await;
+    let first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(
+        row.model.as_deref(),
+        Some("mock-current"),
+        "the filled model is kept"
+    );
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata.as_ref().unwrap()["model"],
+        json!("mock-current")
+    );
 }

@@ -5929,7 +5929,24 @@ impl AgentManager {
         flushed_ids: Option<&[String]>,
         group_source_ids: &[String],
     ) -> (String, HashSet<String>) {
+        let failover_replay = self.services.quota_failover_replay_pending(agent_id);
         if !self.take_recreated(agent_id) {
+            // A resumed native session (no replay) already holds the cut-short
+            // turn's history from the backup's earlier prompt; it still gets
+            // the continuation instead of the message again.
+            if failover_replay
+                && self
+                    .services
+                    .store
+                    .get_agent_messages(agent_id, None)
+                    .await
+                    .is_ok_and(|messages| partial_turn_follows_last_user(&messages))
+            {
+                return (
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION.to_string(),
+                    HashSet::new(),
+                );
+            }
             return (content.to_string(), HashSet::new());
         }
         // The per-block cap is read live so a `config.toml` edit applies to
@@ -5976,7 +5993,18 @@ impl AgentManager {
                 .iter()
                 .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
-        let prior: &[_] = if let Some(index) = first_flushed {
+        // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
+        // already persisted assistant/tool rows after the current user row,
+        // the backup continues that turn — the replay keeps the user row and
+        // the partial work, and a continuation instruction replaces the
+        // re-sent message so finished tool calls are not repeated.
+        // Applies to every send shape (direct, live flush, saved groups): the
+        // whole persisted turn, including the current batch's user rows, is
+        // replayed as history.
+        let continue_partial_turn = failover_replay && partial_turn_follows_last_user(&messages);
+        let prior: &[_] = if continue_partial_turn {
+            &messages
+        } else if let Some(index) = first_flushed {
             // Preserve the existing boundary for an ordinary live flush.
             &messages[..index]
         } else if !excluded_group_sources.is_empty() {
@@ -5992,6 +6020,11 @@ impl AgentManager {
         if prior.is_empty() {
             return (content.to_string(), excluded_group_sources);
         }
+        let content = if continue_partial_turn {
+            crate::quota_failover::QUOTA_FAILOVER_CONTINUATION
+        } else {
+            content
+        };
         // Unlike the existing live-flush boundary, saved group sources may
         // precede unrelated conversation. Remove only matched source rows.
         let prior: Vec<_> = prior
@@ -6000,6 +6033,7 @@ impl AgentManager {
             .filter(|message| !crate::agent_ops::is_qualified_monitor_message(message))
             .filter(|message| {
                 message.role != "user"
+                    || continue_partial_turn
                     || (!excluded_group_sources.contains(&message.id)
                         && !queue_source(message)
                             .is_some_and(|source| excluded_group_sources.contains(&source)))
@@ -10637,12 +10671,30 @@ impl AgentManager {
         let Some(latest) = latest else {
             return false;
         };
-        // Quota failover (PROTOCOL §5.54): the `provider_failover` row already
-        // names this exact hop between selections (profiles included).
+        // Quota failover (PROTOCOL §5.54): the `provider_failover` rows of
+        // this turn already name the hop between selections (profiles
+        // included) — one row, or an unbroken chain when a backup's own setup
+        // also ran out before another one succeeded.
         if latest["type"].as_str() == Some(crate::quota_failover::PROVIDER_FAILOVER_NOTICE_TYPE) {
-            let hop = |key: &str| latest[key].as_str().map(selection);
-            return hop("fromProvider") == Some(selection(from_provider))
-                && hop("toProvider") == Some(selection(to_provider));
+            return match self
+                .services
+                .store
+                .recent_agent_identity_notices(
+                    agent_id,
+                    crate::quota_failover::FAILOVER_CHAIN_READ_LIMIT,
+                )
+                .await
+            {
+                Ok(notices) => crate::quota_failover::failover_chain_announces(
+                    &notices,
+                    from_provider,
+                    to_provider,
+                ),
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to read identity notices; keeping the model-change notice");
+                    false
+                }
+            };
         }
         if same_base || latest["type"].as_str() != Some("provider_rehomed") {
             return false;
@@ -11056,6 +11108,13 @@ impl AgentManager {
             &settings,
             self.chief_cwd_root.as_deref(),
         )?;
+        // Backup failover (PROTOCOL §5.54): the identity this attempt starts
+        // with — a failure only fails over while the session still carries it.
+        self.services.note_quota_failover_attempt(
+            agent_id,
+            &resolved.selection,
+            session.model.as_deref(),
+        );
 
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
@@ -11304,19 +11363,15 @@ impl AgentManager {
         // Record the identity this attempt runs under BEFORE anything below
         // can fail: a spawn or session-setup failure is attributed to the
         // provider that was actually tried, not to whatever the last committed
-        // turn ran on. Cleared on success at the end of this method. A
-        // profile attempt records its reference (PROTOCOL §5.54: a quota
-        // exhaustion names the last reference tried); a bare selection keeps
-        // its base id.
-        let attempt_provider = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
-            resolved.selection.clone()
-        } else {
-            resolved.provider.id.to_string()
-        };
+        // turn ran on. Cleared on success at the end of this method. The
+        // selection is recorded: a bare provider's selection is its canonical
+        // id, and a profile attempt names its reference (PROTOCOL §5.54: a
+        // quota exhaustion names the last reference tried, and failover must
+        // attribute the failure to the configuration that actually ran).
         self.spawn_attempt_provider
             .lock()
             .unwrap()
-            .insert(agent_id.clone(), attempt_provider);
+            .insert(agent_id.clone(), resolved.selection.clone());
         let private_history = if let Some(session_id) = &session.acp_session_id {
             self.services
                 .store
@@ -11392,6 +11447,12 @@ impl AgentManager {
             &mut resolved,
         ))
         .await;
+        // Backup failover: a turn that started on the provider default now
+        // runs under the filled model, which the session row also carries.
+        if let (None, Some(filled)) = (session.model.as_deref(), filled_model.as_deref()) {
+            self.services
+                .note_quota_failover_filled_model(agent_id, filled);
+        }
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -14339,10 +14400,16 @@ async fn run_message_worker(
                 // message instead of surfacing `agent:failed`. The attempt's
                 // provider record is consumed here because no terminal
                 // publisher runs for the swallowed attempt.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .cloned();
                 if intent_acp::message_is_quota_exceeded(&e.to_string())
                     && mgr
                         .services
-                        .try_quota_failover(&workspace_id, &agent_id)
+                        .try_quota_failover(&workspace_id, &agent_id, attempted.as_deref())
                         .await
                 {
                     mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
@@ -15521,6 +15588,19 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     false
 }
 
+/// Whether assistant rows (a cut-short attempt's partial work) follow the
+/// newest user row of `messages`.
+fn partial_turn_follows_last_user(messages: &[intent_core::AgentMessage]) -> bool {
+    messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .is_some_and(|index| {
+            messages[index + 1..]
+                .iter()
+                .any(|message| message.role == "assistant")
+        })
+}
+
 /// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with jittered
 /// backoff. On each retry (after the first failure), tear down the failed
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
@@ -15561,7 +15641,23 @@ async fn retry_spawn_owned(
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
                 let error_msg = e.to_string();
-                let will_retry = retryable && attempt < MAX_SPAWN_ATTEMPTS;
+                // Backup failover (PROTOCOL §5.54): a quota-rejected setup
+                // with a backup candidate skips the remaining same-provider
+                // retries — a spent quota stays spent — so the worker fails
+                // over at once. Without a candidate the retries run as today.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(agent_id)
+                    .cloned();
+                let will_retry = retryable
+                    && attempt < MAX_SPAWN_ATTEMPTS
+                    && !(intent_acp::message_is_quota_exceeded(&error_msg)
+                        && mgr
+                            .services
+                            .has_quota_failover_candidate(agent_id, attempted.as_deref())
+                            .await);
                 let captured = if will_retry {
                     stderr_capture_hint(mgr, agent_id, &e).await
                 } else {

@@ -15,7 +15,7 @@
 //! switch the failed attempt is swallowed (no `agent:failed`, no error row)
 //! and the worker loops back through its spawn with the same content.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use intent_core::{now_iso, AgentId, WorkspaceId};
@@ -32,11 +32,38 @@ pub(crate) const PROMPT_QUOTA_FAILOVER_PREFIX: &str = "session/prompt quota fail
 /// `metadata.type` of the transcript notice persisted for each switch.
 pub(crate) const PROVIDER_FAILOVER_NOTICE_TYPE: &str = "provider_failover";
 
-/// Per-agent failover chain of the user turn in flight: the references
-/// already tried. Present only while a turn worker owns the agent's turn
-/// (armed before each attempt), so a quota failure outside a worker never
-/// fails over without a redrive. In-memory only.
-pub(crate) type QuotaFailoverChains = Arc<Mutex<HashMap<AgentId, Vec<String>>>>;
+/// Per-agent failover chain of the user turn in flight. Present only while a
+/// turn worker owns the agent's turn (armed before each attempt), so a quota
+/// failure outside a worker never fails over without a redrive. In-memory
+/// only.
+pub(crate) type QuotaFailoverChains = Arc<Mutex<HashMap<AgentId, QuotaFailoverChain>>>;
+
+/// One message's failover state.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QuotaFailoverChain {
+    /// References already tried for this message.
+    tried: Vec<String>,
+    /// The identity the current attempt started with: its canonical
+    /// selection and the session's `model` column as read at turn start.
+    /// A failure is only failed over while the session still carries exactly
+    /// this identity — a user switch of provider OR model during the attempt
+    /// always wins.
+    attempt: Option<(String, Option<String>)>,
+}
+
+/// Agents whose current message is a turn a quota failover cut short (set
+/// when a switch lands, cleared with the message): every history replay for
+/// it shows the backup the partial turn's persisted work instead of starting
+/// over.
+pub(crate) type QuotaFailoverReplays = Arc<Mutex<HashSet<AgentId>>>;
+
+/// Sent to the backup in place of the original user message when the failed
+/// attempt already produced output: the user message and the partial work
+/// are in the replayed history above, so re-sending the message as new would
+/// invite the backup to redo work (duplicate edits or commands).
+pub(crate) const QUOTA_FAILOVER_CONTINUATION: &str = "The previous provider ran out of quota \
+partway through your reply to the last user message above. Continue that reply from where it \
+stopped. The tool calls and results shown above have already happened: do not repeat them.";
 
 /// Whether `err` is the swallowed-attempt marker from `run_prompt_turn`.
 pub(crate) fn is_quota_failover_error(err: &intent_core::Error) -> bool {
@@ -81,19 +108,128 @@ impl Services {
     pub(crate) fn arm_quota_failover(&self, agent_id: &AgentId, keep: bool) {
         let mut chains = self.quota_failover_chains.lock().unwrap();
         if keep {
-            chains.entry(agent_id.clone()).or_default();
+            chains.entry(agent_id.clone()).or_default().attempt = None;
         } else {
-            chains.insert(agent_id.clone(), Vec::new());
+            chains.insert(agent_id.clone(), QuotaFailoverChain::default());
+            self.quota_failover_replays.lock().unwrap().remove(agent_id);
         }
     }
 
-    /// Drop the agent's chain when its turn worker exits.
+    /// Record the identity the armed attempt starts with (called at turn
+    /// start, once the spawn identity is resolved). A no-op when no worker
+    /// armed a chain.
+    pub(crate) fn note_quota_failover_attempt(
+        &self,
+        agent_id: &AgentId,
+        selection: &str,
+        model: Option<&str>,
+    ) {
+        if let Some(chain) = self.quota_failover_chains.lock().unwrap().get_mut(agent_id) {
+            chain.attempt = Some((
+                provider_profiles::canonical_selection(selection),
+                model.map(str::to_owned),
+            ));
+        }
+    }
+
+    /// The session-open fill of a turn that started on the provider default
+    /// (no stored model) landed `filled` in the `model` column: that is the
+    /// identity the attempt now runs under, so the recorded attempt adopts
+    /// it. Only an attempt recorded with no model is updated, from the value
+    /// the fill itself persisted — never from a re-read of the row, which
+    /// could pick up a user's concurrent change.
+    pub(crate) fn note_quota_failover_filled_model(&self, agent_id: &AgentId, filled: &str) {
+        if let Some(chain) = self.quota_failover_chains.lock().unwrap().get_mut(agent_id) {
+            if let Some((_, model)) = chain.attempt.as_mut() {
+                if model.is_none() {
+                    *model = Some(filled.to_owned());
+                }
+            }
+        }
+    }
+
+    /// The armed chain's tried references, when the session still carries
+    /// the exact identity the failed attempt started with (and, when given,
+    /// the failed step's own provider record agrees). `None` otherwise: no
+    /// armed worker, an unrecorded attempt, or a user switch of provider or
+    /// model since the attempt started.
+    fn chain_for_failed_attempt(
+        &self,
+        agent_id: &AgentId,
+        session: &intent_core::AgentSession,
+        failed_provider: Option<&str>,
+    ) -> Option<(String, Vec<String>)> {
+        let chain = self
+            .quota_failover_chains
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()?;
+        let (selection, model) = chain.attempt?;
+        let current = failed_attempt_selection(session.provider.as_deref(), Some(&selection))?;
+        if let Some(failed) = failed_provider {
+            if provider_profiles::canonical_selection(failed) != current {
+                return None;
+            }
+        }
+        (session.model == model).then_some((current, chain.tried))
+    }
+
+    /// Drop the agent's chain when its turn worker is torn down.
     pub(crate) fn disarm_quota_failover(&self, agent_id: &AgentId) {
         self.quota_failover_chains.lock().unwrap().remove(agent_id);
+        self.quota_failover_replays.lock().unwrap().remove(agent_id);
+    }
+
+    /// Whether the agent's current message is a turn a quota failover cut
+    /// short (see [`QuotaFailoverReplays`]). The mark lives for the whole
+    /// message — so a same-message redrive on the backup (a silent transport
+    /// redrive, a further failover) still continues the turn — and is cleared
+    /// when the worker arms a new message or is torn down.
+    pub(crate) fn quota_failover_replay_pending(&self, agent_id: &AgentId) -> bool {
+        self.quota_failover_replays
+            .lock()
+            .unwrap()
+            .contains(agent_id)
+    }
+
+    /// Whether a quota failure right now would fail over: the agent's turn
+    /// worker armed a chain and an untried backup exists for the session's
+    /// provider. Read-only. The spawn retry loop uses it to skip the
+    /// same-provider retries a spent quota cannot benefit from; with no
+    /// candidate those retries run as before.
+    pub(crate) async fn has_quota_failover_candidate(
+        &self,
+        agent_id: &AgentId,
+        failed_provider: Option<&str>,
+    ) -> bool {
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return false;
+        };
+        let Some((from, tried)) =
+            self.chain_for_failed_attempt(agent_id, &session, failed_provider)
+        else {
+            return false;
+        };
+        let Ok(profiles) = self.provider_profiles.profiles() else {
+            return false;
+        };
+        let settings = self.effective_settings();
+        next_backup(
+            &from,
+            &tried,
+            &profiles,
+            settings.providers.enabled.as_ref(),
+        )
+        .is_some()
     }
 
     /// After a quota failure, switch the agent onto its next backup profile.
-    /// Returns `true` when the switch landed — the caller then swallows the
+    /// `failed_provider` is the configuration the failed attempt actually ran
+    /// on (the committed turn identity, or the spawn attempt's record). When
+    /// the session already names another configuration — the user switched
+    /// while the attempt was in flight — nothing fails over: the user's
+    /// choice is never overwritten. Returns `true` when the switch landed — the caller then swallows the
     /// failed attempt and the worker redrives the same message — and `false`
     /// when the failure must stay terminal (no armed worker, no candidate,
     /// an unreadable session or profile list, or a concurrent provider
@@ -107,15 +243,8 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
+        failed_provider: Option<&str>,
     ) -> bool {
-        if !self
-            .quota_failover_chains
-            .lock()
-            .unwrap()
-            .contains_key(agent_id)
-        {
-            return false;
-        }
         let session = match self.store.get_agent_session(agent_id).await {
             Ok(session) => session,
             Err(e) => {
@@ -123,7 +252,14 @@ impl Services {
                 return false;
             }
         };
-        let Some(from) = session.provider.clone().filter(|p| !p.trim().is_empty()) else {
+        if self
+            .chain_for_failed_attempt(agent_id, &session, failed_provider)
+            .is_none()
+        {
+            tracing::info!(agent = %agent_id, "no armed attempt, or provider/model changed since the failed attempt; quota failover skipped");
+            return false;
+        }
+        let Some(from) = session.provider.clone() else {
             return false;
         };
         let profiles = match self.provider_profiles.profiles() {
@@ -137,9 +273,10 @@ impl Services {
         let from_selection = provider_profiles::canonical_selection(&from);
         let target = {
             let mut chains = self.quota_failover_chains.lock().unwrap();
-            let Some(tried) = chains.get_mut(agent_id) else {
+            let Some(chain) = chains.get_mut(agent_id) else {
                 return false;
             };
+            let tried = &mut chain.tried;
             if !tried.contains(&from_selection) {
                 tried.push(from_selection.clone());
             }
@@ -157,9 +294,17 @@ impl Services {
         let Some(target) = target else {
             return false;
         };
+        let model = session.model.clone().filter(|m| !m.is_empty());
         let landed = match self
             .store
-            .failover_agent_session_provider(workspace_id, agent_id, &from, &target, &now_iso())
+            .failover_agent_session_provider(
+                workspace_id,
+                agent_id,
+                &from,
+                session.model.as_deref(),
+                &target,
+                &now_iso(),
+            )
             .await
         {
             Ok(landed) => landed,
@@ -169,7 +314,7 @@ impl Services {
             }
         };
         if !landed {
-            tracing::info!(agent = %agent_id, "provider changed concurrently; quota failover skipped");
+            tracing::info!(agent = %agent_id, "provider or model changed concurrently; quota failover skipped");
             return false;
         }
         tracing::info!(
@@ -178,7 +323,10 @@ impl Services {
             to_provider = %target,
             "provider quota exhausted; switching to backup profile"
         );
-        let model = session.model.clone().filter(|m| !m.is_empty());
+        self.quota_failover_replays
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
         self.invalidate_agent_list_cache(workspace_id);
         self.publish_agent_mutation_event(
             workspace_id,
@@ -241,6 +389,62 @@ impl Services {
             }
         }
     }
+}
+
+/// Upper bound on the identity notices the `model_changed` suppression reads
+/// back: comfortably above one turn's failover chain (at most one hop per
+/// saved backup, 32 profiles per base).
+pub(crate) const FAILOVER_CHAIN_READ_LIMIT: u32 = 64;
+
+/// Whether `notices` (identity-change rows, newest first) announce the hop
+/// `from` → `to` as one unbroken chain of `provider_failover` rows: the
+/// newest lands on `to`, each row starts where the next-older one landed,
+/// and the oldest in the chain starts at `from`. A turn whose first backup
+/// also failed (A → B → C, last committed turn on A) is announced by its two
+/// rows; any other identity row in between — a manual switch's
+/// `model_changed`, a re-home — breaks the chain, so a genuine change still
+/// gets its own notice.
+pub(crate) fn failover_chain_announces(
+    notices: &[serde_json::Value],
+    from: &str,
+    to: &str,
+) -> bool {
+    let selection = provider_profiles::canonical_selection;
+    let from = selection(from);
+    let mut landing = selection(to);
+    for notice in notices {
+        if notice["type"].as_str() != Some(PROVIDER_FAILOVER_NOTICE_TYPE) {
+            return false;
+        }
+        let (Some(hop_from), Some(hop_to)) = (
+            notice["fromProvider"].as_str(),
+            notice["toProvider"].as_str(),
+        ) else {
+            return false;
+        };
+        if selection(hop_to) != landing {
+            return false;
+        }
+        let hop_from = selection(hop_from);
+        if hop_from == from {
+            return true;
+        }
+        landing = hop_from;
+    }
+    false
+}
+
+/// The canonical selection the quota failure belongs to, when the session
+/// still runs it: `None` when the failed attempt's provider is unknown, the
+/// session has no provider, or the session already names a different
+/// configuration (a concurrent user switch, which always wins).
+fn failed_attempt_selection(
+    session_provider: Option<&str>,
+    failed_provider: Option<&str>,
+) -> Option<String> {
+    let session = session_provider.filter(|p| !p.trim().is_empty())?;
+    let session = provider_profiles::canonical_selection(session);
+    (provider_profiles::canonical_selection(failed_provider?) == session).then_some(session)
 }
 
 /// The notice text: both configurations by readable label, never by

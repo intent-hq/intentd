@@ -565,7 +565,17 @@ async function handlePrompt(id, params) {
     typeof behavior.promptRpcErrorAttempts === 'number' && behavior.promptRpcErrorAttempts > 0
       ? behavior.promptRpcErrorAttempts
       : 0;
-  const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
+  // `exitDuringPromptOnAttempt` exits on exactly that attempt only (e.g. a
+  // transport failure on a later spawn after an earlier attempt failed).
+  const exitOn =
+    typeof behavior.exitDuringPromptOnAttempt === 'number' && behavior.exitDuringPromptOnAttempt > 0
+      ? behavior.exitDuringPromptOnAttempt
+      : 0;
+  const attempt = exitGate > 0 || rpcGate > 0 || exitOn > 0 ? getAndIncrementAttempt() : 0;
+  if (exitOn > 0 && attempt === exitOn) {
+    log(`exiting during prompt (attempt ${attempt} = exitDuringPromptOnAttempt)`);
+    process.exit(1);
+  }
   if (exitGate > 0 && attempt <= exitGate) {
     // Pipe-holding descendant (monorepo#3592): on the LAST gated attempt (the
     // one the daemon classifies as a terminal failure), leave a same-group
@@ -599,6 +609,26 @@ async function handlePrompt(id, params) {
           update: {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: behavior.streamBeforeErrorText },
+          },
+        });
+      }
+      // `toolCallBeforeError` (a command string) runs one completed tool
+      // call before the failure, modelling partial work a mid-turn failure
+      // leaves behind (quota failover must replay it to the next provider).
+      if (typeof behavior.toolCallBeforeError === 'string' && behavior.toolCallBeforeError.length > 0) {
+        const toolCallId = `pre-error-tool-${promptCount}`;
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute',
+            status: 'in_progress', rawInput: { command: behavior.toolCallBeforeError },
+          },
+        });
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+            rawOutput: `ran: ${behavior.toolCallBeforeError}`,
           },
         });
       }

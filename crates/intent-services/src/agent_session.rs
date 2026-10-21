@@ -4876,7 +4876,9 @@ impl Services {
         // can fail over, and the chain is bounded per user turn.
         let quota_failover = prompt_quota_failure
             && prompt_actionable_error.is_none()
-            && self.try_quota_failover(workspace_id, agent_id).await;
+            && self
+                .try_quota_failover(workspace_id, agent_id, prompt_quota_provider.as_deref())
+                .await;
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));

@@ -1096,6 +1096,9 @@ pub struct Services {
     /// [`quota_failover::QuotaFailoverChains`]. Shared across clones so the
     /// turn worker's arm and the failure seam's switch observe the same chain.
     quota_failover_chains: quota_failover::QuotaFailoverChains,
+    /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
+    /// [`quota_failover::QuotaFailoverReplays`].
+    quota_failover_replays: quota_failover::QuotaFailoverReplays,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1771,6 +1774,7 @@ impl Services {
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),

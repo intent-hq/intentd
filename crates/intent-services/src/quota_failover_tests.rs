@@ -134,3 +134,103 @@ fn the_swallowed_attempt_marker_is_prefix_anchored() {
     let mentioned = intent_core::Error::Internal(format!("boom: {PROMPT_QUOTA_FAILOVER_PREFIX}"));
     assert!(!is_quota_failover_error(&mentioned));
 }
+
+#[test]
+fn the_failure_belongs_to_the_configuration_that_ran() {
+    assert_eq!(
+        failed_attempt_selection(Some("claude-code"), Some("claude-code")).as_deref(),
+        Some("claude-code")
+    );
+    assert_eq!(
+        failed_attempt_selection(Some("claude-code@pb1"), Some("claude-code@pb1")).as_deref(),
+        Some("claude-code@pb1")
+    );
+    // The user switched (to a profile, or between profiles) mid-attempt.
+    assert_eq!(
+        failed_attempt_selection(Some("claude-code@pb1"), Some("claude-code")),
+        None
+    );
+    assert_eq!(
+        failed_attempt_selection(Some("claude-code"), Some("claude-code@pb1")),
+        None
+    );
+    // Unattributable failures never fail over.
+    assert_eq!(failed_attempt_selection(Some("claude-code"), None), None);
+    assert_eq!(failed_attempt_selection(None, Some("claude-code")), None);
+}
+
+fn hop(from: &str, to: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "provider_failover", "fromProvider": from, "toProvider": to })
+}
+
+#[test]
+fn a_single_failover_hop_announces_the_switch() {
+    let notices = [hop("claude-code", "claude-code@pb1")];
+    assert!(failover_chain_announces(
+        &notices,
+        "claude-code",
+        "claude-code@pb1"
+    ));
+    assert!(!failover_chain_announces(
+        &notices,
+        "claude-code",
+        "claude-code@pb2"
+    ));
+    assert!(!failover_chain_announces(
+        &notices,
+        "claude-code@pb2",
+        "claude-code@pb1"
+    ));
+}
+
+#[test]
+fn a_multi_hop_chain_in_one_turn_announces_the_whole_switch() {
+    // Committed on Default; pb1's session setup also ran out; pb2 succeeded.
+    let notices = [
+        hop("claude-code@pb1", "claude-code@pb2"),
+        hop("claude-code", "claude-code@pb1"),
+    ];
+    assert!(failover_chain_announces(
+        &notices,
+        "claude-code",
+        "claude-code@pb2"
+    ));
+    // The last hop alone is also a valid (shorter) announcement.
+    assert!(failover_chain_announces(
+        &notices,
+        "claude-code@pb1",
+        "claude-code@pb2"
+    ));
+}
+
+#[test]
+fn any_other_identity_row_breaks_the_chain() {
+    let manual = serde_json::json!({
+        "type": "model_changed", "fromProvider": "claude-code@pb1", "toProvider": "claude-code@pwork",
+    });
+    let notices = [
+        hop("claude-code@pwork", "claude-code@pb2"),
+        manual,
+        hop("claude-code", "claude-code@pb1"),
+    ];
+    assert!(!failover_chain_announces(
+        &notices,
+        "claude-code",
+        "claude-code@pb2"
+    ));
+    // A gap between hops (the chain does not connect) is not an announcement.
+    let gap = [
+        hop("claude-code@pb3", "claude-code@pb2"),
+        hop("claude-code", "claude-code@pb1"),
+    ];
+    assert!(!failover_chain_announces(
+        &gap,
+        "claude-code",
+        "claude-code@pb2"
+    ));
+    assert!(!failover_chain_announces(
+        &[],
+        "claude-code",
+        "claude-code@pb1"
+    ));
+}

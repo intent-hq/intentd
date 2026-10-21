@@ -2671,6 +2671,39 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `limit` identity-change system rows
+    /// (the same row set as [`Store::latest_agent_identity_notice`]),
+    /// newest first. The quota failover suppression walks a chain of
+    /// consecutive `provider_failover` hops back to the last committed turn
+    /// identity (PROTOCOL §5.54). Unparseable metadata rows are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn recent_agent_identity_notices(
+        &self,
+        agent_id: &AgentId,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover') \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(&agent_id.0)
+        .bind(i64::from(limit))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("recent agent identity notices failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .collect())
+    }
+
     /// Metadata of the agent's newest `role: "system"` transcript row that
     /// records a spawn-identity change — a `model_changed`, a
     /// `provider_rehomed` or a `provider_failover` notice — or `None` when
@@ -3217,9 +3250,11 @@ impl Store {
     /// write is what `agent.setModel` with the same model would persist.
     /// Like [`Store::rehome_agent_session_provider`] it may change `provider`
     /// after first real use, and it is a compare-and-set on the `provider`
-    /// column: a concurrent `agent.setModel` that moved the session between
-    /// the caller's read and this write is never overwritten (`Ok(false)`,
-    /// nothing mutated). Scoped to `workspace_id`.
+    /// and `model` columns: a concurrent `agent.setModel` that moved the
+    /// session — to another provider, or to another model on the same one —
+    /// between the caller's read and this write is never overwritten
+    /// (`Ok(false)`, nothing mutated), so the notice and `agent:updated`
+    /// never name a stale model. Scoped to `workspace_id`.
     ///
     /// # Errors
     ///
@@ -3229,6 +3264,7 @@ impl Store {
         workspace_id: &WorkspaceId,
         id: &AgentId,
         expected_provider: &str,
+        expected_model: Option<&str>,
         provider: &str,
         updated_at: &str,
     ) -> Result<bool> {
@@ -3236,19 +3272,21 @@ impl Store {
         let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id == *workspace_id
             && current.provider.as_deref() == Some(expected_provider)
+            && current.model.as_deref() == expected_model
             && expected_provider != provider
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
         let rows = sqlx::query(
             "UPDATE agent_session SET provider=?, updated_at=? \
-             WHERE id=? AND workspace_id=? AND provider=?",
+             WHERE id=? AND workspace_id=? AND provider=? AND model IS ?",
         )
         .bind(provider)
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
         .bind(expected_provider)
+        .bind(expected_model)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?
@@ -14116,6 +14154,7 @@ mod tests {
                 &WorkspaceId("ws-other".to_string()),
                 &agent_id,
                 "claude-code",
+                Some("opus"),
                 "claude-code@pbackup",
                 &now_iso(),
             )
@@ -14128,6 +14167,7 @@ mod tests {
                 &ws_id,
                 &agent_id,
                 "claude-code@pother",
+                Some("opus"),
                 "claude-code@pbackup",
                 &now_iso(),
             )
@@ -14137,12 +14177,30 @@ mod tests {
         let unchanged = store.get_agent_session(&agent_id).await.expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
 
+        // Same provider, but the model moved since the caller's read: no
+        // write, so a notice can never name a stale model.
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("sonnet"),
+                "claude-code@pbackup",
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected model is not an error");
+        assert!(!landed, "compare-and-set covers the model too");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
         let updated_at = now_iso();
         let landed = store
             .failover_agent_session_provider(
                 &ws_id,
                 &agent_id,
                 "claude-code",
+                Some("opus"),
                 "claude-code@pbackup",
                 &updated_at,
             )
@@ -14285,6 +14343,20 @@ mod tests {
             .expect("provider_failover row");
         assert_eq!(latest["type"], "provider_failover");
         assert_eq!(latest["toProvider"], "c");
+
+        let recent = store
+            .recent_agent_identity_notices(&agent_id, 2)
+            .await
+            .expect("read");
+        let types: Vec<_> = recent.iter().map(|m| m["type"].clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                serde_json::json!("provider_failover"),
+                serde_json::json!("model_changed")
+            ],
+            "newest first, bounded, identity rows only"
+        );
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
