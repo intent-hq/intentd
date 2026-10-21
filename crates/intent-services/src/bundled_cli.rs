@@ -156,13 +156,7 @@ pub async fn ensure_in(
     let _file_lock = blocking(move || {
         std::fs::create_dir_all(&lock_parent)
             .map_err(|e| format!("cannot create {}: {e}", lock_parent.display()))?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(lock_parent.join(LOCK))
-            .map_err(|e| format!("cannot open the bundled CLI install lock: {e}"))?;
-        lock_install(file)
+        lock_install(&lock_parent.join(LOCK))
     })
     .await?;
     let (dest, pin) = (destination.clone(), bundled.clone());
@@ -323,22 +317,51 @@ fn activate(
     complete(destination, cli, bundled).ok_or_else(|| format!("{spec} is not usable after install"))
 }
 
-/// Exclusive advisory lock shared with every process using this home;
-/// released when dropped. Windows installs are serialized per daemon only.
+/// Exclusive lock shared with every process using this home (daemons and
+/// standalone doctor runs); released when dropped. Unix uses an advisory
+/// `flock`; Windows holds the lock file open without sharing.
 #[cfg(unix)]
 type InstallLock = nix::fcntl::Flock<std::fs::File>;
 #[cfg(not(unix))]
 type InstallLock = std::fs::File;
 
-fn lock_install(file: std::fs::File) -> Result<InstallLock, String> {
+fn lock_install(path: &Path) -> Result<InstallLock, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
     #[cfg(unix)]
     {
+        let file = options
+            .open(path)
+            .map_err(|e| format!("cannot open the bundled CLI install lock: {e}"))?;
         nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
             .map_err(|(_, errno)| format!("cannot lock the bundled CLI install: {errno}"))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        Ok(file)
+        use std::os::windows::fs::OpenOptionsExt;
+        // ERROR_SHARING_VIOLATION: another process holds the lock. Wait as
+        // long as one install may take, then give up rather than hang.
+        const SHARING_VIOLATION: i32 = 32;
+        options.share_mode(0);
+        let deadline = std::time::Instant::now() + INSTALL_TIMEOUT + VERIFY_TIMEOUT;
+        loop {
+            match options.open(path) {
+                Ok(file) => return Ok(file),
+                Err(e)
+                    if e.raw_os_error() == Some(SHARING_VIOLATION)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(format!("cannot lock the bundled CLI install: {e}")),
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        options
+            .open(path)
+            .map_err(|e| format!("cannot open the bundled CLI install lock: {e}"))
     }
 }
 
