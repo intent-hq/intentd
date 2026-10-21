@@ -611,7 +611,8 @@ jobs:
 
   build:
     # Native macOS Rust validation runs once on the queue's merged tree; main
-    # pushes retain the release build. Windows lives in the push-only
+    # pushes retain the release build. Windows lint lives in the queue-only
+    # `windows-lint` job and the Windows runtime proofs in the push-only
     # `windows` job below. The explicit event allowlist prevents matrix
     # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
@@ -910,7 +911,9 @@ jobs:
     name: Windows post-merge (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     # Runtime proofs + lifecycle proof + release build share one warm target
-    # dir.
+    # dir. Kept at the pre-split budget: on a cold hosted runner these steps
+    # compile the test and release profiles from scratch, which is most of
+    # the time the job used to spend.
     timeout-minutes: 120
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -2149,10 +2152,10 @@ jobs:
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
   # Required context for each event: PRs certify only the lightweight tier.
-  # Queue entries require the Linux/macOS native/runtime/coverage proofs;
-  # push requires the release builds, packaging checks and ALL Windows
-  # validation (auto-cut-alpha.yml reads this push gate on the main tip
-  # before cutting an alpha). Missing/failed results never pass.
+  # Queue entries require the Linux/macOS native/runtime/coverage proofs and
+  # the Windows lint; push requires the release builds, packaging checks and
+  # the Windows runtime validation (auto-cut-alpha.yml reads this push gate
+  # on the main tip before cutting an alpha). Missing/failed results never pass.
   gate:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}

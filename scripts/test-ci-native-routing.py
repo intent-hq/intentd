@@ -280,10 +280,13 @@ def windows_errors(workflow):
             errors.append(f"pi-session-paths: wrong platforms on {event}")
     errors += windows_job_errors(workflow, "windows-lint", "merge_group", WINDOWS_LINT_STEPS)
     errors += windows_job_errors(workflow, "windows", "push", WINDOWS_STEPS)
-    # Moved, not duplicated: main's tree is one the queue just linted.
-    lint = workflow["jobs"].get("windows", {}).get("steps", [])
-    if any(step.get("name") in WINDOWS_LINT_STEPS for step in lint):
-        errors.append("windows: lint steps belong to the queue-only windows-lint job")
+    # Moved, not duplicated: main's tree is one the queue just linted. Match
+    # the cargo subcommand too, so a renamed copy is still caught.
+    for step in workflow["jobs"].get("windows", {}).get("steps", []):
+        run = str(step.get("run", ""))
+        if step.get("name") in WINDOWS_LINT_STEPS or re.search(r"\bcargo\s+(?:\+\S+\s+)?(?:check|clippy)\b", run):
+            errors.append("windows: lint steps belong to the queue-only windows-lint job")
+            break
     return errors
 
 
@@ -920,6 +923,10 @@ class NativeRoutingTests(unittest.TestCase):
             "lint-dropped": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name == 'push'"),
             "lint-duplicated": lambda w: w["jobs"]["windows"]["steps"].insert(
                 0, copy.deepcopy(next(s for s in w["jobs"]["windows-lint"]["steps"] if s.get("name") == "Clippy (target-gated code)"))),
+            "lint-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
+                0, {"name": "Clippy (Windows)", "run": "cargo clippy --workspace --all-targets -- -D warnings"}),
+            "check-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
+                0, {"name": "Typecheck", "run": "rustup run stable cargo check --workspace"}),
             "job-queue": lambda w: w["jobs"]["windows"].__setitem__("if", "github.event_name == 'merge_group' || github.event_name == 'push'"),
             "job-pr": lambda w: w["jobs"]["windows"].__setitem__("if", "github.event_name != 'merge_group'"),
             "installer-queue": lambda w: w["jobs"]["install-ps1"].__setitem__("if", "github.event_name == 'merge_group' || github.event_name == 'push'"),
