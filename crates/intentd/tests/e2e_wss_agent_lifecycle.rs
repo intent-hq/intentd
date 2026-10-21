@@ -12878,11 +12878,17 @@ async fn unsupported_images_become_file_notices_over_wss() {
     }
 }
 
+#[intent_test_macros::daemon_test]
+async fn cross_workspace_unsupported_image_is_retrievable_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::CrossWorkspaceSvg).await;
+}
+
 enum ImagePreparationCase {
     LargePng,
     CorruptPng,
     JpegAlias,
     MimeParameters,
+    CrossWorkspaceSvg,
     Unsupported(&'static str, &'static str, &'static [u8]),
 }
 
@@ -12893,11 +12899,14 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
-    let unsupported = matches!(case, ImagePreparationCase::Unsupported(..));
+    let cross_workspace = matches!(case, ImagePreparationCase::CrossWorkspaceSvg);
+    let unsupported = cross_workspace || matches!(case, ImagePreparationCase::Unsupported(..));
     let corrupt = matches!(case, ImagePreparationCase::CorruptPng);
     let jpeg_alias = matches!(case, ImagePreparationCase::JpegAlias);
     let (format, mime, file_name) = if let ImagePreparationCase::Unsupported(mime, name, _) = case {
         (image::ImageFormat::Png, mime, name)
+    } else if cross_workspace {
+        (image::ImageFormat::Png, "image/svg+xml", "original.svg")
     } else if matches!(case, ImagePreparationCase::MimeParameters) {
         (
             image::ImageFormat::Png,
@@ -12913,10 +12922,10 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // Deterministic high-entropy pixels defeat PNG compression. This fixture
     // exceeds 5 MiB and the 2000-pixel long-edge limit, but its inline base64
     // still fits the existing 8 MiB prompt cap before preparation.
-    let (width, height) = if !matches!(case, ImagePreparationCase::LargePng) {
-        (20, 10)
-    } else {
+    let (width, height) = if matches!(case, ImagePreparationCase::LargePng) {
         (3000, 640)
+    } else {
+        (20, 10)
     };
     let mut state = 0x1234_5678_u32;
     let pixels = image::RgbImage::from_fn(width, height, |_, _| {
@@ -12933,6 +12942,9 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     let mut original = encoded.into_inner();
     if let ImagePreparationCase::Unsupported(_, _, bytes) = case {
         original = bytes.to_vec();
+    } else if cross_workspace {
+        original = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>foreign source</text></svg>"#
+            .to_vec();
     } else if corrupt {
         original.truncate(33); // PNG signature + valid IHDR; no IDAT pixel data.
         assert!(image::load_from_memory(&original).is_err());
@@ -12950,7 +12962,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // The workspace needs a real filesystem root: `file.placeAttachment`
     // lands bytes under `.intent/attachments/` and the reference resolution
     // reads them back from the same root.
-    let ws_id = {
+    let (ws_id, source_ws_id) = {
         use intent_store::Store;
         let store = Store::open(&data_dir.join("intentd.db"))
             .await
@@ -12964,12 +12976,30 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         let mut seed = workspace_seed(&ws);
         seed.worktree_path = Some(root.to_string_lossy().into_owned());
         store.insert_workspace(&seed).await.expect("insert ws");
-        ws.0
+        if cross_workspace {
+            let destination = intent_core::WorkspaceId::new();
+            let root = data_dir.join("receiving-root");
+            std::fs::create_dir_all(&root).expect("mkdir receiving root");
+            let mut seed = workspace_seed(&destination);
+            seed.worktree_path = Some(root.to_string_lossy().into_owned());
+            store
+                .insert_workspace(&seed)
+                .await
+                .expect("insert receiving workspace");
+            (destination.0, ws.0)
+        } else {
+            (ws.0.clone(), ws.0)
+        }
     };
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.jsonl");
-    let behavior = json!({ "response": "seen", "loadSession": corrupt }).to_string();
+    let retrieval_log = data_dir.join("retrievals.jsonl");
+    let mut behavior = json!({ "response": "seen", "loadSession": corrupt });
+    if cross_workspace {
+        behavior["attachmentRetrievalLog"] = json!(retrieval_log);
+    }
+    let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -13008,7 +13038,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         10,
         "file.placeAttachment",
         json!({
-            "workspaceId": &ws_id,
+            "workspaceId": &source_ws_id,
             "fileName": file_name,
             "data": &image_b64,
             "mimeType": mime,
@@ -13032,7 +13062,18 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
         ),
     ];
-    if unsupported {
+    if cross_workspace {
+        inputs = vec![
+            (
+                "ImgRef",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+            (
+                "ImgRefAgain",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+        ];
+    } else if unsupported {
         inputs.push((
             "ImgInlineAgain",
             json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
@@ -13285,7 +13326,29 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
                     .split('.')
                     .next()
                     .expect("id terminator");
-                if name == "ImgRef" {
+                if cross_workspace {
+                    assert_ne!(
+                        id, attachment_id,
+                        "foreign reference gets receiving-workspace identity"
+                    );
+                    if let Some(previous) = &inline_file_id {
+                        assert_eq!(id, previous, "repeat delivery reuses receiving file");
+                    } else {
+                        inline_file_id = Some(id.to_owned());
+                    }
+                    let retrievals: Vec<Value> = std::fs::read_to_string(&retrieval_log)
+                        .expect("actual MCP retrieval log")
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("retrieval JSON"))
+                        .collect();
+                    assert_eq!(retrievals.len(), if name == "ImgRef" { 1 } else { 2 });
+                    let retrieval = retrievals.last().expect("retrieval");
+                    assert_eq!(retrieval["attachmentId"], id);
+                    assert_ne!(
+                        retrieval["result"]["isError"], true,
+                        "receiving agent can retrieve source: {retrieval}"
+                    );
+                } else if name == "ImgRef" {
                     assert_eq!(id, attachment_id);
                 } else if let Some(previous) = &inline_file_id {
                     assert_eq!(
@@ -13405,7 +13468,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         15,
         "file.getAttachmentInfo",
-        json!({ "workspaceId": &ws_id, "attachmentId": &attachment_id }),
+        json!({ "workspaceId": &source_ws_id, "attachmentId": &attachment_id }),
     )
     .await;
     assert_eq!(info["exists"], true);
@@ -13416,7 +13479,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         16,
         "file.readChunk",
-        json!({ "workspaceId": &ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
+        json!({ "workspaceId": &source_ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
     )
     .await;
     assert_eq!(read["size"], json!(original.len()));

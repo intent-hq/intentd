@@ -5918,14 +5918,26 @@ impl AgentManager {
                     .filter(|id| !id.trim().is_empty());
                 let notice = if let Some(id) = reference {
                     let record = self.services.store.get_attachment(id).await?;
-                    attachment_reference_notice(
-                        &record.file_name,
-                        Some(&mime),
-                        u64::try_from(record.size).ok(),
-                        id,
-                    )
+                    if record.workspace_id == *workspace_id {
+                        attachment_reference_notice(
+                            &record.file_name,
+                            Some(&mime),
+                            u64::try_from(record.size).ok(),
+                            id,
+                        )
+                    } else {
+                        // Image references are registry-wide, but getAttachment is
+                        // workspace-scoped. Give the receiver its own retrievable copy.
+                        self.preserve_image_file(
+                            workspace_id,
+                            image,
+                            &mime,
+                            Some(&record.file_name),
+                        )
+                        .await?
+                    }
                 } else {
-                    self.preserve_inline_image(workspace_id, image, &mime)
+                    self.preserve_image_file(workspace_id, image, &mime, None)
                         .await?
                 };
                 blocks.extend(text_prompt(&notice));
@@ -5941,13 +5953,14 @@ impl AgentManager {
         Ok(())
     }
 
-    /// Keep legacy inline unsupported images accessible without feeding them to vision.
-    /// Content-addressed placement also makes queue retries reuse the original file.
-    async fn preserve_inline_image(
+    /// Keep unsupported inline or foreign-reference images accessible to the receiver.
+    /// Content-addressed placement also makes queue retries reuse the source copy.
+    async fn preserve_image_file(
         &self,
         workspace_id: &WorkspaceId,
         image: &Value,
         mime: &str,
+        file_name: Option<&str>,
     ) -> Result<String> {
         use crate::attachment_upload::{attachment_fingerprint, sha256_hex, KeyedPlacement};
         use base64::Engine as _;
@@ -5969,7 +5982,7 @@ impl AgentManager {
             })?;
         let mime = mime.trim().to_ascii_lowercase();
         let extension = intent_core::asset_extension_from_mime(&mime).unwrap_or(".bin");
-        let name = format!("image{extension}");
+        let name = file_name.map_or_else(|| format!("image{extension}"), str::to_owned);
         let digest = sha256_hex(&bytes);
         let fingerprint = attachment_fingerprint(&name, bytes.len() as u64, Some(&digest));
         let key = format!("image-file-{}", sha256_hex(fingerprint.as_bytes()));
