@@ -35,8 +35,9 @@ commands, change credentials, or manage sharing. Host membership retains its exi
 authority. Role downgrades apply to subsequent operations on open connections.
 
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈 without hover tooltips. Click an
-existing reaction to toggle yours. Legacy 🙂 can be removed. Agents can react only
+Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+hover or focus an existing reaction to see who reacted, and click to toggle yours.
+Legacy 🙂 can be removed. Agents can react only
 after explicit addressing in the workspace-wide discussion; reactions never wake
 agents. Private discussions remain human-only. Imported reaction names are historical
 snapshots, not local access.
