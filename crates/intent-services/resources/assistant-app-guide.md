@@ -35,10 +35,11 @@ commands, change credentials, or manage sharing. Host membership retains its exi
 authority. Role downgrades apply to subsequent operations on open connections.
 
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈 and shows a bounded sample of who
-reacted. Legacy 🙂 can be removed. Agents can react only after explicit addressing
-in the workspace-wide discussion; reactions never wake agents. Private discussions
-remain human-only. Imported reaction names are historical snapshots, not local access.
+Labs feature supports reactions 👍 👎 👀 ✅ 🙈 without hover tooltips. Click an
+existing reaction to toggle yours. Legacy 🙂 can be removed. Agents can react only
+after explicit addressing in the workspace-wide discussion; reactions never wake
+agents. Private discussions remain human-only. Imported reaction names are historical
+snapshots, not local access.
 
 <!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
 
