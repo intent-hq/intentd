@@ -278,21 +278,24 @@ PR and its latest status. Required checks that are still running or failing can
 block merging. If monitoring is paused or information is unavailable, wait for a
 fresh status before treating the PR as ready.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts}; packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager}.rs; packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts} (connection-drop demotion); packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager}.rs; packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
 
 When a Claude Code agent starts work in the background, such as a dev server
-command, its conversation lists it under the **Subscribed to N events** header
-(expand the header if collapsed) as **Running**. Expanding the row shows the task
-type and when Intent first saw it. If the row has a **…** menu, **Stop** ends that
+command, its conversation shows a row for it marked **Running**. When the
+conversation has several events, they are grouped under a **Subscribed to N
+events** header that may need expanding. Expanding the row shows the task type
+and when Intent first saw it. If the row has a **…** menu, **Stop** ends that
 task without interrupting the agent; the row shows **Stopping…** and disappears
 once the agent reports it stopped. Rows that end on their own disappear too.
-**Connection lost** means Intent cannot currently confirm the task. If the app
-just reconnected, the row returns to **Running** shortly. Otherwise the agent's
-process has ended and the task with it: an idle agent is closed after
-**Settings → Advanced → Agent backend → Idle reap minutes** (10 by default; Off
-disables it), or sooner under memory pressure. A Connection lost row has no Stop
-and clears the next time the agent starts. Codex and other providers do not
-report background tasks.
+**Connection lost** means Intent cannot currently confirm the task, not that it
+stopped. If the app has lost its connection to Intent, the task may still be
+running and the row returns to **Running** after the app reconnects; wait for
+that fresh status before saying the task ended. If the app is connected and the
+row still shows Connection lost, the agent's process has ended and its tasks
+with it: an idle agent is closed after **Settings → Advanced → Agent backend →
+Idle reap minutes** (10 by default; Off disables it), or sooner under memory
+pressure. Such a row has no Stop and clears the next time the agent starts.
+Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
 
