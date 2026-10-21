@@ -1115,16 +1115,6 @@ pub struct Services {
     /// raising op and the turn worker observe the same map.
     deferred_attention: Arc<Mutex<HashMap<AgentId, Vec<DeferredAttention>>>>,
     attention_mutation_gates: agent_ops::AttentionMutationGates,
-    /// Daemon-raised provider-stall blockers (intent-hq/intent#7182): the
-    /// `(reason, savedAt)` of the blocker the stall watchdog raised on a
-    /// failed turn, keyed by agent. The persisted attention columns do not
-    /// record who raised a blocker, so this marker is what distinguishes a
-    /// daemon stall blocker from an agent's own `ws.agent.reportBlocker`.
-    /// The agent's next successful turn clears the blocker through the
-    /// `resolveBlocker` path only while the pending request still matches the
-    /// recorded generation. In-memory only: after a daemon restart the
-    /// blocker keeps the ordinary clearing rules.
-    daemon_stall_blockers: Arc<Mutex<HashMap<AgentId, (String, String)>>>,
     /// Per-note debouncers for `attribute_lines` recomputes (PROTOCOL §5.2.1,
     /// FE parity with `LineAttributionService.scheduleComputation`). Every
     /// content-changing `note.*` mutation schedules a delayed recompute
@@ -1770,7 +1760,6 @@ impl Services {
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             attention_mutation_gates: agent_ops::AttentionMutationGates::default(),
-            daemon_stall_blockers: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
@@ -32181,6 +32170,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The daemon's provider-stall blocker prefixes are reserved so an
+            // agent-raised request is never mistaken for one and auto-cleared
+            // by a later successful turn (intent-hq/intent#7182).
+            if crate::agent_session::is_daemon_stall_blocker_reason(reason.trim()) {
+                return Err(Error::InvalidParams(
+                    "reason uses a prefix reserved for daemon-raised provider-stall blockers"
+                        .to_string(),
+                ));
+            }
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
                 .await
         })

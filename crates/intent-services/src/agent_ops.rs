@@ -10386,66 +10386,42 @@ impl Services {
         Ok(true)
     }
 
-    /// Raise a daemon-owned provider-stall blocker on `agent_id` through the
-    /// shared [`Self::agent_request_attention_op`] and record its generation
-    /// so the agent's next successful turn can clear it
-    /// ([`Self::clear_daemon_stall_blocker_after_success`],
-    /// intent-hq/intent#7182). Agent-raised blockers are never recorded here.
-    pub(crate) async fn raise_daemon_stall_blocker(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-        reason: String,
-    ) -> Result<()> {
-        let raised = self
-            .agent_request_attention_op(
-                workspace_id.clone(),
-                "blocker".to_string(),
-                reason,
-                Some(agent_id.clone()),
-            )
-            .await?;
-        if let (Some(reason), Some(saved_at)) = (
-            raised.get("reason").and_then(Value::as_str),
-            raised.get("savedAt").and_then(Value::as_str),
-        ) {
-            if let Ok(mut map) = self.daemon_stall_blockers.lock() {
-                map.insert(agent_id.clone(), (reason.to_string(), saved_at.to_string()));
-            }
-        }
-        Ok(())
-    }
-
-    /// Successful-turn hook (intent-hq/intent#7182): when the turn that just
-    /// completed successfully belongs to an agent carrying a daemon-raised
-    /// provider-stall blocker, clear that blocker through the
-    /// `resolveBlocker` path. Only the exact recorded generation is cleared —
-    /// an agent's own later blocker or a discussion stays pending. The marker
-    /// is consumed either way. Best-effort: errors log and the turn proceeds.
+    /// Successful-turn hook (intent-hq/intent#7182): when the agent's
+    /// pending request is a daemon-raised provider-stall blocker — recognised
+    /// by its persisted reason, which starts with a daemon-reserved prefix
+    /// ([`crate::agent_session::is_daemon_stall_blocker_reason`]) — clear
+    /// that exact `(reason, savedAt)` generation through the
+    /// `resolveBlocker` path. Recognition reads the persisted row, so it
+    /// survives a daemon restart. Agent-raised blockers (whose reasons can
+    /// never carry the reserved prefixes) and discussions are untouched, and
+    /// the generation CAS leaves any newer request pending. Best-effort:
+    /// errors log and the turn proceeds.
     pub(crate) async fn clear_daemon_stall_blocker_after_success(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        let marker = match self.daemon_stall_blockers.lock() {
-            Ok(mut map) => map.remove(agent_id),
-            Err(_) => None,
-        };
-        let Some((reason, saved_at)) = marker else {
-            return;
-        };
         let outcome = async {
             let session = self.load_session_internal(agent_id).await?;
-            if session.workspace_id != *workspace_id {
+            if session.workspace_id != *workspace_id
+                || session.attention_request_kind.as_deref() != Some("blocker")
+            {
                 return Ok(false);
             }
+            let Some(reason) = session
+                .attention_request_reason
+                .as_deref()
+                .filter(|reason| crate::agent_session::is_daemon_stall_blocker_reason(reason))
+            else {
+                return Ok(false);
+            };
             let _mutation = self.workspace_mutations.enter(workspace_id)?;
             self.clear_observed_blocker(
                 workspace_id,
                 agent_id,
                 &session,
-                &reason,
-                Some(saved_at.as_str()),
+                reason,
+                session.attention_request_timestamp.as_deref(),
             )
             .await
         };

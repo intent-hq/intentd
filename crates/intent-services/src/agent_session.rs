@@ -1271,6 +1271,26 @@ pub(crate) fn open_tool_call_stall_ms() -> u64 {
     15 * 60 * 1000
 }
 
+/// Reason prefix of the daemon's terminal provider-stall blocker
+/// (intent-hq/intent#5395). Shared by the raise and by
+/// [`is_daemon_stall_blocker_reason`] so the two cannot drift; reserved —
+/// the agent-facing `reportBlocker` / `requestDiscussion` reject it.
+pub(crate) const PROVIDER_STALL_BLOCKER_PREFIX: &str = "Turn ended after a provider stall: ";
+
+/// Reason prefix of the daemon's blocker for a failed unsolicited (harness
+/// wake) provider turn. Shared and reserved like
+/// [`PROVIDER_STALL_BLOCKER_PREFIX`].
+pub(crate) const UNSOLICITED_STALL_BLOCKER_PREFIX: &str = "Unsolicited provider activity stopped: ";
+
+/// Whether a persisted blocker reason is a daemon-raised provider-stall
+/// blocker (intent-hq/intent#7182): prefix-anchored on the reserved daemon
+/// prefixes — the remainder carries per-stall details (durations, tool
+/// label, provider error) so a whole-string match is not possible.
+pub(crate) fn is_daemon_stall_blocker_reason(reason: &str) -> bool {
+    reason.starts_with(PROVIDER_STALL_BLOCKER_PREFIX)
+        || reason.starts_with(UNSOLICITED_STALL_BLOCKER_PREFIX)
+}
+
 /// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
 /// gone this many ms with zero `session/update` traffic AND no recorded tool
 /// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
@@ -4715,7 +4735,7 @@ impl Services {
         {
             let reason = match open_tool_call {
                 Some(label) => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with tool call {label} still open (open-tool terminal threshold \
                      {:?}; error class: provider stall). The tool call never reported completion \
                      and emitted nothing for the whole window, so the turn was failed instead of \
@@ -4724,7 +4744,7 @@ impl Services {
                     Duration::from_millis(open_tool_terminal_ms),
                 ),
                 None => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
                      provider stall). The provider is neither streaming nor running a tool, so the \
                      turn was failed instead of waiting for the idle timeout; the agent is stopping \
@@ -4733,10 +4753,15 @@ impl Services {
                     Duration::from_millis(stall_terminal_ms),
                 ),
             };
-            // Daemon-owned stall blocker: recorded so the agent's next
-            // successful turn clears it (intent-hq/intent#7182).
+            // The reserved reason prefix marks it daemon-raised, so the
+            // agent's next successful turn clears it (intent-hq/intent#7182).
             if let Err(raise_err) = self
-                .raise_daemon_stall_blocker(workspace_id, agent_id, reason)
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    reason,
+                    Some(agent_id.clone()),
+                )
                 .await
             {
                 tracing::warn!(
@@ -5563,11 +5588,17 @@ impl Services {
                 error,
             )
             .await;
-            if let Err(raise_error) = self.raise_daemon_stall_blocker(
-                workspace_id,
-                agent_id,
-                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
-            ).await {
+            if let Err(raise_error) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    format!(
+                        "{UNSOLICITED_STALL_BLOCKER_PREFIX}{error}. Retry the agent to continue."
+                    ),
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
             Some(persisted)
@@ -5595,9 +5626,11 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
-        if failure.is_none() {
+        if failure.is_none() && !empty_response {
             // Successful wake turn: same stall-blocker retirement as the
-            // prompt-turn settlement (intent-hq/intent#7182).
+            // prompt-turn settlement (intent-hq/intent#7182). An empty wake is
+            // not a success — `recover_empty_harness_wake` handles it — so it
+            // leaves the stall blocker pending.
             self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
                 .await;
         }

@@ -7959,8 +7959,8 @@ async fn daemon_stall_blocker_clears_after_later_successful_turn() {
         .unwrap_or_else(|| panic!("agent:idle emitted: {types:?}"));
     assert!(cleared_idx < idle_idx, "cleared before idle: {types:?}");
 
-    // The marker is consumed: a later blocker the agent raises itself is not
-    // cleared by the next successful turn.
+    // A later blocker the agent raises itself is not cleared by the next
+    // successful turn.
     services
         .agent_request_attention_op(
             workspace_id.clone(),
@@ -8026,7 +8026,7 @@ async fn daemon_stall_blocker_survives_later_failed_and_cancelled_turns() {
         "failed/cancelled turns must not clear the stall blocker"
     );
 
-    // The marker survives the failures: the next successful turn clears it.
+    // The blocker survives the failures: the next successful turn clears it.
     run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
         .await
         .expect("the later turn succeeds");
@@ -8113,6 +8113,177 @@ async fn successful_turn_leaves_agent_blockers_and_discussions_pending() {
         0,
         "no attention request was cleared"
     );
+}
+
+/// intent-hq/intent#7182 restart path: the stall blocker is recognised from
+/// its persisted reason, so a blocker raised before a daemon restart is still
+/// cleared by the agent's first successful turn on the restarted daemon.
+#[tokio::test]
+async fn daemon_stall_blocker_clears_after_restart_on_next_successful_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let store = services.store.clone();
+    drop(services);
+    let restarted = Services::new(store).with_event_bus(bus.clone());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    run_follow_up_turn(&restarted, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the follow-up turn succeeds after restart");
+
+    let stored = restarted.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "the persisted stall blocker clears after restart: {:?}",
+        stored.attention_request_reason
+    );
+    let events = drain_events(&mut sub).await;
+    assert_eq!(attention_cleared_events(&events, &agent_id), 1);
+}
+
+/// intent-hq/intent#7182 review: an EMPTY harness wake is not a successful
+/// turn (`recover_empty_harness_wake` treats it as a failed no-op), so it
+/// leaves the stall blocker pending; a non-empty wake then clears it.
+#[tokio::test]
+async fn empty_harness_wake_keeps_stall_blocker_and_nonempty_wake_clears_it() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+    let stall_reason = services
+        .store
+        .get_agent_session(&agent_id)
+        .await
+        .unwrap()
+        .attention_request_reason;
+
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("   "),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    assert!(outcome.empty_response, "whitespace-only wake is empty");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert_eq!(
+        stored.attention_request_reason, stall_reason,
+        "an empty wake must not clear the stall blocker"
+    );
+
+    let (_tx, mut notifications) = mpsc::unbounded_channel();
+    let outcome = services
+        .run_harness_wake_turn(
+            &mut notifications,
+            message_note("back to work"),
+            &agent_id,
+            &workspace_id,
+            Duration::ZERO,
+        )
+        .await;
+    assert!(!outcome.empty_response);
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "a successful wake clears the stall blocker"
+    );
+}
+
+/// intent-hq/intent#7182 review: a clear cancelled mid-flight (here while
+/// waiting on the attention gate) loses nothing — recognition reads the
+/// persisted row, so the next successful turn still clears the blocker.
+#[tokio::test]
+async fn cancelled_stall_blocker_clear_retries_on_next_successful_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    raise_stall_blocker_via_failed_turn(&services, &agent_id, &workspace_id).await;
+
+    let gate = services.attention_mutation_gates.for_agent(&agent_id);
+    let held = gate.lock().await;
+    // fixed-deadline: allow — the clear must still be parked on the held gate when this window ends; its length is the cancellation point under test
+    let cancelled = timeout(
+        Duration::from_millis(100),
+        services.clear_daemon_stall_blocker_after_success(&workspace_id, &agent_id),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the clear was cancelled on the gate");
+    drop(held);
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a cancelled clear leaves the blocker pending"
+    );
+
+    run_follow_up_turn(&services, &agent_id, &workspace_id, connect())
+        .await
+        .expect("the follow-up turn succeeds");
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "the next successful turn clears the blocker after a cancelled clear"
+    );
+}
+
+/// intent-hq/intent#7182: the daemon stall-blocker reason prefixes are
+/// reserved — an agent cannot raise a request that would later be mistaken
+/// for a daemon stall blocker and auto-cleared.
+#[tokio::test]
+async fn agent_raised_attention_rejects_reserved_stall_prefixes() {
+    // The member gate needs a bound caller; the agent tool path binds one.
+    intent_core::with_caller(intent_core::Caller::Daemon, async {
+        use intent_core::WorkspaceApi;
+        let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+        for reason in [
+            format!(
+                "{}spoofed",
+                crate::agent_session::PROVIDER_STALL_BLOCKER_PREFIX
+            ),
+            format!(
+                "{}spoofed",
+                crate::agent_session::UNSOLICITED_STALL_BLOCKER_PREFIX
+            ),
+        ] {
+            let err = services
+                .agent_request_attention(
+                    workspace_id.clone(),
+                    "blocker".into(),
+                    reason.clone(),
+                    Some(agent_id.clone()),
+                )
+                .await
+                .expect_err("reserved prefix rejected");
+            assert!(
+                matches!(err, intent_core::Error::InvalidParams(_)),
+                "{reason}: {err}"
+            );
+        }
+        let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+        assert!(stored.attention_request_kind.is_none());
+        services
+            .agent_request_attention(
+                workspace_id.clone(),
+                "blocker".into(),
+                "an ordinary agent blocker".into(),
+                Some(agent_id.clone()),
+            )
+            .await
+            .expect("ordinary reasons are accepted");
+    })
+    .await;
 }
 
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
