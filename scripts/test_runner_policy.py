@@ -237,7 +237,8 @@ class RunnerPolicy(unittest.TestCase):
             self.assertIn("runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"gh-linux-16x\"]') }}" % job, body[job])
         self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"gh-linux-16x\"]') }}", body['daemon-lifecycle'])
         # An 8-CPU heavy slot (xl busy) runs about twice as long as gh-linux-16x.
-        self.assertIn('    timeout-minutes: 70\n', body['coverage-all'])
+        # Under the merge queue's 60-minute check response timeout.
+        self.assertIn('    timeout-minutes: 55\n', body['coverage-all'])
         self.assertIn('    timeout-minutes: 45\n', body['coverage-e2e'])
         # The sysctl raise only runs where the limit is low (hosted runners); slots have no sudo.
         self.assertIn('if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then', body['coverage-all'])

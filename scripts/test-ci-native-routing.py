@@ -650,7 +650,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
-                    logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
+                    logged = "merge queue: the shared linux_labels mapping stays hosted" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
         # The queue-only coverage suites read their own merge_group slots (the
         # slot hosts raise the inotify limit to 32768).

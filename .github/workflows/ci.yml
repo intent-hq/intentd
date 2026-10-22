@@ -272,7 +272,7 @@ jobs:
             LINUX_LABELS="[\"gh-linux-${LINUX_SIZE}x\"]"
             CHECK_LABELS='["gh-linux-8x"]'
             LINUX_BURST=true
-            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on GitHub-hosted larger runners)"
+            echo "heavy linux routing: burst=true (merge queue: the shared linux_labels mapping stays hosted; listed jobs use their own slots)"
           fi
           {
             echo "linux_labels=$LINUX_LABELS"
@@ -1296,8 +1296,10 @@ jobs:
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-all'] || fromJSON('["gh-linux-16x"]') }}
     # Include LLVM report generation after the full suite on shared runners.
     # ~22 min on gh-linux-16x or the xl slot; an 8-CPU heavy slot (xl busy)
-    # takes about twice that.
-    timeout-minutes: 70
+    # takes about twice that. Stay under the merge queue's 60-minute check
+    # response timeout: CI Gate requires this job, so a later finish ejects
+    # the entry anyway.
+    timeout-minutes: 55
     env:
       # Merge each binary's executions into eight locked raw profiles instead
       # of retaining a multi-megabyte profile for every nextest process.
@@ -1384,7 +1386,7 @@ jobs:
       - name: Verify bounded coverage profile pooling
         run: python3 -I -B scripts/test-coverage-profile-pool.py
       - name: Run combined coverage
-        timeout-minutes: 68
+        timeout-minutes: 53
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
