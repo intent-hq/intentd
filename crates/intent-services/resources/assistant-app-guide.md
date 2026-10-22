@@ -58,7 +58,9 @@ The development preview supplies app typography, compact controls and optional
 drawing styles from the diagrams: neutral surfaces and thin lines that stay thin
 as the drawing resizes. Use HTML labels for readable text in narrow chat columns.
 Playback buttons, sliders and their values share a compact row. Authored styles
-can override the defaults.
+can override the defaults. Figures share the surrounding content gutter; keep
+headings, chart labels, controls and results on common edges, with row values
+aligned at the right.
 
 <!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.2/common.md. -->
 

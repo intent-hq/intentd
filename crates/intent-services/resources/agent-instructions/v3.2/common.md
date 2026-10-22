@@ -138,10 +138,12 @@ Fence raw, self-contained HTML/CSS/JavaScript with `ws-block:html` (not JSON). A
 
 The supporting preview inherits app body typography and provides an optional composition kit:
 
-- `.visual`: vertical content stack; `.visual-controls`: wrapping inline controls; `.visual-field`: label/value row with a full-width control.
-- `.diagram-surface`: quiet neutral figure; `.diagram-node`: soft filled SVG shape; `.diagram-connector`: thin SVG connector; `.diagram-guide`: dashed SVG guide; `.diagram-label`: readable SVG text.
+- `.visual`: vertical content stack; `.visual-controls`: wrapping inline controls; `.visual-field`: label/value row with a full-width control; `.visual-row`: label and end-aligned value with tabular numbers.
+- `.diagram-surface`: quiet neutral figure without an extra inset; `.diagram-node`: soft filled SVG shape; `.diagram-connector`: thin SVG connector; `.diagram-guide`: dashed SVG guide; `.diagram-label`: readable SVG text.
 
 Use the layout and drawing classes before adding custom CSS. Authored styles can override the defaults. Prefer body-sized HTML labels outside SVG so text stays readable when the drawing shrinks. Use short connections, soft rounded shapes and thin strokes; avoid oversized canvases, heavy outlines and redundant captions. Keep the SVG viewBox close to its drawing bounds. Reflow controls and labels on narrow screens without overlap or nested scrolling. The wrapper adds no default heading or caption.
+
+Use one content gutter: align headings, chart labels, plot edges, control groups and summaries to the same left edge; align row values to the same right edge. Use `.visual-row` for label/value pairs instead of unrelated margins or spaces. Avoid adding padding or browser-default figure margins inside a transparent chart. If a distinct panel needs padding, keep its labels, controls and results on the same inner edges. Let long labels wrap while values stay in their column; inspect both edges at narrow widths and after values change.
 
 For playback or scrubbing, put the button, range input and output directly in `.visual-controls`. They share one row, with the value beside the track. Keep Play/Pause button width stable. Use `.visual-field` for fields that need a visible label; give an obvious scene-position slider an `aria-label` instead of a redundant Position heading.
 
@@ -152,7 +154,6 @@ Small starting template for a supporting development frontend; copy its contents
 ```html
 <style>
   .travel-diagram { display: block; width: 100%; height: auto; }
-  .travel-labels { display: flex; justify-content: space-between; gap: var(--space-4); flex-wrap: wrap; }
 </style>
 <div class="visual">
   <div class="diagram-surface">
@@ -161,7 +162,7 @@ Small starting template for a supporting development frontend; copy its contents
       <path id="travel-path" class="diagram-connector" d="M24 44H160" />
       <rect id="travel-node" class="diagram-node" x="148" y="32" width="24" height="24" rx="8" />
     </svg>
-    <div class="travel-labels"><span>Start</span><span>Finish</span></div>
+    <div class="visual-row"><span>Start</span><span>Finish</span></div>
   </div>
   <div class="visual-controls">
     <input id="travel-position" type="range" aria-label="Position" min="0" max="100" value="50">
