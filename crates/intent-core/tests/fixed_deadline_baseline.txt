@@ -139,7 +139,6 @@ crates/intentd/tests/e2e_wss_settings_live_reload.rs 1
 crates/intentd/tests/e2e_wss_shutdown_reaps_provider_tree.rs 1
 crates/intentd/tests/e2e_wss_specialists_changed.rs 2
 crates/intentd/tests/e2e_wss_stall_annotation.rs 1
-crates/intentd/tests/e2e_wss_system_prompt_fallback.rs 1
 crates/intentd/tests/e2e_wss_tilde_paths.rs 1
 crates/intentd/tests/e2e_wss_tool_payload_retention.rs 1
 crates/intentd/tests/e2e_wss_truncation_redrive.rs 1
