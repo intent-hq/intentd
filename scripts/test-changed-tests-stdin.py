@@ -14,9 +14,9 @@ How long the suite takes never decides the result. A loaded runner can make a
 healthy suite take 30 s or more, and an elapsed-time limit then reported a
 false hang (intentd CI run 39627608959). Instead, a marker line is queued in the
 caller's input before the suite starts, and the harness watches the unread byte
-count (FIONREAD, which consumes nothing). If the count drops, a process read the
-caller's input, and the harness fails at once with that cause. Only a suite
-stuck for some other reason reaches the BACKSTOP_SECONDS limit.
+count (FIONREAD, which consumes nothing). If the count drops, a process read
+(or flushed) the caller's input, and the harness fails at once with that cause.
+Only a suite stuck for some other reason reaches the BACKSTOP_SECONDS limit.
 """
 
 import contextlib
@@ -40,9 +40,11 @@ import unittest
 SUITE = Path(__file__).resolve().with_name("test-changed-tests.sh")
 MARKER = b"caller input the suite must not read\n"
 # Only a suite stuck for a reason other than reading its input reaches this;
-# a healthy run never does, however slow the host. It stays well inside the
-# release-scripts job's 15-minute timeout.
-BACKSTOP_SECONDS = 300
+# a healthy run never does, however slow the host (about 30 s per case at
+# worst under 3x CPU oversubscription). Three stuck cases cost about
+# 3 x (120 + 5) s, which leaves the release-scripts job's other steps room
+# inside its 15-minute timeout, so the failure is reported, not cut off.
+BACKSTOP_SECONDS = 120
 POLL_SECONDS = 0.05
 # After the source closes, how long the suite gets to exit on its own.
 GRACE_SECONDS = 5
@@ -100,7 +102,11 @@ def unread(fd):
 
 def describe(returncode):
     if returncode is not None and returncode < 0:
-        return f"was killed by {signal.Signals(-returncode).name}"
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"was killed by {name}"
     return f"exited {returncode}"
 
 
@@ -112,6 +118,8 @@ class Run:
     # input, None while the marker stays queued (or for /dev/null).
     read_input: Optional[str] = None
     backstop: bool = False
+    # A group member outlived the suite's own exit, or the suite did not exit
+    # within the grace period after its source was closed.
     forced_cleanup: bool = False
     group_survived: bool = False
 
@@ -177,25 +185,35 @@ def drive(command, source, env, backstop=BACKSTOP_SECONDS, grace=GRACE_SECONDS):
                 if time.monotonic() >= deadline:
                     run.backstop = True
                     break
-            if process.returncode is not None and was_read():
-                run.read_input = "after exit"
         finally:
-            # Close the source first to unblock a stuck reader (EOF or PTY
-            # hangup) and let parents reap children and remove fixtures.
+            exited = process.returncode is not None
+            if exited:
+                # The suite waits for its own children before it exits, so a
+                # member still in the group now was left running (and may
+                # yet read the caller's input).
+                if group_exists(process.pid):
+                    run.forced_cleanup = True
+                if run.read_input is None and was_read():
+                    run.read_input = "after exit"
+            # Close the source to unblock a stuck reader (EOF or PTY hangup)
+            # and let parents reap children and remove fixtures.
             if writer is not None:
                 writer.close()
             stdin.close()
-            try:
-                process.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                run.forced_cleanup = True
-            if not group_gone(process.pid, grace):
-                run.forced_cleanup = True
+            if not exited:
+                try:
+                    process.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    run.forced_cleanup = True
+            if group_exists(process.pid):
+                # Stragglers, or a member still exiting: either way the group
+                # must go. A member that vanished meanwhile is not an error.
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=grace)
+            # SIGKILL cannot be ignored, so this wait is bounded in practice.
+            process.wait()
         run.returncode = process.returncode
-        run.group_survived = not group_gone(process.pid, grace)
+        run.group_survived = not group_gone(process.pid, GRACE_SECONDS)
         output.seek(0)
         run.log = output.read()
         return run
@@ -225,11 +243,11 @@ class StdinTests(unittest.TestCase):
                 },
             )
             log = run.log
-            self.assertFalse(run.group_survived, "owned process group survived cleanup")
+            when = "then" if run.read_input == "after exit" else "after closing the source"
             self.assertIsNone(
                 run.read_input,
-                f"{source}: a suite process read the caller's input ({run.read_input}); "
-                f"after closing the source the suite {describe(run.returncode)}\n{log}",
+                f"{source}: a suite process read or flushed the caller's input "
+                f"({run.read_input}); {when} the suite {describe(run.returncode)}\n{log}",
             )
             self.assertFalse(
                 run.backstop,
@@ -237,6 +255,7 @@ class StdinTests(unittest.TestCase):
                 f"unread; after closing the source it {describe(run.returncode)}\n{log}",
             )
             self.assertFalse(run.forced_cleanup, "suite needed forced process cleanup\n" + log)
+            self.assertFalse(run.group_survived, "owned process group survived cleanup")
             created = manifest.read_text().splitlines() if manifest.exists() else []
             self.assertTrue(
                 any(Path(path).is_relative_to(fixtures) for path in created),
@@ -297,6 +316,21 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(run.forced_cleanup)
         self.assertFalse(run.group_survived)
         self.assertEqual(describe(run.returncode), "was killed by SIGKILL")
+
+    def test_process_left_running_after_exit_fails(self):
+        # Bash gives a background job /dev/null as stdin, so the late reader
+        # reaches the caller's input through a saved descriptor.
+        for script in ("(sleep 30) & exit 0", "exec 3<&0; (sleep 0.5; read -r line <&3) & exit 0"):
+            with self.subTest(script=script):
+                run = self.stub("pipe", script)
+                self.assertEqual(run.returncode, 0)
+                self.assertTrue(run.forced_cleanup)
+                self.assertFalse(run.group_survived)
+
+    def test_describe_names_signals_outside_the_enum(self):
+        self.assertEqual(describe(-signal.SIGHUP), "was killed by SIGHUP")
+        self.assertEqual(describe(-99), "was killed by signal 99")
+        self.assertEqual(describe(3), "exited 3")
 
 
 if __name__ == "__main__":
