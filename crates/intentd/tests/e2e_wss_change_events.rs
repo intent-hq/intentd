@@ -227,9 +227,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -4441,7 +4444,8 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
     // The re-seeded edge recomputes readiness again, triggered by the new
     // Beta child. Child deletions above may also have emitted recomputes;
     // scan past them to the relations-changed trigger.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,

@@ -8271,8 +8271,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         };
         executable("node", format!("#!/bin/sh\nexec {} \"$@\"\n", quoted(node)));
         executable("claude", format!(
-            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'version\\n' >> {record}\nprintf 'fixture-claude 1.2.3\\n'\n",
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'version\\n' >> {record}\nprintf '%s\\n' '{current}'\n",
             record = quoted(&scratch.join("cli-versions")),
+            current = intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            ),
         ));
         executable("npx", format!(
             "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 3 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = -y ] && [ \"$3\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",

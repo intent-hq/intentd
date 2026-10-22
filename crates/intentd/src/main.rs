@@ -2056,6 +2056,8 @@ async fn cmd_serve_owned(
     // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
     // as the retention sweep) before the store is moved into the services below.
     let idempotency_store = store.clone();
+    // Hold a store handle for the retired note paging cleanup (#7515).
+    let note_paging_cleanup_store = store.clone();
     // Hold a store handle for the graceful close at shutdown.
     let shutdown_store = store.clone();
     // REV-1: build the shared first-client-sticky reverse-dispatch registry
@@ -2577,6 +2579,12 @@ async fn cmd_serve_owned(
             settings_registry.clone(),
         )
     });
+    // Retired note paging cleanup (intent-hq/intent#7515): migration 0164
+    // left the two large paging tables in place so startup stays fast; delete
+    // them in short paced batches once the daemon is up, then drop them.
+    // Resumes on the next start if interrupted. Aborted on clean shutdown.
+    let note_paging_cleanup_task =
+        startup_work.spawn(|| spawn_retired_note_paging_cleanup(note_paging_cleanup_store));
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
     // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
     // per-agent stderr capture files older than 7 days (STAB-53); the first tick
@@ -2617,10 +2625,11 @@ async fn cmd_serve_owned(
     // Arc'd so the watcher registry's `.git` metadata watches feed the same
     // debounced trigger path. Held for the lifetime of `serve` and torn down
     // on return.
-    let git_status_refresher = Arc::new(GitStatusRefresher::start(
+    let git_status_refresher = Arc::new(GitStatusRefresher::start_with_presence(
         bus.clone(),
         api.clone(),
         services.git_status_cache(),
+        services.worktree_presence(),
     ));
     // Slow initializations run in the background so the listeners below bind —
     // and `system.status` answers — without waiting on them (monorepo#1581):
@@ -2648,6 +2657,7 @@ async fn cmd_serve_owned(
             api.clone(),
             Arc::clone(&git_status_refresher),
             watch_health.clone(),
+            services.worktree_presence(),
             watcher_shutdown,
         )
     });
@@ -3233,6 +3243,8 @@ async fn cmd_serve_owned(
     }
     retention_task.abort();
     let _ = retention_task.await;
+    note_paging_cleanup_task.abort();
+    let _ = note_paging_cleanup_task.await;
     idempotency_reap_task.abort();
     let _ = idempotency_reap_task.await;
     let _ = merge_retry_task.await;
@@ -6370,6 +6382,26 @@ fn spawn_stream_retention_loop(
     })
 }
 
+/// Delay before the retired note paging cleanup starts, so it stays clear of
+/// the startup burst of reads and writes.
+const NOTE_PAGING_CLEANUP_START_DELAY: Duration = Duration::from_secs(30);
+
+/// Spawn the one-shot retired note paging cleanup
+/// ([`Store::run_retired_note_paging_cleanup`]): short batches that each hold
+/// the single write connection for about 100 ms at most, with pauses between
+/// them so queued writes run first. Freed pages are released later by the
+/// retention loop's incremental vacuum drain. A no-op once both tables are gone.
+fn spawn_retired_note_paging_cleanup(store: Store) -> tokio::task::JoinHandle<()> {
+    intent_core::spawn_daemon(async move {
+        tokio::time::sleep(NOTE_PAGING_CLEANUP_START_DELAY).await;
+        store
+            .run_retired_note_paging_cleanup(
+                intent_store::note_paging_cleanup::NotePagingCleanupPolicy::default(),
+            )
+            .await;
+    })
+}
+
 /// Log one retention tick's freelist drain: freed pages, chunk pacing, and
 /// the remaining backlog with a ticks-to-drain estimate, so a large
 /// freelist (intent-hq/intent#7448: 15.9 GB) is visible in the daemon log.
@@ -6604,6 +6636,7 @@ fn spawn_watcher_registry_init(
     api: Arc<dyn WorkspaceApi>,
     refresher: Arc<GitStatusRefresher>,
     watch_health: intent_services::WatchHealth,
+    presence: intent_services::worktree_presence::WorktreePresence,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     intent_core::spawn_daemon(async move {
@@ -6629,7 +6662,15 @@ fn spawn_watcher_registry_init(
                     // exercise worker starvation at all.
                     std::thread::sleep(delay);
                 }
-                WatcherRegistry::start_with_health(&hub, bus, api, refresher, &watch_health).await
+                WatcherRegistry::start_with_health(
+                    &hub,
+                    bus,
+                    api,
+                    refresher,
+                    &watch_health,
+                    presence,
+                )
+                .await
             })
         });
         tracing::info!("watcher registry ready");
@@ -8341,30 +8382,40 @@ for line in sys.stdin:
         let start = intent_core::spawn_daemon(async move {
             owner.start(config, true).await;
         });
-        let (control, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (control, _) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let (read, mut write) = control.into_split();
         let mut reader = tokio::io::BufReader::new(read);
         let mut pid = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut pid))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            reader.read_line(&mut pid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let pid: i32 = pid.trim().parse().unwrap();
         let monitor = hub.spawn_health_monitor();
         hub.begin_background_shutdown();
         let mut shutdown = intent_core::spawn_daemon(settle_mcp_background(start, monitor));
+        // fixed-deadline: allow — past the 2s boot-shutdown grace but before mcp_handshake's fixed 10s init timeout reaps the fake child
         let retained = tokio::time::timeout(Duration::from_millis(2200), &mut shutdown)
             .await
             .is_err();
         let _ = write.write_all(b"x").await;
         if retained {
-            tokio::time::timeout(Duration::from_secs(5), shutdown)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                shutdown,
+            )
+            .await
+            .unwrap()
+            .unwrap();
         }
         hub.shutdown().await;
         assert!(
@@ -8442,10 +8493,13 @@ for line in sys.stdin:
             .await
             .unwrap();
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), entering)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            entering,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut settlement = Box::pin(settle_startup_attachment_retention(sweep));
         let pending = poll_fn(|cx| Poll::Ready(settlement.as_mut().poll(cx).is_pending())).await;
         // Always release the physical writer before asserting the regression.
@@ -8994,7 +9048,8 @@ for line in sys.stdin:
                 Ok(child) => {
                     let child = StandInSitter(child);
                     let pid = child.id();
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    let deadline = std::time::Instant::now()
+                        + intentd_test_support::test_timeout(Duration::from_secs(10));
                     while !pid_is_sitter(pid, pid) {
                         assert!(
                             std::time::Instant::now() < deadline,
@@ -10375,10 +10430,13 @@ for line in sys.stdin:
             "the admitted operation is still owned and draining"
         );
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), sweep)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            sweep,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

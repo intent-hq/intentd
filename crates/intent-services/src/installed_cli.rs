@@ -260,10 +260,7 @@ impl InstalledContext {
     }
 
     fn provider_id(&self) -> &'static str {
-        match self.runtime.cli() {
-            InstalledCli::Codex => "codex",
-            InstalledCli::Claude => "claude-code",
-        }
+        self.runtime.cli().provider_id()
     }
 
     pub fn validate_launch_version(&self, version: &str) -> Result<(), String> {

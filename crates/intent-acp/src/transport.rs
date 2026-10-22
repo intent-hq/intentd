@@ -1981,11 +1981,14 @@ mod prompt_transfer_tests {
     }
 
     async fn until(mut predicate: impl FnMut() -> bool) {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !predicate() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(3)),
+            async {
+                while !predicate() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
     }
@@ -2594,7 +2597,8 @@ mod watermark_tests {
         // bumps the response watermark, giving us an ordering fence past
         // line 2; poll briefly for the request lines behind it).
         assert!(conn.await_response_after(0, Duration::from_secs(2)).await);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while conn.client_request_seq() < 2 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2699,7 +2703,11 @@ mod cancel_on_timeout_tests {
         }
         assert_eq!(conn.writer_tx.capacity(), 0, "writer queue wedged full");
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), fut).await;
+        let outcome = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            fut,
+        )
+        .await;
         let err = outcome
             .expect("timed-out call returned within budget")
             .unwrap_err();
@@ -2867,10 +2875,13 @@ mod write_fence_tests {
         let mut buf = [0_u8; 1024];
         // Read until the needle has arrived and the line holding it is complete.
         while !(seen.contains(needle) && seen.ends_with('\n')) {
-            let n = tokio::time::timeout(Duration::from_secs(5), agent.read(&mut buf))
-                .await
-                .expect("agent stdin read timed out")
-                .unwrap();
+            let n = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                agent.read(&mut buf),
+            )
+            .await
+            .expect("agent stdin read timed out")
+            .unwrap();
             assert!(n > 0, "stdin closed before {needle}");
             seen.push_str(&String::from_utf8_lossy(&buf[..n]));
         }

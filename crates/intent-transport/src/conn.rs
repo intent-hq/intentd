@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-mod page_state;
 mod presence_focus;
 pub(crate) mod recovery;
 
@@ -568,24 +567,6 @@ async fn process_captured_frame(
                 };
                 return out_tx.send_priority(frame).await.is_ok();
             }
-        }
-        // Admit opt-in state subscriptions before classifiers clone params/id.
-        if matches!(
-            value["method"].as_str(),
-            Some("note.subscribe" | "comment.subscribe")
-        ) && value["params"]["projection"] == "pageState"
-            && (raw.len() > 65_536 || !page_state::valid_id(value.get("id")))
-        {
-            let id = value.get("id").filter(|id| page_state::valid_id(Some(id)));
-            return send_fast_path_error(
-                events::IdInfo {
-                    present: value.get("id").is_some(),
-                    echo: id.cloned().unwrap_or(Value::Null),
-                },
-                "Invalid pageState subscription",
-                out_tx,
-            )
-            .await;
         }
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
@@ -1649,38 +1630,6 @@ pub(crate) async fn handle_sub_fast_path(
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
-    let sub = match sub {
-        SubFastPath::Subscribe {
-            id,
-            channel,
-            params,
-        } if matches!(channel, Channel::Note | Channel::Comment) => {
-            let kind = if channel == Channel::Note {
-                crate::annotation_subscription::PageStateChannel::Note
-            } else {
-                crate::annotation_subscription::PageStateChannel::Comment
-            };
-            let value = Value::Object(params);
-            match crate::annotation_subscription::parse_page_state_subscription(kind, &value) {
-                Ok(Some(request)) => {
-                    return page_state::subscribe(id, channel, request, api, bus, out_tx, subs)
-                        .await
-                }
-                Ok(None) => {
-                    let Value::Object(params) = value else {
-                        unreachable!()
-                    };
-                    SubFastPath::Subscribe {
-                        id,
-                        channel,
-                        params,
-                    }
-                }
-                Err(message) => return send_fast_path_error(id, &message, out_tx).await,
-            }
-        }
-        other => other,
-    };
     match sub {
         SubFastPath::Subscribe {
             id,
@@ -3113,9 +3062,12 @@ mod tests {
             )
             .await
         );
-        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            writer.entered.notified(),
+        )
+        .await
+        .unwrap();
         limiter.begin_shutdown();
         assert!(
             !process_frame(
@@ -3142,9 +3094,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         writer.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), drained)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drained,
+        )
+        .await
+        .unwrap();
         assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.get_setting("test.admitted").await.unwrap().as_deref(),
@@ -3228,7 +3183,8 @@ mod tests {
             }));
         }
         // Both permits come free while the writer is still stalled.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while limiter.available_permits() != Some(2) {
             assert!(
                 std::time::Instant::now() < deadline,

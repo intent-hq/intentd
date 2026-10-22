@@ -4,6 +4,8 @@
 //! rewrite them. `scripts/test-transfer-selection-contract.sh --regenerate`
 //! is the explicit golden update route; `--output PATH` emits a fresh envelope.
 //! Both require a clean, committed Cargo build. No provider turn is started.
+//! Each case imports into its own copy of one once-migrated destination
+//! database (`migrated_template`), keeping fsyncs out of the connect deadline.
 
 use std::io::{Cursor, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -132,8 +134,55 @@ fn run_imports(root: &Path, contract: &Value, fault: &str) -> Result<Value, Stri
     Ok(read_json(&root.join("cases.json")))
 }
 
-async fn import_case(root: &Path, contract: &Value, case: &Value, fault: &str) -> Value {
-    let store = Store::open(&root.join("store.db")).await.unwrap();
+/// Migrate one destination database for the whole worker run and close it,
+/// leaving a single checkpointed file that every case copies.
+///
+/// Creating a database from nothing commits about six fsyncs inside the write
+/// pool's 10s connect deadline: file creation, the WAL switch and an
+/// `auto_vacuum` header write all land before `synchronous = NORMAL` applies.
+/// Every migration then runs on top of that. Paying both for each case
+/// stalled one case's first connection past the deadline on a shared runner
+/// with a slow disk ("write pool exhausted", cloudlands-fe merge-group run
+/// 39612275470). A copy is still a pristine destination per case (see
+/// `template_copy_matches_a_fresh_destination`). Its connect only
+/// pays the header write, and its `Store::open` applies no migrations.
+async fn migrated_template(dir: &Path) -> PathBuf {
+    let path = dir.join("template.db");
+    let store = Store::open(&path).await.unwrap();
+    // `close` checkpoints with TRUNCATE, so the main file holds every page.
+    // A non-empty WAL would mean copies silently lose committed rows.
+    store.close().await;
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    let wal_len = match std::fs::metadata(&wal) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("cannot inspect template WAL: {error}"),
+    };
+    assert_eq!(
+        wal_len, 0,
+        "template WAL was not checkpointed into the main file"
+    );
+    path
+}
+
+/// A per-case destination database: a copy of the template in `root`.
+fn fresh_destination(template: &Path, root: &Path) -> PathBuf {
+    let path = root.join("store.db");
+    std::fs::copy(template, &path).unwrap();
+    path
+}
+
+async fn import_case(
+    root: &Path,
+    template: &Path,
+    contract: &Value,
+    case: &Value,
+    fault: &str,
+) -> Value {
+    let store = Store::open(&fresh_destination(template, root))
+        .await
+        .unwrap();
     let registry = Arc::new(SettingsRegistry::load(root.join("settings.toml")).unwrap());
     let defaults = &contract["destinationDefaults"];
     let mut enabled = contract["enabledProviders"].clone();
@@ -472,6 +521,116 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
     }
 }
 
+/// Everything a destination database holds: schema, file-level pragmas, and
+/// every row of every table (`quote()` keeps BLOBs exact), sorted.
+///
+/// `Store::open` seeds each new database with a random identity: the local
+/// owner principal (id and creation time, which the seeded `__chief__`
+/// workspace, its membership and authority rows reference) and the time that
+/// membership was added. Copies of one template share those values; two fresh
+/// databases never do. Exactly those values are masked, wherever they appear,
+/// so every other value must still match. A new random seed fails this comparison until it
+/// is listed here. The migration ledger's install times and durations are
+/// left out.
+async fn database_snapshot(store: &Store) -> Value {
+    use sqlx::Row as _;
+    let pool = store.write_pool();
+    let mut identity: Vec<String> = Vec::new();
+    for query in [
+        "SELECT quote(id), quote(created_at), quote(updated_at) FROM principal",
+        // Seeded by a separate statement, so `now` can be a millisecond later.
+        "SELECT quote(added_at), NULL, NULL FROM workspace_member \
+         WHERE workspace_id = '__chief__'",
+    ] {
+        let rows: Vec<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(query).fetch_all(pool).await.unwrap();
+        for (first, second, third) in rows {
+            identity.extend([first, second, third].into_iter().flatten());
+        }
+    }
+    let mut snapshot = serde_json::Map::new();
+    for pragma in ["auto_vacuum", "journal_mode"] {
+        let row = sqlx::query(&format!("PRAGMA {pragma}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let value: String = row
+            .try_get::<String, _>(0)
+            .unwrap_or_else(|_| row.get::<i64, _>(0).to_string());
+        snapshot.insert(pragma.into(), json!(value));
+    }
+    let schema: Vec<(String, String, String, Option<String>)> =
+        sqlx::query_as("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    snapshot.insert("schema".into(), json!(schema));
+    for (kind, table, _, _) in &schema {
+        if kind != "table" {
+            continue;
+        }
+        let columns: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let quoted: Vec<String> = columns
+            .iter()
+            .filter(|(column,)| {
+                table != "_sqlx_migrations"
+                    || !matches!(column.as_str(), "installed_on" | "execution_time")
+            })
+            .map(|(column,)| format!("quote(\"{column}\")"))
+            .collect();
+        let rows: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT {} FROM \"{table}\"",
+            quoted.join(" || '|' || ")
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut rows: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                identity.iter().fold(row.clone(), |row, value| {
+                    row.replace(value, "<per-database>")
+                })
+            })
+            .collect();
+        rows.sort();
+        snapshot.insert(format!("rows:{table}"), json!(rows));
+    }
+    Value::Object(snapshot)
+}
+
+#[tokio::test]
+async fn template_copy_matches_a_fresh_destination() {
+    let scratch = test_tempdir("transfer-selection-template-");
+    let template = migrated_template(scratch.path()).await;
+    let copy_dir = test_tempdir("transfer-selection-copy-");
+    let copied = fresh_destination(&template, copy_dir.path());
+
+    // The copy records every migration, complete and unmodified, before any
+    // Store opens it, so the per-case Store::open does no schema work.
+    let ledger = intent_store::DiagnosticStore::open(&copied).await.unwrap();
+    let status = ledger.migration_status().await.unwrap();
+    ledger.close().await;
+    assert!(status.is_current(), "template copy has pending migrations");
+
+    let fresh_dir = test_tempdir("transfer-selection-fresh-");
+    let fresh = Store::open(&fresh_dir.path().join("store.db"))
+        .await
+        .unwrap();
+    let reused = Store::open(&copied).await.unwrap();
+    assert_eq!(
+        database_snapshot(&reused).await,
+        database_snapshot(&fresh).await,
+        "a template copy must be indistinguishable from a fresh destination"
+    );
+    reused.close().await;
+    fresh.close().await;
+}
+
 #[test]
 fn public_import_matches_contract() {
     if let Some(root) = std::env::var_os("TRANSFER_SELECTION_WORKER") {
@@ -484,10 +643,13 @@ fn public_import_matches_contract() {
             .build()
             .unwrap();
         let cases = runtime.block_on(intent_core::with_caller(Caller::Daemon, async {
+            let template_dir = test_tempdir("transfer-selection-template-");
+            let template = migrated_template(template_dir.path()).await;
             let mut observations = Vec::new();
             for case in contract["cases"].as_array().unwrap() {
                 let temporary = test_tempdir("transfer-selection-case-");
-                observations.push(import_case(temporary.path(), &contract, case, &fault).await);
+                observations
+                    .push(import_case(temporary.path(), &template, &contract, case, &fault).await);
             }
             Value::Array(observations)
         }));

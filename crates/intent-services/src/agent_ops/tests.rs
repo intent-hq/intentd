@@ -9673,7 +9673,10 @@ async fn set_model_bare_model_with_explicit_provider_id() {
     // the test host happens to have npx and the claude CLI.
     crate::test_support::provider_installed::mark_on(&svc, &["claude-code"]);
     #[cfg(unix)]
-    let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    let _cli_env = crate::test_support::installed_cli_env(
+        tmp.path.parent().unwrap(),
+        intent_providers::installed_cli::InstalledCli::Claude,
+    );
     #[cfg(not(unix))]
     let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.

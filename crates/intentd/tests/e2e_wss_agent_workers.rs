@@ -310,8 +310,11 @@ fn write_fake_npx(bin_dir: &Path, report: &Path, script: &str) -> PathBuf {
     std::fs::write(
         &cli,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.cli'\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'claude 1.0.0\\n'\n",
-            report.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}.cli'\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{}'\n",
+            report.display(),
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            )
         ),
     )
     .expect("write canonical Claude CLI");
@@ -379,9 +382,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     for _ in 0..200 {
-        let next = timeout(Duration::from_secs(60), ws.next())
-            .await
-            .expect("worker push timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
+            ws.next(),
+        )
+        .await
+        .expect("worker push timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");

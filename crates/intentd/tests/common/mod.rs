@@ -1254,11 +1254,11 @@ mod tests {
                     caught_panic();
                     ready_tx.send((original, retained, owner)).expect("ready");
                     release_rx
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                         .expect("release");
                 });
                 let (failed_original, failed_retained, failed_owner) = ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .expect("retained");
                 // KEEP_TMP intentionally leaves the original occupied, so name
                 // reuse only applies to the ordinary rename-on-panic policy.

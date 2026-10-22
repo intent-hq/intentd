@@ -18,6 +18,7 @@ fn version_output_never_becomes_an_error_or_account_payload() {
         );
     }
     assert_eq!(
+        // cli-fixture-version: allow — version parsing of a literal --version output
         parse_version(b"codex-cli 0.222.3\n", VersionKind::Runtime).as_deref(),
         Some("0.222.3")
     );
@@ -96,6 +97,7 @@ mod unix {
             executable(
                 &bin.join("codex"),
                 &format!(
+                    // cli-fixture-version: allow — the PATH codex must never run; its version is irrelevant
                     "#!/bin/sh\nprintf ran > '{}'\nprintf 'codex-cli 9.99.9\\n'\n",
                     path_marker.display()
                 ),
@@ -814,6 +816,7 @@ async fn installed_cli_diagnostics_measure_selected_native_entry_with_same_envir
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let cli = root.path().join("codex");
+    // cli-fixture-version: allow — diagnostics report this exact measured version
     std::fs::write(&cli,"#!/bin/sh\n[ \"$CODEX_DIAGNOSTIC_TOKEN\" = test-private-token ] || exit 7\nprintf 'codex-cli 9.8.7\\n'\n").unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let runtime = intent_providers::installed_cli::InstalledCli::Codex

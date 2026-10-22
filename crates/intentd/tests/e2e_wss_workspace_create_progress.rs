@@ -354,7 +354,8 @@ async fn workspace_create_without_progress_id_stays_silent_over_wss() {
 
     // Give any (erroneous) frames a moment to arrive, then assert silence.
     let mut leaked: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

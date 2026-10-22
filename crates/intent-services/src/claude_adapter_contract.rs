@@ -239,7 +239,10 @@ async fn complete(adapter: &Path, prompt: &str, meta: Option<Value>) -> Observed
     // `.mjs` so Node loads the ESM stand-in without relying on module-type
     // detection (absent before Node 22.12).
     let fake = root.join("claude.mjs");
-    std::fs::write(&fake, FAKE_CLI).unwrap();
+    let current = intent_providers::test_support::current_cli_version(
+        intent_providers::installed_cli::InstalledCli::Claude,
+    );
+    std::fs::write(&fake, FAKE_CLI.replace("@CURRENT_CLI_VERSION@", &current)).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let log = root.join("cli.ndjson");
 

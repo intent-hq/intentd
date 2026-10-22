@@ -25,10 +25,8 @@ mod sharing;
 mod workspace_delete;
 
 mod metadata_key_json;
-mod note_annotations;
-mod note_index_profile;
 mod note_line_attribution;
-mod note_pages;
+mod note_paging_removal;
 mod note_search;
 mod pull_request_workspace;
 mod write_acquire_retry;
@@ -4158,7 +4156,7 @@ async fn incremental_vacuum_chunk_reports_freed_and_remaining() {
     // than `try_acquire`; a held connection would block for the full 10 s
     // acquire timeout.
     let reacquired = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
         store.write_pool().acquire(),
     )
     .await;
@@ -7386,9 +7384,6 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     let store = Store {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
-        note_pages: std::sync::Arc::default(),
-        note_index_jobs: std::sync::Arc::default(),
-        note_index_owner: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)

@@ -282,11 +282,14 @@ async fn host_detection_services_over_wss() {
             .await
             .unwrap();
         let err = loop {
-            let next = timeout(Duration::from_secs(15), ws.next())
-                .await
-                .expect("timed out")
-                .unwrap()
-                .unwrap();
+            let next = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                ws.next(),
+            )
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
             if let Message::Text(t) = next {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if v["id"] == json!(2) {
@@ -500,11 +503,14 @@ async fn host_app_detection_services_over_wss() {
             .await
             .unwrap();
         let err = loop {
-            let next = timeout(Duration::from_secs(15), ws.next())
-                .await
-                .expect("timed out")
-                .unwrap()
-                .unwrap();
+            let next = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                ws.next(),
+            )
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
             if let Message::Text(t) = next {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if v["id"] == json!(100) {
@@ -1005,11 +1011,14 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .unwrap();
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("timed out")
+        .unwrap()
+        .unwrap();
         match next {
             Message::Text(t) => {
                 let v: Value = serde_json::from_str(&t).unwrap();
@@ -2714,9 +2723,12 @@ exit 1
         (5, json!({"providerIds":["codex","codex"]}), None),
     ] {
         ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"method":"host.prepareProviderAdapters","params":params}).to_string().into())).await.unwrap();
-        let reply = timeout(Duration::from_secs(5), wss_expect_error(&mut ws, id))
-            .await
-            .expect("ack must not wait for npm");
+        let reply = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            wss_expect_error(&mut ws, id),
+        )
+        .await
+        .expect("ack must not wait for npm");
         if let Some(code) = code {
             assert_eq!(reply["error"]["code"], code);
         } else {
@@ -2730,21 +2742,27 @@ exit 1
         !probe_release.exists(),
         "acknowledgement must precede version probe completion"
     );
-    timeout(Duration::from_secs(10), async {
-        while !probe_started.exists() {
-            // timing-guard: poll the explicitly held version probe
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !probe_started.exists() {
+                // timing-guard: poll the explicitly held version probe
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("version probe started");
     std::fs::write(&probe_release, "go").unwrap();
-    timeout(Duration::from_secs(10), async {
-        while !started.exists() {
-            // timing-guard: poll fake npm's observable start marker
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !started.exists() {
+                // timing-guard: poll fake npm's observable start marker
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("background download started");
     let args = std::fs::read_to_string(&report).unwrap();

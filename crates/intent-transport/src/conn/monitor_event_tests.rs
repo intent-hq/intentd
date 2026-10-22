@@ -88,10 +88,13 @@ impl Document {
                 )
                 .await
             );
-            let frame = tokio::time::timeout(Duration::from_secs(10), self.rx.recv_priority())
-                .await
-                .unwrap()
-                .unwrap();
+            let frame = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                self.rx.recv_priority(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let mut bytes = Vec::new();
             frame.write_uds(&mut bytes).await.unwrap();
             let response: Value = serde_json::from_slice(&bytes).unwrap();
@@ -110,10 +113,13 @@ impl Document {
             .into()
     }
     async fn event(&mut self) -> crate::OutboundFrame {
-        tokio::time::timeout(Duration::from_secs(10), self.rx.bulk.recv())
-            .await
-            .unwrap()
-            .unwrap()
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            self.rx.bulk.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 }
 impl Drop for Document {

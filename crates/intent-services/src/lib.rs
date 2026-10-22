@@ -103,7 +103,6 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
-mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -208,10 +207,8 @@ mod member_removal;
 mod model_catalog;
 mod model_preference;
 mod nested_repos;
-mod note_annotation;
 mod note_merge;
 pub mod note_ops;
-mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -246,6 +243,7 @@ mod script_monitor;
 mod script_ops;
 mod script_output_cleanup;
 mod script_output_store;
+pub mod worktree_presence;
 pub use script_ops::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
@@ -349,8 +347,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, FenceHandle, GitStatusRefresher, InvalidationSubscription, SharedWatchHub,
-    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, SharedWatchHub, Subscription,
+    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -677,6 +675,11 @@ pub struct Services {
     /// generation up front and commits the fallback subject. In-memory only,
     /// shared across clones like the other registries.
     auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
+    /// Workspaces last observed with a missing checkout folder
+    /// (intent-hq/intent#7183). Gates auto-commit and the tracked-changes
+    /// sweep and is shared with the watcher registry's presence probe.
+    /// In-memory only, shared across clones.
+    worktree_presence: worktree_presence::WorktreePresence,
     /// Per-workspace setup-stage state (§6.5 lifecycle) backing
     /// [`WorkspaceApi::workspace_setup_status`]: written at every
     /// `workspace:setup:started` / `workspace:setup:completed` publish site
@@ -714,7 +717,6 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
-    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -1680,6 +1682,7 @@ impl Services {
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            worktree_presence: worktree_presence::WorktreePresence::default(),
             workspace_setup_states: WorkspaceSetupStates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -1692,7 +1695,6 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
-            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -2858,6 +2860,14 @@ impl Services {
     pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));
         self
+    }
+
+    /// The shared missing-checkout map (intent-hq/intent#7183), handed to the
+    /// composition root so the watcher registry's presence probe and the
+    /// auto-commit / sweep gates agree on one transition log.
+    #[must_use]
+    pub fn worktree_presence(&self) -> worktree_presence::WorktreePresence {
+        self.worktree_presence.clone()
     }
 
     /// The shared event-invalidated working-tree status cache (monorepo#1648),
@@ -7021,8 +7031,6 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
-        self.note_deletions.close();
-        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -11298,8 +11306,9 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match plan.persist(store, &note, Some(current_rev), author).await {
+        match persist_note_content(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -11324,8 +11333,11 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes. Callers commit source, its version, orphan flags and anchor readiness
-/// together through the versioned writer; a failure leaves every row unchanged.
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// cannot leave comment rows flagged orphaned while the persisted markdown
+/// still contains the original anchors.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -11403,6 +11415,7 @@ async fn reanchor_note_comments(
     current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
         content: current,
+        note_id: note_id.clone(),
         orphaned,
     })
 }
@@ -11418,30 +11431,34 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 }
 
 /// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
-/// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
+/// ids of root comments whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
+    note_id: NoteId,
+    /// Ids of root comments to flag orphaned (never whole cached rows).
     orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    async fn persist(
-        &self,
-        store: &Store,
-        note: &Note,
-        expected_version: Option<i64>,
-        author: &NoteVersionAuthor,
-    ) -> Result<i64> {
-        store
-            .update_note_with_version_and_orphans(
-                note,
-                expected_version,
-                author,
-                &note.updated_at,
-                &self.orphaned,
-            )
-            .await
-            .map(|(revision, _)| revision)
+    /// Persist the queued orphan flips. Callers **must** run this only after
+    /// the note-content write has succeeded so a note-write failure cannot
+    /// leave comment rows marked orphaned while the persisted markdown still
+    /// contains the original anchors. If a comment update fails after the
+    /// note has been written the anchors on disk are still a valid pointer
+    /// (either intact or scrubbed) and the next mutation's reanchor pass
+    /// will finish the job.
+    ///
+    /// Each flip is a targeted update of the orphan flag and its timestamp,
+    /// never a write-back of the comment row read before the note write: a
+    /// thread resolved in between must stay resolved (intentd#2592 review).
+    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
+        let now = now_iso();
+        for id in self.orphaned {
+            store
+                .mark_comment_orphaned(workspace_id, &self.note_id, &id, &now)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -11566,25 +11583,14 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// A generation ticket binds the computation to its original source and
-    /// prevents an older or superseded job from publishing over newer state.
-    /// Indexed attribution and the compatible legacy snapshot commit together.
+    /// The write is idempotent (upsert), so a race between two computes leaves
+    /// the store consistent with the *latest* one to complete.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
-        let job = self
-            .store
-            .begin_note_attribution(workspace_id, note_id, note.rev)
-            .await?;
-        // Publish the committed pending invalidation without fabricating an
-        // empty legacy attribution result. Existing note listeners can re-read.
-        publish_event_transient(
-            self.event_bus.as_ref(),
-            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
-        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11623,9 +11629,7 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store
-            .publish_note_attribution(&job, &note.content, &data)
-            .await?;
+        self.store.upsert_note_line_attribution(&data).await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -16916,13 +16920,12 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children_and_orphans(
+                .update_note_with_version_and_children(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
-                    &plan.orphaned,
                 )
                 .await
             {
@@ -16936,6 +16939,7 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
+                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -25901,60 +25905,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn note_paging_backend_id(&self) -> Option<String> {
-        Some(self.store.note_paging_backend_id().to_owned())
-    }
-
-    fn get_note_page(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        request: intent_core::note_page::NotePageRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let principal = match intent_core::current_caller() {
-                Some(intent_core::Caller::Wire { principal_id, .. }) => {
-                    format!("principal:{}", principal_id.0)
-                }
-                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
-                Some(intent_core::Caller::Daemon) => "daemon".into(),
-                None => return Err(Error::Forbidden("Caller required".into())),
-            };
-            let result = self
-                .store
-                .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
-                .await;
-            #[cfg(test)]
-            note_annotation::tests::pause_after_read(
-                &workspace_id,
-                note_annotation::tests::read_outcome(&result),
-            )
-            .await;
-            self.require_member(&workspace_id).await?;
-            result
-        })
-    }
-
-    fn get_note_annotation_page(
-        &self,
-        method: intent_core::note_annotation::AnnotationMethod,
-        request: intent_core::note_annotation::AnnotationReadRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_annotation_page(method, request, rpc_id))
-    }
-
-    fn get_note_page_state(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        incarnation: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
-    }
-
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -26108,10 +26058,8 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                if let Some(plan) = &reanchor_plan {
-                    plan.persist(&store, &note, expected_version, &user_version_author())
-                        .await?;
-                }
+                persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await?;
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -26124,6 +26072,9 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
+            if let Some(plan) = reanchor_plan {
+                plan.apply_orphaned(&store, &workspace_id).await?;
+            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -26597,31 +26548,6 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
-    }
-
-    fn supports_note_delete_grace(&self) -> bool {
-        true
-    }
-
-    fn schedule_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteSchedule,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_schedule(request))
-    }
-
-    fn cancel_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteCancel,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_cancel(request))
-    }
-
-    fn note_delete_status(
-        &self,
-        request: intent_core::note_delete::NoteDeleteStatus,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
-        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(
@@ -27230,8 +27156,9 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match plan.persist(&store, &note, Some(read_rev), &author).await {
+                match persist_note_content(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
@@ -32867,17 +32794,21 @@ impl WorkspaceApi for Services {
             &request,
         );
         self.execution_call(async move {
-            match captured?
-                .read(self)
-                .await
-                .map_err(|_| repository_read_source::refused())?
-            {
+            let refused = |refusal| {
+                repository_read_source::refused_at(
+                    "pr.snapshot",
+                    &workspace_id,
+                    request.pr_number,
+                    refusal,
+                )
+            };
+            match captured?.read_staged(self).await.map_err(refused)? {
                 repository_read_source::ReadOutcome::Unsupported => Err(Error::Unsupported(
                     "Addressed review monitoring unavailable".into(),
                 )),
                 repository_read_source::ReadOutcome::Github(repo) => {
                     self.pr_state(
-                        workspace_id,
+                        workspace_id.clone(),
                         request.pr_number,
                         Some(format!("{}/{}", repo.owner, repo.name)),
                     )
@@ -32888,7 +32819,13 @@ impl WorkspaceApi for Services {
                         pr_monitor::qualified_cache::CacheError::Provider(error) => {
                             pr_ops::map_sc_err(error)
                         }
-                        _ => repository_read_source::refused(),
+                        cause => repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            request.pr_number,
+                            repository_read_source::RefusalStage::CacheRead,
+                            &cause,
+                        ),
                     })?;
                     pr_ops::qualified_review_snapshot(&target, &read.value)
                 }
@@ -32918,11 +32855,25 @@ impl WorkspaceApi for Services {
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
                 None => match captured
-                    .ok_or_else(repository_read_source::refused)?
-                    .read(self)
+                    .ok_or_else(|| {
+                        repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            repository_read_source::RefusalStage::Capture,
+                            repository_read_source::RefusalReason::Detail("MissingCapture"),
+                        )
+                    })?
+                    .read_staged(self)
                     .await
-                    .map_err(|_| repository_read_source::refused())?
-                {
+                    .map_err(|refusal| {
+                        repository_read_source::refused_at(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            refusal,
+                        )
+                    })? {
                     repository_read_source::ReadOutcome::Unsupported => {
                         return Err(Error::Unsupported(
                             "Addressed review monitoring unavailable".into(),
@@ -32934,7 +32885,13 @@ impl WorkspaceApi for Services {
                             pr_monitor::qualified_cache::CacheError::Provider(error) => {
                                 pr_ops::map_sc_err(error)
                             }
-                            _ => repository_read_source::refused(),
+                            cause => repository_read_source::refused_with(
+                                "pr.snapshot",
+                                &workspace_id,
+                                pr_number,
+                                repository_read_source::RefusalStage::CacheRead,
+                                &cause,
+                            ),
                         })?;
                         return pr_ops::qualified_review_snapshot(&target, &read.value);
                     }

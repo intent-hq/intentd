@@ -173,9 +173,12 @@ async fn wss_rpc(
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -470,7 +473,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     // Poll agent.get to wait for the agent to complete its turn and reach idle
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while tokio::time::Instant::now() < deadline {
         let agent_result = wss_rpc(
             &mut ws,
@@ -681,7 +685,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     eprintln!("Phase 4: Poll agent status to confirm turn completion");
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while tokio::time::Instant::now() < deadline {
         let agent_result = wss_rpc(
             &mut ws,
@@ -835,17 +840,20 @@ async fn startup_recovery_serves_rpcs_while_sweep_is_held() {
         .await
         .expect("sweep reached gate")
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        let mut ws = fixture.wss().await;
-        let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
-        assert_eq!(
-            pending["agents"],
-            json!([]),
-            "automatic candidates must not flash in the manual recovery dialog"
-        );
-        let workspaces = wss_rpc(&mut ws, 2, "workspace.list", json!({})).await;
-        assert!(workspaces.is_object());
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut ws = fixture.wss().await;
+            let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+            assert_eq!(
+                pending["agents"],
+                json!([]),
+                "automatic candidates must not flash in the manual recovery dialog"
+            );
+            let workspaces = wss_rpc(&mut ws, 2, "workspace.list", json!({})).await;
+            assert!(workspaces.is_object());
+        },
+    )
     .await
     .expect("UDS and authenticated WSS RPCs must finish before releasing recovery");
     assert_eq!(
@@ -975,27 +983,30 @@ async fn startup_recovery_insecure_ws_serves_while_sweep_is_held() {
         .await
         .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        let socket = fixture.root.path().join("intentd.sock");
-        assert!(await_uds(&socket).await);
-        let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
-        let port = status["result"]["port"].as_u64().unwrap();
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let socket = fixture.root.path().join("intentd.sock");
+            assert!(await_uds(&socket).await);
+            let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+            let port = status["result"]["port"].as_u64().unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+                .await
+                .unwrap();
+            ws.send(Message::Text(
+                json!({"jsonrpc":"2.0", "id": 2, "method":"agent.listInterrupted", "params":{}})
+                    .to_string()
+                    .into(),
+            ))
             .await
             .unwrap();
-        ws.send(Message::Text(
-            json!({"jsonrpc":"2.0", "id": 2, "method":"agent.listInterrupted", "params":{}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        let frame = ws.next().await.unwrap().unwrap();
-        let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-        assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["id"], 2);
-        assert_eq!(value["result"]["agents"], json!([]));
-    })
+            let frame = ws.next().await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(value["jsonrpc"], "2.0");
+            assert_eq!(value["id"], 2);
+            assert_eq!(value["result"]["agents"], json!([]));
+        },
+    )
     .await
     .expect("insecure WS and UDS ready before recovery release");
     release.write_u8(1).await.unwrap();
@@ -1032,22 +1043,25 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     )
     .await;
     release.write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let frame = ws.next().await.unwrap().unwrap();
-            if let Message::Text(text) = frame {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                let event = &frame["params"]["event"];
-                if event["type"] == "agent:updated"
-                    && event["data"]["startupRecoveryFailed"] == true
-                {
-                    assert_eq!(event["data"]["agentId"], json!(id));
-                    assert_eq!(event["workspaceId"], json!(workspace));
-                    break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let frame = ws.next().await.unwrap().unwrap();
+                if let Message::Text(text) = frame {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:updated"
+                        && event["data"]["startupRecoveryFailed"] == true
+                    {
+                        assert_eq!(event["data"]["agentId"], json!(id));
+                        assert_eq!(event["workspaceId"], json!(workspace));
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("failed recovery must notify the already connected client");
     let pending = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;

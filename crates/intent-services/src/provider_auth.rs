@@ -1453,11 +1453,16 @@ case "$*" in
   --version)
     [ "$CLAUDE_CODE_EXECUTABLE" = "$0" ] || exit 91
     printf 'version\n' >> "$HOME/cli-calls"
-    printf '2.1.0 (Claude Code)\n' ;;
+    printf '%s\n' '@CURRENT@' ;;
   *) exit 92 ;;
 esac
 "#
-                .to_owned(),
+                .replace(
+                    "@CURRENT@",
+                    &intent_providers::test_support::current_cli_version(
+                        intent_providers::installed_cli::InstalledCli::Claude,
+                    ),
+                ),
             ),
             (
                 "npx",

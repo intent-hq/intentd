@@ -235,9 +235,12 @@ async fn wss_rpc(ws: &mut TlsWs, method: &str, params: Value) -> Value {
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -1286,6 +1289,7 @@ async fn run_deferred_surfacing_scenario(
 
     // Drain everything the subscriber saw so far plus a short live window:
     // none of it may be part of the surfacing bundle.
+    // fixed-deadline: allow — observation window; must end before the mock's fixed DEFER_TAIL_MS hold releases the turn
     let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     while let Some(ev) = wss_event_until(&mut sub, drain_deadline).await {
         assert_not_surfaced_mid_turn(&ev, &agent_id, meta_kind);

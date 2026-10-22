@@ -11,7 +11,6 @@ use std::time::Duration;
 const HISTORY_ROWS: i64 = 1_201;
 const PRESTAGED_ROWS: i64 = 7;
 
-mod annotation_retirement;
 mod review;
 
 async fn seed_history(store: &Store, workspace: &WorkspaceId, name: &str, count: i64) -> AgentId {
@@ -158,12 +157,12 @@ async fn loaded_workspace_delete_releases_writer_during_history_sweep() {
         }
         (observed_progress, observed_session_progress)
     };
-    let (deleted, (observed_progress, observed_session_progress)) =
-        tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::join!(deleting, writing)
-        })
-        .await
-        .expect("delete and writer finish");
+    let (deleted, (observed_progress, observed_session_progress)) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deleting, writing) },
+    )
+    .await
+    .expect("delete and writer finish");
     deleted.expect("workspace delete");
     assert!(
         observed_progress,
@@ -317,7 +316,7 @@ async fn workspace_delete_cancellation_can_retry() {
             tx.commit().await.unwrap();
         }
     };
-    let held = tokio::time::timeout(Duration::from_secs(30), async {
+    let held = tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             held = observe => held,
             result = &mut deleting => panic!("deletion finished without observable progress: {result:?}"),
@@ -552,9 +551,10 @@ async fn workspace_delete_sweeps_heavy_children_before_final_transaction() {
         }
         saw_partial
     };
-    let (deleted, saw_partial) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(deleting, writing)
-    })
+    let (deleted, saw_partial) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deleting, writing) },
+    )
     .await
     .expect("cleanup completes");
     deleted.expect("no heavy final cascade");

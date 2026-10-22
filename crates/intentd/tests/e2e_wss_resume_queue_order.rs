@@ -183,9 +183,12 @@ async fn wss_rpc(
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -550,7 +553,8 @@ async fn await_drained_and_idle(
     ws_id: &str,
     agent_id: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while tokio::time::Instant::now() < deadline {
         let queue = wss_rpc(ws, 30, "agent.getQueue", json!({ "agentId": agent_id })).await;
         let empty = queue["queue"]
