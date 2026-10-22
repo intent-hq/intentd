@@ -9637,17 +9637,24 @@ impl AgentManager {
                     Ok(ws) if ws.archived
                 )
             {
-                return self
-                    .send_message(agent_id, workspace_id, content, message_id, options)
-                    .await;
+                return Box::pin(self.send_message(
+                    agent_id,
+                    workspace_id,
+                    content,
+                    message_id,
+                    options,
+                ))
+                .await;
             }
             self.preempt_busy_turn(&agent_id, &mut options).await;
             // The slot was just released (or was never held): the send path claims
             // it and streams the interrupt message right away rather than queueing.
             // If a concurrent send wins the race the message queues instead — it is
             // still delivered by that worker's drain loop, never dropped.
-            self.send_message(agent_id, workspace_id, content, message_id, options)
-                .await
+            // The send can synchronously drain its append-failure fallback. Keep
+            // its large future out of this interrupt frame so the nested drain
+            // also fits on the default thread stack under coverage instrumentation.
+            Box::pin(self.send_message(agent_id, workspace_id, content, message_id, options)).await
         })
         .await
     }
