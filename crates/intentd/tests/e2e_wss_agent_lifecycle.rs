@@ -247,9 +247,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -275,7 +278,8 @@ async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Valu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     wss_event_opt_until(ws, deadline).await
 }
 
@@ -320,9 +324,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss push timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss push timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -18242,22 +18249,25 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    timeout(Duration::from_secs(secs), async {
-        loop {
-            let frame = wss_push(chat, secs).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| pred(e))
-            {
-                return (entity.clone(), delta);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        async {
+            loop {
+                let frame = wss_push(chat, secs).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| pred(e))
+                {
+                    return (entity.clone(), delta);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("matching chat delta entity arrived in time")
 }

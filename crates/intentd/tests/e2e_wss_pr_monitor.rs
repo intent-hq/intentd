@@ -768,24 +768,27 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 
 /// Assert no `event_type` notification arrives within a short quiet window.
 async fn assert_no_event(ws: &mut TlsWs, event_type: &str) {
-    let quiet = timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v["params"]["event"].clone();
+    let quiet = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "expected no {event_type} event: {quiet:?}");
 }

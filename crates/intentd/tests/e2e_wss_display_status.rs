@@ -524,24 +524,28 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 /// Assert no `workspace:displayStatus-changed` notification arrives within the
 /// window (transition-only emission — no spam on no-op recomputes).
 async fn assert_no_display_status_event(ws: &mut TlsWs) {
-    let res = timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!("workspace:displayStatus-changed")
-                    {
-                        return v["params"]["event"].clone();
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"]
+                                == json!("workspace:displayStatus-changed")
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(res.is_err(), "unexpected displayStatus event: {res:?}");
 }
