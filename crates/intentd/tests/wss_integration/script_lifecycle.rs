@@ -701,7 +701,10 @@ async fn script_changed_full_rows_and_terminal_order_over_wss() {
         )
         .await;
         let removed = script_event_frame(&mut watching, sid, "script:changed").await;
-        assert_eq!(removed["data"], json!({"scriptId":sid,"action":"removed"}));
+        assert_eq!(
+            removed["data"],
+            json!({"scriptId":sid,"action":"removed","purpose":purpose})
+        );
     }
     srv.ws.stop().await;
 }
