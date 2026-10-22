@@ -1410,10 +1410,13 @@ mod tests {
             copy.lock().unwrap().extend_from_slice(bytes);
         }));
         let id = host.spawn(spec).unwrap();
-        tokio::time::timeout(Duration::from_secs(60), host.wait_output_eof(id))
-            .await
-            .expect("reader reached EOF")
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
+            host.wait_output_eof(id),
+        )
+        .await
+        .expect("reader reached EOF")
+        .unwrap();
         assert_eq!(Arc::strong_count(&seen), 1, "sink dropped at EOF");
         let text = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
         let expected = (1..=20000).fold(String::new(), |mut acc, n| {
@@ -1477,7 +1480,7 @@ mod tests {
         let id = host.spawn(spec).unwrap();
 
         // Poll fresh attachments until the reader has captured the history.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         let mut attachment = host.attach(id).unwrap();
         while !contains(&attachment.backlog, b"HIST") {
             assert!(
@@ -1647,7 +1650,7 @@ mod tests {
         let exit = host.wait(id).await.unwrap();
         assert_eq!(exit.exit_code, 0);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while host.slave_held(id) || !host.reader_finished(id) {
             assert!(
                 Instant::now() < deadline,
@@ -1724,10 +1727,13 @@ mod tests {
             Some(&exit),
             "latched: later polls return the same exit"
         );
-        let waited = tokio::time::timeout(Duration::from_secs(5), host.wait(id))
-            .await
-            .expect("wait() settles instead of spinning")
-            .unwrap();
+        let waited = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            host.wait(id),
+        )
+        .await
+        .expect("wait() settles instead of spinning")
+        .unwrap();
         assert_eq!(waited, exit);
 
         host.kill(id).await;

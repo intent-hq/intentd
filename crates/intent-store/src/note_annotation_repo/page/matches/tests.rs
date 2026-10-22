@@ -80,24 +80,30 @@ async fn annotation_actual_dense_preparation_cancellation_and_expiry() {
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while work.load(Ordering::Relaxed) < 10_000 {
-            assert!(
-                !task.is_finished(),
-                "preparation completed before cancellation observation"
-            );
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while work.load(Ordering::Relaxed) < 10_000 {
+                assert!(
+                    !task.is_finished(),
+                    "preparation completed before cancellation observation"
+                );
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     // Cancel the real request after SQLite has started its real matching query.
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    let permit = tokio::time::timeout(Duration::from_secs(10), PREPARATION_SLOT.acquire())
-        .await
-        .unwrap()
-        .unwrap();
+    let permit = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        PREPARATION_SLOT.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         retained(&store, id).await,
         0,

@@ -648,7 +648,11 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             self.entered.notify_one();
             let (lock, cv) = &self.release;
             let (_released, timeout) = cv
-                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| !*v)
+                .wait_timeout_while(
+                    lock.lock().unwrap(),
+                    intentd_test_support::test_timeout(Duration::from_secs(10)),
+                    |v| !*v,
+                )
                 .unwrap();
             assert!(!timeout.timed_out());
             *self.token.lock().unwrap() = Some(token.to_owned());
@@ -680,9 +684,12 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             let new = new.clone();
             async move { store.store_token(&new).await }
         });
-        tokio::time::timeout(Duration::from_secs(5), backing.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            backing.entered.notified(),
+        )
+        .await
+        .unwrap();
         if cancel {
             writer.abort();
             assert!(writer.await.unwrap_err().is_cancelled());
@@ -825,9 +832,12 @@ async fn exercise_writer_ready_after_wait(elapsed: Duration, expired: bool) {
     };
     // A wrongly admitted blocking write owns the lock until publication. Wait
     // for that precise boundary before inspecting its effects, without sleeps.
-    let idle = timeout(Duration::from_secs(5), store.admission.write())
-        .await
-        .unwrap();
+    let idle = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        store.admission.write(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         backing.writes.load(Ordering::SeqCst),
         usize::from(!expired),

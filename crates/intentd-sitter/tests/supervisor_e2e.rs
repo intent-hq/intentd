@@ -3744,7 +3744,7 @@ fn background_call(dir: &Path, base_url: &str, args: &[&str]) -> std::process::O
         .stderr(Stdio::piped());
     let mut child = spawn_guarded(&mut cmd);
     assert!(child
-        .wait_with_timeout(Duration::from_secs(15))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
         .unwrap()
         .is_some());
     child.disarm().wait_with_output().unwrap()
@@ -3786,7 +3786,7 @@ fn background_start_stop_during_update_or_backoff_confirms_supervisor_exit() {
             assert!(out.status.success(), "{out:?}");
             assert!(
                 owner
-                    .wait_with_timeout(Duration::from_secs(1))
+                    .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(1)))
                     .unwrap()
                     .expect("stop must wait for supervisor exit")
                     .success(),
@@ -3837,7 +3837,7 @@ esac
             .unwrap();
         let out = background_call(dir.path(), &base, &["stop"]);
         assert!(out.status.success(), "{out:?}");
-        assert!(owner.wait_with_timeout(Duration::from_secs(1)).unwrap().unwrap().success(),
+        assert!(owner.wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(1))).unwrap().unwrap().success(),
             "private stop must prevent restart-on-failure after forced cleanup (starting={starting})");
         assert!(
             !alive(daemon_pid),
@@ -3892,7 +3892,7 @@ esac
     // cleans the intentionally surviving daemon when this scope ends.
     send_signal(&owner, "KILL");
     let status = stop
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap();
     assert!(
@@ -3912,7 +3912,7 @@ fn serve_stop_eof(
     finished: &std::sync::mpsc::Receiver<()>,
 ) -> bool {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -4135,7 +4135,7 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
         .env(KILL_TIMEOUT_ENV, "200");
     let mut child = spawn_guarded(&mut cmd);
     assert!(!child
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
@@ -4160,7 +4160,7 @@ fn background_start_timeout_cancels_a_stalled_initial_update() {
         .env(KILL_TIMEOUT_ENV, "100");
     let mut child = spawn_guarded(&mut cmd);
     assert!(!child
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -4206,7 +4206,7 @@ fn restart_clean_stopped_instance_and_start_with_foreground_owner() {
         .status
         .success());
     assert!(foreground
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -4232,7 +4232,7 @@ fn start_and_restart_do_not_duplicate_an_unsupervised_daemon() {
     }
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(daemon
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -4300,7 +4300,7 @@ fn supervisor_death_during_startup(ready: bool) {
     }
     caller.signal(Signal::SIGCONT).unwrap();
     let status = caller
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap();
     wait_until("owned orphan termination", Duration::from_secs(1), || {
@@ -4403,7 +4403,7 @@ fn live_indexing_deadline_case(detached: bool, terminal: &str) {
             fs::write(dir.path().join(terminal), "stop answering starting").unwrap();
         }
         let exit = child
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4430,7 +4430,7 @@ fn live_indexing_deadline_case(detached: bool, terminal: &str) {
     fs::write(dir.path().join("release-indexing"), "ready").unwrap();
     if detached {
         assert!(child
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap()
             .success());
@@ -4481,7 +4481,7 @@ fn stop_during_probe_case(contended: bool) {
         )
         .unwrap();
         assert!(first
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap()
             .success());
@@ -4499,14 +4499,14 @@ fn stop_during_probe_case(contended: bool) {
         .success());
     if contended {
         assert!(!first
-            .wait_with_timeout(Duration::from_secs(5))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .unwrap()
             .unwrap()
             .success());
     }
     fs::write(dir.path().join("probe-release"), "resume after stop").unwrap();
     assert!(!second
-        .wait_with_timeout(Duration::from_secs(7))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(7)))
         .unwrap()
         .unwrap()
         .success());
@@ -4533,7 +4533,7 @@ fn live_indexing_concurrent_start_without_status_is_bounded() {
         .env(intentd_sitter::readiness::TIMEOUT_ENV, "800");
     let mut child = spawn_guarded(&mut command);
     assert!(!child
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -4588,7 +4588,7 @@ fn live_indexing_concurrent_start_waits_for_owner_and_real_readiness() {
         for caller in [&mut first, &mut second] {
             assert_eq!(
                 caller
-                    .wait_with_timeout(Duration::from_secs(5))
+                    .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .unwrap()
                     .unwrap()
                     .success(),
@@ -4670,7 +4670,7 @@ fn live_indexing_existing_unsupervised_owner_is_never_replaced_or_stopped() {
     );
     fs::write(dir.path().join("lost"), "disconnected").unwrap();
     assert!(!caller
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .unwrap()
         .success());
@@ -4680,7 +4680,7 @@ fn live_indexing_existing_unsupervised_owner_is_never_replaced_or_stopped() {
     );
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(daemon
-        .wait_with_timeout(Duration::from_secs(5))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         .unwrap()
         .is_some());
 }

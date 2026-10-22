@@ -459,13 +459,17 @@ mod retirement_tests {
             transferring.with_current(|| {
                 entered_tx.send(()).unwrap();
                 release_rx
-                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(
+                        std::time::Duration::from_secs(5),
+                    ))
                     .unwrap();
                 42
             })
         });
         entered_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
             .unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -476,9 +480,12 @@ mod retirement_tests {
             done_tx.send(()).unwrap();
         });
         started_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
             .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(1));
         while !leaf.retired.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
@@ -532,13 +539,17 @@ mod retirement_tests {
                 transferring.with_current(|| {
                     entered_tx.send(()).unwrap();
                     release_rx
-                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(5),
+                        ))
                         .unwrap();
                     42
                 })
             });
             entered_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(intentd_test_support::test_timeout(
+                    std::time::Duration::from_secs(5),
+                ))
                 .unwrap();
             let retiring = generation.clone();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -550,7 +561,8 @@ mod retirement_tests {
                 }
                 done_tx.send(()).unwrap();
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let deadline = std::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(1));
             while original.is_current() && std::time::Instant::now() < deadline {
                 std::thread::yield_now();
             }

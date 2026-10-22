@@ -28,6 +28,7 @@ tower = { version = "0.5", features = ["util", "retry"] }
 tower-http = { version = "0.6", features = ["follow-redirect"] }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 tempfile = "3"

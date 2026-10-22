@@ -836,10 +836,13 @@ mod tests {
         .await;
         drop(owner);
         release.send(()).unwrap();
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(1), completion)
-            .await
-            .unwrap()
-            .unwrap();
+        let observed = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            completion,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(observed, Some(wire(false)));
         assert_eq!(current_caller(), None);
     }
