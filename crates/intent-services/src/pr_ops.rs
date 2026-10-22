@@ -1283,9 +1283,9 @@ impl ChecksStartEvidence {
 }
 
 /// Whether CI never started on the PR head: the PR is open and ready (a
-/// draft may legitimately run nothing until `ready_for_review`) with no
-/// merge conflicts (GitHub starts no `pull_request` workflow on a
-/// conflicting head), its checks were freshly observed and number zero, the base
+/// draft may legitimately run nothing until `ready_for_review`) and KNOWN
+/// to be conflict-free (GitHub starts no `pull_request` workflow on a
+/// conflicting head, and an unknown verdict may be hiding one), its checks were freshly observed and number zero, the base
 /// branch requires status checks, and [`CHECKS_NOT_STARTED_AFTER`] has
 /// passed since the head's commit time. Every unknown input — no commit
 /// time, unreadable rules, unobserved checks — yields `None`: absence means
@@ -1296,8 +1296,18 @@ pub(crate) fn checks_not_started(
     evidence: &ChecksStartEvidence,
     now: OffsetDateTime,
 ) -> Option<ChecksNotStarted> {
+    // Positive conflict-free evidence: `has_conflicts == false` alone also
+    // holds while GitHub recomputes mergeability (`mergeable: None`,
+    // `mergeStateStatus: UNKNOWN`) — and conflicts are themselves a reason
+    // `pull_request` CI never starts.
+    let conflict_free = requirements.mergeable == Some(true)
+        && !requirements.has_conflicts
+        && requirements
+            .merge_state_status
+            .as_deref()
+            .is_none_or(|s| !s.eq_ignore_ascii_case("UNKNOWN") && !s.eq_ignore_ascii_case("DIRTY"));
     if requirements.state != "open"
-        || requirements.has_conflicts
+        || !conflict_free
         || !checks_observed
         || requirements.checks.total != 0
         || !evidence.checks_required
@@ -3675,6 +3685,32 @@ mod tests {
             ..evidence.clone()
         };
         assert_eq!(flag(&base, true, &headless), None);
+    }
+
+    #[test]
+    fn checks_not_started_requires_known_conflict_free_mergeability() {
+        let (base, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let flag = |req: &MergeRequirements| checks_not_started(req, true, &evidence, stall_now());
+        assert!(flag(&base).is_some(), "control: mergeable, BLOCKED-free");
+        // GitHub recomputing: no verdict yet, or an UNKNOWN merge state.
+        let mut recomputing = base.clone();
+        recomputing.mergeable = None;
+        assert_eq!(flag(&recomputing), None);
+        let mut unknown_state = base.clone();
+        unknown_state.merge_state_status = Some("UNKNOWN".into());
+        assert_eq!(flag(&unknown_state), None);
+        // Contradictory inputs never read as conflict-free.
+        let mut not_mergeable = base.clone();
+        not_mergeable.mergeable = Some(false);
+        assert_eq!(flag(&not_mergeable), None);
+        let mut dirty_but_mergeable = base.clone();
+        dirty_but_mergeable.merge_state_status = Some("DIRTY".into());
+        assert_eq!(flag(&dirty_but_mergeable), None);
+        // A known BLOCKED (waiting on the missing required checks) is the
+        // intentd#2531 shape and still flags.
+        let mut blocked = base.clone();
+        blocked.merge_state_status = Some("BLOCKED".into());
+        assert!(flag(&blocked).is_some());
     }
 
     #[test]

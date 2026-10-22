@@ -1091,7 +1091,10 @@ impl Harness for V1 {
             let flagged_before = o
                 .checks_not_started
                 .as_ref()
-                .is_some_and(|s| s.head_sha == stall.head_sha);
+                .is_some_and(|s| s.head_sha == stall.head_sha)
+                || [old, new].iter().any(|s| {
+                    s.checks_not_started_delivered.as_deref() == Some(stall.head_sha.as_str())
+                });
             if !flagged_before {
                 let short: String = stall.head_sha.chars().take(8).collect();
                 changes.push(format!(

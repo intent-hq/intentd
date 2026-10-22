@@ -483,6 +483,14 @@ pub(crate) struct PrMonitorSnapshot {
     /// participates in the change diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// The head whose never-started-CI wake was already DELIVERED: stamped
+    /// on the snapshot that becomes the emit baseline and carried forward on
+    /// the same head, so a degraded read that clears the flag (and an
+    /// unrelated wake that moves the baseline meanwhile) never re-arms a
+    /// second stall wake for that head. Internal persisted bookkeeping only;
+    /// never part of the public projection or the change diff on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_not_started_delivered: Option<String>,
 }
 
 impl PrMonitorSnapshot {
@@ -667,11 +675,21 @@ impl SharedPrSnapshot {
             status_checks: Some(status_checks),
             required_check_names,
             observed_at: None,
+            checks_not_started_delivered: same_head
+                .and_then(|p| p.checks_not_started_delivered.clone()),
         }
     }
 }
 
 impl SharedPrSnapshot {
+    /// Whether this read could feed the never-started-CI flag: zero checks
+    /// on a base branch that requires them. Check runs do not bump the PR's
+    /// `updatedAt`, so reusing such an entry could let a cached empty list
+    /// override CI that has since started — every poll re-reads instead.
+    fn awaits_first_check(&self) -> bool {
+        self.checks_start.checks_required && self.requirements.checks.total == 0
+    }
+
     /// Whether every read behind this snapshot answered — the precondition
     /// for a later poll to REUSE it instead of re-fetching: a degraded
     /// comment count, merge-requirements probe or any other checklist
@@ -828,6 +846,7 @@ impl PrCacheEntry {
             && self.snapshot.is_complete()
             && self.cheap_polls < PR_MONITOR_MAX_CHEAP_POLLS
             && now.saturating_duration_since(self.fetched_at) < PR_MONITOR_MAX_CHEAP_AGE
+            && !self.snapshot.awaits_first_check()
     }
 }
 
@@ -4036,6 +4055,21 @@ impl Services {
         let changes = actionable_pending_changes(monitor);
         let message = render_change_wake(monitor, &changes, &snapshot);
         let now = now_iso();
+        // A delivered never-started-CI flag is remembered for its head, so a
+        // later degraded read cannot re-arm the same stall wake.
+        let delivered_snapshot = snapshot
+            .requirements
+            .checks_not_started
+            .as_ref()
+            .filter(|stall| {
+                snapshot.checks_not_started_delivered.as_deref() != Some(stall.head_sha.as_str())
+            })
+            .map(|stall| {
+                let mut stamped = snapshot.clone();
+                stamped.checks_not_started_delivered = Some(stall.head_sha.clone());
+                serde_json::to_string(&stamped).expect("serialize snapshot")
+            })
+            .or_else(|| monitor.last_snapshot.clone());
         // The delivered snapshot becomes the new emit baseline: the next
         // wake reports only what moves from here.
         if !self
@@ -4043,8 +4077,8 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 PrMonitorPollUpdate {
-                    last_snapshot: monitor.last_snapshot.as_deref(),
-                    baseline_snapshot: monitor.last_snapshot.as_deref(),
+                    last_snapshot: delivered_snapshot.as_deref(),
+                    baseline_snapshot: delivered_snapshot.as_deref(),
                     pending_changes: &[],
                     last_polled_at: monitor.last_polled_at.as_deref(),
                     updated_at: &now,
@@ -4059,7 +4093,8 @@ impl Services {
         #[cfg(test)]
         self.hold_periodic_commit("monitor").await;
         let mut emitted = monitor.clone();
-        emitted.baseline_snapshot = monitor.last_snapshot.clone();
+        emitted.last_snapshot.clone_from(&delivered_snapshot);
+        emitted.baseline_snapshot = delivered_snapshot;
         emitted.pending_changes = Vec::new();
         emitted.pending_since = None;
         emitted.last_change_at = None;
@@ -5883,6 +5918,7 @@ mod tests {
             status_checks: Some(Vec::new()),
             required_check_names: None,
             observed_at: None,
+            checks_not_started_delivered: None,
         };
         f(&mut s);
         s
@@ -6558,6 +6594,95 @@ mod tests {
         assert!(no_ci_lines(&previous_head, &first).is_empty());
         let registration = read.materialize_at(None, no_ci_now());
         assert_eq!(registration.requirements.checks_not_started, None);
+    }
+
+    #[test]
+    fn delivered_stall_wake_survives_a_degraded_read_and_an_unrelated_wake() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        let mut flagged = read.materialize_at(Some(&seen), no_ci_now());
+        assert_eq!(no_ci_lines(&seen, &flagged).len(), 1);
+        // Delivered: the emit stamps the head on the new baseline.
+        flagged.checks_not_started_delivered = Some(NO_CI_HEAD.into());
+        // A degraded rules read clears the flag; the marker rides along.
+        let mut degraded = read.clone();
+        degraded.checks_start.checks_required = false;
+        let mut cleared = degraded.materialize_at(Some(&flagged), no_ci_now());
+        assert_eq!(cleared.requirements.checks_not_started, None);
+        assert_eq!(
+            cleared.checks_not_started_delivered.as_deref(),
+            Some(NO_CI_HEAD)
+        );
+        // An unrelated change is delivered meanwhile: the flagless snapshot
+        // becomes the emit baseline.
+        cleared.conversation_count += 1;
+        let baseline = cleared.clone();
+        // The read recovers on the same head: no second stall wake.
+        let recovered = read.materialize_at(Some(&baseline), no_ci_now());
+        assert!(recovered.requirements.checks_not_started.is_some());
+        assert!(no_ci_lines(&baseline, &recovered).is_empty());
+        // A new head starts clean: the marker never carries across heads.
+        let other = zero_run_read(
+            "9d1f000000000000000000000000000000000000",
+            "2026-10-21T03:00:00Z",
+        )
+        .materialize_at(Some(&recovered), no_ci_now());
+        assert_eq!(other.checks_not_started_delivered, None);
+    }
+
+    #[test]
+    fn an_undelivered_stall_is_not_lost_to_a_degraded_read_and_an_unrelated_wake() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        // Flagged, but the debounce window has not delivered it yet.
+        let flagged = read.materialize_at(Some(&seen), no_ci_now());
+        assert!(flagged.requirements.checks_not_started.is_some());
+        // A degraded read clears it before delivery; an unrelated wake then
+        // delivers the flagless snapshot (nothing stamps a marker).
+        let mut degraded = read.clone();
+        degraded.checks_start.checks_required = false;
+        let mut baseline = degraded.materialize_at(Some(&flagged), no_ci_now());
+        baseline.conversation_count += 1;
+        assert_eq!(baseline.checks_not_started_delivered, None);
+        // Recovery still reports the stall once.
+        let recovered = read.materialize_at(Some(&baseline), no_ci_now());
+        assert_eq!(no_ci_lines(&baseline, &recovered).len(), 1);
+    }
+
+    #[test]
+    fn a_cached_empty_check_list_is_never_reused_while_ci_is_required() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let mut pr = intent_sourcecontrol::PullRequest {
+            number: 42,
+            url: read.url.clone(),
+            title: read.title.clone(),
+            body: None,
+            state: intent_sourcecontrol::PrState::Open,
+            draft: false,
+            source_branch: "feat".into(),
+            target_branch: "main".into(),
+            author: "a".into(),
+            mergeable: Some(true),
+            mergeable_state: Some("blocked".into()),
+            head_sha: Some(NO_CI_HEAD.into()),
+            created_at: String::new(),
+            updated_at: "2026-10-21T03:59:00Z".into(),
+        };
+        let now = Instant::now();
+        let fingerprint = PrFingerprint::of(&pr, None);
+        // Zero checks on a base that requires them: always a full re-read,
+        // so CI that started without bumping `updatedAt` is seen.
+        let entry = PrCacheEntry::new(pr.clone(), read.clone(), now);
+        assert!(!entry.reusable(&fingerprint, now));
+        // Control: the same entry is reusable once CI is not required...
+        let mut no_ci = read.clone();
+        no_ci.checks_start.checks_required = false;
+        assert!(PrCacheEntry::new(pr.clone(), no_ci, now).reusable(&fingerprint, now));
+        // ...or once the head has a check.
+        let mut with_run = read;
+        with_run.requirements = snapshot(|_| {}).requirements;
+        pr.head_sha = Some(NO_CI_HEAD.into());
+        assert!(PrCacheEntry::new(pr, with_run, now).reusable(&fingerprint, now));
     }
 
     #[test]
