@@ -2056,6 +2056,8 @@ async fn cmd_serve_owned(
     // Hold a store handle for the §5.4 idempotency reaper (same lifecycle root
     // as the retention sweep) before the store is moved into the services below.
     let idempotency_store = store.clone();
+    // Hold a store handle for the retired note paging cleanup (#7515).
+    let note_paging_cleanup_store = store.clone();
     // Hold a store handle for the graceful close at shutdown.
     let shutdown_store = store.clone();
     // REV-1: build the shared first-client-sticky reverse-dispatch registry
@@ -2577,6 +2579,12 @@ async fn cmd_serve_owned(
             settings_registry.clone(),
         )
     });
+    // Retired note paging cleanup (intent-hq/intent#7515): migration 0164
+    // left the two large paging tables in place so startup stays fast; delete
+    // them in short paced batches once the daemon is up, then drop them.
+    // Resumes on the next start if interrupted. Aborted on clean shutdown.
+    let note_paging_cleanup_task =
+        startup_work.spawn(|| spawn_retired_note_paging_cleanup(note_paging_cleanup_store));
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
     // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
     // per-agent stderr capture files older than 7 days (STAB-53); the first tick
@@ -3235,6 +3243,8 @@ async fn cmd_serve_owned(
     }
     retention_task.abort();
     let _ = retention_task.await;
+    note_paging_cleanup_task.abort();
+    let _ = note_paging_cleanup_task.await;
     idempotency_reap_task.abort();
     let _ = idempotency_reap_task.await;
     let _ = merge_retry_task.await;
@@ -6369,6 +6379,26 @@ fn spawn_stream_retention_loop(
                 tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
+    })
+}
+
+/// Delay before the retired note paging cleanup starts, so it stays clear of
+/// the startup burst of reads and writes.
+const NOTE_PAGING_CLEANUP_START_DELAY: Duration = Duration::from_secs(30);
+
+/// Spawn the one-shot retired note paging cleanup
+/// ([`Store::run_retired_note_paging_cleanup`]): short batches that each hold
+/// the single write connection for about 100 ms at most, with pauses between
+/// them so queued writes run first. Freed pages are released later by the
+/// retention loop's incremental vacuum drain. A no-op once both tables are gone.
+fn spawn_retired_note_paging_cleanup(store: Store) -> tokio::task::JoinHandle<()> {
+    intent_core::spawn_daemon(async move {
+        tokio::time::sleep(NOTE_PAGING_CLEANUP_START_DELAY).await;
+        store
+            .run_retired_note_paging_cleanup(
+                intent_store::note_paging_cleanup::NotePagingCleanupPolicy::default(),
+            )
+            .await;
     })
 }
 

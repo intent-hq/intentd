@@ -326,6 +326,20 @@ pub(crate) enum CacheError {
     PageTooLarge,
 }
 
+impl CacheError {
+    /// Static variant name for daemon-side refusal logs; never the inner
+    /// message, which may carry provider text.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Admission(_) => "Admission",
+            Self::Credential(_) => "Credential",
+            Self::Ineligible(_) => "Ineligible",
+            Self::Provider(_) => "Provider",
+            Self::PageTooLarge => "PageTooLarge",
+        }
+    }
+}
+
 /// Quota evidence survives rejection of a late payload as well as provider errors.
 #[derive(Debug)]
 pub(crate) struct CacheFailure {
