@@ -3,6 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:rust_integration_tests.bzl", "rust_integration_tests")
 load("//bazel:shared_binary_test.bzl", "shared_binary_test")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
@@ -1901,10 +1902,12 @@ shared_binary_test(
     ],
 )
 
-rust_test(
-    name = "monitor_provenance",
-    srcs = ["tests/monitor_provenance.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/monitor_provenance.rs",
+rust_integration_tests(
+    overrides = {
+        "observation_adapter": {"workspace_sources": True},
+        "observation_policy": {"workspace_sources": True},
+        "repository_context_reader": {"workspace_sources": True},
+    },
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
@@ -1926,131 +1929,6 @@ rust_test(
         "//crates/intent-voice:intent_voice_dev",
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_services_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = ["//:workspace_test_data"],
-    edition = "2021",
-    version = "0.11.28",
-    crate_features = ["repository-test-fixtures"],
-    lint_config = ":cargo_lints",
-    tags = [
-        "no-sandbox",
-        "test-graph",
-    ],
-)
-
-rust_test(
-    name = "observation_adapter",
-    srcs = ["tests/observation_adapter.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/observation_adapter.rs",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_PKG_RUST_VERSION": "1.88",
-    },
-    deps = dev_crate_deps(normal = True, normal_dev = True) + [
-        "//crates/intent-acp:intent_acp_dev",
-        "//crates/intent-context:intent_context_dev",
-        "//crates/intent-core:intent_core_dev",
-        "//crates/intent-git:intent_git_dev",
-        "//crates/intent-js:intent_js_dev",
-        "//crates/intent-linear:intent_linear_dev",
-        "//crates/intent-providers:intent_providers_dev",
-        "//crates/intent-pty:intent_pty_dev",
-        "//crates/intent-search:intent_search_dev",
-        "//crates/intent-sentry:intent_sentry_dev",
-        "//crates/intent-sourcecontrol:intent_sourcecontrol_dev",
-        "//crates/intent-store:intent_store_dev",
-        "//crates/intent-voice:intent_voice_dev",
-        "//crates/intentd-test-support:intentd_test_support_dev",
-        ":intent_services_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        "//:workspace_rust_sources",
-    ],
-    edition = "2021",
-    version = "0.11.28",
-    crate_features = ["repository-test-fixtures"],
-    lint_config = ":cargo_lints",
-    tags = [
-        "no-sandbox",
-        "test-graph",
-    ],
-)
-
-rust_test(
-    name = "observation_policy",
-    srcs = ["tests/observation_policy.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/observation_policy.rs",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_PKG_RUST_VERSION": "1.88",
-    },
-    deps = dev_crate_deps(normal = True, normal_dev = True) + [
-        "//crates/intent-acp:intent_acp_dev",
-        "//crates/intent-context:intent_context_dev",
-        "//crates/intent-core:intent_core_dev",
-        "//crates/intent-git:intent_git_dev",
-        "//crates/intent-js:intent_js_dev",
-        "//crates/intent-linear:intent_linear_dev",
-        "//crates/intent-providers:intent_providers_dev",
-        "//crates/intent-pty:intent_pty_dev",
-        "//crates/intent-search:intent_search_dev",
-        "//crates/intent-sentry:intent_sentry_dev",
-        "//crates/intent-sourcecontrol:intent_sourcecontrol_dev",
-        "//crates/intent-store:intent_store_dev",
-        "//crates/intent-voice:intent_voice_dev",
-        "//crates/intentd-test-support:intentd_test_support_dev",
-        ":intent_services_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        "//:workspace_rust_sources",
-    ],
-    edition = "2021",
-    version = "0.11.28",
-    crate_features = ["repository-test-fixtures"],
-    lint_config = ":cargo_lints",
-    tags = [
-        "no-sandbox",
-        "test-graph",
-    ],
-)
-
-rust_test(
-    name = "repository_context_reader",
-    srcs = ["tests/repository_context_reader.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/repository_context_reader.rs",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_PKG_RUST_VERSION": "1.88",
-    },
-    deps = dev_crate_deps(normal = True, normal_dev = True) + [
-        "//crates/intent-acp:intent_acp_dev",
-        "//crates/intent-context:intent_context_dev",
-        "//crates/intent-core:intent_core_dev",
-        "//crates/intent-git:intent_git_dev",
-        "//crates/intent-js:intent_js_dev",
-        "//crates/intent-linear:intent_linear_dev",
-        "//crates/intent-providers:intent_providers_dev",
-        "//crates/intent-pty:intent_pty_dev",
-        "//crates/intent-search:intent_search_dev",
-        "//crates/intent-sentry:intent_sentry_dev",
-        "//crates/intent-sourcecontrol:intent_sourcecontrol_dev",
-        "//crates/intent-store:intent_store_dev",
-        "//crates/intent-voice:intent_voice_dev",
-        "//crates/intentd-test-support:intentd_test_support_dev",
-        ":intent_services_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        "//:workspace_rust_sources",
     ],
     edition = "2021",
     version = "0.11.28",

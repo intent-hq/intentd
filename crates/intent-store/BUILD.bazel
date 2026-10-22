@@ -3,6 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:rust_integration_tests.bzl", "rust_integration_tests")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -106,11 +107,10 @@ rust_test(
     ],
 )
 
-# manual: trybuild compiles its UI cases by running Cargo (crates.io registry, a full dependency build and a target dir outside Bazel); not expressible as a Bazel action
-rust_test(
-    name = "store_pool_api",
-    srcs = ["tests/store_pool_api.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/store_pool_api.rs",
+rust_integration_tests(
+    overrides = {
+        "store_pool_api": {"manual": "trybuild compiles its UI cases by running Cargo (crates.io registry, a full dependency build and a target dir outside Bazel); not expressible as a Bazel action"},
+    },
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
@@ -121,14 +121,11 @@ rust_test(
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_store_dev",
     ],
-    compile_data = ["//:workspace_test_data"],
-    data = ["//:workspace_test_data"],
     edition = "2021",
     version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
-        "manual",
         "no-sandbox",
         "test-graph",
     ],

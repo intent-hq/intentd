@@ -3,6 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:rust_integration_tests.bzl", "rust_integration_tests")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -96,6 +97,27 @@ rust_test(
     deps = dev_crate_deps(normal_dev = True),
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
+    edition = "2021",
+    version = "0.11.28",
+    crate_features = [],
+    lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+rust_integration_tests(
+    overrides = {},
+    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
+    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
+    deps = dev_crate_deps(normal = True, normal_dev = True) + [
+        "//crates/intent-core:intent_core_dev",
+        ":intent_nodes_dev",
+    ],
     edition = "2021",
     version = "0.11.28",
     crate_features = [],

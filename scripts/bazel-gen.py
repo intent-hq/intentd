@@ -10,10 +10,17 @@ rust-toolchain.toml and .config/nextest.toml and writes:
   * bazel/prod-workspace/**              Cargo manifests without dev-dependencies
 
 Run it after changing a Cargo.toml (new crate, first-party dependency, feature,
-build script, test target), rust-toolchain.toml or .config/nextest.toml:
+build script, [[test]] entry), rust-toolchain.toml or .config/nextest.toml:
 
     python3 scripts/bazel-gen.py          # rewrite the generated files
     python3 scripts/bazel-gen.py --check  # exit 1 if any generated file is stale
+
+A new integration test (tests/<name>.rs or tests/<name>/main.rs) in an existing
+crate needs no rerun: bazel/rust_integration_tests.bzl discovers the files at
+load time. The generated call lists only the tests that deviate from the crate's
+defaults, so the output changes only when a test needs a policy (nextest
+overrides, the tables below, or reading other crates' sources without the
+`_lint` name).
 
 Third-party dependencies are not listed here: the generated BUILD files call
 crate_universe's `all_crate_deps()`, which resolves them from Cargo.toml and
@@ -49,6 +56,9 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# Regenerates these files and refreshes MODULE.bazel.lock, which a crate-set or
+# dependency change also needs; plain `scripts/bazel-gen.py` only regenerates.
+FIX_COMMAND = "python3 scripts/bazel-drift.py --fix"
 PROD_WORKSPACE = Path("bazel/prod-workspace")
 # Top-level directories that root Cargo.toml path entries ([patch] crates) point
 # into. bazel/prod-workspace links to each, so the copied manifest keeps the same
@@ -203,7 +213,79 @@ KNOWN_FAILING[("intent-services", "intent-services")] = {
 # `module::` prefixes; `<target>_shard_rest` runs everything matching no shard.
 # A test therefore runs at least once; a name that also contains another
 # shard's prefix may run twice.
-MODULE_SHARDS: dict[str, int] = {"intent-services": 8}
+#
+# The assignment is a fixed table, not derived from the sources: balancing by
+# file size reshuffled most shards whenever a module grew by a few hundred
+# bytes, so nearly every intent-services change failed the drift guard. A new
+# module runs in `_shard_rest` until it is added here; a removed one leaves a
+# prefix that matches nothing. `python3 scripts/bazel-gen.py --suggest-shards
+# intent-services` prints a fresh size-balanced table to paste in.
+MODULE_SHARDS: dict[str, list[list[str]]] = {
+    "intent-services": [
+        [
+            "agent", "antigravity_setup", "auggie_cli", "auggie_discovery", "clone_ops", "comments",
+            "complete_ops", "delete_grace", "diffs", "enhance_ops", "event",
+            "event_notification_metadata_tests", "file", "file_tracking", "git", "github_browse_ops",
+            "github_token_source_tests", "human_attribution_tests", "invite_ops", "notes",
+            "observation_adapter", "orphan_trash_sweep_tests", "pi_cli", "pr", "pr_discovery", "pr_monitor",
+            "provider_auth", "quota_failover", "repository_admission_durable_source",
+            "repository_admission_git_source", "repository_admission_installation",
+            "repository_admission_source_tests", "repository_admission_sources",
+            "repository_context_reader", "repository_credentials", "repository_native_wire",
+            "repository_pending_delete_tests", "repository_read_policy", "repository_read_source",
+            "sandbox_ops", "script", "session_stats", "setup_runner", "setup_scripts", "task_effort",
+            "tasks", "transfer", "transfer_authorship", "transfer_import", "transfer_materialize",
+            "transfer_roundtrip", "transfer_submodules", "workspace", "workspace_check_cadence",
+            "workspace_mutations"
+        ],
+        [
+            "agent_list_cache", "agent_subscriptions", "automatic_pr_refresh", "bundled_cli", "capability",
+            "event_ops", "file_ops", "file_tracking_ops", "git_ops", "installed_cli", "line_attribution",
+            "mcp_servers", "metrics", "note_merge", "observation_policy", "provider_cli", "provider_images",
+            "provider_preparation", "rate_limit", "repository_credential_writers", "retention", "rtk",
+            "script_ops", "script_output_store", "sentry_ops", "source_control_auth_ops", "terminal_ops",
+            "test_tracing", "transfer_git", "workspace_status"
+        ],
+        [
+            "agent_locks", "agent_session", "auto_commit", "browser_ops", "completion_interception_tests",
+            "create_progress", "delivery_tasks", "discovery_cache", "git_diff_singleflight",
+            "git_status_singleflight", "harness", "hook_manager", "mcp_oauth", "member_removal",
+            "model_catalog", "note_ops", "npx_cli", "presence", "profile_activation", "rules",
+            "script_output_cleanup", "search_ops", "specialists", "transfer_export",
+            "transfer_model_selection", "unsloth_server", "usage_stats_read", "v2_4_goldens", "voice_ops",
+            "workspace_aggregates"
+        ],
+        [
+            "accept_changes", "agent_workers", "antigravity", "assistant_context", "checkpoint",
+            "conditional_write_precedence_tests", "disk_usage", "fast_mode", "github_auth_ops",
+            "issue_cache", "linear_ops", "model_preference", "primitive_ops", "provider_return",
+            "repository_context_output", "script_monitor", "test_support", "tests", "tool_block",
+            "tracked_changes_sweep", "v2_3_goldens", "workspace_vocabulary", "worktree_presence"
+        ],
+        [
+            "antigravity_install", "attachment_upload", "browser_tabs", "codex_diagnostics",
+            "codex_session_title", "collaboration_auth_ops", "direct_secret_ops", "event_subscriptions",
+            "events", "history_xml", "host_exec_stream", "image_dimensions", "instructions", "one_shot_acp",
+            "periodic_shutdown_tests", "pr_ops", "principal_ops", "provider_catalog", "provider_models",
+            "settings", "shell", "skills", "stack_sample", "truncated_read_guard_tests", "usage_rate",
+            "usage_stats", "v1_goldens", "v2_10_goldens", "v2_1_goldens", "v2_2_goldens", "v2_7_goldens"
+        ],
+        [
+            "ac_status_singleflight", "acp_adapter", "claude_adapter_contract", "config_watcher",
+            "device_ops", "drafts", "git_status_cache", "github_ops", "host_exec", "host_execution",
+            "nested_repos", "pagination", "provider_profiles", "provider_test_prompt", "repo_config",
+            "repository_admission", "repository_context_live", "settings_registry", "token_usage",
+            "transfer_remotes", "transfer_selection_contract", "usage_semantics", "v1_1_goldens",
+            "v2_5_goldens", "workspace_branch"
+        ],
+        [
+            "agent_manager"
+        ],
+        [
+            "agent_ops"
+        ],
+    ],
+}
 
 # Shards tagged manual, keyed by (package, shard number): ones that did not
 # finish within Bazel's `long` timeout (900 s) on the loaded evaluation host
@@ -573,6 +655,35 @@ def module_shards(pkg_root: Path, crate_root: str, count: int) -> list[list[str]
 
 
 SRC_GLOB = 'glob(["src/**/*.rs"], exclude = INCLUDED_SRCS)'
+
+
+def integration_test_roots(pkg_root: Path) -> list[tuple[str, str]]:
+    """(name, crate root) of each file Cargo autodiscovers as an integration test.
+
+    Mirrors `integration_test_roots` in bazel/rust_integration_tests.bzl.
+    """
+    roots = [(p.stem, f"tests/{p.name}") for p in pkg_root.glob("tests/*.rs") if p.is_file()]
+    roots += [(p.parent.name, f"tests/{p.parent.name}/main.rs") for p in pkg_root.glob("tests/*/main.rs") if p.is_file()]
+    return sorted(roots)
+
+
+def reads_workspace_sources_by_name(test_name: str) -> bool:
+    """Mirrors `reads_workspace_sources` in bazel/rust_integration_tests.bzl."""
+    return test_name.endswith("_lint")
+
+
+def render_overrides(overrides: dict[str, dict]) -> str:
+    if not overrides:
+        return "{}"
+
+    def value(v: object) -> str:
+        return ("True" if v else "False") if isinstance(v, bool) else json.dumps(v)
+
+    lines = []
+    for test, override in sorted(overrides.items()):
+        fields = ", ".join(f"{json.dumps(k)}: {value(v)}" for k, v in sorted(override.items()))
+        lines.append(f"        {json.dumps(test)}: {{{fields}}},\n")
+    return "{\n" + "".join(lines) + "    }"
 _INCLUDE_RE = re.compile(r'\binclude!\s*\(\s*"([^"]+\.rs)"\s*\)')
 
 
@@ -763,8 +874,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             "long" if "::" not in binary_id or "::bin/" in binary_id else None,
         )
         known = KNOWN_FAILING.get((name, binary_id.split("::", 1)[-1]), {})
-        shards = module_shards(pkg_root, relative_src(package, lib), MODULE_SHARDS[name]) \
-            if binary_id == name and name in MODULE_SHARDS and lib is not None else []
+        shards = MODULE_SHARDS.get(name, []) if binary_id == name and lib is not None else []
         # A binary split into several targets is compiled once, as
         # `<target>_binary`; the split targets run it through shared_binary_test. The
         # binary target itself only lists its tests, so it stays a normal
@@ -876,16 +986,34 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             None,
         )
 
+    # Integration tests: bazel/rust_integration_tests.bzl globs tests/*.rs and
+    # tests/*/main.rs, so a new test file needs no regeneration. Only tests
+    # that deviate from the crate's defaults are named here (`overrides`), and
+    # tests split into several targets are written out as explicit rules
+    # (`exclude`). Every crate gets the call, so its first test file needs no
+    # regeneration either.
     bin_env = {
         f"CARGO_BIN_EXE_{b['name']}": f"$(execpath :{b['name']}_test_bin)" for b in bins
     }
+    extra = list(dev_deps)
+    macros = list(dev_macros)
+    if lib is not None:
+        (macros if is_proc_macro else extra).append(f":{lib['name']}_dev")
+    integration_attrs = {
+        "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
+        "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", sorted(set(macros))),
+        "rustc_env": test_env | bin_env or None,
+        "deps": concat("dev_crate_deps(normal = True, normal_dev = True)", sorted(set(extra))),
+    }
+    shared_test_sources = crate_sources(pkg_root, "tests/*/**/*.rs")
+    crate_reads_sources = bool(READS_WORKSPACE_SOURCES.search(shared_test_sources))
+    discovered = dict(integration_test_roots(pkg_root))
+    overrides: dict[str, dict] = {}
+    exclude: set[str] = {n for n in discovered if n not in {t["name"] for t in tests}}
     for test in sorted(tests, key=lambda t: t["name"]):
         root = relative_src(package, test)
         in_subdir = root.count("/") > 1
-        extra = list(dev_deps)
-        macros = list(dev_macros)
-        if lib is not None:
-            (macros if is_proc_macro else extra).append(f":{lib['name']}_dev")
+        binary_id = f"{name}::{test['name']}"
         missing = sorted(set(test.get("required-features") or []) - set(ws.dev_features[name]))
         reason = MANUAL_TESTS.get((name, test["name"]))
         if missing and not reason:
@@ -893,7 +1021,27 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 f"required-features {', '.join(missing)} are off in `cargo test --workspace`; "
                 "Cargo CI runs it with --features"
             )
-        sources = (pkg_root / root).read_text(errors="replace") + crate_sources(pkg_root, "tests/*/**/*.rs")
+        sources = (pkg_root / root).read_text(errors="replace") + shared_test_sources
+        exclusive = binary_id in nextest.exclusive_binaries
+        split = (not exclusive and nextest.serial_patterns(binary_id, sources)) or (name, test["name"]) in KNOWN_FAILING
+        if discovered.get(test["name"]) == root and not split:
+            override: dict[str, object] = {}
+            if 'env!("CARGO")' in sources:
+                override["cargo"] = True
+            if exclusive:
+                override["exclusive"] = True
+            if reason:
+                override["manual"] = reason
+            if (name, test["name"]) in TEST_TIMEOUTS:
+                override["timeout"] = TEST_TIMEOUTS[(name, test["name"])]
+            if (READS_WORKSPACE_SOURCES.search(sources) and not crate_reads_sources
+                    and not reads_workspace_sources_by_name(test["name"])):
+                override["workspace_sources"] = True
+            if override:
+                overrides[test["name"]] = override
+            continue
+        if test["name"] in discovered:
+            exclude.add(test["name"])
         add_test(
             test["name"],
             f"{name}::{test['name']}",
@@ -901,14 +1049,25 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             {
                 "srcs": Raw("TEST_SUPPORT_SRCS" if in_subdir else f'["{root}"] + TEST_SUPPORT_SRCS'),
                 "crate_root": root,
-                "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
-                "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", sorted(set(macros))),
-                "rustc_env": test_env | bin_env or None,
+                **integration_attrs,
                 "extra_data": [f":{b['name']}_test_bin" for b in bins],
-                "deps": concat("dev_crate_deps(normal = True, normal_dev = True)", sorted(set(extra))),
             },
             reason,
         )
+
+    used.add("rust_integration_tests")
+    rules.append(Rule(
+        "rust_integration_tests",
+        overrides=Raw(render_overrides(overrides)),
+        exclude=sorted(exclude) or None,
+        workspace_sources=True if crate_reads_sources else None,
+        **integration_attrs,
+        data=[f":{b['name']}_test_bin" for b in bins] or None,
+        **common,
+        crate_features=g["features"],
+        lint_config=lint_config,
+        tags=TEST_GRAPH_TAGS,
+    ))
 
     # --- assemble ---
     out = [HEADER]
@@ -918,6 +1077,8 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     cargo_rules = sorted({"cargo_build_script"} & used | ({"extract_cargo_lints"} if lint_config else set()))
     if cargo_rules:
         out.append('load("@rules_rust//cargo:defs.bzl", ' + ", ".join(f'"{r}"' for r in cargo_rules) + ")\n")
+    if "rust_integration_tests" in used:
+        out.append('load("//bazel:rust_integration_tests.bzl", "rust_integration_tests")\n')
     if "shared_binary_test" in used:
         out.append('load("//bazel:shared_binary_test.bzl", "shared_binary_test")\n')
     rust_rules = sorted(used & {"rust_binary", "rust_library", "rust_proc_macro", "rust_test"})
@@ -1154,10 +1315,31 @@ def generated_files() -> dict[Path, str]:
     return files
 
 
-def main() -> int:
+def stale_label(path: Path, exists: bool, generated: bool) -> str:
+    """How `--check` describes a stale file: a missing crate BUILD file means a new crate."""
+    rel = path.relative_to(ROOT)
+    crate_build = len(rel.parts) == 3 and rel.parts[0] == "crates" and rel.name == "BUILD.bazel"
+    if not exists:
+        return f"{rel} (missing{': new crate ' + rel.parts[1] if crate_build else ''})"
+    if not generated:
+        return f"{rel} (no longer generated{': removed crate ' + rel.parts[1] if crate_build else ''})"
+    return str(rel)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check", action="store_true", help="fail if any generated file is stale")
-    args = parser.parse_args()
+    parser.add_argument("--suggest-shards", metavar="PACKAGE",
+                        help="print a size-balanced MODULE_SHARDS entry for PACKAGE and exit")
+    args = parser.parse_args(argv)
+
+    if args.suggest_shards:
+        ws = Workspace(cargo_metadata())
+        package = ws.by_name[args.suggest_shards]
+        count = len(MODULE_SHARDS.get(args.suggest_shards, [])) or 8
+        shards = module_shards(ROOT / ws.package_dir(package), relative_src(package, lib_target(package)), count)
+        print(json.dumps({args.suggest_shards: shards}, indent=4))
+        return 0
 
     files = generated_files()
     stale = []
@@ -1165,7 +1347,7 @@ def main() -> int:
         current = path.read_text() if path.exists() else None
         if current == content:
             continue
-        stale.append(path.relative_to(ROOT))
+        stale.append(stale_label(path, current is not None, True))
         if not args.check:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
@@ -1175,7 +1357,7 @@ def main() -> int:
         target = Path("../" * len(PROD_WORKSPACE.parts) + entry)
         if link.is_symlink() and Path(link.readlink()) == target:
             continue
-        stale.append(link.relative_to(ROOT))
+        stale.append(str(link.relative_to(ROOT)))
         if not args.check:
             if link.is_symlink() or link.exists():
                 link.unlink()
@@ -1186,7 +1368,7 @@ def main() -> int:
         if p not in files
     ]
     for path in leftovers:
-        stale.append(path.relative_to(ROOT))
+        stale.append(stale_label(path, True, False))
         if not args.check:
             path.unlink()
 
@@ -1194,7 +1376,7 @@ def main() -> int:
         print("Bazel files are out of date with Cargo metadata:", file=sys.stderr)
         for path in stale:
             print(f"  {path}", file=sys.stderr)
-        print("Run: python3 scripts/bazel-gen.py", file=sys.stderr)
+        print(f"Run: {FIX_COMMAND}, then commit the files above and MODULE.bazel.lock.", file=sys.stderr)
         return 1
     for path in stale:
         print(f"wrote {path}")
