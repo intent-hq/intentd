@@ -101,6 +101,7 @@ cargo_build_script(
 rust_library(
     name = "intentd_sitter_dev",
     crate_name = "intentd_sitter",
+    disable_pipelining = True,
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
@@ -110,10 +111,10 @@ rust_library(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + [":build_script_dev"],
 )
 
@@ -128,10 +129,10 @@ rust_binary(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + [
         ":build_script_dev",
         ":intentd_sitter_dev",
@@ -142,8 +143,11 @@ copy_file(
     name = "intentd-sitter_test_bin",
     src = ":intentd-sitter_dev",
     out = "test_bin/intentd-sitter",
-    is_executable = true,
-    tags = ["test-graph"],
+    is_executable = True,
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -151,9 +155,6 @@ rust_test(
     crate = ":intentd_sitter_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
-    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intentd-test-support:intentd_test_support_dev"],
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
@@ -161,6 +162,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -169,9 +174,6 @@ rust_test(
     crate_root = "src/main.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":build_script_dev",
@@ -183,6 +185,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -192,8 +198,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -208,6 +213,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -217,8 +226,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -233,6 +241,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -242,8 +254,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -258,6 +269,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -267,8 +282,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -283,6 +297,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -292,8 +310,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -308,6 +325,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -317,8 +338,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -333,6 +353,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -342,8 +366,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -358,6 +381,10 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -367,8 +394,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "${exec_root}/$(execpath :intentd-sitter_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd-sitter",
+        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -383,4 +409,8 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )

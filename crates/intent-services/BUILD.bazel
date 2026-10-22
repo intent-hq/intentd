@@ -71,6 +71,7 @@ rust_library(
 rust_library(
     name = "intent_services_dev",
     crate_name = "intent_services",
+    disable_pipelining = True,
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
@@ -80,10 +81,10 @@ rust_library(
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -106,9 +107,6 @@ rust_test(
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intentd-test-support:intentd_test_support_dev"],
     compile_data = ["//:workspace_test_data"],
     data = [
@@ -155,6 +153,10 @@ rust_test(
         "--skip",
         "specialists_watcher::",
     ],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -162,9 +164,6 @@ rust_test(
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intentd-test-support:intentd_test_support_dev"],
     compile_data = ["//:workspace_test_data"],
     data = [
@@ -193,7 +192,11 @@ rust_test(
         "specialists_watcher::",
         "--test-threads=1",
     ],
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 # manual: needs INTENT_ACP_CALLBACK_ADAPTER_FIXTURE, TRANSFER_SELECTION_FIXTURE_ROOT from the client environment
@@ -202,9 +205,6 @@ rust_test(
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intentd-test-support:intentd_test_support_dev"],
     compile_data = ["//:workspace_test_data"],
     data = [
@@ -226,6 +226,8 @@ rust_test(
     tags = [
         "exclusive",
         "manual",
+        "no-sandbox",
+        "test-graph",
     ],
 )
 
@@ -235,9 +237,6 @@ rust_test(
     crate_root = "tests/monitor_provenance.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -261,6 +260,10 @@ rust_test(
     version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -269,9 +272,6 @@ rust_test(
     crate_root = "tests/observation_adapter.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -298,6 +298,10 @@ rust_test(
     version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -306,9 +310,6 @@ rust_test(
     crate_root = "tests/observation_policy.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -335,6 +336,10 @@ rust_test(
     version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -343,9 +348,6 @@ rust_test(
     crate_root = "tests/repository_context_reader.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-services",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -372,4 +374,8 @@ rust_test(
     version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )

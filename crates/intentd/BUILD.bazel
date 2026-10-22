@@ -76,10 +76,10 @@ rust_binary(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -97,8 +97,11 @@ copy_file(
     name = "intentd_test_bin",
     src = ":intentd_dev",
     out = "test_bin/intentd",
-    is_executable = true,
-    tags = ["test-graph"],
+    is_executable = True,
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -107,9 +110,6 @@ rust_test(
     crate_root = "src/main.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -132,6 +132,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -141,8 +145,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -170,6 +173,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -179,8 +186,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -208,6 +214,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -217,8 +227,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -246,6 +255,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -255,8 +268,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -284,6 +296,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -293,8 +309,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -322,6 +337,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -331,8 +350,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -360,6 +378,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -369,8 +391,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -398,6 +419,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -407,8 +432,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -436,6 +460,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -445,8 +473,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -474,6 +501,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -483,8 +514,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -512,6 +542,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -521,8 +555,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -550,6 +583,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -559,8 +596,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -588,6 +624,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -597,8 +637,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -626,6 +665,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -635,8 +678,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -664,6 +706,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -673,8 +719,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -702,6 +747,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -711,8 +760,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -740,6 +788,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -749,8 +801,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -778,6 +829,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -787,8 +842,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -816,6 +870,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -825,8 +883,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -854,6 +911,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -863,8 +924,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -892,6 +952,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -901,8 +965,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -930,6 +993,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -939,8 +1006,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -968,6 +1034,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -977,8 +1047,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1006,6 +1075,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1015,8 +1088,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1044,6 +1116,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1053,8 +1129,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1082,6 +1157,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1091,8 +1170,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1120,6 +1198,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1129,8 +1211,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1158,7 +1239,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1168,8 +1253,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1197,6 +1281,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1206,8 +1294,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1235,6 +1322,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1244,8 +1335,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1273,6 +1363,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1282,8 +1376,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1311,6 +1404,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1320,8 +1417,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1349,6 +1445,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1358,8 +1458,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1387,6 +1486,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1396,8 +1499,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1425,6 +1527,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1434,8 +1540,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1463,6 +1568,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1472,8 +1581,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1501,6 +1609,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1510,8 +1622,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1539,6 +1650,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1548,8 +1663,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1577,6 +1691,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1586,8 +1704,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1615,6 +1732,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1624,8 +1745,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1653,6 +1773,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1662,8 +1786,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1691,6 +1814,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1700,8 +1827,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1729,6 +1855,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1738,8 +1868,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1767,6 +1896,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1776,8 +1909,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1805,6 +1937,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1814,8 +1950,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1843,6 +1978,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1852,8 +1991,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1881,6 +2019,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1890,8 +2032,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1919,6 +2060,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1928,8 +2073,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1957,6 +2101,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -1966,8 +2114,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1995,6 +2142,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2004,8 +2155,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2033,6 +2183,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2042,8 +2196,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2071,6 +2224,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2080,8 +2237,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2109,6 +2265,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2118,8 +2278,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2147,6 +2306,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2156,8 +2319,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2185,6 +2347,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2194,8 +2360,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2223,6 +2388,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2232,8 +2401,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2261,6 +2429,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2270,8 +2442,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2299,6 +2470,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2308,8 +2483,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2337,6 +2511,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2346,8 +2524,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2375,6 +2552,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2384,8 +2565,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2413,6 +2593,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2422,8 +2606,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2451,6 +2634,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2460,8 +2647,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2489,6 +2675,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2498,8 +2688,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2527,6 +2716,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2536,8 +2729,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2565,6 +2757,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2574,8 +2770,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2603,6 +2798,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2612,8 +2811,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2641,6 +2839,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2650,8 +2852,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2679,6 +2880,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2688,8 +2893,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2717,6 +2921,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2726,8 +2934,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2755,6 +2962,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2764,8 +2975,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2793,6 +3003,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2802,8 +3016,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2831,7 +3044,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2841,8 +3058,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2870,6 +3086,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2879,8 +3099,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2908,6 +3127,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2917,8 +3140,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2946,6 +3168,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2955,8 +3181,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2984,6 +3209,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -2993,8 +3222,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3022,6 +3250,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3031,8 +3263,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3060,6 +3291,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3069,8 +3304,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3098,6 +3332,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3107,8 +3345,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3136,6 +3373,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3145,8 +3386,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3174,6 +3414,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3183,8 +3427,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3212,6 +3455,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3221,8 +3468,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3250,6 +3496,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3259,8 +3509,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3288,6 +3537,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3297,8 +3550,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3326,6 +3578,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3335,8 +3591,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3364,6 +3619,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3373,8 +3632,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3402,6 +3660,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3411,8 +3673,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3440,6 +3701,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3449,8 +3714,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3478,6 +3742,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3487,8 +3755,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3516,6 +3783,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3525,8 +3796,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3554,6 +3824,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 # manual: required-features repository-test-fixtures are off in `cargo test --workspace`; Cargo CI runs it with --features
@@ -3564,8 +3838,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3593,7 +3866,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3603,8 +3880,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3632,6 +3908,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3641,8 +3921,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3670,6 +3949,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3679,8 +3962,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3708,6 +3990,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3717,8 +4003,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3746,6 +4031,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3755,8 +4044,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3784,6 +4072,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3793,8 +4085,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3822,7 +4113,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3832,8 +4127,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3861,6 +4155,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3870,8 +4168,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3899,6 +4196,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3908,8 +4209,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3937,6 +4237,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3946,8 +4250,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3975,6 +4278,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -3984,8 +4291,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4013,7 +4319,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4023,8 +4333,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4052,7 +4361,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4062,8 +4375,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4091,6 +4403,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4100,8 +4416,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4129,6 +4444,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4138,8 +4457,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4167,6 +4485,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4176,8 +4498,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4205,6 +4526,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4214,8 +4539,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4243,6 +4567,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4252,8 +4580,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4281,6 +4608,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4290,8 +4621,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4319,7 +4649,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4329,8 +4663,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4358,6 +4691,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4367,8 +4704,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4396,6 +4732,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4405,8 +4745,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4434,6 +4773,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4443,8 +4786,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4472,6 +4814,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4481,8 +4827,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4510,6 +4855,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4519,8 +4868,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4548,6 +4896,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4557,8 +4909,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4586,6 +4937,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4595,8 +4950,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4624,6 +4978,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4633,8 +4991,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4662,6 +5019,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4671,8 +5032,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4700,6 +5060,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4709,8 +5073,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4738,6 +5101,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4747,8 +5114,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4776,7 +5142,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4786,8 +5156,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4815,6 +5184,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4824,8 +5197,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4853,6 +5225,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4862,8 +5238,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4891,6 +5266,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4900,8 +5279,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4929,6 +5307,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4938,8 +5320,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4967,6 +5348,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -4976,8 +5361,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5005,6 +5389,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5014,8 +5402,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5043,6 +5430,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5052,8 +5443,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5081,6 +5471,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5090,8 +5484,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5119,6 +5512,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5128,8 +5525,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5157,6 +5553,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5166,8 +5566,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5195,6 +5594,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5204,8 +5607,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5233,7 +5635,11 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5243,8 +5649,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5272,6 +5677,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5281,8 +5690,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5310,6 +5718,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5319,8 +5731,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5348,6 +5759,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5357,8 +5772,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5386,6 +5800,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5395,8 +5813,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5424,6 +5841,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5433,8 +5854,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5462,6 +5882,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5471,8 +5895,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5500,6 +5923,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5509,8 +5936,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5538,6 +5964,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5547,8 +5977,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5576,6 +6005,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5585,8 +6018,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5614,6 +6046,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5623,8 +6059,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5652,6 +6087,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5661,8 +6100,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5690,6 +6128,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5699,8 +6141,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5728,6 +6169,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5737,8 +6182,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5766,6 +6210,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5775,8 +6223,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5804,6 +6251,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5813,8 +6264,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5842,6 +6292,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5851,8 +6305,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5880,6 +6333,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5889,8 +6346,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5918,6 +6374,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5927,8 +6387,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5956,6 +6415,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -5965,8 +6428,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5994,6 +6456,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6003,8 +6469,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6032,6 +6497,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6041,8 +6510,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6070,6 +6538,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6079,8 +6551,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6108,6 +6579,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6117,8 +6592,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6146,6 +6620,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6155,8 +6633,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6184,6 +6661,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6193,8 +6674,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6222,6 +6702,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6231,8 +6715,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6260,6 +6743,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6269,8 +6756,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6298,6 +6784,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6307,8 +6797,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6336,6 +6825,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6345,8 +6838,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6374,6 +6866,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6383,8 +6879,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6412,6 +6907,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6421,8 +6920,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6450,6 +6948,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6459,8 +6961,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6488,6 +6989,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6497,8 +7002,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6526,6 +7030,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6535,8 +7043,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6564,6 +7071,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6573,8 +7084,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6602,6 +7112,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6611,8 +7125,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6640,6 +7153,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6649,8 +7166,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6678,6 +7194,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6687,8 +7207,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6716,6 +7235,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6725,8 +7248,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6754,6 +7276,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6763,8 +7289,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6792,6 +7317,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6801,8 +7330,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6830,6 +7358,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6839,8 +7371,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6868,6 +7399,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6877,8 +7412,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6906,6 +7440,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6915,8 +7453,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6944,6 +7481,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6953,8 +7494,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6982,6 +7522,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -6991,8 +7535,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7020,6 +7563,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7029,8 +7576,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7058,6 +7604,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7067,8 +7617,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7096,6 +7645,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7105,8 +7658,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7134,6 +7686,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7143,8 +7699,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7172,6 +7727,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7181,8 +7740,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7210,6 +7768,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7219,8 +7781,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7248,6 +7809,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7257,8 +7822,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7286,6 +7850,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7295,8 +7863,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7324,6 +7891,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7333,8 +7904,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7362,6 +7932,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7371,8 +7945,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7400,6 +7973,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7409,8 +7986,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7438,6 +8014,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7447,8 +8027,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7476,6 +8055,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7485,8 +8068,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7514,6 +8096,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7523,8 +8109,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7552,6 +8137,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7561,8 +8150,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7590,6 +8178,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7599,8 +8191,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7628,6 +8219,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7637,8 +8232,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7666,6 +8260,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7675,8 +8273,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7704,6 +8301,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7713,8 +8314,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7742,6 +8342,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7751,8 +8355,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7780,6 +8383,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7789,8 +8396,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7818,6 +8424,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7827,8 +8437,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7856,6 +8465,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7865,8 +8478,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7894,6 +8506,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7903,8 +8519,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7932,6 +8547,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7941,8 +8560,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7970,6 +8588,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -7979,8 +8601,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8008,6 +8629,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -8017,8 +8642,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8046,6 +8670,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -8055,8 +8683,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8084,6 +8711,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -8093,8 +8724,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8122,6 +8752,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -8131,8 +8765,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
-        "CARGO_BIN_EXE_intentd": "${exec_root}/$(execpath :intentd_test_bin)",
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intentd",
+        "CARGO_BIN_EXE_intentd": "$${exec_root}/$(execpath :intentd_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8160,4 +8793,8 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )

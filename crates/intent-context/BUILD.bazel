@@ -57,6 +57,7 @@ rust_library(
 rust_library(
     name = "intent_context_dev",
     crate_name = "intent_context",
+    disable_pipelining = True,
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
@@ -66,10 +67,10 @@ rust_library(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-context",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + ["//crates/intent-core:intent_core_dev"],
 )
 
@@ -78,9 +79,6 @@ rust_test(
     crate = ":intent_context_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-context",
-    },
     deps = dev_crate_deps(normal_dev = True),
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
@@ -94,6 +92,10 @@ rust_test(
         "--skip",
         "run_auggie",
     ],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -101,9 +103,6 @@ rust_test(
     crate = ":intent_context_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-context",
-    },
     deps = dev_crate_deps(normal_dev = True),
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
@@ -116,5 +115,9 @@ rust_test(
         "run_auggie",
         "--test-threads=1",
     ],
-    tags = ["exclusive"],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+        "test-graph",
+    ],
 )

@@ -57,6 +57,7 @@ rust_library(
 rust_library(
     name = "intent_core_dev",
     crate_name = "intent_core",
+    disable_pipelining = True,
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
@@ -66,10 +67,10 @@ rust_library(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True),
 )
 
@@ -78,9 +79,6 @@ rust_test(
     crate = ":intent_core_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intentd-test-support:intentd_test_support_dev"],
     compile_data = ["//:workspace_test_data"],
     data = [
@@ -91,6 +89,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -99,9 +101,6 @@ rust_test(
     crate_root = "tests/clock.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -112,6 +111,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -120,9 +123,6 @@ rust_test(
     crate_root = "tests/config_resolve.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -133,6 +133,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -141,9 +145,6 @@ rust_test(
     crate_root = "tests/error.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -154,6 +155,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -162,9 +167,6 @@ rust_test(
     crate_root = "tests/event_type_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -178,6 +180,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -186,9 +192,6 @@ rust_test(
     crate_root = "tests/events.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -199,6 +202,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -207,9 +214,6 @@ rust_test(
     crate_root = "tests/fixed_deadline_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -223,6 +227,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -231,9 +239,6 @@ rust_test(
     crate_root = "tests/fixed_sleep_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -244,6 +249,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -252,9 +261,6 @@ rust_test(
     crate_root = "tests/ids.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -265,6 +271,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -273,9 +283,6 @@ rust_test(
     crate_root = "tests/queue_entry_egress_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -289,6 +296,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -297,9 +308,6 @@ rust_test(
     crate_root = "tests/repo_slug_fold_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -313,6 +321,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -321,9 +333,6 @@ rust_test(
     crate_root = "tests/review_monitor_contract.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -334,6 +343,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -342,9 +355,6 @@ rust_test(
     crate_root = "tests/running_turn_rule_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -358,6 +368,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -367,7 +381,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
+        "CARGO": "$${exec_root}/$(execpath @rules_rust//rust/toolchain:current_cargo_files)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -377,11 +391,16 @@ rust_test(
     data = [
         "//:workspace_test_data",
         "//:workspace_rust_sources",
+        "@rules_rust//rust/toolchain:current_cargo_files",
     ],
     edition = "2021",
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -390,9 +409,6 @@ rust_test(
     crate_root = "tests/transfer_version_source_lint.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-core",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
         ":intent_core_dev",
@@ -406,4 +422,8 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )

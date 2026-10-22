@@ -96,6 +96,15 @@ ROOT_TEST_DATA_FILES = [
 # time (the source lints walk the workspace), so it gets every crate's .rs files
 # as data. Other tests get only non-Rust files: their own crate's sources are
 # already inputs of the test binary.
+# The real execroot, substituted by rules_rust's process wrapper (`$$` escapes
+# Make-variable expansion). Generated files (the test binaries, the
+# toolchain's cargo) live below it.
+EXEC_ROOT = "$${exec_root}"
+# Test-graph targets (`_dev` libraries, test binaries) compile and run outside
+# the sandbox; see test_env in render_build.
+TEST_GRAPH_TAGS = ["no-sandbox", "test-graph"]
+CARGO_FILES = "@rules_rust//rust/toolchain:current_cargo_files"
+
 READS_WORKSPACE_SOURCES = re.compile(r"source_lint|workspace_root\(|\.\./[\w./-]*\.rs\"")
 
 # Hand decisions that Cargo metadata cannot express. Keys are Cargo package names.
@@ -427,6 +436,8 @@ class Rule:
                 text = starlark_list(value)
             elif isinstance(value, dict):
                 text = starlark_dict(value)
+            elif isinstance(value, bool):
+                text = "True" if value else "False"
             else:
                 text = json.dumps(value)
             out.append(f"    {key} = {text},\n")
@@ -463,7 +474,11 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     env_files = override.get("rustc_env_files", [])
     lint_config = ":cargo_lints" if has_lints(package) else None
     common = {"edition": package["edition"], "version": package["version"]}
-    test_env = {"CARGO_MANIFEST_DIR": f"${{exec_root}}/{pkg_dir}"}
+    # Test-graph actions run outside the sandbox (TEST_GRAPH_TAGS), so rules_rust's
+    # CARGO_MANIFEST_DIR is the real execroot, whose top-level entries link to
+    # the source tree. Tests embed it with env!() and hand paths below it to
+    # child processes, as under Cargo, so it must outlive the compile action.
+    test_env: dict[str, str] = {}
 
     rules: list[Rule] = []
     used = {"rust_test"} if (tests or bins or lib) else set()
@@ -523,6 +538,9 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 rule,
                 name=lib["name"] + g["suffix"],
                 crate_name=lib["name"] if dev else None,
+                # Unsandboxed, a pipelined full compile rewrites the read-only
+                # .rmeta its metadata action already produced.
+                disable_pipelining=True if dev and not is_proc_macro else None,
                 srcs=Raw('glob(["src/**/*.rs"])'),
                 crate_root=relative_src(package, lib),
                 aliases=Raw(f"{g['aliases']}({g['pkg'].rstrip(', ')})"),
@@ -531,9 +549,9 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 crate_features=g["features"],
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
-                rustc_env=test_env if dev else None,
+                rustc_env=test_env or None if dev else None,
                 rustc_env_files=env_files or None,
-                tags=["test-graph"] if dev else None,
+                tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), normal_deps + build_dep),
             ))
         for bin_target in bins:
@@ -552,9 +570,9 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 crate_features=g["features"],
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
-                rustc_env=test_env if dev else None,
+                rustc_env=test_env or None if dev else None,
                 rustc_env_files=env_files or None,
-                tags=["test-graph"] if dev else None,
+                tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), sorted(set(extra))),
             ))
             if dev:
@@ -566,7 +584,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                     src=f":{bin_target['name']}_dev",
                     out=f"test_bin/{bin_target['name']}",
                     is_executable=True,
-                    tags=["test-graph"],
+                    tags=TEST_GRAPH_TAGS,
                 ))
 
     # --- tests (dev graph only) ---
@@ -586,6 +604,11 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         if READS_WORKSPACE_SOURCES.search(sources):
             data.append(workspace_rust_data)
         data += attrs.pop("extra_data", [])
+        if 'env!("CARGO")' in sources:
+            # Cargo sets CARGO for every compile; tests that run `cargo
+            # metadata` get the toolchain's cargo.
+            data.append(CARGO_FILES)
+            attrs["rustc_env"] = (attrs.get("rustc_env") or {}) | {"CARGO": f"{EXEC_ROOT}/$(execpath {CARGO_FILES})"}
         fixtures = FIXTURE_TESTS.get(name, []) if binary_id == name else []
         fixture_patterns = sorted({p for p, _ in fixtures})
         serial = [
@@ -594,7 +617,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         ]
         if binary_id in nextest.exclusive_binaries:
             serial = []
-        base_tags = ["manual"] if manual_reason else []
+        base_tags = TEST_GRAPH_TAGS + (["manual"] if manual_reason else [])
 
         def emit(suffix: str, args: list[str], tags: list[str], extra: dict) -> None:
             rules.append(Rule(
@@ -634,7 +657,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 "crate": f":{lib['name']}_dev",
                 "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
                 "proc_macro_deps": concat("dev_crate_deps(proc_macro_dev = True)", sorted(set(dev_macros) - set(normal_macros))),
-                "rustc_env": test_env,
+                "rustc_env": test_env or None,
                 "deps": concat("dev_crate_deps(normal_dev = True)", sorted(set(dev_deps) - set(normal_deps))),
             },
             None,
@@ -655,7 +678,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 "crate_root": relative_src(package, bin_target),
                 "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
                 "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", dev_macros),
-                "rustc_env": test_env,
+                "rustc_env": test_env or None,
                 "rustc_env_files": env_files or None,
                 "deps": concat("dev_crate_deps(normal = True, normal_dev = True)", sorted(set(extra))),
             },
@@ -663,7 +686,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         )
 
     bin_env = {
-        f"CARGO_BIN_EXE_{b['name']}": f"${{exec_root}}/$(execpath :{b['name']}_test_bin)" for b in bins
+        f"CARGO_BIN_EXE_{b['name']}": f"{EXEC_ROOT}/$(execpath :{b['name']}_test_bin)" for b in bins
     }
     for test in sorted(tests, key=lambda t: t["name"]):
         root = relative_src(package, test)
@@ -689,7 +712,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 "crate_root": root,
                 "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
                 "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", sorted(set(macros))),
-                "rustc_env": test_env | bin_env,
+                "rustc_env": test_env | bin_env or None,
                 "extra_data": [f":{b['name']}_test_bin" for b in bins],
                 "deps": concat("dev_crate_deps(normal = True, normal_dev = True)", sorted(set(extra))),
             },

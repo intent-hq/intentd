@@ -61,6 +61,7 @@ rust_library(
 rust_library(
     name = "intent_transport_dev",
     crate_name = "intent_transport",
+    disable_pipelining = True,
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
@@ -70,11 +71,11 @@ rust_library(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-transport",
-    },
     rustc_env_files = ["//bazel:build_commit_env"],
-    tags = ["test-graph"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
     deps = dev_crate_deps(normal = True) + [
         "//crates/intent-core:intent_core_dev",
         "//crates/intent-services:intent_services_dev",
@@ -86,9 +87,6 @@ rust_test(
     crate = ":intent_transport_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-transport",
-    },
     deps = dev_crate_deps(normal_dev = True) + [
         "//crates/intent-store:intent_store_dev",
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -99,6 +97,10 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
 
 rust_test(
@@ -107,9 +109,6 @@ rust_test(
     crate_root = "tests/build_script.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_MANIFEST_DIR": "${exec_root}/crates/intent-transport",
-    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-core:intent_core_dev",
         "//crates/intent-services:intent_services_dev",
@@ -126,4 +125,8 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
 )
