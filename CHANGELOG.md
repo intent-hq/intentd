@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.29] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- Treat Claude Code weekly/session limit errors as quota ([#7615](https://github.com/intent-hq/intentd/pull/7615)) ([#2607](https://github.com/intent-hq/intentd/pull/2607))
+
+### 📚 Documentation
+
+- *(browser)* Document background hosting and snapshot mount-on-demand ([#2541](https://github.com/intent-hq/intentd/pull/2541))
+
+
 ## [0.11.28] - 2026-10-22
 
 ### 🚀 Features
