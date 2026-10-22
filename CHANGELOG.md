@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.24] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- *(test)* Wait for durable idle before restart in assistant restart e2e ([#2585](https://github.com/intent-hq/intentd/pull/2585))
+
+### 🧪 Testing
+
+- Scale fixed test deadlines of 1s or more in the remaining crates ([#2583](https://github.com/intent-hq/intentd/pull/2583))
+
+
 ## [0.11.23] - 2026-10-21
 
 ### 🚀 Features
