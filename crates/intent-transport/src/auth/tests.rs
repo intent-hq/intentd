@@ -744,7 +744,11 @@ async fn imported_owner_credential_wait_is_bounded_by_load_timeout() {
         token,
     };
     let writer = store.admission.write().await;
-    let result = tokio::time::timeout(Duration::from_millis(500), authority.authorize()).await;
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        authority.authorize(),
+    )
+    .await;
     drop(writer);
     assert!(
         matches!(result, Ok(Err(_))),
@@ -771,7 +775,7 @@ async fn imported_owner_credential_write_wait_is_bounded_by_write_timeout() {
     };
     let lease = authority.authorize().await.unwrap();
     let result = tokio::time::timeout(
-        Duration::from_millis(500),
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
         store.store_token(&"cd".repeat(32)),
     )
     .await;

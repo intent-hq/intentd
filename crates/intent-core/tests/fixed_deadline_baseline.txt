@@ -2,13 +2,6 @@
 # Checked by `cargo test -p intent-core --test fixed_deadline_lint`. Entries only ratchet
 # down: wrap a budget in `intentd_test_support::test_timeout(..)` (or mark a deliberate
 # short window with `// fixed-deadline: allow — <reason>`) and lower or remove its line.
-crates/intent-acp/src/callback_registration/tests.rs 9
-crates/intent-acp/src/mcp_bridge/guidance_tests.rs 1
-crates/intent-acp/src/tests.rs 2
-crates/intent-acp/src/transport.rs 3
-crates/intent-acp/src/transport_review_history.rs 1
-crates/intent-acp/tests/acp_integration.rs 1
-crates/intent-git/src/repo_cache.rs 1
 crates/intent-services/src/agent_manager.rs 1
 crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs 1
 crates/intent-services/src/agent_manager/repository_origin/tests.rs 2
@@ -37,15 +30,6 @@ crates/intent-services/src/script_ops.rs 4
 crates/intent-services/src/source_control_auth_ops/repository_owner_tests.rs 2
 crates/intent-services/src/tests.rs 51
 crates/intent-services/src/workspace_status.rs 1
-crates/intent-sourcecontrol/src/account_search/tests.rs 1
-crates/intent-store/src/browser_tab_repo/tests.rs 1
-crates/intent-transport/src/agent_workers.rs 1
-crates/intent-transport/src/auth/tests.rs 2
-crates/intent-transport/src/browser/tests.rs 2
-crates/intent-transport/src/events/tests.rs 3
-crates/intent-transport/src/reverse/primary/tests.rs 1
-crates/intent-transport/src/subscriptions/tests.rs 1
-crates/intentd-sitter/src/readiness.rs 1
 crates/intentd/tests/e2e_agent_features_gating.rs 1
 crates/intentd/tests/e2e_native_review_wire.rs 1
 crates/intentd/tests/e2e_wss_agent_config_option.rs 1

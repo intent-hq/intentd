@@ -6413,6 +6413,7 @@ mod mcp_bridge_tests {
             // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6519,6 +6520,7 @@ mod mcp_bridge_tests {
             // to consume the line before the gate opens).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
