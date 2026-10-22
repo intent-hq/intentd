@@ -392,6 +392,37 @@ impl Store {
         Ok(())
     }
 
+    /// Flag one root comment of `note_id` orphaned, touching only its
+    /// `isOrphaned` extra and `updated_at`. Status, content, attribution and
+    /// every other field are left as stored, so a concurrent
+    /// `comment.resolveThread` (which does not bump the note rev) is never
+    /// undone by a stale whole-row write. Returns whether a row matched; a
+    /// comment deleted in the meantime is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn mark_comment_orphaned(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+        comment_id: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE comment SET extra_json=json_set(COALESCE(extra_json,'{}'),'$.isOrphaned',json('true')), \
+             updated_at=? WHERE id=? AND workspace_id=? AND note_id=? AND parent_id IS NULL",
+        )
+        .bind(updated_at)
+        .bind(comment_id)
+        .bind(workspace_id.as_str())
+        .bind(note_id.as_str())
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("mark comment orphaned failed: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Delete a comment by id, scoped to `workspace_id` (defense-in-depth).
     /// `NotFound` if the row is absent or the workspace does not match.
     ///

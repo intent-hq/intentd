@@ -11313,7 +11313,7 @@ async fn reanchor_note_comments(
     // debris too.
     let mut live_ids = live_comment_ids(&comments);
     let mut current = content;
-    let mut orphaned: Vec<Comment> = Vec::new();
+    let mut orphaned: Vec<String> = Vec::new();
     for comment in &comments {
         // Only root-level anchored comments carry markers; replies inherit the
         // parent's anchor and never inject their own into the note body.
@@ -11328,18 +11328,12 @@ async fn reanchor_note_comments(
             note_ops::AnchorState::Healthy => {}
             note_ops::AnchorState::Missing => {
                 live_ids.remove(&comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::Degenerate => {
                 live_ids.remove(&comment.id);
                 current = note_ops::remove_anchor_markers(&current, &comment.id);
-                let mut updated = comment.clone();
-                updated.is_orphaned = Some(true);
-                updated.updated_at = now_iso();
-                orphaned.push(updated);
+                orphaned.push(comment.id.clone());
             }
             note_ops::AnchorState::PartialStartOnly | note_ops::AnchorState::PartialEndOnly => {
                 let outcome = note_ops::recover_partial_anchor(
@@ -11360,10 +11354,7 @@ async fn reanchor_note_comments(
                         );
                         live_ids.remove(&comment.id);
                         current = note_ops::remove_anchor_markers(&current, &comment.id);
-                        let mut updated = comment.clone();
-                        updated.is_orphaned = Some(true);
-                        updated.updated_at = now_iso();
-                        orphaned.push(updated);
+                        orphaned.push(comment.id.clone());
                     }
                 }
             }
@@ -11377,6 +11368,7 @@ async fn reanchor_note_comments(
     current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
         content: current,
+        note_id: note_id.clone(),
         orphaned,
     })
 }
@@ -11392,10 +11384,12 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 }
 
 /// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
-/// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
+/// ids of root comments whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
-    orphaned: Vec<Comment>,
+    note_id: NoteId,
+    /// Ids of root comments to flag orphaned (never whole cached rows).
+    orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
@@ -11406,9 +11400,16 @@ impl ReanchorPlan {
     /// note has been written the anchors on disk are still a valid pointer
     /// (either intact or scrubbed) and the next mutation's reanchor pass
     /// will finish the job.
+    ///
+    /// Each flip is a targeted update of the orphan flag and its timestamp,
+    /// never a write-back of the comment row read before the note write: a
+    /// thread resolved in between must stay resolved (intentd#2592 review).
     async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
-        for c in self.orphaned {
-            store.update_comment(workspace_id, &c).await?;
+        let now = now_iso();
+        for id in self.orphaned {
+            store
+                .mark_comment_orphaned(workspace_id, &self.note_id, &id, &now)
+                .await?;
         }
         Ok(())
     }
