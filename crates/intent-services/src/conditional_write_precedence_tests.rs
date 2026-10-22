@@ -654,6 +654,7 @@ async fn issue(
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op,
+                    base_content_bytes: None,
                 },
             )
             .await

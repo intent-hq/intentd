@@ -269,6 +269,8 @@ mod transfer_roundtrip;
 #[cfg(all(test, unix))]
 mod transfer_selection_contract;
 mod transfer_submodules;
+#[cfg(test)]
+mod truncated_read_guard_tests;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -11139,6 +11141,27 @@ fn check_set_content_reduction(
     Ok(())
 }
 
+/// Truncated-read write guard: compare the writer's `baseContentBytes` with
+/// the UTF-8 size of the base `merge` resolved — the stored `current`
+/// content on the exact path, the retained snapshot on the merge path. The
+/// last-writer-wins path has no known base, so a guarded write is refused
+/// there rather than overwriting text the writer never saw.
+fn check_content_base(expected: u64, merge: &SetContentMerge, current: &str) -> Result<()> {
+    let resolved = match merge.outcome {
+        "exact" => Some(current.len()),
+        "merged" => merge.base.as_deref().map(str::len),
+        _ => None,
+    }
+    .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    if resolved == Some(expected) {
+        return Ok(());
+    }
+    Err(Error::ContentBaseMismatch {
+        base_content_bytes: expected,
+        resolved_base_bytes: resolved,
+    })
+}
+
 /// How [`persist_merged_content`] turns one attempt's merged text into the
 /// text it persists.
 #[derive(Clone, Copy)]
@@ -11184,6 +11207,16 @@ struct ContentWrite<'a> {
     author: &'a NoteVersionAuthor,
     /// Method label for the merge trace.
     op: &'static str,
+    /// The writer's `baseContentBytes` (truncated-read write guard): when
+    /// `Some`, every attempt refuses the write with
+    /// [`Error::ContentBaseMismatch`] unless it equals the UTF-8 size of the
+    /// base that attempt resolves (the stored content on the exact path, the
+    /// merge snapshot on the stale path; an unknown base always refuses, so
+    /// a guarded write never degrades to last-writer-wins). Without
+    /// `expected_version` a retry after a lost rev gate is refused too: the
+    /// concurrent text was never the writer's base. `None` (surgical ops,
+    /// agents, MCP) is unguarded.
+    base_content_bytes: Option<u64>,
 }
 
 /// Read-merge-persist loop every client content write runs through
@@ -11220,6 +11253,7 @@ async fn persist_merged_content(
         policy,
         author,
         op,
+        base_content_bytes,
     } = write;
     let normalized;
     let merge_input = match policy {
@@ -11238,6 +11272,16 @@ async fn persist_merged_content(
         };
         let old_content = note.content.clone();
         let current_rev = note.rev;
+        if let (Some(expected), None, true) = (base_content_bytes, expected_version, attempt > 1) {
+            // A guarded write without `expectedVersion` checked its base
+            // against the row the previous attempt read; a write that landed
+            // since is text the writer never saw, so it is refused rather
+            // than retried over (the caller holds no rev to merge from).
+            return Err(Error::ContentBaseMismatch {
+                base_content_bytes: expected,
+                resolved_base_bytes: Some(u64::try_from(old_content.len()).unwrap_or(u64::MAX)),
+            });
+        }
         let merge = merge_set_content(
             store,
             workspace_id,
@@ -11247,6 +11291,9 @@ async fn persist_merged_content(
             expected_version,
         )
         .await?;
+        if let Some(expected) = base_content_bytes {
+            check_content_base(expected, &merge, &old_content)?;
+        }
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
         } = policy
@@ -12250,6 +12297,7 @@ async fn append_primitive(
             policy: ContentWritePolicy::Surgical,
             author: &author,
             op: "primitive.append",
+            base_content_bytes: None,
         },
     )
     .await?;
@@ -25955,10 +26003,30 @@ impl WorkspaceApi for Services {
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
-            let expected_version = input.expected_version;
+            let caller_expected_version = input.expected_version;
+            let mut expected_version = caller_expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
+                // Truncated-read write guard, after the strict
+                // `expectedVersion` check (a stale value is `-32005` first).
+                // The persist below is then gated on the rev just checked, so
+                // a write landing in between cannot be overwritten unseen.
+                if expected_version.is_some_and(|v| v != note.rev) {
+                    let current = serde_json::to_value(&note)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    return Err(Error::Conflict { current });
+                }
+                let stored = u64::try_from(note.content.len()).unwrap_or(u64::MAX);
+                if stored != base {
+                    return Err(Error::ContentBaseMismatch {
+                        base_content_bytes: base,
+                        resolved_base_bytes: Some(stored),
+                    });
+                }
+                expected_version = Some(note.rev);
+            }
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
                 // Plain versioned write: a stale `expectedVersion` surfaces
@@ -25984,8 +26052,30 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                match persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await
+                {
+                    // A guarded write the caller sent without
+                    // `expectedVersion` lost the rev gate pinned above: a
+                    // concurrent writer changed the note after the size
+                    // check, which the contract reports as a base mismatch.
+                    Err(Error::Conflict { current }) if caller_expected_version.is_none() => {
+                        if let Some(base) = input.base_content_bytes {
+                            let resolved = current
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|c| u64::try_from(c.len()).unwrap_or(u64::MAX));
+                            return Err(Error::ContentBaseMismatch {
+                                base_content_bytes: base,
+                                resolved_base_bytes: resolved,
+                            });
+                        }
+                        return Err(Error::Conflict { current });
+                    }
+                    other => {
+                        other?;
+                    }
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -26079,6 +26169,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.add",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26169,6 +26260,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.edit",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26257,6 +26349,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.editLines",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26318,6 +26411,27 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        self.set_note_content_guarded(
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+            None,
+            caller_agent_id,
+        )
+    }
+
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
@@ -26347,6 +26461,7 @@ impl WorkspaceApi for Services {
                     },
                     author: &author,
                     op: "note.setContent",
+                    base_content_bytes,
                 },
             )
             .await?;
@@ -26881,6 +26996,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "task.updateStatus",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -27072,6 +27188,7 @@ impl WorkspaceApi for Services {
                             policy: ContentWritePolicy::Surgical,
                             author: &author,
                             op: "task.update",
+                            base_content_bytes: None,
                         },
                     )
                     .await?;

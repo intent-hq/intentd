@@ -7891,6 +7891,7 @@ async fn update_note_full_content_with_task_block_auto_converts() {
                 title: None,
                 tags: None,
                 expected_version: None,
+                base_content_bytes: None,
             },
         )
         .await
