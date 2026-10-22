@@ -26,7 +26,7 @@ rust_binary(
     aliases = aliases(),
     compile_data = COMPILE_DATA,
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = [],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     deps = all_crate_deps(normal = True) + [
