@@ -366,11 +366,8 @@ fn spawn_prompt(
                         if cancelled.load(Ordering::SeqCst) {
                             break;
                         }
-                        let _ = tokio::time::timeout(
-                            intentd_test_support::test_timeout(Duration::from_millis(25)),
-                            fut,
-                        )
-                        .await;
+                        // fixed-deadline: allow — not a deadline: the mock's cancel-flag re-check tick; stretching it only delays cancel detection
+                        let _ = tokio::time::timeout(Duration::from_millis(25), fut).await;
                     }
                 }
                 Step::Call { method, params } => {

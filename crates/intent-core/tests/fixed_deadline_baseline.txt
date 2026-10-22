@@ -2,5 +2,4 @@
 # Checked by `cargo test -p intent-core --test fixed_deadline_lint`. The list is empty and
 # should stay that way: wrap a hang guard in `intentd_test_support::test_timeout(..)`, or
 # mark an observation window that must stay under a fixed production timer with
-# `// fixed-deadline: allow — stays under <timer>`. Entries only ratchet down; a bulk
-# change that cannot be converted in one go may add lines here only with review sign-off.
+# `// fixed-deadline: allow — stays under <timer>`. Entries only ratchet down.

@@ -342,13 +342,12 @@ async fn acquire_queues_until_a_process_goes_idle() {
 
     let reg2 = reg.clone();
     let acquired = tokio::spawn(async move { reg2.acquire(&b, claim_all, release_none).await });
-    // All processes active → the acquire must block.
-    assert!(timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(50)),
-        async {}
-    )
-    .await
-    .is_ok());
+    // All processes active → the acquire must block. Give the spawned
+    // acquire time to run before checking it is still parked.
+    tokio::time::sleep(intentd_test_support::test_timeout(Duration::from_millis(
+        50,
+    )))
+    .await;
     assert!(!acquired.is_finished(), "acquire blocks while all active");
 
     // Becoming idle wakes the queued spawn, which evicts `a` and proceeds.

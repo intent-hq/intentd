@@ -45,8 +45,9 @@
 //! - **Marker:** a standalone `// fixed-deadline: allow — <reason>` on the
 //!   line above the hit, or above the first line of its statement, exempts it
 //!   — for an observation window; write the reason as
-//!   `stays under <timer or constant>` so a reader can check the relationship. A marker without a reason never exempts and is
-//!   itself reported.
+//!   `stays under <timer or constant>` so a reader can check the
+//!   relationship. A marker without a reason never exempts and is itself
+//!   reported.
 //! - **Baseline** (`tests/fixed_deadline_baseline.txt`): one `<path> <count>`
 //!   line per file that still has unmarked fixed deadlines, sorted by path. It
 //!   only ratchets down: a file over its entry (or absent) fails naming every
@@ -612,7 +613,8 @@ fn report(
         for d in found.iter().filter(|d| d.marker_malformed) {
             out.push(format!(
                 "{path}:{}: {}\n  fixed-deadline marker is malformed: expected \
-                 `// {TAG}: allow — <reason>` on its own line; the reason is required.",
+                 `// {TAG}: allow — <reason>` on its own line; the reason is required and \
+                 should name the fixed timer the window stays under.",
                 d.line, d.text
             ));
         }

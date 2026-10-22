@@ -33217,7 +33217,9 @@ mod known_repo {
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(tokio::time::Duration::from_secs(6));
+        while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
             if let Ok(Some(batch)) = tokio::time::timeout(
