@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject workload cloud pins while allowing only named infrastructure exceptions."""
+"""Reject paid cloud pins while allowing free standard labels and named infrastructure exceptions."""
 from pathlib import Path
 import json
 import re
@@ -7,26 +7,29 @@ import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+# Standard GitHub-hosted runners are free for public repositories, so jobs may pin
+# them directly; the route never sends them to a self-hosted slot or WarpBuild.
+FREE = {'ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'}
 # The probe must work when the fleet is offline; the cache smoke test needs a fresh hosted machine.
 EXCEPTIONS = {('runner-route.yml', 'probe'), ('cache-smoke.yml', 'populate'), ('cache-smoke.yml', 'verify'), ('manual-signed-build.yml', 'smoke-macos')}
 # Control jobs must remain independent of the queues they inspect or retire.
 HOSTED_CONTROL = {('retire-obsolete-merge-runs.yml', 'cleanup'), ('retirement-credential-probe.yml', 'existing-read-credential')}
 # The intent-cache Linux slots are unprivileged containers (no sudo, no Docker
-# socket). These jobs need sudo on Linux, so their Linux legs keep the hosted
-# label while macOS and Windows legs stay routed.
+# socket). These jobs need sudo on Linux, so their Linux legs take the burst
+# runner (`cloud`: WarpBuild or GitHub) while macOS and Windows legs stay routed.
 HOSTED_LINUX = {
     ('release-cache.yml', 'daemon'): 'apt configuration and retrying apt-get shim',
     ('release-sitter.yml', 'build'): 'installs qemu-user-static for the aarch64 smoke test',
     ('v-release.yml', 'build-local-artifacts'): 'cargo-dist apt configuration and cross-build packages',
 }
-# Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends to GitHub-hosted runners.
+# Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends to their burst runner.
 HEAVY_HOSTED_ONLY = {('ci.yml', 'coverage-all'): 'raises fs.inotify.max_user_instances with sudo sysctl'}
 MAINTENANCE = {('m1mac-smoke.yml', 'smoke'), ('provision-m1mac.yml', 'provision'), ('provision-m1mac.yml', 'verify'), ('macos-prune.yml', 'prune'), ('windows-prune.yml', 'prune')}
 
 
 def hosted_linux(key):
-    return ("${{ (contains(%s, 'ubuntu') || contains(%s, 'linux')) && %s || "
-            "fromJSON(needs.runner-route.outputs.runners || '{}')[%s] || %s }}") % ((key,) * 5)
+    return ("${{ (contains(%s, 'ubuntu') || contains(%s, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[%s] || %s) || "
+            "fromJSON(needs.runner-route.outputs.runners || '{}')[%s] || %s }}") % ((key,) * 6)
 
 
 def jobs(text):
@@ -59,11 +62,11 @@ def violations(text, filename):
         if (filename, job) in HOSTED_CONTROL and runner[1] == 'ubuntu-latest' and 'matrix:' not in body:
             continue
         runner = runner[1].strip('"\'')
-        if (filename, job) in EXCEPTIONS or (job == 'route' and 'id: decide' in body and 'listSelfHostedRunnersForOrg' in body):
+        if runner in FREE or (filename, job) in EXCEPTIONS or (job == 'route' and 'id: decide' in body and 'listSelfHostedRunnersForOrg' in body):
             continue
         if runner.startswith('[self-hosted,') and (filename, job) in MAINTENANCE:
             continue
-        routed = re.fullmatch(r"\$\{\{ fromJSON\(needs\.(route|runner-route)\.outputs\.(runners|slots|linux_labels|check_labels).*\}\}", runner)
+        routed = re.fullmatch(r"\$\{\{ fromJSON\(needs\.(route|runner-route)\.outputs\.(runners|slots|cloud|linux_labels|check_labels).*\}\}", runner)
         # Matrix legs that may take a pool read their own slot first.
         routed = routed or re.fullmatch(r"\$\{\{ [^|]+ && fromJSON\(needs\.(route|runner-route)\.outputs\.slots \|\| '\{\}'\)\[format\('[\w-]+-\{0\}', matrix\.\w+\)\] \|\| fromJSON\(needs\.(route|runner-route)\.outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\] \|\| matrix\.\3 \}\}", runner)
         if (filename, job) in HOSTED_LINUX:
@@ -74,6 +77,7 @@ def violations(text, filename):
     return errors
 
 
+# Free labels may still be listed; the route always gives them their GitHub label.
 POOLED = {'gh-linux-8x', 'gh-linux-16x', 'ubuntu-22.04', 'ubuntu-24.04'}
 SLOT_READ = re.compile(r"outputs\.slots \|\| '\{\}'\)\[(?:'([\w-]+)'|format\('([\w-]+)-\{0\}', matrix\.\w+\))\] \|\| (?:fromJSON\('\[\"([\w.-]+)\"\]'\)|fromJSON\(needs\.[\w-]+\.outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\])")
 
@@ -132,8 +136,8 @@ def slot_violations(text):
     return errors
 
 
-POOL_OF = {'gh-linux-8x': 'heavy', 'gh-linux-16x': 'heavy', 'ubuntu-22.04': 'small', 'ubuntu-24.04': 'small'}
-# Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends hosted.
+POOL_OF = {'gh-linux-8x': 'heavy', 'gh-linux-16x': 'heavy'}
+# Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends to their burst runner.
 QUEUE_HOSTED = {('ci.yml', 'coverage-e2e'), ('ci.yml', 'coverage-all')}
 
 def pool_reads(body):
@@ -147,7 +151,7 @@ def pool_reads(body):
     if re.search(r'outputs\.(linux_labels|check_labels)', runner):
         return ('heavy', legs)
     by_leg = re.search(r"outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\]", runner)
-    if by_leg and 'outputs.slots' not in runner and not re.search(r"contains\(matrix\.\w+, 'linux'\)\) && matrix\.", runner):
+    if by_leg and 'outputs.slots' not in runner and not re.search(r"contains\(matrix\.\w+, 'linux'\)\) && \(fromJSON\(needs\.runner-route\.outputs\.cloud", runner):
         labels = [label for label in POOL_OF if label in body]
         return (POOL_OF[labels[0]], True) if labels else None
     return None
@@ -191,8 +195,8 @@ class RunnerPolicy(unittest.TestCase):
         two = 'jobs:\n  a:\n' + read.format('route') + '  b:\n' + read.format('route')
         self.assertEqual(len(parallel_pool_violations(two, 'x.yml')), 1)
         self.assertEqual(parallel_pool_violations('jobs:\n  a:\n' + read.format('route') + '  b:\n' + read.format('route, a'), 'x.yml'), [])
-        legs = 'jobs:\n  a:\n    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n        node: [22, 24]\n    runs-on: ${{ fromJSON(needs.route.outputs.runners || \'{}\')[matrix.os] || matrix.os }}\n'
-        self.assertEqual(parallel_pool_violations(legs, 'x.yml'), ['a: several matrix legs share the small pool mapping'])
+        legs = 'jobs:\n  a:\n    strategy:\n      matrix:\n        os: [gh-linux-8x]\n        node: [22, 24]\n    runs-on: ${{ fromJSON(needs.route.outputs.runners || \'{}\')[matrix.os] || matrix.os }}\n'
+        self.assertEqual(parallel_pool_violations(legs, 'x.yml'), ['a: several matrix legs share the heavy pool mapping'])
 
     def test_slot_lists_match_their_jobs(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
@@ -272,8 +276,7 @@ class RunnerPolicy(unittest.TestCase):
         # Pool sizes are org/repo variables, so adding hosts needs no workflow change;
         # the defaults keep today's routing (no xl slots).
         route = (ROOT / '.github/workflows/runner-route.yml').read_text()
-        for env, var, default in [('THRESHOLD', 'CI_LINUX_HEAVY_SLOTS', 2), ('XL_THRESHOLD', 'CI_LINUX_XL_SLOTS', 0),
-                                  ('SMALL_THRESHOLD', 'CI_LINUX_SMALL_SLOTS', 6)]:
+        for env, var, default in [('THRESHOLD', 'CI_LINUX_HEAVY_SLOTS', 2), ('XL_THRESHOLD', 'CI_LINUX_XL_SLOTS', 0)]:
             self.assertIn(f"          {env}: ${{{{ vars.{var} || '{default}' }}}}\n", route)
         self.assertIn("xl: ['self-hosted', 'linux', 'x64', 'intent-cache-xl'],", route)
         # The Linux kill switch covers xl, and only 16-core jobs may take an xl slot.
@@ -283,19 +286,41 @@ class RunnerPolicy(unittest.TestCase):
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn("  LINUX_BURST_THRESHOLD: ${{ vars.CI_LINUX_HEAVY_SLOTS || '2' }}\n", ci)
         self.assertIn("  LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}\n", ci)
-        self.assertIn("  LINUX_SMALL_BURST_THRESHOLD: ${{ vars.CI_LINUX_SMALL_SLOTS || '6' }}\n", ci)
+        self.assertNotIn('SMALL', ci)
+        self.assertIn('          WARPBUILD_DISABLED: ${{ vars.CI_WARPBUILD_DISABLED }}\n', ci)
         self.assertIn('          XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}\n', ci)
 
-    def test_policy_rejects_new_cloud_pins(self):
-        for label in ['ubuntu-24.04', 'ubuntu-latest', '${{ matrix.runner }}', '${{ needs.unrelated.outputs.runner }}']:
+    def test_policy_rejects_new_paid_pins(self):
+        for label in ['gh-linux-8x', 'gh-linux-16x', 'gh-windows-16x', 'macos-26-xlarge', 'macos-15-xlarge',
+                      '${{ matrix.runner }}', '${{ needs.unrelated.outputs.runner }}']:
             self.assertEqual(violations(f'jobs:\n  new-work:\n    runs-on: {label}\n', 'new.yml'), ['new-work'])
+        # Free standard labels and the cloud mapping are allowed.
+        for label in sorted(FREE) + ["${{ fromJSON(needs.runner-route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('[\"gh-linux-8x\"]') }}"]:
+            self.assertEqual(violations(f'jobs:\n  new-work:\n    runs-on: {label}\n', 'new.yml'), [])
+
+    def test_route_knows_the_free_labels(self):
+        route = (ROOT / '.github/workflows/runner-route.yml').read_text()
+        listed = re.search(r"const free = \[([^\]]*)\];", route)[1]
+        self.assertEqual({label.strip(" '") for label in listed.split(',')}, FREE)
 
     def test_control_exceptions_are_exact(self):
         for filename, job in HOSTED_CONTROL:
-            for label in ['ubuntu-24.04', '[ubuntu-latest]', '${{ matrix.os }}']:
+            # A control job stays on one free GitHub label, never a matrix or a list.
+            for label in ['[ubuntu-latest]', '${{ matrix.os }}']:
                 self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: {label}\n', filename), [job])
-            self.assertEqual(violations(f'jobs:\n  unexpected:\n    runs-on: ubuntu-latest\n', filename), ['unexpected'])
-            self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: ubuntu-latest\n', 'copy.yml'), [job])
+            self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: ubuntu-latest\n', filename), [])
+
+    def test_callback_fixture_jobs_clear_node_options(self):
+        # WarpBuild runners preset NODE_OPTIONS and the fixture provisioner refuses it,
+        # which ejected merge-queue PRs once coverage jobs burst there (intentd#2595).
+        import yaml
+        doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        builders = [name for name, job in doc['jobs'].items()
+                    if any('scripts/prepare-acp-callback-fixture.py' in (step.get('run') or '') for step in job.get('steps', []))]
+        self.assertTrue(builders)
+        for name in builders:
+            with self.subTest(job=name):
+                self.assertEqual(doc['jobs'][name].get('env', {}).get('NODE_OPTIONS'), '')
 
     def test_routing_behavior(self):
         subprocess.run(['node', '--test', str(ROOT / 'scripts/runner-policy.test.cjs')], check=True)
