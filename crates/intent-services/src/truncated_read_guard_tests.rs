@@ -252,3 +252,126 @@ async fn update_note_content_arm_is_guarded() {
         .expect("matching base writes");
     assert_eq!(note.content, "x\n");
 }
+
+const RACING_TEXT: &str = "a concurrent writer text\n";
+
+/// Arm a one-shot trigger that lands a concurrent writer between the guard
+/// check and the gated persist: the next `UPDATE` of the note row instead
+/// writes [`RACING_TEXT`] at `rev + 1` and is itself ignored, so the
+/// guarded write's rev gate misses deterministically (no timing).
+async fn arm_racing_writer(svc: &Services) {
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE race_armed(n INTEGER);
+         INSERT INTO race_armed VALUES (1);
+         CREATE TRIGGER race_writer BEFORE UPDATE ON note
+         WHEN (SELECT n FROM race_armed) = 1 BEGIN
+             UPDATE race_armed SET n = 0;
+             UPDATE note SET content = '{RACING_TEXT}', rev = OLD.rev + 1
+                 WHERE id = OLD.id AND workspace_id = OLD.workspace_id;
+             SELECT RAISE(IGNORE);
+         END;"
+    ))
+    .execute(svc.store.write_pool())
+    .await
+    .expect("arm racing writer");
+}
+
+async fn assert_racing_text_survived(svc: &Services, ws: &WorkspaceId, id: &NoteId) {
+    let stored = svc.store.get_note(ws, id).await.expect("get");
+    assert_eq!(
+        stored.content, RACING_TEXT,
+        "the concurrent writer's text survives"
+    );
+    assert_eq!(stored.rev, 1);
+}
+
+/// Guarded `note.setContent` without `expectedVersion` that loses the rev
+/// gate to a concurrent writer is refused as a base mismatch on the retry —
+/// never `-32005`, never an overwrite of the text it did not read.
+#[intent_test_macros::daemon_test]
+async fn guarded_set_content_without_expected_version_refuses_a_lost_race() {
+    let body = large_note();
+    let (_tmp, svc, ws, id) = setup(&body).await;
+    arm_racing_writer(&svc).await;
+    let edited = format!("{body}mine\n");
+    let r = guarded_set(&svc, &ws, &id, &edited, None, Some(bytes(&body))).await;
+    assert_mismatch(r, bytes(&body), Some(bytes(RACING_TEXT)));
+    assert_racing_text_survived(&svc, &ws, &id).await;
+}
+
+/// Guarded write with a current `expectedVersion` whose retry finds no
+/// snapshot for that rev: the base is unknown, so it is refused
+/// (`resolvedBaseBytes: null`) instead of degrading to last-writer-wins.
+#[intent_test_macros::daemon_test]
+async fn guarded_retry_without_snapshot_never_falls_back_to_lww() {
+    // `setup` inserts the row directly: no snapshot exists at rev 0.
+    let (_tmp, svc, ws, id) = setup("v0 body\n").await;
+    arm_racing_writer(&svc).await;
+    let r = guarded_set(
+        &svc,
+        &ws,
+        &id,
+        "v0 body\nmine\n",
+        Some(0),
+        Some(bytes("v0 body\n")),
+    )
+    .await;
+    assert_mismatch(r, bytes("v0 body\n"), None);
+    assert_racing_text_survived(&svc, &ws, &id).await;
+}
+
+/// With a retained snapshot the same race keeps the existing merge
+/// behavior: the retry re-checks the base against the snapshot and merges
+/// the writer's intent onto the concurrent text.
+#[intent_test_macros::daemon_test]
+async fn guarded_retry_with_snapshot_rechecks_and_merges() {
+    let (_tmp, svc, ws, id) = setup_versioned("v0 body\n").await;
+    arm_racing_writer(&svc).await;
+    let r = guarded_set(
+        &svc,
+        &ws,
+        &id,
+        "v0 body\nmine\n",
+        Some(0),
+        Some(bytes("v0 body\n")),
+    )
+    .await
+    .expect("retry merges from the checked snapshot");
+    assert!(r.new_content.contains("mine"), "{}", r.new_content);
+    assert!(
+        r.new_content.contains("concurrent writer"),
+        "{}",
+        r.new_content
+    );
+    assert_eq!(r.rev, 2);
+}
+
+/// `note.update` content arm: a guarded write without `expectedVersion`
+/// that loses the race is a base mismatch, not `-32005`; with
+/// `expectedVersion` the strict compare-and-set `Conflict` is unchanged.
+#[intent_test_macros::daemon_test]
+async fn guarded_update_note_refuses_a_lost_race() {
+    let body = large_note();
+    let (_tmp, svc, ws, id) = setup(&body).await;
+    arm_racing_writer(&svc).await;
+    let input = NoteUpdateInput {
+        content: Some("rewritten\n".into()),
+        base_content_bytes: Some(bytes(&body)),
+        ..Default::default()
+    };
+    let r = svc.update_note(ws.clone(), id.clone(), input).await;
+    assert_mismatch(r, bytes(&body), Some(bytes(RACING_TEXT)));
+    assert_racing_text_survived(&svc, &ws, &id).await;
+
+    let (_tmp2, svc, ws, id) = setup(&body).await;
+    arm_racing_writer(&svc).await;
+    let input = NoteUpdateInput {
+        content: Some("rewritten\n".into()),
+        expected_version: Some(0),
+        base_content_bytes: Some(bytes(&body)),
+        ..Default::default()
+    };
+    let r = svc.update_note(ws.clone(), id.clone(), input).await;
+    assert!(matches!(r, Err(Error::Conflict { .. })), "{r:?}");
+    assert_racing_text_survived(&svc, &ws, &id).await;
+}

@@ -1323,9 +1323,12 @@ pub trait WorkspaceApi: Send + Sync {
     /// (no write) unless it equals the size of the base the daemon resolves
     /// — the stored content when `expected_version` is absent or current,
     /// the merge snapshot when it is stale; an unrecoverable snapshot is an
-    /// unknown base and always refuses. The check runs after the
-    /// above-current `expected_version` `Conflict` and before the merge
-    /// result is persisted. `None` behaves exactly like `set_note_content`.
+    /// unknown base and always refuses (never last-writer-wins). The check
+    /// runs on every read-merge-persist attempt, after the above-current
+    /// `expected_version` `Conflict` and before the merge result is
+    /// persisted; without `expected_version`, losing the rev gate to a
+    /// concurrent writer is a refusal, not a retry. `None` behaves exactly
+    /// like `set_note_content`.
     #[expect(clippy::too_many_arguments)]
     fn set_note_content_guarded(
         &self,

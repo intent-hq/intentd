@@ -11192,11 +11192,14 @@ struct ContentWrite<'a> {
     /// Method label for the merge trace.
     op: &'static str,
     /// The writer's `baseContentBytes` (truncated-read write guard): when
-    /// `Some`, the first attempt refuses the write with
+    /// `Some`, every attempt refuses the write with
     /// [`Error::ContentBaseMismatch`] unless it equals the UTF-8 size of the
-    /// base it resolves (the stored content on the exact path, the merge
-    /// snapshot on the stale path; an unknown base always refuses). `None`
-    /// (surgical ops, agents, MCP) is unguarded.
+    /// base that attempt resolves (the stored content on the exact path, the
+    /// merge snapshot on the stale path; an unknown base always refuses, so
+    /// a guarded write never degrades to last-writer-wins). Without
+    /// `expected_version` a retry after a lost rev gate is refused too: the
+    /// concurrent text was never the writer's base. `None` (surgical ops,
+    /// agents, MCP) is unguarded.
     base_content_bytes: Option<u64>,
 }
 
@@ -11253,6 +11256,16 @@ async fn persist_merged_content(
         };
         let old_content = note.content.clone();
         let current_rev = note.rev;
+        if let (Some(expected), None, true) = (base_content_bytes, expected_version, attempt > 1) {
+            // A guarded write without `expectedVersion` checked its base
+            // against the row the previous attempt read; a write that landed
+            // since is text the writer never saw, so it is refused rather
+            // than retried over (the caller holds no rev to merge from).
+            return Err(Error::ContentBaseMismatch {
+                base_content_bytes: expected,
+                resolved_base_bytes: Some(u64::try_from(old_content.len()).unwrap_or(u64::MAX)),
+            });
+        }
         let merge = merge_set_content(
             store,
             workspace_id,
@@ -11262,10 +11275,8 @@ async fn persist_merged_content(
             expected_version,
         )
         .await?;
-        if attempt == 1 {
-            if let Some(expected) = base_content_bytes {
-                check_content_base(expected, &merge, &old_content)?;
-            }
+        if let Some(expected) = base_content_bytes {
+            check_content_base(expected, &merge, &old_content)?;
         }
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
@@ -25969,7 +25980,8 @@ impl WorkspaceApi for Services {
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
-            let mut expected_version = input.expected_version;
+            let caller_expected_version = input.expected_version;
+            let mut expected_version = caller_expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
@@ -26017,8 +26029,30 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                match persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await
+                {
+                    // A guarded write the caller sent without
+                    // `expectedVersion` lost the rev gate pinned above: a
+                    // concurrent writer changed the note after the size
+                    // check, which the contract reports as a base mismatch.
+                    Err(Error::Conflict { current }) if caller_expected_version.is_none() => {
+                        if let Some(base) = input.base_content_bytes {
+                            let resolved = current
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|c| u64::try_from(c.len()).unwrap_or(u64::MAX));
+                            return Err(Error::ContentBaseMismatch {
+                                base_content_bytes: base,
+                                resolved_base_bytes: resolved,
+                            });
+                        }
+                        return Err(Error::Conflict { current });
+                    }
+                    other => {
+                        other?;
+                    }
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
