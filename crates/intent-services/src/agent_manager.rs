@@ -557,6 +557,12 @@ pub struct TurnOptions {
     /// delivered report queryable via `agent.get`. Fresh turns leave this
     /// `false` and clear as today.
     pub suppress_report_clear: bool,
+    /// `true` when this turn replays an earlier one rather than starting a
+    /// new turn: a stale (#576) redelivery or a requeued entry whose user
+    /// row already reached the transcript (a terminal-failure retry). Such a
+    /// turn never starts a timed return to the home provider (PROTOCOL
+    /// §5.54); carried through every worker spawn path.
+    pub replay: bool,
     /// The drained entry's original `queued_at`, threaded through so a
     /// terminal-failure requeue (STAB-112) re-enqueues with the ORIGINAL
     /// timestamp instead of stamping `now_iso()` — keeping the #576 staleness
@@ -683,6 +689,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         file_blocks: entry.file_blocks.clone(),
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
+        replay: stale || entry.persisted,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
         recovery_sources: entry.recovery_sources.clone(),
@@ -8892,6 +8899,7 @@ impl AgentManager {
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
+            replay: stale || next.persisted,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
             recovery_sources: next.recovery_sources.clone(),
@@ -9205,6 +9213,12 @@ impl AgentManager {
             .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
+        // An entry whose user row was already persisted retries an earlier
+        // turn (no timed return home, PROTOCOL §5.54).
+        let options = TurnOptions {
+            replay: options.replay || entry.persisted,
+            ..options
+        };
         self.spawn_worker(
             agent_id,
             workspace_id,
@@ -13857,7 +13871,7 @@ async fn run_message_worker(
             return;
         }
         let redrive = std::mem::take(&mut keep_failover_chain);
-        let continuation = std::mem::take(&mut continuation_turn);
+        let continuation = std::mem::take(&mut continuation_turn) || options.replay;
         mgr.services.arm_quota_failover(&agent_id, redrive);
         // Timed return to the home provider (PROTOCOL §5.54): at the start of
         // every new turn, whatever its origin (user, agent-to-agent,
@@ -14695,6 +14709,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
@@ -14905,6 +14920,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),

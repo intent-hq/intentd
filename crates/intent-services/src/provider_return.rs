@@ -160,6 +160,7 @@ pub(crate) fn on_switch(
     } else if from == state.home {
         state = on_failed_return(state, reported, now);
         state.away_on = to;
+        state.returning = None;
     } else {
         state.away_on = to;
         state.returning = None;
@@ -169,7 +170,9 @@ pub(crate) fn on_switch(
 
 /// Home rejected a return before producing any output: one more failed
 /// return. The next return-after is the reported reset (when usable), else
-/// the next backoff step.
+/// the next backoff step. The return mode is kept: when nothing else was
+/// left to try the conversation stays on home with that return still owed
+/// (a timed return's notice is written once home accepts).
 pub(crate) fn on_failed_return(
     mut state: ProviderReturnState,
     reported: Option<DateTime<Utc>>,
@@ -178,7 +181,6 @@ pub(crate) fn on_failed_return(
     let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
     state.backoff_step = state.backoff_step.saturating_add(1);
     state.return_after = rfc3339(reported.unwrap_or(now + backoff_delay(state.backoff_step)));
-    state.returning = None;
     state
 }
 
@@ -419,7 +421,16 @@ impl Services {
         // already announced, so no `provider_returned` row.
         if let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
             if provider_profiles::canonical_selection(current) == state.home {
-                state.returning = Some(ReturnMode::Rotation);
+                // Keep an outstanding timed return (with its original away
+                // provider): it was switched home by the timer but home has
+                // not accepted it yet (cancelled, a non-quota failure, a
+                // restart before first output, or rejected with nothing else
+                // to try), so its `provider_returned` row is still owed.
+                // Rotation only when the move home was announced by a
+                // `provider_failover` row.
+                if state.returning.is_none() {
+                    state.returning = Some(ReturnMode::Rotation);
+                }
                 if self
                     .persist_provider_return_state_if_identity(
                         workspace_id,

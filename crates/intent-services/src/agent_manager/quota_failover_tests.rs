@@ -1641,7 +1641,11 @@ async fn an_exhausted_failed_return_still_backs_off() {
     assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
     let state = fx.return_state().await.expect("still away from home");
     assert_eq!(state.backoff_step, 1);
-    assert_eq!(state.returning, None);
+    assert_eq!(
+        state.returning,
+        Some(crate::provider_return::ReturnMode::Rotation),
+        "the move home was a rotation: no notice owed"
+    );
     assert!(
         near(&state.return_after, before + chrono::Duration::hours(1)),
         "{}",
@@ -1805,4 +1809,93 @@ async fn home_is_a_candidate_while_away_even_without_backup_flags() {
         notices(&messages, "provider_returned").is_empty(),
         "{messages:#?}"
     );
+}
+
+/// A timed return that switches home but fails for another reason before
+/// any output (here a non-quota error) still owes its notice: the next turn
+/// that home answers writes exactly one `provider_returned` row.
+#[intent_test_macros::daemon_test]
+async fn a_timed_return_cut_short_before_output_still_announces_once() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": { "code": -32603, "message": "Internal error", "data": "boom" },
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on home",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+
+    let events = fx.send_as_user("hello again").await;
+    assert_eq!(of_type(&events, "agent:failed").len(), 1, "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    let state = fx.return_state().await.expect("not accepted yet");
+    assert_eq!(
+        state.returning,
+        Some(crate::provider_return::ReturnMode::Timer)
+    );
+    assert_eq!(state.away_on, first, "the original away provider is kept");
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+
+    fx.send_as_user("try again").await;
+    assert_eq!(fx.return_state().await, None, "accepted now");
+    let messages = fx.messages().await;
+    let returned = notices(&messages, "provider_returned");
+    assert_eq!(returned.len(), 1, "{messages:#?}");
+    assert_eq!(
+        returned[0].metadata.as_ref().unwrap()["fromProvider"],
+        json!(first)
+    );
+}
+
+/// A replayed turn (a requeued entry whose user row is already in the
+/// transcript, drained into a fresh worker) never starts a timed return,
+/// even after the return-after time.
+#[intent_test_macros::daemon_test]
+async fn a_replayed_queue_entry_drained_into_a_fresh_worker_does_not_return_home() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    fx.mgr.services.enqueue_message(
+        &fx.agent,
+        "retry of an earlier turn".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::Automatic,
+    );
+    // Make it a terminal-failure requeue whose user row already landed.
+    let mut entry = fx.mgr.services.dequeue_message(&fx.agent).expect("queued");
+    fx.mgr
+        .services
+        .store
+        .append_agent_message_with_metadata(
+            &fx.agent,
+            "user",
+            &json!([{ "type": "text", "text": entry.content }]),
+            None,
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    entry.persisted = true;
+    let _ = fx.mgr.services.requeue_front(&fx.agent, entry);
+
+    fx.mgr
+        .clone()
+        .try_drain_queue(fx.agent.clone(), fx.ws.clone())
+        .await;
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    assert_eq!(
+        fx.row().await.provider.as_deref(),
+        Some(first.as_str()),
+        "a replay never starts a timed return"
+    );
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
 }
