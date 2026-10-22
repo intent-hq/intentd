@@ -8,6 +8,14 @@ common --lockfile_mode=update
 build --workspace_status_command=bazel/workspace_status.sh
 build --stamp
 
+# Unlock dependent crates as soon as a dependency's .rmeta is ready, like
+# Cargo's pipelining.
+build --@rules_rust//rust/settings:pipelined_compilation=True
+
+# Build proc-macros, build scripts and their deps unoptimized, like Cargo's dev
+# profile; Bazel's default exec configuration compiles them with `opt`.
+build --host_compilation_mode=fastbuild
+
 # Keep host environment out of action keys.
 build --incompatible_strict_action_env
 
