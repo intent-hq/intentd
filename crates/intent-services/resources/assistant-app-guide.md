@@ -58,6 +58,11 @@ navigation and inactive tabs. They reflect messages observed by this client and
 clear as focused discussion content is read; they are not durable cross-device
 read receipts. These additions remain part of unreleased Multiplayer Labs.
 
+In the People panel's Activity list, nearby consecutive actions by the same person
+share an avatar. Each action remains individually selectable.
+
+<!-- Source: packages/cloudlands-fe/src/features/presence/components/WorkspacePeopleActivity.svelte. -->
+
 <!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
