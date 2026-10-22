@@ -106,6 +106,9 @@ Bazel times out whole test binaries (unit-test binaries get `long`, 900 s)
 rather than single tests. nextest overrides that reserve every test thread
 become the `exclusive` tag; tests in a nextest test-group or listed by test
 name run in a `<target>_serial` companion with `--test-threads=1`.
+Tests see the host `PATH` (`test --test_env=PATH`) so they find `node` and other
+host tools as under Cargo. This is a known non-hermetic input, to be replaced by a
+hermetic node toolchain (rules_nodejs) in the test-hermeticity phase.
 
 ### Adding a test
 

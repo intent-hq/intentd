@@ -29,6 +29,12 @@ build --incompatible_strict_action_env
 test --flaky_test_attempts=2
 test --test_output=errors
 
+# Tests find node (and other host tools) on the host PATH, as under Cargo; the
+# strict action env would otherwise cut it to /bin:/usr/bin:/usr/local/bin.
+# Known non-hermetic input, to be replaced by a hermetic node toolchain
+# (rules_nodejs) in the test-hermeticity phase.
+test --test_env=PATH
+
 # --config=clippy: `cargo clippy --workspace --all-targets -- -D warnings`.
 # [workspace.lints] reaches clippy through each crate's `cargo_lints` target.
 build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
